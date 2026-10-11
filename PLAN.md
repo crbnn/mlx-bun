@@ -253,13 +253,13 @@ without a gate change.
       and the segmented backward's donor checkpoints in `models/gemma4/trainable.ts`. The
       universal graph's softcap attention landed in D3 as `state/softcap-attention.ts`, a named
       read chosen per layer at construction.
-- [ ] Training-side reads (owner: the training item): `TrainingCache.appendWindow` takes no
-      window, so perplexity of a universal model with sliding layers through it diverges (D3
-      measured 484.94 → 482.76 on a synthetic case; pinned as `test.failing` in the dense gate,
-      to flip back when `TrainingCache` takes its window from `trainForwardHidden`).
-      `PrefixSharedCache` has no read and the flash choice is a trainer global, so MiniCPM5's
-      training forward stays in its graph, deprecated, and its two remaining `cache-escape`
-      ratchet entries belong here.
+- [ ] Training-side reads (owner: the training item): `TrainingCache` now takes its layer's
+      sliding window and a mask memo (D3 Gemma 4), which closed the perplexity divergence D3
+      dense had pinned (the dense gate's scoring case reads maxDiff 0 on the merged tree).
+      `PrefixSharedCache` has no read and the flash choice is a trainer global, so MiniCPM5's and
+      Gemma 4's training forwards stay in their graphs, deprecated, and their remaining
+      `cache-escape` ratchet entries (two each) belong here with the segmented backward's donor
+      checkpoints.
 - [ ] The deprecated members leave the contract in D3, once every graph reads through `attend`.
 
 Exit: `quantizedSdpaUnfused` and `kv4DecodeAttention` have no callers outside `state/`; the
