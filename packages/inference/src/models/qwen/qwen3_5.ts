@@ -38,32 +38,18 @@ import type {
 import type { TargetView } from "../../contracts/mlx/draft-target";
 import type { MediaEncoders, MlxPromptInput, Vision } from "../../contracts/mlx/media";
 import { declareGraph } from "../capabilities";
-import { atEveryWidth } from "../graph";
+import { atEveryWidth, deprecatedPhase, type ReadPhase } from "../graph";
 import { bindQwenMediaInput, qwenDraftTarget, qwenMediaEncoders } from "./media-input";
 import { SSMCache } from "../../state/ssm";
 import { buildMropePositions, mropeInvFreq } from "../../layers/qwen-mrope";
 import { type MropeRequestState } from "../../contracts/mlx/positions";
-import { Qwen3Layer, type ReadPhase } from "./blocks";
+import { Qwen3Layer } from "./blocks";
 
 const PREFIX = "language_model";
 
-/** The phase of a forward reaching one of the deprecated entry points
- * (`forwardHidden`, `forwardHiddenMixed`, `forwardHiddenAtPositions`,
- * `forwardEmbeddingsAtPositions`, `forwardEmbeddings`, `createAppend`'s
- * `forwardHidden`, the MTP companion's `forward`), derived from the shape of
- * the input it was handed, [rows, tokens, ...]. A committed-append forward
- * (`committedAppend`) of one row is a committed span; otherwise one position
- * per row is a decode and more is a window. A padded forward of one position
- * per row would read as a decode, which ignores prefill padding; no caller pads
- * a one-position forward.
- * @deprecated E2 deletes this adapter when the scheduler calls the named phases
- * (`prefillChunk`, `prefillTail`, `decode`, `verify` and the committed append).
- * Nothing else in the graph or its blocks derives the phase from a shape. */
-export function deprecatedPhase(input: MlxArray, committedAppend = false): ReadPhase {
-  const [rows, tokens] = input.shape as [number, number];
-  if (committedAppend && rows === 1) return "committed";
-  return tokens === 1 ? "decode" : "window";
-}
+/** The shared deprecated adapter (models/graph.ts), re-exported for the Qwen
+ * graphs that import it from here; E2 deletes both. */
+export { deprecatedPhase };
 
 export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;

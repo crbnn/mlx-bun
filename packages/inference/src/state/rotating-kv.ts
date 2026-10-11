@@ -518,6 +518,13 @@ class TracedRingKVCache extends RotatingKVCache implements DecodeTrace {
     const whole = (a: MlxArray): MlxArray => a.slice(a.shape.map(() => 0), a.shape);
     return [whole(updK), whole(updV)];
   }
+
+  /** The decode read over the in-graph write: the whole updated ring with no
+   *  mask, as `RotatingKVCache.appendDecode` reads the ring it writes in place. */
+  override appendDecode(k: MlxArray, v: MlxArray): AttentionRead {
+    const [keys, values] = this.updateAndFetch(k, v);
+    return sdpaRead(keys, values, unmaskedLease);
+  }
 }
 
 function ringDecodeSlot(offset: number, maxSize: number): DecodeSlot {

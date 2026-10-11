@@ -11,7 +11,7 @@
 //   tokens, every sampled full-vocabulary vector, and each retired row's valid
 //   K/V in every layer (main's paged-kv-parity contract, extended to KV planes);
 // - direct reads at B3 over bf16, KV4 and KV8 pages: the direct kernel actually
-//   serves decode (queries of at most 8 tokens without an array mask), and on
+//   serves decode (the cache's decode read; windows gather), and on
 //   every such call its output equals the gathered reader's over the same query
 //   and pages within DIRECT_TOLERANCE of the output's scale (the two differ only
 //   in reduction order and where dequantized values round); every sampled
@@ -147,32 +147,31 @@ test.skipIf(!inputs)("Gemma4 paged KV: gathered bf16 equals plain KV; direct rea
     const layers = (() => { const probe: Cache[] = model.makeCache(); try { return probe.length; } finally { releaseAll(probe.map(c => () => c.dispose())); } })();
     const runtimeFor = (reader: Reader) => createRuntimeConfig({ MLX_BUN_COMPILED_DECODE: "0",
       MLX_BUN_PAGED_ATTN: reader === "direct" ? "1" : "0" });
-    // Direct dispatch accounting: every call the direct kernel serves is
-    // checked against the gathered reader over the same query and pages.
+    // Direct dispatch accounting: the direct kernel serves the decode read
+    // (`appendDecode`, one query, no mask; a window always gathers), and every
+    // such call is checked against the gathered reader over the same query and pages.
     let directCalls = 0, worstRelative = 0;
-    const appendAndFetch = PagedKVCache.prototype.appendAndFetch;
-    PagedKVCache.prototype.appendAndFetch = function (this: A, k: MlxArray, v: MlxArray) {
-      const view = appendAndFetch.call(this, k, v);
-      if (!this.direct) return view;
+    const appendDecode = PagedKVCache.prototype.appendDecode;
+    PagedKVCache.prototype.appendDecode = function (this: A, k: MlxArray, v: MlxArray) {
+      const read = appendDecode.call(this, k, v);
+      if (!this.direct) return read;
       const gathered = pagedAttentionView(this.pool!, [...this.blockTable], this.offset, false);
-      return { attend(q: MlxArray, scale: number, mask: A) {
-        const out = view.attend(q, scale, mask);
-        if (q.shape[2]! <= 8 && mask.mode !== "array") {
-          directCalls++;
-          using expected = gathered.attend(q, scale, mask);
-          const [x, y] = [out.toFloat32(), expected.toFloat32()];
-          let difference = 0, magnitude = 0;
-          for (let i = 0; i < y.length; i++) {
-            difference = Math.max(difference, Math.abs(x[i]! - y[i]!)); magnitude = Math.max(magnitude, Math.abs(y[i]!));
-          }
-          worstRelative = Math.max(worstRelative, difference / magnitude);
-          if (!(difference <= DIRECT_TOLERANCE * magnitude))
-            throw new Error(`direct paged attention differs from the gathered reader by ${difference} (output scale ${magnitude}, q ${q.shape})`);
+      return { attend(q: MlxArray, scale: number) {
+        const out = read.attend(q, scale);
+        directCalls++;
+        using expected = gathered.attend(q, scale, { mode: "", arr: null });
+        const [x, y] = [out.toFloat32(), expected.toFloat32()];
+        let difference = 0, magnitude = 0;
+        for (let i = 0; i < y.length; i++) {
+          difference = Math.max(difference, Math.abs(x[i]! - y[i]!)); magnitude = Math.max(magnitude, Math.abs(y[i]!));
         }
+        worstRelative = Math.max(worstRelative, difference / magnitude);
+        if (!(difference <= DIRECT_TOLERANCE * magnitude))
+          throw new Error(`direct paged attention differs from the gathered reader by ${difference} (output scale ${magnitude}, q ${q.shape})`);
         return out;
-      }, dispose() { view.dispose(); gathered.dispose(); } };
+      }, dispose() { read.dispose(); gathered.dispose(); } };
     };
-    releases.push(() => { PagedKVCache.prototype.appendAndFetch = appendAndFetch; });
+    releases.push(() => { PagedKVCache.prototype.appendDecode = appendDecode; });
 
     /** One execution group per call, bound under the reader's runtime. Rows
      * submit while admission is held, then release together (a real cohort). */

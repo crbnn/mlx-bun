@@ -19,7 +19,8 @@
 // packages/inference/src/contracts/mlx/cache.ts; the stand-ins live beside their
 // cache classes in packages/inference/src/state/) — so the compiled graph
 // is the production op sequence by construction, not a reimplementation, and this
-// module names no cache class.
+// module names no cache class. Every layer reads its stand-in through the
+// decode read (`appendDecode`), as the ordinary decode reads the real cache.
 // Per-cache fetch strategy (see DecodeStepPlan in
 // packages/inference/src/contracts/mlx/cache.ts):
 // - "concat": graph returns this step's (quantized) KV row; the buffer
@@ -38,13 +39,10 @@ import { disposeResources } from "../../runtime/resources";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { CompiledFunction } from "@mlx-bun/mlx/compile";
 import * as ops from "@mlx-bun/mlx/ops";
-import { runtimeValue } from "../../runtime/config";
 import { isCompiledDecodeCache, isRowBatchCache } from "../../state/capabilities";
 import { decodeStepInputs } from "../../state/decode-step-inputs";
 import { setCompiledTrace } from "../../runtime/compiled-trace";
-import type {
-  Cache, CompiledDecodeCache, DecodeSlot, DecodeTrace, Mask, SharedKv,
-} from "../../contracts/mlx/cache";
+import type { Cache, CompiledDecodeCache, DecodeSlot, DecodeTrace } from "../../contracts/mlx/cache";
 import type { MlxCompiledDecodeStep } from "../../contracts/mlx/graph";
 
 /** What the runner reads of the Gemma graph it compiles (the graph passes
@@ -52,14 +50,14 @@ import type { MlxCompiledDecodeStep } from "../../contracts/mlx/graph";
 export interface CompiledGemmaTarget {
   readonly config: { readonly text: { readonly numKvSharedLayers: number; readonly enableMoeBlock: boolean } };
   readonly perLayerWidth: number;
-  readonly windowSize: number;
   readonly embedScale: number;
   readonly embed: { encode(ids: MlxArray): MlxArray };
   readonly finalNorm: { forward(h: MlxArray): MlxArray };
+  /** A decoder layer reading its cache for one decode position. A donor layer
+   *  returns its read, which the runner disposes. */
   readonly layers: readonly {
-    readonly layerType: string;
-    forward(x: MlxArray, mask: Mask, cache: Cache | null, sharedIn: SharedKv | null,
-      perLayerInput: MlxArray | null): { h: MlxArray; shared: SharedKv };
+    forward(x: MlxArray, cache: Cache, phase: "decode", donor: null,
+      perLayerInput: null): { h: MlxArray; donor: { dispose(): void } | null };
   }[];
   materializeGraphConstants(): void;
   forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray;
@@ -67,13 +65,13 @@ export interface CompiledGemmaTarget {
 }
 
 /** Graph-shape signature: anything that changes the traced op sequence
- *  must appear here (the slots' cache kinds/quant params and the env flags read
- *  inside quantizedSdpa's dispatch). Offsets/capacities don't — they're
- *  array values or shapeless dims. */
+ *  must appear here. That is the slots' cache kinds and quant params, and no
+ *  kernel set: every composed affine set decodes with the one unfused kernel,
+ *  which the quantized stand-ins are built with. Offsets/capacities don't —
+ *  they're array values or shapeless dims. */
 function closureKey(slots: DecodeSlot[]): string {
-  return slots.map((d) => d.key).join(",") + "|" + flagKey();
+  return slots.map((d) => d.key).join(",");
 }
-const flagKey = (): string => `nf=${runtimeValue("MLX_BUN_NO_FUSED_SDPA") === "1" ? 1 : 0}`;
 
 /** The stand-ins for `slots` over the closure inputs that follow the token and
  *  RoPE offset, in slot order. */
@@ -115,19 +113,6 @@ function makeTraceFn(model: CompiledGemmaTarget, slots: DecodeSlot[]) {
 // replays compiled. At steady state on the 12B that is 6 JS layers and
 // 7 compiled segments per step.
 
-function disposeShared(s: SharedKv): void {
-  if (s.kind === "view") {
-    s.attention.dispose();
-    s.offsetArr?.dispose();
-  } else if (s.kind === "plain") {
-    s.keys.dispose();
-    s.values.dispose();
-  } else {
-    for (const t of [s.keys, s.values])
-      for (const a of [t.packed, t.scales, t.biases]) a.dispose();
-  }
-}
-
 /** Trace one compiled segment: layers [from, to) — all ring caches, one slot each —
  *  with embed before (first) and finalNorm+logits after (last).
  *  Input layout: [idsOrH, ropeOffset, ...ring slots in layer order].
@@ -154,14 +139,10 @@ function makeSegmentTraceFn(
       }
 
       for (let i = from; i < to; i++) {
-        const layer = model.layers[i]!;
-        const adapter = adapters[i - from]!;
-        const window = layer.layerType === "sliding_attention" ? model.windowSize : null;
-        const mask = adapter.makeMask(1, window); // N=1 → mode ""
-        const { h: next, shared } = layer.forward(h, mask, adapter, null, null);
+        const { h: next, donor } = model.layers[i]!.forward(h, adapters[i - from]!, "decode", null, null);
         h.dispose();
         h = next;
-        disposeShared(shared);
+        donor?.dispose();
       }
 
       let out = h;
@@ -316,7 +297,7 @@ export class CompiledDecode implements MlxCompiledDecodeStep {
   #stepSegmented(cur: MlxArray, caches: CompiledDecodeCache[], offset0: number): { logits: MlxArray; evalWith: MlxArray[] } {
     const phases = caches.map((c) => c.decodePhase());
     // ring caches need their host bookkeeping (growth/trim/rotation) now;
-    // growing caches keep it inside their layer's real updateAndFetch
+    // growing caches keep it inside their layer's real decode read (appendDecode)
     const plans = caches.map((c, i) =>
       phases[i] === "ring" ? c.prepareDecodeStep() : null,
     );
@@ -338,7 +319,7 @@ export class CompiledDecode implements MlxCompiledDecodeStep {
 
     // layout key: ring slot tags at their positions; js layers only by
     // position (their quant params live outside the closures)
-    const key = "seg|" + slots.map((slot) => slot?.key ?? "js").join(",") + "|" + flagKey();
+    const key = "seg|" + slots.map((slot) => slot?.key ?? "js").join(",");
     if (this.#broken.has(key)) throw new Error(`compiled decode: known-broken closure ${key}`);
 
     let closures = this.#segClosures.get(key);
@@ -368,10 +349,10 @@ export class CompiledDecode implements MlxCompiledDecodeStep {
     //    growth/trim/rotate bookkeeping is benign for the uncompiled path —
     //    the same invariant #stepWhole and generate.ts's fallback rely on).
     //  - js (concat) layers: layer.forward commits via the cache's real
-    //    updateAndFetch mid-loop, so on failure the commit is ROLLED BACK by
+    //    decode read (appendDecode) mid-loop, so on failure the commit is ROLLED BACK by
     //    reverting offset (and ring index) — trim(1) semantics. The written
     //    KV row beyond the reverted offset is dead data the re-forward
-    //    overwrites at the same position (updateAndFetch writes at offset/
+    //    overwrites at the same position (the decode read writes at offset/
     //    ringIdx), so post-recovery state equals a single clean write; the
     //    in-place S=1 write slot is re-derived from the reverted ringIdx.
     const stagedAdopts: { c: CompiledDecodeCache; slot: DecodeSlot; bufs: MlxArray[] }[] = [];
@@ -422,17 +403,13 @@ export class CompiledDecode implements MlxCompiledDecodeStep {
         }
         if (s < jsLayers.length) {
           const li = jsLayers[s]!;
-          const layer = this.model.layers[li]!;
           const c = caches[li]!;
-          const window = layer.layerType === "sliding_attention" ? this.model.windowSize : null;
-          const mask = c.makeMask(1, window); // N=1 → mode ""
           committedJs.push({ c, offsetBefore: c.offset });
-          const { h: next, shared } = layer.forward(carried, mask, c, null, null);
+          const { h: next, donor } = this.model.layers[li]!.forward(carried, c, "decode", null, null);
           if (carriedOwned) carried.dispose();
           carried = next;
           carriedOwned = true;
-          disposeShared(shared);
-          mask.arr?.dispose();
+          donor?.dispose();
         }
       }
       // every segment and js layer succeeded — commit the staged ring adopts
