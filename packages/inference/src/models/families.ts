@@ -52,7 +52,7 @@ export function familyForGraph(graph: ModelGraph): ModelFamily | null {
 
 /** What the engine can do independent of any model. */
 const BASE_CAPABILITIES = [
-  "autoregressive", "colibri-container", "diffusion", "encoder-decoder", "generated-graph",
+  "autoregressive", "colibri-container", "diffusion", "encoder-decoder",
   "mixed-precision-kv", "native-mtp", "safetensors", "vision-sidecar",
 ] as const satisfies readonly EngineCapability[];
 
