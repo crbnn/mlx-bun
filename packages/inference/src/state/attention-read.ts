@@ -1,6 +1,7 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { AttentionRead, Mask } from "../contracts/mlx/cache";
+import { bidirMask } from "../kernels/attention/masks";
 
 /** A mask held by one attention read until that read is disposed. */
 export interface MaskLease {
@@ -83,6 +84,20 @@ export class AttentionMasks {
 
 function drop(slot: MaskSlot): void {
   if (--slot.holders === 0) slot.mask.arr?.dispose();
+}
+
+/** The encoder window's mask over an `L`-position first window
+ * (`EncoderAttentionCache.appendEncoderWindow`): causal, OR'd with the overlay
+ * of positions both flagged in `bidirectional`, with no sliding window, as one
+ * [1, 1, L, L] bool array (the shape the DiffusionGemma encoder built on the
+ * host). No cache's window enters it, so every cache of a model leases it
+ * under one family and a forward builds it once. */
+export function encoderWindowMask(masks: AttentionMasks, L: number, bidirectional: MlxArray): MaskLease {
+  return masks.lease("encoder-window", `${L}`, () => {
+    const { arr } = bidirMask(L, null, bidirectional);
+    try { return { mode: "array", arr: ops.reshape(arr!, [1, 1, L, L]) }; }
+    finally { arr!.dispose(); }
+  }, bidirectional);
 }
 
 /** The read over dense stored keys and values: the stock fused SDPA kernel

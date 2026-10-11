@@ -352,6 +352,45 @@ test("bidirectional first window: KVCache and RotatingKVCache match Gemma 4's bi
   expectAllZero(diffs);
 });
 
+test("encoder window: KVCache and RotatingKVCache match the DiffusionGemma vision encoder's read, inside and past the window", () => {
+  const diffs: number[] = [];
+  for (const L of [3, 8, 32, 37, 70]) {
+    for (const [name, make] of [["KVCache", () => new KVCache()], ["RotatingKVCache", () => new RotatingKVCache(WINDOW)]] as const) {
+      const masks = new AttentionMasks();
+      const pair: [KVCache | RotatingKVCache, KVCache | RotatingKVCache] = [make(), name === "KVCache" ? new KVCache(masks) : new RotatingKVCache(WINDOW, masks)];
+      const flags = Array.from({ length: L }, (_, i) => i >= 2 && i < 2 + Math.floor(L / 2) ? 1 : 0);
+      using flagsI = ops.fromInt32(flags, [L]);
+      using bidir = flagsI.astype(Dtype.bool);
+      const [k, v] = kv(1, L);
+      using q = query(1, L);
+      try {
+        // The pre-D3 encoder (DiffusionGemma model.ts #encoderVisionMask and the
+        // encoder branch of its attention): a host-built [1, 1, L, L] mask, no
+        // sliding window, every layer, then updateAndFetch and the fused SDPA.
+        const bits = new Int32Array(L * L);
+        for (let i = 0; i < L; i++) for (let j = 0; j < L; j++) bits[i * L + j] = i >= j || (flags[i] && flags[j]) ? 1 : 0;
+        using hostMaskI = MlxArray.fromInt32(bits, [1, 1, L, L]);
+        using hostMask = hostMaskI.astype(Dtype.bool);
+        const [keys, values] = pair[0].updateAndFetch(k, v);
+        using expected = ops.sdpa(q, keys, values, SCALE, "array", hostMask);
+        expected.eval(); keys.dispose(); values.dispose();
+        using actual = attendOnce(pair[1].appendEncoderWindow(k, v, bidir), q);
+        const diff = maxDiff(actual, expected);
+        diffs.push(diff);
+        outcomes.push({ label: `${name} encoder window ${L} @0`, diff });
+        expect(pair[1].offset).toBe(L);
+        for (let i = 0; i < 2; i++) diffs.push(maxDiff(pair[1].state()[i]!, pair[0].state()[i]!));
+        // A second layer of the same forward leases the first one's mask.
+        const builds = masks.builds;
+        const other = name === "KVCache" ? new RotatingKVCache(WINDOW, masks) : new KVCache(masks);
+        try { attendOnce(other.appendEncoderWindow(k, v, bidir), q).dispose(); } finally { other.dispose(); }
+        expect(masks.builds).toBe(builds);
+      } finally { k.dispose(); v.dispose(); disposeResources(pair); }
+    }
+  }
+  expectAllZero(diffs);
+});
+
 /** DiffusionGemma's decoder canvas read today (model.ts #makeDecoderMasks and
  * the decoder branch of its attention), for one layer. */
 function oldCanvasRead(cache: KVCache | RotatingKVCache, sliding: boolean, slidingWindow: number,

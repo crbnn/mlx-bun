@@ -101,7 +101,7 @@ export interface CommittedAttentionCache extends AttentionCache {
 }
 
 /** A cache composed for prompts whose media tokens attend each other in both
- * directions (Gemma 4 vision prefill, the DiffusionGemma vision encoder). */
+ * directions (Gemma 4 vision prefill). */
 export interface BidirectionalAttentionCache extends AttentionCache {
   /** Bidirectional window: the same as `appendWindow`, except that two
    * positions both flagged in `bidirectional` see each other in either
@@ -109,6 +109,21 @@ export interface BidirectionalAttentionCache extends AttentionCache {
    * borrowed bool [L] that applies to every row. Defined only for the first
    * window of a sequence (offset 0). */
   appendBidirectional(k: MlxArray, v: MlxArray, bidirectional: MlxArray): AttentionRead;
+}
+
+/** A cache composed for an encoder that reads its whole prompt with no sliding
+ * window, its media tokens attending each other in both directions (the
+ * DiffusionGemma vision encoder, which reads every layer, sliding or full,
+ * through one mask over the whole prompt). */
+export interface EncoderAttentionCache extends AttentionCache {
+  /** Encoder window: the first window of a sequence (offset 0), `L` new
+   * positions per row, stored as `appendWindow` stores them. Query `i` sees
+   * window positions `0..i`, and two positions both flagged in `bidirectional`
+   * see each other in either direction. The cache's sliding window does not
+   * limit this read: every query sees the whole window, whatever its length.
+   * (`appendBidirectional` is the read the sliding window does limit.)
+   * `bidirectional` is a borrowed bool [L] that applies to every row. */
+  appendEncoderWindow(k: MlxArray, v: MlxArray, bidirectional: MlxArray): AttentionRead;
 }
 
 /** A cache composed for block reads, where a block's queries attend the stored

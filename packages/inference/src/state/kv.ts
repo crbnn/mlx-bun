@@ -1,11 +1,11 @@
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
-import type { AttentionRead,BidirectionalAttentionCache,BlockAttentionCache,Cache,CommittedAttentionCache,CompiledDecodeCache,DecodeSlot,DecodeStepInputs,DecodeStepPlan,DecodeTrace,KvDonorRows,Mask } from "../contracts/mlx/cache";
+import type { AttentionRead,BidirectionalAttentionCache,BlockAttentionCache,Cache,CommittedAttentionCache,CompiledDecodeCache,DecodeSlot,DecodeStepInputs,DecodeStepPlan,DecodeTrace,EncoderAttentionCache,KvDonorRows,Mask } from "../contracts/mlx/cache";
 import { bidirMask, createCausalMask } from "../kernels/attention/masks";
 import { QuantizedKVCache } from "./quantized-kv";
 import { plainKvStorage } from "./dense-kv-reads";
-import { AttentionMasks, causalLease, sdpaRead, unmaskedLease, withLease } from "./attention-read";
+import { AttentionMasks, causalLease, encoderWindowMask, sdpaRead, unmaskedLease, withLease } from "./attention-read";
 import type { AffineKernels } from "./affine-attention";
 import { uncomposedTurboQuantKernels, type TurboQuantKernels } from "./turboquant-attention";
 
@@ -23,9 +23,9 @@ export type AffineKernelSet = (bits: number, groupSize: number, dtype: Dtype) =>
  *  `updateAndFetch` today. Decode passes no mask and a window the fused causal
  *  mask; at one query the two compute the same bits, so a one-row window needs
  *  no case of its own. This cache has no sliding window (graphs compose
- *  `RotatingKVCache` for sliding layers), so only a bidirectional read builds
- *  a mask array. */
-export class KVCache implements CompiledDecodeCache, CommittedAttentionCache, BidirectionalAttentionCache, BlockAttentionCache {
+ *  `RotatingKVCache` for sliding layers), so only the bidirectional and encoder
+ *  reads build a mask array. */
+export class KVCache implements CompiledDecodeCache, CommittedAttentionCache, BidirectionalAttentionCache, EncoderAttentionCache, BlockAttentionCache {
   readonly denseKvReads = plainKvStorage;
   static readonly STEP = 256;
   /** Set only by compiled-decode trace adapters (see Cache). */
@@ -75,6 +75,16 @@ export class KVCache implements CompiledDecodeCache, CommittedAttentionCache, Bi
     return withLease(mask, held => {
       const [keys, values] = this.updateAndFetch(k, v);
       return sdpaRead(keys, values, held);
+    });
+  }
+
+  /** DiffusionGemma's vision encoder read on a full-attention layer: the
+   * append `updateAndFetch` makes, then the fused SDPA under the encoder
+   * window's mask (`encoderWindowMask`), one per forward for every layer. */
+  appendEncoderWindow(k: MlxArray, v: MlxArray, bidirectional: MlxArray): AttentionRead {
+    return withLease(encoderWindowMask(this.masks, k.shape[2]!, bidirectional), mask => {
+      const [keys, values] = this.updateAndFetch(k, v);
+      return sdpaRead(keys, values, mask);
     });
   }
 
