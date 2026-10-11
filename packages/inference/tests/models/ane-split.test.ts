@@ -59,7 +59,6 @@ test.skipIf(!process.env.MLX_BUN_TEST_ANE)("affine projection split matches the 
 
 for (const interleave of [false, true])
   test.skipIf(!process.env.MLX_BUN_TEST_ANE)(`Trellis whole-MLP split matches the GPU MLP (${interleave ? "3-bit interleaved" : "row-major"} down)`, () => {
-    const gate = trellis(R, D, 1, 3, 11), up = trellis(R, D, 1, 3, 23), down = trellis(R, D, 0, interleave ? 3 : 2, 37, interleave);
     using x = hidden();
     const { gate, up, down, expected } = mlp(D, R, interleave, 11, x);
     using split = (interleave ? AneTrellisMlpSplitK3i : AneTrellisMlpSplit).build(gate, up, down, 0.5, M);
