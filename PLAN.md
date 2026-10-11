@@ -136,9 +136,13 @@ and `bun run test` pass.
 - [ ] Add `prefillChunk`, `prefillTail`, `decode` and `verify` to `contracts/mlx/graph.ts`, with
       the capture callback a parameter of `verify`. Vision prefill is prefill with embeddings and
       positions, which `forwardEmbeddingsAtPositions` already is.
-- [ ] `decode` and `verify` exist per width class (one row, 2 to 4, 5 to 8, wider), declared by
-      the graph as a table of operations the scheduler indexes by the rows it is loading. The
-      graph never derives the class from its input.
+- [ ] `decode` and `verify` exist per width class, declared by the graph as a table of
+      operations the scheduler indexes by the rows it is loading. The graph never derives the
+      class from its input. D1 set the classes to the row-count boundaries the shipped kernels
+      were measured at: one, two to three, four, five to eight, wider (the old M4 Pro graph had a
+      separate four-row plan with the matrix-unit down; lumping four with two and three cost
+      0.078 on real verify logits). `logits` is a width table too (the head is part of the
+      phase), and `prefillChunk` is per execution unit, `gpu` and, when composed, `ane`.
 - [ ] Keep `forwardHidden` and `forwardHiddenMixed` until E2 moves every caller, then delete.
 - [ ] `verifyRoundCosts` stays as declared data; the scheduler's adaptive gate reads it.
 
@@ -249,13 +253,13 @@ without a gate change.
       and the segmented backward's donor checkpoints in `models/gemma4/trainable.ts`. The
       universal graph's softcap attention landed in D3 as `state/softcap-attention.ts`, a named
       read chosen per layer at construction.
-- [ ] Training-side reads (owner: the training item): `TrainingCache.appendWindow` takes no
-      window, so perplexity of a universal model with sliding layers through it diverges (D3
-      measured 484.94 → 482.76 on a synthetic case; pinned as `test.failing` in the dense gate,
-      to flip back when `TrainingCache` takes its window from `trainForwardHidden`).
-      `PrefixSharedCache` has no read and the flash choice is a trainer global, so MiniCPM5's
-      training forward stays in its graph, deprecated, and its two remaining `cache-escape`
-      ratchet entries belong here.
+- [ ] Training-side reads (owner: the training item): `TrainingCache` now takes its layer's
+      sliding window and a mask memo (D3 Gemma 4), which closed the perplexity divergence D3
+      dense had pinned (the dense gate's scoring case reads maxDiff 0 on the merged tree).
+      `PrefixSharedCache` has no read and the flash choice is a trainer global, so MiniCPM5's and
+      Gemma 4's training forwards stay in their graphs, deprecated, and their remaining
+      `cache-escape` ratchet entries (two each) belong here with the segmented backward's donor
+      checkpoints.
 - [ ] The deprecated members leave the contract in D3, once every graph reads through `attend`.
 
 Exit: `quantizedSdpaUnfused` and `kv4DecodeAttention` have no callers outside `state/`; the
