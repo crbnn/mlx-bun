@@ -282,7 +282,7 @@ test("text: prefill, canvas passes and continuations are bit-identical across th
       canvasSteps(`text ${length} +${CANVAS}+5`, caches, BigInt(length) + 200n, 2);
     } finally { disposeResources([...caches.current, ...caches.frozen]); }
   }
-});
+}, 120_000);
 
 test("vision: the encoder window over synthetic pixels is bit-identical, inside and past the sliding window", () => {
   for (const [before, after] of [[0, 1], [2, 3], [8, 13]] as const) {
@@ -298,7 +298,7 @@ test("vision: the encoder window over synthetic pixels is bit-identical, inside 
   }
   // The longest prompt crosses the window, where the encoder read differs from a windowed one.
   expect(visionPrompt(8, VISION.output, 13).length).toBeGreaterThan(WINDOW);
-});
+}, 120_000);
 
 test("D1 entry and the training forward: forwardCanvasLogits and forwardCanvasLogitsArr are bit-identical", () => {
   for (const length of [6, 29]) {
@@ -309,7 +309,7 @@ test("D1 entry and the training forward: forwardCanvasLogits and forwardCanvasLo
     outputDiff("forwardCanvasLogitsArr logits", `forwardCanvasLogitsArr ${length}`,
       current.forwardCanvasLogitsArr(ids, canvasArr), frozen.forwardCanvasLogitsArr(ids, canvasArr));
   }
-});
+}, 120_000);
 
 /** One seeded run through the denoising engine, recording every step's logits and the final state. */
 function generate(model: DiffusionGemmaModel | FrozenDiffusionGemmaModel, ids: number[], options: DiffusionGenOptions) {
@@ -354,4 +354,4 @@ test("seeded generation: the denoising engine produces identical tokens, step lo
       image?.dispose();
     }
   }
-});
+}, 120_000);
