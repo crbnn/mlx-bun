@@ -1,4 +1,5 @@
 import type { ModelConfig } from "../../artifacts/config";
+import { TURBOQUANT_FOLD_FILE, readTurboQuantFold } from "../../artifacts/turboquant-fold";
 import type { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import type { QuantizedLinear } from "../../layers/quantized-linear";
 import { mropePositionIds } from "../../layers/qwen-mrope";
@@ -6,8 +7,9 @@ import { type MropeRequestState } from "../../contracts/mlx/positions";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { Cache } from "../../contracts/mlx/cache";
 import type { MediaEncoders, MlxDecodeState, MlxPromptInput, VisionEncoder } from "../../contracts/mlx/media";
-import type { TargetView } from "../../contracts/mlx/draft-target";
+import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
 import { existsSync } from "node:fs";
+import { join } from "node:path";
 import * as ops from "@mlx-bun/mlx/ops";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import { bindEmbeddingsInput } from "../media-input";
@@ -68,10 +70,26 @@ export async function qwenMediaEncoders(model: QwenMediaGraph, modelDir: string)
   return { vision: () => Qwen3VLVisionTower.load(modelDir) as unknown as VisionEncoder, audio: null };
 }
 
+/** The residual basis a rotated Qwen artifact declares in its fold record
+ * (`turboquant_fold.json`), for its graph's constructor to read once. A record
+ * whose stream carries no R1 rotation declares none. A missing record, or one
+ * without `final_gain`, declares none either: DFlash 2 then drafts in its
+ * trained basis (output exact, acceptance collapsed), and one line names the
+ * file to update. */
+export function qwenResidualBasis(graph: string, modelDir: string): ResidualBasis | undefined {
+  const fold = readTurboQuantFold(modelDir);
+  if (fold && !fold.r1) return undefined;
+  if (fold?.finalGain) return Object.freeze({ r1Seed: fold.seed, finalGain: fold.finalGain });
+  console.error(`[graph] ${graph}: ${join(modelDir, TURBOQUANT_FOLD_FILE)} ${fold ? "records no final_gain" : "is missing"}; ` +
+    "DFlash 2 drafts unrotated (output exact, acceptance collapses) until it records the final-norm gain the fold moved into lm_head");
+  return undefined;
+}
+
 /** Ports draft sources read from this graph: its embedding, head, layer taps,
- * and the MTP geometry a checkpoint-native draft head needs. */
-export function qwenDraftTarget(model: QwenMediaGraph): TargetView {
-  return Object.freeze({ identity: model, hiddenLayerTaps: Object.freeze({
+ * the MTP geometry a checkpoint-native draft head needs and, from a graph whose
+ * residual stream carries a rotation fold, that basis (the same object on every view). */
+export function qwenDraftTarget(model: QwenMediaGraph, residualBasis?: ResidualBasis): TargetView {
+  return Object.freeze({ identity: model, ...(residualBasis ? { residualBasis } : {}), hiddenLayerTaps: Object.freeze({
     layerCount: model.config.text.numHiddenLayers,
     projection: Object.freeze({ embed: model.embed, logitsFromHidden: model.logitsFromHidden.bind(model) }),
   }), recurrentMtp: Object.freeze({

@@ -34,8 +34,10 @@ import { quantFor, type ModelConfig } from "../../artifacts/config";
 import { runtimeFlag, runtimeValue } from "../../runtime/config";
 import { QuantizedLinear } from "../../layers/quantized-linear";
 import { type Cache, type Mask } from "../../contracts/mlx/cache";
+import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
 import { compiledSwiglu } from "../../layers/swiglu";
 import { Qwen35Model, type Qwen3Layer } from "./qwen3_5";
+import { qwenDraftTarget, qwenResidualBasis } from "./media-input";
 import type { SSMCache } from "../../state/ssm";
 import {
   TrellisLinear, TRELLIS_MATVEC_MAX_M, fusedGateUpEligible, fusedGateUpSwiglu,
@@ -104,9 +106,12 @@ export class Qwen38TrellisTQ extends Qwen35Model {
   readonly plan: Qwen38TqPlanSummary;
   readonly #steps: LayerStep[];
   #qkScale: { q: MlxArray; k: MlxArray } | null = null;
+  /** The artifact's R1 basis, from its fold record (read once, here). */
+  readonly #residualBasis: ResidualBasis | undefined;
 
   constructor(weights: Weights, config: ModelConfig) {
     super(weights, config);
+    this.#residualBasis = qwenResidualBasis(this.graph, config.modelDir);
     const options = {
       // Layers whose gate and up were allocated DIFFERENT bit widths fall off the
       // same-k fused kernel onto two projections plus a separate SwiGLU. One kernel
@@ -133,6 +138,8 @@ export class Qwen38TrellisTQ extends Qwen35Model {
     console.error(`[graph] ${this.graph} ${this.plan.fingerprint} mlp fused=${counts.fused} mixedFused=${counts.mixedFused} ` +
       `split=${counts.split} options=${JSON.stringify(options)}`);
   }
+
+  override draftTarget(_caches: Cache[]): TargetView { return qwenDraftTarget(this, this.#residualBasis); }
 
   /** Resolve one layer into a closure of direct calls. */
   #layerStep(layer: Qwen3Layer, options: { mixedGateUp: MixedGateUpTail | "off" }, counts: Record<string, number>): LayerStep {
