@@ -101,9 +101,9 @@ Closed by Josh, 2026-10-10:
 - **Bit-stability across batch width** (closed by Josh, 2026-10-11): keep the measured-best
   kernels per width class (factored for 1 to 4 rows, matrix-unit for 5 to 8), so a request's last
   bits can depend on how many rows were batched with it; this is what the old graph served and it
-  is documented and KL-gated. Invariance is a composition, not a flag: `--batch-size 1` builds the
-  one-row class only, so a request never shares a forward and its bits never depend on another
-  request. The batched paged read follows the same rule (joined rows, as served today).
+  is documented and KL-gated. There is no separate switch: choosing `--batch-size N` above one opts
+  into batching, and batching may move the last bits; `--batch-size 1` says nothing can be batched,
+  so nothing can change. The batched paged read follows the same rule (joined rows, as served today).
 
 ### Phase A: contracts (no behavior change)
 
