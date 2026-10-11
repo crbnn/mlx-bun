@@ -375,8 +375,16 @@ same phase; the Qwen generator (D2) produces it.
 
 #### D2. Generators are the asset
 
-- [ ] Fix the template in `packages/inference/scripts/gen-gemma4.ts`: no `extends`, no
+- [x] Fix the template in `packages/inference/scripts/gen-gemma4.ts`: no `extends`, no
       `#matches`, named phases. Regenerate `gemma4-e4b.ts`, `gemma4-12b.ts`, `gemma4-26b.ts`.
+      Landed (`refactor/composition-d2`): the blocks live in `models/gemma4/blocks.ts`; each
+      generated class extends nothing, folds its per-layer KV scheme as literals, declares
+      `COMPOSITION`, and is checked for drift by `gemma4-generated-sync.test.ts`; 840
+      comparisons at maxDiff 0 and the e4b and 12B digests identical. Seams for the E1 merge:
+      the generated classes join the `RuntimeModel` union (then the transitional `GENERATED`
+      map and its cast go), and training on those three fingerprints must load the generic
+      graph, since a generated graph declares no `trainable` (a composition field the train
+      verbs set, or the train module selecting the generic entry explicitly).
 - [ ] Write `packages/inference/scripts/gen-qwen38.ts` taking the composition as input; the M4 Pro
       graph and the M1 Max graph are its outputs. The hand-written TQ graph is broken into its
       reusable pieces and deleted. D1 landed the generator and the M4 Pro output (`--describe`
