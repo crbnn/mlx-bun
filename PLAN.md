@@ -177,7 +177,18 @@ without a gate change.
       codec still picks its decode kernel per call (`tryDecodePackedKv` returns null and the
       eager decode runs): the kernel is fixed at construction with the rest of the scheme, and
       the null path goes. `appendBidirectional` on the TurboQuant caches (Gemma 4 image prefill)
-      is still to implement.
+      is still to implement. B1e: two kernel sets at construction, `denseTurboQuantKernels`
+      (Qwen's read before C1: decode keys and values, then SDPA) and
+      `deferredTurboQuantKernels` (Gemma 4 and MiniCPM5: SDPA on rotated values, un-rotate the
+      output); the graph puts its set on the bf16 caches `makeCache` builds and every
+      conversion, copy and restore takes it from the cache it converts. A graph that passes no
+      set leaves a placeholder whose named reads throw; D3 gives every graph its set and the
+      placeholder goes.
+- [ ] Transition reads, all marked E3 and deleted there: the conversion site in
+      `kv-maintenance.ts` and the two SSD restore sites choose the affine kernel set from the
+      flag the app writes today through `state/served-affine-kernels.ts` (`1` → unfused,
+      otherwise tiled-causal where the configuration tiles). E3 composes the set from the KV
+      scheme at load and the app stops writing the flag.
 - [ ] The quantized lego `--kv-quant N` composes is bf16 through its first append and quantized
       storage after, inside its own `appendWindow`/`appendDecode` (the state transition the
       three `delayed-*-kv.ts` caches do today, owned by one lego built at load), so the first
@@ -254,6 +265,17 @@ warm-reuse test is unchanged; no `toQuantized` caller outside `state/`.
       `independentRows` goes.
 - [ ] Follow-up, after the DeltaNet block takes the SSM cache contract instead of the concrete
       class: move the blocks to `layers/`.
+
+- [ ] Landed in C1 (#337) with B1e (#338): the attention block holds one read strategy taken at
+      construction (the cache's own read; a deprecated strategy reproduces the Trellis graphs'
+      injected cores until D1); the DeltaNet block calls `recurDecode`/`recurWindow`; the MLP
+      is `TrellisMlp` or `AffineMlp`, chosen by `loadQwenMlp` from the quant table at load; the
+      phase is a value passed down `forwardLayers`, derived from a shape only in
+      `deprecatedPhase`, the one adapter E2 deletes. Still inside the generic blocks and owned
+      by E2's width tables: `TrellisMlp`'s "4 rows or fewer → fused gate/up" choice.
+      `MLX_BUN_MIXED_PACKED_MLP` is read once at construction and becomes a composition fact in
+      E3. `verify` on the TQ graph now runs the TQ plan where A2's delegation ran the generic
+      mixed loop: E2's capture-path decision.
 
 Exit: `Qwen35Model` and the M4 Pro graph both import from `blocks.ts`; no `extends` between
 them; bit-identical generic forward.
