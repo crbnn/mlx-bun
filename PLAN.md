@@ -193,7 +193,8 @@ without a gate change.
       flag the app writes today through `state/served-affine-kernels.ts` (`1` → unfused,
       otherwise tiled-causal where the configuration tiles). E3 composes the set from the KV
       scheme at load and the app stops writing the flag.
-- [ ] B1f, owed before the merge to main. (1) The delayed row layouts (`delayed-quantized-kv.ts`,
+- [x] B1f, landed (`refactor/composition-b1f`): served numbers equal the pre-D3 base on e4b and
+      12B at every stage of two-row cohorts under `--kv-quant config` and `4`. (1) The delayed row layouts (`delayed-quantized-kv.ts`,
       `delayed-rotating-quantized-kv.ts`, `bf16-first-kv.ts`, `batched-rotating-quant.ts`) take
       their affine kernel set when `kv-maintenance`'s `preparePrefill` builds them, from the same
       transition rule, instead of a hardcoded unfused set: D3 Gemma 4 measured that rows converted
@@ -213,9 +214,10 @@ without a gate change.
       own and is not compared.
 - [ ] Paged: `state/paged/cache.ts` already conforms; align names. B1a found its direct
       kernel was chosen by query count (8 or fewer); the window kernel becomes a construction
-      choice of the paged lego (direct up to the composition's verify width, SDPA otherwise),
-      and the batched paged lego's window read is per row by design (the old joined-rows path
-      differed by up to 1e-3 and falls under the bit-stability decision).
+      choice of the paged lego (direct up to the composition's verify width, SDPA otherwise).
+      B1f restored the batched paged lego's reads to the old joined-rows computation for both
+      the window and the decode read (per-row decode differed by up to 3.9e-3 at head dim 512),
+      so `gemma4-paged` holds at three rows; per-row reads wait for the bit-stability decision.
 - [ ] B1a's first divergence: a single-position append on a rotating cache keeps today's
       numbers only through the in-place write, which is `appendDecode`; a one-row window
       concatenates and reorders the keys after the ring wraps (up to 3.9e-3). E2 maps the
