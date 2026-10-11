@@ -444,7 +444,11 @@ new flag.
       the published `mlx-bun/Qwen3.8-27B-Trellis-3.2bpw` sidecar gets the values computed
       from the bf16 source (a one-off, where that source is available); each Trellis graph
       reads the sidecar once at construction and declares `residualBasis` through
-      `draftTarget`. The old basis JSON the env var pointed at is not on the M4 Pro.
+      `draftTarget`. Resolved 2026-10-11: the basis JSON was on the M1 Max share
+      (`mlx-bun-perf/models/Qwen3.8-27B-Trellis-3.2bpw-dflash2-basis.json`, gain taken from
+      the bf16 final norm of a sibling quant of the same source, effective 1+w), and the
+      published artifact's `turboquant_fold.json` now carries `final_gain`, its convention and
+      its source (hub commit `d5a4fc64`). E4b makes the graphs read it and the quantizer write it.
 - [ ] The drafter builds its matrix-unit layer for its fixed block width at construction and uses
       the ordinary quantized matmul for context projection; no per-call row switch in `matmulW`.
 
