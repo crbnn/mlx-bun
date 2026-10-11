@@ -341,9 +341,16 @@ the default variant on the M4 Pro and the M1 Max; paired serve benchmark shows n
       form itself, one per Neural Engine generation built on a host of that generation, stays
       possible later; it is not required.
 
+- [ ] Program creation can hang: after the real artifact's 2048-row programs ran, the next
+      synthetic program's `mbane_program_create` blocked for over 20 minutes waiting on aned's
+      `loadModel` reply in the same process (D1's merge gate, 2026-10-11; the real-artifact test
+      alone passes). Reproduce and fix in the bridge (a per-process `_ANEClient` state or the
+      shared-buffer release order are the suspects) before E2 dispatches chunks to the ANE.
+
 Exit: two graphs can coexist in one process without evicting each other's programs; KL gate on
 ANE prefill unchanged; after install, the first ANE prefill on a fresh machine loads from the
-cache and compiles nothing, measured by the bridge's own `compiledModelExists`.
+cache and compiles nothing, measured by the bridge's own `compiledModelExists`; a process that
+runs several ANE programs of different shapes in sequence never blocks in program creation.
 
 ### Phase D: graphs
 
