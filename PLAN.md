@@ -488,7 +488,7 @@ paired batched-lane benchmark records the gain at one and four rows.
 
 #### E3. App
 
-- [ ] `--kv-quant` composes the cache lego before the model loads. D1 measured why this cannot
+- [x] `--kv-quant` composes the cache lego before the model loads. D1 measured why this cannot
       wait: the scheduler still calls `makeCache()` with no scheme and `kv-maintenance` converts
       to the plain affine cache, so the entire M4 Pro graph (which reads through the cache
       instead of injecting its KV4 and folded kernels) serves `--kv-quant 4` through the generic
@@ -500,10 +500,34 @@ paired batched-lane benchmark records the gain at one and four rows.
       the KV4 cores, several on the generic path); the choice keys on the cache's own layout, as
       the tiled-causal set does. E3's gate: the composed lego against the old graph's injected
       cores at maxDiff 0 on the real artifact.
-- [ ] `MLX_BUN_QWEN_SPEC_KV4` (read once in the M4 Pro constructor since D1) and
+- [x] `MLX_BUN_QWEN_SPEC_KV4` (read once in the M4 Pro constructor since D1) and
       `MLX_BUN_MIXED_PACKED_MLP` become composition facts.
-- [ ] The per-request `kvBits`, `kvConfig` and `quantizedKvStart` options leave `generation/types.ts` and the server request plan; the cache lego is composed at load from `--kv-quant` and `--quantized-kv-start`.
+- [x] The per-request `kvBits`, `kvConfig` and `quantizedKvStart` options leave `generation/types.ts` and the server request plan; the cache lego is composed at load from `--kv-quant` and `--quantized-kv-start`.
 - [ ] `--num-draft-tokens adaptive` is served by the scheduler choosing among the built widths; a number is fixed depth.
+- [x] Landed (`refactor/composition-e3`, five commits on `30412523`). Every graph's `makeCache()`
+      composes from `composition.kv`: plain bf16; bf16-first affine (uniform, or per listed
+      layer under `config`), read kernels from `KvStorageScheme.kernels` (`--fused-sdpa` on =
+      tiled-causal, off = unfused, unset = by scheme); bf16-first TurboQuant dense (Qwen) or
+      deferred (Gemma 4, MiniCPM5); `Bf16FirstKv4Head256Cache` for the M4 Pro composition,
+      reading with the KV4 kernels while its own layout holds one row and with the plain affine
+      kernels when it holds more. Gate (a) passed on the real artifact at maxDiff 0 (chunk,
+      conversion point, tail, decodes, verify 3 and 8); 24 app-path digests on e4b and MiniCPM5
+      unchanged; speculative-group and gemma4-paged lines identical. Deleted: the per-request KV
+      options, kv-maintenance's serial conversion branch, `served-affine-kernels.ts`, every
+      `MLX_BUN_NO_FUSED_SDPA` read and write. `speculativeAffineKv` and `packedMixedMlp` are
+      composition fields, default on, with no env override. Behavior that changed, accepted:
+      prefix and checkpoint entries stored at the conversion start are saved converted (reuse
+      is identical; a request diverging before the start recomputes instead of reusing);
+      speculative prefix namespaces and method keys dropped their KV fields, so entries written
+      before E3 miss once. Found and assigned: under a quantized scheme the generated Gemma 4
+      graphs matched on raw cache signatures and fell to the monolith on every forward (numbers
+      unchanged, fast path lost); the merge of E1 + D2 + E3 deletes that run-time match and the
+      table selects them on the scheme (gate: `gemma4-generated` asserts the generated forward,
+      digests equal `30412523`). The deprecated attention views and the donor reads still pick
+      the decode kernel by query count (E2 deletes the views; the donor reads ride the Gemma
+      assistant-drafter item). Real-weight tests E3 ported but did not run are the merge's to
+      run: `gemma4-generated`, `compiled-decode`, `ordinary-continuation`,
+      `affine-grammar-spans`, `gemma4-parity`, `minicpm5-parity`, the Trellis parity tests.
 
 Exit: `serve-cli.test.ts` and the draft-flags test pass; the CLI inventory regenerates with no
 new flag.
