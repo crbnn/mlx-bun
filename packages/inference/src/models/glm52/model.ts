@@ -20,7 +20,9 @@ import { type Cache } from "../../contracts/mlx/cache";
 import { argmaxLastPosition } from "../../kernels/logits";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
-import type { MlxDeclaredGraph, MlxPhaseForward, MlxTokenPhases, MlxVerifyForward } from "../../contracts/mlx/graph";
+import type {
+  MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward,
+} from "../../contracts/mlx/graph";
 import { declareGraph } from "../capabilities";
 import { atEveryWidth } from "../graph";
 import { type QuantizedLinear } from "../../layers/quantized-linear";
@@ -968,8 +970,9 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
     }
   }
 
-  prefillChunk(ids: MlxArray, cache: Cache[]): Promise<MlxArray> { return this.forwardHiddenAsync(ids, cache); }
+  readonly prefillChunk: MlxPrefillChunk = { gpu: (ids, cache) => this.forwardHiddenAsync(ids, cache) };
   prefillTail(ids: MlxArray, cache: Cache[]): Promise<MlxArray> { return this.forwardHiddenAsync(ids, cache); }
+  readonly logits = atEveryWidth<MlxHeadForward>(hidden => this.logitsFromHidden(hidden));
   readonly decode = atEveryWidth<MlxPhaseForward>((ids, cache) => this.forwardHiddenAsync(ids, cache));
   readonly verify = atEveryWidth<MlxVerifyForward>((ids, cache) => this.forwardHiddenAsync(ids, cache));
 

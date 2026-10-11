@@ -55,17 +55,40 @@ export type MlxPhaseForward = (ids: MlxArray, state: Cache[]) => MlxArray | Prom
 export type MlxVerifyForward = (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
   MlxArray | Promise<MlxArray>;
 
+/** The output head over a post-final-norm hidden [.., hidden-width] (borrowed)
+ * to logits [.., vocabulary] the caller owns, possibly unevaluated. */
+export type MlxHeadForward = (hidden: MlxArray) => MlxArray;
+
+/** The prompt-chunk operation for each execution unit the composition built.
+ * Both follow `MlxPhaseForward` and append the same positions. The scheduler
+ * owns the units: it reads which operations exist once when it binds the graph
+ * (`ane` is a declared fact, like `verifyRoundCosts`) and chooses per chunk; the
+ * graph never picks between them. */
+export interface MlxPrefillChunk {
+  /** The GPU operation. Every graph supplies it. */
+  readonly gpu: MlxPhaseForward;
+  /** The Neural Engine operation, which splits each layer's channels between
+   * the Neural Engine and the GPU, for chunks of exactly the composition's
+   * prefill chunk size. Present only when the composition built it. */
+  readonly ane?: MlxPhaseForward;
+}
+
 /** One operation per width class, where a forward's rows are its sequences
- * times its tokens per sequence. The caller picks the entry by the rows it is
- * loading and hands an entry only rows of its class; an entry never inspects
- * its input to learn its class. A graph with one forward supplies the same
- * operation in every entry; a specialized graph supplies the operation it built
- * for each class. */
+ * times its tokens per sequence. The classes are the row-count boundaries the
+ * shipped kernels were measured at: one row, two or three rows sharing each
+ * decoded weight, four rows (where the matrix-unit down projection takes over
+ * from the shared-row one), five to eight rows on the matrix unit, and wider.
+ * The caller picks the entry by the rows it is loading and hands an entry only
+ * rows of its class; an entry never inspects its input to learn its class. A
+ * graph with one forward supplies the same operation in every entry; a
+ * specialized graph supplies the operation it built for each class. */
 export interface MlxWidthTable<Operation> {
   /** Exactly one row. */
   readonly one: Operation;
-  /** Two to four rows. */
-  readonly twoToFour: Operation;
+  /** Two or three rows. */
+  readonly twoToThree: Operation;
+  /** Exactly four rows. */
+  readonly four: Operation;
   /** Five to eight rows. */
   readonly fiveToEight: Operation;
   /** Nine or more rows. */
@@ -80,8 +103,8 @@ export interface MlxTokenPhases {
    * prefill chunk size; rows are sequences times that size. Token ids only: a
    * prompt with prepared media enters through the `MlxPromptInput` that
    * `bindMediaInput` returns (for `embeddings+positions`, the graph's
-   * `forwardEmbeddingsAtPositions`). */
-  prefillChunk(ids: MlxArray, state: Cache[]): MlxArray | Promise<MlxArray>;
+   * `forwardEmbeddingsAtPositions`). One operation per execution unit. */
+  readonly prefillChunk: MlxPrefillChunk;
   /** The positions left at the end of a prompt after its whole chunks, fewer
    * than the chunk size per sequence; rows are sequences times those tokens.
    * The same semantics as `prefillChunk`, named apart because a composition
@@ -95,6 +118,10 @@ export interface MlxTokenPhases {
    * appends all depth + 1 positions; dropping the rejected suffix is the
    * caller's speculative transaction, begun before this call. */
   readonly verify: MlxWidthTable<MlxVerifyForward>;
+  /** The output head, part of each phase: the entry for the rows of the hidden
+   * the caller projects (a decode or verify forward's rows, or the positions it
+   * selects). A graph with one head supplies it in every entry. */
+  readonly logits: MlxWidthTable<MlxHeadForward>;
 }
 
 /** A graph's compiled single-token decode step: the whole forward replayed from

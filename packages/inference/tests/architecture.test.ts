@@ -843,7 +843,6 @@ const seamRatchet: RatchetTable = {
     "packages/inference/src/models/gemma4/generated/gemma4-12b.ts": 2, // D2
     "packages/inference/src/models/gemma4/generated/gemma4-26b.ts": 2, // D2
     "packages/inference/src/models/gemma4/generated/gemma4-e4b.ts": 2, // D2
-    "packages/inference/src/models/qwen/qwen38-27b-trellis-m4pro.ts": 5, // D1
     "packages/inference/src/models/qwen/qwen38-27b-trellis-tq.ts": 2, // D2
   },
   "hot-path-read": {
@@ -867,10 +866,8 @@ const seamRatchet: RatchetTable = {
     "packages/inference/src/models/gemma4/generated/gemma4-e4b.ts": 8, // D2
     "packages/inference/src/models/gemma4/model.ts": 13, // D3
     "packages/inference/src/models/minicpm5/model.ts": 11, // D3
-    "packages/inference/src/models/qwen/blocks.ts": 3, // D1
     "packages/inference/src/models/qwen/qwen3-moe.ts": 1, // D3
     "packages/inference/src/models/qwen/qwen3.ts": 1, // D3
-    "packages/inference/src/models/qwen/qwen38-27b-trellis-m4pro.ts": 2, // D1
     "packages/inference/src/models/universal/dense.ts": 2, // D3
     "packages/inference/src/scoring/full-sequence.ts": 3, // D3 (B1e reads over the deprecated members)
   },

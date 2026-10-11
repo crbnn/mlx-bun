@@ -33,7 +33,9 @@ import { isExpertTracing,recordRouting } from "../../runtime/expert-trace";
 import { Checkpoint } from "@mlx-bun/mlx/checkpoint";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
-import type { MlxCompiledDecodeStep, MlxDeclaredGraph, MlxPhaseForward, MlxTokenPhases, MlxVerifyForward } from "../../contracts/mlx/graph";
+import type {
+  MlxCompiledDecodeStep, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward,
+} from "../../contracts/mlx/graph";
 import { CompiledDecode } from "./compiled-decode";
 import type { TargetView } from "../../contracts/mlx/draft-target";
 import type { TrainableGraph } from "../../contracts/mlx/trainable";
@@ -748,8 +750,9 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
     return this.forwardLayers(h, cache, null, ids);
   }
 
-  prefillChunk(ids: MlxArray, cache: Cache[]): MlxArray { return this.forwardHidden(ids, cache); }
+  readonly prefillChunk: MlxPrefillChunk = { gpu: (ids, cache) => this.forwardHidden(ids, cache) };
   prefillTail(ids: MlxArray, cache: Cache[]): MlxArray { return this.forwardHidden(ids, cache); }
+  readonly logits = atEveryWidth<MlxHeadForward>(hidden => this.logitsFromHidden(hidden));
   readonly decode = atEveryWidth<MlxPhaseForward>((ids, cache) => this.forwardHidden(ids, cache));
   readonly verify = atEveryWidth<MlxVerifyForward>((ids, cache, capture) =>
     this.forwardHiddenMixed([{ ids, cache, captureLayer: capture ?? undefined, preserveTokenGeometry: true }])[0]!);

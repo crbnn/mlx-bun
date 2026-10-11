@@ -37,7 +37,7 @@ export interface MlxTokenGraph extends MlxGraphOperations<Cache[]>, MlxDeclaredG
 
 /** The width table of a graph whose one operation serves every width class. */
 export function atEveryWidth<Operation>(operation: Operation): MlxWidthTable<Operation> {
-  return Object.freeze({ one: operation, twoToFour: operation, fiveToEight: operation, wider: operation });
+  return Object.freeze({ one: operation, twoToThree: operation, four: operation, fiveToEight: operation, wider: operation });
 }
 
 /** Bind once. No array wrapper, await, readback, or synchronization is added

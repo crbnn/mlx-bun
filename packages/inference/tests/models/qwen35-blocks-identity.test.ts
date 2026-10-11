@@ -344,7 +344,7 @@ for (const kind of ["trellis", "affine"] as const) {
         try {
           const prefill = prompt(37, 1);
           both(`${tag} prefill37`, p, oldCaches, newCaches, forwardHidden([prefill]));
-          phased(`${tag} prefillChunk37`, [prefill], (input, caches) => p.current.prefillChunk(input, caches));
+          phased(`${tag} prefillChunk37`, [prefill], (input, caches) => p.current.prefillChunk.gpu(input, caches) as MlxArray);
           convert(scheme, oldCaches, newCaches, refCaches, phaseCaches);
           stateDiff(`${tag} converted`, newCaches, oldCaches);
           stateDiff(`${tag} converted (phase operation)`, phaseCaches, refCaches);
@@ -369,7 +369,7 @@ for (const kind of ["trellis", "affine"] as const) {
             const reference = mixedVerify(p.old, refCaches, rows);
             using input = ids(rows);
             const taps: MlxArray[] = [];
-            const hidden = p.current.verify.twoToFour(input, phaseCaches, (_layer, h) => { taps.push(ops.contiguous(h)); }) as MlxArray;
+            const hidden = p.current.verify.four(input, phaseCaches, (_layer, h) => { taps.push(ops.contiguous(h)); }) as MlxArray;
             tapsDiff(`${tag} verify4 (phase operation)`, taps, reference.taps);
             outputDiff(`${tag} verify4 (phase operation)`, p.current, hidden, reference.hidden);
             stateDiff(`${tag} verify4 (phase operation)`, phaseCaches, refCaches);

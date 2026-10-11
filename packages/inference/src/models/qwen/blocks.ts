@@ -13,7 +13,6 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { CompiledFunction } from "@mlx-bun/mlx/compile";
 import { TrellisLinear, fusedGateUpEligible, fusedGateUpSwiglu, TRELLIS_MATVEC_MAX_M } from "../../layers/trellis-linear";
-import { disposeTriple } from "../../state/quantized-tensor";
 import { disposing } from "../../layers/helpers";
 import { compiledSwiglu } from "../../layers/swiglu";
 import { QuantizedLinear } from "../../layers/quantized-linear";
@@ -248,34 +247,6 @@ export interface AttentionReadStrategy {
 export const cacheRead: AttentionReadStrategy = Object.freeze({
   read: (cache: Cache, phase: ReadPhase, k: MlxArray, v: MlxArray) => appendFor[phase](cache, k, v),
 });
-
-/** Attention over a quantized KV cache: q [B, H, L, D] against the packed
- *  keys/values → [B, H, L, D].
- *  @deprecated The M4 Pro graph's injected kernels; D1 composes them as the
- *  `Kv4Head256Cache` lego's reads. */
-export type QuantizedAttentionCore = (q: MlxArray, keys: ops.QuantizedTensor, values: ops.QuantizedTensor, scale: number,
-  groupSize: number, bits: number) => MlxArray;
-
-/** The M4 Pro graph's attention read today: over a cache that hands packed
- *  keys and values out (`quantizedAttention`, without an attention state), the
- *  deprecated `updateAndFetchQuantized` fetch and `core` for every phase; over
- *  any other cache, the cache's own read.
- *  @deprecated D1 replaces it with the `Kv4Head256Cache` lego, which owns these
- *  kernels as its reads. */
-export function quantizedCoreRead(core: QuantizedAttentionCore): AttentionReadStrategy {
-  return Object.freeze({
-    read(cache: Cache, phase: ReadPhase, k: MlxArray, v: MlxArray): AttentionRead {
-      const quantized = cache.attentionState ? undefined : cache.quantizedAttention;
-      if (!quantized) return appendFor[phase](cache, k, v);
-      const { groupSize, bits } = quantized;
-      const [keys, values] = quantized.updateAndFetchQuantized(k, v);
-      return {
-        attend: (q, scale) => core(q, keys, values, scale, groupSize, bits),
-        dispose() { disposeTriple(keys); disposeTriple(values); },
-      };
-    },
-  });
-}
 
 /** Full (softmax) attention with output gate + q/k norm + partial RoPE.
  *  `loadLinear` chooses the projection type (the MTP companion loads dense or
