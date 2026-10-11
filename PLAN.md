@@ -136,9 +136,13 @@ and `bun run test` pass.
 - [ ] Add `prefillChunk`, `prefillTail`, `decode` and `verify` to `contracts/mlx/graph.ts`, with
       the capture callback a parameter of `verify`. Vision prefill is prefill with embeddings and
       positions, which `forwardEmbeddingsAtPositions` already is.
-- [ ] `decode` and `verify` exist per width class (one row, 2 to 4, 5 to 8, wider), declared by
-      the graph as a table of operations the scheduler indexes by the rows it is loading. The
-      graph never derives the class from its input.
+- [ ] `decode` and `verify` exist per width class, declared by the graph as a table of
+      operations the scheduler indexes by the rows it is loading. The graph never derives the
+      class from its input. D1 set the classes to the row-count boundaries the shipped kernels
+      were measured at: one, two to three, four, five to eight, wider (the old M4 Pro graph had a
+      separate four-row plan with the matrix-unit down; lumping four with two and three cost
+      0.078 on real verify logits). `logits` is a width table too (the head is part of the
+      phase), and `prefillChunk` is per execution unit, `gpu` and, when composed, `ane`.
 - [ ] Keep `forwardHidden` and `forwardHiddenMixed` until E2 moves every caller, then delete.
 - [ ] `verifyRoundCosts` stays as declared data; the scheduler's adaptive gate reads it.
 
