@@ -4,7 +4,8 @@
 // bit for bit there, falling back to the monolith under plain caches. This
 // ports `02d723a:tests/parity/generated-parity.test.ts` (12B and e4b cells) to
 // every registered fingerprint:
-// - createModel selects the generated graph registered for the fingerprint;
+// - createModel selects the generated graph registered for the fingerprint, for
+//   the composition it serves (`--kv-quant config`: the artifact's kv_config);
 // - three uncompiled steps over caches converted to kv_config before the first
 //   forward, from a prompt past the sliding window: byte-identical full
 //   vocabulary vectors, with at least every decode step on the unrolled path;
@@ -52,7 +53,7 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
   const ffi = await import("@mlx-bun/mlx/ffi");
   const ops = await import("@mlx-bun/mlx/ops");
   const { loadModelConfig, Weights, configFingerprint } = await import("@mlx-bun/inference/artifacts");
-  const { createModel } = await import("@mlx-bun/inference/models");
+  const { createModel, resolveComposition } = await import("@mlx-bun/inference/models");
   const { Gemma4Model } = await import("@mlx-bun/inference/models/gemma4");
   const { CompiledDecode } = await import("@mlx-bun/inference/models/gemma4/compiled-decode");
   const { generate } = await import("@mlx-bun/inference/generation");
@@ -87,7 +88,7 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
   };
   try {
     mono = new Gemma4Model(weights, config);
-    gen = createModel(weights, config);
+    gen = createModel(weights, config, resolveComposition(config, { kv: { override: "config" } }));
     expect(gen).toBeInstanceOf(generated.GeneratedGemma4);
     expect(mono).not.toBeInstanceOf(generated.GeneratedGemma4);
 

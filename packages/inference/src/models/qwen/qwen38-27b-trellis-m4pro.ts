@@ -5,7 +5,7 @@
 // Composition qwen38-27b-trellis-m4pro:
 //   artifact     mlx-bun/Qwen3.8-27B-Trellis-3.2bpw@cbb7a58a7222a19a3d02d36540c9cab5d9aadf0d, graph fingerprint cfa205c8f5af046a
 //   device       applegpu_g16s (M4 Pro GPU)
-//   KV           affine 4-bit group 64 composes Kv4Head256Cache; any other scheme the bf16 cache
+//   KV           bf16, or affine 4-bit group 64 (composes Kv4Head256Cache)
 //   draft depth  adaptive up to 7
 //   prefill      2048-token chunks
 //   rows         up to 8 per forward
@@ -86,21 +86,23 @@ import { SSMCache } from "../../state/ssm";
 import { denseTurboQuantKernels } from "../../state/turboquant-attention";
 import { declareGraph } from "../capabilities";
 import { atEveryWidth, deprecatedPhase, type ReadPhase } from "../graph";
+import type { ServedComposition } from "../implementation";
 import {
   GatedDeltaNet, Qwen3Attention, Qwen3Layer, type AttentionLinear, type AttentionLinearLoader, type TrellisMlp,
 } from "./blocks";
 import { qwen35WeightsView } from "./checkpoint";
 import { bindQwenMediaInput, qwenDraftTarget, qwenMediaEncoders, qwenResidualBasis } from "./media-input";
-import { qwen38TrellisTqFingerprint } from "./qwen38-27b-trellis-tq";
 
 export const QWEN38_TRELLIS_M4PRO_GRAPH = "qwen3.8-27b-trellis-3.2bpw-m4pro";
 
-/** What this file was generated and gated for. */
-export const COMPOSITION = Object.freeze({
+/** The composition this file was generated and gated for, its entry in the loader's table: the artifact's graph
+ *  fingerprint on this GPU, the bf16 cache or the affine 4-bit group-64 lego, at most 8 rows per
+ *  forward. Draft depth, prefill chunk, adapters and the Neural Engine bridge constrain nothing: the constructor
+ *  builds them from the record it is handed. */
+export const COMPOSITION: ServedComposition = Object.freeze({
   fingerprint: "cfa205c8f5af046a", device: "applegpu_g16s",
-  kv: Object.freeze({ kind: "affine", bits: 4, groupSize: 64 }) as KvStorageScheme,
-  draftDepth: Object.freeze({ adaptive: true as const, max: 7 }),
-  prefillChunkTokens: 2048, maxRows: 8, aneBridge: true,
+  kv: Object.freeze([Object.freeze({ kind: "bf16" }), Object.freeze({ kind: "affine", bits: 4, groupSize: 64 })]),
+  maxRows: 8,
 });
 
 /** One decoder layer of the artifact: its block, the affine width of each projection (DeltaNet: in_proj_qkv, in_proj_z, in_proj_a, in_proj_b, out_proj;
@@ -191,12 +193,6 @@ const ASYNC_EVERY = 4;
 /** The Neural Engine's channel fraction in each split. */
 const ANE_FRACTION = 0.55;
 const BF16: KvStorageScheme = Object.freeze({ kind: "bf16" });
-
-/** This artifact on this GPU family. */
-export function qwen38TrellisM4ProAccepts(config: ModelConfig, composition: Composition): boolean {
-  if (config.modelType !== "qwen3_5" && config.modelType !== "qwen3_5_text") return false;
-  return composition.device === COMPOSITION.device && qwen38TrellisTqFingerprint(config) === COMPOSITION.fingerprint;
-}
 
 /** One layer: input norm, mixer, residual, post-attention norm, MLP, residual. Consumes nothing; returns an owned output. */
 type Step = (x: MlxArray, cache: Cache, phase: ReadPhase, mrope: MropeForwardState | null) => MlxArray;

@@ -57,13 +57,13 @@ describe("family implementations", () => {
     expect(MODEL_FAMILIES.filter(family => family.loader !== "safetensors").map(family => family.graph)).toEqual(["glm5.2"]);
   });
 
-  test("a generated Gemma specialization resolves to the implementation registered for it (skips when the snapshot is not downloaded)", async () => {
+  test("a generated Gemma specialization's profile resolves to the family's implementation, whose graph table picks the graph (skips when the snapshot is not downloaded)", async () => {
     const snapshots = join(homedir(), ".cache/huggingface/hub/models--mlx-community--gemma-4-e4b-it-OptiQ-4bit/snapshots");
     const revision = existsSync(snapshots) ? readdirSync(snapshots).find(entry => existsSync(join(snapshots, entry, "config.json"))) : undefined;
     if (!revision) return;
     const config = await loadModelConfig(join(snapshots, revision));
     const profile = resolveModelProfile(config);
     expect(profile.profile.execution.specialization).toBe("generated");
-    expect(MLX_MODEL_IMPLEMENTATIONS.select(config, profile).id).toBe("gemma4-generated");
+    expect(MLX_MODEL_IMPLEMENTATIONS.select(config, profile).id).toBe("gemma4");
   });
 });

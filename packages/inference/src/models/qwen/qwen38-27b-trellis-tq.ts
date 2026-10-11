@@ -1,9 +1,9 @@
 // Qwen3.8-27B packed-Trellis (TurboQuant) — THE graph for this exact quant.
 //
-// One hand-written forward for one model and one quantization map. It is
-// selected at load only when the artifact's graph fingerprint (architecture plus
-// the COMPLETE per-tensor quantization table) is one this file was built for;
-// every other Qwen3.5-family artifact keeps the generic Qwen35Model.
+// One hand-written forward for one model and one quantization map. The loader's
+// table selects it for the composition below: the artifact's graph fingerprint
+// (architecture plus the COMPLETE per-tensor quantization table) on the GPU it was
+// built for; every other composition gets the generic Qwen35Model.
 //
 // What is compile-time here: the 48 DeltaNet + 16 attention layer pattern, the
 // shapes, and the codec and bit width of every tensor. What is NOT: batch rows,
@@ -37,6 +37,7 @@ import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target
 import { compiledSwiglu } from "../../layers/swiglu";
 import { Qwen35Model } from "./qwen3_5";
 import type { ReadPhase } from "../graph";
+import type { ServedComposition } from "../implementation";
 import type { Qwen3Layer } from "./blocks";
 import { qwenDraftTarget, qwenResidualBasis } from "./media-input";
 import {
@@ -46,10 +47,13 @@ import {
 
 export const QWEN38_TRELLIS_TQ_GRAPH = "qwen3.8-27b-trellis-tq";
 
-/** Graph fingerprints this file was built and qualified for. */
-export const QWEN38_TRELLIS_TQ_FINGERPRINTS: ReadonlySet<string> = new Set([
-  "cfa205c8f5af046a", // qwen38-trellis-global-exit5-h39-q4b-v2 (11.99 GB incumbent)
-]);
+/** The composition this file was built and qualified for, its entry in the loader's
+ *  table: this artifact (qwen38-trellis-global-exit5-h39-q4b-v2, the 11.99 GB
+ *  incumbent) on the M1 Max GPU family, with whatever KV scheme the composition
+ *  carries. The A/B control is a different composition, not a flag: a bench
+ *  constructs the generic graph explicitly, through the registry's generic entry
+ *  (`MLX_GRAPH_TABLES` in `models/factory.ts`, its `generic`). */
+export const COMPOSITION: ServedComposition = Object.freeze({ fingerprint: "cfa205c8f5af046a", device: "applegpu_g13s" });
 
 /** Architecture plus the complete language-model quantization table. Two
  *  artifacts share a fingerprint only if every tensor has the same codec. */
@@ -73,14 +77,6 @@ export function qwen38TrellisTqFingerprint(config: ModelConfig): string {
   const hash = new Bun.CryptoHasher("sha256");
   hash.update(payload);
   return hash.digest("hex").slice(0, 16);
-}
-
-/** Is this exactly a quant this graph was built for? `MLX_BUN_QWEN38_TQ_GRAPH=0`
- *  keeps the generic model (the A/B control). */
-export function qwen38TrellisTqAccepts(config: ModelConfig): boolean {
-  if (!runtimeFlag("MLX_BUN_QWEN38_TQ_GRAPH", true)) return false;
-  if (config.modelType !== "qwen3_5" && config.modelType !== "qwen3_5_text") return false;
-  return QWEN38_TRELLIS_TQ_FINGERPRINTS.has(qwen38TrellisTqFingerprint(config));
 }
 
 /** `MLX_BUN_QWEN38_TQ_MIXED_GATEUP`: unset or `split` = on with the split-exact tail,

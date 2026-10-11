@@ -1,16 +1,21 @@
-// Model construction consumes one declared profile. Exact artifact profiles
-// outrank family profiles; dedicated/generated graphs outrank the universal
-// fallback. Request-level methods are resolved elsewhere and are never changed
-// by this module.
+// Model construction consumes one declared profile and one composition. Exact
+// artifact profiles outrank family profiles; the profile names the family's
+// implementation, and the family's graph table picks the graph for the
+// composition. Request-level methods are resolved elsewhere and are never
+// changed by this module.
 
 import { loadModelConfig, type ModelConfig } from "../artifacts/config";
 import { totalmem } from "node:os";
 import { Weights } from "../artifacts/weights";
 import { Gemma4Model } from "./gemma4/model";
 import { configFingerprint } from "../artifacts/fingerprint";
-import { Qwen38TrellisTQ, qwen38TrellisTqAccepts } from "./qwen/qwen38-27b-trellis-tq";
-import { Qwen38TrellisM4Pro, qwen38TrellisM4ProAccepts } from "./qwen/qwen38-27b-trellis-m4pro";
-import { GENERATED } from "./gemma4/generated/index";
+import {
+  COMPOSITION as QWEN38_TRELLIS_TQ_COMPOSITION, QWEN38_TRELLIS_TQ_GRAPH, Qwen38TrellisTQ, qwen38TrellisTqFingerprint,
+} from "./qwen/qwen38-27b-trellis-tq";
+import {
+  COMPOSITION as QWEN38_TRELLIS_M4PRO_COMPOSITION, QWEN38_TRELLIS_M4PRO_GRAPH, Qwen38TrellisM4Pro,
+} from "./qwen/qwen38-27b-trellis-m4pro";
+import { GENERATED_GRAPHS } from "./gemma4/generated/index";
 import { MiniCPM5Model } from "./minicpm5/model";
 import { Qwen35Model } from "./qwen/qwen3_5";
 import { Qwen3Model } from "./qwen/qwen3";
@@ -31,7 +36,9 @@ import { familyForGraph } from "./families";
 import { resolveComposition } from "./composition";
 import type { Composition } from "../contracts/portable/composition";
 import {
+  GraphTable,
   ModelImplementationRegistry,
+  type GraphEntry,
   type ModelImplementation,
   type ModelImplementationProvider,
 } from "./implementation";
@@ -47,40 +54,49 @@ export type RuntimeModel =
   | Gemma4Model | MiniCPM5Model | Qwen35Model | Qwen38TrellisM4Pro | Qwen3Model | Qwen3MoeModel
   | DiffusionGemmaModel | Glm52Model | UniversalDenseModel;
 
-/** A resident graph's native construction. Its loader and loop are the family's own declaration. */
-function residentImplementation(
-  id: string,
-  graph: ModelGraph,
-  create: ModelImplementation<Weights, RuntimeModel>["create"],
-): ModelImplementation<Weights, RuntimeModel> {
+/** A family's generic graph: the table entry that constrains nothing. */
+function generic(id: string, create: GraphEntry<Weights, RuntimeModel>["create"]): GraphEntry<Weights, RuntimeModel> {
+  return { id, serves: {}, create };
+}
+
+/** Every resident family's graphs, keyed by the graph its family declares. Each
+ * table lists the compositions its specialized graphs were built and qualified
+ * for, plus the family's generic graph; see {@link GraphTable} for how one is
+ * selected. Adding a graph means adding an entry here (or to the list a table
+ * spreads in). */
+export const MLX_GRAPH_TABLES: Readonly<Record<ModelGraph, GraphTable<Weights, RuntimeModel>>> = Object.freeze({
+  "diffusion-gemma": new GraphTable([generic("diffusion-gemma", (weights, config) => new DiffusionGemmaModel(weights, config))]),
+  "minicpm5": new GraphTable([generic("minicpm5", (weights, config) => new MiniCPM5Model(weights, config))]),
+  // Our published Trellis quant has its purpose-built graphs, keyed by its graph fingerprint
+  // (architecture plus the complete quantization table).
+  "qwen3.5": new GraphTable([
+    { id: QWEN38_TRELLIS_M4PRO_GRAPH, serves: QWEN38_TRELLIS_M4PRO_COMPOSITION,
+      create: (weights, config, composition) => new Qwen38TrellisM4Pro(weights, config, composition) },
+    { id: QWEN38_TRELLIS_TQ_GRAPH, serves: QWEN38_TRELLIS_TQ_COMPOSITION, create: (weights, config) => new Qwen38TrellisTQ(weights, config) },
+    generic("qwen3.5", (weights, config) => new Qwen35Model(weights, config)),
+  ], qwen38TrellisTqFingerprint),
+  "qwen3-moe": new GraphTable([generic("qwen3-moe", (weights, config) => new Qwen3MoeModel(weights, config))]),
+  "qwen3": new GraphTable([generic("qwen3", (weights, config) => new Qwen3Model(weights, config))]),
+  "gemma4": new GraphTable([...GENERATED_GRAPHS, generic("gemma4", (weights, config) => new Gemma4Model(weights, config))],
+    configFingerprint),
+  "universal-dense": new GraphTable([generic("universal-dense", (weights, config) =>
+    new UniversalDenseModel(weights, config, genericArgsFor(config)!))]),
+});
+
+/** A resident family's native construction: its graph table selects the graph for
+ * the composition it receives. Its loader and loop are the family's own declaration. */
+function residentImplementation(graph: ModelGraph, table: GraphTable<Weights, RuntimeModel>): ModelImplementation<Weights, RuntimeModel> {
   const family = familyForGraph(graph);
-  if (!family) throw new Error(`implementation ${id} names graph ${graph}, which no model family declares`);
-  return { id, graph, loader: family.loader, loop: family.loop, create };
+  if (!family) throw new Error(`graph table ${graph} names a graph no model family declares`);
+  return { id: graph, graph, loader: family.loader, loop: family.loop,
+    create: (weights, config, _profile, composition) => table.select(config, composition).create(weights, config, composition) };
 }
 
 /** Engine-owned registrations, one per resident graph of `MODEL_FAMILIES`. Exact
  * quant profiles can name additional implementations in a composed registry,
  * without changing sessions or files. */
-export const MLX_MODEL_IMPLEMENTATIONS = new ModelImplementationRegistry<Weights, RuntimeModel>([
-  residentImplementation("diffusion-gemma", "diffusion-gemma", (weights, config) => new DiffusionGemmaModel(weights, config)),
-  residentImplementation("minicpm5", "minicpm5", (weights, config) => new MiniCPM5Model(weights, config)),
-  // Our published Trellis quant loads its own purpose-built graph — the M4 Pro
-  // graph on that GPU family, the TQ graph elsewhere; every other
-  // Qwen3.5-family artifact keeps the generic model.
-  residentImplementation("qwen3.5", "qwen3.5", (weights, config, _profile, composition) =>
-    qwen38TrellisM4ProAccepts(config, composition) ? new Qwen38TrellisM4Pro(weights, config, composition)
-      : qwen38TrellisTqAccepts(config) ? new Qwen38TrellisTQ(weights, config) : new Qwen35Model(weights, config)),
-  residentImplementation("qwen3-moe", "qwen3-moe", (weights, config) => new Qwen3MoeModel(weights, config)),
-  residentImplementation("qwen3", "qwen3", (weights, config) => new Qwen3Model(weights, config)),
-  residentImplementation("gemma4", "gemma4", (weights, config) => new Gemma4Model(weights, config)),
-  residentImplementation("gemma4-generated", "gemma4", (weights, config) => {
-    const Graph = GENERATED.get(configFingerprint(config));
-    if (!Graph) throw new Error("no generated Gemma graph for this config; refusing to fall back");
-    return new Graph(weights, config);
-  }),
-  residentImplementation("universal-dense", "universal-dense", (weights, config) =>
-    new UniversalDenseModel(weights, config, genericArgsFor(config)!)),
-]);
+export const MLX_MODEL_IMPLEMENTATIONS = new ModelImplementationRegistry<Weights, RuntimeModel>(
+  Object.entries(MLX_GRAPH_TABLES).map(([graph, table]) => residentImplementation(graph, table)));
 
 export interface ModelOpenOptions<Model = RuntimeModel> extends Glm52RuntimeOpenOptions {
   readonly profiles?: ResolveModelProfileOptions;
