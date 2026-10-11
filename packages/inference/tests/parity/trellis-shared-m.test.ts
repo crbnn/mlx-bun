@@ -10,6 +10,7 @@ import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import type { MlxArray } from "@mlx-bun/mlx/array";
+import type { ReadPhase } from "../../src/models/qwen/blocks";
 
 const artifact = process.env.MLX_BUN_TEST_TRELLIS_MODEL;
 if (artifact && !existsSync(`${artifact}/config.json`)) throw new Error(`unavailable packed artifact: ${artifact}`);
@@ -60,13 +61,14 @@ test.skipIf(!artifact)("shared-M kernels preserve full Qwen logits, recurrent st
   const variantMlp = (mlp: { gate: unknown; up: unknown; down: unknown }, variant: number) => {
     const gate = mlp.gate as Trellis, up = mlp.up as Trellis, down = mlp.down as Trellis;
     return {
-      forward(x: MlxArray, inputRowContiguous = false): MlxArray {
+      // Every phase computes the same rows; the layer hands the MLP its row-contiguous RMSNorm output.
+      forward(x: MlxArray, _phase: ReadPhase): MlxArray {
         if (fusedGateUpEligible(gate, up) && x.shape.slice(0, -1).reduce((a, b) => a * b, 1) <= kernels.TRELLIS_MATVEC_MAX_M) {
           using hidden = kernels.fusedGateUpSwiglu(x, gate, up, variant, gate.representations.gateUpCodebook);
           return project(down, hidden, variant, false);
         }
-        using g = project(gate, x, variant, inputRowContiguous);
-        using u = project(up, x, variant, inputRowContiguous);
+        using g = project(gate, x, variant, true);
+        using u = project(up, x, variant, true);
         using hidden = compiledSwiglu(g, u);
         return project(down, hidden, variant, false);
       },
