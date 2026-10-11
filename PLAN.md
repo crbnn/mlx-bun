@@ -584,7 +584,7 @@ Exit: acceptance rate on the paired MTP bench unchanged; no env read in `dflash2
       band. Unqualified numbers never gate; the check reports the paired delta and its interval.
 - [ ] Agent briefs for this plan point at the generator and the contract, never at an example
       file to copy; copying the nearest example is how the M4 Pro graph inherited the fallback.
-- [ ] ARCHITECTURE.md: the cache owns the read; phases are named; a specialized graph extends
+- [x] ARCHITECTURE.md: the cache owns the read; phases are named; a specialized graph extends
       nothing; the exemplar sentence points at the regenerated graphs; the loader-level generic
       fallback is stated and the in-graph one forbidden; the one-way-per-pattern list above.
 - [ ] PLAN.md: first decision updated per the off-composition decision; this file's closed phases
