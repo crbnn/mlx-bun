@@ -25,9 +25,9 @@ import { loadModelConfig, quantFor } from "../src/artifacts/config";
  * layer and kernel tables written into the file; `kv` names the scheme whose
  * cache lego `makeCache` composes; `aneBridge` writes the Neural Engine chunk
  * operation. `draftDepth`, `prefillChunkTokens` and `maxRows` record what the
- * file was generated and gated for (its exported `COMPOSITION`, which the
- * loader's selection table keys on); the constructor builds from the record it
- * is handed. */
+ * file was generated and gated for. Its exported `COMPOSITION`, the loader's
+ * table entry, constrains the fingerprint, the device, the KV schemes (bf16 and
+ * `kv`) and the row bound; the constructor builds from the record it is handed. */
 export interface Qwen38Composition {
   /** Output file stem under src/models/qwen. */
   readonly stem: string;
@@ -251,7 +251,7 @@ export function emitQwen38Graph(description: Qwen38Description, stem: string): s
 // Composition ${stem}:
 //   artifact     ${description.source}, graph fingerprint ${c.fingerprint}
 //   device       ${c.device} (${k.label})
-//   KV           affine ${c.kv.bits}-bit group ${c.kv.groupSize} composes ${k.kvLego}; any other scheme the bf16 cache
+//   KV           bf16, or affine ${c.kv.bits}-bit group ${c.kv.groupSize} (composes ${k.kvLego})
 //   draft depth  ${depthText(c.draftDepth)}
 //   prefill      ${c.prefillChunkTokens}-token chunks
 //   rows         up to ${c.maxRows} per forward
@@ -329,21 +329,23 @@ import { SSMCache } from "../../state/ssm";
 import { denseTurboQuantKernels } from "../../state/turboquant-attention";
 import { declareGraph } from "../capabilities";
 import { atEveryWidth, deprecatedPhase, type ReadPhase } from "../graph";
+import type { ServedComposition } from "../implementation";
 import {
   GatedDeltaNet, Qwen3Attention, Qwen3Layer, type AttentionLinear, type AttentionLinearLoader, type TrellisMlp,
 } from "./blocks";
 import { qwen35WeightsView } from "./checkpoint";
 import { bindQwenMediaInput, qwenDraftTarget, qwenMediaEncoders, qwenResidualBasis } from "./media-input";
-import { qwen38TrellisTqFingerprint } from "./qwen38-27b-trellis-tq";
 
 export const ${constName(c)} = ${JSON.stringify(c.graph)};
 
-/** What this file was generated and gated for. */
-export const COMPOSITION = Object.freeze({
+/** The composition this file was generated and gated for, its entry in the loader's table: the artifact's graph
+ *  fingerprint on this GPU, the bf16 cache or the affine ${c.kv.bits}-bit group-${c.kv.groupSize} lego, at most ${c.maxRows} rows per
+ *  forward. Draft depth, prefill chunk, adapters and the Neural Engine bridge constrain nothing: the constructor
+ *  builds them from the record it is handed. */
+export const COMPOSITION: ServedComposition = Object.freeze({
   fingerprint: ${JSON.stringify(c.fingerprint)}, device: ${JSON.stringify(c.device)},
-  kv: Object.freeze({ kind: "affine", bits: ${c.kv.bits}, groupSize: ${c.kv.groupSize} }) as KvStorageScheme,
-  draftDepth: ${typeof c.draftDepth === "number" ? c.draftDepth : `Object.freeze({ adaptive: true as const, max: ${c.draftDepth.max} })`},
-  prefillChunkTokens: ${c.prefillChunkTokens}, maxRows: ${c.maxRows}, aneBridge: ${c.aneBridge},
+  kv: Object.freeze([Object.freeze({ kind: "bf16" }), Object.freeze({ kind: "affine", bits: ${c.kv.bits}, groupSize: ${c.kv.groupSize} })]),
+  maxRows: ${c.maxRows},
 });
 
 /** One decoder layer of the artifact: its block, the affine width of each projection (DeltaNet: ${DELTANET_PROJECTIONS.join(", ")};
@@ -371,12 +373,6 @@ const ASYNC_EVERY = ${k.asyncEvery};
 /** The Neural Engine's channel fraction in each split. */
 const ANE_FRACTION = ${k.ane.fraction};
 const BF16: KvStorageScheme = Object.freeze({ kind: "bf16" });
-
-/** This artifact on this GPU family. */
-export function ${acceptsName(c)}(config: ModelConfig, composition: Composition): boolean {
-  if (config.modelType !== "qwen3_5" && config.modelType !== "qwen3_5_text") return false;
-  return composition.device === COMPOSITION.device && qwen38TrellisTqFingerprint(config) === COMPOSITION.fingerprint;
-}
 
 /** One layer: input norm, mixer, residual, post-attention norm, MLP, residual. Consumes nothing; returns an owned output. */
 type Step = (x: MlxArray, cache: Cache, phase: ReadPhase, mrope: MropeForwardState | null) => MlxArray;
@@ -796,9 +792,6 @@ const projectionMember = {
 }
 
 function constName(c: Qwen38Composition): string { return c.graphConstant; }
-function acceptsName(c: Qwen38Composition): string {
-  return `${c.className[0]!.toLowerCase()}${c.className.slice(1)}Accepts`;
-}
 
 if (import.meta.main) {
   const { values, positionals } = parseArgs({

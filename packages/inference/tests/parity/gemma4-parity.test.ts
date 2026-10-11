@@ -8,10 +8,10 @@
 //     vectors bit for bit.
 // At every step the whole vector must be finite and its argmax must be the
 // reference token, which is then fed. This is a 100-token trajectory plus four
-// vectors and a separate 12-step control, not 100-step full-vector parity. For
-// this artifact createModel selects the generated 12B graph, whose unrolled path
-// serves only the quantized kv_config cache layout; under plain KV it takes its
-// monolith fallback, and both entry points assert the unrolled path never ran.
+// vectors and a separate 12-step control, not 100-step full-vector parity. The
+// generated 12B graph serves only the kv_config composition, so for plain KV (the
+// default composition) the loader's table selects the generic graph for this
+// artifact, and both entry points assert the unrolled path never ran.
 // The model and reference stay outside this repository; Python never runs.
 // Opt in with all three of
 //   MLX_BUN_TEST_GEMMA4_MODEL=/model/snapshot
@@ -199,8 +199,7 @@ async function runEntry(entry: "createModel" | "Gemma4Model", steps: number) {
   const unrolledBefore = generated.generatedForwardUses;
   try {
     model = entry === "createModel" ? createModel(weights, config) as InstanceType<typeof Gemma4Model> : new Gemma4Model(weights, config);
-    if (entry === "createModel") expect(model).toBeInstanceOf(generated.GeneratedGemma4);
-    else expect(model).not.toBeInstanceOf(generated.GeneratedGemma4);
+    expect(model.constructor).toBe(Gemma4Model);
     const layers = model.makeCache();
     caches = layers;
     checkPlainCaches(layers, config.text.layerTypes, { KVCache, RotatingKVCache });

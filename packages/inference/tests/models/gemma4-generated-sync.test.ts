@@ -11,7 +11,7 @@ import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync }
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GEMMA4_GRAPHS, GENERATED_DIR, type Gemma4GraphStem } from "../../scripts/gen-gemma4";
-import { GENERATED } from "../../src/models/gemma4/generated";
+import { GENERATED_GRAPHS } from "../../src/models/gemma4/generated";
 
 const FIXTURES = join(import.meta.dir, "../fixtures/gemma4-graphs");
 const SCRIPT = join(import.meta.dir, "../../scripts/gen-gemma4.ts");
@@ -46,14 +46,20 @@ test("every registered generated graph equals what the generator emits from its 
   } finally { rmSync(out, { recursive: true, force: true }); }
 });
 
-test("the registry serves exactly the generated files, each keyed by the fingerprint it declares", async () => {
+test("the table's generated entries are exactly the generated files, each serving the fingerprint and kv_config it was generated from", async () => {
   expect(readdirSync(GENERATED_DIR).filter(file => file !== "index.ts").sort()).toEqual(stems.map(stem => `${stem}.ts`).sort());
   const { GENERATED_GEMMA_FINGERPRINTS } = await import("../../src/models/profile");
-  expect([...GENERATED.keys()].sort()).toEqual(Object.values(GENERATED_GEMMA_FINGERPRINTS).sort());
+  expect(GENERATED_GRAPHS.map(entry => entry.id).sort()).toEqual([...stems].sort());
+  expect(GENERATED_GRAPHS.map(entry => entry.serves.fingerprint).sort()).toEqual(Object.values(GENERATED_GEMMA_FINGERPRINTS).sort());
   for (const stem of stems) {
     const module = await import(`../../src/models/gemma4/generated/${stem}`);
     expect(module.FINGERPRINT).toBe(GENERATED_GEMMA_FINGERPRINTS[GEMMA4_GRAPHS[stem]]);
-    expect(GENERATED.get(module.FINGERPRINT)).toBe(module.GeneratedGemma4);
+    const entry = GENERATED_GRAPHS.find(item => item.id === stem)!;
+    expect(entry.serves.fingerprint).toBe(module.FINGERPRINT);
+    // The KV it serves is its input kv_config, as `--kv-quant config` composes it, and nothing else.
+    const kv = JSON.parse(readFileSync(join(snapshot(stem), "kv_config.json"), "utf8")) as { layer_idx: number; bits: number; group_size: number }[];
+    expect(entry.serves).toEqual({ fingerprint: module.FINGERPRINT,
+      kv: [{ kind: "affine-layers", layers: kv.map(item => ({ layer: item.layer_idx, bits: item.bits, groupSize: item.group_size })) }] });
     // Capabilities are declared once, by Gemma4Model; a specialization only overrides its forward pass.
     expect(Object.getOwnPropertyNames(module.GeneratedGemma4.prototype).sort()).toEqual(["constructor", "forwardLayers"]);
   }
