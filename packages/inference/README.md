@@ -124,10 +124,10 @@ reference is main's `scripts/regen/parity.ts` output: the prompt
 float32 vectors. Through `createModel` it checks the 100-token greedy trajectory
 and those four vectors byte for byte; a separate 12-step control does the same
 through `new Gemma4Model`. Every step must be finite and select the reference
-token. This is not 100-step full-vector parity. For this artifact `createModel`
-selects the generated 12B graph, whose unrolled path serves only the quantized
-`kv_config` cache layout; under plain KV it runs its monolith fallback, and the
-test asserts the unrolled path never ran. Opt in with all of
+token. This is not 100-step full-vector parity. The loader's Gemma 4 table
+builds the generated 12B graph only for the `kv_config` composition it serves, so
+for plain KV (the default composition) `createModel` builds `Gemma4Model` too,
+and the test asserts that. Opt in with all of
 `MLX_BUN_TEST_GEMMA4_MODEL`, `MLX_BUN_TEST_GEMMA4_REFERENCE` (the directory
 holding `gemma4-parity.json`, the producer's unchanged `parity.json` and the four
 step blobs) and `MLX_BUN_TEST_GEMMA4_REFERENCE_SHA256`. Before native libraries
@@ -148,11 +148,14 @@ The [generated-graph test](tests/parity/gemma4-generated.test.ts) is that
 unrolled-path check, ported from `02d723a:tests/parity/generated-parity.test.ts`
 for each registered fingerprint (12B, e4b, 26B-A4B). With
 `MLX_BUN_TEST_GENERATED_MODEL` naming an artifact that ships `kv_config.json`, it
-requires `createModel` to select the generated graph, byte-identical vectors
-against `new Gemma4Model` over caches converted to `kv_config` before a prompt past
-the sliding window, identical 24-token greedy trajectories (stop tokens off, so
-every trajectory is full length) uncompiled and with compiled decode (counting
-generated forwards), and the monolith fallback under plain caches. This is
+requires the `kv_config` composition (`--kv-quant config`) to build the generated
+graph and the default composition `Gemma4Model`; byte-identical vectors against
+`Gemma4Model` over caches converted to `kv_config` before a prompt past the
+sliding window; identical 24-token greedy trajectories under the `kv_config`
+composition, each graph reading its own composed caches (stop tokens off, so
+every trajectory is full length), uncompiled, where from the second forward on
+every listed cache answers from its quantized storage, and with compiled decode;
+and identical vectors over plain caches. This is
 specialization identity within this tree, not an oracle claim. On 2026-09-28 it
 passed on the M1 Max for mlx-community gemma-4-e4b-it-OptiQ-4bit (`98d7dc6a`; 24
 generated forwards uncompiled, 2 compiled) and gemma-4-12B-it-OptiQ-4bit
