@@ -9,9 +9,9 @@
 // At every step the whole vector must be finite and its argmax must be the
 // reference token, which is then fed. This is a 100-token trajectory plus four
 // vectors and a separate 12-step control, not 100-step full-vector parity. For
-// this artifact createModel selects the generated 12B graph, whose unrolled path
-// serves only the quantized kv_config cache layout; under plain KV it takes its
-// monolith fallback, and both entry points assert the unrolled path never ran.
+// this artifact createModel selects the generated 12B graph, built for the
+// quantized kv_config composition; under plain KV it reads the bf16 caches
+// through their own reads, so both entry points meet the same reference.
 // The model and reference stay outside this repository; Python never runs.
 // Opt in with all three of
 //   MLX_BUN_TEST_GEMMA4_MODEL=/model/snapshot
@@ -196,7 +196,6 @@ async function runEntry(entry: "createModel" | "Gemma4Model", steps: number) {
   let model: InstanceType<typeof Gemma4Model> | null = null, caches: Array<{ dispose(): void }> = [];
   const greedy: number[] = [];
   let vectorsCompared = 0;
-  const unrolledBefore = generated.generatedForwardUses;
   try {
     model = entry === "createModel" ? createModel(weights, config) as InstanceType<typeof Gemma4Model> : new Gemma4Model(weights, config);
     if (entry === "createModel") expect(model).toBeInstanceOf(generated.GeneratedGemma4);
@@ -219,13 +218,11 @@ async function runEntry(entry: "createModel" | "Gemma4Model", steps: number) {
       tokens = [next];
     }
   } finally { releaseEntry(caches, model, weights); }
-  // Plain KV never matches the unrolled graph's cache layout.
-  expect(generated.generatedForwardUses).toBe(unrolledBefore);
   expect(greedy).toHaveLength(steps);
   expect(vectorsCompared).toBe(VECTORS);
   console.log(JSON.stringify({ status: "pass", entry, steps: greedy.length, vectorsCompared, valuesCompared: VECTORS * VOCAB,
     scope: entry === "createModel" ? "100-token greedy trajectory + 4 full vectors" : "12-step dedicated-graph control + 4 full vectors",
-    unrolledForwards: 0, promptTokens: manifest.prompt_ids.length, batch: 1, kv: "plain", greedyIds: greedy,
+    promptTokens: manifest.prompt_ids.length, batch: 1, kv: "plain", greedyIds: greedy,
     manifestSha256: inputs!.manifestSha256, mlx: ffi.MLX_VERSION, architecture: ffi.deviceArchitecture(), bun: Bun.version }));
 }
 
