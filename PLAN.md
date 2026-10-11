@@ -89,9 +89,8 @@ Closed by Josh, 2026-10-10:
   M` extends the bf16 span to M tokens), which preserves today's numbers and mlx-lm parity with
   no check outside the cache. A cache quantized from token zero is a different composition with
   different first-chunk numbers (up to 0.125 at 4 bits on a test tensor), no mlx-lm oracle, and
-  a cheaper first chunk; it exists as its own lego, opt-in, gated by KL. Provisional until Josh
-  confirms which the default `--kv-quant N` should compose; the parity-preserving one is
-  recorded here as the default.
+  a cheaper first chunk; it exists as its own lego, opt-in, gated by KL. Confirmed by Josh
+  2026-10-11: the parity-preserving lego is the default `--kv-quant N` composes.
 - **KV scheme is a serve flag.** `--kv-quant` composes the cache lego at load. The per-request
   `kvBits`, `kvConfig` and `quantizedKvStart` options are removed; mlx-lm's server takes these as
   server flags too.
@@ -99,14 +98,14 @@ Closed by Josh, 2026-10-10:
   and the file is deleted when the M1 Max composition is generated.
 - **`--batch-size`** is the cap on rows per forward the scheduler may batch. Nothing else.
 
-Open:
+- **Bit-stability across batch width** (closed by Josh, 2026-10-11): keep the measured-best
+  kernels per width class (factored for 1 to 4 rows, matrix-unit for 5 to 8), so a request's last
+  bits can depend on how many rows were batched with it; this is what the old graph served and it
+  is documented and KL-gated. Invariance is a composition, not a flag: `--batch-size 1` builds the
+  one-row class only, so a request never shares a forward and its bits never depend on another
+  request. The batched paged read follows the same rule (joined rows, as served today).
 
-- [ ] **Bit-stability across batch width.** The factored row kernels (1 row, 2 to 4) and the
-      matrix-unit kernels (5 to 8) reassociate differently, so a request's last bits can depend on
-      how many rows were batched with it. Either require every width class of a phase to be
-      bit-identical per row (one kernel family across widths), or accept bf16-level variation by
-      batch width, documented and gated by KL. "One request or four, it works" is true either way;
-      "identical to the bit either way" needs the first.
+After the merge to main, the next program is performance optimization on this structure.
 
 ### Phase A: contracts (no behavior change)
 
