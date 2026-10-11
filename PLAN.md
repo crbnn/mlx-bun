@@ -213,8 +213,10 @@ without a gate change.
 - [ ] The three reads A1 found that the two phases do not cover, each already its own named
       interface, implemented only by the caches composed for them: `appendCommitted` (fill
       spans, today's independent-rows path through `quantizedAppendAttention`),
-      `appendBidirectional` (Gemma 4 vision prefill, DiffusionGemma's encoder), `readBlock`
-      (DiffusionGemma's canvas pass, DFlash 2 block attention over the context).
+      `appendBidirectional` (Gemma 4 vision prefill), `readBlock` (DiffusionGemma's canvas pass,
+      DFlash 2 block attention over the context), and `appendEncoderWindow` (DiffusionGemma's
+      vision encoder, whose first-window mask ignores the sliding window; D3 found
+      `appendBidirectional` differs by 0.68 past the window and gave the encoder its own read).
 - [ ] `state/ssm.ts` implements `recurDecode` and `recurWindow`, and the training cache sits
       behind the same calls, which removes the `instanceof TrainingSSMCache` branch in the block.
 - [ ] Delete the device check (`applegpu_g16s` head-shape case) in `quantized-attention.ts`
