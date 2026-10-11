@@ -37,7 +37,8 @@ import { Checkpoint } from "@mlx-bun/mlx/checkpoint";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import type {
-  MlxCompiledDecodeStep, MlxDeclaredGraph, MlxLayerCapture, MlxPhaseForward, MlxTokenPhases, MlxVerifyForward,
+  MlxCompiledDecodeStep, MlxDeclaredGraph, MlxHeadForward, MlxLayerCapture, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases,
+  MlxVerifyForward,
 } from "../../contracts/mlx/graph";
 import { CompiledDecode } from "./compiled-decode";
 import type { TargetView } from "../../contracts/mlx/draft-target";
@@ -902,10 +903,10 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
   /** One whole chunk of a prompt: tokens per sequence equal the composition's
    * prefill chunk size; rows are sequences times that size. Token ids only: a
    * prompt with prepared media enters through the `MlxPromptInput` that
-   * `bindMediaInput` returns. */
-  prefillChunk(ids: MlxArray, cache: Cache[]): MlxArray {
-    return this.forwardDecoder(this.embedTokens(ids), cache, "window", ids);
-  }
+   * `bindMediaInput` returns. The GPU is this graph's one unit. */
+  readonly prefillChunk: MlxPrefillChunk = {
+    gpu: (ids, cache) => this.forwardDecoder(this.embedTokens(ids), cache, "window", ids),
+  };
 
   /** The positions left at the end of a prompt after its whole chunks, fewer
    * than the chunk size per sequence; rows are sequences times those tokens.
@@ -914,6 +915,9 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
   prefillTail(ids: MlxArray, cache: Cache[]): MlxArray {
     return this.forwardDecoder(this.embedTokens(ids), cache, "window", ids);
   }
+
+  /** The one output head at every width. */
+  readonly logits = atEveryWidth<MlxHeadForward>(hidden => this.logitsFromHidden(hidden));
 
   /** One new token per sequence: `ids` [sequences, 1], so rows are sequences. */
   readonly decode = atEveryWidth<MlxPhaseForward>((ids, cache) =>

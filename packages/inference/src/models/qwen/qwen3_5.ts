@@ -33,7 +33,8 @@ import { type Cache } from "../../contracts/mlx/cache";
 import { qwen35WeightsView } from "./checkpoint";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import type {
-  MlxDeclaredGraph, MlxLayerCapture, MlxPhaseForward, MlxTokenPhases, MlxVerifyForward, MlxWidthTable,
+  MlxDeclaredGraph, MlxHeadForward, MlxLayerCapture, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward,
+  MlxWidthTable,
 } from "../../contracts/mlx/graph";
 import type { TargetView } from "../../contracts/mlx/draft-target";
 import type { MediaEncoders, MlxPromptInput, Vision } from "../../contracts/mlx/media";
@@ -191,10 +192,8 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
    * prefill chunk size; rows are sequences times that size. Token ids only: a
    * prompt with prepared media enters through the `MlxPromptInput` that
    * `bindMediaInput` returns (for `embeddings+positions`, the graph's
-   * `forwardEmbeddingsAtPositions`). */
-  prefillChunk(ids: MlxArray, state: Cache[]): MlxArray {
-    return this.forwardLayers(this.embed.encode(ids), state, "window");
-  }
+   * `forwardEmbeddingsAtPositions`). The GPU is this graph's one unit. */
+  readonly prefillChunk: MlxPrefillChunk = { gpu: (ids, state) => this.forwardLayers(this.embed.encode(ids), state, "window") };
 
   /** The positions left at the end of a prompt after its whole chunks, fewer
    * than the chunk size per sequence; rows are sequences times those tokens.
@@ -218,6 +217,9 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
     capture?.(this.layers.length, hidden);
     return hidden;
   });
+
+  /** The one output head at every width. */
+  readonly logits = atEveryWidth<MlxHeadForward>(hidden => this.logitsFromHidden(hidden));
 
   /** Borrowed request positions, including different positions for each row. */
   forwardHiddenAtPositions(ids: MlxArray, cache: Cache[], positions: MlxArray): MlxArray {

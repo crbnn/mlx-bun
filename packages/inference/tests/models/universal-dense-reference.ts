@@ -33,7 +33,9 @@ import { FINFO_MIN } from "../../src/layers/quantized-attention";
 import { KVCache } from "../../src/state/kv";
 import { LoraState } from "../../src/layers/lora";
 import type { GraphCapabilities } from "../../src/contracts/portable/graph";
-import type { MlxDeclaredGraph, MlxPhaseForward, MlxTokenPhases, MlxVerifyForward } from "../../src/contracts/mlx/graph";
+import type {
+  MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward,
+} from "../../src/contracts/mlx/graph";
 import { PLAIN_KV_VERIFICATION, declareGraph } from "../../src/models/capabilities";
 import { atEveryWidth } from "../../src/models/graph";
 import { QuantizedLinear } from "../../src/layers/quantized-linear";
@@ -562,8 +564,9 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
     return this.forwardLayers(h, cache);
   }
 
-  prefillChunk(ids: MlxArray, cache: Cache[]): MlxArray { return this.forwardHidden(ids, cache); }
+  readonly prefillChunk: MlxPrefillChunk = { gpu: (ids, cache) => this.forwardHidden(ids, cache) };
   prefillTail(ids: MlxArray, cache: Cache[]): MlxArray { return this.forwardHidden(ids, cache); }
+  readonly logits = atEveryWidth<MlxHeadForward>(hidden => this.logitsFromHidden(hidden));
   readonly decode = atEveryWidth<MlxPhaseForward>((ids, cache) => this.forwardHidden(ids, cache));
   readonly verify = atEveryWidth<MlxVerifyForward>((ids, cache) => this.forwardHidden(ids, cache));
 

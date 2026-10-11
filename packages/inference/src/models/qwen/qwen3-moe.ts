@@ -30,7 +30,9 @@ import { AttentionMasks } from "../../state/attention-read";
 import { denseTurboQuantKernels } from "../../state/turboquant-attention";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
-import type { MlxDeclaredGraph, MlxPhaseForward, MlxTokenPhases, MlxVerifyForward } from "../../contracts/mlx/graph";
+import type {
+  MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward,
+} from "../../contracts/mlx/graph";
 import { declareGraph } from "../capabilities";
 import { atEveryWidth, deprecatedPhase, type ReadPhase } from "../graph";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
@@ -295,16 +297,19 @@ export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
     return this.forwardLayers(this.embed.encode(ids), cache, deprecatedPhase(ids)); // self.embed_tokens(inputs)
   }
 
-  /** One whole chunk of a prompt; rows are sequences times the chunk size. */
-  prefillChunk(ids: MlxArray, cache: Cache[]): MlxArray {
-    return this.forwardLayers(this.embed.encode(ids), cache, "window");
-  }
+  /** One whole chunk of a prompt; rows are sequences times the chunk size. The GPU is this graph's one unit. */
+  readonly prefillChunk: MlxPrefillChunk = {
+    gpu: (ids, cache) => this.forwardLayers(this.embed.encode(ids), cache, "window"),
+  };
 
   /** The positions left after a prompt's whole chunks: the same semantics as
    * `prefillChunk`, named apart because a composition may run it elsewhere. */
   prefillTail(ids: MlxArray, cache: Cache[]): MlxArray {
     return this.forwardLayers(this.embed.encode(ids), cache, "window");
   }
+
+  /** The one output head at every width. */
+  readonly logits = atEveryWidth<MlxHeadForward>(hidden => this.logitsFromHidden(hidden));
 
   /** One new token per sequence: `ids` [sequences, 1]. */
   readonly decode = atEveryWidth<MlxPhaseForward>((ids, cache) =>

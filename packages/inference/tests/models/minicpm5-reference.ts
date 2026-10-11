@@ -16,7 +16,9 @@ import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import { LoraState } from "../../src/layers/lora";
 import type { GraphCapabilities } from "../../src/contracts/portable/graph";
-import type { MlxDeclaredGraph, MlxPhaseForward, MlxTokenPhases, MlxVerifyForward } from "../../src/contracts/mlx/graph";
+import type {
+  MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward,
+} from "../../src/contracts/mlx/graph";
 import type { TrainableGraph } from "../../src/contracts/mlx/trainable";
 import { activePrefixLayout, ropeBlocks } from "../../src/layers/prefix-layout";
 import { miniCpmTrainable } from "../../src/models/minicpm5/trainable";
@@ -271,8 +273,9 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
     return this.forwardLayers(h, cache);
   }
 
-  prefillChunk(ids: MlxArray, cache: Cache[]): MlxArray { return this.forwardHidden(ids, cache); }
+  readonly prefillChunk: MlxPrefillChunk = { gpu: (ids, cache) => this.forwardHidden(ids, cache) };
   prefillTail(ids: MlxArray, cache: Cache[]): MlxArray { return this.forwardHidden(ids, cache); }
+  readonly logits = atEveryWidth<MlxHeadForward>(hidden => this.logitsFromHidden(hidden));
   readonly decode = atEveryWidth<MlxPhaseForward>((ids, cache) => this.forwardHidden(ids, cache));
   readonly verify = atEveryWidth<MlxVerifyForward>((ids, cache) => this.forwardHidden(ids, cache));
 

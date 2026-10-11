@@ -44,7 +44,7 @@ import {
 } from "./profile";
 
 export type RuntimeModel =
-  | Gemma4Model | MiniCPM5Model | Qwen35Model | Qwen3Model | Qwen3MoeModel
+  | Gemma4Model | MiniCPM5Model | Qwen35Model | Qwen38TrellisM4Pro | Qwen3Model | Qwen3MoeModel
   | DiffusionGemmaModel | Glm52Model | UniversalDenseModel;
 
 /** A resident graph's native construction. Its loader and loop are the family's own declaration. */
@@ -67,8 +67,8 @@ export const MLX_MODEL_IMPLEMENTATIONS = new ModelImplementationRegistry<Weights
   // Our published Trellis quant loads its own purpose-built graph — the M4 Pro
   // graph on that GPU family, the TQ graph elsewhere; every other
   // Qwen3.5-family artifact keeps the generic model.
-  residentImplementation("qwen3.5", "qwen3.5", (weights, config) =>
-    qwen38TrellisM4ProAccepts(config) ? new Qwen38TrellisM4Pro(weights, config)
+  residentImplementation("qwen3.5", "qwen3.5", (weights, config, _profile, composition) =>
+    qwen38TrellisM4ProAccepts(config, composition) ? new Qwen38TrellisM4Pro(weights, config, composition)
       : qwen38TrellisTqAccepts(config) ? new Qwen38TrellisTQ(weights, config) : new Qwen35Model(weights, config)),
   residentImplementation("qwen3-moe", "qwen3-moe", (weights, config) => new Qwen3MoeModel(weights, config)),
   residentImplementation("qwen3", "qwen3", (weights, config) => new Qwen3Model(weights, config)),
