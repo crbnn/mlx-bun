@@ -412,6 +412,15 @@ Exit: no graph reads `quantizedAttention`; bit-identical generic forwards.
       the new one would run its width sets over whatever cache it is handed) and its
       `Kv4Head256Cache` lego serves one sequence until E3's batched form lands.
 
+- [x] Landed (`refactor/composition-e1`): `GraphTable` in `models/implementation.ts`, one table
+      per resident family in `MLX_GRAPH_TABLES`; building a table fails unless it has exactly
+      one generic entry and no two equally constrained entries can both match. The generated
+      Gemma graphs serve their kv_config scheme, so the default bf16 composition selects the
+      generic Gemma 4 graph, which is what the old `#matches` guard fell back to. Loose ends:
+      `models/profile.ts` still labels the generated-fingerprint Gemma artifacts
+      `gemma4-generated` regardless of composition (make the label the selected graph's), and
+      two README sentences describe the old selection (F2).
+
 Exit: selection is data; `qwen38TrellisM4ProAccepts` and the nested ternary are gone.
 
 #### E2. Scheduler calls phases
