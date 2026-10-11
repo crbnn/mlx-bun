@@ -6,13 +6,10 @@ import { bidirMask, createCausalMask } from "../kernels/attention/masks";
 import { QuantizedKVCache } from "./quantized-kv";
 import { plainKvStorage } from "./dense-kv-reads";
 import { AttentionMasks, causalLease, encoderWindowMask, sdpaRead, unmaskedLease, withLease } from "./attention-read";
-import type { AffineKernels } from "./affine-attention";
+import type { AffineKernelSet } from "./affine-attention";
 import { uncomposedTurboQuantKernels, type TurboQuantKernels } from "./turboquant-attention";
 
-/** A kernel set named by the composition it serves (`unfusedAffineKernels`,
- * `tiledCausalAffineKernels`, `tiledAffineKernels`), which a conversion builds
- * for the converted cache's bits, group size and activation dtype. */
-export type AffineKernelSet = (bits: number, groupSize: number, dtype: Dtype) => AffineKernels;
+export type { AffineKernelSet };
 
 
 /** KV cache — port of mlx-lm cache.py KVCache: preallocated in steps of

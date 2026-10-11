@@ -1,9 +1,9 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { Cache, KvAttentionView, KvDonorAttention } from "../contracts/mlx/cache";
-import { quantizedSdpa } from "../layers/quantized-attention";
 import { disposeTriple } from "./quantized-tensor";
 import { quantizedAppendAttention } from "../layers/quantized-append-attention";
+import { viewAffineKernel, type AffineKernels } from "./affine-attention";
 
 export function captureKvDonorAttention(cache: Cache): KvDonorAttention {
   if (cache.captureDonorAttention) return cache.captureDonorAttention();
@@ -16,17 +16,21 @@ export function captureKvDonorAttention(cache: Cache): KvDonorAttention {
   };
 }
 
+/** Q-only attention over fetched affine keys and values with the storage's
+ * kernel set (`viewAffineKernel`). Takes ownership of `keys` and `values`. */
 export function quantizedDonorAttention(keys: ops.QuantizedTensor, values: ops.QuantizedTensor,
-  validity: Pick<KvDonorAttention, "offsets" | "starts" | "ends">,
-  groupSize: number, bits: number): KvDonorAttention {
+  validity: Pick<KvDonorAttention, "offsets" | "starts" | "ends">, kernels: AffineKernels): KvDonorAttention {
   return {
     width: keys.packed.shape[2]!, dtype: keys.scales.dtype, ...validity,
-    attend: (q, scale, mask) => quantizedSdpa(q, keys, values, scale, mask, groupSize, bits),
+    attend: (q, scale, mask) => viewAffineKernel(kernels, q.shape[2]!, mask)(q, keys, values, scale, mask),
     dispose() { disposeTriple(keys); disposeTriple(values); },
   };
 }
 
-export function captureKvAttention(cache: Cache, k: MlxArray, v: MlxArray): KvAttentionView {
+/** Append `k` and `v` to `cache` and return its attention view. Plain storage
+ * reads with the stock SDPA; affine storage with `kernels`, the kernel set of
+ * the row layout reading it (`viewAffineKernel`). */
+export function captureKvAttention(cache: Cache, k: MlxArray, v: MlxArray, kernels: AffineKernels): KvAttentionView {
     if (cache.attentionState) return cache.attentionState.appendAndFetch(k, v);
     const quantized = cache.quantizedAttention;
     if (quantized) {
@@ -35,7 +39,7 @@ export function captureKvAttention(cache: Cache, k: MlxArray, v: MlxArray): KvAt
       return {
         attend: (q, scale, mask, independentPositions) => independentPositions && q.shape[2]! > 1
           ? quantizedAppendAttention(q, keys, values, scale, groupSize, bits)
-          : quantizedSdpa(q, keys, values, scale, mask, groupSize, bits),
+          : viewAffineKernel(kernels, q.shape[2]!, mask)(q, keys, values, scale, mask),
         dispose() { disposeTriple(keys); disposeTriple(values); },
       };
     }

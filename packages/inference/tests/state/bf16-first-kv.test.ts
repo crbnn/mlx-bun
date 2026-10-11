@@ -1,8 +1,8 @@
 // B1d bit-identity gate: the quantized legos `--kv-quant N` composes against
 // the path they replace. "Old" is today's: a plain cache read as the graphs
-// read it (`makeMask` before the append, `updateAndFetch`, the fused SDPA), with
-// `createKvMaintenance` run on it after every append (the conversion the served
-// path performs after each forward), then the graphs' affine call
+// read it (`makeMask` before the append, `updateAndFetch`, the fused SDPA),
+// converted after every append as the served path's maintenance converted it
+// after each forward before E3 (`convert-after-reference.ts`), then the graphs' affine call
 // (`updateAndFetchQuantized`, `quantizedSdpa`) or TurboQuant call (deferred-V
 // fetch, SDPA, inverse rotation) once it has converted. "New" is the lego's
 // phase-named read. Same random q/k/v. Every read's output must match (maxDiff
@@ -15,7 +15,7 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { AttentionCache, AttentionRead, Cache } from "../../src/contracts/mlx/cache";
 import { unrotateValues } from "../../src/kernels/turboquant/ops";
-import { quantizedSdpa } from "../../src/layers/quantized-attention";
+import { quantizedSdpa } from "../models/quantized-sdpa-reference";
 import { unfusedAffineKernels } from "../../src/state/affine-attention";
 import { Bf16FirstQuantizedKVCache, Bf16FirstRotatingQuantizedKVCache, Bf16FirstTurboQuantKVCache } from "../../src/state/bf16-first-kv";
 import { DelayedQuantizedKVCache } from "../../src/state/delayed-quantized-kv";
@@ -23,7 +23,7 @@ import { DelayedRotatingQuantizedKVCache } from "../../src/state/delayed-rotatin
 import { DelayedTurboQuantKVCache } from "../../src/state/delayed-turboquant-kv";
 import { KVCache } from "../../src/state/kv";
 import { deferredTurboQuantKernels } from "../../src/state/turboquant-attention";
-import { createKvMaintenance } from "../../src/state/kv-maintenance";
+import { settleAffine, settleTurbo } from "./convert-after-reference";
 import { QuantizedKVCache } from "../../src/state/quantized-kv";
 import { disposeTriple } from "../../src/state/quantized-tensor";
 import { RotatingKVCache } from "../../src/state/rotating-kv";
@@ -31,6 +31,7 @@ import { RotatingQuantizedKVCache } from "../../src/state/rotating-quantized-kv"
 import { turboQuantFusedDecode } from "../../src/state/turboquant-codec";
 import { TurboQuantKVCache } from "../../src/state/turboquant-kv";
 import { disposeResources } from "../../src/runtime/resources";
+import { createRuntimeConfig, runtimeConfig, withRuntimeConfig } from "../../src/runtime/config";
 
 const HKV = 2, HQ = 8, D = 128, SCALE = 0.088, GROUP = 64;
 /** The sliding window of the rotating cases: the 300- and 250-position windows
@@ -70,9 +71,8 @@ const SCHEMES: readonly Scheme[] = [
   { name: "affine 8 rotating", bits: 8, rotating: true },
   { name: "TurboQuant k8v3", rotating: false },
 ];
-const maintenanceOf = (scheme: Scheme, start: number) => createKvMaintenance(scheme.bits
-  ? { kvBits: scheme.bits, kvGroupSize: GROUP, quantizedKvStart: start }
-  : { turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: start });
+const maintenanceOf = (scheme: Scheme, start: number) => (caches: Cache[]) => scheme.bits
+  ? settleAffine(caches, scheme.bits, start, GROUP) : settleTurbo(caches, 8, 3, start);
 const plainOf = (scheme: Scheme): Cache => scheme.rotating ? new RotatingKVCache(W) : new KVCache(undefined, deferredTurboQuantKernels);
 const legoOf = (scheme: Scheme, start: number): AttentionCache => !scheme.bits
   ? new Bf16FirstTurboQuantKVCache(8, 3, start, turboQuantFusedDecode(), deferredTurboQuantKernels)
@@ -84,13 +84,17 @@ function materialize(cache: Cache): void {
   try { ops.evalAll(state); } finally { if (cache.stateNeedsDispose) for (const array of state) array.dispose(); }
 }
 
-/** The graphs' read today on whichever storage the old path holds. */
+/** The flag the app wrote for `--kv-quant N` before E3 (fused SDPA off: the
+ * uniform composition reads unfused, `unfusedAffineKernels`). */
+const UNIFORM_FLAG = createRuntimeConfig({ ...runtimeConfig().values, MLX_BUN_NO_FUSED_SDPA: "1" });
+
+/** The graphs' read before E3 on whichever storage the old path holds. */
 function oldRead(cache: Cache, window: number | null, k: MlxArray, v: MlxArray, q: MlxArray): MlxArray {
   const mask = cache.makeMask(k.shape[2]!, window);
   try {
     if (cache instanceof QuantizedKVCache || cache instanceof RotatingQuantizedKVCache) {
       const [keys, values] = cache.updateAndFetchQuantized(k, v);
-      try { return quantizedSdpa(q, keys, values, SCALE, mask, cache.groupSize, cache.bits); }
+      try { return withRuntimeConfig(UNIFORM_FLAG, () => quantizedSdpa(q, keys, values, SCALE, mask, cache.groupSize, cache.bits)); }
       finally { disposeTriple(keys); disposeTriple(values); }
     }
     if (cache instanceof TurboQuantKVCache) {
@@ -164,7 +168,7 @@ for (const scheme of SCHEMES) for (const start of [0, 512]) {
           (plain ? bf16Reads : quantizedReads).push(diff);
           if (diff !== 0) outcomes.push({ label: `${scheme.name} start ${start} step ${index} (${step === "D" ? "decode" : `window ${L}`})`, diff });
           if (converted < 0 && !old[0]!.signature().includes("plain")) converted = old[0]!.offset;
-          expect(lego.signature(), `step ${index}`).toBe(old[0]!.signature());
+          expect(lego.signature(), `step ${index}`).toBe(`kv:bf16-first:${old[0]!.signature()}`);
           expect(lego.offset, `step ${index}`).toBe(old[0]!.offset);
           expect(lego.minimumReusableOffset ?? 0, `step ${index}`).toBe(old[0]!.minimumReusableOffset ?? 0);
           stored.push(...storedDifferences(old[0]!, lego).map(plane => `step ${index} ${plane}`));
@@ -193,7 +197,7 @@ for (const scheme of SCHEMES) for (const start of [0, 512]) {
 const fromZeroOf = (scheme: Scheme): Cache => !scheme.bits ? new TurboQuantKVCache(8, 3, deferredTurboQuantKernels, turboQuantFusedDecode())
   : scheme.rotating ? new RotatingQuantizedKVCache(W, GROUP, scheme.bits, unfusedAffineKernels(scheme.bits, GROUP, Dtype.bfloat16))
   : new QuantizedKVCache(GROUP, scheme.bits, unfusedAffineKernels(scheme.bits, GROUP, Dtype.bfloat16));
-/** The conversion `kv-maintenance` performs, applied by hand. */
+/** The convert-after conversion, applied by hand. */
 const convertedOf = (scheme: Scheme, plain: Cache): Cache => !scheme.bits
   ? TurboQuantKVCache.fromKVCache(plain as KVCache, 8, 3, deferredTurboQuantKernels, turboQuantFusedDecode())
   : (plain as KVCache | RotatingKVCache).toQuantized(GROUP, scheme.bits, unfusedAffineKernels);
@@ -219,7 +223,7 @@ for (const scheme of SCHEMES) {
         expect(zeroDiff).toBeGreaterThan(0);
       } finally { k.dispose(); v.dispose(); }
       quantized = convertedOf(scheme, plain);
-      expect(lego.signature()).toBe(quantized.signature());
+      expect(lego.signature()).toBe(`kv:bf16-first:${quantized.signature()}`);
       for (const step of ["D", "D", 12, "D"] as const) {
         const L = step === "D" ? 1 : step;
         const [k2, v2] = kv(1, L);

@@ -275,25 +275,38 @@ export interface DenseKvReads {
   appendable(row: number): boolean;
 }
 
-/** KV precision maintenance over a list of caches (a model's layers, or the
- * rows of a delayed cache): converts eligible entries in place. */
+/** The row-layout half of a composition's KV scheme, over one request's layer
+ * caches: where its serial caches (the graph's composed legos) join row
+ * layouts. The legos convert themselves inside their own appends; nothing here
+ * converts a serial cache. */
 export interface KvMaintenance {
-  (cache: Cache[]): void;
   /** Limit committed work at a pending precision transition. */
   maxAppendTokens?(cache: readonly Cache[]): number;
   /** Bind state requiring row-local maintenance before shared decode. */
   prepareBatch?(cache: Cache[]): void;
   /** Bind all precision policies before a prefill cohort owns row boundaries. */
   preparePrefill?(cache: Cache[]): void;
-  /** Pure: whether `cache` at `index` (its layer, or its row inside a delayed
-   * cache), reading dense now, still reads dense after this maintenance next
-   * runs on it — by its own conversion test and what it converts to. Absent:
-   * this maintenance cannot answer, so storage it maintains is not certified
-   * for dense reads. */
-  keepsDenseReads?(cache: Cache, index: number): boolean;
+}
+
+/** The storage a composed cache holds and converts (the bf16-first KV legos a
+ * graph's `makeCache` builds for its composition's KV scheme). The row
+ * layouts, clones and saved files take the storage, never the lego; whoever
+ * hands storage back to serial use composes it with `over`. */
+export interface ComposedStorage {
+  /** The storage held now, borrowed: bf16 before the transition, quantized or
+   * encoded after. */
+  storage(): Cache;
+  /** This lego's composition over `storage`, which the result owns: storage
+   * that already holds the conversion start converts before this returns, and
+   * quantized storage reads with this lego's kernels. */
+  over(storage: Cache): Cache;
+  /** Hands the storage held now to the caller and leaves this lego empty. */
+  release(): Cache;
 }
 
 export interface Cache {
+  /** Present on a cache that composes the storage it holds (see ComposedStorage). */
+  readonly composed?: ComposedStorage;
   /** Dense reads, when this storage can answer for them (see DenseKvReads). */
   readonly denseKvReads?: DenseKvReads;
   /** Maximum committed positions before this state changes precision. */

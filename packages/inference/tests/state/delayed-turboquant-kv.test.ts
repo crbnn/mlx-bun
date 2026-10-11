@@ -9,7 +9,7 @@ import { TurboQuantKVCache } from "../../src/state/turboquant-kv";
 import { type Cache } from "../../src/contracts/mlx/cache";
 import { DelayedTurboQuantKVCache } from "../../src/state/delayed-turboquant-kv";
 import { turboQuantFusedDecode } from "../../src/state/turboquant-codec";
-import { createKvMaintenance } from "../../src/state/kv-maintenance";
+import { settleTurbo } from "./convert-after-reference";
 import { cloneKvCaches } from "../../src/state/persistence";
 import { unrotateValues } from "../../src/kernels/turboquant/ops";
 
@@ -39,7 +39,7 @@ function stateEqual(a: Cache, b: Cache) {
 }
 for (const fused of ["0", "1"]) test(`delayed TQ preserves exact row boundaries, values and retirement (fused=${fused})`, () => {
   const restore = configureRuntime({ MLX_BUN_TURBOQUANT_FUSED_DECODE: fused });
-  const maintain = createKvMaintenance({ turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: 5 });
+  const maintain = (rows: Cache[]) => settleTurbo(rows, 8, 3, 5);
   let reference = [plain(3), plain(6)];
   const copies = cloneKvCaches(reference);
   let group = new DelayedTurboQuantKVCache(8, 3, 5, turboQuantFusedDecode(), deferredTurboQuantKernels);
@@ -122,7 +122,7 @@ for (const fused of ["0", "1"]) test(`delayed TQ preserves exact row boundaries,
 
 for (const fused of ["0", "1"]) test(`speculative delayed TQ converts committed history and rolls back unequal rows (fused=${fused})`, () => {
   const restore = configureRuntime({ MLX_BUN_TURBOQUANT_FUSED_DECODE: fused });
-  const maintain = createKvMaintenance({ turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: 5 });
+  const maintain = (rows: Cache[]) => settleTurbo(rows, 8, 3, 5);
   let reference = [plain(3), plain(6)];
   let group = new DelayedTurboQuantKVCache(8, 3, 5, turboQuantFusedDecode(), deferredTurboQuantKernels);
   group.mergeRows(reference);

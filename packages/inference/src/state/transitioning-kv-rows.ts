@@ -33,6 +33,10 @@ export interface KvRowTransition<Layout extends TransitionedKvLayout> {
   prepareRows?(rows: Cache[]): Cache[];
   extractRow?(row: Cache): Cache;
   rollbackRow?(row: Cache, before: number, keep: number, preserveColumns: boolean): void;
+  /** How the lego these rows came from composes storage for serial use
+   * (`ComposedStorage.over`): a row this layout hands back to serial use is
+   * that lego again. Absent for rows that came as storage. */
+  compose?(storage: Cache): Cache;
 }
 
 
@@ -149,8 +153,8 @@ export abstract class TransitioningKvRows<Layout extends TransitionedKvLayout> i
     try {
       for (const row of rows) {
         if (row instanceof TransitioningKvRows) {
-          for (let index = 0; index < row.batchSize!; index++) owned.push(row.extractRow(index));
-        } else owned.push(...cloneKvCaches([row]));
+          for (let index = 0; index < row.batchSize!; index++) owned.push(row.extractStorageRow(index));
+        } else owned.push(...cloneKvCaches([row.composed ? row.composed.storage() : row]));
       }
     } catch (error) { disposeResources(owned); throw error; }
     let prepared: Cache[];
@@ -163,7 +167,16 @@ export abstract class TransitioningKvRows<Layout extends TransitionedKvLayout> i
     const previous = this.rows; this.rows = keep.map(index => previous[index]!);
     disposeResources(previous.filter((_, index) => !keep.includes(index))); this.positions.filterRows(keep);
   }
-  extractRow(row: number): Cache { return this.packed?.extractRow(row) ?? (this.transition.extractRow?.(this.rows[row]!) ?? cloneKvCaches([this.rows[row]!])[0]!); }
+  /** A row's storage, owned by the caller: what another row layout merges. */
+  extractStorageRow(row: number): Cache {
+    return this.packed?.extractRow(row) ?? (this.transition.extractRow?.(this.rows[row]!) ?? cloneKvCaches([this.rows[row]!])[0]!);
+  }
+  /** A row handed back to serial use: its storage, composed again by the lego
+   * the row came from (`KvRowTransition.compose`). */
+  extractRow(row: number): Cache {
+    const storage = this.extractStorageRow(row);
+    return this.transition.compose ? this.transition.compose(storage) : storage;
+  }
   state(): MlxArray[] {
     return withResource(leaseCacheStates(this.packed ? [this.packed] : this.rows), arrays => {
       const views: MlxArray[] = [];

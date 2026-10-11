@@ -18,7 +18,10 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import { Dtype } from "@mlx-bun/mlx/ffi";
-import type { Cache } from "../../src/contracts/mlx/cache";
+import type { AttentionCache, Cache } from "../../src/contracts/mlx/cache";
+import { AttentionMasks } from "../../src/state/attention-read";
+import { composedFullAttentionCache } from "../../src/state/bf16-first-kv";
+import { denseTurboQuantKernels } from "../../src/state/turboquant-attention";
 import { KVCache } from "../../src/state/kv";
 import { QuantizedKVCache } from "../../src/state/quantized-kv";
 import { RotatingKVCache } from "../../src/state/rotating-kv";
@@ -466,10 +469,15 @@ describe("MlxBatchExecutionGroup per-row extraction (stub model)", () => {
   });
 
   test("authoritative kvScheme converts scheduled rows before cache storage", async () => {
-    // This graph reads the quantized planes (updateAndFetchQuantized), so it
-    // declares no plain-KV reads: the scheduler may convert its rows.
+    const scheme = resolveKvScheme({
+      override: "config",
+      config: [{ layerIdx: 0, bits: 4, groupSize: 32 }],
+    });
+    // This graph composes the scheme's lego and reads through its window read,
+    // so it declares no plain-KV reads: the scheduler may convert its rows.
     const quantModel = {
       ...stubModel,
+      makeCache: () => [composedFullAttentionCache(scheme.storage, 0, new AttentionMasks(), denseTurboQuantKernels)],
       requiredDenseKvLayers: [],
       graphCapabilities: declareGraph({ kv: { denseReads: false } }),
       forwardHidden(ids: MlxArray, caches: Cache[]): MlxArray {
@@ -477,22 +485,11 @@ describe("MlxBatchExecutionGroup per-row extraction (stub model)", () => {
         const f = ids.astype(Dtype.float32);
         const col = ops.reshape(f, [B, 1, L, 1]);
         f.dispose();
-        const k = ops.concatAxis(Array.from({ length: 32 }, () => col), 3);
+        const wide = ops.concatAxis(Array.from({ length: 32 }, () => col), 3);
         col.dispose();
-        for (const cache of caches) {
-          if (cache instanceof QuantizedKVCache) {
-            const [rk, rv] = cache.updateAndFetchQuantized(k, k);
-            for (const tensor of [rk, rv]) {
-              tensor.packed.dispose();
-              tensor.scales.dispose();
-              tensor.biases.dispose();
-            }
-          } else {
-            const [rk, rv] = cache.updateAndFetch(k, k);
-            rk.dispose();
-            rv.dispose();
-          }
-        }
+        const k = wide.astype(Dtype.bfloat16);
+        wide.dispose();
+        for (const cache of caches) (cache as unknown as AttentionCache).appendWindow(k, k).dispose();
         k.dispose();
         return ops.zeros([B, L, HD], Dtype.float32);
       },
@@ -502,10 +499,6 @@ describe("MlxBatchExecutionGroup per-row extraction (stub model)", () => {
       take: () => null,
       put: (_tokens, caches) => { puts.push(caches); },
     };
-    const scheme = resolveKvScheme({
-      override: "config",
-      config: [{ layerIdx: 0, bits: 4, groupSize: 32 }],
-    });
     const sched = newGroup(quantModel, {
       maxBatch: 2,
       kvScheme: scheme,
@@ -522,7 +515,9 @@ describe("MlxBatchExecutionGroup per-row extraction (stub model)", () => {
 
     expect(stats.generatedTokens).toBe(1);
     expect(puts).toHaveLength(1);
-    expect(puts[0]![0]).toBeInstanceOf(QuantizedKVCache);
+    // The stored row holds converted storage (a lego's, or the storage a row
+    // layout hands back).
+    expect(puts[0]![0]!.composed?.storage() ?? puts[0]![0]).toBeInstanceOf(QuantizedKVCache);
     for (const caches of puts) for (const cache of caches) cache.dispose();
   }, 30_000);
 

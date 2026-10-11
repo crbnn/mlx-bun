@@ -51,13 +51,17 @@ export class DelayedTurboQuantKVCache extends FullTransitioningKvRows<BatchedTur
   implements RotatedValueAttentionState, CommittedAttentionCache {
   #rotated: boolean[] = [];
   constructor(readonly kBits: number, readonly vBits: number, readonly start: number,
-    readonly fusedDecode: boolean, readonly turboQuantKernels: TurboQuantKernels, row?: Cache) {
+    readonly fusedDecode: boolean, readonly turboQuantKernels: TurboQuantKernels, row?: Cache,
+    /** How the lego these rows came from composes the rows this layout hands
+     * back to serial use (`ComposedStorage.over`). */
+    readonly compose?: (storage: Cache) => Cache) {
     super({ signature: `kv:delayed-turboquant:${kBits}:${vBits}:${start}`, conversionOffset: start,
       settle: rows => settleTurboQuantRows(rows, kBits, vBits, start, fusedDecode),
       // The conversion leaves storage that decodes on read.
       keepsDenseReads: () => true,
       converted: row => row instanceof TurboQuantKVCache,
-      makeLayout: () => new BatchedTurboQuantKVCache(kBits, vBits, turboQuantKernels, fusedDecode) }, row);
+      makeLayout: () => new BatchedTurboQuantKVCache(kBits, vBits, turboQuantKernels, fusedDecode),
+      ...(compose ? { compose } : {}) }, row);
   }
   /** Rows made for an empty layout carry the graph's read into their conversion. */
   protected override plainRow(): KVCache { return new KVCache(undefined, this.turboQuantKernels); }
@@ -117,6 +121,6 @@ export class DelayedTurboQuantKVCache extends FullTransitioningKvRows<BatchedTur
     };
   }
   makeEmptyBatch(): DelayedTurboQuantKVCache {
-    return new DelayedTurboQuantKVCache(this.kBits, this.vBits, this.start, this.fusedDecode, this.turboQuantKernels);
+    return new DelayedTurboQuantKVCache(this.kBits, this.vBits, this.start, this.fusedDecode, this.turboQuantKernels, undefined, this.compose);
   }
 }

@@ -2,12 +2,12 @@ import { test, expect } from "bun:test";
 import { createHash } from "node:crypto";
 import { KVCache } from "../../src/state/kv";
 import { QuantizedKVCache } from "../../src/state/quantized-kv";
-import { quantizedSdpa } from "../../src/layers/quantized-attention";
+import { quantizedSdpa } from "../models/quantized-sdpa-reference";
 import { disposeTriple } from "../../src/state/quantized-tensor";
 import { type Cache } from "../../src/contracts/mlx/cache";
 import { unfusedAffineKernels } from "../../src/state/affine-attention";
 import { DelayedQuantizedKVCache } from "../../src/state/delayed-quantized-kv";
-import { createKvMaintenance } from "../../src/state/kv-maintenance";
+import { settleAffine } from "./convert-after-reference";
 import { cloneKvCaches } from "../../src/state/persistence";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
@@ -19,8 +19,9 @@ const hashes = (cache: Cache) => cache.state().map(a => {
 const tensor = (b: number, heads: number, n: number, seed: number) => {
   using key = ops.randomKey(BigInt(seed)); return ops.randomNormal([b,heads,n,64], Dtype.bfloat16, 0, 1, key);
 };
+const settle = (rows: Cache[], bits: number) => settleAffine(rows, bits, 5);
 for (const bits of [4,8]) test(`delayed KV${bits} retains independent precision, rollback, padding and immutable checkpoints`, () => {
-  const maintain = createKvMaintenance({ kvBits: bits, kvGroupSize:64, quantizedKvStart:5 });
+  const maintain = (rows: Cache[]) => settle(rows, bits);
   const source: Cache[] = [];
   for (const n of [2,6]) {
     const c = new KVCache(); using k=tensor(1,1,n,n), v=tensor(1,1,n,n+1);
@@ -78,7 +79,7 @@ for (const bits of [4,8]) test(`delayed KV${bits} retains independent precision,
 
 
 for (const bits of [4, 8]) test(`captured KV${bits} attention survives multiple consumers, conversion and owner disposal`, () => {
-  const maintain = createKvMaintenance({ kvBits: bits, kvGroupSize: 64, quantizedKvStart: 5 });
+  const maintain = (rows: Cache[]) => settle(rows, bits);
   const source: Cache[] = [];
   for (const length of [2, 6]) {
     const row = new KVCache();
@@ -183,7 +184,7 @@ test("plain reads are owned by the caller and outlive later appends", () => {
 });
 
 test("a plain read appends to no row once any row is converted, before or by the scheduled maintenance", () => {
-  const maintain = createKvMaintenance({ kvBits: 4, kvGroupSize: 64, quantizedKvStart: 5 });
+  const maintain = (rows: Cache[]) => settle(rows, 4);
   const snapshot = (group: DelayedQuantizedKVCache) => ({ offsets: [...group.rowOffsets], pads: [...group.leftPad],
     rows: group.rowOffsets.map((_, row) => { const s = group.extractRow(row); try { return [s.constructor.name, ...hashes(s)]; } finally { s.dispose(); } }) });
   using k = tensor(2, 1, 1, 50), v = tensor(2, 1, 1, 51);

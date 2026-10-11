@@ -20,7 +20,9 @@ import { captureKvAttention } from "../../src/state/kv-attention-view";
 import { disposeTriple } from "../../src/state/quantized-tensor";
 import { alignRotatingRows } from "../../src/state/rotating-kv-layout";
 import type { Cache } from "../../src/contracts/mlx/cache";
+import type { KvStorageScheme } from "../../src/contracts/portable/composition";
 import { unfusedAffineKernels } from "../../src/state/affine-attention";
+import { settleAffine } from "./convert-after-reference";
 import { DelayedRotatingQuantizedKVCache } from "../../src/state/delayed-rotating-quantized-kv";
 import { cloneKvCaches } from "../../src/state/persistence";
 
@@ -28,10 +30,10 @@ const W = 8;
 const digest = (a: MlxArray) => { using c = ops.contiguous(a); return createHash("sha256").update(c.rawBytes()).digest("hex"); };
 /** One attention step as the model runs it: the group mask from the cache
  * before its write, then the cache's own attention view. */
-const attend = (cache: Cache, q: MlxArray, k: MlxArray, v: MlxArray, scale: number): string => {
+const attend = (cache: Cache, q: MlxArray, k: MlxArray, v: MlxArray, scale: number, bits: number): string => {
   const mask = cache.makeMask(k.shape[2]!, W);
   try {
-    const view = captureKvAttention(cache, k, v);
+    const view = captureKvAttention(cache, k, v, unfusedAffineKernels(bits, 64, q.dtype));
     try { using out = view.attend(q, scale, mask); return digest(out); } finally { view.dispose(); }
   } finally { mask.arr?.dispose(); }
 };
@@ -51,6 +53,9 @@ const write = (cache: Cache, k: MlxArray, v: MlxArray) => {
   if (cache instanceof RotatingQuantizedKVCache) { const [kq, vq] = cache.updateAndFetchQuantized(k, v); disposeTriple(kq); disposeTriple(vq); }
   else for (const a of (cache as RotatingKVCache).updateAndFetch(k, v)) a.dispose();
 };
+const settle = settleAffine;
+const affine = (bits: number, start: number): KvStorageScheme =>
+  ({ kind: "affine", bits, groupSize: 64, quantizedKvStart: start, kernels: "unfused" });
 
 const CASES: [string, number[], number][] = [
   // label, prefill chunks (a trailing 1 is the tail-split token), conversion start
@@ -67,8 +72,7 @@ test(`${dtypeName} ${g.name} KV${bits} ${label}: the adopted wrapper equals the 
   const tensor = (n: number, seed: number, heads = g.kvHeads) => {
     using key = ops.randomKey(BigInt(seed)); return ops.randomNormal([1, heads, n, g.dim], dtype, 0, 1, key);
   };
-  const options = { kvBits: bits, kvGroupSize: 64, quantizedKvStart: start };
-  const serial = createKvMaintenance(options);
+  const serial = (caches: Cache[]) => settle(caches, bits, start);
   // Two identical solo rows: prefill writes, maintained after each non-final
   // chunk and before the first decode (the serial loop and the batch cohort).
   const prefilled = () => {
@@ -86,12 +90,12 @@ test(`${dtypeName} ${g.name} KV${bits} ${label}: the adopted wrapper equals the 
   };
   const solo = prefilled(), adopted = prefilled();
   try {
-    createKvMaintenance(options).prepareBatch!(adopted);
+    createKvMaintenance(affine(bits, start)).prepareBatch!(adopted);
     expect(adopted[0]!.signature()).toStartWith("kv:delayed-rotating");
     for (let t = 0; t < steps; t++) {
-      serial(solo); // the serial loop maintains before each decode forward
+      serial(solo); // the serial row converts after the append that reaches its start
       using q = tensor(1, 100 + t, g.heads), k = tensor(1, 200 + t), v = tensor(1, 300 + t);
-      expect(attend(adopted[0]!, q, k, v, scale), `step ${t} attention`).toBe(attend(solo[0]!, q, k, v, scale));
+      expect(attend(adopted[0]!, q, k, v, scale, bits), `step ${t} attention`).toBe(attend(solo[0]!, q, k, v, scale, bits));
       const extracted = (adopted[0] as unknown as { extractRow(row: number): Cache }).extractRow(0);
       try { expect(logical(extracted), `step ${t} state`).toEqual(logical(solo[0]!)); } finally { extracted.dispose(); }
     }
@@ -106,7 +110,7 @@ for (const quantized of [false, true]) test(`${quantized ? "quantized" : "plain"
   for (let failing = 0; failing < failures; failing++) {
     let rows: Cache[] = [new RotatingKVCache(W)];
     for (const [n, seed] of [[11, 1], [1, 3]] as const) { using k = tensor(n, seed), v = tensor(n, seed + 1); write(rows[0]!, k, v); }
-    if (quantized) createKvMaintenance({ kvBits: 4, kvGroupSize: 64, quantizedKvStart: 1 })(rows);
+    if (quantized) settle(rows, 4, 1);
     const source = rows[0]!, before = logical(source);
     const ring = source as unknown as { keys: unknown; values: unknown };
     const arrays = (quantized ? [ring.keys, ring.values].flatMap(t => { const q = t as { packed: MlxArray; scales: MlxArray; biases: MlxArray };
@@ -155,7 +159,7 @@ const soloRows = (lengths: number[], seed: number) => lengths.map((length, index
 
 for (const [label, chunks] of [["tail split past the window", [11, 1]], ["one block past the window", [12]], ["within the window", [5, 1]]] as const)
 test(`B1 plain reads keep the adopted ring's physical bytes and attend as the solo row: ${label}, then an oversize block`, () => {
-  const options = { kvBits: 4, kvGroupSize: 64, quantizedKvStart: 1000 };
+  const options = affine(4, 1000);
   const prefilled = () => {
     const caches: Cache[] = [new RotatingKVCache(W)];
     let seed = 1;
@@ -269,8 +273,7 @@ test("padded rotating prefill reads plain, finalizes its positions and decodes a
 test("a rotating plain read appends to no row once any row is converted, before or by the scheduled maintenance", () => {
   const snapshot = (group: DelayedRotatingQuantizedKVCache) => ({ offsets: [...group.rowOffsets], pads: [...group.leftPad],
     rows: group.rowOffsets.map((_, row) => { const s = group.extractRow(row); try { return logical(s); } finally { s.dispose(); } }) });
-  const options = { kvBits: 4, kvGroupSize: 64, quantizedKvStart: 6 };
-  const maintain = createKvMaintenance(options);
+  const maintain = (rows: Cache[]) => settle(rows, 4, 6);
   using k = f16(2, 2, 1, 50), v = f16(2, 2, 1, 51);
   for (const lengths of [[3, 7], [7, 9]]) {
     const source = soloRows(lengths, 40); maintain(source);

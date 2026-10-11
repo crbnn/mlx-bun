@@ -3,11 +3,11 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { AttentionCache,AttentionRead,CompiledDecodeCache,DecodeSlot,DecodeStepInputs,DecodeStepPlan,DecodeTrace,KvDonorAttention,Mask,QuantizedAttentionState } from "../contracts/mlx/cache";
 import { createCausalMask } from "../kernels/attention/masks";
-import { quantizedSdpa } from "../layers/quantized-attention";
+
 import { activeQuantViews,quantConcatDecodeSlot } from "./quantized-kv";
 import { disposeTriple,mapTriple } from "./quantized-tensor";
 import { AttentionMasks, unmaskedLease, withLease, type MaskLease } from "./attention-read";
-import { affineCausalLease, affineRead, unfusedAffineKernels, type AffineKernel, type AffineKernels } from "./affine-attention";
+import { affineCausalLease, affineRead, unfusedAffineKernels, viewAffineKernel, type AffineKernel, type AffineKernels, type AffineKernelSet } from "./affine-attention";
 
 
 /** Quantized rotating (sliding-window) KV cache — port of optiq
@@ -59,6 +59,10 @@ export class RotatingQuantizedKVCache implements CompiledDecodeCache, AttentionC
   ) {
     this.maxSize = maxSize;
   }
+
+  /** The kernel set affine storage restored at this cache's layer reads with
+   * (`state/persistence`): this cache's own kernels. */
+  get kernelSet(): AffineKernelSet { return () => this.kernels; }
 
   signature(): string { return `kv:rotating-quant:${this.bits}:${this.groupSize}`; }
 
@@ -328,7 +332,7 @@ export class RotatingQuantizedKVCache implements CompiledDecodeCache, AttentionC
     const B = keys.packed.shape[0]!, width = keys.packed.shape[2]!;
     return { width, dtype: keys.scales.dtype, offsets: Array(B).fill(this.offset),
       starts: Array(B).fill(0), ends: Array(B).fill(width),
-      attend: (q, scale, mask) => quantizedSdpa(q, keys, values, scale, mask, this.groupSize, this.bits),
+      attend: (q, scale, mask) => viewAffineKernel(this.kernels, q.shape[2]!, mask)(q, keys, values, scale, mask),
       dispose() { disposeTriple(keys); disposeTriple(values); },
     };
   }

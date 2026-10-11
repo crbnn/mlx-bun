@@ -268,7 +268,7 @@ export class RotatingAffineLayout implements TransitionedKvLayout, PaddedPrefill
         if (row instanceof RotatingAffineLayout) {
           for (let i = 0; i < (row.batchSize ?? 0); i++) owned.push(row.extractRow(i));
         } else if (row instanceof AlignedRotatingCache) owned.push(row.extract());
-        else owned.push(...cloneKvCaches([row]));
+        else owned.push(...cloneKvCaches([row.composed ? row.composed.storage() : row]));
       }
       if (!owned.length) { this.dispose(); return; }
       const aligned = alignRotatingRows(owned); owned.length = 0;

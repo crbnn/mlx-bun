@@ -24,7 +24,7 @@ export type TargetRowLayout = MLACache | DelayedRotatingQuantizedKVCache | Rotat
 export function targetRowLayoutFactory(cache: Cache): (() => TargetRowLayout) | undefined {
   if (cache instanceof MLACache) return () => cache.makeEmptyBatch();
   if (cache instanceof DelayedRotatingQuantizedKVCache)
-    return () => new DelayedRotatingQuantizedKVCache(cache.maxSize, cache.groupSize, cache.bits, cache.start, cache.kernelSet, undefined, true);
+    return () => new DelayedRotatingQuantizedKVCache(cache.maxSize, cache.groupSize, cache.bits, cache.start, cache.kernelSet, undefined, true, cache.compose);
   if (cache instanceof RotatingAffineLayout || cache instanceof RotatingQuantizedKVCache)
     return () => new SpeculativeRotatingAffineLayout(cache.maxSize, cache.groupSize, cache.bits, cache.kernels, cache.masks);
   if (cache instanceof RotatingKVCache || cache instanceof SpeculativeRotatingKVCache) return () => new SpeculativeRotatingKVCache(cache.maxSize, cache.masks);

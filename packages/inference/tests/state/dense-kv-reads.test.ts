@@ -27,7 +27,10 @@ import { DelayedTurboQuantKVCache } from "../../src/state/delayed-turboquant-kv"
 import { createKvMaintenance } from "../../src/state/kv-maintenance";
 import { turboQuantFusedDecode } from "../../src/state/turboquant-codec";
 import { prefillCacheLayout } from "../../src/state/layout";
+import { AttentionMasks } from "../../src/state/attention-read";
+import { composedFullAttentionCache, composedSlidingAttentionCache } from "../../src/state/bf16-first-kv";
 import type { Cache } from "../../src/contracts/mlx/cache";
+import type { KvStorageScheme } from "../../src/contracts/portable/composition";
 
 const W = 8;
 const tensor = (b: number, n: number, seed: number) => {
@@ -88,13 +91,21 @@ test("an empty prepared row never converts, even from start 0", () => {
   }
 });
 
-test("per-layer policy: configured layers answer through their own scheme, unconfigured ones stay plain", () => {
-  const maintain = createKvMaintenance({ kvConfig: [{ layerIdx: 0, bits: 4, groupSize: 64 }], quantizedKvStart: 3 });
-  const caches = [plainRow(false, 5, 40), plainRow(true, 5, 42), plainRow(false, 2, 44)];
+test("per-layer policy: a configured layer's lego reads dense through the append that converts it; unconfigured layers stay plain", () => {
+  const kv: KvStorageScheme = { kind: "affine-layers", layers: [{ layer: 0, bits: 4, groupSize: 64 }], quantizedKvStart: 3, kernels: "unfused" };
+  const masks = new AttentionMasks();
+  const caches: Cache[] = [composedFullAttentionCache(kv, 0, masks, deferredTurboQuantKernels),
+    composedSlidingAttentionCache(kv, 1, W, masks), composedFullAttentionCache(kv, 2, masks, deferredTurboQuantKernels)];
   try {
-    expect(maintain.keepsDenseReads!(caches[0]!, 0)).toBe(false);
-    expect(maintain.keepsDenseReads!(caches[1]!, 1)).toBe(true);   // not in the policy
-    maintain.preparePrefill!(caches);
+    for (const [index, cache] of caches.entries()) {
+      using k = tensor(1, 2, 40 + 2 * index), v = tensor(1, 2, 41 + 2 * index);
+      for (const a of cache.updateAndFetch(k, v)) a.dispose();
+    }
+    expect(caches.map(cache => cache.denseKvReads?.appendable(0) ?? false)).toEqual([true, true, true]);
+    // The append that reaches the start reads bf16; the lego converts after it.
+    expect(denseRead(caches[0]!, 1, 46)).toEqual([[1, 2, 3, 64], [1, 2, 3, 64], "bfloat16", "bfloat16"]);
+    expect(caches.map(cache => cache.denseKvReads?.appendable(0) ?? false)).toEqual([false, true, true]);
+    createKvMaintenance(kv).preparePrefill!(caches);
     expect(caches[0]).toBeInstanceOf(DelayedQuantizedKVCache);
     expect(caches[1]).toBeInstanceOf(RotatingKVCache);
     expect(caches.map(cache => cache.denseKvReads!.appendable(0))).toEqual([false, true, true]);
@@ -103,7 +114,7 @@ test("per-layer policy: configured layers answer through their own scheme, uncon
 
 test("adoption and filtering: the query follows the rows each cache currently holds", () => {
   for (const rotating of [false, true]) {
-    const maintain = createKvMaintenance({ kvBits: 4, kvGroupSize: 64, quantizedKvStart: 5 });
+    const maintain = createKvMaintenance({ kind: "affine", bits: 4, groupSize: 64, quantizedKvStart: 5, kernels: "unfused" });
     const solo = [plainRow(rotating, 3, 50)];
     try {
       maintain.prepareBatch!(solo);   // adopt one row
@@ -194,12 +205,16 @@ const denseRead = (cache: Cache, rows: number, seed: number) => {
 };
 
 test("a TurboQuant conversion keeps dense reads: the converted entry declares them and reads its dequantized window", () => {
-  const maintain = createKvMaintenance({ turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: 3 });
-  const caches = [plainRow(false, 5, 120), plainRow(true, 5, 122)];
+  const kv: KvStorageScheme = { kind: "turbo", kBits: 8, vBits: 3, quantizedKvStart: 3 };
+  const masks = new AttentionMasks();
+  const caches: Cache[] = [composedFullAttentionCache(kv, 0, masks, deferredTurboQuantKernels), composedSlidingAttentionCache(kv, 1, W, masks)];
   try {
-    expect(caches.map((cache, index) => maintain.keepsDenseReads!(cache, index))).toEqual([true, true]);
-    maintain(caches);
-    expect(caches[0]).toBeInstanceOf(TurboQuantKVCache);   // a full layer past start converts
+    expect(caches.map(cache => cache.denseKvReads?.appendable(0))).toEqual([true, true]);
+    for (const [index, cache] of caches.entries()) {
+      using k = tensor(1, 5, 120 + 2 * index), v = tensor(1, 5, 121 + 2 * index);
+      for (const a of cache.updateAndFetch(k, v)) a.dispose();
+    }
+    expect(caches[0]!.composed!.storage()).toBeInstanceOf(TurboQuantKVCache);   // a full layer past start converts
     expect(caches[1]).toBeInstanceOf(RotatingKVCache);     // a sliding layer stays plain
     expect(caches.map(cache => cache.denseKvReads?.appendable(0))).toEqual([true, true]);
     expect(denseRead(caches[0]!, 1, 124)).toEqual([[1, 2, 6, 64], [1, 2, 6, 64], "bfloat16", "bfloat16"]);

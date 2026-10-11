@@ -25,7 +25,7 @@ export function captureRotatingDonorAttention(ring: RotatingRing): KvDonorAttent
     let values: import("@mlx-bun/mlx/ops").QuantizedTensor;
     try { values = temporalStorageView(quantizedRowStorage, ring.values!, position, range); }
     catch (error) { quantizedRowStorage.dispose(keys); throw error; }
-    return quantizedDonorAttention(keys, values, validity, ring.groupSize, ring.bits);
+    return quantizedDonorAttention(keys, values, validity, ring.kernels);
   }
   const keys = temporalStorageView(plainRowStorage, ring.keys!, position, range);
   let values: import("@mlx-bun/mlx/array").MlxArray;

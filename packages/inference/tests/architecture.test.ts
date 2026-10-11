@@ -849,7 +849,6 @@ const seamRatchet: RatchetTable = {
     "packages/inference/src/execution/batch-group.ts": 2, // no item yet: MLX_BUN_BATCH_VEC_SAMPLE, MLX_BUN_GRAMMAR_DEBUG
     "packages/inference/src/generation/speculative/sources/two-model.ts": 1, // E2 (prefill tail split)
     "packages/inference/src/layers/geglu.ts": 1, // C2
-    "packages/inference/src/layers/quantized-attention.ts": 2, // B1
     "packages/inference/src/models/glm52/model.ts": 2, // no item yet: B1 defers GLM-5.2 MLA
     "packages/inference/src/state/layout.ts": 3, // no item yet: prefillCacheLayout dispatches on cache class
     "packages/training/src/kernels/flash-cce.ts": 9, // C2 for now
