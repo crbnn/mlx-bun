@@ -2,13 +2,14 @@
 // layers against the GPU-only result: the ANE computes its channels in fp16
 // from weights the GPU writes into its buffers, so the outputs agree to fp16
 // precision. Each layer owns one program built for exactly its chunk size.
-// Requires the ANE bridge (dist/native/libmlx_bun_ane.dylib) and an Apple
-// Neural Engine; skipped otherwise, which is not evidence of a pass.
+// Opt-in: set MLX_BUN_TEST_ANE=1 on a real Apple Silicon machine (every
+// M-series chip has a Neural Engine; a virtual machine such as a hosted CI runner
+// loads the framework but cannot compile). Unset skips, which is not evidence of a pass.
 import { expect, test } from "bun:test";
 import { Dtype, MlxArray, ops } from "@mlx-bun/mlx";
 import { QuantizedLinear } from "../../src/layers/quantized-linear";
 import { TrellisLinear } from "../../src/layers/trellis-linear";
-import { AneAffineSplit, AneTrellisMlpSplit, AneTrellisMlpSplitK3i, aneAvailable } from "../../src/layers/ane-prefill-split";
+import { AneAffineSplit, AneTrellisMlpSplit, AneTrellisMlpSplitK3i } from "../../src/layers/ane-prefill-split";
 import { compiledSwiglu } from "../../src/layers/swiglu";
 
 const D = 512, R = 1024, M = 96;
@@ -47,7 +48,7 @@ function mlp(d: number, r: number, interleave: boolean, seed: number, x: MlxArra
   return { gate, up, down, expected: down.forward(mid, true) };
 }
 
-test.skipIf(!aneAvailable())("affine projection split matches the GPU projection", () => {
+test.skipIf(!process.env.MLX_BUN_TEST_ANE)("affine projection split matches the GPU projection", () => {
   const lin = affine(256, D, 1);
   using x = hidden();
   using expected = lin.forward(x);
@@ -57,7 +58,8 @@ test.skipIf(!aneAvailable())("affine projection split matches the GPU projection
 }, 120_000);
 
 for (const interleave of [false, true])
-  test.skipIf(!aneAvailable())(`Trellis whole-MLP split matches the GPU MLP (${interleave ? "3-bit interleaved" : "row-major"} down)`, () => {
+  test.skipIf(!process.env.MLX_BUN_TEST_ANE)(`Trellis whole-MLP split matches the GPU MLP (${interleave ? "3-bit interleaved" : "row-major"} down)`, () => {
+    const gate = trellis(R, D, 1, 3, 11), up = trellis(R, D, 1, 3, 23), down = trellis(R, D, 0, interleave ? 3 : 2, 37, interleave);
     using x = hidden();
     const { gate, up, down, expected } = mlp(D, R, interleave, 11, x);
     using split = (interleave ? AneTrellisMlpSplitK3i : AneTrellisMlpSplit).build(gate, up, down, 0.5, M);
@@ -66,7 +68,7 @@ for (const interleave of [false, true])
     expected.dispose();
   }, 120_000);
 
-test.skipIf(!aneAvailable())("two split layers of different shapes each own their program; disposing one leaves the other", () => {
+test.skipIf(!process.env.MLX_BUN_TEST_ANE)("two split layers of different shapes each own their program; disposing one leaves the other", () => {
   using xa = hidden(M, D), xb = hidden(2 * M, 2 * D);
   const a = mlp(D, R, false, 11, xa), b = mlp(2 * D, 2 * R, true, 41, xb);
   const splitA = AneTrellisMlpSplit.build(a.gate, a.up, a.down, 0.5, M);
@@ -81,7 +83,7 @@ test.skipIf(!aneAvailable())("two split layers of different shapes each own thei
   a.expected.dispose(); b.expected.dispose();
 }, 120_000);
 
-test.skipIf(!aneAvailable())("a split built on another's buffers keeps them after that split is disposed", () => {
+test.skipIf(!process.env.MLX_BUN_TEST_ANE)("a split built on another's buffers keeps them after that split is disposed", () => {
   using x = hidden();
   const a = mlp(D, R, false, 11, x), b = mlp(D, R, true, 53, x);
   const lender = AneTrellisMlpSplit.build(a.gate, a.up, a.down, 0.5, M);
