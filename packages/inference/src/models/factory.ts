@@ -15,7 +15,7 @@ import {
 import {
   COMPOSITION as QWEN38_TRELLIS_M4PRO_COMPOSITION, QWEN38_TRELLIS_M4PRO_GRAPH, Qwen38TrellisM4Pro,
 } from "./qwen/qwen38-27b-trellis-m4pro";
-import { GENERATED_GRAPHS } from "./gemma4/generated/index";
+import { GENERATED_GRAPHS, type GeneratedGemma4Graph } from "./gemma4/generated/index";
 import { MiniCPM5Model } from "./minicpm5/model";
 import { Qwen35Model } from "./qwen/qwen3_5";
 import { Qwen3Model } from "./qwen/qwen3";
@@ -51,7 +51,7 @@ import {
 } from "./profile";
 
 export type RuntimeModel =
-  | Gemma4Model | MiniCPM5Model | Qwen35Model | Qwen38TrellisM4Pro | Qwen3Model | Qwen3MoeModel
+  | Gemma4Model | GeneratedGemma4Graph | MiniCPM5Model | Qwen35Model | Qwen38TrellisM4Pro | Qwen3Model | Qwen3MoeModel
   | DiffusionGemmaModel | Glm52Model | UniversalDenseModel;
 
 /** A family's generic graph: the table entry that constrains nothing. */

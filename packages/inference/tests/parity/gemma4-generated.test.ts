@@ -1,24 +1,24 @@
 // Generated Gemma4 graphs against the dedicated graph on real weights. A
-// generated specialization (12B, e4b or 26B, dispatched by config fingerprint)
-// serves only the artifact's kv_config cache layout and must equal the monolith
-// bit for bit there, falling back to the monolith under plain caches. This
+// generated graph (12B, e4b or 26B, selected by config fingerprint) is an entire
+// graph built for the artifact's kv_config composition; it reads every cache
+// through that cache's own read and must equal the monolith bit for bit. This
 // ports `02d723a:tests/parity/generated-parity.test.ts` (12B and e4b cells) to
 // every registered fingerprint:
 // - createModel selects the generated graph registered for the fingerprint, for
 //   the composition it serves (`--kv-quant config`: the artifact's kv_config);
 // - three uncompiled steps over caches converted to kv_config before the first
 //   forward, from a prompt past the sliding window: byte-identical full
-//   vocabulary vectors, with at least every decode step on the unrolled path;
+//   vocabulary vectors;
 // - 24-token greedy trajectories under kv_config (quantized from token 0; stop
 //   tokens off, since e4b's first token for this raw prompt is EOS) are
-//   identical uncompiled, where every forward is generated, and with compiled
-//   decode, whose trace runs the generated layers (12B: exactly the one
-//   quantized step the dense segmented closure leaves to it, as in main);
-// - under plain bf16 caches the generated graph takes its monolith fallback:
-//   identical vectors and no generated forward;
+//   identical uncompiled and with compiled decode, whose step records the
+//   generated graph's own layers (e4b whole-graph, 12B segmented);
+// - under plain bf16 caches, which the composition does not name, the
+//   generated graph reads them through their own reads: identical vectors;
 // - two different rows in one forward over kv_config caches equal the monolith's.
-// This is within-tree specialization identity, not external-oracle parity; the
-// monolith's oracle consumer is gemma4-parity.test.ts.
+// Each case logs a digest of the generated graph's outputs, for comparing runs
+// across trees. This is within-tree specialization identity, not
+// external-oracle parity; the monolith's oracle consumer is gemma4-parity.test.ts.
 // Opt in with MLX_BUN_TEST_GENERATED_MODEL=/gemma4/snapshot (an artifact whose
 // fingerprint has a generated graph and which ships kv_config.json). Unset
 // skips; a blank value or an artifact without kv_config.json fails. No downloads.
@@ -27,7 +27,7 @@ import { strict as assert } from "node:assert";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { configureRuntime } from "@mlx-bun/inference/runtime/config";
-import { releaseAll } from "./real-weight-inputs";
+import { releaseAll, sha256 } from "./real-weight-inputs";
 
 type A = any;
 const MODEL = "MLX_BUN_TEST_GENERATED_MODEL";
@@ -49,7 +49,7 @@ export const promptLength = (window: number) => Math.max(700, window + 76);
 
 const inputs = optIn(Bun.env);
 
-test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config and falls back under plain caches", async () => {
+test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config and under plain caches", async () => {
   const ffi = await import("@mlx-bun/mlx/ffi");
   const ops = await import("@mlx-bun/mlx/ops");
   const { loadModelConfig, Weights, configFingerprint } = await import("@mlx-bun/inference/artifacts");
@@ -58,16 +58,15 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
   const { CompiledDecode } = await import("@mlx-bun/inference/models/gemma4/compiled-decode");
   const { generate } = await import("@mlx-bun/inference/generation");
   const { loadTokenizer } = await import("@mlx-bun/inference/input");
-  // The kernel set kv-maintenance composes for the flag the run has (the monolith reads through it).
+  // The kernel set kv-maintenance composes for the flag the run has (both graphs read through it).
   const { servedAffineKernels } = await import("../../src/state/served-affine-kernels");
-  // The fast-path counters live in each generated module.
-  const modules = await Promise.all([import("../../src/models/gemma4/generated/gemma4-12b"),
-    import("../../src/models/gemma4/generated/gemma4-e4b"), import("../../src/models/gemma4/generated/gemma4-26b")]);
+  const { GENERATED_GRAPHS } = await import("../../src/models/gemma4/generated");
   const path = inputs!.model;
   const config = await loadModelConfig(path);
   const fingerprint = configFingerprint(config);
-  const generated = modules.find(module => module.FINGERPRINT === fingerprint);
-  assert(generated, `no generated graph is registered for fingerprint ${fingerprint}`);
+  const registered = GENERATED_GRAPHS.find(item => item.serves.fingerprint === fingerprint);
+  assert(registered, `no generated graph is registered for fingerprint ${fingerprint}`);
+  const generated = await import(`../../src/models/gemma4/generated/${registered.id}`);
   const kvConfig = config.kvQuant;
   assert(kvConfig?.length, "the artifact's kv_config.json did not load");
   const tokenizer = await loadTokenizer(path);
@@ -78,6 +77,9 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
   const prompt = tokenizer.encode(message).slice(0, length);
   const weights = await Weights.open(path);
   let mono: A, gen: A;
+  const digest = (label: string, parts: (Buffer | number[])[]) =>
+    console.log(`[generated ${fingerprint}] ${label} digest ${sha256(Buffer.concat(parts.map(part =>
+      Array.isArray(part) ? Buffer.from(JSON.stringify(part)) : part)))}`);
   /** The last position's full vector (bytes) and its argmax. */
   const lastVector = (logits: A): { bytes: Buffer; next: number } => {
     const [, L, V] = logits.shape as [number, number, number];
@@ -85,6 +87,15 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
     using exact = ops.contiguous(last);
     using arg = ops.argmaxAxis(last, -1);
     return { bytes: Buffer.from(exact.rawBytes()), next: arg.toIntTokens()[0]! };
+  };
+  /** Fresh caches with each layer the kv_config names converted before any forward (the serve scenario). */
+  const converted = (model: A): A[] => {
+    const caches: A[] = model.makeCache();
+    for (let layer = 0; layer < caches.length; layer++) {
+      const entry = kvConfig.find(item => item.layerIdx === layer);
+      if (entry) caches[layer] = caches[layer].toQuantized(entry.groupSize, entry.bits, servedAffineKernels());
+    }
+    return caches;
   };
   try {
     mono = new Gemma4Model(weights, config);
@@ -96,13 +107,8 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
     const restore = configureRuntime({ MLX_BUN_COMPILED_DECODE: "0" });
     try {
       const steps = (model: A) => {
-        const caches: A[] = model.makeCache();
+        const caches = converted(model);
         try {
-          // The serve scenario: each cache the kv_config names converts before any forward.
-          for (let layer = 0; layer < caches.length; layer++) {
-            const entry = kvConfig.find(item => item.layerIdx === layer);
-            if (entry) caches[layer] = caches[layer].toQuantized(entry.groupSize, entry.bits, servedAffineKernels());
-          }
           const vectors: Buffer[] = [];
           let tokens = prompt;
           for (let step = 0; step < STEPS; step++) {
@@ -113,14 +119,10 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
           return vectors;
         } finally { releaseAll(caches.map(cache => () => cache.dispose())); ffi.clearCache(); }
       };
-      const before = generated.generatedForwardUses;
       const specialized = steps(gen);
-      const used = generated.generatedForwardUses - before;
-      // At least every decode step; the long first forward may also qualify.
-      expect(used).toBeGreaterThanOrEqual(STEPS - 1);
       const dedicated = steps(mono);
-      expect(generated.generatedForwardUses - before).toBe(used);
       specialized.forEach((vector, step) => expect({ step, equal: vector.equals(dedicated[step]!) }).toEqual({ step, equal: true }));
+      digest("kv_config step vectors", specialized);
     } finally { restore(); }
 
     // 2. Greedy trajectories under kv_config, uncompiled and compiled.
@@ -135,21 +137,21 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
           ffi.clearCache();
           return out;
         };
-        const before = generated.generatedForwardUses;
+        const before = CompiledDecode.stepsExecuted;
         const specialized = await run(gen);
-        const used = generated.generatedForwardUses - before;
+        const steps = CompiledDecode.stepsExecuted - before;
         const dedicated = await run(mono);
         expect(specialized.length).toBe(TOKENS);
         expect({ compiled, specialized }).toEqual({ compiled, specialized: dedicated });
-        if (!compiled) expect(used).toBeGreaterThanOrEqual(specialized.length - 1);
-        else if (fingerprint === modules[0].FINGERPRINT) expect(used).toBe(1);
-        else expect(used).toBeGreaterThanOrEqual(1);
-        console.log(`[generated ${fingerprint}] compiled ${compiled}: ${specialized.length} tokens identical, ${used} generated forwards`);
+        // The compiled run took compiled steps where the composition declares them (not the MoE 26B).
+        if (!compiled || !gen.graphCapabilities.compiledDecode) expect(steps).toBe(0);
+        else expect(steps).toBeGreaterThan(0);
+        digest(`compiled ${compiled} trajectory`, [specialized]);
+        console.log(`[generated ${fingerprint}] compiled ${compiled}: ${specialized.length} tokens identical, ${steps} compiled steps`);
       } finally { reset(); }
     }
 
-    // 3. Plain caches take the monolith fallback.
-    const before = generated.generatedForwardUses;
+    // 3. Plain caches: read through their own reads.
     const plain = (model: A) => {
       const caches: A[] = model.makeCache();
       try {
@@ -157,18 +159,15 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
         try { return lastVector(logits).bytes; } finally { logits.dispose(); }
       } finally { releaseAll(caches.map(cache => () => cache.dispose())); }
     };
-    expect(plain(gen).equals(plain(mono))).toBe(true);
-    expect(generated.generatedForwardUses).toBe(before);
+    const plainVector = plain(gen);
+    expect(plainVector.equals(plain(mono))).toBe(true);
+    digest("bf16 vector", [plainVector]);
 
     // 4. Two different rows through one forward over kv_config caches: the batch axis is not
     // assumed to be one (e4b slices its per-layer inputs per layer; row 1 must get its own).
     const rows = (model: A) => {
-      const caches: A[] = model.makeCache();
+      const caches = converted(model);
       try {
-        for (let layer = 0; layer < caches.length; layer++) {
-          const entry = kvConfig.find(item => item.layerIdx === layer);
-          if (entry) caches[layer] = caches[layer].toQuantized(entry.groupSize, entry.bits, servedAffineKernels());
-        }
         const ids = ops.fromInt32([...prompt.slice(0, ROW_TOKENS), ...prompt.slice(-ROW_TOKENS)], [2, ROW_TOKENS]);
         try {
           const hidden = model.forwardHidden(ids, caches);
@@ -176,13 +175,12 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
         } finally { ids.dispose(); }
       } finally { releaseAll(caches.map(cache => () => cache.dispose())); ffi.clearCache(); }
     };
-    const usedBefore = generated.generatedForwardUses;
     const batched = rows(gen);
-    expect(generated.generatedForwardUses - usedBefore).toBe(1);
     expect(batched.equals(rows(mono))).toBe(true);
+    digest("two rows hidden", [batched]);
   } finally {
     // Compiled closures borrow weight arrays: release their tapes before the weights.
-    try { releaseAll([mono, gen].filter(Boolean).map(model => () => CompiledDecode.for(model).dispose())); }
+    try { releaseAll([mono, gen].filter(Boolean).map(model => () => CompiledDecode.release(model))); }
     finally {
       try { weights.dispose(); }
       finally { releaseAll([...weights.shards.files.values()].map(file => () => file.mmap.unmap()).concat([() => ffi.clearCache()])); }

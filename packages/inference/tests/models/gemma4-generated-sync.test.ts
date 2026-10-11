@@ -1,25 +1,31 @@
-// The generated Gemma4 graphs are compiled from a model description by
-// scripts/gen-gemma4.ts. This regenerates every registered graph from the
-// committed hub-layout inputs (tests/fixtures/gemma4-graphs: config.json,
-// kv_config.json, and the index names the generator reads; no weights) into a
-// temp directory and fails when a committed file differs, so a change to the
-// generator or to the graph it transcribes cannot leave a stale specialization.
-// Whether a regenerated graph is numerically identical is the real-weight
-// tests/parity/gemma4-generated.test.ts.
+// The generated Gemma 4 graphs are compiled from a composition by
+// scripts/gen-gemma4.ts. This regenerates every composition from its committed
+// artifact inputs (tests/fixtures/gemma4-graphs: config.json, kv_config.json and
+// the index names the generator reads; no weights) into a temp directory and
+// fails when a committed file differs, so a change to the generator, or to the
+// blocks it composes, cannot leave a stale graph. Whether a regenerated graph
+// computes the same bits is tests/models/gemma4-generated-identity.test.ts
+// (synthetic weights) and tests/parity/gemma4-generated.test.ts (real weights).
 import { expect, test } from "bun:test";
 import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GEMMA4_GRAPHS, GENERATED_DIR, type Gemma4GraphStem } from "../../scripts/gen-gemma4";
+import { GEMMA4_COMPOSITIONS, GENERATED_DIR } from "../../scripts/gen-gemma4";
+import { loadModelConfig } from "../../src/artifacts/config";
+import { GENERATED_GEMMA_FINGERPRINTS } from "../../src/models/gemma4/family";
 import { GENERATED_GRAPHS } from "../../src/models/gemma4/generated";
+import { resolveKvScheme } from "../../src/state/kv-scheme";
+import { kvStorageOf } from "../../src/state/kv-storage";
 
 const FIXTURES = join(import.meta.dir, "../fixtures/gemma4-graphs");
 const SCRIPT = join(import.meta.dir, "../../scripts/gen-gemma4.ts");
-const stems = Object.keys(GEMMA4_GRAPHS) as Gemma4GraphStem[];
-const REPO = { "gemma4-12b": "gemma-4-12B-it-OptiQ-4bit", "gemma4-e4b": "gemma-4-e4b-it-OptiQ-4bit", "gemma4-26b": "gemma-4-26B-A4B-it-OptiQ-4bit" } as const;
+const stems = Object.keys(GEMMA4_COMPOSITIONS);
+const REPO: Readonly<Record<string, string>> = {
+  "gemma4-12b": "gemma-4-12B-it-OptiQ-4bit", "gemma4-e4b": "gemma-4-e4b-it-OptiQ-4bit", "gemma4-26b": "gemma-4-26B-A4B-it-OptiQ-4bit",
+};
 
-/** The hub-layout snapshot directory holding a stem's inputs. */
-function snapshot(stem: Gemma4GraphStem, root = FIXTURES): string {
+/** The hub-layout snapshot directory holding a composition's inputs. */
+function snapshot(stem: string, root = FIXTURES): string {
   const repo = join(root, `models--mlx-community--${REPO[stem]}`, "snapshots");
   const [hash] = readdirSync(repo);
   return join(repo, hash!);
@@ -31,7 +37,7 @@ async function run(...args: string[]) {
   return { stdout, stderr, code };
 }
 
-test("every registered generated graph equals what the generator emits from its committed inputs", async () => {
+test("every generated Gemma 4 graph equals what the generator emits from its committed inputs", async () => {
   const out = mkdtempSync(join(tmpdir(), "gen-gemma4-"));
   try {
     for (const stem of stems) {
@@ -39,33 +45,32 @@ test("every registered generated graph equals what the generator emits from its 
       expect({ stem, code: result.code, stderr: result.stderr }).toEqual({ stem, code: 0, stderr: "" });
       const committed = readFileSync(join(GENERATED_DIR, `${stem}.ts`), "utf8");
       const regenerated = readFileSync(join(out, `${stem}.ts`), "utf8");
-      // A diff here means: run `bun packages/inference/scripts/gen-gemma4.ts <snapshot> ${stem}` (the
-      // fixture snapshot works) and re-run tests/parity/gemma4-generated.test.ts on real weights.
+      // A difference here means: run `bun packages/inference/scripts/gen-gemma4.ts <snapshot> ${stem}` (the
+      // fixture snapshot works) and re-run tests/models/gemma4-generated-identity.test.ts and, on real weights,
+      // tests/parity/gemma4-generated.test.ts.
       expect({ stem, current: regenerated === committed }).toEqual({ stem, current: true });
     }
   } finally { rmSync(out, { recursive: true, force: true }); }
 });
 
-test("the table's generated entries are exactly the generated files, each serving the fingerprint and kv_config it was generated from", async () => {
+test("the table's generated entries are exactly the generated files, each serving the composition its file was generated for", async () => {
   expect(readdirSync(GENERATED_DIR).filter(file => file !== "index.ts").sort()).toEqual(stems.map(stem => `${stem}.ts`).sort());
-  const { GENERATED_GEMMA_FINGERPRINTS } = await import("../../src/models/profile");
   expect(GENERATED_GRAPHS.map(entry => entry.id).sort()).toEqual([...stems].sort());
   expect(GENERATED_GRAPHS.map(entry => entry.serves.fingerprint).sort()).toEqual(Object.values(GENERATED_GEMMA_FINGERPRINTS).sort());
-  for (const stem of stems) {
-    const module = await import(`../../src/models/gemma4/generated/${stem}`);
-    expect(module.FINGERPRINT).toBe(GENERATED_GEMMA_FINGERPRINTS[GEMMA4_GRAPHS[stem]]);
-    const entry = GENERATED_GRAPHS.find(item => item.id === stem)!;
-    expect(entry.serves.fingerprint).toBe(module.FINGERPRINT);
-    // The KV it serves is its input kv_config, as `--kv-quant config` composes it, and nothing else.
-    const kv = JSON.parse(readFileSync(join(snapshot(stem), "kv_config.json"), "utf8")) as { layer_idx: number; bits: number; group_size: number }[];
-    expect(entry.serves).toEqual({ fingerprint: module.FINGERPRINT,
-      kv: [{ kind: "affine-layers", layers: kv.map(item => ({ layer: item.layer_idx, bits: item.bits, groupSize: item.group_size })) }] });
-    // Capabilities are declared once, by Gemma4Model; a specialization only overrides its forward pass.
-    expect(Object.getOwnPropertyNames(module.GeneratedGemma4.prototype).sort()).toEqual(["constructor", "forwardLayers"]);
+  for (const entry of GENERATED_GRAPHS) {
+    const module = await import(`../../src/models/gemma4/generated/${entry.id}`);
+    // An entire graph: it extends nothing.
+    expect(Object.getPrototypeOf(module.GeneratedGemma4.prototype)).toBe(Object.prototype);
+    expect(module.COMPOSITION.fingerprint).toBe(GENERATED_GEMMA_FINGERPRINTS[GEMMA4_COMPOSITIONS[entry.id]!.key]);
+    // It serves its file's composition and nothing else: the fingerprint, and the KV scheme `--kv-quant config`
+    // resolves for the artifact.
+    const config = await loadModelConfig(snapshot(entry.id));
+    expect(entry.serves).toEqual({ fingerprint: module.COMPOSITION.fingerprint,
+      kv: [kvStorageOf(resolveKvScheme({ override: "config", config: config.kvQuant }))] });
   }
 });
 
-test("a description whose fingerprint is not the registered one is refused", async () => {
+test("a source whose fingerprint is not the registered one is refused", async () => {
   const root = mkdtempSync(join(tmpdir(), "gen-gemma4-drift-"));
   try {
     cpSync(FIXTURES, root, { recursive: true });
@@ -79,7 +84,7 @@ test("a description whose fingerprint is not the registered one is refused", asy
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("--help prints usage without a model; unknown stems and missing arguments exit non-zero", async () => {
+test("--help prints usage without a model; unknown compositions and missing arguments exit non-zero", async () => {
   const help = await run("--help");
   expect(help.code).toBe(0);
   expect(help.stdout).toContain("Usage: bun packages/inference/scripts/gen-gemma4.ts <model-dir>");

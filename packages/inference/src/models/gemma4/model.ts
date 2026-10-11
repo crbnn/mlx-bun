@@ -18,21 +18,15 @@
 // window) and attends with the kernel it was composed with. The graph never
 // inspects the query count, builds a mask or chooses a kernel; only the
 // training forward (gradient checkpointing, prefix-shared and segmented
-// training) still builds its masks, through `makeTrainingMasks`.
+// training) still builds its masks, through `makeTrainingMasks`. The blocks
+// (attention, feed-forward, per-layer inputs, KV sharing, decoder layer) live in
+// blocks.ts, which the generated graphs (generated/*.ts) compose too.
 
 import { disposeResources } from "../../runtime/resources";
-import { MlxArray } from "@mlx-bun/mlx/array";
-import { Dtype } from "@mlx-bun/mlx/ffi";
+import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
-import { isExpertTracing,recordRouting } from "../../runtime/expert-trace";
-
-// The shared, config-independent machinery lives in packages/inference/src/layers/,
-// packages/inference/src/contracts/mlx/cache.ts and packages/inference/src/state/;
-// this file keeps the architecture-specific assembly that is generated per model.
-// Re-export the base so existing importers keep one entry point.
-
 import { Checkpoint } from "@mlx-bun/mlx/checkpoint";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
@@ -43,667 +37,161 @@ import type {
 import { CompiledDecode } from "./compiled-decode";
 import type { TargetView } from "../../contracts/mlx/draft-target";
 import type { TrainableGraph } from "../../contracts/mlx/trainable";
-import { activePrefixLayout, ropeBlocks } from "../../layers/prefix-layout";
 import { gemma4Trainable, type GradCheckpointCtx, type LayerLoras } from "./trainable";
 import type { MediaEncoders, MediaSidecarProbes, MlxPromptInput, Vision } from "../../contracts/mlx/media";
 import { declareGraph } from "../capabilities";
-import { atEveryWidth, deprecatedPhase, type ReadPhase } from "../graph";
+import { atEveryWidth, deprecatedPhase } from "../graph";
 import { bindGemma4MediaInput, gemma4DraftTarget, gemma4MediaEncoders } from "./media";
-import type {
-  AttentionCache, AttentionRead, BidirectionalAttentionCache, Cache, Mask, SharedKv,
-} from "../../contracts/mlx/cache";
+import type { Cache, Mask, SharedKv } from "../../contracts/mlx/cache";
 import { isCompiledTrace } from "../../runtime/compiled-trace";
 import { runtimeFlag } from "../../runtime/config";
 import { mapPackedTokens } from "../../input/token-groups";
 import { type TokenGroup } from "../../contracts/mlx/token-work";
-import { flashAttention,flashSupported,getTrainingAttn } from "../../kernels/attention/flash";
-import { compiledGegluActive,geglu,GegluMLP } from "../../layers/geglu";
+import { flashAttention, flashSupported, getTrainingAttn } from "../../kernels/attention/flash";
+import { compiledGegluActive } from "../../layers/geglu";
 import { disposing } from "../../layers/helpers";
+import { activePrefixLayout, ropeBlocks } from "../../layers/prefix-layout";
+import { captureRopeOffsets } from "../../state/capabilities";
 import { RMSNorm } from "../../layers/normalization";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
-import { QuantizedLinear } from "../../layers/quantized-linear";
-import { QuantizedSwitchLinear } from "../../layers/quantized-switch-linear";
+import type { QuantizedLinear } from "../../layers/quantized-linear";
 import { argmaxLastPosition,logitSoftcap } from "../../kernels/logits";
 import { compiledLogitSoftcap } from "../../kernels/softcap";
-import { captureRopeOffsets } from "../../state/capabilities";
 import { AttentionMasks } from "../../state/attention-read";
 import { KVCache } from "../../state/kv";
 import { deferredTurboQuantKernels } from "../../state/turboquant-attention";
 import { RotatingKVCache } from "../../state/rotating-kv";
-
-/** The phase a Gemma 4 forward runs, named by its caller: one new position per
- * row (`decode`), a causal window of positions (`window`: prefill chunks and
- * tails, speculative verify windows), or the first window of a prompt whose
- * image tokens attend each other in both directions (`bidirectional`: a
- * borrowed bool [L] flagging them, for every row). Each names a read of the
- * cache: `AttentionCache.appendDecode`, `appendWindow`,
- * `BidirectionalAttentionCache.appendBidirectional`. Gemma 4 composes no
- * committed append. */
-export type Gemma4Phase = Exclude<ReadPhase, "committed"> | { readonly bidirectional: MlxArray };
-
-/** How an attention block reads its cache, fixed when the block is built.
- * `read` appends `k` and `v` (borrowed) for `phase` and returns the read the
- * block, and the layers sharing its keys and values, attend. */
-export interface Gemma4ReadStrategy {
-  read(cache: Cache, phase: Gemma4Phase, k: MlxArray, v: MlxArray): AttentionRead;
-}
-
-const appendFor: Readonly<Record<Exclude<ReadPhase, "committed">, (cache: Cache, k: MlxArray, v: MlxArray) => AttentionRead>> = {
-  decode: (cache, k, v) => (cache as AttentionCache).appendDecode(k, v),
-  window: (cache, k, v) => (cache as AttentionCache).appendWindow(k, v),
-};
-
-/** The cache's own read for the phase: the default strategy. */
-export const gemma4CacheRead: Gemma4ReadStrategy = Object.freeze({
-  read: (cache: Cache, phase: Gemma4Phase, k: MlxArray, v: MlxArray): AttentionRead => typeof phase === "string"
-    ? appendFor[phase](cache, k, v)
-    : (cache as BidirectionalAttentionCache).appendBidirectional(k, v, phase.bidirectional),
-});
-
-/** A donor layer's read for one forward and the positions its queries take: the
- * donor cache's offset before the append and, where the cache carries per-row
- * positions (a batched layout, a compiled-decode trace), an owned copy of them,
- * held because advancing the cache may release its own array. The layers
- * sharing the donor's keys and values attend the same read with their own
- * queries (`AttentionRead.attend` is repeatable); the forward that made it
- * disposes it once, after its last sharer. */
-export interface DonorRead {
-  readonly read: AttentionRead;
-  readonly offset: number;
-  readonly offsetArr?: MlxArray;
-  dispose(): void;
-}
+import {
+  DecoderLayer, kvDonors, PerLayerInputs, type Attention, type DonorRead, type Gemma4Phase,
+} from "./blocks";
 
 /** The training forward's donor keys and values: training caches fetch them
  * plain. */
 type PlainSharedKv = Extract<SharedKv, { kind: "plain" }>;
 
-class Attention {
-  readonly isSliding: boolean;
-  readonly windowSize: number;
-  readonly useKEqV: boolean;
-  readonly hasKv: boolean;
-  readonly headDim: number;
-  readonly nHeads: number;
-  readonly nKvHeads: number;
-  readonly ropeBase: number | null;
-  readonly ropeFreqs: MlxArray | null;
-  readonly qProj: QuantizedLinear;
-  readonly kProj: QuantizedLinear | null;
-  readonly vProj: QuantizedLinear | null;
-  readonly oProj: QuantizedLinear;
-  readonly qNorm: RMSNorm;
-  readonly kNorm: RMSNorm | null;
-  readonly vNorm: RMSNorm | null;
+/** The training forward's attention (`Gemma4Model.forwardTrainingHidden`,
+ *  gradient checkpointing and the segmented backward) over `attn`'s projections:
+ *  the plain keys and values a training cache fetches (`updateAndFetch`), roped
+ *  block-wise under a prefix-shared layout, attended under `mask` with the stock
+ *  fused SDPA or the opt-in flash kernel. Returns the attention output and the
+ *  fetched keys and values (a sharer returns `sharedIn`); the caller owns those
+ *  of a donor and disposes them after the pass.
+ *  @deprecated The segmented backward checkpoints donor keys and values as
+ *  tensors, and the prefix-shared caches have no read of their own; B1's
+ *  out-of-step items (the training flash path, the segmented backward's donor
+ *  checkpoints) give them a contract, and this path goes with them. */
+function attentionMasked(
+  attn: Attention, x: MlxArray, mask: Mask, cache: Cache | null, sharedIn: PlainSharedKv | null,
+): { out: MlxArray; shared: PlainSharedKv } {
+  const [B, L] = x.shape as [number, number, number];
 
-  constructor(
-    weights: Weights, config: ModelConfig, prefix: string, layerType: string,
-    hasKv = true,
-    /** How a donor layer reads its cache (the cache's own read). */
-    readonly reads: Gemma4ReadStrategy = gemma4CacheRead,
-  ) {
-    const t = config.text;
-    this.hasKv = hasKv;
-    this.isSliding = layerType === "sliding_attention";
-    this.windowSize = t.slidingWindow;
-    this.headDim = this.isSliding ? t.headDim : t.globalHeadDim;
-    this.nHeads = t.numAttentionHeads;
-    this.useKEqV = t.attentionKEqV && !this.isSliding;
-    this.nKvHeads = this.useKEqV ? t.numGlobalKeyValueHeads : t.numKeyValueHeads;
+  let q = attn.qProj.forward(x);
+  q = disposing(q, ops.reshape(q, [B, L, attn.nHeads, attn.headDim]));
+  q = disposing(q, attn.qNorm.forward(q));
 
-    const rp = t.ropeParameters[this.isSliding ? "sliding_attention" : "full_attention"]!;
-    if (rp.ropeType === "default") {
-      this.ropeBase = rp.ropeTheta;
-      this.ropeFreqs = null;
-    } else if (rp.ropeType === "proportional") {
-      // Port of rope_utils.ProportionalRoPE.__init__. The rotated freqs
-      // MUST be computed on-device in f32 (arange/dims, then base**x)
-      // exactly like the reference — computing them host-side in f64 and
-      // rounding to f32 lands 17/64 of them 1 ulp off (f64 pow ≠ f32
-      // powf), a latent knife-edge that tiled values exposed
-      // as a 1-ulp q-rope divergence at layer 11 (porting rule:
-      // replicate the helper's IMPLEMENTATION, not its formula).
-      const rotated = Math.floor(this.headDim * rp.partialRotaryFactor);
-      const n = this.headDim / 2;
-      const exponentsRaw = ops.arange(0, rotated, 2, Dtype.float32);
-      const dims = ops.scalarLike(this.headDim, exponentsRaw);
-      const exponents = ops.div(exponentsRaw, dims);
-      const base = ops.scalarLike(rp.ropeTheta, exponents);
-      let rotFreqs = ops.pow(base, exponents);
-      if (rp.factor !== 1.0) {
-        const f = ops.scalarLike(rp.factor, rotFreqs);
-        rotFreqs = disposing(rotFreqs, ops.mul(f, rotFreqs));
-        f.dispose();
-      }
-      this.ropeBase = null;
-      const tailLen = n - rotated / 2;
-      if (tailLen > 0) {
-        const tail = MlxArray.fromFloat32(
-          new Float32Array(tailLen).fill(Infinity), [tailLen],
-        );
-        this.ropeFreqs = ops.concatAxis([rotFreqs, tail], 0);
-        tail.dispose();
-      } else {
-        this.ropeFreqs = rotFreqs;
-      }
-      for (const a of [exponentsRaw, dims, exponents, base])
-        a.dispose();
-      if (this.ropeFreqs !== rotFreqs) rotFreqs.dispose();
-    } else {
-      throw new Error(`unsupported rope_type ${rp.ropeType}`);
-    }
-
-    this.qProj = QuantizedLinear.load(weights, `${prefix}.q_proj`, config);
-    this.kProj = hasKv ? QuantizedLinear.load(weights, `${prefix}.k_proj`, config) : null;
-    this.vProj = hasKv && !this.useKEqV
-      ? QuantizedLinear.load(weights, `${prefix}.v_proj`, config) : null;
-    this.oProj = QuantizedLinear.load(weights, `${prefix}.o_proj`, config);
-    this.qNorm = new RMSNorm(weights.tensor(`${prefix}.q_norm.weight`), t.rmsNormEps);
-    this.kNorm = hasKv
-      ? new RMSNorm(weights.tensor(`${prefix}.k_norm.weight`), t.rmsNormEps) : null;
-    this.vNorm = hasKv ? new RMSNorm(null, t.rmsNormEps) : null;
-  }
-
-  /** A number offset takes the static fast::rope; an array offset (set by
-   *  compiled-decode trace adapters) takes the dynamic variant — same
-   *  kernel, offset read from the array (bit-exactness asserted in
-   *  `02d723a:tests/unit/compile.test.ts`). */
-  rope(x: MlxArray, offset: number | MlxArray): MlxArray {
-    return typeof offset === "number"
-      ? ops.rope(x, this.headDim, this.ropeBase, offset, this.ropeFreqs)
-      : ops.ropeDynamic(x, this.headDim, this.ropeBase, offset, this.ropeFreqs);
-  }
-
-  /** `x` [B, L, hidden] (borrowed) to an owned [B, L, hidden]. A donor layer
-   *  appends its keys and values to `cache` through the read `phase` names and
-   *  returns that read (`donor`, owned by the caller, who keeps it for the
-   *  layers that share it); a KV-sharing layer attends `donor`, the read its
-   *  donor layer made in this forward, and returns null. */
-  forward(
-    x: MlxArray, cache: Cache | null, phase: Gemma4Phase, donor: DonorRead | null,
-  ): { out: MlxArray; donor: DonorRead | null } {
-    const [B, L] = x.shape as [number, number, number];
-
-    let q = this.qProj.forward(x);
-    q = disposing(q, ops.reshape(q, [B, L, this.nHeads, this.headDim]));
-    q = disposing(q, this.qNorm.forward(q));
-
-    const own = this.hasKv ? this.#append(x, cache!, phase) : null;
-    const source = own ?? donor!;
-    let attn: MlxArray;
-    try {
-      q = disposing(q, ops.transposeAxes(q, [0, 2, 1, 3]));
-      q = disposing(q, this.rope(q, source.offsetArr ?? source.offset));
-      attn = source.read.attend(q, 1.0);
-    } catch (error) {
-      own?.dispose();
-      throw error;
-    } finally { q.dispose(); }
-    const attnT = ops.transposeAxes(attn, [0, 2, 1, 3]);
-    attn.dispose();
-    const merged = ops.reshape(attnT, [B, L, -1]);
-    attnT.dispose();
-    const out = this.oProj.forward(merged);
-    merged.dispose();
-    return { out, donor: own };
-  }
-
-  /** The donor half of `forward`: this layer's keys and values, normalized and
-   *  positioned at the cache's offset, appended through the read `phase`
-   *  names. The caller owns the returned read. */
-  #append(x: MlxArray, cache: Cache, phase: Gemma4Phase): DonorRead {
-    const [B, L] = x.shape as [number, number, number];
-    let k = this.kProj!.forward(x);
-    k = disposing(k, ops.reshape(k, [B, L, this.nKvHeads, this.headDim]));
+  let shared: PlainSharedKv;
+  if (!attn.hasKv) {
+    if (!sharedIn) throw new Error("KV-shared layer received no shared KV");
+    shared = sharedIn;
+  } else {
+    if (!cache) throw new Error("donor layer requires a cache");
+    let k = attn.kProj!.forward(x);
+    k = disposing(k, ops.reshape(k, [B, L, attn.nKvHeads, attn.headDim]));
     let v: MlxArray;
-    if (this.vProj) {
-      v = this.vProj.forward(x);
-      v = disposing(v, ops.reshape(v, [B, L, this.nKvHeads, this.headDim]));
+    if (attn.vProj) {
+      v = attn.vProj.forward(x);
+      v = disposing(v, ops.reshape(v, [B, L, attn.nKvHeads, attn.headDim]));
     } else {
       v = k; // attention_k_eq_v: shared projection; norms differ below
     }
 
     const offset = cache.offset;
-    // Own the pre-write positions through every query that attends this read.
-    // Advancing a row cache may replace and release its borrowed offset array
-    // before the queries' RoPE is built.
+    // Own the pre-write positions through every query and shared-KV
+    // consumer. Advancing a row cache may replace and release its borrowed
+    // offset array before Q's RoPE is built. The fetched shared state owns
+    // this retained handle and releases it with K/V at the end of the pass.
     const offsetArr = captureRopeOffsets(cache);
 
-    const kNormed = this.kNorm!.forward(k);
+    const kNormed = attn.kNorm!.forward(k);
     const kT = ops.transposeAxes(kNormed, [0, 2, 1, 3]);
     kNormed.dispose();
-    const kRoped = this.rope(kT, offsetArr ?? offset);
+    const prefixLayout = activePrefixLayout();
+    const kRoped = prefixLayout
+      ? ropeBlocks(kT, prefixLayout, (block, offset) => attn.rope(block, offset))
+      : attn.rope(kT, offsetArr ?? offset);
     kT.dispose();
 
-    const vNormed = this.vNorm!.forward(v);
+    const vNormed = attn.vNorm!.forward(v);
     const vT = ops.transposeAxes(vNormed, [0, 2, 1, 3]);
     vNormed.dispose();
     if (v !== k) v.dispose();
     k.dispose();
 
-    let read: AttentionRead;
-    try {
-      read = this.reads.read(cache, phase, kRoped, vT);
-    } catch (error) {
-      offsetArr?.dispose();
-      throw error;
-    } finally {
-      kRoped.dispose();
-      vT.dispose();
-    }
-    return { read, offset, offsetArr, dispose() { read.dispose(); offsetArr?.dispose(); } };
+    const [keys, values] = cache.updateAndFetch(kRoped, vT);
+    kRoped.dispose();
+    vT.dispose();
+    shared = { kind: "plain", keys, values, offset, offsetArr };
   }
 
-  /** The training forward's attention (`Gemma4Model.forwardTrainingHidden`,
-   *  gradient checkpointing and the segmented backward): the plain keys and
-   *  values a training cache fetches (`updateAndFetch`), roped block-wise under
-   *  a prefix-shared layout, attended under `mask` with the stock fused SDPA or
-   *  the opt-in flash kernel. Returns the attention output and the fetched keys
-   *  and values (a sharer returns `sharedIn`); the caller owns those of a donor
-   *  and disposes them after the pass.
-   *  @deprecated The segmented backward checkpoints donor keys and values as
-   *  tensors, and the prefix-shared caches have no read of their own; B1's
-   *  out-of-step items (the training flash path, the segmented backward's donor
-   *  checkpoints) give them a contract, and this path goes with them. */
-  forwardMasked(
-    x: MlxArray, mask: Mask, cache: Cache | null, sharedIn: PlainSharedKv | null,
-  ): { out: MlxArray; shared: PlainSharedKv } {
-    const [B, L] = x.shape as [number, number, number];
+  q = disposing(q, ops.transposeAxes(q, [0, 2, 1, 3]));
+  const prefixLayoutQ = activePrefixLayout();
+  q = disposing(q, prefixLayoutQ
+    ? ropeBlocks(q, prefixLayoutQ, (block, offset) => attn.rope(block, offset))
+    : attn.rope(q, shared.offsetArr ?? shared.offset));
 
-    let q = this.qProj.forward(x);
-    q = disposing(q, ops.reshape(q, [B, L, this.nHeads, this.headDim]));
-    q = disposing(q, this.qNorm.forward(q));
-
-    let shared: PlainSharedKv;
-    if (!this.hasKv) {
-      if (!sharedIn) throw new Error("KV-shared layer received no shared KV");
-      shared = sharedIn;
-    } else {
-      if (!cache) throw new Error("donor layer requires a cache");
-      let k = this.kProj!.forward(x);
-      k = disposing(k, ops.reshape(k, [B, L, this.nKvHeads, this.headDim]));
-      let v: MlxArray;
-      if (this.vProj) {
-        v = this.vProj.forward(x);
-        v = disposing(v, ops.reshape(v, [B, L, this.nKvHeads, this.headDim]));
-      } else {
-        v = k; // attention_k_eq_v: shared projection; norms differ below
-      }
-
-      const offset = cache.offset;
-      // Own the pre-write positions through every query and shared-KV
-      // consumer. Advancing a row cache may replace and release its borrowed
-      // offset array before Q's RoPE is built. The fetched shared state owns
-      // this retained handle and releases it with K/V at the end of the pass.
-      const offsetArr = captureRopeOffsets(cache);
-
-      const kNormed = this.kNorm!.forward(k);
-      const kT = ops.transposeAxes(kNormed, [0, 2, 1, 3]);
-      kNormed.dispose();
-      const prefixLayout = activePrefixLayout();
-      const kRoped = prefixLayout
-        ? ropeBlocks(kT, prefixLayout, (block, offset) => this.rope(block, offset))
-        : this.rope(kT, offsetArr ?? offset);
-      kT.dispose();
-
-      const vNormed = this.vNorm!.forward(v);
-      const vT = ops.transposeAxes(vNormed, [0, 2, 1, 3]);
-      vNormed.dispose();
-      if (v !== k) v.dispose();
-      k.dispose();
-
-      const [keys, values] = cache.updateAndFetch(kRoped, vT);
-      kRoped.dispose();
-      vT.dispose();
-      shared = { kind: "plain", keys, values, offset, offsetArr };
-    }
-
-    q = disposing(q, ops.transposeAxes(q, [0, 2, 1, 3]));
-    const prefixLayoutQ = activePrefixLayout();
-    q = disposing(q, prefixLayoutQ
-      ? ropeBlocks(q, prefixLayoutQ, (block, offset) => this.rope(block, offset))
-      : this.rope(q, shared.offsetArr ?? shared.offset));
-
-    let attn: MlxArray;
-    const ta = getTrainingAttn();
-    if (ta === "flash" && flashSupported(q) && (mask.mode === "causal" || mask.mode === "array")) {
-      // Training, OPT-IN flash path (MLX_BUN_TRAIN_ATTN=flash) for O(L)-memory
-      // long context. NOTE the default (ops.sdpa, below) is the CORRECT and
-      // verified route: its dQ/dK/dV vjps are exact (finite-difference checked;
-      // it's what mlx-lm's tuner differentiates). The two historical bugs were
-      // in THIS flash kernel (spurious dK transpose, divergent dQ barrier),
-      // both fixed and gated by `02d723a:tests/unit/flash-attention.test.ts` vs the ops.sdpa
-      // oracle — see packages/inference/src/kernels/attention/flash.ts's routing comment. Flash also remains
-      // Gemma-guarded in the trainer (e4b >=2K SIGTRAP not yet re-validated).
-      // Full layers → window 0 (pure causal); sliding layers → their window.
-      const window = this.isSliding ? this.windowSize : 0;
-      attn = flashAttention(q, shared.keys, shared.values, 1.0, true, window);
-    } else {
-      attn = ops.sdpa(q, shared.keys, shared.values, 1.0, mask.mode, mask.arr);
-    }
-    q.dispose();
-    const attnT = ops.transposeAxes(attn, [0, 2, 1, 3]);
-    attn.dispose();
-    const merged = ops.reshape(attnT, [B, L, -1]);
-    attnT.dispose();
-    const out = this.oProj.forward(merged);
-    merged.dispose();
-    return { out, shared };
+  let out: MlxArray;
+  const ta = getTrainingAttn();
+  if (ta === "flash" && flashSupported(q) && (mask.mode === "causal" || mask.mode === "array")) {
+    // Training, OPT-IN flash path (MLX_BUN_TRAIN_ATTN=flash) for O(L)-memory
+    // long context. NOTE the default (ops.sdpa, below) is the CORRECT and
+    // verified route: its dQ/dK/dV vjps are exact (finite-difference checked;
+    // it's what mlx-lm's tuner differentiates). The two historical bugs were
+    // in THIS flash kernel (spurious dK transpose, divergent dQ barrier),
+    // both fixed and gated by `02d723a:tests/unit/flash-attention.test.ts` vs the ops.sdpa
+    // oracle — see packages/inference/src/kernels/attention/flash.ts's routing comment. Flash also remains
+    // Gemma-guarded in the trainer (e4b >=2K SIGTRAP not yet re-validated).
+    // Full layers → window 0 (pure causal); sliding layers → their window.
+    const window = attn.isSliding ? attn.windowSize : 0;
+    out = flashAttention(q, shared.keys, shared.values, 1.0, true, window);
+  } else {
+    out = ops.sdpa(q, shared.keys, shared.values, 1.0, mask.mode, mask.arr);
   }
+  q.dispose();
+  const attnT = ops.transposeAxes(out, [0, 2, 1, 3]);
+  out.dispose();
+  const merged = ops.reshape(attnT, [B, L, -1]);
+  attnT.dispose();
+  return { out: disposing(merged, attn.oProj.forward(merged)), shared };
 }
 
-// --- MoE block (26B-A4B) — port of reference Router/Experts/SwitchGLU ----
-// (gemma4_text.py + switch_layers.py in the oracle venv). The checkpoint
-// ships pre-stacked switch_glu tensors [experts, out, in/packed]; only the
-// quantized path exists here (all our targets are OptiQ quants).
-
-/** Port of reference Router: norm -> scale -> project -> top-k -> renormalize. */
-class Router {
-  readonly proj: QuantizedLinear;
-  /** scale · hidden_size^-0.5, precomputed (identical ops to the per-call
-   *  product in the reference: bf16 array × weak scalar). */
-  readonly normWeight: MlxArray;
-  readonly perExpertScale: MlxArray;
-  readonly eps: number;
-  readonly numExperts: number;
-  readonly topK: number;
-  /** Decoder layer index (parsed from the weight prefix) — for E0 tracing. */
-  readonly layerIdx: number;
-
-  constructor(weights: Weights, config: ModelConfig, prefix: string) {
-    const t = config.text;
-    this.layerIdx = Number(prefix.match(/layers\.(\d+)/)?.[1] ?? -1);
-    this.proj = QuantizedLinear.load(weights, `${prefix}.proj`, config);
-    // weights.tensor() returns the Weights-owned cached array — do NOT
-    // dispose it (a second model over the same Weights would get a dead
-    // handle; Weights.dispose() frees it at end of life)
-    const scale = weights.tensor(`${prefix}.scale`);
-    this.normWeight = ops.mulScalar(scale, Math.pow(t.hiddenSize, -0.5));
-    this.perExpertScale = weights.tensor(`${prefix}.per_expert_scale`);
-    this.eps = t.rmsNormEps;
-    this.numExperts = t.numExperts;
-    this.topK = t.topKExperts;
-  }
-
-  /** x [B, L, H] → { indices [B, L, k] (uint32), weights [B, L, k] }. */
-  forward(x: MlxArray): { indices: MlxArray; weights: MlxArray } {
-    const normed = ops.rmsNorm(x, this.normWeight, this.eps);
-    const scores = this.proj.forward(normed);
-    normed.dispose();
-
-    const part = ops.argpartitionAxis(scores, this.numExperts - this.topK, -1);
-    const [B, L] = scores.shape as [number, number, number];
-    let indices: MlxArray;
-    if (isCompiledTrace()) {
-      const start = ops.fromInt32([this.numExperts - this.topK], [1]);
-      indices = ops.sliceDynamic(part, start, [2], [B, L, this.topK]);
-      start.dispose();
-    } else {
-      indices = part.slice([0, 0, this.numExperts - this.topK], [B, L, this.numExperts]);
-    }
-    part.dispose();
-
-    let w = ops.takeAlongAxis(scores, indices, -1);
-    scores.dispose();
-    w = disposing(w, ops.softmaxAxis(w, -1, false));
-    const gathered = ops.takeAxis(this.perExpertScale, indices, 0);
-    w = disposing(w, ops.mul(w, gathered));
-    gathered.dispose();
-    if (isExpertTracing()) recordRouting(this.layerIdx, indices);
-    return { indices, weights: w };
-  }
+/** The training forward's attention sub-block of `layer` (see
+ *  `DecoderLayer.forwardAttn`): inputNorm → `attentionMasked` → postAttnNorm →
+ *  residual add.
+ *  @deprecated With `attentionMasked`. */
+function layerAttnMasked(
+  layer: DecoderLayer, x: MlxArray, mask: Mask, cache: Cache | null, sharedIn: PlainSharedKv | null,
+): { h: MlxArray; shared: PlainSharedKv } {
+  let h = layer.inputNorm.forward(x);
+  const { out, shared } = attentionMasked(layer.attn, h, mask, cache, sharedIn);
+  h.dispose();
+  h = out;
+  h = disposing(h, layer.postAttnNorm.forward(h));
+  h = disposing(h, ops.add(x, h));
+  return { h, shared };
 }
 
-/** Port of switch_layers.SwitchGLU (geglu activation), quantized path. */
-class SwitchGLU {
-  readonly gate: QuantizedSwitchLinear;
-  readonly up: QuantizedSwitchLinear;
-  readonly down: QuantizedSwitchLinear;
-
-  constructor(weights: Weights, config: ModelConfig, prefix: string) {
-    this.gate = QuantizedSwitchLinear.load(weights, `${prefix}.gate_proj`, config);
-    this.up = QuantizedSwitchLinear.load(weights, `${prefix}.up_proj`, config);
-    this.down = QuantizedSwitchLinear.load(weights, `${prefix}.down_proj`, config);
-  }
-
-  /** x [B, L, H], indices [B, L, k] → [B, L, k, H]. */
-  forward(x: MlxArray, indices: MlxArray): MlxArray {
-    // x → [B, L, 1, 1, H] (reference expand_dims(x, (-2, -3)))
-    let h = ops.expandDims(x, -2);
-    h = disposing(h, ops.expandDims(h, -3));
-
-    // Sort tokens by expert when there are many rows (reference threshold).
-    const doSort = indices.size >= 64;
-    let idx = indices;
-    let invOrder: MlxArray | null = null;
-    let order: MlxArray | null = null;
-    if (doSort) {
-      // _gather_sort: flatten indices, argsort, gather rows by order // k
-      const k = indices.shape[indices.ndim - 1]!;
-      const idxFlat = ops.reshape(indices, [indices.size]);
-      order = ops.argsortAxis(idxFlat, 0);
-      invOrder = ops.argsortAxis(order, 0);
-      const kScalar = ops.scalarLike(k, order);
-      const rowIdx = ops.floorDivide(order, kScalar);
-      kScalar.dispose();
-      const [, , , , H] = h.shape as number[];
-      const flat = ops.reshape(h, [-1, 1, H!]);
-      h.dispose();
-      h = ops.takeAxis(flat, rowIdx, 0);
-      flat.dispose();
-      rowIdx.dispose();
-      idx = ops.takeAxis(idxFlat, order, 0);
-      idxFlat.dispose();
-    }
-
-    const xUp = this.up.forward(h, idx, doSort);
-    const xGate = this.gate.forward(h, idx, doSort);
-    h.dispose();
-    // GeGLU activation: gelu_approx(gate) · up. The oracle SwitchGLU uses the SAME
-    // @mx.compile'd geglu as the dense MLP (activation=GeGLU(), switch_layers.py).
-    const mid = geglu(xGate, xUp);
-    let y = this.down.forward(mid, idx, doSort);
-    mid.dispose();
-    if (idx !== indices) idx.dispose();
-
-    if (doSort) {
-      // _scatter_unsort: restore row order, unflatten to indices.shape
-      y = disposing(y, ops.takeAxis(y, invOrder!, 0));
-      invOrder!.dispose();
-      order!.dispose();
-      const [B, L, k] = indices.shape as number[];
-      const H = y.shape[y.ndim - 1]!;
-      y = disposing(y, ops.reshape(y, [B!, L!, k!, 1, H]));
-    }
-
-    // squeeze(-2)
-    const shape = y.shape;
-    shape.splice(shape.length - 2, 1);
-    return disposing(y, ops.reshape(y, shape));
-  }
-}
-
-/** Port of reference Experts: switch_glu then top-k weighted sum. */
-class Experts {
-  readonly switchGlu: SwitchGLU;
-
-  constructor(weights: Weights, config: ModelConfig, prefix: string) {
-    this.switchGlu = new SwitchGLU(weights, config, `${prefix}.switch_glu`);
-  }
-
-  forward(x: MlxArray, indices: MlxArray, weights: MlxArray): MlxArray {
-    const w = ops.expandDims(weights, -1);
-    const y = this.switchGlu.forward(x, indices);
-    const wy = ops.mul(w, y);
-    w.dispose();
-    y.dispose();
-    return disposing(wy, ops.sumAxis(wy, -2, false));
-  }
-}
-
-export class DecoderLayer {
-  readonly attn: Attention;
-  readonly mlp: GegluMLP;
-  readonly inputNorm: RMSNorm;
-  readonly postAttnNorm: RMSNorm;
-  readonly preFfNorm: RMSNorm;
-  readonly postFfNorm: RMSNorm;
-  readonly layerScalar: MlxArray | null;
-  readonly layerType: string;
-  // 26B-A4B MoE block (dense MLP + routed experts in parallel branches)
-  readonly router: Router | null;
-  readonly experts: Experts | null;
-  readonly postFfNorm1: RMSNorm | null;
-  readonly postFfNorm2: RMSNorm | null;
-  readonly preFfNorm2: RMSNorm | null;
-  // e2b/e4b per-layer input gating
-  readonly perLayerGate: QuantizedLinear | null;
-  readonly perLayerProjection: QuantizedLinear | null;
-  readonly postPerLayerNorm: RMSNorm | null;
-
-  constructor(weights: Weights, config: ModelConfig, prefixBase: string, idx: number, hasKv: boolean) {
-    const prefix = `${prefixBase}.layers.${idx}`;
-    const t = config.text;
-    this.layerType = t.layerTypes[idx]!;
-    this.attn = new Attention(weights, config, `${prefix}.self_attn`, this.layerType, hasKv);
-    this.mlp = new GegluMLP(weights, config, `${prefix}.mlp`);
-    const norm = (n: string) => new RMSNorm(weights.tensor(`${prefix}.${n}.weight`), t.rmsNormEps);
-    this.inputNorm = norm("input_layernorm");
-    this.postAttnNorm = norm("post_attention_layernorm");
-    this.preFfNorm = norm("pre_feedforward_layernorm");
-    this.postFfNorm = norm("post_feedforward_layernorm");
-    this.layerScalar = weights.has(`${prefix}.layer_scalar`)
-      ? weights.tensor(`${prefix}.layer_scalar`)
-      : null;
-    if (t.enableMoeBlock) {
-      this.router = new Router(weights, config, `${prefix}.router`);
-      this.experts = new Experts(weights, config, `${prefix}.experts`);
-      this.postFfNorm1 = norm("post_feedforward_layernorm_1");
-      this.postFfNorm2 = norm("post_feedforward_layernorm_2");
-      this.preFfNorm2 = norm("pre_feedforward_layernorm_2");
-    } else {
-      this.router = this.experts = null;
-      this.postFfNorm1 = this.postFfNorm2 = this.preFfNorm2 = null;
-    }
-    if (t.hiddenSizePerLayerInput > 0) {
-      this.perLayerGate = QuantizedLinear.load(weights, `${prefix}.per_layer_input_gate`, config);
-      this.perLayerProjection = QuantizedLinear.load(weights, `${prefix}.per_layer_projection`, config);
-      this.postPerLayerNorm = norm("post_per_layer_input_norm");
-    } else {
-      this.perLayerGate = this.perLayerProjection = null;
-      this.postPerLayerNorm = null;
-    }
-  }
-
-  /** `x` [B, L, hidden] (borrowed) to an owned [B, L, hidden], the attention
-   *  block reading `cache` for `phase` (a donor) or attending `donor` (a
-   *  KV-sharing layer). Returns a donor layer's read, which the caller owns. */
-  forward(
-    x: MlxArray, cache: Cache | null, phase: Gemma4Phase,
-    donor: DonorRead | null, perLayerInput: MlxArray | null,
-  ): { h: MlxArray; donor: DonorRead | null } {
-    // Composed from the two sub-blocks (the intra-layer min-cut is the post-attn
-    // residual `hMid` [1,T,hidden]). `forwardMlp` borrows hMid.
-    const { h: hMid, donor: made } = this.forwardAttn(x, cache, phase, donor);
-    let h: MlxArray;
-    try { h = this.forwardMlp(hMid, perLayerInput); }
-    catch (error) { made?.dispose(); throw error; }
-    finally { hMid.dispose(); }
-    return { h, donor: made };
-  }
-
-  /** Attention sub-block: inputNorm → attn → postAttnNorm → residual add.
-   *  Returns the post-attn residual stream `h` [B,T,hidden] (the intra-layer
-   *  boundary) and a donor layer's read (null for a sharer). `x` is borrowed
-   *  (never disposed). The e4b donor threading lives entirely here. */
-  forwardAttn(
-    x: MlxArray, cache: Cache | null, phase: Gemma4Phase, donor: DonorRead | null,
-  ): { h: MlxArray; donor: DonorRead | null } {
-    let h = this.inputNorm.forward(x);
-    const { out, donor: made } = this.attn.forward(h, cache, phase, donor);
-    h.dispose();
-    h = out;
-    h = disposing(h, this.postAttnNorm.forward(h));
-    h = disposing(h, ops.add(x, h));
-    return { h, donor: made };
-  }
-
-  /** The training forward's layer (see `Attention.forwardMasked`). The split
-   *  into two sub-blocks lets the checkpoint path rematerialize attention and
-   *  MLP separately (peak attn+MLP → max(attn,MLP)+hMid).
-   *  @deprecated With `Attention.forwardMasked`. */
-  forwardMasked(
-    x: MlxArray, mask: Mask, cache: Cache | null,
-    sharedIn: PlainSharedKv | null, perLayerInput: MlxArray | null,
-  ): { h: MlxArray; shared: PlainSharedKv } {
-    const { h: hMid, shared } = this.forwardAttnMasked(x, mask, cache, sharedIn);
-    const h = this.forwardMlp(hMid, perLayerInput);
-    hMid.dispose();
-    return { h, shared };
-  }
-
-  /** The training forward's attention sub-block (see `forwardAttn`).
-   *  @deprecated With `Attention.forwardMasked`. */
-  forwardAttnMasked(
-    x: MlxArray, mask: Mask, cache: Cache | null, sharedIn: PlainSharedKv | null,
-  ): { h: MlxArray; shared: PlainSharedKv } {
-    let h = this.inputNorm.forward(x);
-    const { out, shared } = this.attn.forwardMasked(h, mask, cache, sharedIn);
-    h.dispose();
-    h = out;
-    h = disposing(h, this.postAttnNorm.forward(h));
-    h = disposing(h, ops.add(x, h));
-    return { h, shared };
-  }
-
-  /** MLP sub-block: FFN (dense or MoE) + postFfNorm + residual add, then the
-   *  e4b per-layer-input gate and layer scalar. `hMid` (the attn sub-block's
-   *  output) is BORROWED — the caller owns/disposes it (it is the checkpoint
-   *  boundary leaf), so this never disposes it. */
-  forwardMlp(hMid: MlxArray, perLayerInput: MlxArray | null): MlxArray {
-    let f: MlxArray;
-    if (this.router && this.experts) {
-      // MoE: dense MLP and routed experts as parallel branches off hMid
-      // (reference DecoderLayer, enable_moe path)
-      let h1 = this.preFfNorm.forward(hMid);
-      h1 = disposing(h1, this.mlp.forward(h1));
-      h1 = disposing(h1, this.postFfNorm1!.forward(h1));
-
-      const { indices, weights: topKWeights } = this.router.forward(hMid);
-      let h2 = this.preFfNorm2!.forward(hMid);
-      h2 = disposing(h2, this.experts.forward(h2, indices, topKWeights));
-      h2 = disposing(h2, this.postFfNorm2!.forward(h2));
-      indices.dispose();
-      topKWeights.dispose();
-
-      f = ops.add(h1, h2);
-      h1.dispose();
-      h2.dispose();
-    } else {
-      f = this.preFfNorm.forward(hMid);
-      f = disposing(f, this.mlp.forward(f));
-    }
-    f = disposing(f, this.postFfNorm.forward(f));
-    let h = ops.add(hMid, f); // hMid borrowed — NOT disposed here
-    f.dispose();
-
-    // per-layer input gating (reference gemma4_text DecoderLayer). gelu(gate)·pli
-    // is the second GeGLU site — the bit-exact spelled-out gelu+mul.
-    if (this.perLayerGate && this.perLayerProjection && this.postPerLayerNorm && perLayerInput) {
-      const res2 = h;
-      let gate = this.perLayerGate.forward(h);
-      gate = disposing(gate, ops.geluApprox(gate));
-      gate = disposing(gate, ops.mul(gate, perLayerInput));
-      gate = disposing(gate, this.perLayerProjection.forward(gate));
-      gate = disposing(gate, this.postPerLayerNorm.forward(gate));
-      h = ops.add(res2, gate);
-      res2.dispose();
-      gate.dispose();
-    }
-
-    if (this.layerScalar) h = disposing(h, ops.mul(h, this.layerScalar));
-    return h;
-  }
+/** The training forward's layer (see `attentionMasked`). The split into two
+ *  sub-blocks lets the checkpoint path rematerialize attention and MLP
+ *  separately (peak attn+MLP → max(attn,MLP)+hMid).
+ *  @deprecated With `attentionMasked`. */
+function layerMasked(
+  layer: DecoderLayer, x: MlxArray, mask: Mask, cache: Cache | null,
+  sharedIn: PlainSharedKv | null, perLayerInput: MlxArray | null,
+): { h: MlxArray; shared: PlainSharedKv } {
+  const { h: hMid, shared } = layerAttnMasked(layer, x, mask, cache, sharedIn);
+  const h = layer.forwardMlp(hMid, perLayerInput);
+  hMid.dispose();
+  return { h, shared };
 }
 
 export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
@@ -765,7 +253,8 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    *  (live decode); else the full [1,L,H] (offline regen). The caller owns and
    *  disposes the captured arrays. Additive/read-only → parity untouched. */
   hiddenTap: { layers: Set<number>; pos?: number; captured: Map<number, MlxArray> } | null = null;
-  // e2b/e4b per-layer input machinery
+  // e2b/e4b per-layer input machinery (the block and its parts)
+  readonly perLayerInputs: PerLayerInputs | null;
   readonly perLayerEmbed: QuantizedEmbedding | null;
   readonly perLayerModelProjection: QuantizedLinear | null;
   readonly perLayerProjectionNorm: RMSNorm | null;
@@ -795,18 +284,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
     );
     // previous_kvs (reference Gemma4TextModel): sharer j uses the LAST
     // donor of its own layer type
-    this.previousKvs = this.layers.map((_, i) => i);
-    if (t.numKvSharedLayers > 0) {
-      const lastByType: Record<string, number> = {};
-      for (let i = 0; i < this.numDonors; i++)
-        lastByType[this.layers[i]!.layerType] = i;
-      for (let j = this.numDonors; j < this.layers.length; j++) {
-        const donor = lastByType[this.layers[j]!.layerType];
-        if (donor === undefined)
-          throw new Error(`no donor layer of type ${this.layers[j]!.layerType}`);
-        this.previousKvs[j] = donor;
-      }
-    }
+    this.previousKvs = kvDonors(this.layers.map(layer => layer.layerType), this.numDonors);
     this.cacheIndex = this.layers.map((_, i) => (i < this.numDonors ? i : -1));
 
     this.finalNorm = new RMSNorm(
@@ -816,18 +294,11 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
     this.embedScale = Math.sqrt(t.hiddenSize);
     this.windowSize = t.slidingWindow;
 
-    if (t.hiddenSizePerLayerInput > 0) {
-      this.perLayerEmbed = QuantizedEmbedding.load(weights, `${prefixBase}.embed_tokens_per_layer`, config);
-      this.perLayerModelProjection = QuantizedLinear.load(weights, `${prefixBase}.per_layer_model_projection`, config);
-      this.perLayerProjectionNorm = new RMSNorm(
-        weights.tensor(`${prefixBase}.per_layer_projection_norm.weight`), t.rmsNormEps,
-      );
-      this.perLayerWidth = t.hiddenSizePerLayerInput;
-    } else {
-      this.perLayerEmbed = this.perLayerModelProjection = null;
-      this.perLayerProjectionNorm = null;
-      this.perLayerWidth = 0;
-    }
+    this.perLayerInputs = t.hiddenSizePerLayerInput > 0 ? new PerLayerInputs(weights, config, prefixBase) : null;
+    this.perLayerEmbed = this.perLayerInputs?.embed ?? null;
+    this.perLayerModelProjection = this.perLayerInputs?.modelProjection ?? null;
+    this.perLayerProjectionNorm = this.perLayerInputs?.projectionNorm ?? null;
+    this.perLayerWidth = this.perLayerInputs?.width ?? 0;
     this.#packMixedMlp = runtimeFlag("MLX_BUN_MIXED_PACKED_MLP", true);
   }
 
@@ -935,25 +406,9 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
   });
 
   /** Per-layer inputs (reference _get_per_layer_inputs +
-   *  _project_per_layer_inputs): [1, L, nLayers, perLayerWidth]. */
+   *  _project_per_layer_inputs): [B, L, nLayers, perLayerWidth] (`PerLayerInputs.compute`). */
   protected computePerLayerInputs(ids: MlxArray, hScaled: MlxArray): MlxArray {
-    const t = this.config.text;
-    const B = ids.shape[0]!;
-    const L = ids.shape[1]!;
-    let pli = this.perLayerEmbed!.encode(ids); // [B, L, nLayers*width]
-    pli = disposing(pli, ops.mulScalar(pli, Math.sqrt(this.perLayerWidth)));
-    pli = disposing(pli, ops.reshape(pli, [B, L, t.numHiddenLayers, this.perLayerWidth]));
-
-    let proj = this.perLayerModelProjection!.forward(hScaled);
-    proj = disposing(proj, ops.mulScalar(proj, 1 / Math.sqrt(t.hiddenSize)));
-    proj = disposing(proj, ops.reshape(proj, [B, L, t.numHiddenLayers, this.perLayerWidth]));
-    proj = disposing(proj, this.perLayerProjectionNorm!.forward(proj));
-
-    let combined = ops.add(proj, pli);
-    proj.dispose();
-    pli.dispose();
-    combined = disposing(combined, ops.mulScalar(combined, Math.SQRT1_2));
-    return combined;
+    return this.perLayerInputs!.compute(ids, hScaled);
   }
 
   /** Pre-merged (unscaled) input embeddings → hidden states. Used by the
@@ -1015,9 +470,9 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    *  `forwardHiddenMixed`'s single group): the shared adapter derives the phase,
    *  and a window over an image mask (`bidir`, bool [L]) is the bidirectional
    *  read. While the trainer checkpoints (`gradCkpt`), the training forward.
-   *  @deprecated The generated graphs (generated/*.ts) override this with their
-   *  unrolled forward and fall back here; D2 regenerates them onto the named
-   *  phases and E2 deletes the adapter, and this hook goes with both. */
+   *  @deprecated E2 deletes the adapter, and this hook goes with it. Since D2
+   *  the generated graphs (generated/*.ts) are entire graphs and no longer
+   *  override it. */
   protected forwardLayers(
     h0: MlxArray, cache: Cache[], bidir: MlxArray | null, ids: MlxArray | null,
   ): MlxArray {
@@ -1072,20 +527,9 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
   }
 
   /** Layer `i`'s per-layer input [B, L, width] (owned) from the model's
-   *  [B, L, nLayers, width] tensor. A compiled-decode trace slices at an array
-   *  start, which replays at every step. */
+   *  [B, L, nLayers, width] tensor (`PerLayerInputs.layer`). */
   #perLayerInput(perLayer: MlxArray, i: number, B: number, L: number): MlxArray {
-    let pls: MlxArray;
-    if (isCompiledTrace()) {
-      const start = ops.fromInt32([i], [1]);
-      pls = ops.sliceDynamic(perLayer, start, [2], [B, L, 1, this.perLayerWidth]);
-      start.dispose();
-    } else {
-      pls = perLayer.slice([0, 0, i, 0], [B, L, i + 1, this.perLayerWidth]);
-    }
-    const r = ops.reshape(pls, [B, L, this.perLayerWidth]);
-    pls.dispose();
-    return r;
+    return this.perLayerInputs!.layer(perLayer, i, B, L);
   }
 
   /** The training forward over training caches (`TrainingCache`,
@@ -1126,7 +570,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
       const layerCache = ci === -1 ? null : cache[ci]!;
       const { h: next, shared } = this.gradCkpt
         ? this.runCheckpointedLayer(i, layer, h, mask, layerCache, sharedIn, pls)
-        : layer.forwardMasked(h, mask, layerCache, sharedIn, pls);
+        : layerMasked(layer, h, mask, layerCache, sharedIn, pls);
       pls?.dispose();
       h.dispose();
       h = next;
@@ -1217,7 +661,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
 
 
   // --- Segmented-backward support (`02d723a:docs/design/orpo-training.md`
-  // §5.3). These run the training forward's layers (`forwardMasked`). The
+  // §5.3). These run the training forward's layers (`layerMasked`). The
   // segmented driver builds masks + per-layer inputs ONCE, then drives
   // runLayerRange per segment, threading the KV-shared donor K/V across segment
   // boundaries.
@@ -1233,7 +677,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    *  once, shared across all segments, and the training forward's masks
    *  (`forwardTrainingHidden`). Caller owns the returned arrays (dispose each
    *  mask.arr).
-   *  @deprecated With `Attention.forwardMasked`: the training caches' own reads
+   *  @deprecated With `attentionMasked`: the training caches' own reads
    *  will build these. */
   makeTrainingMasks(cache: Cache[], L: number): Map<string, Mask> {
     const masks = new Map<string, Mask>();
@@ -1307,7 +751,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
         sl.dispose();
       }
       const mask = masks.get(layer.layerType)!;
-      const { h: next, shared } = layer.forwardMasked(cur, mask, isDonor ? cache[ci]! : null, sharedIn, pls);
+      const { h: next, shared } = layerMasked(layer, cur, mask, isDonor ? cache[ci]! : null, sharedIn, pls);
       pls?.dispose();
       if (i > aIdx) cur.dispose(); // keep the input boundary leaf; drop interiors
       cur = next;
@@ -1369,7 +813,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
       const saved = lws.map((lw) => [lw.a, lw.b] as [MlxArray, MlxArray]);
       for (const lw of lws) { lw.a = ins[k++]!; lw.b = ins[k++]!; }
       try {
-        const out = layer.forwardMasked(hIn, { mode: maskMode, arr: mArr }, layerCache, sharedInRebuilt, plsIn);
+        const out = layerMasked(layer, hIn, { mode: maskMode, arr: mArr }, layerCache, sharedInRebuilt, plsIn);
         if (!isSharer && out.shared && out.shared.kind === "plain")
           return [out.h, out.shared.keys, out.shared.values];
         return [out.h];
@@ -1423,7 +867,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
       const saved = attnLws.map((lw) => [lw.a, lw.b] as [MlxArray, MlxArray]);
       for (const lw of attnLws) { lw.a = ins[k++]!; lw.b = ins[k++]!; }
       try {
-        const out = layer.forwardAttnMasked(hIn, { mode: maskMode, arr: mArr }, layerCache, sharedInRebuilt);
+        const out = layerAttnMasked(layer, hIn, { mode: maskMode, arr: mArr }, layerCache, sharedInRebuilt);
         if (!isSharer && out.shared && out.shared.kind === "plain")
           return [out.h, out.shared.keys, out.shared.values];
         return [out.h];
