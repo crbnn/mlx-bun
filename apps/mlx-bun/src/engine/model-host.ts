@@ -66,8 +66,8 @@ export interface ModelContext<Model = RuntimeModel> {
   media: MediaPreparation;
   adapters: AdapterService;
   /** Per-layer KV quantization from the repo's kv_config.json (null if
-   *  absent). Applied by default — optiq serve's headline behavior;
-   *  ServerOptions.kvQuant overrides ("off" | uniform bits). */
+   *  absent): what `--kv-quant config` composes into the loaded model's KV
+   *  scheme (`composition.kv`). */
   kvConfig: KvQuantSpec[] | null;
   /** Model-author recommended sampling from generation_config.json —
    *  optiq serve injects these as server defaults (gen_config.py);

@@ -32,7 +32,6 @@ describe("planRequest", () => {
         stopSequences: ["END"],
         repetitionPenalty: 1.1,
         presencePenalty: 0.2,
-        kvBits: 4,
       },
       adapterIds: ["adapter-a"],
       hasGrammar: true,
@@ -45,7 +44,6 @@ describe("planRequest", () => {
       hasAdapters: true,
       hasRepetitionPenalty: true,
       hasLogitsExtras: true,
-      kvQuant: true,
       hasGrammar: true,
     });
   });

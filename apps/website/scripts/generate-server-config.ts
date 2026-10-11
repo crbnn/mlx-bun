@@ -24,7 +24,7 @@ export const DIRECT_ENV_READS = [
 ];
 /** Only what the code cannot say. Each named key or serve flag must still exist. */
 export const NOTES: readonly { names: string[]; text: string }[] = [
-  { names: ["MLX_BUN_NO_FUSED_SDPA", "--fused-sdpa", "--kv-quant"], text: "`serve` and `generate` write `0` when fused SDPA resolves on and `1` otherwise, replacing the environment's value (`generate` for its own run only). `--fused-sdpa on|off` decides; without it, fused SDPA is on only when the KV choice (`--kv-quant`, or `--l2`'s model-config KV) is `config`. `1` turns off the fused quantized-KV attention tiles." },
+  { names: ["--fused-sdpa", "--kv-quant"], text: "`--fused-sdpa on|off` picks the read kernels of affine-quantized KV when the model loads: `on`, the fused quantized-KV attention tiles for windows under a causal mask; `off`, the unfused path for every read. Without it, fused SDPA is on only when the KV choice (`--kv-quant`, or `--l2`'s model-config KV) is `config`." },
   { names: ["MLX_BUN_RD_PREFILL_CHUNK"], text: "Unset, the model's prefill policy picks the chunk: 2048 tokens, halved for linear-attention models at long context to bound the attention workspace. The `2048` shown for its `number` read applies only to a set, non-numeric value." },
   { names: ["--prompt-cache"], text: "`--prompt-cache` is in GiB (N × 2^30 bytes), but the cap without it is 8e9 bytes (decimal 8 GB, about 7.45 GiB)." },
   { names: ["MLX_BUN_PAGED_KV", "--paged-kv"], text: "`--paged-kv` or `MLX_BUN_PAGED_KV=1` turns paging on; no flag turns an environment `1` off, and either satisfies `--paged-kv-block-size`." },

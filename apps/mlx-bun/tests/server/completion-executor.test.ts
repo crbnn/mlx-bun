@@ -127,7 +127,7 @@ describe("CompletionExecutor", () => {
     let usageProgress: Readonly<CompletionUsage> | undefined;
     let observedPlacement: CompletionPlacement | undefined;
     const ownership = new RequestOwnership();
-    const kvConfig = [{ layerIdx: 0, bits: 4, groupSize: 64 }];
+    const logitBias: Record<number, number> = { 5: -100 };
 
     const prepared = prepareCompletion({
       requestId: "chatcmpl-test",
@@ -137,8 +137,7 @@ describe("CompletionExecutor", () => {
           maxTokens: 8,
           temperature: 0.25,
           stopSequences: [],
-          kvConfig,
-          quantizedKvStart: 0,
+          logitBias,
         },
         requestedMaxTokens: 8,
         contextLimit: 32,
@@ -202,11 +201,11 @@ describe("CompletionExecutor", () => {
         maxTokens: 8,
         temperature: 0.25,
         adapters: ["careful-adapter"],
-        quantizedKvStart: 0,
+        logitBias,
       }),
     ]);
-    expect(engine.seenOptions[0]!.kvConfig).toEqual(kvConfig);
-    expect(engine.seenOptions[0]!.kvConfig).not.toBe(kvConfig);
+    expect(engine.seenOptions[0]!.logitBias).toEqual(logitBias);
+    expect(engine.seenOptions[0]!.logitBias).not.toBe(logitBias);
     expect(observedPlacement).toMatchObject({
       mechanism: "continuous",
       lane: "batched",

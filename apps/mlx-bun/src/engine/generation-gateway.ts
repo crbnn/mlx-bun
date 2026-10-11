@@ -175,7 +175,8 @@ export class GenerationGateway implements CompletionEngine {
     const frozenShape = Object.freeze(shape);
     const execution = this.#binding.plan(frozenShape, options, {
       continuous: this.#cachesBatchable ??= this.#binding.cachesBatchable(),
-      quantizedBatch: (shape.kvQuant || shape.turboQuant) && this.#kvBatchable(),
+      // Every request stores the composition's KV scheme.
+      quantizedBatch: this.opts.kvScheme?.quantized === true && this.#kvBatchable(),
       checkpoints: this.opts.checkpoints === true,
     });
     if (execution.mechanism !== "continuous")

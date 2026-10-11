@@ -71,7 +71,7 @@ function harness(overrides: { contextLimit?: number; defaultAdapter?: string;
   } as unknown as ModelContext;
   const engine = new ScriptedEngine();
   const peeks: number[][] = [];
-  const prep = createRequestPrep({ ctx, serverOptions: {}, kvScheme: {}, defaultGeneratedTokens: undefined });
+  const prep = createRequestPrep({ ctx, serverOptions: {}, defaultGeneratedTokens: undefined });
   const contextLimit = overrides.contextLimit ?? 4096;
   const chat = new ChatStage(
     ctx, prep, { peekPrefixLen: (ids: number[]) => { peeks.push(ids); return 0; } },

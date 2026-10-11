@@ -147,8 +147,6 @@ export function planRequest(input: RequestPlanInput): PlanRequestResult {
     ),
     wantsLogprobs: captureLogprobs,
     userSeed: input.userSeed,
-    kvQuant: !!(options.kvConfig?.length || options.kvBits),
-    turboQuant: !!options.turboQuant,
     hasGrammar: input.hasGrammar,
     hasDraft: input.hasDraft,
   };

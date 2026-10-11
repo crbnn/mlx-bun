@@ -1,7 +1,6 @@
 import { readFileSync } from "node:fs";
 import { modelIdentity } from "@mlx-bun/hub/registry";
-import { resolveKvScheme, supportsTurboQuantHeadDim, TURBOQUANT_HEAD_DIMS, type KvQuantOverride } from "@mlx-bun/inference/state/kv-scheme";
-import type { TurboQuantScheme } from "@mlx-bun/inference/artifacts/config";
+import { kvSchemeOf, supportsTurboQuantHeadDim, TURBOQUANT_HEAD_DIMS } from "@mlx-bun/inference/state/kv-scheme";
 import type { Cache } from "@mlx-bun/inference/contracts/mlx";
 import type { PromptCache, TieredPromptCache, SsdCacheStore, SsdIndexEntry,
   CacheCodecProvider, ColdTier, DurabilitySnapshotStats, DurabilityFlushResult } from "@mlx-bun/inference/state";
@@ -11,11 +10,11 @@ import type { ModelBinding } from "./model-binding";
 import { createKvBudget, type KvBudget } from "./kv-budget";
 import { join } from "node:path";
 
+/** Cache policy. The KV scheme is the loaded composition's
+ * (`LoadedModelContext.composition`), resolved with the model; nothing here
+ * resolves it again. */
 export interface CacheServiceOptions {
   promptCacheBytes?: number;
-  kvQuant?: KvQuantOverride;
-  turboQuant?: TurboQuantScheme;
-  quantizedKvStart?: number;
   /** The saved-state root; each model's store lives in its own directory under it. */
   ssdCacheDir?: string;
   /** Bytes the whole root may hold, across every model's directory; unset means unlimited. */
@@ -79,8 +78,10 @@ export async function createCacheServices(context: LoadedModelContext, binding: 
   if (options.ssdCacheDir && cap <= 0) throw new Error("SSD cache requires a nonzero RAM prompt cache");
   if (options.ssdCacheDir && !binding.stateCompatibility?.length)
     throw new Error("SSD cache requires the model binding's stateCompatibility identity");
-  const resolvedKvScheme = resolveKvScheme({ override: options.kvQuant, turboQuant: options.turboQuant,
-    quantizedKvStart: options.quantizedKvStart, config: context.kvConfig });
+  // The composition's KV scheme: what the graph's caches compose, keys the saved
+  // state and describes `/stats`. A context an engine-owned implementation built
+  // composes none, and stores bf16.
+  const resolvedKvScheme = kvSchemeOf(context.composition?.kv ?? { kind: "bf16" });
   // As main's createServer did, refuse at startup a TurboQuant scheme the codec
   // cannot encode for this model, instead of failing every request in prefill.
   if (resolvedKvScheme.kind === "turbo" && !supportsTurboQuantHeadDim(context.model.config))
@@ -89,7 +90,9 @@ export async function createCacheServices(context: LoadedModelContext, binding: 
   const deps = supplied ?? await defaultDependencies();
   const runtime = binding.gateway.runtime;
   const stateCodecs = context.stateCodecs ?? deps.defaultStateCodecs;
-  const cloneState = (caches: Cache[]) => deps.cloneState(caches, stateCodecs);
+  // A reused prefix comes back as the graph's composed caches, which convert as
+  // the caches that stored it would have.
+  const cloneState = (caches: Cache[]) => binding.gateway.composeState(deps.cloneState(caches, stateCodecs));
   const adapterNamespace = (adapters: string[]) => context.adapters.cacheNamespace(adapters);
   let checkpoints: SsdCacheStore | null = null;
   let budgetMember: ReturnType<KvBudget["attach"]> | undefined, budget: KvBudget | undefined;
@@ -186,7 +189,7 @@ export async function createCacheServices(context: LoadedModelContext, binding: 
         elapsedMs: performance.now() - started };
     };
     let closing: Promise<DurabilityFlushResult> | undefined;
-    return { promptCache, resolvedKvScheme, kvScheme: resolvedKvScheme.generationOptions,
+    return { promptCache, resolvedKvScheme,
       stateCodecs, checkpoints: store, continuationServices, adapterNamespace, stats, flush,
       /** Stop new background demotion before draining active requests. */
       stopIdleDemotion,
