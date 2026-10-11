@@ -8,6 +8,7 @@ import type { UniversalDenseModel } from "../../../src/models/universal/dense";
 import type { ModelConfig } from "../../../src/artifacts/config";
 import type { Weights } from "../../../src/artifacts/weights";
 import type { Cache, Mask } from "../../../src/contracts/mlx/cache";
+import type { ReadPhase } from "../../../src/models/qwen/blocks";
 import type { DraftProvider } from "../../../src/generation/speculative/source";
 import type { GenerateOptions } from "../../../src/generation/index";
 
@@ -89,6 +90,8 @@ const { rotatingSourcePosition } = await import("../../../src/state/rotating-kv-
 const { plainRowStorage, temporalStorageView } = await import("../../../src/state/batched-row-storage");
 const { bindMlxGateway } = await import("../../../src/execution/gateway-binding");
 const { resolveKvScheme } = await import("../../../src/state/kv-scheme");
+const { captureKvAttention } = await import("../../../src/state/kv-attention-view");
+const { softcapAttention } = await import("../../../src/state/softcap-attention");
 function fixture() {
   const raw = { model_type: "gemma2", hidden_size: 32, num_hidden_layers: 1,
     num_attention_heads: 8, num_key_value_heads: 4, head_dim: 4,
@@ -128,20 +131,41 @@ function fixture() {
     } };
 }
 
-// Main's original explicit-mask path; only this mask selection is duplicated.
-// Every projection, norm and attention operation remains the production graph.
-class LegacyMaskModel extends UniversalDenseModel {
-  protected override forwardLayers(hidden: MlxArray, caches: Cache[]): MlxArray {
-    const length = hidden.shape[1]!;
+/** A reference graph whose layers attend under the masks it selects for each
+ * forward, through the calls the graph made before its blocks read through the
+ * cache: the plain fetch and the manual softcap attention, or the attention
+ * view. Only the mask selection is duplicated; every projection, norm and
+ * attention operation remains the production graph's. */
+abstract class SelectedMaskModel extends UniversalDenseModel {
+  /** One mask per layer for a `length`-position forward over `caches`, before it appends. */
+  protected abstract selectMasks(caches: Cache[], length: number): Mask[];
+  protected override forwardLayers(hidden: MlxArray, caches: Cache[], phase: ReadPhase): MlxArray {
+    const masks = this.selectMasks(caches, hidden.shape[1]!);
+    try {
+      for (const [index, layer] of this.layers.entries())
+        Object.assign(layer.attn, { reads: maskedRead(masks[index]!, layer.attn.softcap) });
+      return super.forwardLayers(hidden, caches, phase);
+    } finally { for (const arr of new Set(masks.map(mask => mask.arr))) arr?.dispose(); }
+  }
+}
+function maskedRead(mask: Mask, softcap: number | null) {
+  return { read(cache: Cache, _phase: ReadPhase, k: MlxArray, v: MlxArray) {
+    if (softcap === null) {
+      const view = captureKvAttention(cache, k, v);
+      return { attend: (q: MlxArray, scale: number) => view.attend(q, scale, mask), dispose: () => view.dispose() };
+    }
+    const [keys, values] = cache.updateAndFetch(k, v);
+    return { attend: (q: MlxArray, scale: number) => softcapAttention(q, keys, values, mask, scale, softcap),
+      dispose() { keys.dispose(); values.dispose(); } };
+  } };
+}
+
+// Main's original explicit-mask path: one causal matrix at cache 0's offset.
+class LegacyMaskModel extends SelectedMaskModel {
+  protected selectMasks(caches: Cache[], length: number): Mask[] {
     const mask: Mask = length === 1 ? { mode: "", arr: null }
       : { mode: "array", arr: createCausalMask(length, caches[0]!.offset, null) };
-    let current = hidden;
-    try {
-      for (const [index, layer] of this.layers.entries()) {
-        const next = layer.forward(current, mask, caches[index]!); current.dispose(); current = next;
-      }
-      return this.finalNorm.forward(current);
-    } finally { current.dispose(); mask.arr?.dispose(); }
+    return this.layers.map(() => mask);
   }
 }
 const dispose = (caches: Cache[]) => { for (const cache of caches) cache.dispose(); };
@@ -305,30 +329,21 @@ function mixedFixture(types: string[], explicitMask: boolean, headDim = 4) {
 /** Each layer's mask from absolute positions alone: full layers see every
  * earlier key; sliding layers see the ring's newest window (mlx-lm
  * create_causal_mask(N, min(W - 1, offset), W)); single tokens need none. */
-class PositionMaskModel extends UniversalDenseModel {
-  protected override forwardLayers(hidden: MlxArray, caches: Cache[]): MlxArray {
-    const length = hidden.shape[1]!, masks: MlxArray[] = [];
-    let current = hidden;
-    try {
-      for (const [index, layer] of this.layers.entries()) {
-        const sliding = this.args.layerTypes![index] === S, offset = caches[index]!.offset;
-        const arr = length === 1 ? null
-          : sliding ? createCausalMask(length, Math.min(W - 1, offset), W) : createCausalMask(length, offset, null);
-        if (arr) masks.push(arr);
-        const next = layer.forward(current, arr ? { mode: "array", arr } : { mode: "", arr: null }, caches[index]!);
-        current.dispose(); current = next;
-      }
-      return this.finalNorm.forward(current);
-    } finally { current.dispose(); for (const mask of masks) mask.dispose(); }
+class PositionMaskModel extends SelectedMaskModel {
+  protected selectMasks(caches: Cache[], length: number): Mask[] {
+    return this.layers.map((_, index): Mask => {
+      const sliding = this.args.layerTypes![index] === S, offset = caches[index]!.offset;
+      return length === 1 ? { mode: "", arr: null } : { mode: "array",
+        arr: sliding ? createCausalMask(length, Math.min(W - 1, offset), W) : createCausalMask(length, offset, null) };
+    });
   }
 }
 
-/** The selection this change replaces, verbatim: with explicit masks every
- * layer took cache 0's full mask; otherwise one mask per group. */
-class PreviousSelectionModel extends UniversalDenseModel {
-  protected override forwardLayers(h0: MlxArray, cache: Cache[]): MlxArray {
+/** The selection an earlier change replaced, verbatim: with explicit masks
+ * every layer took cache 0's full mask; otherwise one mask per group. */
+class PreviousSelectionModel extends SelectedMaskModel {
+  protected selectMasks(cache: Cache[], L: number): Mask[] {
     const a = this.args;
-    const L = h0.shape[1]!;
     let faMask: Mask;
     let swaMask: Mask | null = null;
     if (a.maskArray) {
@@ -343,18 +358,7 @@ class PreviousSelectionModel extends UniversalDenseModel {
     } else {
       faMask = cache[0]!.makeMask(L, null);
     }
-    let cur = h0;
-    for (let i = 0; i < this.layers.length; i++) {
-      const mask = a.layerTypes?.[i] === "sliding_attention" && swaMask ? swaMask : faMask;
-      const next = this.layers[i]!.forward(cur, mask, cache[i]!);
-      cur.dispose();
-      cur = next;
-    }
-    faMask.arr?.dispose();
-    swaMask?.arr?.dispose();
-    const out = this.finalNorm.forward(cur);
-    cur.dispose();
-    return out;
+    return this.layers.map((_, i) => a.layerTypes?.[i] === "sliding_attention" && swaMask ? swaMask : faMask);
   }
 }
 
@@ -508,33 +512,37 @@ describe.skipIf(!native)("Universal forward ownership", () => {
     MlxArray.prototype.dispose = function (this: MlxArray) { calls.set(this, (calls.get(this) ?? 0) + 1); return original.call(this); };
     try { return run(array => calls.get(array) ?? 0); } finally { MlxArray.prototype.dispose = original; }
   };
-  /** Record the hidden states and masks the layers see, optionally failing layer `failAt`. */
-  const instrument = (model: UniversalDenseModel, failAt = -1) => {
-    const hidden: MlxArray[] = [], masks = new Set<MlxArray>();
+  /** Record the hidden states the layers see, optionally failing layer `failAt`, and the mask each read takes
+   * from its cache: the caches hand out their causal masks as arrays, so every release can be counted. */
+  const instrument = (model: UniversalDenseModel, caches: Cache[], failAt = -1) => {
+    const hidden: MlxArray[] = [], masks: MlxArray[] = [];
     // The forward owns its input (the scaled embedding) and every layer output.
-    const forwardLayers = (model as unknown as { forwardLayers(h: MlxArray, c: Cache[]): MlxArray }).forwardLayers.bind(model);
-    Object.assign(model, { forwardLayers: (h: MlxArray, c: Cache[]) => { hidden.push(h); return forwardLayers(h, c); } });
+    type Layers = { forwardLayers(h: MlxArray, c: Cache[], p: ReadPhase): MlxArray };
+    const forwardLayers = (model as unknown as Layers).forwardLayers.bind(model);
+    Object.assign(model, { forwardLayers: (h: MlxArray, c: Cache[], p: ReadPhase) => { hidden.push(h); return forwardLayers(h, c, p); } });
     model.layers.forEach((layer, index) => {
       const forward = layer.forward.bind(layer);
-      layer.forward = ((x: MlxArray, mask: Mask, cache: Cache) => {
-        if (mask.arr) masks.add(mask.arr);
+      layer.forward = ((x: MlxArray, cache: Cache, phase: ReadPhase) => {
         if (index === failAt) throw new Error(`layer ${index} failed`);
-        const out = forward(x, mask, cache); hidden.push(out); return out;
+        const out = forward(x, cache, phase); hidden.push(out); return out;
       }) as never;
     });
+    for (const cache of caches) cache.makeMask = (length: number, window: number | null) => {
+      const arr = createCausalMask(length, cache.offset, window); masks.push(arr); return { mode: "array", arr };
+    };
     return { hidden, masks };
   };
   const tokens = () => ops.fromInt32([2, 4, 7], [1, 3]);
 
-  test("a successful forward releases every intermediate and mask exactly once and returns an owned result", () => {
+  test("a successful forward releases every intermediate and every read's mask exactly once and returns an owned result", () => {
     const f = mixedFixture([S, F, S, F], true), model = f.make(), caches = model.makeCache();
     try {
       counting(count => {
-        const seen = instrument(model);
+        const seen = instrument(model, caches);
         using ids = tokens();
         const out = model.forwardHidden(ids, caches);
         try {
-          expect(seen.masks.size).toBe(2);
+          expect(seen.masks.length).toBe(4); // one per layer's read
           for (const array of [...seen.hidden, ...seen.masks]) expect(count(array)).toBe(1);
           expect(count(out)).toBe(0);
         } finally { out.dispose(); }
@@ -542,33 +550,32 @@ describe.skipIf(!native)("Universal forward ownership", () => {
     } finally { dispose(caches); f.dispose(); }
   });
 
-  test("a failing layer releases the owned hidden state and both masks once and keeps its error", () => {
+  test("a failing layer releases the owned hidden state and the earlier reads' masks once and keeps its error", () => {
     const f = mixedFixture([S, F, S, F], true), model = f.make(), caches = model.makeCache();
     try {
       counting(count => {
-        const seen = instrument(model, 2);
+        const seen = instrument(model, caches, 2);
         using ids = tokens();
         expect(() => model.forwardHidden(ids, caches)).toThrow("layer 2 failed");
         expect(seen.hidden.length).toBe(3); // the input and two layer outputs
-        expect(seen.masks.size).toBe(2);
+        expect(seen.masks.length).toBe(2);
         for (const array of [...seen.hidden, ...seen.masks]) expect(count(array)).toBe(1);
       });
     } finally { dispose(caches); f.dispose(); }
   });
 
-  test("a failing second mask releases the input and the first mask", () => {
-    // Sliding first: the full group's mask (cache 1) is built before the sliding group's (cache 0).
+  test("a failing mask releases the forward's hidden states and the earlier read's mask once and keeps its error", () => {
+    // Sliding first: layer 0 reads its ring's mask, then layer 1's full cache fails to build one.
     const f = mixedFixture([S, F, S, F], true), model = f.make(), caches = model.makeCache();
     try {
       counting(count => {
-        const seen = instrument(model);
-        let first: MlxArray | null = null;
-        caches[1]!.makeMask = (length: number) => ({ mode: "array", arr: first = createCausalMask(length, 0, null) });
-        caches[0]!.makeMask = () => { throw new Error("sliding mask failed"); };
+        const seen = instrument(model, caches);
+        caches[1]!.makeMask = () => { throw new Error("full mask failed"); };
         using ids = tokens();
-        expect(() => model.forwardHidden(ids, caches)).toThrow("sliding mask failed");
-        expect(first).not.toBeNull();
-        expect([count(seen.hidden[0]!), count(first!)]).toEqual([1, 1]);
+        expect(() => model.forwardHidden(ids, caches)).toThrow("full mask failed");
+        expect(seen.masks.length).toBe(1);
+        expect(seen.hidden.length).toBe(2); // the input and layer 0's output
+        for (const array of [...seen.hidden, ...seen.masks]) expect(count(array)).toBe(1);
       });
     } finally { dispose(caches); f.dispose(); }
   });
@@ -576,11 +583,11 @@ describe.skipIf(!native)("Universal forward ownership", () => {
   test("throwing destructors never release an array twice and never leak the survivor", () => {
     const f = mixedFixture([S, F, S, F], true), model = f.make();
     try {
-      // A mask destructor fails after every layer ran: it is not retried and the last hidden state is still released.
+      // A read's mask destructor fails: it is not retried, and the hidden states are still released.
       let caches = model.makeCache();
       try {
         counting(count => {
-          const seen = instrument(model);
+          const seen = instrument(model, caches);
           let failing: MlxArray | null = null;
           caches[1]!.makeMask = (length: number) => {
             const arr = failing = createCausalMask(length, 0, null), release = arr.dispose.bind(arr);
@@ -600,8 +607,8 @@ describe.skipIf(!native)("Universal forward ownership", () => {
         counting(count => {
           const layers = model.layers, last = layers[layers.length - 1]!, forward = last.forward.bind(last);
           let normalized: MlxArray | null = null;
-          last.forward = ((x: MlxArray, mask: Mask, cache: Cache) => {
-            const out = forward(x, mask, cache), release = out.dispose.bind(out);
+          last.forward = ((x: MlxArray, cache: Cache, phase: ReadPhase) => {
+            const out = forward(x, cache, phase), release = out.dispose.bind(out);
             out.dispose = () => { release(); throw new Error("hidden release failed"); };
             return out;
           }) as never;

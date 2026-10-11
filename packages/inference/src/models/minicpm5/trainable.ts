@@ -14,7 +14,7 @@ export interface MiniCpmTraining {
   readonly layers: readonly unknown[];
   readonly finalNorm: RMSNorm;
   readonly lmHead: QuantizedLinear;
-  forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray;
+  /** The training forward over layers `[aIdx, bIdx)`; `h` stays the caller's. */
   runLayerRange(h: MlxArray, aIdx: number, bIdx: number, cache: Cache[]): MlxArray;
 }
 
@@ -64,11 +64,16 @@ export function miniCpmTrainable(model: MiniCpmTraining): TrainableGraph {
       begin: (ids, prefix) => new MiniCpmSegmentedPass(model, ids, prefix),
     },
     prefixShared: {
+      /** The training forward over the whole concat: the prefix-shared caches
+       *  have no attention read of their own, so it runs `runLayerRange`. */
       forwardHidden(ids: MlxArray, layout: PrefixLayout): MlxArray {
         const caches = prefixSharedCaches(model.layers.length, layout);
         setActivePrefixLayout(layout);
         try {
-          return model.forwardHidden(ids, caches); // [1, T, hidden], post-finalNorm
+          const h0 = model.embed.encode(ids);
+          let h: MlxArray;
+          try { h = model.runLayerRange(h0, 0, model.layers.length, caches); } finally { h0.dispose(); }
+          try { return model.finalNorm.forward(h); } finally { h.dispose(); } // [1, T, hidden], post-finalNorm
         } finally {
           setActivePrefixLayout(null);
           for (const c of caches) c.dispose();
