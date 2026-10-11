@@ -559,7 +559,7 @@ async function record(inputs: { target: string; draft: string }, directory: stri
     const methodFor = (sampling: A, maxTokens: number) => {
       const options = { ...sampling, maxTokens };
       const plan = binding.plan({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: "seed" in sampling,
-        kvQuant: false, turboQuant: false, hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true }, options,
+        hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true }, options,
       { continuous: true, quantizedBatch: false, checkpoints: false });
       assert.equal(plan.method, "speculative"); assert.equal(plan.mechanism, "continuous");
       const method = binding.methodRequest!(plan, options);

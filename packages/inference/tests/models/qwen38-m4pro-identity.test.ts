@@ -20,8 +20,11 @@ import { parseQuantization, type ModelConfig } from "../../src/artifacts/config"
 import type { Weights } from "../../src/artifacts/weights";
 import type { BatchableCache, Cache } from "../../src/contracts/mlx/cache";
 import type { MlxLayerCapture, MlxWidthTable } from "../../src/contracts/mlx/graph";
-import type { Composition } from "../../src/contracts/portable/composition";
+import type { Composition, KvStorageScheme } from "../../src/contracts/portable/composition";
 import { LAYERS, Qwen38TrellisM4Pro } from "../../src/models/qwen/qwen38-27b-trellis-m4pro";
+import { unfusedAffineKernels } from "../../src/state/affine-attention";
+import { AttentionMasks } from "../../src/state/attention-read";
+import { Bf16FirstKv4Head256Cache, Bf16FirstQuantizedKVCache, Bf16FirstTurboQuantKVCache, convertToAffine } from "../../src/state/bf16-first-kv";
 import { KVCache } from "../../src/state/kv";
 import { Kv4Head256Cache } from "../../src/state/kv4-head256-cache";
 import { targetCacheLayout } from "../../src/state/layout";
@@ -134,8 +137,19 @@ function artifact(): { weights: Weights; config: ModelConfig } {
 
 const composition = (overrides: Partial<Composition> = {}): Composition => Object.freeze<Composition>({
   device: "applegpu_g16s", aneBridge: false, kv: { kind: "bf16" }, draftDepth: { adaptive: true, max: 7 },
-  prefillChunkTokens: CHUNK, adapters: false, maxRows: 8, ...overrides,
+  prefillChunkTokens: CHUNK, adapters: false, maxRows: 8, speculativeAffineKv: true, packedMixedMlp: true, ...overrides,
 });
+/** The M4 Pro composition's KV scheme (`--kv-quant 4`, fused SDPA unset). */
+const KV4: KvStorageScheme = Object.freeze({ kind: "affine", bits: 4, groupSize: 64, kernels: "unfused" });
+
+/** Kv4Head256Cache storage, quantized from token zero, for every attention layer: the storage the D1 gate holds both
+ *  graphs to (each reads its packed keys through the KV4 kernels), as the graph's makeCache composed it before E3
+ *  made the composition's lego bf16-first. One mask memo; the uniform composition's affine set for several rows. */
+function kv4Caches(): Cache[] {
+  const masks = new AttentionMasks();
+  return LAYERS.map(layer => layer.kind === "deltanet" ? new SSMCache()
+    : new Kv4Head256Cache(unfusedAffineKernels(4, 64, Dtype.bfloat16), masks));
+}
 
 // ── Comparison ──────────────────────────────────────────────────────────────
 
@@ -240,8 +254,7 @@ function graphs(): { old: FrozenM4Pro; current: Qwen38TrellisM4Pro } {
 function caches(scheme: Scheme): { old: Cache[]; current: Cache[] } {
   const { current } = graphs();
   if (scheme === "bf16") return { old: current.makeCache(), current: current.makeCache() };
-  const kv4 = { kind: "affine", bits: 4, groupSize: 64 } as const;
-  return { old: current.makeCache(kv4), current: current.makeCache(kv4) };
+  return { old: kv4Caches(), current: kv4Caches() };
 }
 
 const oldHead = (h: MlxArray) => graphs().old.logitsFromHidden(h);
@@ -256,21 +269,35 @@ function collecting(): { capture: MlxLayerCapture; taps: MlxArray[] } {
 }
 
 describe("composition", () => {
-  test("makeCache composes the lego the KV scheme names; the graph declares what the composition built", () => {
+  test("makeCache composes the lego the composition's KV scheme names; the graph declares what the composition built", () => {
     const { current } = graphs();
-    const plain = current.makeCache(), kv4 = current.makeCache({ kind: "affine", bits: 4, groupSize: 64 });
-    const other = current.makeCache({ kind: "affine", bits: 8, groupSize: 64 });
+    const { weights, config } = source();
+    const composed = (kv: KvStorageScheme) => new Qwen38TrellisM4Pro(weights, config, composition({ kv })).makeCache();
+    const plain = current.makeCache(), kv4 = composed(KV4), fused = composed({ ...KV4, kernels: "tiled-causal" });
+    const other = composed({ kind: "affine", bits: 8, groupSize: 64, kernels: "unfused" });
+    const turbo = composed({ kind: "turbo", kBits: 8, vBits: 3 });
     try {
       for (const [layer, spec] of LAYERS.entries()) {
-        const expected = spec.kind === "deltanet" ? SSMCache : null;
-        if (expected) for (const set of [plain, kv4, other]) expect(set[layer]).toBeInstanceOf(SSMCache);
+        if (spec.kind === "deltanet") for (const set of [plain, kv4, fused, other, turbo]) expect(set[layer]).toBeInstanceOf(SSMCache);
         else {
           expect(plain[layer]).toBeInstanceOf(KVCache);
-          expect(other[layer]).toBeInstanceOf(KVCache);
-          expect(kv4[layer]).toBeInstanceOf(Kv4Head256Cache);
+          expect(other[layer]).toBeInstanceOf(Bf16FirstQuantizedKVCache);
+          expect(other[layer]).not.toBeInstanceOf(Bf16FirstKv4Head256Cache);
+          expect(turbo[layer]).toBeInstanceOf(Bf16FirstTurboQuantKVCache);
+          // The KV4 lego, its several-row reads the composition's affine set.
+          for (const [set, plainSet] of [[kv4, unfusedAffineKernels], [fused, "tiled-causal"]] as const) {
+            expect(set[layer]).toBeInstanceOf(Bf16FirstKv4Head256Cache);
+            const lego = set[layer] as Bf16FirstKv4Head256Cache;
+            expect(lego.start).toBe(0);
+            if (plainSet === unfusedAffineKernels) expect(lego.plain).toBe(unfusedAffineKernels);
+            else expect(lego.plain).not.toBe(unfusedAffineKernels);
+          }
         }
       }
-    } finally { disposeAll(plain, kv4, other); }
+      // One mask memo per makeCache call.
+      for (const set of [plain, kv4, turbo])
+        expect(new Set(set.filter(cache => !(cache instanceof SSMCache)).map(cache => (cache as { masks?: unknown }).masks)).size).toBe(1);
+    } finally { disposeAll(plain, kv4, fused, other, turbo); }
     expect(current.graphCapabilities.adapters).toEqual({ batched: false, mountable: false });
     expect(current.loraTargets().size).toBe(0);
     expect(current.prefillChunk.ane).toBeUndefined();
@@ -550,6 +577,67 @@ describe("Qwen3.8 M4 Pro graph on the real artifact", () => {
       }
     } finally { weights.dispose(); }
   }, 1_800_000);
+
+  // E3: the composition's KV scheme (`--kv-quant 4`: affine 4-bit group 64) composes the bf16-first KV4 lego in the
+  // graph's own makeCache. Driven as the scheduler drives one row: the prefill chunk the composition is built for
+  // (read bf16; the lego converts inside that append, the old path converted after the forward), the tail, decodes and
+  // verify at 3 and 8, against the old graph over plain caches converted at the same point, whose plans read the packed
+  // keys through the cores it injected.
+  test.skipIf(!ARTIFACT || !g16s)("composed KV4: the bf16-first lego through prefill, its conversion, decodes and verify 3 and 8, the old graph's injected cores to the bit", async () => {
+    const { Weights } = await import("../../src/artifacts/weights");
+    const { loadModelConfig } = await import("../../src/artifacts/config");
+    const config = await loadModelConfig(ARTIFACT!);
+    const weights = await Weights.open(ARTIFACT!);
+    try {
+      const current = new Qwen38TrellisM4Pro(weights, config, composition({ kv: KV4, prefillChunkTokens: 2048 }));
+      const shared = {
+        tensor: (name: string) => weights.tensor(name), has: (name: string) => weights.has(name), info: (name: string) => weights.info(name),
+        get tensorNames() { return weights.tensorNames; }, shards: weights.shards, setView: () => {},
+      } as unknown as Weights;
+      const old = new FrozenM4Pro(shared, config, false);
+      const head = (h: MlxArray) => old.logitsFromHidden(h);
+      const last = (h: MlxArray) => { const L = h.shape[1]!; return h.slice([0, L - 1, 0], [1, L, h.shape[2]!]); };
+      const lastLogits = (project: (h: MlxArray) => MlxArray) => (h: MlxArray) => { using row = last(h); return project(row); };
+      const oldCaches = old.makeCache(), newCaches = current.makeCache();
+      const storage = (set: Cache[]) => set.map(cache => cache.composed?.storage() ?? cache);
+      const real = (n: number, salt: number) => Array.from({ length: n }, (_, i) => (i * 7919 + salt * 104729) % 151_000 + 1000);
+      try {
+        expect(newCaches.filter(cache => cache instanceof Bf16FirstKv4Head256Cache)).toHaveLength(LAYERS.length - 48);
+        {
+          using input = ids([real(2048, 1)]);
+          const expected = old.forwardHidden(input, oldCaches);
+          outputDiff("composed kv4 prefillChunk.gpu 2048", current.prefillChunk.gpu(input, newCaches) as MlxArray, expected,
+            lastLogits(current.logits.one), lastLogits(head));
+          // The conversion point: the old path's conversion after the first forward (quantized_kv_start 0).
+          for (const [layer, cache] of oldCaches.entries())
+            if (cache instanceof KVCache) oldCaches[layer] = convertToAffine(cache, 64, 4, 0, unfusedAffineKernels);
+          expect(storage(newCaches).filter(cache => cache.signature() === "kv:quant:4:64")).toHaveLength(LAYERS.length - 48);
+          stateDiff("composed kv4 conversion point", storage(newCaches), oldCaches);
+        }
+        {
+          using input = ids([real(37, 2)]);
+          const expected = old.forwardHidden(input, oldCaches);
+          outputDiff("composed kv4 prefillTail 37", current.prefillTail(input, newCaches), expected, lastLogits(current.logits.one), lastLogits(head));
+          stateDiff("composed kv4 prefillTail 37", storage(newCaches), oldCaches);
+        }
+        for (let step = 0; step < 4; step++) {
+          using input = ids([[real(1, 10 + step)[0]!]]);
+          const expected = old.forwardHidden(input, oldCaches);
+          outputDiff("composed kv4 decode.one", current.decode.one(input, newCaches) as MlxArray, expected, current.logits.one, head);
+          stateDiff("composed kv4 decode.one", storage(newCaches), oldCaches);
+        }
+        for (const [width, salt] of [[3, 23], [8, 28]] as const) {
+          using input = ids([real(width, salt)]);
+          const before = collecting(), after = collecting();
+          const expected = old.verify[widthOf(width)](input, oldCaches, before.capture) as MlxArray;
+          const actual = current.verify[widthOf(width)](input, newCaches, after.capture) as MlxArray;
+          tapsDiff(`composed kv4 verify ${width}`, after.taps, before.taps);
+          outputDiff(`composed kv4 verify ${width}`, actual, expected, current.logits[widthOf(width)], head);
+          stateDiff(`composed kv4 verify ${width}`, storage(newCaches), oldCaches);
+        }
+      } finally { disposeAll(oldCaches, newCaches); }
+    } finally { weights.dispose(); }
+  }, 1_800_000);
 });
 
 describe("Qwen3.8 M4 Pro graph, Neural Engine chunk operation (MLX_BUN_TEST_ANE=1)", () => {
@@ -559,8 +647,8 @@ describe("Qwen3.8 M4 Pro graph, Neural Engine chunk operation (MLX_BUN_TEST_ANE=
     const { old } = graphs();
     const current = new Qwen38TrellisM4Pro(weights, config, composition({ aneBridge: true, prefillChunkTokens: 2048 }));
     expect(current.prefillChunk.ane).toBeDefined();
-    const kv = scheme === "kv4" ? { kind: "affine", bits: 4, groupSize: 64 } as const : undefined;
-    const sets = [current.makeCache(kv), current.makeCache(kv), current.makeCache(kv), current.makeCache(kv)];
+    const make = () => scheme === "kv4" ? kv4Caches() : current.makeCache();
+    const sets = [make(), make(), make(), make()];
     try {
       using input = ids([prompt(2048, 100)]);
       const ane = oldAne.forwardHidden(input, sets[0]!);

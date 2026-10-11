@@ -365,8 +365,8 @@ async function setup() {
       const spans: number[][] = [], tokens: number[] = [], abort = new AbortController();
       const { prompt, options } = await optionsFor(request, spans);
       const start = async (): Promise<Outcome> => {
-        const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false, kvQuant: false,
-          turboQuant: false, hasLogitsExtras: false, hasGrammar: !!options.grammar, wantsLogprobs: false, hasDraft: false };
+        const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
+          hasLogitsExtras: false, hasGrammar: !!options.grammar, wantsLogprobs: false, hasDraft: false };
         let sampling: ReturnType<typeof createRowSampling> | undefined;
         try {
           const execution = binding.plan(shape, options, { continuous: binding.cachesBatchable(), quantizedBatch: false, checkpoints: false });

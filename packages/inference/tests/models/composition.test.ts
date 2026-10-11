@@ -30,7 +30,7 @@ afterAll(() => rmSync(dir, { recursive: true, force: true }));
 test("the default record: this machine, bf16, no drafter, the 2048-token chunk, no adapters, eight rows", () => {
   const composition = resolveComposition(config);
   expect(composition).toEqual({ device: deviceArchitecture(), aneBridge: aneAvailable(), kv: { kind: "bf16" },
-    draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 8 });
+    draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 8, speculativeAffineKv: true, packedMixedMlp: true });
   expect(Object.isFrozen(composition)).toBe(true);
   expect(Object.isFrozen(composition.kv)).toBe(true);
 });
@@ -48,18 +48,47 @@ test("the prefill chunk comes from the prefill policy's override, read through t
 test("the KV flags resolve to the scheme maintenance applies, with a delayed start only when nonzero", () => {
   const kv = (request: Parameters<typeof resolveComposition>[1] & {}, base = config) => resolveComposition(base, request).kv;
   expect(kv({ kv: { override: "off" } })).toEqual({ kind: "bf16" });
-  expect(kv({ kv: { override: 4 } })).toEqual({ kind: "affine", bits: 4, groupSize: 64 });
-  expect(kv({ kv: { override: 8, quantizedKvStart: 0 } })).toEqual({ kind: "affine", bits: 8, groupSize: 64 });
-  expect(kv({ kv: { override: 8, quantizedKvStart: 512 } })).toEqual({ kind: "affine", bits: 8, groupSize: 64, quantizedKvStart: 512 });
+  expect(kv({ kv: { override: 4 } })).toEqual({ kind: "affine", bits: 4, groupSize: 64, kernels: "unfused" });
+  expect(kv({ kv: { override: 8, quantizedKvStart: 0 } })).toEqual({ kind: "affine", bits: 8, groupSize: 64, kernels: "unfused" });
+  expect(kv({ kv: { override: 8, quantizedKvStart: 512 } })).toEqual({ kind: "affine", bits: 8, groupSize: 64, quantizedKvStart: 512, kernels: "unfused" });
   // `config` reads the artifact's kv_config.json, and stays bf16 without one.
   expect(kv({ kv: { override: "config" } })).toEqual({ kind: "bf16" });
   const layered = { ...config, kvQuant: [{ layerIdx: 0, bits: 4, groupSize: 32 }, { layerIdx: 1, bits: 8, groupSize: 64 }] };
   expect(kv({ kv: { override: "config" } }, layered)).toEqual({ kind: "affine-layers",
-    layers: [{ layer: 0, bits: 4, groupSize: 32 }, { layer: 1, bits: 8, groupSize: 64 }] });
+    layers: [{ layer: 0, bits: 4, groupSize: 32 }, { layer: 1, bits: 8, groupSize: 64 }], kernels: "tiled-causal" });
   expect(kv({ kv: { override: "config", quantizedKvStart: 100 } }, layered)).toMatchObject({ kind: "affine-layers", quantizedKvStart: 100 });
   expect(kv({ kv: { turboQuant: { kBits: 8, vBits: 3 } } })).toEqual({ kind: "turbo", kBits: 8, vBits: 3 });
   expect(kv({ kv: { turboQuant: { kBits: 4, vBits: 4 }, quantizedKvStart: 64 } })).toEqual({ kind: "turbo", kBits: 4, vBits: 4, quantizedKvStart: 64 });
   expect(() => kv({ kv: { override: 4, quantizedKvStart: -1 } })).toThrow("quantizedKvStart must be a nonnegative integer");
+});
+
+test("--fused-sdpa picks the affine read kernels: on tiled-causal, off unfused, unset by the scheme's kind", () => {
+  const kernels = (request: NonNullable<Parameters<typeof resolveComposition>[1]>["kv"], base = config) => {
+    const kv = resolveComposition(base, { kv: request }).kv;
+    return kv.kind === "affine" || kv.kind === "affine-layers" ? kv.kernels : undefined;
+  };
+  const layered = { ...config, kvQuant: [{ layerIdx: 0, bits: 4, groupSize: 64 }] };
+  expect([kernels({ override: 4 }), kernels({ override: 4, fusedSdpa: true }), kernels({ override: 4, fusedSdpa: false })])
+    .toEqual(["unfused", "tiled-causal", "unfused"]);
+  expect([kernels({ override: "config" }, layered), kernels({ override: "config", fusedSdpa: true }, layered),
+    kernels({ override: "config", fusedSdpa: false }, layered)]).toEqual(["tiled-causal", "tiled-causal", "unfused"]);
+  // Schemes without affine reads ignore it.
+  expect(resolveComposition(config, { kv: { turboQuant: { kBits: 8, vBits: 3 }, fusedSdpa: false } }).kv)
+    .toEqual({ kind: "turbo", kBits: 8, vBits: 3 });
+  expect(resolveComposition(config, { kv: { fusedSdpa: true } }).kv).toEqual({ kind: "bf16" });
+});
+
+test("the two graph switches are composition fields, on by default; the runtime configuration does not reach them", () => {
+  const switches = (request: Parameters<typeof resolveComposition>[1] = {}, values: Record<string, string> = {}) =>
+    withRuntimeConfig(createRuntimeConfig(values), () => {
+      const { speculativeAffineKv, packedMixedMlp } = resolveComposition(config, request);
+      return { speculativeAffineKv, packedMixedMlp };
+    });
+  expect(switches()).toEqual({ speculativeAffineKv: true, packedMixedMlp: true });
+  expect(switches({ speculativeAffineKv: false })).toEqual({ speculativeAffineKv: false, packedMixedMlp: true });
+  expect(switches({ packedMixedMlp: false })).toEqual({ speculativeAffineKv: true, packedMixedMlp: false });
+  expect(switches({}, { MLX_BUN_QWEN_SPEC_KV4: "0", MLX_BUN_MIXED_PACKED_MLP: "0" }))
+    .toEqual({ speculativeAffineKv: true, packedMixedMlp: true });
 });
 
 test("the loaded drafter fixes the depth, or caps it when the scheduler adapts; rows and adapters are recorded as given", () => {

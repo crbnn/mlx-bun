@@ -12,12 +12,12 @@ export function evalCacheState(cache: Cache[]): void {
   withResource(leaseCacheStates(cache), (state) => { if (state.length) ops.evalAll([...state]); });
 }
 
-/** Forward once. Drains evaluate state, apply KV maintenance, then clear the
- * allocator cache. Finals return owned hidden state without forcing eval. */
+/** Forward once. Drains evaluate state (the composed caches converted inside
+ * their own appends), then clear the allocator cache. Finals return owned
+ * hidden state without forcing eval. */
 export async function executeMlxPrefillStep(
   forward: (ids: MlxArray, cache: Cache[]) => MlxArray | Promise<MlxArray>,
   cache: Cache[], prompt: readonly number[], step: PrefillStep,
-  maintain: () => void,
 ): Promise<MlxArray | null> {
   const chunk = prompt.slice(step.start, step.end);
   const ids = ops.fromInt32(chunk, [1, chunk.length]);
@@ -27,7 +27,6 @@ export async function executeMlxPrefillStep(
   if (step.kind === "final") return hidden;
   hidden.dispose();
   evalCacheState(cache);
-  maintain();
   clearCache();
   return null;
 }

@@ -30,6 +30,7 @@
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { Weights } from "../../artifacts/weights";
+import type { Composition } from "../../contracts/portable/composition";
 import { quantFor, type ModelConfig } from "../../artifacts/config";
 import { runtimeFlag, runtimeValue } from "../../runtime/config";
 import { type Cache, type GatedDeltaCache } from "../../contracts/mlx/cache";
@@ -105,8 +106,8 @@ export class Qwen38TrellisTQ extends Qwen35Model {
   /** The artifact's R1 basis, from its fold record (read once, here). */
   readonly #residualBasis: ResidualBasis | undefined;
 
-  constructor(weights: Weights, config: ModelConfig) {
-    super(weights, config);
+  constructor(weights: Weights, config: ModelConfig, composition: Composition) {
+    super(weights, config, composition);
     this.#residualBasis = qwenResidualBasis(this.graph, config.modelDir);
     const options = {
       // Layers whose gate and up were allocated DIFFERENT bit widths fall off the

@@ -163,7 +163,7 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis: logits, greedy tokens and MTP spec
     for (const [i, run] of reference.mtp.runs.entries()) {
       forwards = [];
       const plan = binding.plan({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
-        kvQuant: false, turboQuant: false, hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true }, options,
+        hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true }, options,
       { continuous: true, quantizedBatch: false, checkpoints: false });
       assert.equal(plan.method, "speculative");
       const method = binding.methodRequest!(plan, options);

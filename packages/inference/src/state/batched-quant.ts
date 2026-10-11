@@ -26,7 +26,7 @@ import { buildBatchedDecodeMask } from "./batched-mask";
 import { isQuantizedKvCache } from "./capabilities";
 import { runtimeValue } from "../runtime/config";
 import { AttentionMasks, withLease } from "./attention-read";
-import { affineRead, type AffineKernel, type AffineKernels } from "./affine-attention";
+import { affineRead, rowLayoutKernels, type AffineKernel, type AffineKernels } from "./affine-attention";
 
 export interface QuantRow {
   keys: ops.QuantizedTensor;
@@ -118,7 +118,7 @@ export function extendQuantRows(
  *  HEAD_DIM (file header) — a row's quantized bytes come out exactly as
  *  the serial oracle wrote them. */
 export function extractQuantRow(
-  cache: QuantizedKVCache, leftPad: number, i: number,
+  cache: QuantizedKVCache, leftPad: number, i: number, kernels: AffineKernels = cache.kernels,
 ): QuantizedKVCache {
   if (!cache.keys || !cache.values) throw new Error("extractQuantRow: empty cache");
   const S = cache.offset;
@@ -130,7 +130,7 @@ export function extractQuantRow(
       view.dispose();
       return own;
     });
-  const out = new QuantizedKVCache(cache.groupSize, cache.bits, cache.kernels);
+  const out = new QuantizedKVCache(cache.groupSize, cache.bits, kernels);
   out.restoreState(cut(cache.keys), cut(cache.values), S - leftPad);
   return out;
 }
@@ -246,7 +246,10 @@ export class BatchedQuantDecodeMaskCache extends QuantizedKVCache {
  *
  *  Reads: while no row is padded, the serial cache's reads; while one is, the
  *  step wrapper's (`BatchedQuantDecodeMaskCache`): the same kernels under the
- *  padding-aware mask, with the masked-window kernel for a window. */
+ *  padding-aware mask, with the masked-window kernel for a window. The kernels
+ *  are `kernels` while the layout holds one unpadded row and its `multiRow` set
+ *  otherwise (`rowLayoutKernels`), chosen when the rows change; rows it
+ *  extracts keep `kernels`. */
 export class PaddedQuantKVRows implements AttentionCache, BatchableCache {
   #inner: QuantizedKVCache;
   #leftPad: number[] = [];
@@ -260,7 +263,7 @@ export class PaddedQuantKVRows implements AttentionCache, BatchableCache {
     readonly kernels: AffineKernels,
     /** The per-forward masks of the model this layout serves. */
     readonly masks = new AttentionMasks(),
-  ) { this.#inner = this.#storage(); }
+  ) { this.#inner = this.#storage([]); }
 
   appendDecode(k: MlxArray, v: MlxArray): AttentionRead {
     return (this.#padded ? this.#step() : this.#inner).appendDecode(k, v);
@@ -270,8 +273,10 @@ export class PaddedQuantKVRows implements AttentionCache, BatchableCache {
     return (this.#padded ? this.#step() : this.#inner).appendWindow(k, v);
   }
 
-  /** Empty serial storage that reads with this layout's masks and kernels. */
-  #storage(): QuantizedKVCache { return new QuantizedKVCache(this.groupSize, this.bits, this.kernels, this.masks); }
+  /** Empty serial storage that reads with this layout's masks and the kernels for rows at `leftPad`. */
+  #storage(leftPad: readonly number[]): QuantizedKVCache {
+    return new QuantizedKVCache(this.groupSize, this.bits, rowLayoutKernels(this.kernels, leftPad.length <= 1 && !leftPad[0]), this.masks);
+  }
 
   signature(): string { return `kv:padded-rows-quant:${this.bits}:${this.groupSize}`; }
   get batchSize(): number | null { return this.#leftPad.length || null; }
@@ -347,7 +352,7 @@ export class PaddedQuantKVRows implements AttentionCache, BatchableCache {
       }
       final = acc.row;
       held.splice(held.indexOf(final.keys), 1); held.splice(held.indexOf(final.values), 1);
-      const cache = this.#storage();
+      const cache = this.#storage(acc.pads);
       cache.restoreState(final.keys, final.values, final.keys.packed.shape[2]!);
       final = undefined;
       this.#set(cache, acc.pads);
@@ -358,7 +363,7 @@ export class PaddedQuantKVRows implements AttentionCache, BatchableCache {
   }
 
   extractRow(row: number): Cache {
-    return this.#inner.keys ? extractQuantRow(this.#inner, this.#leftPad[row]!, row)
+    return this.#inner.keys ? extractQuantRow(this.#inner, this.#leftPad[row]!, row, this.kernels)
       : new QuantizedKVCache(this.groupSize, this.bits, this.kernels);
   }
 
@@ -370,14 +375,15 @@ export class PaddedQuantKVRows implements AttentionCache, BatchableCache {
     let filtered: { keys: ops.QuantizedTensor; values: ops.QuantizedTensor };
     try { filtered = filterQuantRows(keys, values, [...keep], shared); }
     finally { disposeTriple(keys); disposeTriple(values); }
-    const cache = this.#storage();
+    const pads = kept.map((pad) => pad - shared);
+    const cache = this.#storage(pads);
     cache.restoreState(filtered.keys, filtered.values, this.#inner.offset - shared);
     this.#inner.dispose();
-    this.#set(cache, kept.map((pad) => pad - shared));
+    this.#set(cache, pads);
   }
 
   dispose(): void {
     this.#inner.dispose();
-    this.#set(this.#storage(), []);
+    this.#set(this.#storage([]), []);
   }
 }

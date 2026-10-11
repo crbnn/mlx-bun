@@ -39,7 +39,7 @@ import { QuantizedLinear } from "../../src/layers/quantized-linear";
 import { RMSNorm } from "../../src/layers/normalization";
 import { type Cache, type Mask } from "../../src/contracts/mlx/cache";
 import { compiledSwiglu } from "../../src/layers/swiglu";
-import { captureKvAttention } from "../../src/state/kv-attention-view";
+import { referenceKvAttention as captureKvAttention } from "./quantized-sdpa-reference";
 
 /** Qwen3 attention (per-head q/k RMSNorm over head_dim before full-head RoPE,
  *  GQA). qwen3 and qwen3_moe share it; they differ only in the `rope_theta`

@@ -3,17 +3,16 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { AttentionRead,CommittedAttentionCache,CompiledDecodeCache,DecodeSlot,DecodeStepInputs,DecodeStepPlan,DecodeTrace,KvDonorAttention,Mask,QuantizedAttentionState } from "../contracts/mlx/cache";
 import { createCausalMask } from "../kernels/attention/masks";
-import { quantizedSdpa } from "../layers/quantized-attention";
 import { disposeTriple } from "./quantized-tensor";
 import { AttentionMasks, unmaskedLease, withLease } from "./attention-read";
-import { affineCausalLease, affineRead, committedAffineRead, unfusedAffineKernels, type AffineKernels } from "./affine-attention";
+import { affineCausalLease, affineRead, committedAffineRead, unfusedAffineKernels, viewAffineKernel, type AffineKernels, type AffineKernelSet } from "./affine-attention";
 
 
 /** Quantized KV cache — port of mlx-lm QuantizedKVCache: keys/values
  *  stored as (packed u32, scales, biases) triples, quantized along
  *  head_dim. Only full-attention layers convert (mlx-lm's rotating-cache
  *  quantization is NYI upstream; sliding layers are window-capped
- *  anyway). Attention dispatches to quantizedSdpa for these.
+ *  anyway).
  *
  *  Built empty, it quantizes from token zero: the first append is read
  *  quantized, so the first chunk's numbers differ from today's served path
@@ -22,13 +21,10 @@ import { affineCausalLease, affineRead, committedAffineRead, unfusedAffineKernel
  *  Reads: each named read appends through `updateAndFetchQuantized` and
  *  attends the fetched prefix with the kernel `kernels` fixed for it at
  *  construction: decode with no mask, a window under the bottom-right causal
- *  matrix. `tiledAffineKernels` computes what `quantizedSdpa` gives the graphs
- *  on this cache's masks with fused SDPA on, and `unfusedAffineKernels` what it
- *  gives with fused SDPA off, except a one-row window, which `quantizedSdpa`
- *  sends unfused by its query count and the window read sends to the window
- *  kernel. The committed read is
- *  `quantizedAppendAttention`. This cache has no sliding window (graphs compose
- *  `RotatingQuantizedKVCache` for sliding layers). */
+ *  matrix. The composition names the set (`composedAffineKernels`: tiled-causal
+ *  for `--kv-quant config` and `--fused-sdpa on`, unfused otherwise). The
+ *  committed read is `quantizedAppendAttention`. This cache has no sliding
+ *  window (graphs compose `RotatingQuantizedKVCache` for sliding layers). */
 export class QuantizedKVCache implements CompiledDecodeCache, CommittedAttentionCache {
   minimumReusableOffset?: number;
   static readonly STEP = 256;
@@ -47,6 +43,10 @@ export class QuantizedKVCache implements CompiledDecodeCache, CommittedAttention
      * made from this cache (`state/layout`) share them. */
     readonly masks = new AttentionMasks(),
   ) {}
+
+  /** The kernel set affine storage restored at this cache's layer reads with
+   * (`state/persistence`): this cache's own kernels. */
+  get kernelSet(): AffineKernelSet { return () => this.kernels; }
 
   get quantizedAttention(): QuantizedAttentionState { return this; }
 
@@ -272,7 +272,7 @@ export class QuantizedKVCache implements CompiledDecodeCache, CommittedAttention
     const B = keys.packed.shape[0]!, width = keys.packed.shape[2]!;
     return { width, dtype: keys.scales.dtype, offsets: Array(B).fill(this.offset),
       starts: Array(B).fill(0), ends: Array(B).fill(width),
-      attend: (q, scale, mask) => quantizedSdpa(q, keys, values, scale, mask, this.groupSize, this.bits),
+      attend: (q, scale, mask) => viewAffineKernel(this.kernels, q.shape[2]!, mask)(q, keys, values, scale, mask),
       dispose() { disposeTriple(keys); disposeTriple(values); },
     };
   }

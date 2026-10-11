@@ -1,5 +1,5 @@
 import type { ModelConfig } from "../artifacts/config";
-import type { Composition, DraftDepth, KvStorageScheme } from "../contracts/portable/composition";
+import type { AffineKvLayer, Composition, DraftDepth } from "../contracts/portable/composition";
 import {
   assertResolvedModelProfile,
   type GenerationLoop,
@@ -78,6 +78,16 @@ export class ModelImplementationRegistry<Source, Model> implements ModelImplemen
   }
 }
 
+/** A KV scheme as a table entry serves it: its storage, the kind and widths. A
+ * composition's scheme also names the affine read kernels (`kernels`) and the
+ * delayed conversion start (`quantizedKvStart`); the cache composes both from
+ * the composition, so neither constrains the graph. */
+export type ServedKv =
+  | { readonly kind: "bf16" }
+  | { readonly kind: "affine"; readonly bits: number; readonly groupSize: number }
+  | { readonly kind: "affine-layers"; readonly layers: readonly AffineKvLayer[] }
+  | { readonly kind: "turbo"; readonly kBits: number; readonly vBits: number };
+
 /** The composition a graph was built and qualified for, as its {@link GraphTable}
  * entry states it. Each field present constrains the composition; an absent
  * field accepts every value. */
@@ -88,9 +98,8 @@ export interface ServedComposition {
   readonly device?: string;
   readonly aneBridge?: boolean;
   /** The KV schemes served. A composition matches one with the same kind and
-   * widths (every layer's, for a per-layer scheme). The delayed conversion start
-   * (`quantizedKvStart`) is the cache's own timing and constrains nothing. */
-  readonly kv?: readonly KvStorageScheme[];
+   * widths (every layer's, for a per-layer scheme). */
+  readonly kv?: readonly ServedKv[];
   readonly draftDepth?: DraftDepth;
   readonly prefillChunkTokens?: number;
   readonly adapters?: boolean;
@@ -108,7 +117,7 @@ export interface GraphEntry<Source, Model> {
   create(source: Source, config: ModelConfig, composition: Composition): Model;
 }
 
-const kvKey = (scheme: KvStorageScheme): string => {
+const kvKey = (scheme: ServedKv): string => {
   switch (scheme.kind) {
     case "bf16": return "bf16";
     case "affine": return `affine ${scheme.bits}/${scheme.groupSize}`;

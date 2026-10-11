@@ -21,6 +21,7 @@ import { writeShardedSafetensors, type NamedTensor } from "../../src/artifacts/s
 import { TURBOQUANT_FOLD_FILE } from "../../src/artifacts/turboquant-fold";
 import { Weights } from "../../src/artifacts/weights";
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
+import { testComposition } from "../models/test-composition";
 import { QWEN38_TRELLIS_TQ_GRAPH, Qwen38TrellisTQ } from "../../src/models/qwen/qwen38-27b-trellis-tq";
 import { Affine4MmaLinear } from "../../src/layers/affine-verify-linear";
 import type { DraftProjection } from "../../src/contracts/mlx/draft-projection";
@@ -321,21 +322,21 @@ test("the rotated Trellis graph declares the basis its turboquant_fold.json reco
 
     // A record without final_gain declares nothing and names the file once, at construction; so does a missing record.
     writeFileSync(foldPath, JSON.stringify(record));
-    expect("residualBasis" in new Qwen38TrellisTQ(weights, config).draftTarget([])).toBe(false);
+    expect("residualBasis" in new Qwen38TrellisTQ(weights, config, testComposition()).draftTarget([])).toBe(false);
     expect(fileLines()).toEqual([`[graph] ${QWEN38_TRELLIS_TQ_GRAPH}: ${foldPath} records no final_gain; DFlash 2 drafts ` +
       "unrotated (output exact, acceptance collapses) until it records the final-norm gain the fold moved into lm_head"]);
     unlinkSync(foldPath);
-    expect("residualBasis" in new Qwen38TrellisTQ(weights, config).draftTarget([])).toBe(false);
+    expect("residualBasis" in new Qwen38TrellisTQ(weights, config, testComposition()).draftTarget([])).toBe(false);
     expect(fileLines()).toHaveLength(2);
     expect(fileLines()[1]).toContain(`${foldPath} is missing;`);
     // A stream the record says is not rotated has no basis to declare and nothing to report.
     writeFileSync(foldPath, JSON.stringify({ ...record, r1: false, final_gain: Array.from(basis.finalGain) }));
-    expect("residualBasis" in new Qwen38TrellisTQ(weights, config).draftTarget([])).toBe(false);
+    expect("residualBasis" in new Qwen38TrellisTQ(weights, config, testComposition()).draftTarget([])).toBe(false);
 
     // The record with final_gain: the graph declares it; the generic graph on the same artifact declares nothing.
     writeFileSync(foldPath, JSON.stringify({ ...record, final_gain: Array.from(basis.finalGain) }));
-    const graph = new Qwen38TrellisTQ(weights, config);
-    expect("residualBasis" in new Qwen35Model(weights, config).draftTarget([])).toBe(false);
+    const graph = new Qwen38TrellisTQ(weights, config, testComposition());
+    expect("residualBasis" in new Qwen35Model(weights, config, testComposition()).draftTarget([])).toBe(false);
     expect(fileLines()).toHaveLength(2);
     unlinkSync(foldPath); // read once, at construction: the declaration no longer depends on the file
     const head = graph.logitsFromHidden.bind(graph);

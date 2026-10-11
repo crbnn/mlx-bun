@@ -7,7 +7,7 @@
 // with the model's EOS and no stop strings, full-precision KV, and the raw
 // decoded text main returned.
 
-import { resolveKvScheme, type KvScheme } from "@mlx-bun/inference/state/kv-scheme";
+import { kvSchemeOf, type KvScheme } from "@mlx-bun/inference/state/kv-scheme";
 import type { LoadContextOptions, LoadedModelContext } from "../engine/model-host";
 import type { CompletionEngine } from "../engine/completion";
 import type { GenerationGateway } from "../engine/generation-gateway";
@@ -76,8 +76,8 @@ export function createInProcessMemoryClient(deps: MemoryEngineDependencies = def
     const dir = deps.adapterDir("chunk");
     const context = await deps.load(path, MEMORY_TASK_MODEL, { adapters: dir !== undefined, maxRows: memoryBatchSize() });
     if (closed) { context.dispose(); throw closedError(); }
-    // Main decoded with a full-precision cache, whatever the artifact's kv_config says.
-    const scheme = resolveKvScheme({ override: "off", config: context.kvConfig });
+    // Main decoded with a full-precision cache, whatever the artifact's kv_config says: the load names no KV flags.
+    const scheme = kvSchemeOf(context.composition?.kv ?? { kind: "bf16" });
     const engine = await deps.engine(context, scheme, memoryBatchSize());
     try {
       if (closed) throw closedError();
@@ -95,7 +95,7 @@ export function createInProcessMemoryClient(deps: MemoryEngineDependencies = def
     const promptIds = memoryPromptIds(request.stage, request.input,
       { encode: text => tokenizer.encode(text), bosTokenId: tokenizer.bosTokenId ?? -1 }, context.template);
     const plan = planRequest({ promptIds,
-      options: { maxTokens: request.maxTokens, temperature: 0, ...rt.scheme.generationOptions, stopSequences: [] },
+      options: { maxTokens: request.maxTokens, temperature: 0, stopSequences: [] },
       requestedMaxTokens: request.maxTokens, contextLimit: context.memoryPlan?.contextTokens ?? null,
       stream: false, wantLogprobs: false, topLogprobs: 0,
       adapterIds: request.stage === "chunk" && rt.chunkAdapter ? [CHUNK_ADAPTER] : [],

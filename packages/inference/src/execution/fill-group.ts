@@ -12,7 +12,7 @@ import { MlxPrefillCohort } from "./prefill-cohort";
 import { MlxStateRows } from "../state/rows";
 import { targetCacheLayout } from "../state/layout";
 import { leaseCacheStates } from "../state/leases";
-import { createKvMaintenance, type KvMaintenance } from "../state/kv-maintenance";
+import type { KvStorageScheme } from "../contracts/portable/composition";
 import { bindMlxAutoregressiveGraph, supportsCommittedAppendCache, type MlxAutoregressiveBinding, type MlxTokenAppend } from "../generation/bindings/autoregressive";
 import { appendHiddenRows } from "../generation/fill-append";
 import { advanceSpeculativeOutputs } from "../generation/speculative/round";
@@ -30,21 +30,20 @@ interface RequestState {
 /** Strict continuations share preparation, row layouts and queueing with other
  * methods. Sampled tokens remain pipelined; committed tokens bypass sampling.
  * This binding is qualified independently before serving advertises it. */
-export function bindFillGroupRequests(model: MlxTokenGraph) {
+export function bindFillGroupRequests(model: MlxTokenGraph, kv: KvStorageScheme) {
   return (input: GenerateOptions): MlxGroupMethodRequest => {
     const options = snapshotGenerationPolicy(input);
     return {
-      key: JSON.stringify(["fill", options.kvBits ?? null, options.kvGroupSize ?? 64,
-        options.quantizedKvStart ?? null, options.turboQuant ?? null, options.kvConfig ?? null]),
+      // The KV scheme is the composition's, shared by every request.
+      key: JSON.stringify(["fill"]),
       data: options,
-      open: host => new FillGroup(host, model, options),
+      open: host => new FillGroup(host, model, kv),
     };
   };
 }
 
 class FillGroup implements MlxGroupedMethod {
   readonly #binding: MlxAutoregressiveBinding;
-  readonly #maintain: KvMaintenance;
   readonly #append: MlxTokenAppend | null | undefined;
   readonly #verify: MlxSpeculativeTargetBinding;
   readonly #requests = new Map<Row, RequestState>();
@@ -54,12 +53,11 @@ class FillGroup implements MlxGroupedMethod {
   #real: boolean[] = [];
   #steps = 0;
 
-  constructor(readonly host: MlxGroupMethodHost, readonly model: MlxTokenGraph, options: GenerateOptions) {
+  constructor(readonly host: MlxGroupMethodHost, readonly model: MlxTokenGraph, kv: KvStorageScheme) {
     this.#binding = bindMlxAutoregressiveGraph(model);
     this.#verify = bindSpeculativeTargetModel(model);
-    this.#maintain = createKvMaintenance(options);
     const append = this.#binding.createAppend?.({ hasAdapters: !!this.#binding.adapters?.active.length, pagedKv: false });
-    this.#append = supportsCommittedAppendCache(append, options) ? append : null;
+    this.#append = supportsCommittedAppendCache(append, kv) ? append : null;
   }
 
   get runningTokens(): number { return this.host.rows.length * Math.max(1, this.#burstLength(), this.#verifyLength()); }
@@ -88,7 +86,7 @@ class FillGroup implements MlxGroupedMethod {
     const target = new MlxPrefillCohort({
       model: this.model, chunkSize: this.host.prefillChunkSize,
       tailSplit: this.host.runtime.flag("MLX_BUN_PREFILL_TAIL_SPLIT", true),
-      promptCache: this.host.promptCache, maintain: this.#maintain,
+      promptCache: this.host.promptCache, maintain: this.host.kvMaintenance,
       forward: async (ids, caches) => this.#binding.graph.forwardHidden(ids, caches),
       project: hidden => this.#binding.graph.projectLogits(hidden, { type: "all" }),
       complete: async (state, logits) => {
@@ -99,7 +97,6 @@ class FillGroup implements MlxGroupedMethod {
         row.generated = row.sampled = 1;
         try {
           const reason = await this.#emit(row, token.toIntTokens()[0]!, false);
-          this.#maintain(state.solo);
           if (reason) {
             this.#put(row, state.solo, state.retain);
             state.solo = []; state.retain = undefined;
@@ -140,7 +137,7 @@ class FillGroup implements MlxGroupedMethod {
             if (state.row.req.signal?.aborted) {
               this.#closeRequest(state.row); state.row.reject(state.row.req.signal.reason); continue;
             }
-            this.#maintain.prepareBatch?.(state.caches);
+            this.host.kvMaintenance?.prepareBatch?.(state.caches);
             this.#target ??= new MlxStateRows(state.caches.map(targetCacheLayout));
             this.#target.append(state.caches);
             // Copies must settle before releasing a restored SSD lease.
@@ -352,7 +349,7 @@ class FillGroup implements MlxGroupedMethod {
     using input = ops.fromInt32(rows.flatMap(row => spans.get(row)!), [B, length]);
     using hidden = await appendHiddenRows(this.#append!.forwardHidden.bind(this.#append), this.#target!.caches, input,
       (caches, count) => Math.min(this.#append!.maxChunkSize(caches, count),
-        this.#maintain.maxAppendTokens?.(caches) ?? Infinity,
+        this.host.kvMaintenance?.maxAppendTokens?.(caches) ?? Infinity,
         ...rows.map(row => this.#requests.get(row)!.fill.appendChunkSize || Infinity)));
     const nextKnown: boolean[] = [], nextReal: boolean[] = [];
     const selected = rows.map(row => {

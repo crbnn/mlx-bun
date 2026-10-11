@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { declareGraph, declaredGraph, PLAIN_KV_VERIFICATION } from "../../src/models/capabilities";
-import { createRuntimeConfig, withRuntimeConfig } from "../../src/runtime/config";
+import { testComposition } from "./test-composition";
 import { Gemma4Model } from "../../src/models/gemma4/model";
 import { UniversalDenseModel } from "../../src/models/universal/dense";
 import { DiffusionGemmaModel } from "../../src/models/diffusion-gemma/model";
@@ -30,11 +30,13 @@ describe("every graph declares its capabilities", () => {
   });
 
   test("Qwen3.5 and its Trellis specialization: prepared embeddings with positions, video, speculation over affine KV as its own option", () => {
+    // Speculation over affine KV is the composition's field (`MLX_BUN_QWEN_SPEC_KV4`, read when it resolves).
     for (const prototype of [Qwen35Model.prototype, Qwen38TrellisTQ.prototype]) {
-      const declared = graph(prototype, { hiddenTap: null }).graphCapabilities;
+      const declared = graph(prototype, { hiddenTap: null, composition: testComposition() }).graphCapabilities;
       expect(declared).toEqual(declareGraph({ media: { input: "embeddings+positions", video: true }, hiddenLayerTaps: true,
         kv: { delayedAffine: "all" }, prefill: { boundedWorkspace: true }, speculation: { immediateAffine4: true } }));
-      const off = withRuntimeConfig(createRuntimeConfig({ MLX_BUN_QWEN_SPEC_KV4: "0" }), () => graph(prototype, { hiddenTap: null }).graphCapabilities);
+      const off = graph(prototype, { hiddenTap: null, composition: testComposition(undefined, { speculativeAffineKv: false }) })
+        .graphCapabilities;
       expect(off.speculation).toEqual({ ...declared.speculation, affineKv: false });
     }
   });
@@ -80,7 +82,7 @@ describe("a graph's operations match what it declares", () => {
   test("the class that declares media supplies the operations that serve it", () => {
     for (const [prototype, input] of [[Gemma4Model.prototype, "embeddings"], [Qwen35Model.prototype, "embeddings+positions"]] as const) {
       expect(typeof (prototype as { bindMediaInput?: unknown }).bindMediaInput).toBe("function");
-      expect(graph(prototype, { hiddenTap: null }).graphCapabilities.media?.input).toBe(input);
+      expect(graph(prototype, { hiddenTap: null, composition: testComposition() }).graphCapabilities.media?.input).toBe(input);
     }
     expect(typeof (DiffusionGemmaModel.prototype as { pixelInput?: unknown }).pixelInput).toBe("function");
   });

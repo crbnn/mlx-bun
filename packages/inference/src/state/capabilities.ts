@@ -19,6 +19,23 @@ export function cacheSignature(cache: Cache | undefined): string {
   return cache ? cache.signature() : "unknown";
 }
 
+/** The storage a cache holds: a composed lego's (`Cache.composed`), else the
+ * cache itself. What a binding probes to learn which layers a fresh cache list
+ * can lay out and convert. */
+export function composedStorageOf(cache: Cache): Cache {
+  return cache.composed ? cache.composed.storage() : cache;
+}
+
+/** `stored` (restored or cloned storage) as the cache of a layer whose graph
+ * cache is `layer`: composed again by that layer's lego (`ComposedStorage.over`),
+ * so it converts as the lego that stored it would have. A cache that already is
+ * a lego stays, and so do paged pages, which the paged request policy holds in
+ * the lego's place (`state/request-policy.ts`). */
+export function composeAtLayer(layer: Cache, stored: Cache): Cache {
+  const composed = layer.composed;
+  return !composed || stored.composed || cacheSignature(stored) === "kv:paged" ? stored : composed.over(stored);
+}
+
 export function isRowBatchCache(cache: Cache): cache is RowBatchCache {
   const candidate = cache as Partial<RowBatchCache>;
   return typeof candidate.batchSize === "number" &&
@@ -41,6 +58,10 @@ export function isQuantizedKvCache(cache: Cache | undefined): cache is Quantized
 
 export function isRotatingPlainCache(cache: Cache | undefined): cache is RotatingKVCache {
   return cacheSignature(cache) === "kv:rotating-plain";
+}
+
+export function isTurboQuantKvCache(cache: Cache | undefined): boolean {
+  return cacheSignature(cache).startsWith("kv:turboquant:");
 }
 
 export function isRotatingQuantizedCache(

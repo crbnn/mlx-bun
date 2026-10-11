@@ -101,7 +101,7 @@ export async function createServingUnit(context: LoadedModelContext, options: Co
       if (!result.durable) console.warn(`[server] cache flush incomplete: ${result.pendingSnapshots} snapshots, ${result.pendingSpills} spills, ${result.failedSpills} failed`);
     };
     cleanup = async () => { try { await closeCaches(); } finally { releaseContext(context, input.ownership); } };
-    validatePagedServingOptions(options.request.pagedKv, caches.kvScheme, !!context.draft);
+    validatePagedServingOptions(options.request.pagedKv, caches.resolvedKvScheme.storage, !!context.draft);
     binding.gateway.configureContinuation?.(caches.continuationServices);
     // createAppEngine takes ownership even when its constructor rejects.
     cleanup = undefined;
@@ -125,7 +125,7 @@ export async function createServingUnit(context: LoadedModelContext, options: Co
       undefined, undefined, 0, options.memoryBudgetBytes, caches.resolvedKvScheme.fitOptions);
     const limits = resolveServingLimits(options, context.memoryPlan, admission);
     const completions = createCompletionRoutes(engine, { ...options.request, promptCache: caches.promptCache,
-      kvScheme: caches.kvScheme, ...limits, tokenHistory, responseHistory: shared.responses,
+      ...limits, tokenHistory, responseHistory: shared.responses,
       transcription: shared.transcription,
       ...(input.buildPrompt ? { buildPrompt: input.buildPrompt } : {}),
       ...(input.defaultAdapter ? { defaultAdapter: input.defaultAdapter } : {}) });

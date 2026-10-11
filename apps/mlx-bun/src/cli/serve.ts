@@ -6,7 +6,6 @@ import { numericalPolicy } from "./numerical-policy";
 import { storagePath } from "../storage/paths";
 import { resolveModelAuto } from "./model-selection";
 import type { ModelRecord } from "@mlx-bun/hub/registry";
-import type { CacheServiceOptions } from "../engine/cache-services";
 import type { RequestPrepOptions } from "../server/request-prep";
 import type { DraftKind } from "../engine/model-host";
 import { installedModules, locateTaskModel, MEMORY_TASK_MODEL, type ModuleSettings } from "../modules";
@@ -50,7 +49,7 @@ export function parseServeOptions(args: CommandArgs): ServeOptions {
   // Main's TurboQuant spec, turbo (k8v3) or turbo:k<bits>v<bits>, is its own scheme beside affine KV.
   const turboQuant = parseTurboQuantScheme(kv);
   if (!turboQuant && !["off", "config", "4", "8"].includes(kv)) throw new Error("--kv-quant expects off|config|4|8|turbo[:k<bits>v<bits>]");
-  const cache: CacheServiceOptions = turboQuant ? { turboQuant }
+  const cache: ServeOptions["cache"] = turboQuant ? { turboQuant }
     : { kvQuant: kv === "4" || kv === "8" ? Number(kv) : kv as "off" | "config" };
   const promptCache = number("prompt-cache");
   if (promptCache !== undefined) cache.promptCacheBytes = promptCache * 2 ** 30;

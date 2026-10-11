@@ -13,6 +13,7 @@ import { createInferenceEngine, createAutoregressiveMethod } from "@mlx-bun/infe
 import { bindMlxAutoregressiveGraph } from "@mlx-bun/inference/generation/bindings/autoregressive";
 import { generate } from "@mlx-bun/inference";
 import { bindMlxGraph } from "@mlx-bun/inference/models/graph";
+import { testComposition } from "./test-composition";
 
 /** A tiny checkpoint generated in memory; no model download or stored fixture. */
 async function checkpoint(dir: string): Promise<void> {
@@ -61,7 +62,7 @@ test("a caller loads a graph, owns its state, selects logits and generates direc
     await checkpoint(dir);
     const config = await loadModelConfig(dir), weights = await Weights.open(dir);
     try {
-      const model = new Qwen3Model(weights, config), state = model.makeCache();
+      const model = new Qwen3Model(weights, config, testComposition()), state = model.makeCache();
       try {
         const graph = bindMlxGraph(model, { id: "tiny-qwen3", artifact: "synthetic", stateAbi: "kv" });
         using ids = ops.fromInt32([1, 2, 3], [1, 3]);

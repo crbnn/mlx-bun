@@ -34,10 +34,14 @@ function settleAffineRings(rows: Cache[], groupSize: number, bits: number, start
 export class DelayedRotatingQuantizedKVCache extends SpeculativeTransitioningKvRows<RotatingAffineLayout>
   implements KvAttentionState, PaddedPrefillCache, CommittedAttentionCache {
   constructor(readonly maxSize: number, readonly groupSize: number, readonly bits: number, readonly start: number,
-    /** The affine kernel set converted rings attend with, named by the
-     * composition (`unfusedAffineKernels`, `tiledCausalAffineKernels`). */
-    readonly kernelSet: AffineKernelSet, row?: Cache, readonly speculative = false) {
+    /** The affine kernel set converted rings and every read attend with,
+     * named by the composition (`composedAffineKernels`). */
+    readonly kernelSet: AffineKernelSet, row?: Cache, readonly speculative = false,
+    /** How the lego these rings came from composes the rings this layout
+     * hands back to serial use (`ComposedStorage.over`). */
+    readonly compose?: (storage: Cache) => Cache) {
     super({ signature: `kv:delayed-rotating-quant:${maxSize}:${bits}:${groupSize}:${start}`, conversionOffset: start,
+      ...(compose ? { compose } : {}),
       settle: rows => settleAffineRings(rows, groupSize, bits, start, kernelSet),
       keepsDenseReads: row => {
         const source = (row as AlignedRotatingCache).affineConversion;
@@ -109,7 +113,8 @@ export class DelayedRotatingQuantizedKVCache extends SpeculativeTransitioningKvR
   get maxTokens(): number { return this.maxSize; }
   projectedBytes(tokens: number): number { return this.bytesPerToken() * Math.min(tokens, this.maxSize); }
   makeEmptyBatch(): DelayedRotatingQuantizedKVCache {
-    return new DelayedRotatingQuantizedKVCache(this.maxSize, this.groupSize, this.bits, this.start, this.kernelSet, undefined, this.speculative);
+    return new DelayedRotatingQuantizedKVCache(this.maxSize, this.groupSize, this.bits, this.start, this.kernelSet, undefined,
+      this.speculative, this.compose);
   }
   /** Plain keys and values while every row is still plain: each row's own
    * ring answers (one row keeps its physical columns and phase; several share
@@ -139,13 +144,14 @@ export class DelayedRotatingQuantizedKVCache extends SpeculativeTransitioningKvR
   releaseRopeArr(): void { this.packed?.releaseRopeArr(); }
   appendAndFetch(k: MlxArray, v: MlxArray): KvAttentionView {
     this.advance();
-    if (this.packed) return captureKvAttention(this.packed, k, v);
+    const kernels = this.kernelSet(this.bits, this.groupSize, k.dtype);
+    if (this.packed) return captureKvAttention(this.packed, k, v, kernels);
     const views: KvAttentionView[] = [];
     try {
       for (const [row, cache] of this.rows.entries()) {
         const slice = (a: MlxArray) => a.slice([row, 0, 0, 0], [row + 1, a.shape[1]!, a.shape[2]!, a.shape[3]!]);
         using kr = slice(k), vr = slice(v);
-        views.push(captureKvAttention(cache, kr, vr));
+        views.push(captureKvAttention(cache, kr, vr, kernels));
       }
       this.syncPositions(true);
     } catch (error) { for (const view of views) view.dispose(); throw error; }

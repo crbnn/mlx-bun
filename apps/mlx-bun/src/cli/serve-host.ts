@@ -79,10 +79,11 @@ function mergeDurability(all: readonly DurabilityFlushResult[]): DurabilityFlush
     missingSnapshots: all.reduce((n, item) => n + item.missingSnapshots, 0), elapsedMs: all.reduce((n, item) => Math.max(n, item.elapsedMs), 0) };
 }
 
-/** Serve's KV flags as the composition request names them. */
-const kvFlags = ({ kvQuant, turboQuant, quantizedKvStart }: ServeOptions["cache"]) => ({
+/** Serve's KV flags as the composition request names them, `--fused-sdpa` (the
+ * affine read kernels) with them. */
+const kvFlags = ({ cache: { kvQuant, turboQuant, quantizedKvStart }, fusedSdpa }: ServeOptions) => ({
   ...(kvQuant !== undefined ? { override: kvQuant } : {}), ...(turboQuant ? { turboQuant } : {}),
-  ...(quantizedKvStart !== undefined ? { quantizedKvStart } : {}) });
+  ...(quantizedKvStart !== undefined ? { quantizedKvStart } : {}), ...(fusedSdpa !== undefined ? { fusedSdpa } : {}) });
 
 /** Model composition owns resources until each explicit ownership transfer. */
 export function startModelHost(state: AppState, model: ModelRecord, options: ServeOptions, hooks?: ModelHostHooks & { unix?: undefined }): Promise<RunningModelHost>;
@@ -90,8 +91,7 @@ export function startModelHost(state: AppState, model: ModelRecord, options: Ser
 export function startModelHost(state: AppState, model: ModelRecord, options: ServeOptions, hooks?: ModelHostHooks): Promise<RunningModelHost | RunningWorkerHost>;
 export async function startModelHost(state: AppState, model: ModelRecord, options: ServeOptions, hooks: ModelHostHooks = {}): Promise<RunningModelHost | RunningWorkerHost> {
   const [{ loadContext }, { configureRuntime }] = await Promise.all([import("../engine"), import("@mlx-bun/inference/runtime/config")]);
-  // Keep main's KV numerical composition while graph compilation stays a layer concern.
-  const restoreRuntime = configureRuntime({ MLX_BUN_NO_FUSED_SDPA: (options.fusedSdpa ?? options.cache.kvQuant === "config") ? "0" : "1",
+  const restoreRuntime = configureRuntime({
     ...(options.forceWire ? { MLX_BUN_FORCE_WIRE: "1" } : {}),
     ...(options.allowPrivateMedia ? { MLX_BUN_ALLOW_PRIVATE_MEDIA: "1" } : {}) });
   // Offload routing and the runtime switches are restored only after the
@@ -117,7 +117,7 @@ export async function startModelHost(state: AppState, model: ModelRecord, option
       const context = await loadContext(record.path, record.repoId, {
         ...(options.memoryBudgetBytes !== undefined ? { memoryBudgetBytes: options.memoryBudgetBytes } : {}),
         // The composition's facts: the KV flags, the startup adapter and the batch cap.
-        kv: kvFlags(options.cache), adapters: startup && options.adapterDir !== undefined, maxRows: options.capacity,
+        kv: kvFlags(options), adapters: startup && options.adapterDir !== undefined, maxRows: options.capacity,
         // Resource plan inputs for runtimes that plan memory up front; other models ignore this block.
         runtime: { batchSize: options.capacity, maxGenerationTokens: options.defaultGeneratedTokens ?? 128,
           ...(options.memoryBudgetBytes !== undefined ? { memoryBudgetBytes: options.memoryBudgetBytes } : {}),

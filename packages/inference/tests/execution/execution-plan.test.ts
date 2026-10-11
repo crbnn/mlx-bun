@@ -4,9 +4,11 @@ import type { ExecutionCapabilities, ExecutionRequirements } from "../../src/con
 
 const request: ExecutionRequirements = {
   hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
-  kvQuant: false, turboQuant: false, hasLogitsExtras: false, hasGrammar: false,
+  hasLogitsExtras: false, hasGrammar: false,
   wantsLogprobs: false, hasDraft: false,
 };
+// The composition's KV scheme is an executor fact every request stores with.
+const affineKv = { kvQuant: true } as const, turboKv = { turboQuant: true } as const;
 const capabilities: ExecutionCapabilities = {
   method: "autoregressive", continuous: true, quantizedBatch: true,
   grammarBatch: true, checkpoints: true,
@@ -49,17 +51,19 @@ test("with grammar coordination and no optional features, grammar never changes 
   const variants: Partial<ExecutionCapabilities>[] = [{}, { continuous: false }, { quantizedBatch: false },
     { mediaBatch: true }, { adapterBatch: true }, { turboQuantBatch: true }, { method: "denoising" },
     { groupedMethods: ["autoregressive", "speculative"], speculativeLogprobs: true }];
-  for (const variant of variants) for (const extra of [{}, { hasVision: true }, { hasAdapters: true },
-    { kvQuant: true }, { turboQuant: true }, { wantsLogprobs: true }, { userSeed: true }, { hasDraft: true }]) {
-    const supported = { ...capabilities, ...variant };
-    expect({ variant, extra, plan: resolveExecution({ ...request, ...extra, hasGrammar: true }, supported) })
-      .toEqual({ variant, extra, plan: resolveExecution({ ...request, ...extra }, supported) });
+  for (const variant of variants) for (const kv of [{}, affineKv, turboKv]) for (const extra of [{}, { hasVision: true },
+    { hasAdapters: true }, { wantsLogprobs: true }, { userSeed: true }, { hasDraft: true }]) {
+    const supported = { ...capabilities, ...variant, ...kv };
+    expect({ variant, kv, extra, plan: resolveExecution({ ...request, ...extra, hasGrammar: true }, supported) })
+      .toEqual({ variant, kv, extra, plan: resolveExecution({ ...request, ...extra }, supported) });
   }
 });
 
 test.each(["hasVision", "hasAdapters", "wantsLogprobs", "kvQuant", "turboQuant"] as const)(
   "%s uses AR and retains an explicit draft fallback reason", (key) => {
-    const plan = resolveExecution({ ...request, hasDraft: true, [key]: true }, capabilities);
+    const scheme = key === "kvQuant" || key === "turboQuant";
+    const plan = resolveExecution({ ...request, hasDraft: true, ...(scheme ? {} : { [key]: true }) },
+      scheme ? { ...capabilities, [key]: true } : capabilities);
     expect(plan.method).toBe("autoregressive");
     expect(plan.mechanism).toBe(key === "wantsLogprobs" || key === "kvQuant" ? "continuous" : "unsupported");
     expect(plan.reasons).toContain("draft-incompatible-with-request");
@@ -73,20 +77,21 @@ test("grammar and an explicit seed select speculation, which needs a grouped ver
 });
 
 test("qualified speculative KV without a grouped verifier is unsupported; other guards keep AR", () => {
-  const qualified = { ...capabilities, speculativeKvQuant: true };
-  const draft = { ...request, hasDraft: true, kvQuant: true };
+  const qualified = { ...capabilities, ...affineKv, speculativeKvQuant: true };
+  const draft = { ...request, hasDraft: true };
   expect(resolveExecution(draft, qualified)).toMatchObject({
     method: "speculative", mechanism: "unsupported", promptCache: false, checkpoint: false,
   });
-  for (const key of ["hasVision", "hasAdapters", "wantsLogprobs", "turboQuant"] as const)
+  for (const key of ["hasVision", "hasAdapters", "wantsLogprobs"] as const)
     expect(resolveExecution({ ...draft, [key]: true }, qualified).method).toBe("autoregressive");
+  expect(resolveExecution(draft, { ...qualified, ...turboKv }).method).toBe("autoregressive");
   expect(resolveExecution(draft, qualified, { pagedKv: true, fill: false }).method).toBe("autoregressive");
 });
 
 test("supported affine KV batches; unavailable layouts and TurboQuant are unsupported", () => {
-  expect(resolveExecution({ ...request, kvQuant: true }, capabilities).mechanism).toBe("continuous");
-  expect(resolveExecution({ ...request, kvQuant: true }, { ...capabilities, quantizedBatch: false }).mechanism).toBe("unsupported");
-  expect(resolveExecution({ ...request, turboQuant: true }, capabilities).mechanism).toBe("unsupported");
+  expect(resolveExecution(request, { ...capabilities, ...affineKv }).mechanism).toBe("continuous");
+  expect(resolveExecution(request, { ...capabilities, ...affineKv, quantizedBatch: false }).mechanism).toBe("unsupported");
+  expect(resolveExecution(request, { ...capabilities, ...turboKv }).mechanism).toBe("unsupported");
 });
 
 test("paged placement keeps prefix reuse separate from interruption checkpoints", () => {
@@ -108,8 +113,8 @@ test("paged placement keeps prefix reuse separate from interruption checkpoints"
 test("fill requires a qualified shared binding and cannot run in another method or resumable checkpoint", () => {
   const features = { pagedKv: false, fill: true };
   expect(resolveExecution(request, capabilities, features).fill).toBe(false);
-  for (const shape of [request, { ...request, kvQuant: true }, { ...request, turboQuant: true }]) {
-    const plan = resolveExecution(shape, { ...capabilities, continuous: false }, features);
+  for (const kv of [{}, affineKv, turboKv]) {
+    const plan = resolveExecution(request, { ...capabilities, ...kv, continuous: false }, features);
     expect(plan).toMatchObject({ mechanism: "unsupported", fill: false, checkpoint: false });
     expect(plan.reasons).toContain("fill-incompatible-with-request");
   }
@@ -123,9 +128,9 @@ test("fill requires a qualified shared binding and cannot run in another method 
 test("qualified shared fill retains seeded sampling and excludes paging, grammar and metadata", () => {
   const supported = { ...capabilities, sharedFill: true, turboQuantBatch: true, compiledDecode: true };
   const features = { pagedKv: false, fill: true, compiledDecode: true };
-  for (const shape of [request, { ...request, userSeed: true }, { ...request, kvQuant: true },
-    { ...request, turboQuant: true }]) {
-    expect(resolveExecution(shape, supported, features)).toMatchObject({
+  for (const [shape, kv] of [[request, {}], [{ ...request, userSeed: true }, {}], [request, affineKv],
+    [request, turboKv]] as const) {
+    expect(resolveExecution(shape, { ...supported, ...kv }, features)).toMatchObject({
       method: "autoregressive", mechanism: "continuous", fill: true,
       promptCache: true, checkpoint: false, compiledDecode: false,
     });
@@ -172,10 +177,10 @@ test("adapter-capable groups retain ordinary sampling features", () => {
 });
 
 test("registered grouped methods compose speculation with sampling and KV storage", () => {
-  const composed = { ...capabilities, groupedMethods: ["autoregressive", "speculative"],
+  const composed = { ...capabilities, ...affineKv, groupedMethods: ["autoregressive", "speculative"],
     speculativeLogprobs: true, speculativeKvQuant: true };
   const plan = resolveExecution({ ...request, hasDraft: true, wantsLogprobs: true,
-    userSeed: true, hasGrammar: true, kvQuant: true }, composed);
+    userSeed: true, hasGrammar: true }, composed);
   expect(plan).toMatchObject({ method: "speculative", mechanism: "continuous" });
   expect(plan.reasons).not.toContain("method-batch-unsupported");
   expect(plan.reasons).not.toContain("draft-incompatible-with-request");
@@ -183,8 +188,8 @@ test("registered grouped methods compose speculation with sampling and KV storag
 
 
 test("TurboQuant group capability composes with ordinary and speculative methods", () => {
-  const turbo = { ...request, turboQuant: true };
-  const supported = { ...capabilities, turboQuantBatch: true };
+  const turbo = request;
+  const supported = { ...capabilities, ...turboKv, turboQuantBatch: true };
   expect(resolveExecution(turbo, supported).mechanism).toBe("continuous");
   const mtp = resolveExecution({ ...turbo, hasDraft: true }, { ...supported,
     speculativeTurboQuant: true, groupedMethods: ["autoregressive", "speculative"] });
@@ -226,10 +231,12 @@ test("grammar proposals select the shared verifier only when its request combina
   expect(resolveExecution({ ...grammar, wantsLogprobs: true }, { ...supported, speculativeLogprobs: true }, features))
     .toMatchObject({ method: "speculative", mechanism: "continuous", grammarJump: true });
   expect(resolveExecution(grammar, supported).method).toBe("autoregressive");
-  for (const option of [{ wantsLogprobs: true }, { kvQuant: true }, { turboQuant: true }, { hasAdapters: true }])
+  for (const option of [{ wantsLogprobs: true }, { hasAdapters: true }])
     expect(resolveExecution({ ...grammar, ...option }, supported, features).method).toBe("autoregressive");
-  expect(resolveExecution({ ...grammar, kvQuant: true }, { ...supported, speculativeKvQuant: true }, features).grammarJump).toBe(true);
-  expect(resolveExecution({ ...grammar, turboQuant: true }, { ...supported,
+  for (const kv of [affineKv, turboKv])
+    expect(resolveExecution(grammar, { ...supported, ...kv }, features).method).toBe("autoregressive");
+  expect(resolveExecution(grammar, { ...supported, ...affineKv, speculativeKvQuant: true }, features).grammarJump).toBe(true);
+  expect(resolveExecution(grammar, { ...supported, ...turboKv,
     turboQuantBatch: true, speculativeTurboQuant: true }, features).grammarJump).toBe(true);
   expect(resolveExecution(grammar, { ...supported, groupedMethods: ["autoregressive"] }, features).method).toBe("autoregressive");
   expect(resolveExecution({ ...grammar, hasDraft: true }, supported, features)).toMatchObject({
@@ -238,8 +245,8 @@ test("grammar proposals select the shared verifier only when its request combina
 });
 
 test("a provider consuming external tokens composes echo with shared speculation", () => {
-  const shape = { ...request, hasDraft: true, userSeed: true, kvQuant: true };
-  const supported = { ...capabilities, groupedMethods: ["autoregressive", "speculative"],
+  const shape = { ...request, hasDraft: true, userSeed: true };
+  const supported = { ...capabilities, ...affineKv, groupedMethods: ["autoregressive", "speculative"],
     speculativeKvQuant: true, sharedSpeculativeEcho: true };
   const features = { fill: true, pagedKv: false };
   expect(resolveExecution(shape, supported, features)).toMatchObject({
@@ -264,18 +271,18 @@ describe("interleaved denoising placement", () => {
   });
 
   test.each([
-    [{ hasDraft: true }, {}, "draft-method-unsupported"],
-    [{ hasGrammar: true }, {}, "grammar-batch-unsupported"],
-    [{ wantsLogprobs: true }, {}, "logprobs-method-unsupported"],
-    [{ hasRepetitionPenalty: true }, {}, "repetition-penalty-method-unsupported"],
-    [{ hasLogitsExtras: true }, {}, "logits-extras-method-unsupported"],
-    [{}, { fill: true }, "fill-method-unsupported"],
-    [{ kvQuant: true }, {}, "kv-scheme-batch-unsupported"],
-    [{ turboQuant: true }, {}, "turbo-kv-batch-unsupported"],
-    [{}, { pagedKv: true }, "paged-kv-batch-unsupported"],
-    [{ hasVision: true }, {}, "media-batch-unsupported"],
-  ] as const)("a token-level or AR-state request is refused, never discarded: %#", (shape, feature, reason) => {
-    const plan = resolveExecution({ ...request, ...shape }, denoising, { ...features, ...feature });
+    [{ hasDraft: true }, {}, "draft-method-unsupported", {}],
+    [{ hasGrammar: true }, {}, "grammar-batch-unsupported", {}],
+    [{ wantsLogprobs: true }, {}, "logprobs-method-unsupported", {}],
+    [{ hasRepetitionPenalty: true }, {}, "repetition-penalty-method-unsupported", {}],
+    [{ hasLogitsExtras: true }, {}, "logits-extras-method-unsupported", {}],
+    [{}, { fill: true }, "fill-method-unsupported", {}],
+    [{}, {}, "kv-scheme-batch-unsupported", affineKv],
+    [{}, {}, "turbo-kv-batch-unsupported", turboKv],
+    [{}, { pagedKv: true }, "paged-kv-batch-unsupported", {}],
+    [{ hasVision: true }, {}, "media-batch-unsupported", {}],
+  ] as const)("a token-level or AR-state request is refused, never discarded: %#", (shape, feature, reason, kv: Partial<ExecutionCapabilities>) => {
+    const plan = resolveExecution({ ...request, ...shape }, { ...denoising, ...kv }, { ...features, ...feature });
     expect(plan).toMatchObject({ method: "denoising", mechanism: "unsupported", promptCache: false,
       checkpoint: false, fill: false, grammarJump: false });
     expect(plan.reasons.filter(entry => entry.endsWith("-unsupported"))).toEqual([reason]);
@@ -309,8 +316,8 @@ test.each([
   [{}, { continuous: false }, {}, "continuous-unavailable"],
   [{ hasVision: true }, {}, {}, "media-batch-unsupported"],
   [{ hasAdapters: true }, {}, {}, "adapter-batch-unsupported"],
-  [{ kvQuant: true }, { quantizedBatch: false }, {}, "kv-scheme-batch-unsupported"],
-  [{ turboQuant: true }, {}, {}, "turbo-kv-batch-unsupported"],
+  [{}, { ...affineKv, quantizedBatch: false }, {}, "kv-scheme-batch-unsupported"],
+  [{}, turboKv, {}, "turbo-kv-batch-unsupported"],
   [{ hasGrammar: true }, { grammarBatch: false }, {}, "grammar-batch-unsupported"],
   [{}, {}, { pagedKv: true }, "paged-kv-batch-unsupported"],
   [{}, { method: "denoising" }, {}, "method-batch-unsupported"],

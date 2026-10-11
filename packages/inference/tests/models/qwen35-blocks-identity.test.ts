@@ -24,14 +24,17 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { parseQuantization, type ModelConfig } from "../../src/artifacts/config";
 import type { Weights } from "../../src/artifacts/weights";
 import type { BatchableCache, Cache, PaddedPrefillCache } from "../../src/contracts/mlx/cache";
+import type { KvStorageScheme } from "../../src/contracts/portable/composition";
 import type { TokenGroup } from "../../src/contracts/mlx/token-work";
 import type { RuntimeModel } from "../../src/models/factory";
 import { createRuntimeConfig, runtimeConfig, withRuntimeConfig } from "../../src/runtime/config";
 import { trainForward } from "../../src/scoring/full-sequence";
 import { evalPpl } from "../../src/scoring/perplexity";
-import { unfusedAffineKernels } from "../../src/state/affine-attention";
+import { composedAffineKernels, unfusedAffineKernels } from "../../src/state/affine-attention";
 import { DelayedRotatingQuantizedKVCache } from "../../src/state/delayed-rotating-quantized-kv";
 import { createKvMaintenance } from "../../src/state/kv-maintenance";
+import { settleAffine, settleTurbo } from "../state/convert-after-reference";
+import { testComposition } from "./test-composition";
 import { KVCache } from "../../src/state/kv";
 import { targetCacheLayout } from "../../src/state/layout";
 import { loadKvCache, saveKvCache } from "../../src/state/persistence";
@@ -189,12 +192,13 @@ function maxDiff(actual: MlxArray, expected: MlxArray, what: string): number {
   throw new Error(`${what}: bytes differ, maxDiff ${worst}`);
 }
 
-/** Every tensor of every layer's cache, with its signature and offset. */
+/** Every tensor of every layer's cache, with its signature and offset; a
+ * composed cache (`Cache.composed`) is compared by the storage it holds. */
 function stateDiff(label: string, actual: readonly Cache[], expected: readonly Cache[]): void {
   expect(actual.length).toBe(expected.length);
   let worst = 0, count = 0;
   for (let layer = 0; layer < expected.length; layer++) {
-    const a = actual[layer]!, b = expected[layer]!;
+    const a = actual[layer]!.composed?.storage() ?? actual[layer]!, b = expected[layer]!.composed?.storage() ?? expected[layer]!;
     expect(a.signature(), `${label} layer ${layer}`).toBe(b.signature());
     expect(a.offset, `${label} layer ${layer}`).toBe(b.offset);
     expect((a as Partial<BatchableCache>).rowOffsets, `${label} layer ${layer}`).toEqual((b as Partial<BatchableCache>).rowOffsets);
@@ -242,29 +246,50 @@ const SCHEMES: Scheme[] = [
 ];
 
 /** The frozen and current graphs over one synthetic artifact. */
-interface Pair { kind: MlpKind; old: FrozenQwen35Model; current: Qwen35Model }
+interface Pair { kind: MlpKind; old: FrozenQwen35Model; current: Qwen35Model;
+  /** The current graph over the same artifact composed with `scheme`'s KV. */
+  composed(scheme: Scheme): Qwen35Model }
 const pairs = new Map<MlpKind, Pair>();
 function pair(kind: MlpKind): Pair {
   let found = pairs.get(kind);
   if (!found) {
     const { weights, config } = artifact(kind);
-    found = { kind, old: new FrozenQwen35Model(weights, config), current: new Qwen35Model(weights, config) };
+    found = { kind, old: new FrozenQwen35Model(weights, config), current: new Qwen35Model(weights, config, testComposition()),
+      composed(scheme) {
+        const kv: KvStorageScheme = scheme.turbo ? { kind: "turbo", ...scheme.turbo }
+          : scheme.kvBits === null ? { kind: "bf16" }
+          : { kind: "affine", bits: scheme.kvBits, groupSize: 64, kernels: scheme.flag === "1" ? "unfused" : "tiled-causal" };
+        const graph = new Qwen35Model(weights, config, testComposition(kv));
+        as27b(graph);
+        return graph;
+      } };
     as27b(found.old); as27b(found.current);
     pairs.set(kind, found);
   }
   return found;
 }
+/** A composed cache's storage, the cache released; other caches as they are. */
+const storageOnly = (cache: Cache): Cache => {
+  const composed = cache.composed;
+  if (!composed) return cache;
+  const storage = composed.release();
+  cache.dispose();
+  return storage;
+};
 
 function withScheme<T>(scheme: Scheme, run: () => T): T {
   return withRuntimeConfig(createRuntimeConfig({ ...runtimeConfig().values, MLX_BUN_NO_FUSED_SDPA: scheme.flag }), run);
 }
 
-/** Convert after a forward, as the served path does (quantized_kv_start 0). */
+/** Convert after a forward, as the served path did before E3 (quantized_kv_start
+ * 0): the convert-after reference, whose affine storage reads with the kernel set
+ * the scheme's flag named (unset: tiled-causal, `--fused-sdpa on`; 1: unfused). */
 function convert(scheme: Scheme, ...sets: Cache[][]): void {
   if (scheme.kvBits === null && !scheme.turbo) return;
-  const maintain = createKvMaintenance(scheme.turbo
-    ? { turboQuant: scheme.turbo, quantizedKvStart: 0 } : { kvBits: scheme.kvBits!, quantizedKvStart: 0 });
-  for (const caches of sets) maintain(caches);
+  for (const caches of sets) {
+    if (scheme.turbo) settleTurbo(caches, scheme.turbo.kBits, scheme.turbo.vBits, 0);
+    else settleAffine(caches, scheme.kvBits!, 0, 64, composedAffineKernels(scheme.flag === "1" ? "unfused" : "tiled-causal"));
+  }
 }
 
 /** The old graph's and the current graph's deprecated entry point on the same input. */
@@ -521,7 +546,8 @@ function extractedRows(cache: Cache): Cache[] {
 const DELAYED_START = 40;
 const DELAYED: { name: string; converted: string; delay(caches: Cache[]): void }[] = [
   { name: "delayed affine4", converted: "kv:quant:4:64",
-    delay: caches => createKvMaintenance({ kvBits: 4, quantizedKvStart: DELAYED_START }).preparePrefill!(caches) },
+    delay: caches => createKvMaintenance({ kind: "affine", bits: 4, groupSize: 64, quantizedKvStart: DELAYED_START,
+      kernels: "tiled-causal" }).preparePrefill!(caches) },
   { name: "delayed rotating affine4", converted: "kv:rotating-quant:4:64",
     delay(caches) {
       for (const [layer, cache] of caches.entries()) if (cache instanceof KVCache) {
@@ -530,7 +556,7 @@ const DELAYED: { name: string; converted: string; delay(caches: Cache[]): void }
       }
     } },
   { name: "delayed turbo k8v3", converted: "kv:turboquant:8:3",
-    delay: caches => createKvMaintenance({ turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: DELAYED_START }).preparePrefill!(caches) },
+    delay: caches => createKvMaintenance({ kind: "turbo", kBits: 8, vBits: 3, quantizedKvStart: DELAYED_START }).preparePrefill!(caches) },
 ];
 
 for (const kind of ["trellis", "affine"] as const) {
@@ -555,7 +581,7 @@ for (const kind of ["trellis", "affine"] as const) {
     for (const turbo of [{ kBits: 8, vBits: 3 }, { kBits: 4, vBits: 4 }])
       test(`${kind} delayed turbo k${turbo.kBits}v${turbo.vBits}: padded batched prefill from empty layouts, conversion, batched decode, verify, rollback, fill`, () => {
         const p = pair(kind), tag = `${kind} delayed turbo k${turbo.kBits}v${turbo.vBits}`;
-        const maintain = createKvMaintenance({ turboQuant: turbo, quantizedKvStart: 0 });
+        const maintain = createKvMaintenance({ kind: "turbo", ...turbo });
         // The served prefill cohort: the graph's caches wrapped by the scheme's
         // maintenance, then each layer's empty row layout.
         const layouts = (model: Qwen35Model | FrozenQwen35Model) => {
@@ -649,12 +675,17 @@ for (const kind of ["trellis", "affine"] as const) {
           convert(scheme, source);
           const path = join(dir, "entry.kv");
           saveKvCache(path, tokens, source);
-          // Both graphs restore the same file; each restore takes its graph's caches.
-          oldCaches = loadKvCache(path, p.old).caches;
-          newCaches = loadKvCache(path, p.current).caches;
-          stateDiff(`${tag} restored`, newCaches, oldCaches);
+          // Both graphs restore the same file. The current graph's restore takes
+          // the caches the graph composed with this scheme makes; affine storage
+          // restores with that composition's read kernels, so the frozen graph,
+          // which reads it through its own dispatch, takes the same storage.
+          const restoring = p.composed(scheme);
+          oldCaches = scheme.turbo || scheme.kvBits === null ? loadKvCache(path, p.old).caches
+            : loadKvCache(path, restoring).caches.map(storageOnly);
+          newCaches = loadKvCache(path, restoring).caches;
+          stateDiff(`${tag} restored`, newCaches.map(cache => cache.composed?.storage() ?? cache), oldCaches);
           if (scheme.turbo) {
-            expect((newCaches[3] as TurboQuantKVCache).turboQuantKernels).toBe(denseTurboQuantKernels);
+            expect((newCaches[3]!.composed!.storage() as TurboQuantKVCache).turboQuantKernels).toBe(denseTurboQuantKernels);
             expect((oldCaches[3] as TurboQuantKVCache).turboQuantKernels).toBe(uncomposedTurboQuantKernels);
           }
           both(`${tag} window5 after restore`, p, oldCaches, newCaches, forwardHidden([prompt(5, 72)]));

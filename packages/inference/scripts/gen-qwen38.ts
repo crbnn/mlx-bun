@@ -126,7 +126,7 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     },
     head: { twoToThree: "Affine4RowsLinear", four: "Affine4RowsLinear", fiveToEight: "Affine4MmaLinear" },
     asyncEvery: 4,
-    kvLego: "Kv4Head256Cache",
+    kvLego: "Bf16FirstKv4Head256Cache",
     ane: { fraction: 0.55, rowMajorMlp: "AneTrellisMlpSplit", k3InterleavedMlp: "AneTrellisMlpSplitK3i", affine: "AneAffineSplit",
       projections: ["in_proj_z", "out_proj", "o_proj"] },
   },
@@ -271,8 +271,8 @@ ${row("prefillChunk.gpu, prefillTail", "", "")}
 ${row("prefillChunk.ane", `${k.ane.rowMajorMlp}/K3i`, `${aneProjections.join(", ")} split`)}
 //
 // Mixed-width gate/up takes ${one.mixedGateUp} at one to four rows. Every attention block reads
-// through the cache (${k.kvLego}: the fused 4-bit decode kernel and the folded-GQA window kernel;
-// the bf16 cache: the stock SDPA). The head is part of each phase: logits.twoToThree ${k.head.twoToThree}, logits.four
+// through the cache (${k.kvLego}: bf16 through its first append, then the fused 4-bit decode
+// kernel and the folded-GQA window kernel; the bf16 cache: the stock SDPA). The head is part of each phase: logits.twoToThree ${k.head.twoToThree}, logits.four
 // ${k.head.four}, logits.fiveToEight ${k.head.fiveToEight}, QuantizedLinear otherwise. Decode and verify up to 8 rows submit
 // the graph every ${k.asyncEvery} layers; prompt chunks, tails and wider verify windows evaluate each layer
 // and its recurrent state.
@@ -290,7 +290,8 @@ ${row("prefillChunk.ane", `${k.ane.rowMajorMlp}/K3i`, `${aneProjections.join(", 
 //     whose QuantizedLinear projections apply them, and the Neural Engine operation is not built.
 // The loader refuses, from the declared capabilities and never by routing to another graph: adapter requests
 // when the composition mounts none (adapter-batch-unsupported) and paged KV (paged-kv-batch-unsupported).
-// ${k.kvLego} serves one sequence; its row layouts keep its one-row kernels.
+// ${k.kvLego}'s row layouts read with its KV4 kernels while they hold one unpadded row and with the
+// composition's affine kernels while they hold more.
 
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
@@ -305,7 +306,7 @@ import type {
 import type { MediaEncoders, MlxPromptInput, Vision } from "../../contracts/mlx/media";
 import type { MropeForwardState } from "../../contracts/mlx/positions";
 import type { TokenGroup } from "../../contracts/mlx/token-work";
-import type { Composition, KvStorageScheme } from "../../contracts/portable/composition";
+import type { Composition } from "../../contracts/portable/composition";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import { argmaxLastPosition } from "../../kernels/logits";
 import { ${affineLayers.sort().join(", ")} } from "../../layers/affine-verify-linear";
@@ -321,10 +322,9 @@ import { compiledSwiglu } from "../../layers/swiglu";
 import { ${downLayers.sort().join(", ")} } from "../../layers/trellis-down";
 import { ${mlpLayers.sort().join(", ")} } from "../../layers/trellis-gate-up";
 import { TRELLIS_MATVEC_MAX_M } from "../../layers/trellis-linear";
-import { runtimeFlag } from "../../runtime/config";
+import { composedAffineKernels } from "../../state/affine-attention";
 import { AttentionMasks } from "../../state/attention-read";
-import { KVCache } from "../../state/kv";
-import { ${k.kvLego} } from "../../state/kv4-head256-cache";
+import { ${k.kvLego}, composedFullAttentionCache } from "../../state/bf16-first-kv";
 import { SSMCache } from "../../state/ssm";
 import { denseTurboQuantKernels } from "../../state/turboquant-attention";
 import { declareGraph } from "../capabilities";
@@ -372,7 +372,6 @@ const ANE_PROJECTIONS: ReadonlySet<string> = new Set(${list(aneProjections)});
 const ASYNC_EVERY = ${k.asyncEvery};
 /** The Neural Engine's channel fraction in each split. */
 const ANE_FRACTION = ${k.ane.fraction};
-const BF16: KvStorageScheme = Object.freeze({ kind: "bf16" });
 
 /** One layer: input norm, mixer, residual, post-attention norm, MLP, residual. Consumes nothing; returns an owned output. */
 type Step = (x: MlxArray, cache: Cache, phase: ReadPhase, mrope: MropeForwardState | null) => MlxArray;
@@ -419,7 +418,7 @@ export class ${c.className} implements MlxDeclaredGraph, MlxTokenPhases {
   /** Prepared image and video embeddings with request mRoPE positions, layer
    *  taps for drafts (verify's capture), delayed affine rows, bounded prefill
    *  workspace; adapters only when the composition mounts them. Speculation over
-   *  affine KV is \`MLX_BUN_QWEN_SPEC_KV4\`, read once here. */
+   *  affine KV is the composition's \`speculativeAffineKv\`. */
   readonly graphCapabilities: GraphCapabilities;
   /** Verify forward cost by rows relative to one decode step (M4 Pro 24 GB). */
   readonly verifyRoundCosts: ReadonlyMap<number, number> = new Map([
@@ -448,6 +447,8 @@ export class ${c.className} implements MlxDeclaredGraph, MlxTokenPhases {
   readonly #residualBasis: ResidualBasis | undefined;
   /** What this graph created and frees in \`dispose\`: its constants and the Neural Engine layers' programs. */
   readonly #owned: { dispose(): void }[] = [];
+  /** The attention cache of layer \`layer\` the composition's KV scheme names, over one \`makeCache\` call's masks. */
+  readonly #attentionCache: (masks: AttentionMasks, layer: number) => Cache;
 
   constructor(weights: Weights, config: ModelConfig, composition: Composition) {
     // The 5.8-family export's names and stored conventions, mapped onto the
@@ -536,8 +537,16 @@ ${narrowSets}
       media: { input: "embeddings+positions", video: true }, hiddenLayerTaps: true,
       kv: { delayedAffine: "all" }, prefill: { boundedWorkspace: true },
       adapters: composition.adapters ? {} : { batched: false, mountable: false },
-      speculation: { affineKv: runtimeFlag("MLX_BUN_QWEN_SPEC_KV4", true), immediateAffine4: true },
+      speculation: { affineKv: composition.speculativeAffineKv, immediateAffine4: true },
     });
+
+    // The attention cache the composition's KV scheme names, chosen once: affine ${c.kv.bits}-bit group ${c.kv.groupSize}
+    // composes ${k.kvLego}; bf16, the table's other scheme for this graph, the plain cache with the dense
+    // TurboQuant read (\`composedFullAttentionCache\`).
+    const kv = composition.kv;
+    this.#attentionCache = kv.kind === "affine" && kv.bits === ${c.kv.bits} && kv.groupSize === ${c.kv.groupSize}
+      ? (masks: AttentionMasks) => new ${k.kvLego}(kv.quantizedKvStart ?? 0, composedAffineKernels(kv.kernels), masks)
+      : (masks: AttentionMasks, layer: number) => composedFullAttentionCache(kv, layer, masks, denseTurboQuantKernels);
 
     const ${NARROW.map(cls => `${cls} = this.#${cls}`).join(", ")}, wide = this.#generic;
     const embed = this.embed, split = ane;
@@ -571,16 +580,12 @@ ${NARROW.filter(cls => cls !== "one").map(cls => `        ${cls}: hidden => ${he
    *  after the last forward. */
   dispose(): void { for (const resource of this.#owned.splice(0)) resource.dispose(); }
 
-  /** One cache per layer, the attention caches sharing one mask memo. \`kv\` is
-   *  the composition's scheme, passed by whoever composes the cache: affine
-   *  ${c.kv.bits}-bit group ${c.kv.groupSize} composes ${k.kvLego} (quantized from its first append), any
-   *  other scheme the bf16 cache with the dense TurboQuant read, which is also
-   *  what a call without a scheme gets (the scheduler converts it today). */
-  makeCache(kv: KvStorageScheme = BF16): Cache[] {
+  /** One cache per layer, the attention caches sharing one mask memo: the cache the composition's KV scheme names
+   *  (affine ${c.kv.bits}-bit group ${c.kv.groupSize}: ${k.kvLego}, bf16 through its first append, then the KV4 decode
+   *  and folded window reads; bf16: \`composedFullAttentionCache\`'s plain cache with the dense TurboQuant read). */
+  makeCache(): Cache[] {
     const masks = new AttentionMasks();
-    const attention = kv.kind === "affine" && kv.bits === ${c.kv.bits} && kv.groupSize === ${c.kv.groupSize}
-      ? () => new ${k.kvLego}(masks) : () => new KVCache(masks, denseTurboQuantKernels);
-    return LAYERS.map(layer => layer.kind === "deltanet" ? new SSMCache() : attention());
+    return LAYERS.map((layer, i) => layer.kind === "deltanet" ? new SSMCache() : this.#attentionCache(masks, i));
   }
 
   /** The LoRA-applying projections, when the composition mounts adapters; none otherwise. */

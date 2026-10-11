@@ -18,7 +18,8 @@ import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import { argmaxLastPosition, logitSoftcap } from "../../kernels/logits";
 import { disposing } from "../../layers/helpers";
-import { KVCache } from "../../state/kv";
+import { composedFullAttentionCache, composedSlidingAttentionCache } from "../../state/bf16-first-kv";
+import type { Composition } from "../../contracts/portable/composition";
 import { AttentionMasks } from "../../state/attention-read";
 import { softcapAttentionReads } from "../../state/softcap-attention";
 import { denseTurboQuantKernels } from "../../state/turboquant-attention";
@@ -32,7 +33,6 @@ import { atEveryWidth, deprecatedPhase, type ReadPhase } from "../graph";
 import type { QuantizedLinear } from "../../layers/quantized-linear";
 import { TrellisLinear } from "../../layers/trellis-linear";
 import { RMSNorm } from "../../layers/normalization";
-import { RotatingKVCache } from "../../state/rotating-kv";
 import { type Cache } from "../../contracts/mlx/cache";
 import { genericArgsFor, universalCacheWindows, universalMaskRecipe, type UniversalArgs } from "./archs";
 import { compiledSwiglu } from "../../layers/swiglu";
@@ -442,6 +442,8 @@ export class UniversalLayer {
 export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
   readonly args: UniversalArgs;
+  /** The served configuration this graph was built for: its KV scheme is what `makeCache` composes. */
+  readonly composition: Composition;
   readonly weightsBytes: number;
   readonly prefixBase = "model";
   readonly loraState = new LoraState();
@@ -472,12 +474,13 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
   // bound at construction; later edits to `args` cannot make them disagree.
   readonly #cacheWindows: readonly (number | null)[];
 
-  constructor(weights: Weights, config: ModelConfig, args?: UniversalArgs) {
+  constructor(weights: Weights, config: ModelConfig, composition: Composition, args?: UniversalArgs) {
     const a = args ?? genericArgsFor(config);
     if (!a)
       throw new Error(`UniversalDenseModel: no descriptor for model_type ${config.modelType}`);
     this.config = config;
     this.args = a;
+    this.composition = composition;
     this.#cacheWindows = universalCacheWindows(a);
     // Each layer's read: the cache's own read, or the softcapped read over plain
     // KV with the layer group's window (gemma2: create_attention_mask(...,
@@ -551,7 +554,9 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
    * softcapped read still fetches it that way). */
   makeCache(): Cache[] {
     const masks = new AttentionMasks();
-    return this.#cacheWindows.map(window => window ? new RotatingKVCache(window, masks) : new KVCache(masks, denseTurboQuantKernels));
+    const kv = this.composition.kv;
+    return this.#cacheWindows.map((window, layer) => window ? composedSlidingAttentionCache(kv, layer, window, masks)
+      : composedFullAttentionCache(kv, layer, masks, denseTurboQuantKernels));
   }
 
   /** @deprecated E2 calls the named phases. */

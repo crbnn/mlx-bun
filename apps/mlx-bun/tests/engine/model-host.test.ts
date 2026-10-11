@@ -156,7 +156,7 @@ test("closing the app drains borrowed execution before disposing the model", asy
   const engine = await createAppEngine(host, { capacity: 1, binding: supplied,
     beforeModelDispose() { events.push("cache closed"); } });
   const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false,
-    userSeed: false, kvQuant: false, turboQuant: false, hasLogitsExtras: false,
+    userSeed: false, hasLogitsExtras: false,
     hasGrammar: false, wantsLogprobs: false, hasDraft: false };
   const run = engine.completion.run([1], {}, () => {}, undefined, shape, engine.completion.place(shape)).catch(() => {});
   await entered.promise; const closing = engine.close();

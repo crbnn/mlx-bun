@@ -11,8 +11,10 @@ import { modelIdentity } from "@mlx-bun/hub/registry";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { disposeResources } from "@mlx-bun/inference/runtime/resources";
 import { createRuntimeConfig } from "@mlx-bun/inference/runtime/config";
+import type { KvStorageScheme } from "@mlx-bun/inference/contracts/portable";
 
-function setup(values: Record<string, string> = {}) {
+/** `setup`'s loaded model, composed with `kv` (bf16 unless named). */
+function setup(values: Record<string, string> = {}, kv: KvStorageScheme = { kind: "bf16" }) {
   const events: string[] = [];
   const zero = { pendingSnapshots: 0, pendingSpills: 0, pendingSpillBytes: 0, droppedSpills: 0, failedSpills: 0 };
   let interval = 0, demote: (() => void) | undefined, storeOptions: unknown, cold: unknown;
@@ -28,11 +30,12 @@ function setup(values: Record<string, string> = {}) {
     async flush() { events.push("checkpoint flush"); return { durable: true, pendingBytes: 0, failed: 0 }; } };
   const stateCodecs = { id: "replacement-state" };
   const context = { modelId: "test", model: { config: { modelDir: "/unused" }, weightsBytes: 20 },
-    kvConfig: [{ layerIdx: 0, bits: 4, groupSize: 64 }], stateCodecs,
+    kvConfig: [{ layerIdx: 0, bits: 4, groupSize: 64 }], stateCodecs, composition: { kv },
     profile: { artifact: "artifact", profile: { execution: "implementation" } },
     adapters: { cacheNamespace: (names: string[]) => names.join(":") }, dispose() { events.push("model dispose"); },
   } as unknown as LoadedModelContext;
-  const binding = { stateCompatibility: "binding-v1", gateway: { runtime: createRuntimeConfig(values) },
+  const binding = { stateCompatibility: "binding-v1", gateway: { runtime: createRuntimeConfig(values),
+    composeState(caches: unknown) { events.push("compose"); return caches; } },
     restore() { events.push("restore"); return { tokens: [1, 2], caches: [] }; },
     async restoreAsync() { events.push("restore async"); return { tokens: [1, 2], caches: [] }; },
   } as unknown as ModelBinding;
@@ -73,17 +76,21 @@ test("default cache is 8 GB RAM, plain KV, and no SSD even when model quantizati
   expect(cache.adapterNamespace(["a", "b"])).toBe("a:b");
   expect(cache.continuationServices.identity).toEqual({ artifact: "artifact", implementation: "implementation",
     stateAbi: "legacy-cache-array-v1", codecs: "replacement-state" });
-  cache.continuationServices.cloneState([]); expect(f.events).toContain("clone");
+  // A clone is handed back as the caches the graph composes.
+  cache.continuationServices.cloneState([]); expect(f.events.slice(-2)).toEqual(["clone", "compose"]);
   expect(f.cache.pressure.overBudget()).toBe(false); f.setActive(86); expect(f.cache.pressure.overBudget()).toBe(true);
   expect((await cache.flush()).durable).toBe(true);
   await cache.close(); await cache.close(); expect(f.events.filter(e => e === "cache clear")).toHaveLength(1);
 });
 
-test("explicit RAM disabling and KV overrides retain their meaning", async () => {
-  const f = setup(); const cache = await createCacheServices(f.context, f.binding, { promptCacheBytes: 0, kvQuant: 4 }, f.deps);
-  expect(f.cap).toBe(0); expect(cache.kvScheme.kvBits).toBe(4); await cache.close();
-  const second = await createCacheServices(f.context, f.binding, { kvQuant: "config" }, f.deps);
-  expect(second.kvScheme.kvConfig).toEqual(f.context.kvConfig!); await second.close();
+test("explicit RAM disabling retains its meaning; the KV scheme is the loaded composition's", async () => {
+  const f = setup({}, { kind: "affine", bits: 4, groupSize: 64, kernels: "unfused" });
+  const cache = await createCacheServices(f.context, f.binding, { promptCacheBytes: 0 }, f.deps);
+  expect(f.cap).toBe(0); expect(cache.resolvedKvScheme.options.kvBits).toBe(4);
+  expect(cache.resolvedKvScheme.cacheKey).toBe("kv4"); await cache.close();
+  const layered = setup({}, { kind: "affine-layers", layers: [{ layer: 0, bits: 4, groupSize: 64 }], kernels: "tiled-causal" });
+  const second = await createCacheServices(layered.context, layered.binding, {}, layered.deps);
+  expect(second.resolvedKvScheme.options.kvConfig).toEqual(f.context.kvConfig!); await second.close();
 });
 
 test("SSD defaults bind identity, codecs, restoration, checkpoints, idle demotion, and flush before release", async () => {
@@ -189,24 +196,25 @@ test("stopping idle demotion before request drain preserves caches until final c
 });
 
 test("a TurboQuant scheme the codec cannot encode for this model is refused before any cache is composed, as main's startup did", async () => {
-  const withHeadDim = (globalHeadDim: number) => {
-    const f = setup(); (f.context.model.config as { text?: unknown }).text = { globalHeadDim }; return f;
+  const turbo: KvStorageScheme = { kind: "turbo", kBits: 8, vBits: 3 };
+  const withHeadDim = (globalHeadDim: number, kv: KvStorageScheme) => {
+    const f = setup({}, kv); (f.context.model.config as { text?: unknown }).text = { globalHeadDim }; return f;
   };
   for (const globalHeadDim of [96, 72]) {
-    const f = withHeadDim(globalHeadDim);
-    await expect(createCacheServices(f.context, f.binding, { turboQuant: { kBits: 8, vBits: 3 } }, f.deps)).rejects.toThrow(
+    const f = withHeadDim(globalHeadDim, turbo);
+    await expect(createCacheServices(f.context, f.binding, {}, f.deps)).rejects.toThrow(
       `--kv-quant turbo: this model's full-attention head_dim is ${globalHeadDim}; TurboQuant supports {64,128,256,512}`);
     expect(f.events).toEqual([]);   // no prompt cache, store or persistence was created
   }
   for (const globalHeadDim of [128, 256]) {
-    const f = withHeadDim(globalHeadDim);
-    const cache = await createCacheServices(f.context, f.binding, { turboQuant: { kBits: 8, vBits: 3 } }, f.deps);
+    const f = withHeadDim(globalHeadDim, turbo);
+    const cache = await createCacheServices(f.context, f.binding, {}, f.deps);
     expect(cache.resolvedKvScheme.kind).toBe("turbo"); await cache.close();
   }
   // Other schemes do not depend on the TurboQuant codec's dimensions.
-  const f = withHeadDim(96);
-  const cache = await createCacheServices(f.context, f.binding, { kvQuant: 4 }, f.deps);
-  expect(cache.kvScheme.kvBits).toBe(4); await cache.close();
+  const f = withHeadDim(96, { kind: "affine", bits: 4, groupSize: 64, kernels: "unfused" });
+  const cache = await createCacheServices(f.context, f.binding, {}, f.deps);
+  expect(cache.resolvedKvScheme.options.kvBits).toBe(4); await cache.close();
 });
 
 test("model directories have separate saved-prefix stores; restarts reuse them without reading weights", async () => {

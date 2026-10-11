@@ -3,6 +3,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import { KVCache } from "../../src/state/kv";
+import { QuantizedKVCache } from "../../src/state/quantized-kv";
 import { unfusedAffineKernels } from "../../src/state/affine-attention";
 import { TurboQuantKVCache } from "../../src/state/turboquant-kv";
 import { deferredTurboQuantKernels } from "../../src/state/turboquant-attention";
@@ -40,7 +41,9 @@ test("companion cache codecs retain encoded and recurrent state after donor disp
   const expected = bytes(caches);
   const attachment = captureCacheAttachment("test-companion-v1", caches, { pendingLast: 7, processedTokens: 4 });
   disposeResources(caches);
-  const restored = restoreCacheAttachment(attachment, () => [new KVCache(), new KVCache(), new KVCache(), new SSMCache()]);
+  // Each layer restores against the cache the companion composes there: affine storage at the affine layer.
+  const restored = restoreCacheAttachment(attachment, () => [new KVCache(),
+    new QuantizedKVCache(64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16)), new KVCache(), new SSMCache()]);
   disposeAttachments([attachment]);
   try {
     expect(bytes(restored)).toEqual(expected);

@@ -10,7 +10,7 @@ import { type AttentionRead, type BatchableCache, type Cache, type CommittedAtte
 import { KvTensorRows } from "./kv-tensor-rows";
 import { quantizedDonorAttention } from "./kv-attention-view";
 import { AttentionMasks, unmaskedLease, withLease, type MaskLease } from "./attention-read";
-import { affineCausalLease, affineRead, committedAffineRead, type AffineKernel, type AffineKernels } from "./affine-attention";
+import { affineCausalLease, affineRead, committedAffineRead, rowLayoutKernels, type AffineKernel, type AffineKernels } from "./affine-attention";
 
 const FIELDS = ["packed", "scales", "biases"] as const;
 
@@ -24,7 +24,9 @@ const FIELDS = ["packed", "scales", "biases"] as const;
  * as `makeMask` leads the graphs to today; otherwise both pass the per-row mask
  * (causal, past each row's left padding) for their query count, built once per
  * forward through `masks`, and a window takes the masked-window kernel. The
- * committed read is `quantizedAppendAttention`, for one row. */
+ * kernels are `kernels` while the layout holds one unpadded row and its
+ * `multiRow` set otherwise (`rowLayoutKernels`); rows it extracts keep
+ * `kernels`. The committed read is `quantizedAppendAttention`, for one row. */
 export class BatchedQuantizedKVCache implements BatchableCache, QuantizedAttentionState, PaddedPrefillCache, CommittedAttentionCache {
   #planes = FIELDS.map(() => new BatchedKVCache());
   #minimum: number[] = [];
@@ -39,14 +41,19 @@ export class BatchedQuantizedKVCache implements BatchableCache, QuantizedAttenti
   ) {}
 
   appendDecode(k: MlxArray, v: MlxArray): AttentionRead {
-    return this.#read(k, v, this.#planes[0]!.aligned ? unmaskedLease : this.#rowMask(1), this.kernels.decode);
+    return this.#read(k, v, this.#planes[0]!.aligned ? unmaskedLease : this.#rowMask(1), this.#kernels().decode);
   }
 
   appendWindow(k: MlxArray, v: MlxArray): AttentionRead {
     const L = k.shape[2]!;
     return this.#planes[0]!.aligned
-      ? this.#read(k, v, affineCausalLease(this.masks, L, this.offset + L), this.kernels.window)
-      : this.#read(k, v, this.#rowMask(L), this.kernels.maskedWindow);
+      ? this.#read(k, v, affineCausalLease(this.masks, L, this.offset + L), this.#kernels().window)
+      : this.#read(k, v, this.#rowMask(L), this.#kernels().maskedWindow);
+  }
+
+  /** `kernels` while this layout holds one unpadded row, its `multiRow` set otherwise. */
+  #kernels(): AffineKernels {
+    return rowLayoutKernels(this.kernels, this.batchSize === 1 && this.#planes[0]!.aligned);
   }
 
   /** Fill spans run on this layout (the target layout of a full-attention
@@ -84,7 +91,7 @@ export class BatchedQuantizedKVCache implements BatchableCache, QuantizedAttenti
         packed: views[0]![name], scales: views[1]![name], biases: views[2]![name],
       });
       const { offsets, starts, ends } = views[0]!;
-      return quantizedDonorAttention(field("keys"), field("values"), { offsets, starts, ends }, this.groupSize, this.bits);
+      return quantizedDonorAttention(field("keys"), field("values"), { offsets, starts, ends }, this.kernels);
     } catch (error) { disposeResources(views.flatMap(view => [view.keys, view.values])); throw error; }
   }
   signature(): string { return `kv:batched-quant:${this.bits}:${this.groupSize}`; }

@@ -43,8 +43,8 @@ found; offload restore only redirects routing and never unmaps borrowed weights.
 and unfused SDPA; `--l2` selects model-config KV and fused SDPA, and wins if both
 are given. An explicit `--kv-quant` overrides the preset and sets the kernel
 default (fused for `config`, unfused otherwise); `--fused-sdpa on|off` overrides
-that default. The policy is resolved before model loading, including in isolated
-model workers, and restored on shutdown or startup failure.
+that default. The policy is part of the loaded model's composition, resolved before
+its graph is built (including in isolated model workers); no process setting changes.
 
 `--adapter <dir>` (alias `--adapter-path`) mounts a LoRA adapter right after the
 model loads, before any request, under the directory's basename as its id; it

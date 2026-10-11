@@ -26,7 +26,8 @@ import { RMSNorm } from "../../layers/normalization";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import { QuantizedLinear } from "../../layers/quantized-linear";
 import { argmaxLastPosition } from "../../kernels/logits";
-import { KVCache } from "../../state/kv";
+import { composedFullAttentionCache } from "../../state/bf16-first-kv";
+import type { Composition } from "../../contracts/portable/composition";
 import { AttentionMasks } from "../../state/attention-read";
 import { deferredTurboQuantKernels } from "../../state/turboquant-attention";
 import { flashAttention, flashSupported, getTrainingAttn } from "../../kernels/attention/flash";
@@ -261,6 +262,8 @@ export class LlamaLayer {
 
 export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
+  /** The served configuration this graph was built for: its KV scheme is what `makeCache` composes. */
+  readonly composition: Composition;
   readonly weightsBytes: number;
   readonly prefixBase = "model";
   readonly loraState = new LoraState();
@@ -276,10 +279,11 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly finalNorm: RMSNorm;
   readonly lmHead: QuantizedLinear;
 
-  constructor(weights: Weights, config: ModelConfig) {
+  constructor(weights: Weights, config: ModelConfig, composition: Composition) {
     if (config.text.tieWordEmbeddings)
       throw new Error("llama tied embeddings are not supported yet");
     this.config = config;
+    this.composition = composition;
     this.weightsBytes = [...weights.shards.files.values()]
       .reduce((a, f) => a + f.mmap.size, 0);
     this.embed = QuantizedEmbedding.load(weights, "model.embed_tokens", config);
@@ -314,7 +318,7 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
    * graph ran after `updateAndFetchDeferredV` before it read through the cache. */
   makeCache(): Cache[] {
     const masks = new AttentionMasks();
-    return this.layers.map(() => new KVCache(masks, deferredTurboQuantKernels));
+    return this.layers.map((_, layer) => composedFullAttentionCache(this.composition.kv, layer, masks, deferredTurboQuantKernels));
   }
 
   /** The scheduler's deprecated entry point, and the training forward

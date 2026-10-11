@@ -15,7 +15,6 @@ import { loadModelConfig } from "../../src/artifacts/config";
 import { GENERATED_GEMMA_FINGERPRINTS } from "../../src/models/gemma4/family";
 import { GENERATED_GRAPHS } from "../../src/models/gemma4/generated";
 import { resolveKvScheme } from "../../src/state/kv-scheme";
-import { kvStorageOf } from "../../src/state/kv-storage";
 
 const FIXTURES = join(import.meta.dir, "../fixtures/gemma4-graphs");
 const SCRIPT = join(import.meta.dir, "../../scripts/gen-gemma4.ts");
@@ -62,11 +61,14 @@ test("the table's generated entries are exactly the generated files, each servin
     // An entire graph: it extends nothing.
     expect(Object.getPrototypeOf(module.GeneratedGemma4.prototype)).toBe(Object.prototype);
     expect(module.COMPOSITION.fingerprint).toBe(GENERATED_GEMMA_FINGERPRINTS[GEMMA4_COMPOSITIONS[entry.id]!.key]);
-    // It serves its file's composition and nothing else: the fingerprint, and the KV scheme `--kv-quant config`
-    // resolves for the artifact.
+    // It serves its file's composition and nothing else: the fingerprint, and the storage of the KV scheme
+    // `--kv-quant config` resolves for the artifact (its read kernels and start are the composition's).
+    expect(entry.serves).toBe(module.COMPOSITION);
     const config = await loadModelConfig(snapshot(entry.id));
+    const storage = resolveKvScheme({ override: "config", config: config.kvQuant }).storage;
+    expect(storage.kind).toBe("affine-layers");
     expect(entry.serves).toEqual({ fingerprint: module.COMPOSITION.fingerprint,
-      kv: [kvStorageOf(resolveKvScheme({ override: "config", config: config.kvQuant }))] });
+      kv: [{ kind: "affine-layers", layers: storage.kind === "affine-layers" ? storage.layers : [] }] });
   }
 });
 

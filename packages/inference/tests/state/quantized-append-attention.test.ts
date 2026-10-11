@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import { Dtype, clearCache } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { QuantizedKVCache } from "../../src/state/quantized-kv";
-import { quantizedSdpa } from "../../src/layers/quantized-attention";
+import { quantizedSdpa } from "../models/quantized-sdpa-reference";
 import { quantizedAppendAttention } from "../../src/layers/quantized-append-attention";
 
 test("affine committed spans retain sequential attention at each causal prefix", () => {

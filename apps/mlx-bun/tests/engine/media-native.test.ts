@@ -79,7 +79,7 @@ async function family(modelDir: string) {
   const { createRequestPrep } = await import("../../src/server/request-prep");
   const { RequestOwnership } = await import("../../src/server/request-plan");
   const ctx: LoadedModelContext = await loadContext(modelDir);
-  const prep = createRequestPrep({ ctx, serverOptions: {}, kvScheme: {}, defaultGeneratedTokens: undefined });
+  const prep = createRequestPrep({ ctx, serverOptions: {}, defaultGeneratedTokens: undefined });
   const store = new Map<string, import("@mlx-bun/inference/state").CheckpointAttachment[]>();
   let leases = 0, released = 0;
   const objects = {

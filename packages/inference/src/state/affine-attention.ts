@@ -2,6 +2,7 @@ import type { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { AttentionRead, Mask } from "../contracts/mlx/cache";
+import type { AffineKernelChoice } from "../contracts/portable/composition";
 import { quantizedAppendAttention } from "../layers/quantized-append-attention";
 import { fusedSdpaConfigSupported, quantizedSdpaTiled, quantizedSdpaUnfused } from "../layers/quantized-attention";
 import type { AttentionMasks, MaskLease } from "./attention-read";
@@ -11,6 +12,12 @@ import { disposeTriple } from "./quantized-tensor";
  * [B, Hq, L, D] to an owned output [B, Hq, L, Dv]. Borrows every input. */
 export type AffineKernel = (q: MlxArray, keys: ops.QuantizedTensor, values: ops.QuantizedTensor,
   scale: number, mask: Mask) => MlxArray;
+
+/** A kernel set named by the composition it serves (`composedAffineKernels`,
+ * `unfusedAffineKernels`, `tiledCausalAffineKernels`, `tiledAffineKernels`),
+ * which a conversion builds for the converted cache's bits, group size and
+ * activation dtype. */
+export type AffineKernelSet = (bits: number, groupSize: number, dtype: Dtype) => AffineKernels;
 
 /** The kernel an affine cache attends with for each read. The cache takes it
  * when it is built and never chooses again: `unfusedAffineKernels` for a
@@ -28,6 +35,47 @@ export interface AffineKernels {
    * rotating cache. The cache picks it on the branch that picks that mask,
    * from state it owns, never from anything the caller passes. */
   readonly maskedWindow: AffineKernel;
+  /** The kernels a row layout reads with unless it holds exactly one row at
+   * its own positions (several rows, or one behind left padding); absent,
+   * these kernels at every row count. Only a set whose kernels take one
+   * sequence has it (the M4 Pro composition's KV4 set, `Kv4Head256Cache`). The
+   * layout picks it from its own row layout, as it picks `maskedWindow` from
+   * its own mask, never from the queries it is handed. */
+  readonly multiRow?: AffineKernels;
+}
+
+/** The kernels a row layout reads with: `kernels` while it holds exactly one
+ * row at its own positions (`singleUnpaddedRow`), their `multiRow` set (when
+ * they have one) otherwise. */
+export function rowLayoutKernels(kernels: AffineKernels, singleUnpaddedRow: boolean): AffineKernels {
+  return singleUnpaddedRow ? kernels : kernels.multiRow ?? kernels;
+}
+
+/** The kernel set a composition's affine caches attend with
+ * (`KvStorageScheme.kernels`): `unfused`, mlx-lm's port for every read;
+ * `tiled-causal`, OptiQ's wrapper rule where the tiled port takes the bits,
+ * group size and activation dtype and the unfused port where it does not, as
+ * the served path computed each configuration. Resolved for each cache when its
+ * quantized storage is built. */
+export function composedAffineKernels(choice: AffineKernelChoice): AffineKernelSet {
+  return choice === "unfused" ? unfusedAffineKernels
+    : (bits, groupSize, dtype) => fusedSdpaConfigSupported(groupSize, bits, dtype)
+      ? tiledCausalAffineKernels(bits, groupSize, dtype) : unfusedAffineKernels(bits, groupSize, dtype);
+}
+
+/** The read the row layouts' and donors' attention views make over fetched
+ * affine keys and values (`captureKvAttention`, `quantizedDonorAttention`):
+ * one query reads with `kernels.decode`; a window under a plain causal mask, or
+ * a causal-equivalent bool matrix, with `kernels.window`; under any other array
+ * mask with `kernels.maskedWindow`: the deprecated `quantizedSdpa` dispatch,
+ * with the composition's kernel set where that dispatch read a process flag.
+ * @deprecated These views go with the attention-state read paths they serve
+ * (B2's layouts, B1's donor-read contract); the named reads choose by phase. */
+export function viewAffineKernel(kernels: AffineKernels, queries: number, mask: Mask): AffineKernel {
+  if (queries === 1) return kernels.decode;
+  const causal = mask.mode === "causal" || mask.mode === "" ||
+    (mask.mode === "array" && mask.causalEquivalent === true && mask.arr !== null && mask.arr.ndim === 2 && mask.arr.dtype === Dtype.bool);
+  return causal ? kernels.window : kernels.maskedWindow;
 }
 
 /** The stock unfused port (`quantizedSdpaUnfused`). */
@@ -49,25 +97,26 @@ export function tiledKernel(groupSize: number, bits: number): AffineKernel {
 }
 
 /** Every read unfused: mlx-lm's quantized SDPA port. The composition of a
- * uniform `--kv-quant N` (KV scheme `affine`), which keeps mlx-lm parity; it is
- * what `quantizedSdpa` computes with MLX_BUN_NO_FUSED_SDPA=1. The unfused port
- * takes any bits, group size and activation dtype, so the dtype only names the
+ * uniform `--kv-quant N` (KV scheme `affine`, `kernels: "unfused"`), which
+ * keeps mlx-lm parity, and of `--fused-sdpa off`. The unfused port takes any
+ * bits, group size and activation dtype, so the dtype only names the
  * configuration. */
 export function unfusedAffineKernels(bits: number, groupSize: number, _dtype: Dtype): AffineKernels {
   const unfused = unfusedKernel(groupSize, bits);
   return { decode: unfused, window: unfused, maskedWindow: unfused };
 }
 
-/** OptiQ's wrapper rule: decode unfused (what one query gets in
- * `quantizedSdpa`); a window through the N-tiled fused port while the cache's
- * own mask is plain causal, and through the unfused port once the cache's own
- * state makes that mask an array (padded or unequal rows in a batched cache,
- * the sliding window bound in a rotating cache). The choice keys only on state
- * the cache owns, like the ring wrap or the delayed-quantization transition,
- * never on anything the caller passes. The composition of `--kv-quant config`
- * (KV scheme `affine-layers`), which keeps OptiQ parity; it is what
- * `quantizedSdpa` computes with fused SDPA on. Throws at construction when the
- * tiled port does not take these bits, group size and activation `dtype`. */
+/** OptiQ's wrapper rule: decode unfused (what one query gets in OptiQ's
+ * wrapper); a window through the N-tiled fused port while the cache's own mask
+ * is plain causal, and through the unfused port once the cache's own state
+ * makes that mask an array (padded or unequal rows in a batched cache, the
+ * sliding window bound in a rotating cache). The choice keys only on state the
+ * cache owns, like the ring wrap or the delayed-quantization transition, never
+ * on anything the caller passes. The composition of `--kv-quant config` (KV
+ * scheme `affine-layers`, `kernels: "tiled-causal"`), which keeps OptiQ parity,
+ * and of `--fused-sdpa on` (`composedAffineKernels`). Throws at construction
+ * when the tiled port does not take these bits, group size and activation
+ * `dtype`. */
 export function tiledCausalAffineKernels(bits: number, groupSize: number, dtype: Dtype): AffineKernels {
   supportsTiling("tiledCausalAffineKernels", bits, groupSize, dtype);
   const unfused = unfusedKernel(groupSize, bits);

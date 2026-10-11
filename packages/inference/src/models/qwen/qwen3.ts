@@ -18,7 +18,8 @@ import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import { argmaxLastPosition } from "../../kernels/logits";
 import { disposing } from "../../layers/helpers";
-import { KVCache } from "../../state/kv";
+import { composedFullAttentionCache } from "../../state/bf16-first-kv";
+import type { Composition } from "../../contracts/portable/composition";
 import { AttentionMasks } from "../../state/attention-read";
 import { denseTurboQuantKernels } from "../../state/turboquant-attention";
 import { LoraState } from "../../layers/lora";
@@ -168,6 +169,8 @@ export class Qwen3Layer {
 
 export class Qwen3Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
+  /** The served configuration this graph was built for: its KV scheme is what `makeCache` composes. */
+  readonly composition: Composition;
   readonly weightsBytes: number;
   readonly prefixBase = "model";
   readonly loraState = new LoraState();
@@ -182,8 +185,9 @@ export class Qwen3Model implements MlxDeclaredGraph, MlxTokenPhases {
   /** Separate lm_head when NOT tied; otherwise the tied embedding's asLinear. */
   readonly lmHead: QuantizedLinear | null;
 
-  constructor(weights: Weights, config: ModelConfig) {
+  constructor(weights: Weights, config: ModelConfig, composition: Composition) {
     this.config = config;
+    this.composition = composition;
     this.weightsBytes = [...weights.shards.files.values()]
       .reduce((a, f) => a + f.mmap.size, 0);
     this.embed = QuantizedEmbedding.load(weights, "model.embed_tokens", config);
@@ -219,7 +223,7 @@ export class Qwen3Model implements MlxDeclaredGraph, MlxTokenPhases {
    * the cache. */
   makeCache(): Cache[] {
     const masks = new AttentionMasks();
-    return this.layers.map(() => new KVCache(masks, denseTurboQuantKernels));
+    return this.layers.map((_, layer) => composedFullAttentionCache(this.composition.kv, layer, masks, denseTurboQuantKernels));
   }
 
   /** @deprecated E2 calls the named phases. */

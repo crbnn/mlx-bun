@@ -39,7 +39,7 @@ const on = (device: string, config: ModelConfig, request: CompositionRequest = {
 describe("a graph table", () => {
   const entry = (id: string, serves: ServedComposition): GraphEntry<null, string> => ({ id, serves, create: () => id });
   const composition = (fields: Partial<Composition> = {}): Composition => ({ device: M4_PRO, aneBridge: true, kv: { kind: "bf16" },
-    draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 8, ...fields });
+    draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 8, speculativeAffineKv: true, packedMixedMlp: true, ...fields });
 
   test("the most constrained entry the composition meets wins; the generic entry serves the rest", () => {
     const table = new GraphTable([
@@ -51,10 +51,11 @@ describe("a graph table", () => {
     expect(table.generic.id).toBe("generic");
     expect(table.match("x", composition({ device: M1_MAX })).id).toBe("generic");
     expect(table.match("x", composition()).id).toBe("device");
-    expect(table.match("x", composition({ kv: { kind: "affine", bits: 4, groupSize: 64 } })).id).toBe("device+kv");
-    // A delayed start is the cache's timing: the same scheme.
-    expect(table.match("x", composition({ kv: { kind: "affine", bits: 4, groupSize: 64, quantizedKvStart: 512 } })).id).toBe("device+kv");
-    expect(table.match("x", composition({ kv: { kind: "affine", bits: 4, groupSize: 32 } })).id).toBe("device");
+    expect(table.match("x", composition({ kv: { kind: "affine", bits: 4, groupSize: 64, kernels: "unfused" } })).id).toBe("device+kv");
+    // A delayed start is the cache's timing, and the read kernels the cache's composition: the same scheme.
+    expect(table.match("x", composition({ kv: { kind: "affine", bits: 4, groupSize: 64, quantizedKvStart: 512, kernels: "unfused" } })).id).toBe("device+kv");
+    expect(table.match("x", composition({ kv: { kind: "affine", bits: 4, groupSize: 64, kernels: "tiled-causal" } })).id).toBe("device+kv");
+    expect(table.match("x", composition({ kv: { kind: "affine", bits: 4, groupSize: 32, kernels: "unfused" } })).id).toBe("device");
     // maxRows bounds from above, inclusive.
     expect(table.match("f", composition({ maxRows: 4 })).id).toBe("fingerprint+device+rows");
     expect(table.match("f", composition({ maxRows: 1 })).id).toBe("fingerprint+device+rows");
@@ -81,9 +82,9 @@ describe("a graph table", () => {
     expect(table.match(undefined, composition({ device: M1_MAX, prefillChunkTokens: 512 })).id).toBe("generic");
     // Per-layer schemes compare layer by layer, in any order.
     expect(table.match(undefined, composition({ device: "applegpu_g15s",
-      kv: { kind: "affine-layers", layers: [{ layer: 0, bits: 4, groupSize: 64 }, { layer: 1, bits: 8, groupSize: 64 }] } })).id).toBe("layers");
+      kv: { kind: "affine-layers", layers: [{ layer: 0, bits: 4, groupSize: 64 }, { layer: 1, bits: 8, groupSize: 64 }], kernels: "tiled-causal" } })).id).toBe("layers");
     expect(table.match(undefined, composition({ device: "applegpu_g15s",
-      kv: { kind: "affine-layers", layers: [{ layer: 0, bits: 4, groupSize: 64 }, { layer: 1, bits: 4, groupSize: 64 }] } })).id).toBe("generic");
+      kv: { kind: "affine-layers", layers: [{ layer: 0, bits: 4, groupSize: 64 }, { layer: 1, bits: 4, groupSize: 64 }], kernels: "tiled-causal" } })).id).toBe("generic");
     expect(table.match(undefined, composition({ device: "applegpu_g14s", kv: { kind: "turbo", kBits: 8, vBits: 3 } })).id).toBe("turbo");
     expect(table.match(undefined, composition({ device: "applegpu_g14s", kv: { kind: "turbo", kBits: 4, vBits: 4 } })).id).toBe("generic");
   });
@@ -115,6 +116,8 @@ describe("the Qwen 3.5 table", () => {
     expect(select(on(M4_PRO, qwen))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     expect(select(on(M4_PRO, qwen, { kv: { override: 4 } }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     expect(select(on(M4_PRO, qwen, { kv: { override: 4, quantizedKvStart: 512 } }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
+    for (const fusedSdpa of [true, false])
+      expect(select(on(M4_PRO, qwen, { kv: { override: 4, fusedSdpa } }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     expect(select(on(M4_PRO, qwen, { adapters: true }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     expect(select(on(M4_PRO, qwen, { maxRows: 1, draft: { numDraftTokens: 3 } }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     expect(select({ ...on(M4_PRO, qwen, { draft: { numDraftTokens: 7, adaptive: true } }), aneBridge: false, prefillChunkTokens: 512 }))
@@ -174,6 +177,8 @@ describe("the Gemma 4 table", () => {
       expect(on(M4_PRO, config, { kv: { override: "config" } }).kv.kind).toBe("affine-layers");
       expect(pick({ kv: { override: "config" } })).toBe(stem);
       expect(pick({ kv: { override: "config", quantizedKvStart: 100 } })).toBe(stem);
+      // `--fused-sdpa` names the read kernels its caches compose, not another graph.
+      for (const fusedSdpa of [true, false]) expect(pick({ kv: { override: "config", fusedSdpa } })).toBe(stem);
       // Selection does not depend on the device, rows or adapters for these entries.
       expect(table.select(config, on(M1_MAX, config, { kv: { override: "config" }, maxRows: 32, adapters: true })).id).toBe(stem);
       for (const other of [{}, { kv: { override: "off" as const } }, { kv: { override: 4 } }, { kv: { override: 8 } },

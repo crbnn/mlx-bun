@@ -1,6 +1,6 @@
 export * from "./kv";
 export * from "./quantized-kv";
-export { tiledAffineKernels, tiledCausalAffineKernels, unfusedAffineKernels, type AffineKernels } from "./affine-attention";
+export { composedAffineKernels, tiledAffineKernels, tiledCausalAffineKernels, unfusedAffineKernels, type AffineKernels } from "./affine-attention";
 export * from "./rotating-kv";
 export * from "./rotating-quantized-kv";
 export * from "./turboquant-kv";
@@ -14,7 +14,6 @@ export * from "./checkpoint";
 export * from "./kv-maintenance";
 export * from "./dense-kv-reads";
 export * from "./kv-scheme";
-export * from "./kv-storage";
 export * from "./persistence";
 export * from "./batched-kv";
 export * from "./batched-quantized-kv";

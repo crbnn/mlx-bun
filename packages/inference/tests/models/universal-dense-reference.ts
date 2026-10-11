@@ -9,7 +9,7 @@
 //
 // Changes from b3db6b09: import paths only.
 
-import { captureKvAttention } from "../../src/state/kv-attention-view";
+import { referenceKvAttention as captureKvAttention } from "./quantized-sdpa-reference";
 // UniversalDense — the Tier-0 config-driven dense llama-family module
 // (`02d723a:docs/design/generic-model-support.md` §4.1). One module, shaped exactly
 // like qwen3.ts, with every arch delta selected by the UniversalArgs

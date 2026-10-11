@@ -27,11 +27,14 @@
 //   - mounted LoRA adapters (loraTargets: the blocks' QuantizedLinear projections apply them);
 //   - paged KV (the paged caches' own reads), and mixed groups of rows in one
 //     forward (forwardHiddenMixed).
+// Its caches are the composition's (makeCache): under the scheme it serves, every
+// cache the kv_config lists is the bf16-first affine lego, read bf16 through its
+// first append and through its quantized storage after, with the read kernels the
+// composition names (--fused-sdpa); the other caches stay bf16.
 // The loader refuses, or gives the generic graph (Gemma4Model), from the declared
 // capabilities and its selection table, never by routing inside this graph:
-//   - any KV scheme other than COMPOSITION.kv (bf16, uniform --kv-quant N, TurboQuant):
-//     this graph reads whatever cache it is handed through that cache's read, the
-//     same arithmetic as the generic graph, but it was generated and gated for this one;
+//   - any KV scheme other than the one COMPOSITION serves (bf16, uniform --kv-quant N,
+//     TurboQuant): the table builds the generic graph;
 //   - training: this graph declares no training operations (segmented backward,
 //     prefix sharing, gradient checkpointing, the fused head and the training
 //     forward over training caches are the generic graph's);
@@ -49,7 +52,7 @@ import type {
 } from "../../../contracts/mlx/graph";
 import type { MediaEncoders, MediaSidecarProbes, MlxPromptInput, Vision } from "../../../contracts/mlx/media";
 import type { TokenGroup } from "../../../contracts/mlx/token-work";
-import type { KvStorageScheme } from "../../../contracts/portable/composition";
+import type { Composition } from "../../../contracts/portable/composition";
 import type { GraphCapabilities } from "../../../contracts/portable/graph";
 import { mapPackedTokens } from "../../../input/token-groups";
 import { argmaxLastPosition, logitSoftcap } from "../../../kernels/logits";
@@ -61,14 +64,13 @@ import { RMSNorm } from "../../../layers/normalization";
 import { QuantizedEmbedding } from "../../../layers/quantized-embedding";
 import type { QuantizedLinear } from "../../../layers/quantized-linear";
 import { isCompiledTrace } from "../../../runtime/compiled-trace";
-import { runtimeFlag } from "../../../runtime/config";
 import { disposeResources } from "../../../runtime/resources";
 import { AttentionMasks } from "../../../state/attention-read";
-import { KVCache } from "../../../state/kv";
-import { RotatingKVCache } from "../../../state/rotating-kv";
+import { composedFullAttentionCache, composedSlidingAttentionCache } from "../../../state/bf16-first-kv";
 import { deferredTurboQuantKernels } from "../../../state/turboquant-attention";
 import { declareGraph } from "../../capabilities";
 import { atEveryWidth, deprecatedPhase } from "../../graph";
+import type { ServedComposition } from "../../implementation";
 import { DecoderLayer, type Gemma4Phase } from "../blocks";
 import { GENERATED_GEMMA_FINGERPRINTS } from "../family";
 import { bindGemma4MediaInput, gemma4DraftTarget, gemma4MediaEncoders } from "../media";
@@ -127,15 +129,17 @@ const CACHES = 30;
 const PREFIX = "language_model.model";
 const FINAL_LOGIT_SOFTCAP = 30;
 
-/** What this file was generated for, the facts the loader's selection table keys
- *  on: the artifact's config fingerprint and the KV scheme of the caches it serves
- *  (the artifact's kv_config, `--kv-quant config`). */
-export const COMPOSITION = Object.freeze({
+/** The composition this file was generated for, its entry in the loader's table:
+ *  the artifact's config fingerprint and the KV scheme of the caches it serves (the
+ *  artifact's kv_config, `--kv-quant config`). The scheme's read kernels and
+ *  conversion start constrain nothing: `makeCache` composes them from the record
+ *  the constructor is handed. */
+export const COMPOSITION: ServedComposition = Object.freeze({
   fingerprint: FINGERPRINT,
-  kv: Object.freeze({
-    kind: "affine-layers",
+  kv: Object.freeze([Object.freeze({
+    kind: "affine-layers" as const,
     layers: Object.freeze(LAYERS.slice(0, CACHES).flatMap((layer, i) => layer.kv ? [Object.freeze({ layer: i, ...layer.kv })] : [])),
-  }) as KvStorageScheme,
+  })]),
 });
 
 /** A layer's attention half over `x` (borrowed) for one forward, to the post-attention residual (owned). */
@@ -164,6 +168,8 @@ function deprecatedRead(h0: MlxArray, bidir: MlxArray | null): Gemma4Phase {
 
 export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
+  /** The served configuration this graph was built for: its KV scheme is what `makeCache` composes. */
+  readonly composition: Composition;
   /** Total weight-shard bytes (for the conditional wired-limit scope). */
   readonly weightsBytes: number;
   /** Weight-name prefix of the LoRA targets. */
@@ -198,13 +204,14 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
   readonly #attend: readonly Attend[];
   readonly #feedforward: readonly Feedforward[];
   readonly #head: MlxHeadForward;
-  /** `MLX_BUN_MIXED_PACKED_MLP`: the groups of a mixed forward share one feed-forward call (on unless set to 0). */
+  /** The composition's `packedMixedMlp`: the groups of a mixed forward share one feed-forward call. */
   readonly #packMixedMlp: boolean;
   #disposed = false;
 
-  constructor(weights: Weights, config: ModelConfig) {
+  constructor(weights: Weights, config: ModelConfig, composition: Composition) {
     const t = config.text;
     this.config = config;
+    this.composition = composition;
     this.weightsBytes = [...weights.shards.files.values()].reduce((a, f) => a + f.mmap.size, 0);
     this.embed = QuantizedEmbedding.load(weights, `${PREFIX}.embed_tokens`, config);
     this.layers = Object.freeze(LAYERS.map((_, i) => new DecoderLayer(weights, config, PREFIX, i, i < CACHES)));
@@ -222,7 +229,7 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
       return disposing(logits, compiled && !isCompiledTrace()
         ? compiledLogitSoftcap(logits, FINAL_LOGIT_SOFTCAP) : logitSoftcap(logits, FINAL_LOGIT_SOFTCAP));
     };
-    this.#packMixedMlp = runtimeFlag("MLX_BUN_MIXED_PACKED_MLP", true);
+    this.#packMixedMlp = composition.packedMixedMlp;
     this.graphCapabilities = declareGraph({
       media: { input: "embeddings", video: false }, pagedAttention: true, hiddenLayerTaps: true, compiledDecode: false,
       kv: { delayedAffine: "all" },
@@ -244,14 +251,16 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
   }
 
   /** One cache per layer that owns one, all sharing one mask memo, so each
-   *  forward builds each mask once: a ring of the sliding window for sliding
-   *  layers (bf16 under TurboQuant), and for full layers a cache whose TurboQuant
-   *  read is deferred (`deferredTurboQuantKernels`). The generic graph's caches;
-   *  the scheduler converts them to the KV scheme today. */
+   *  forward builds each mask once: the cache the composition's KV scheme names
+   *  for the layer, a ring of the sliding window for sliding layers
+   *  (`composedSlidingAttentionCache`) and for full layers a cache whose
+   *  TurboQuant read is deferred (`composedFullAttentionCache`,
+   *  `deferredTurboQuantKernels`). Under the scheme COMPOSITION serves, each
+   *  cache LAYERS gives a width is the bf16-first affine lego. */
   makeCache(): Cache[] {
-    const masks = new AttentionMasks();
-    return LAYERS.slice(0, CACHES).map(layer => layer.attention === "sliding"
-      ? new RotatingKVCache(this.windowSize, masks) : new KVCache(masks, deferredTurboQuantKernels));
+    const masks = new AttentionMasks(), kv = this.composition.kv;
+    return LAYERS.slice(0, CACHES).map((layer, i) => layer.attention === "sliding"
+      ? composedSlidingAttentionCache(kv, i, this.windowSize, masks) : composedFullAttentionCache(kv, i, masks, deferredTurboQuantKernels));
   }
 
   /** LoRA-mountable linears, keyed by weight-file module path: the attention and
@@ -366,8 +375,8 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
 
   /** @deprecated E2 decides mixed rows. Each group's attention reads its own
    *  caches; the feed-forward runs once over the groups' real tokens packed
-   *  together (unless a group keeps its token geometry or MLX_BUN_MIXED_PACKED_MLP
-   *  is 0). A single group without a capture is `forwardHidden`. */
+   *  together (unless a group keeps its token geometry or the composition's
+   *  `packedMixedMlp` is off). A single group without a capture is `forwardHidden`. */
   forwardHiddenMixed(work: readonly TokenGroup[]): MlxArray[] {
     if (work.length === 1 && !work[0]!.captureLayer) return [this.forwardHidden(work[0]!.ids, work[0]!.cache)];
     const groups: Array<{ ids: MlxArray; cache: Cache[]; h: MlxArray; phase: Gemma4Phase }> = [];

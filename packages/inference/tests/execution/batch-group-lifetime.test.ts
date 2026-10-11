@@ -413,6 +413,7 @@ test("a nearly completed prefill keeps its admission weight until it retires", a
 test.each(["finish", "cancel", "consumer", "grammar"])("mixed work preserves row ownership and completion through %s", async mode => {
   const f = fixture();
   const { captureKvAttention } = await import("../../src/state/kv-attention-view");
+  const { unfusedAffineKernels } = await import("../../src/state/affine-attention");
   const { PromptResponseTrace } = await import("../../src/runtime/trace");
   type TokenGroup = import("../../src/contracts/mlx/token-work").TokenGroup;
   const shapes: number[][][] = [], outputs: number[][] = [[], [], []];
@@ -427,7 +428,7 @@ test.each(["finish", "cancel", "consumer", "grammar"])("mixed work preserves row
     using expanded = ops.add(reshaped, zeros);
     using kv = expanded.astype(Dtype.float32);
     for (const cache of caches) {
-      const view = cache.attentionState?.appendAndFetch(kv, kv) ?? captureKvAttention(cache, kv, kv);
+      const view = cache.attentionState?.appendAndFetch(kv, kv) ?? captureKvAttention(cache, kv, kv, unfusedAffineKernels(4, 64, kv.dtype));
       view.dispose();
     }
     return ops.zeros([batch!, count!, 8], Dtype.float32);

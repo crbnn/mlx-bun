@@ -1,12 +1,23 @@
+/** The read kernels of a composition's affine-quantized caches. `tiled-causal`
+ * is OptiQ's rule: a window through the N-tiled fused port while the cache's own
+ * mask is plain causal (where the port takes the configuration), every other
+ * read through the unfused port. `unfused` is mlx-lm's port for every read.
+ * `--fused-sdpa on` composes the first and `off` the second; unset, a per-layer
+ * scheme (`--kv-quant config`) composes `tiled-causal` and a uniform one
+ * `unfused`, which keeps each scheme's oracle parity. */
+export type AffineKernelChoice = "tiled-causal" | "unfused";
+
 /** How a composition's attention caches store keys and values. A quantized
  * scheme carries `quantizedKvStart` only when it is nonzero: storage stays
  * bf16 until a sequence holds that many tokens, then converts in place. */
 export type KvStorageScheme =
   | { readonly kind: "bf16" }
   /** Every attention layer, affine-quantized with one bit width and group size. */
-  | { readonly kind: "affine"; readonly bits: number; readonly groupSize: number; readonly quantizedKvStart?: number }
+  | { readonly kind: "affine"; readonly bits: number; readonly groupSize: number; readonly quantizedKvStart?: number;
+      readonly kernels: AffineKernelChoice }
   /** The layers listed (cache index), each with its own bit width and group size; the others stay bf16. */
-  | { readonly kind: "affine-layers"; readonly layers: readonly AffineKvLayer[]; readonly quantizedKvStart?: number }
+  | { readonly kind: "affine-layers"; readonly layers: readonly AffineKvLayer[]; readonly quantizedKvStart?: number;
+      readonly kernels: AffineKernelChoice }
   /** Full-attention layers TurboQuant-encoded; sliding-window layers stay bf16. */
   | { readonly kind: "turbo"; readonly kBits: number; readonly vBits: number; readonly quantizedKvStart?: number };
 
@@ -15,6 +26,9 @@ export interface AffineKvLayer {
   readonly bits: number;
   readonly groupSize: number;
 }
+
+/** The bf16 KV scheme: what a graph whose composition names no scheme stores. */
+export const BF16_KV: KvStorageScheme = Object.freeze({ kind: "bf16" });
 
 /** Drafted tokens per verify round: a fixed count (0 when the composition has
  * no drafter), or adaptive, where the scheduler picks each round's count up to
@@ -29,6 +43,7 @@ export interface Composition {
   readonly device: string;
   /** The Neural Engine bridge loaded and compiles programs on this machine. */
   readonly aneBridge: boolean;
+  /** The storage and reads of every attention cache the graph's `makeCache` composes. */
   readonly kv: KvStorageScheme;
   readonly draftDepth: DraftDepth;
   /** The prefill chunk size, in prompt tokens, the composition is built for.
@@ -40,4 +55,10 @@ export interface Composition {
   readonly adapters: boolean;
   /** The most rows one forward carries (`--batch`, mlx-lm's `--batch-size`). */
   readonly maxRows: number;
+  /** Speculative verification over affine-quantized KV: a graph whose verifier
+   * qualifies it declares it (default on). */
+  readonly speculativeAffineKv: boolean;
+  /** The groups of a mixed forward share one MLP pass (default on); off, each
+   * group runs its own. */
+  readonly packedMixedMlp: boolean;
 }

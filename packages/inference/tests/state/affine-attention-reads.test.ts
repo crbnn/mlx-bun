@@ -18,11 +18,11 @@ import { Dtype, deviceArchitecture } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { AttentionCache, AttentionRead, Cache, CommittedAttentionCache, Mask } from "../../src/contracts/mlx/cache";
 import {
-  FINFO_MIN, foldedQuantizedSdpa, quantizedSdpa, quantizedSdpaTiled, quantizedSdpaUnfused,
+  FINFO_MIN, foldedQuantizedSdpa, quantizedSdpaTiled, quantizedSdpaUnfused,
 } from "../../src/layers/quantized-attention";
 import { quantizedAppendAttention } from "../../src/layers/quantized-append-attention";
 import { kv4DecodeAttention } from "../../src/layers/kv4-decode-attention";
-import { tiledAffineKernels, tiledCausalAffineKernels, unfusedAffineKernels, type AffineKernels } from "../../src/state/affine-attention";
+import { composedAffineKernels, tiledAffineKernels, tiledCausalAffineKernels, unfusedAffineKernels, type AffineKernels } from "../../src/state/affine-attention";
 import { AttentionMasks } from "../../src/state/attention-read";
 import { QuantizedKVCache } from "../../src/state/quantized-kv";
 import { BatchedQuantizedKVCache } from "../../src/state/batched-quantized-kv";
@@ -34,7 +34,6 @@ import { Kv4Head256Cache } from "../../src/state/kv4-head256-cache";
 import { GroupedHeadsKv4Cache } from "../../src/state/grouped-heads-kv4-cache";
 import { disposeTriple } from "../../src/state/quantized-tensor";
 import { disposeResources } from "../../src/runtime/resources";
-import { createRuntimeConfig, runtimeConfig, withRuntimeConfig } from "../../src/runtime/config";
 
 const HKV = 2, HQ = 8, D = 128, SCALE = 0.088, WINDOW = 32, TOLERANCE = 4 * 2 ** -6;
 const M4PRO = deviceArchitecture() === "applegpu_g16s";
@@ -571,7 +570,7 @@ for (const [bits, groupSize] of BATCH_CONFIGS) {
 // --- Device-specific legos ------------------------------------------------------------------------
 
 test("Kv4Head256Cache: the M4 Pro graph's decode and folded kernels at its shapes", () => {
-  const pair: [QuantizedKVCache, Kv4Head256Cache] = [new QuantizedKVCache(64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16)), new Kv4Head256Cache()];
+  const pair: [QuantizedKVCache, Kv4Head256Cache] = [new QuantizedKVCache(64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16)), new Kv4Head256Cache(unfusedAffineKernels(4, 64, Dtype.bfloat16))];
   const kernel: NewKernel = phase => phase === "decode" ? "kv4" : "folded";
   try {
     // Prefill chunk, decode across the KV4 kernel's 512-key blocks, verify
@@ -637,10 +636,10 @@ test.skipIf(!M4PRO)("quantizedSdpaUnfused without the device check, at the group
   expect(failures).toEqual([]);
 }, 60_000);
 
-test("quantizedSdpa still reads MLX_BUN_NO_FUSED_SDPA: today's callers compute what they did", () => {
+test("composedAffineKernels: `--fused-sdpa on` and `off` compute what the flag's dispatch did, unset and set", () => {
   const failures: string[] = [];
   for (const noFused of [false, true]) for (const [bits, groupSize] of [[4, 64], [8, 64]])
-    for (const [L, N] of [[3, 300], [37, 600], [200, 1200]] as const) {
+    for (const [L, N] of [[1, 300], [3, 300], [37, 600], [200, 1200]] as const) {
       const [k, v] = kv(1, N);
       using q = query(1, L);
       const kq = ops.quantize(k, groupSize!, bits!), vq = ops.quantize(v, groupSize!, bits!);
@@ -649,9 +648,9 @@ test("quantizedSdpa still reads MLX_BUN_NO_FUSED_SDPA: today's callers compute w
         const mask: Mask = { mode: "causal", arr: null };
         const before = oldQuantizedSdpa(q, kq, vq, SCALE, mask, groupSize!, bits!, noFused);
         using reference = before.out;
-        using after = withRuntimeConfig(createRuntimeConfig({ ...runtimeConfig().values, MLX_BUN_NO_FUSED_SDPA: noFused ? "1" : undefined }),
-          () => quantizedSdpa(q, kq, vq, SCALE, mask, groupSize!, bits!));
-        const failure = record(`quantizedSdpa ${bits}b g${groupSize} window ${L} over ${N} flag ${noFused ? "1" : "unset"}`,
+        const kernels = composedAffineKernels(noFused ? "unfused" : "tiled-causal")(bits!, groupSize!, Dtype.bfloat16);
+        using after = (L === 1 ? kernels.decode : kernels.window)(q, kq, vq, SCALE, mask);
+        const failure = record(`composed ${noFused ? "unfused" : "tiled-causal"} ${bits}b g${groupSize} ${L === 1 ? "decode" : `window ${L}`} over ${N}`,
           maxDiff(after, reference), before.kernel, before.kernel);
         if (failure) failures.push(failure);
       } finally { disposeTriple(kq); disposeTriple(vq); }

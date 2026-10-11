@@ -104,7 +104,7 @@ async function setup(dir: string) {
     fine_tune_type: "lora", lora_parameters: { rank: 4, scale: 2.0, dropout: 0.0 } }));
   await ctx.adapters.mount("generated-lora", adapterDir);
 
-  const prep = createRequestPrep({ ctx, serverOptions: {}, kvScheme: {}, defaultGeneratedTokens: undefined });
+  const prep = createRequestPrep({ ctx, serverOptions: {}, defaultGeneratedTokens: undefined });
   const binding = await modelServingBinding(ctx);
   // One gateway per scenario, closed before the next: an idle scheduler still
   // holding an adapter context must not overlap a direct generation that
@@ -120,7 +120,7 @@ async function setup(dir: string) {
     return compiled.controller;
   };
   const shape = (options: GenerateOptions): RequestShape => ({ hasVision: false, hasAdapters: !!options.adapters?.length,
-    hasRepetitionPenalty: false, userSeed: false, kvQuant: false, turboQuant: false, hasLogitsExtras: false,
+    hasRepetitionPenalty: false, userSeed: false, hasLogitsExtras: false,
     hasGrammar: !!options.grammar, wantsLogprobs: false, hasDraft: false });
   const traced = async <T>(run: () => Promise<T>) => {
     trace = { calls: [], batches: [] };

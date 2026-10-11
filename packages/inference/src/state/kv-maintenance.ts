@@ -1,188 +1,86 @@
-import { turboQuantFusedDecode } from "./turboquant-codec";
-import { runtimeConfig, withRuntimeConfig } from "../runtime/config";
-import type { KvSchemeOptions } from "./kv-scheme";
+// The row-layout half of a composition's KV scheme. The graph's `makeCache`
+// composes the scheme's legos (`state/bf16-first-kv.ts`), which convert
+// themselves inside their own appends, so nothing here converts a serial cache.
+// What remains is where a request's serial caches join row layouts: a lego's
+// storage moves into the layout, and the rows of a scheme that converts later
+// than the first append (or inside a prefill cohort) take the delayed row
+// layouts, which convert each row at its own planned boundary (B2 moves this
+// into `state/layout.ts`).
+import type { KvStorageScheme } from "../contracts/portable/composition";
+import { type Cache, type KvMaintenance } from "../contracts/mlx/cache";
+import { composedAffineKernels } from "./affine-attention";
 import { KVCache } from "./kv";
-import { servedAffineKernels } from "./served-affine-kernels";
 import { QuantizedKVCache } from "./quantized-kv";
 import { RotatingKVCache } from "./rotating-kv";
 import { RotatingQuantizedKVCache } from "./rotating-quantized-kv";
 import { TurboQuantKVCache } from "./turboquant-kv";
-import { type Cache, type KvMaintenance } from "../contracts/mlx/cache";
-import type { KvQuantSpec, TurboQuantScheme } from "../artifacts/config";
-import * as ops from "@mlx-bun/mlx/ops";
-import { clearCache } from "@mlx-bun/mlx/ffi";
-
+import { turboQuantFusedDecode } from "./turboquant-codec";
 import { DelayedRotatingQuantizedKVCache } from "./delayed-rotating-quantized-kv";
 import { DelayedQuantizedKVCache } from "./delayed-quantized-kv";
 import { DelayedTurboQuantKVCache } from "./delayed-turboquant-kv";
 
 export type { KvMaintenance };
 
-/** Maintenance that never converts: every entry keeps the reads it has. */
-export const unchangedKv: KvMaintenance = Object.assign((_cache: Cache[]): void => {}, { keepsDenseReads: () => true });
-let warnedTurboRotating = false;
+/** Maintenance of the bf16 scheme: no layer converts. */
+export const unchangedKv: KvMaintenance = Object.freeze({});
 
-/** Port of mlx-lm maybe_quantize_kv_cache + BOTH halves of optiq serve's
- *  per-layer patched variant (incl. patch_rotating_to_quantized: rotating
- *  caches convert too):
- *  - per-layer bits/group_size selection (kvConfig overrides kvBits,
- *    matching optiq's --kv-config precedence; shipped kv_config.json
- *    files cover EVERY cache-owning layer, sliding ones included —
- *    verified 12B 48/48, 26B 30/30, e4b 24/24 distinct caches — so
- *    rotating quantization engages straight from the config; uniform
- *    kvBits — like optiq --kv-bits — reaches them too), and
- *  - STREAMING conversion (optiq streaming_kv_quant / serve.py
- *    patched_maybe_quantize): eval each layer's quantized triples and
- *    clear the buffer pool before building the next layer's conversion.
- *    Lazily batching every layer's toQuantized into one eval pins ALL
- *    layers' bf16 K/V as graph inputs alongside ALL quantized outputs —
- *    the exact transient optiq's fix kills (16.35 → 7.60 GB at 32k on a
- *    24 GB Mac). Numerics untouched: same quantize math, only the eval
- *    ordering is forced (`02d723a:tests/parity/kv-quant.test.ts`,
- *    `02d723a:tests/parity/rotating-kvq.test.ts`). */
-/** Where affine KV conversion starts: the explicit `quantizedKvStart`, else
- * immediately for a per-layer config and after 5000 tokens for uniform bits. */
-export function affineQuantizedKvStart(options: { quantizedKvStart?: number; kvConfig?: readonly unknown[] }): number {
-  return options.quantizedKvStart ?? (options.kvConfig?.length ? 0 : 5000);
+/** One layer's serial cache made ready for a row layout: a lego hands over its
+ * storage (and how it composes storage back for serial use); other storage is
+ * itself. */
+function released(cache: Cache): { row: Cache; compose?: (storage: Cache) => Cache } {
+  const composed = cache.composed;
+  return composed ? { row: composed.release(), compose: composed.over } : { row: cache };
 }
 
-export function createKvMaintenance(options: Readonly<Omit<KvSchemeOptions, "kvConfig">> & {
-  readonly kvConfig?: readonly Readonly<KvQuantSpec>[];
-}): KvMaintenance {
-  const { kvBits, kvConfig, turboQuant } = options;
-  if (turboQuant) {
-    const start = options.quantizedKvStart ?? 0;
-    const scheme = { ...turboQuant };
-    const runtime = runtimeConfig();
-    const fusedDecode = turboQuantFusedDecode(runtime);
-    const maintain: KvMaintenance = (cache) => withRuntimeConfig(runtime, () => maybeTurboQuantizeKv(cache, scheme, start));
-    // Its only conversion replaces a plain full-attention entry with a
-    // TurboQuantKVCache, which decodes on read; every other entry is left as it is.
-    maintain.keepsDenseReads = () => true;
-    if (start > 0) maintain.maxAppendTokens = (cache) => {
-      let remaining = Number.POSITIVE_INFINITY;
-      for (const c of cache) {
-        remaining = Math.min(remaining, c.maxAppendTokens?.() ?? Infinity);
-        const conversion = c.turboConversion ?? (c instanceof KVCache ? c : undefined);
-        if (conversion && conversion.offset < start)
-          remaining = Math.min(remaining, start - conversion.offset);
-      }
-      return remaining;
-    };
-    // The rows layout converts its own rows with the scheme it is built with;
-    // this maintenance never converts them. The layout attends with the
-    // TurboQuant read of the graph that built the row (its `turboQuantKernels`).
-    maintain.preparePrefill = (cache) => {
+/** The positions a committed append may add before any layer's transition. */
+function maxAppendTokens(cache: readonly Cache[]): number {
+  return Math.min(Infinity, ...cache.map(c => c.maxAppendTokens?.() ?? Infinity));
+}
+
+/** The row-layout maintenance of the composition's KV scheme `kv`.
+ * `preparePrefill` (a prefill cohort forms) routes every converting layer into
+ * its delayed row layout, built with the scheme's kernel set; `prepareBatch`
+ * (a prefilled row joins decode) routes a lego's storage to the batch layouts
+ * and, when the scheme converts after a start, into the same delayed layouts.
+ * A layout built from a lego hands back the lego's composition for the rows it
+ * extracts. */
+export function createKvMaintenance(kv: KvStorageScheme): KvMaintenance {
+  if (kv.kind === "bf16") return unchangedKv;
+  const start = kv.quantizedKvStart ?? 0;
+  if (kv.kind === "turbo") {
+    const fusedDecode = turboQuantFusedDecode();
+    const preparePrefill = (cache: Cache[]): void => {
       for (let layer = 0; layer < cache.length; layer++) {
-        const row = cache[layer]!;
-        if (row instanceof KVCache || row instanceof TurboQuantKVCache)
-          cache[layer] = new DelayedTurboQuantKVCache(scheme.kBits, scheme.vBits, start, fusedDecode, row.turboQuantKernels, row);
+        const { row, compose } = released(cache[layer]!);
+        cache[layer] = row instanceof KVCache || row instanceof TurboQuantKVCache
+          ? new DelayedTurboQuantKVCache(kv.kBits, kv.vBits, start, fusedDecode, row.turboQuantKernels, row, compose) : row;
       }
     };
-    if (start > 0) maintain.prepareBatch = maintain.preparePrefill;
-    return maintain;
+    return Object.freeze(start > 0 ? { preparePrefill, prepareBatch: preparePrefill, maxAppendTokens }
+      : { preparePrefill, prepareBatch: routeStorage });
   }
-  if (!kvBits && !kvConfig?.length) return unchangedKv;
-  const start = affineQuantizedKvStart(options);
-  const groupSize = options.kvGroupSize ?? 64;
+  const kernelSet = composedAffineKernels(kv.kernels);
   // Resolve layer policy once when composing execution, never per token.
-  const byLayer = kvConfig?.length
-    ? new Map(kvConfig.map((entry) => [entry.layerIdx, { ...entry }]))
-    : null;
-  const conversionOf = (c: Cache) => c.affineConversion ?? (c instanceof KVCache || c instanceof RotatingKVCache ? c : undefined);
-  // One test for converting and for answering whether a row would convert.
-  // The populated-cache boundary is part of oracle parity: quantizing an empty
-  // cache would also quantize the first prefill.
-  const converts = (c: Cache, i: number): boolean => {
-    const conversion = conversionOf(c);
-    return !!conversion && conversion.offset >= start && conversion.offset !== 0 && (!byLayer || byLayer.has(i));
-  };
-  const maintain: KvMaintenance = (cache) => {
-    for (let i = 0; i < cache.length; i++) {
-      const c = cache[i]!;
-      if (!converts(c, i)) continue;
-      const conversion = conversionOf(c)!;
-      const conversionOffset = conversion.offset;
-      const entry = byLayer?.get(i);
-      // E3 transition: E3 composes the set from the KV scheme at load and
-      // deletes the flag this reads (`servedAffineKernels`).
-      const kernels = servedAffineKernels();
-      cache[i] = entry ? conversion.toQuantized(entry.groupSize, entry.bits, kernels)
-        : conversion.toQuantized(groupSize, kvBits!, kernels);
-      if (start > 0) cache[i]!.minimumReusableOffset = conversionOffset;
-      // Materialize one layer before converting the next to bound the live
-      // bf16 source plus quantized destination to one conversion at a time.
-      ops.evalAll(cache[i]!.state());
-      clearCache();
-    }
-  };
-  // Affine conversion leaves quantized storage, which does not read dense.
-  maintain.keepsDenseReads = (c, i) => !converts(c, i);
-  if (start > 0) maintain.maxAppendTokens = (cache) => {
-    let remaining = Number.POSITIVE_INFINITY;
+  const spec = kv.kind === "affine" ? () => ({ bits: kv.bits, groupSize: kv.groupSize })
+    : (() => { const layers = new Map(kv.layers.map(entry => [entry.layer, entry])); return (layer: number) => layers.get(layer); })();
+  const preparePrefill = (cache: Cache[]): void => {
     for (let layer = 0; layer < cache.length; layer++) {
-      if (byLayer && !byLayer.has(layer)) continue;
-      const c = cache[layer]!;
-      remaining = Math.min(remaining, c.maxAppendTokens?.() ?? Infinity);
-      const conversion = c.affineConversion ?? (c instanceof KVCache || c instanceof RotatingKVCache ? c : undefined);
-      if (conversion && conversion.offset < start)
-        remaining = Math.min(remaining, start - conversion.offset);
-    }
-    return remaining;
-  };
-  // The rows layouts convert their own rows, each with its layer's scheme;
-  // this maintenance never converts them. Each layout takes the kernel set its
-  // converted rows attend with when it is built here.
-  maintain.preparePrefill = (cache) => {
-    // E3 transition: E3 composes the set from the KV scheme at load and
-    // deletes the flag this reads (`servedAffineKernels`).
-    const kernels = servedAffineKernels();
-    for (let layer = 0; layer < cache.length; layer++) {
-      const row = cache[layer]!;
-      if (!(row instanceof KVCache || row instanceof QuantizedKVCache || row instanceof RotatingKVCache || row instanceof RotatingQuantizedKVCache)) continue;
-      const spec = byLayer ? byLayer.get(layer) : { bits: kvBits!, groupSize };
-      if (!spec) continue;
+      const { row, compose } = released(cache[layer]!);
+      const scheme = spec(layer);
+      if (!scheme || !(row instanceof KVCache || row instanceof QuantizedKVCache || row instanceof RotatingKVCache ||
+          row instanceof RotatingQuantizedKVCache)) { cache[layer] = row; continue; }
       cache[layer] = row instanceof RotatingKVCache || row instanceof RotatingQuantizedKVCache
-        ? new DelayedRotatingQuantizedKVCache(row.maxSize, spec.groupSize, spec.bits, start, kernels, row)
-        : new DelayedQuantizedKVCache(spec.groupSize, spec.bits, start, kernels, row);
+        ? new DelayedRotatingQuantizedKVCache(row.maxSize, scheme.groupSize, scheme.bits, start, kernelSet, row, false, compose)
+        : new DelayedQuantizedKVCache(scheme.groupSize, scheme.bits, start, kernelSet, row, compose);
     }
   };
-  if (start > 0) maintain.prepareBatch = maintain.preparePrefill;
-  return maintain;
+  return Object.freeze(start > 0 ? { preparePrefill, prepareBatch: preparePrefill, maxAppendTokens }
+    : { preparePrefill, prepareBatch: routeStorage });
 }
 
-function maybeTurboQuantizeKv(cache: Cache[], scheme: TurboQuantScheme, start: number): void {
-  for (let i = 0; i < cache.length; i++) {
-    const c = cache[i]!;
-    if (c instanceof RotatingKVCache) {
-      if (!warnedTurboRotating) {
-        warnedTurboRotating = true;
-        console.warn(
-          "[turbo-quant] sliding-window (RotatingKVCache) layers stay bf16 in v1 " +
-          "(full-attention only).",
-        );
-      }
-      continue;
-    }
-    const conversion = c.turboConversion ?? (c instanceof KVCache ? c : undefined);
-    if (!conversion || conversion.offset < start || conversion.offset === 0) continue;
-    const conversionOffset = conversion.offset;
-    // The converted cache attends with the TurboQuant read of the graph that
-    // built the source (its `turboQuantKernels`): dense for Qwen 3.5, deferred
-    // for Gemma 4 and MiniCPM5.
-    const tq = c.turboConversion ? c.turboConversion.toTurboQuantized(scheme.kBits, scheme.vBits)
-      : TurboQuantKVCache.fromKVCache(c as KVCache, scheme.kBits, scheme.vBits, (c as KVCache).turboQuantKernels);
-    if (start > 0) tq.minimumReusableOffset = conversionOffset;
-    cache[i] = tq;
-    // state() allocates fresh trimmed slice views for this cache kind
-    // (see evalCacheState) — dispose after materializing (throw included),
-    // or they leak.
-    const state = tq.state();
-    try {
-      ops.evalAll(state);
-    } finally {
-      for (const a of state) a.dispose();
-    }
-    clearCache();
-  }
+/** A prefilled row joins decode under a scheme that converts after the first
+ * append: every lego has converted (or holds a layer the scheme leaves bf16),
+ * so its storage joins the batch layouts as it is. */
+function routeStorage(cache: Cache[]): void {
+  for (let layer = 0; layer < cache.length; layer++) cache[layer] = released(cache[layer]!).row;
 }

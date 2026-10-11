@@ -8,11 +8,14 @@ import { resolveKvScheme } from "../../src/state/kv-scheme";
 import { NgramProvider } from "../../src/generation/speculative/sources/ngram-source";
 import type { GenerateOptions } from "../../src/generation/index";
 import type { GraphCapabilities } from "../../src/contracts/portable/graph";
+import { kvOf, testComposition, type KvOptions } from "../models/test-composition";
 
 // A graph that is none of the model classes. Placement can only follow what it
 // declares: its name, its model type, and its shape mean nothing to the scheduler.
 const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
-  kvQuant: false, turboQuant: false, hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
+  hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
+/** The graph's composition naming the KV scheme every request stores. */
+const composed = (kv: KvOptions) => ({ composition: testComposition(kvOf(kv)) });
 const schedule = { continuous: true, quantizedBatch: true, checkpoints: false };
 
 function replacement(declared: Parameters<typeof declareGraph>[0] = {}, extra: object = {}, modelType = "replacement"): RuntimeModel {
@@ -70,23 +73,23 @@ describe("placement follows the graph's declarations", () => {
       expect(bind(replacement({ kv: { delayedAffine: level } })).kvBatchable(delayed), level).toBe(batches);
     expect(bind(replacement()).kvBatchable(immediate)).toBe(true);
     // Ordinary-only graphs serve delayed rows ordinarily and refuse to speculate over them; `all` graphs speculate.
-    const request = { ...shape, kvQuant: true, hasDraft: true }, options = { kvBits: 4, quantizedKvStart: 64 } as GenerateOptions;
-    const ordinary = bind(replacement({ kv: { delayedAffine: "ordinary" } }), true).plan(request, options, schedule);
+    const request = { ...shape, hasDraft: true }, kv = composed({ kvBits: 4, quantizedKvStart: 64 });
+    const ordinary = bind(replacement({ kv: { delayedAffine: "ordinary" } }, kv), true).plan(request, {}, schedule);
     expect(ordinary).toMatchObject({ mechanism: "unsupported" });
     expect(ordinary.reasons).toContain("continuous-unavailable");
-    expect(bind(replacement({ kv: { delayedAffine: "all" } }), true).plan(request, options, schedule))
+    expect(bind(replacement({ kv: { delayedAffine: "all" } }, kv), true).plan(request, {}, schedule))
       .toMatchObject({ method: "speculative", mechanism: "continuous" });
   });
 
   test("a verifier that does not qualify a request shape leaves it ordinary", () => {
-    const specs: [keyof GraphCapabilities["speculation"], Record<string, unknown>, GenerateOptions][] = [
+    const specs: [keyof GraphCapabilities["speculation"], Record<string, unknown>, KvOptions][] = [
       ["logprobs", { wantsLogprobs: true }, {}],
-      ["turboKv", { turboQuant: true }, { turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: 0 }],
+      ["turboKv", {}, { turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: 0 }],
     ];
-    for (const [flag, extra, options] of specs) {
-      const request = { ...shape, hasDraft: true, ...extra };
-      expect(bind(replacement(), true).plan(request, options, schedule), `${flag} qualified`).toMatchObject({ method: "speculative" });
-      const unqualified = bind(replacement({ speculation: { [flag]: false } }), true).plan(request, options, schedule);
+    for (const [flag, extra, kv] of specs) {
+      const request = { ...shape, hasDraft: true, ...extra }, options: GenerateOptions = {};
+      expect(bind(replacement({}, composed(kv)), true).plan(request, options, schedule), `${flag} qualified`).toMatchObject({ method: "speculative" });
+      const unqualified = bind(replacement({ speculation: { [flag]: false } }, composed(kv)), true).plan(request, options, schedule);
       expect(unqualified, `${flag} unqualified`).toMatchObject({ method: "autoregressive" });
       expect(unqualified.reasons).toContain("draft-incompatible-with-request");
     }

@@ -66,21 +66,22 @@ function generic(id: string, create: GraphEntry<Weights, RuntimeModel>["create"]
  * spreads in). */
 export const MLX_GRAPH_TABLES: Readonly<Record<ModelGraph, GraphTable<Weights, RuntimeModel>>> = Object.freeze({
   "diffusion-gemma": new GraphTable([generic("diffusion-gemma", (weights, config) => new DiffusionGemmaModel(weights, config))]),
-  "minicpm5": new GraphTable([generic("minicpm5", (weights, config) => new MiniCPM5Model(weights, config))]),
+  "minicpm5": new GraphTable([generic("minicpm5", (weights, config, composition) => new MiniCPM5Model(weights, config, composition))]),
   // Our published Trellis quant has its purpose-built graphs, keyed by its graph fingerprint
   // (architecture plus the complete quantization table).
   "qwen3.5": new GraphTable([
     { id: QWEN38_TRELLIS_M4PRO_GRAPH, serves: QWEN38_TRELLIS_M4PRO_COMPOSITION,
       create: (weights, config, composition) => new Qwen38TrellisM4Pro(weights, config, composition) },
-    { id: QWEN38_TRELLIS_TQ_GRAPH, serves: QWEN38_TRELLIS_TQ_COMPOSITION, create: (weights, config) => new Qwen38TrellisTQ(weights, config) },
-    generic("qwen3.5", (weights, config) => new Qwen35Model(weights, config)),
+    { id: QWEN38_TRELLIS_TQ_GRAPH, serves: QWEN38_TRELLIS_TQ_COMPOSITION,
+      create: (weights, config, composition) => new Qwen38TrellisTQ(weights, config, composition) },
+    generic("qwen3.5", (weights, config, composition) => new Qwen35Model(weights, config, composition)),
   ], qwen38TrellisTqFingerprint),
-  "qwen3-moe": new GraphTable([generic("qwen3-moe", (weights, config) => new Qwen3MoeModel(weights, config))]),
-  "qwen3": new GraphTable([generic("qwen3", (weights, config) => new Qwen3Model(weights, config))]),
-  "gemma4": new GraphTable([...GENERATED_GRAPHS, generic("gemma4", (weights, config) => new Gemma4Model(weights, config))],
+  "qwen3-moe": new GraphTable([generic("qwen3-moe", (weights, config, composition) => new Qwen3MoeModel(weights, config, composition))]),
+  "qwen3": new GraphTable([generic("qwen3", (weights, config, composition) => new Qwen3Model(weights, config, composition))]),
+  "gemma4": new GraphTable([...GENERATED_GRAPHS, generic("gemma4", (weights, config, composition) => new Gemma4Model(weights, config, composition))],
     configFingerprint),
-  "universal-dense": new GraphTable([generic("universal-dense", (weights, config) =>
-    new UniversalDenseModel(weights, config, genericArgsFor(config)!))]),
+  "universal-dense": new GraphTable([generic("universal-dense", (weights, config, composition) =>
+    new UniversalDenseModel(weights, config, composition, genericArgsFor(config)!))]),
 });
 
 /** A resident family's native construction: its graph table selects the graph for

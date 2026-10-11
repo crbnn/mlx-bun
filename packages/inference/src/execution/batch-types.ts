@@ -4,6 +4,7 @@ import type { ExecutionContext } from "../contracts/portable/scheduling";
 import { type RuntimeConfig } from "../runtime/config";
 import type { PromptResponseTrace } from "../runtime/trace";
 import type { GrammarController } from "../sampling/grammar";
+import type { KvMaintenance } from "../contracts/mlx/cache";
 import type { KvScheme } from "../state/kv-scheme";
 import type { MlxRequestStatePolicy } from "../state/request-policy";
 import type { OrdinaryContinuation } from "./continuation-types";
@@ -41,6 +42,9 @@ export interface MlxGroupMethodHost {
   readonly runtime: RuntimeConfig;
   readonly prefillChunkSize: number;
   readonly promptCache: RowPromptCache | undefined;
+  /** The row-layout maintenance of the composition's KV scheme (where a row's
+   * composed caches join row layouts); absent under bf16. */
+  readonly kvMaintenance: KvMaintenance | undefined;
   join(row: Row): void;
   filterRows(keep: number[]): void;
   publish(row: Row, token: number, logprobs?: import("../generation/index").TokenLogprobs): Promise<void | boolean>;
@@ -222,9 +226,10 @@ export interface MlxBatchExecutionGroupOptions {
    *  evict. A request that can NEVER fit (over budget alone, empty batch)
    *  is rejected instead of deadlocking. Unset = unlimited (v1 behavior). */
   kvBudgetBytes?: number;
-  /** Authoritative server-wide scheme. Each joiner's solo prefill converts at
-   * the same chunk boundaries as the serial path, so a row's quantized bytes
-   * preserve the L2 composition. Unsupported schemes fail at construction. */
+  /** The composition's KV scheme, which the graph's caches compose. Each
+   * joiner's solo prefill converts inside its own legos at the same chunk
+   * boundaries as the serial path, so a row's quantized bytes preserve the L2
+   * composition. Unsupported schemes fail at construction. */
   kvScheme?: KvScheme;
   /** Model binding owns support for precision transitions. */
   kvBatchCapabilities?: { delayedAffine?: boolean };

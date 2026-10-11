@@ -57,7 +57,9 @@ describe.skipIf(nativeMissing)("media preparation routes", () => {
     const { Qwen38TrellisTQ } = await import("@mlx-bun/inference/models/qwen38-27b-trellis-tq");
     const { Gemma4Model } = await import("@mlx-bun/inference/models/gemma4");
     const { Qwen3Model } = await import("@mlx-bun/inference/models/qwen3");
-    const bind = (prototype: object) => media.bindMediaPreparation(source(), Object.create(prototype));
+    // Stand-ins built without weights carry the composition facts a graph declares from.
+    const bind = (prototype: object) => media.bindMediaPreparation(source(),
+      Object.assign(Object.create(prototype), { composition: { kv: { kind: "bf16" }, speculativeAffineKv: true, packedMixedMlp: true } }));
     const unreachable = user(image("http://127.0.0.1:9/never-fetched.png"));
 
     const diffusion = await bind(DiffusionGemmaModel.prototype);

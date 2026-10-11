@@ -182,7 +182,7 @@ async function runEntry(entry: "createModel" | "Gemma4Model", steps: number) {
   await checkTokenizer(inputs!.model, manifest);
   const ffi = await import("@mlx-bun/mlx/ffi");
   checkRuntime(manifest, { mlxVersion: ffi.MLX_VERSION, architecture: ffi.deviceArchitecture() });
-  const { loadModelConfig, Weights, createModel } = await import("@mlx-bun/inference");
+  const { loadModelConfig, Weights, createModel, resolveComposition } = await import("@mlx-bun/inference");
   const { Gemma4Model } = await import("@mlx-bun/inference/models/gemma4");
   const { argmaxLastPosition, lastPositionLogits } = await import("@mlx-bun/inference/scoring");
   const { KVCache } = await import("../../src/state/kv");
@@ -196,7 +196,7 @@ async function runEntry(entry: "createModel" | "Gemma4Model", steps: number) {
   const greedy: number[] = [];
   let vectorsCompared = 0;
   try {
-    model = entry === "createModel" ? createModel(weights, config) as InstanceType<typeof Gemma4Model> : new Gemma4Model(weights, config);
+    model = entry === "createModel" ? createModel(weights, config) as InstanceType<typeof Gemma4Model> : new Gemma4Model(weights, config, resolveComposition(config));
     expect(model.constructor).toBe(Gemma4Model);
     const layers = model.makeCache();
     caches = layers;

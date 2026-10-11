@@ -110,7 +110,7 @@ test("serving parses main's TurboQuant spec into the cache scheme, through the i
   // Cache services resolve it as main's standalone scheme: TurboQuant from decode start.
   const { cache } = parse("--kv-quant", "turbo:k5v4");
   expect(resolveKvScheme({ override: cache.kvQuant, turboQuant: cache.turboQuant, quantizedKvStart: cache.quantizedKvStart })
-    .generationOptions).toEqual({ turboQuant: { kBits: 5, vBits: 4 }, quantizedKvStart: 0 });
+    .storage).toEqual({ kind: "turbo", kBits: 5, vBits: 4 });
   // An isolated worker receives the parent's resolved options as its launch record.
   expect((decodeLaunch(encodeLaunch({ ...parse("--isolate", "--kv-quant", "turbo:k4v3"), isolate: false })) as ServeOptions).cache)
     .toMatchObject({ turboQuant: { kBits: 4, vBits: 3 } });
@@ -120,7 +120,7 @@ test("serving parses main's TurboQuant spec into the cache scheme, through the i
     expect(() => parse("--kv-quant", spec)).toThrow(message);
   // Paging keeps refusing TurboQuant at startup.
   const paged = parse("--paged-kv", "--kv-quant", "turbo");
-  expect(() => validatePagedServingOptions(paged.request.pagedKv, resolveKvScheme({ turboQuant: paged.cache.turboQuant }).generationOptions, false))
+  expect(() => validatePagedServingOptions(paged.request.pagedKv, resolveKvScheme({ turboQuant: paged.cache.turboQuant }).storage, false))
     .toThrow("per-layer and TurboQuant pages are not implemented");
 });
 
@@ -562,7 +562,7 @@ test("startup wires the memory budget, runtime context, allocator limit, expert 
     const context = { modelId: "test", model: { config, weightsBytes: 2e9 }, memoryPlan: null, tokenizer: {},
       template: { supportsThinking: false }, genDefaults: {}, dispose() { events.push("model close"); },
       adapters: { async mount(id, dir) { events.push("mount " + id + " " + dir); if (mountFails) throw new Error("adapter_config.json missing"); return { id, mountedLayers: 3 }; } } };
-    const cache = { promptCache: { totalBytes: 0 }, resolvedKvScheme: { mode: "off", fitOptions: undefined }, kvScheme: {}, stateCodecs: {},
+    const cache = { promptCache: { totalBytes: 0 }, resolvedKvScheme: { mode: "off", fitOptions: undefined, storage: { kind: "bf16" } }, stateCodecs: {},
       adapterNamespace() {}, checkpoints: null, continuationServices: {},
       stopIdleDemotion() {}, async close() { return { durable: true }; } };
     const expected = fit(config, 2e9, 1, undefined, undefined, 0, 8e9, undefined).maxSafeContext;
@@ -600,12 +600,13 @@ test("startup wires the memory budget, runtime context, allocator limit, expert 
     assert.deepEqual(events, ["offload /unused", "activate /offload", "load wire=1 media=1", "mount my-lora /unused/adapters/my-lora", "allocator 8000000000"]);
     assert.equal(defaultAdapter, "my-lora");
     assert.deepEqual(loadOptions, { memoryBudgetBytes: 8e9, runtime: { batchSize: 2, maxGenerationTokens: 128, memoryBudgetBytes: 8e9, contextTokens: 4096, nativeDraft: false },
-      kv: { override: "off" }, adapters: true, maxRows: 2, draftKind: "ngram", numDraftTokens: 4, ngramMax: 5, ngramMin: 2 });
+      kv: { override: "off", fusedSdpa: true }, adapters: true, maxRows: 2, draftKind: "ngram", numDraftTokens: 4, ngramMax: 5, ngramMin: 2 });
     assert.equal(cacheOptions.allocatorLimitBytes, 8e9);
     assert.equal(statusBudget, 8e9);
     assert.equal(contextLimit, expected);
     await running.close();
-    assert.deepEqual(routes, ["load:0", "binding:0", "cache:0", "engine:0", "close:0"]);
+    // --fused-sdpa composes with the KV flags at load; no seam writes the process flag.
+    assert.deepEqual(routes, ["load:undefined", "binding:undefined", "cache:undefined", "engine:undefined", "close:undefined"]);
     assert.equal(runtimeValue("MLX_BUN_NO_FUSED_SDPA"), undefined);
     // Process settings restore only after the engine released the model.
     assert.deepEqual(events.slice(5), ["model close", "restore offload", "allocator 77"]);
@@ -616,7 +617,8 @@ test("startup wires the memory budget, runtime context, allocator limit, expert 
     events.length = 0; mountFails = true; routes.length = 0; options.fusedSdpa = false; options.cache.kvQuant = "config";
     await assert.rejects(startModelServer({ path: "/unused", repoId: "test", expertsBytes: 0 }, options), /adapter mount failed: adapter_config.json missing/);
     assert.deepEqual(events, ["load wire=1 media=1", "mount my-lora /unused/adapters/my-lora", "model close"]);
-    assert.deepEqual(routes, ["load:1"]);
+    assert.deepEqual(routes, ["load:undefined"]);
+    assert.deepEqual(loadOptions.kv, { override: "config", fusedSdpa: false });
     assert.equal(runtimeValue("MLX_BUN_NO_FUSED_SDPA"), undefined);
     mountFails = false; options.cache.kvQuant = "off";
     events.length = 0;
@@ -746,7 +748,7 @@ test("paged KV follows main's flag and env mirror, with the block size only alon
 test("paged startup validates the resolved KV codec and loaded draft, preserving explicit overrides", () => {
   const config = [{ layerIdx: 0, bits: 4, groupSize: 64 }];
   const validate = (input: Parameters<typeof resolveKvScheme>[0], hasDraft = false, paged = true) =>
-    validatePagedServingOptions(paged ? {} : undefined, resolveKvScheme(input).generationOptions, hasDraft);
+    validatePagedServingOptions(paged ? {} : undefined, resolveKvScheme(input).storage, hasDraft);
   for (const override of ["off", 4, 8] as const)
     expect(() => validate({ override, config })).not.toThrow();
   // Config mode without a sidecar resolves to bf16, just as on main.
@@ -774,7 +776,7 @@ test("incompatible paged startup closes caches and the loaded model before engin
     mock.module(app + "src/engine/index.ts", () => ({
       loadContext: async () => context,
       modelServingBinding: async () => ({ gateway: { configureContinuation() { events.push("continuation"); } } }),
-      createCacheServices: async () => ({ resolvedKvScheme: scheme, kvScheme: scheme.generationOptions,
+      createCacheServices: async () => ({ resolvedKvScheme: scheme,
         async close() { events.push("cache close"); return { durable: true }; } }),
       createAppEngine: async () => { events.push("engine"); throw new Error("must not construct engine"); },
     }));
@@ -810,7 +812,7 @@ test("startup composes the lazy Whisper companion with the parsed policy, shares
     let found = null, discovery, listenerInput, drain;
     const context = { modelId: "test", model: { config: { text: { maxPositionEmbeddings: 4096 } }, weightsBytes: 1e9 }, memoryPlan: null, tokenizer: {},
       template: { supportsThinking: false }, genDefaults: {}, dispose() { events.push("model close"); } };
-    const cache = { promptCache: { totalBytes: 0 }, resolvedKvScheme: { mode: "off", fitOptions: undefined }, kvScheme: {}, stateCodecs: {},
+    const cache = { promptCache: { totalBytes: 0 }, resolvedKvScheme: { mode: "off", fitOptions: undefined, storage: { kind: "bf16" } }, stateCodecs: {},
       adapterNamespace() {}, checkpoints: null, continuationServices: {}, stopIdleDemotion() {}, async close() { return { durable: true }; } };
     // Every decode pauses the resident models, which is each engine's execution lease.
     const gateway = { activeRows: 0, kvBytes: { projected: 0, budget: null }, async acquireExecutionLease(signal) { events.push("lock"); signal?.throwIfAborted(); return { dispose() {} }; } };

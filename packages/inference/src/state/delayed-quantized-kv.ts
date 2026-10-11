@@ -35,25 +35,32 @@ function settleAffineRows(rows: Cache[], groupSize: number, bits: number, start:
  * their packed planes use the existing batched attention implementation. When
  * a row converts is described on `TransitioningKvRows`. The reads are the
  * graph's call today: this layout's mask before the append, then its attention
- * view. Converted rows and the packed layout attend with `kernelSet`, taken
- * when the layout is built; the rows a cohort extracts carry it into the
- * layouts they join. */
+ * view. Converted rows, the packed layout and every view attend with
+ * `kernelSet`, taken when the layout is built. A row this layout hands back
+ * to serial use is the lego it came from again (`compose`), or its storage when
+ * it came as storage. */
 export class DelayedQuantizedKVCache extends FullTransitioningKvRows<BatchedQuantizedKVCache> implements KvAttentionState, CommittedAttentionCache {
   constructor(readonly groupSize: number, readonly bits: number, readonly start: number,
-    /** The affine kernel set converted rows attend with, named by the
-     * composition (`unfusedAffineKernels`, `tiledCausalAffineKernels`). */
-    readonly kernelSet: AffineKernelSet, row?: Cache) {
+    /** The affine kernel set converted rows and every read attend with, named
+     * by the composition (`composedAffineKernels`). */
+    readonly kernelSet: AffineKernelSet, row?: Cache,
+    /** How the lego these rows came from composes the rows this layout hands
+     * back to serial use (`ComposedStorage.over`). */
+    readonly compose?: (storage: Cache) => Cache) {
     super({ signature: `kv:delayed-quant:${bits}:${groupSize}:${start}`, conversionOffset: start,
       settle: rows => settleAffineRows(rows, groupSize, bits, start, kernelSet),
       keepsDenseReads: row => { const source = affineSource(row); return !source || !transitionDue(source.offset, start); },
       converted: row => row instanceof QuantizedKVCache,
-      makeLayout: () => new BatchedQuantizedKVCache(groupSize, bits, kernelSet(bits, groupSize, Dtype.bfloat16)) }, row);
+      makeLayout: () => new BatchedQuantizedKVCache(groupSize, bits, kernelSet(bits, groupSize, Dtype.bfloat16)),
+      ...(compose ? { compose } : {}) }, row);
   }
   get attentionState(): KvAttentionState { return this; }
   captureDonorAttention() {
     return this.packed?.captureDonorAttention() ?? captureFullKvDonorAttention(this.rows, this.leftPad, this.offset);
   }
-  makeEmptyBatch(): DelayedQuantizedKVCache { return new DelayedQuantizedKVCache(this.groupSize, this.bits, this.start, this.kernelSet); }
+  makeEmptyBatch(): DelayedQuantizedKVCache {
+    return new DelayedQuantizedKVCache(this.groupSize, this.bits, this.start, this.kernelSet, undefined, this.compose);
+  }
 
   appendDecode(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v, false); }
   appendWindow(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v, false); }
@@ -86,7 +93,8 @@ export class DelayedQuantizedKVCache extends FullTransitioningKvRows<BatchedQuan
   }
   appendAndFetch(k: MlxArray, v: MlxArray): KvAttentionView {
     this.advance();
-    if (this.packed) return captureKvAttention(this.packed, k, v);
+    const kernels = this.kernelSet(this.bits, this.groupSize, k.dtype);
+    if (this.packed) return captureKvAttention(this.packed, k, v, kernels);
     if (this.rows.every(row => !row.quantizedAttention)) {
       const [keys, values] = this.#appendPlain(k, v);
       return { attend: (q, scale, mask) => ops.sdpa(q, keys, values, scale, mask.mode, mask.arr),
@@ -98,7 +106,7 @@ export class DelayedQuantizedKVCache extends FullTransitioningKvRows<BatchedQuan
       for (const [row, cache] of this.rows.entries()) {
         const slice = (a: MlxArray) => a.slice([row, 0, 0, 0], [row + 1, a.shape[1]!, a.shape[2]!, a.shape[3]!]);
         using kr = slice(k), vr = slice(v);
-        views.push(captureKvAttention(cache, kr, vr));
+        views.push(captureKvAttention(cache, kr, vr, kernels));
       }
       this.syncPositions(true);
     } catch (error) { for (const view of views) view.dispose(); throw error; }

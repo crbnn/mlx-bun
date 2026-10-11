@@ -7,7 +7,7 @@ import { runtimeConfig, type RuntimeConfig } from "../../runtime/config";
 import { bindMlxGraph, type MlxTokenGraph } from "../../models/graph";
 import type { PrefillPolicy } from "../../contracts/portable/prefill";
 import { resolveMlxPrefillPolicy } from "./prefill-policy";
-import type { KvSchemeOptions } from "../../state/kv-scheme";
+import type { KvStorageScheme } from "../../contracts/portable/composition";
 
 export type { MlxModelMemory, MlxTokenAppend };
 
@@ -21,16 +21,18 @@ export interface MlxDecodeStep {
   close(): void | Promise<void>;
 }
 
-/** The model declares which codecs retain its committed-span arithmetic. */
+/** The model declares which codecs retain its committed-span arithmetic; `kv`
+ * is the composition's KV scheme, which its caches store. */
 export function supportsCommittedAppendCache(
   append: Pick<MlxTokenAppend, "affineKvBits" | "turboQuantFormats"> | null | undefined,
-  options: Pick<KvSchemeOptions, "kvBits" | "kvConfig" | "turboQuant">,
+  kv: KvStorageScheme,
 ): boolean {
-  if (options.turboQuant) return !!append?.turboQuantFormats?.some(format =>
-    format.kBits === options.turboQuant!.kBits && format.vBits === options.turboQuant!.vBits);
-  return options.kvConfig?.length
-    ? options.kvConfig.every(layer => append?.affineKvBits?.includes(layer.bits))
-    : !options.kvBits || !!append?.affineKvBits?.includes(options.kvBits);
+  switch (kv.kind) {
+    case "bf16": return true;
+    case "turbo": return !!append?.turboQuantFormats?.some(format => format.kBits === kv.kBits && format.vBits === kv.vBits);
+    case "affine-layers": return kv.layers.every(layer => append?.affineKvBits?.includes(layer.bits));
+    case "affine": return !!append?.affineKvBits?.includes(kv.bits);
+  }
 }
 
 /** One replaceable binding owns all graph-specific operations used by the AR
@@ -44,6 +46,8 @@ export interface MlxAutoregressiveBinding {
   readonly eosTokenIds: readonly number[];
   readonly memory: MlxModelMemory;
   readonly adapters?: { active: string[] };
+  /** The composition's KV scheme, which `makeCache` composes; absent: bf16. */
+  readonly kv?: KvStorageScheme;
   makeCache(): Cache[];
   forwardEmbeddings?(
     embeddings: MlxArray, state: Cache[], imageMask: MlxArray | null,
@@ -70,6 +74,7 @@ export function bindMlxAutoregressiveGraph(model: MlxTokenGraph): MlxAutoregress
     eosTokenIds: model.config.eosTokenIds,
     memory: model,
     adapters: model.loraState,
+    ...(model.composition ? { kv: model.composition.kv } : {}),
     makeCache: model.makeCache.bind(model),
     forwardEmbeddings: model.forwardEmbeddings?.bind(model),
     createAppend: model.createAppend?.bind(model),

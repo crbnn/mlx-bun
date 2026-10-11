@@ -23,7 +23,11 @@
 // vision prefill, the phase operations against the oracle's deprecated forward,
 // the compiled decode step (e4b whole-graph, 12B segmented; the 26B declares
 // none) and the assistant drafter's donor read. Under kv_config the oracle's
-// unrolled path must have run. No model, no download.
+// unrolled path must have run. Since E3 both graphs are built for the bf16
+// composition and the test converts their plain caches itself, in the
+// convert-after order the bf16-first legos keep inside their appends, reading
+// with the kernel set the flag names; the flag itself now steers only the
+// oracle's frozen dispatch (quantized-sdpa-reference.ts). No model, no download.
 import { afterAll, describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { readdirSync } from "node:fs";
@@ -33,13 +37,15 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { loadModelConfig, parseQuantization, type ModelConfig } from "../../src/artifacts/config";
 import type { Weights } from "../../src/artifacts/weights";
 import type { BatchableCache, Cache } from "../../src/contracts/mlx/cache";
+import type { Composition as CompositionRecord } from "../../src/contracts/portable/composition";
 import type { MlxCompiledDecodeStep, MlxLayerCapture } from "../../src/contracts/mlx/graph";
 import type { Gemma4Model } from "../../src/models/gemma4/model";
 import type { TokenGroup } from "../../src/contracts/mlx/token-work";
 import { createRuntimeConfig, runtimeConfig, withRuntimeConfig } from "../../src/runtime/config";
-import { createKvMaintenance } from "../../src/state/kv-maintenance";
+import { composedAffineKernels, type AffineKernelSet } from "../../src/state/affine-attention";
+import { convertToAffine, transitionDue } from "../../src/state/bf16-first-kv";
 import { targetCacheLayout } from "../../src/state/layout";
-import { servedAffineKernels } from "../../src/state/served-affine-kernels";
+import { testComposition } from "./test-composition";
 import { CompiledDecode } from "../../src/models/gemma4/compiled-decode";
 import * as current12b from "../../src/models/gemma4/generated/gemma4-12b";
 import * as current26b from "../../src/models/gemma4/generated/gemma4-26b";
@@ -63,8 +69,9 @@ type Graph = OracleGraph | CurrentGraph;
 interface Composition {
   readonly stem: string;
   readonly repo: string;
-  readonly oracle: { readonly GeneratedGemma4: new (weights: Weights, config: ModelConfig) => OracleGraph; readonly generatedForwardUses: number };
-  readonly current: { readonly GeneratedGemma4: new (weights: Weights, config: ModelConfig) => CurrentGraph };
+  readonly oracle: { readonly GeneratedGemma4: new (weights: Weights, config: ModelConfig, composition: CompositionRecord) => OracleGraph;
+    readonly generatedForwardUses: number };
+  readonly current: { readonly GeneratedGemma4: new (weights: Weights, config: ModelConfig, composition: CompositionRecord) => CurrentGraph };
 }
 const COMPOSITIONS: readonly Composition[] = [
   { stem: "gemma4-e4b", repo: "gemma-4-e4b-it-OptiQ-4bit", oracle: oracleE4b, current: currentE4b },
@@ -257,7 +264,9 @@ async function pair(c: Composition): Promise<Pair> {
   if (!found) {
     const real = await fixtureConfig(c.repo);
     const { weights, config } = artifact(real, 100 * (COMPOSITIONS.indexOf(c) + 1));
-    found = { c, config, old: new c.oracle.GeneratedGemma4(weights, config), current: new c.current.GeneratedGemma4(weights, config) };
+    // Both built for the bf16 composition, so each makeCache holds plain caches the test converts after the first forward.
+    found = { c, config, old: new c.oracle.GeneratedGemma4(weights, config, testComposition()),
+      current: new c.current.GeneratedGemma4(weights, config, testComposition()) };
     pairs.set(c.stem, found);
   }
   return found;
@@ -269,23 +278,32 @@ const SCHEMES: Scheme[] = [
   { name: "kv_config flag=unset", kvConfig: true, flag: undefined },
   { name: "kv_config flag=1", kvConfig: true, flag: "1" },
 ];
+/** The flag as the oracle reads it (its frozen dispatch, `quantized-sdpa-reference.ts`); the current
+ * graph reads through its caches, whose kernels the test composes from the same flag (`flagKernels`). */
 const withFlag = <T>(flag: string | undefined, run: () => T): T =>
   withRuntimeConfig(createRuntimeConfig({ ...runtimeConfig().values, MLX_BUN_NO_FUSED_SDPA: flag }), run);
+/** The affine read kernels the flag named before E3: unset, the tiled-causal set (`--fused-sdpa on`); 1, unfused. */
+const flagKernels = (flag: string | undefined): AffineKernelSet => composedAffineKernels(flag === "1" ? "unfused" : "tiled-causal");
 
-/** Convert after a forward, as the served path does (quantized_kv_start 0). */
+/** Convert after a forward, as the served path did before E3 (quantized_kv_start 0; the bf16-first legos keep
+ *  this order inside their appends): every plain cache the kv_config lists converts, reading with the flag's kernels. */
 function convert(p: Pair, scheme: Scheme, ...sets: Cache[][]): void {
   if (!scheme.kvConfig) return;
-  const maintain = createKvMaintenance({ kvConfig: p.config.kvQuant!, quantizedKvStart: 0 });
-  for (const caches of sets) maintain(caches);
+  for (const caches of sets) caches.forEach((cache, layer) => {
+    const entry = p.config.kvQuant!.find(item => item.layerIdx === layer);
+    if (entry && transitionDue(cache.offset, 0))
+      caches[layer] = convertToAffine(cache as unknown as { offset: number; toQuantized(g: number, b: number, k: AffineKernelSet): Cache },
+        entry.groupSize, entry.bits, 0, flagKernels(scheme.flag));
+  });
 }
 
-/** Caches converted to the kv_config before any forward (the parity test's serve scenario). */
-function preconverted(p: Pair, model: Graph): Cache[] {
+/** Caches converted to the kv_config before any forward (the parity test's serve scenario), reading with the flag's kernels. */
+function preconverted(p: Pair, model: Graph, flag: string | undefined): Cache[] {
   const caches = model.makeCache();
   for (let layer = 0; layer < caches.length; layer++) {
     const entry = p.config.kvQuant!.find(item => item.layerIdx === layer);
-    if (entry) caches[layer] = (caches[layer] as unknown as { toQuantized(g: number, b: number, k: unknown): Cache })
-      .toQuantized(entry.groupSize, entry.bits, servedAffineKernels());
+    if (entry) caches[layer] = (caches[layer] as unknown as { toQuantized(g: number, b: number, k: AffineKernelSet): Cache })
+      .toQuantized(entry.groupSize, entry.bits, flagKernels(flag));
   }
   return caches;
 }
@@ -588,8 +606,8 @@ for (const c of COMPOSITIONS) {
         const p = await pair(c);
         const tag = `${c.stem} preconverted flag=${flag ?? "unset"}`;
         withFlag(flag, () => expectOraclePath(p, { name: "", kvConfig: true, flag }, () => {
-          const oldCaches = preconverted(p, p.old), newCaches = preconverted(p, p.current);
-          const oldPair = preconverted(p, p.old), newPair = preconverted(p, p.current);
+          const oldCaches = preconverted(p, p.old, flag), newCaches = preconverted(p, p.current, flag);
+          const oldPair = preconverted(p, p.old, flag), newPair = preconverted(p, p.current, flag);
           try {
             const before = p.c.oracle.generatedForwardUses;
             both(`${tag} prefill37`, p, oldCaches, newCaches, forwardHidden([prompt(37, 31)]));

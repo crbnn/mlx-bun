@@ -22,7 +22,7 @@ if (![6, 7, 8, 9, 10, 11, 12].includes(baselineVariant)) throw new Error("baseli
 test.skipIf(!artifact)("shared-M kernels preserve full Qwen logits, recurrent state and KV continuation", async () => {
   const { loadModelConfig } = await import("@mlx-bun/inference/artifacts");
   const { Weights } = await import("@mlx-bun/inference/artifacts");
-  const { Qwen35Model } = await import("@mlx-bun/inference/models/qwen3_5");
+  const { Qwen35Model } = await import("@mlx-bun/inference/models/qwen3_5"), { resolveComposition } = await import("@mlx-bun/inference");
   const { TrellisLinear, compiledSwiglu, fusedGateUpEligible } = await import("@mlx-bun/inference/layers");
   const kernels = await import("@mlx-bun/inference/kernels/trellis");
   const { cloneKvCaches } = await import("@mlx-bun/inference/state");
@@ -77,7 +77,7 @@ test.skipIf(!artifact)("shared-M kernels preserve full Qwen logits, recurrent st
 
   const weights = await Weights.open(artifact!);
   const config = await loadModelConfig(artifact!);
-  const model = new Qwen35Model(weights, config);
+  const model = new Qwen35Model(weights, config, resolveComposition(config));
   const loaded = model.layers.map((layer) => layer.mlp);
   const installed = new Map<number, ReturnType<typeof variantMlp>[]>();
   const install = (variant: number) => {

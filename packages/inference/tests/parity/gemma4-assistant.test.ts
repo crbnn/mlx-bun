@@ -73,7 +73,7 @@ test.skipIf(!inputs)("Gemma4 assistant: donor attention and draft chains equal i
   const { cloneKvCaches } = await import("../../src/state/persistence");
   const { readAssistantDonors } = await import("../../src/models/gemma4/assistant-target");
   const assistant = await import("../../src/models/gemma4/assistant");
-  const { quantizedSdpa } = await import("../../src/layers/quantized-attention");
+  const { quantizedSdpa } = await import("../models/quantized-sdpa-reference");
   const { unfusedAffineKernels } = await import("../../src/state/affine-attention");
   type Triple = Ops.QuantizedTensor;
   type Rows = MlxArray | Triple;
@@ -386,7 +386,7 @@ test.skipIf(!inputs)("Gemma4 assistant: shared generation accepts, rejects and c
     const binding = bindMlxGateway(model, { provider, numDraftTokens: depth });
     assert(binding.runtime.flag("MLX_BUN_PREFILL_TAIL_SPLIT", true), "this consumer requires default tail-split prefill");
     const plan = binding.plan({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
-      kvQuant: false, turboQuant: false, hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true }, options,
+      hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true }, options,
     { continuous: true, quantizedBatch: false, checkpoints: false });
     assert.equal(plan.mechanism, "continuous"); assert.equal(plan.method, "speculative");
     const method = binding.methodRequest!(plan, options);

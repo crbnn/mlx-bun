@@ -6,11 +6,11 @@ import { UnsupportedExecutionError } from "../../src/engine/completion";
 import { runtimeConfig } from "@mlx-bun/inference/runtime/config";
 import type { MlxGatewayBinding, MlxBatchGroup, RowPromptCache } from "@mlx-bun/inference/execution";
 import type { GenerateOptions } from "@mlx-bun/inference/generation";
-import type { ResolvedExecution } from "@mlx-bun/inference/contracts/portable";
+import type { KvStorageScheme, ResolvedExecution } from "@mlx-bun/inference/contracts/portable";
 import type { DeviceStepSampler, DeviceStepSamplerConfig } from "@mlx-bun/inference/sampling";
 
 const shape = (): RequestShape => ({ hasVision: false, hasAdapters: false,
-  hasRepetitionPenalty: false, userSeed: false, kvQuant: false, turboQuant: false,
+  hasRepetitionPenalty: false, userSeed: false,
   hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false });
 const execution: ResolvedExecution = { method: "autoregressive", mechanism: "continuous",
   pagedKv: false, promptCache: true, checkpoint: false, fill: false,
@@ -24,7 +24,7 @@ function fake(options: { submit?: MlxBatchGroup["submit"]; plan?: MlxGatewayBind
     submit: options.submit ?? (async request => { await request.onToken(7); return result; }),
   };
   const binding = { config: { modelType: "replacement", eosTokenIds: [2] } as MlxGatewayBinding["config"], runtime: runtimeConfig(), capabilities: declareGraph(),
-    plan: options.plan ?? (() => execution), cachesBatchable: () => true, kvBatchable: () => true,
+    plan: options.plan ?? (() => execution), cachesBatchable: () => true, kvBatchable: () => true, composeState: caches => caches,
     continuationRequest(_execution, _options, _prompt, onToken) {
       if (options.failSetup) throw new Error("sampling setup failed");
       return { continuation: { interval: 1, restore: () => null, resumeSampling() {}, captureOwned() {}, complete() {} },
@@ -237,13 +237,23 @@ test.skipIf(process.env.MLX_BUN_GEMMA2_NATIVE !== "1")("Gemma2 admits plain KV, 
   const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
   const { KVCache } = await import("@mlx-bun/inference/state");
   const { resolveKvScheme } = await import("@mlx-bun/inference/state/kv-scheme");
-  const model = Object.assign(Object.create(UniversalDenseModel.prototype), {
+  /** The graph composed with `kv`, the scheme every request it serves stores (bf16 unless named). */
+  const graph = (kv: KvStorageScheme = { kind: "bf16" }) => Object.assign(Object.create(UniversalDenseModel.prototype), {
     args: { modelType: "gemma2", maskArray: true, attnLogitSoftcap: 50, layerTypes: null }, encodedKvAttention: false,
     // The text facts KV scheme policy reads; this one-layer graph uses full attention.
     config: { modelType: "gemma2", text: { enableMoeBlock: false, numHiddenLayers: 1, layerTypes: ["full_attention"] }, eosTokenIds: [] },
-    makeCache: () => [new KVCache()], loraState: { active: [] }, requiredDenseKvLayers: [0],
+    makeCache: () => [new KVCache()], loraState: { active: [] }, requiredDenseKvLayers: [0], composition: { kv },
   });
+  const model = graph();
   const binding = bindMlxGateway(model);
+  const AFFINE: KvStorageScheme = { kind: "affine", bits: 4, groupSize: 64, kernels: "unfused" };
+  const TURBO: KvStorageScheme = { kind: "turbo", kBits: 8, vBits: 3 };
+  // A gateway serving a composed scheme it was not configured to batch (no `kvScheme`) refuses its requests.
+  const unconfigured = (kv: KvStorageScheme) => {
+    const composed = bindMlxGateway(graph(kv));
+    composed.createBatchGroup = () => { throw new Error("unexpected execution"); };
+    return { binding: composed, gateway: new GenerationGateway(composed, 4) };
+  };
   let created = false;
   binding.createBatchGroup = () => { created = true; throw new Error("unexpected execution"); };
   const gateway = new GenerationGateway(binding, 4);
@@ -262,9 +272,16 @@ test.skipIf(process.env.MLX_BUN_GEMMA2_NATIVE !== "1")("Gemma2 admits plain KV, 
     expect(binding.bindAdapterContext).toBeFunction();
     // A draft no provider can serve is refused; logprobs and adapter requests
     // ignore a configured draft on this graph as on every other, as main did.
-    for (const request of [{ hasDraft: true }, { hasVision: true },
-      { kvQuant: true }, { turboQuant: true }, { hasGrammar: true, kvQuant: true }, { hasGrammar: true, hasVision: true }])
+    for (const request of [{ hasDraft: true }, { hasVision: true }, { hasGrammar: true, hasVision: true }])
       expect(() => gateway.place({ ...shape(), ...request })).toThrow(UnsupportedExecutionError);
+    for (const kv of [AFFINE, TURBO]) {
+      const { gateway: refusing } = unconfigured(kv);
+      try {
+        for (const request of [{}, { hasGrammar: true }])
+          expect(() => refusing.place({ ...shape(), ...request })).toThrow(UnsupportedExecutionError);
+        expect(() => refusing.place(shape(), { fill: { plan: { echo: null } } } as GenerateOptions)).toThrow(UnsupportedExecutionError);
+      } finally { await refusing.close(); }
+    }
     for (const request of [{ hasDraft: true, wantsLogprobs: true }, { hasAdapters: true, hasDraft: true }])
       expect(gateway.place({ ...shape(), ...request })).toMatchObject({ mechanism: "continuous", execution: { method: "autoregressive" } });
     expect(() => gateway.place({ ...shape(), hasAdapters: true }, { pagedKv: {} })).toThrow(UnsupportedExecutionError);
@@ -274,8 +291,7 @@ test.skipIf(process.env.MLX_BUN_GEMMA2_NATIVE !== "1")("Gemma2 admits plain KV, 
       execution: { method: "autoregressive", compiledDecode: false, fill: true, checkpoint: false } });
     expect(gateway.place({ ...shape(), hasAdapters: true }, { ...fill, adapters: ["upper"] })).toMatchObject({ mechanism: "continuous",
       execution: { method: "autoregressive", compiledDecode: false, fill: true, checkpoint: false } });
-    for (const request of [{ kvQuant: true }, { turboQuant: true }, { hasDraft: true }])
-      expect(() => gateway.place({ ...shape(), ...request }, fill)).toThrow(UnsupportedExecutionError);
+    expect(() => gateway.place({ ...shape(), hasDraft: true }, fill)).toThrow(UnsupportedExecutionError);
     // A served n-gram draft speculates on the shared scheduler; as in main,
     // logprobs and adapter requests ignore it, and a drafted request ignores fill.
     const { NgramProvider } = await import("@mlx-bun/inference/generation/speculative");
@@ -296,10 +312,11 @@ test.skipIf(process.env.MLX_BUN_GEMMA2_NATIVE !== "1")("Gemma2 admits plain KV, 
     } finally { await speculating.close(); }
     // Once the gateway certifies the scheme, affine and TurboQuant KV place
     // ordinarily; a scheme it did not certify stays refused.
-    for (const [request, options] of [[{ kvQuant: true }, { kvBits: 4 }], [{ turboQuant: true }, { turboQuant: { kBits: 8, vBits: 3 } }]] as const) {
-      expect(binding.plan({ ...shape(), ...request }, options, { continuous: true, quantizedBatch: true, checkpoints: true }))
+    for (const kv of [AFFINE, TURBO]) {
+      const composed = unconfigured(kv).binding;
+      expect(composed.plan(shape(), {}, { continuous: true, quantizedBatch: true, checkpoints: true }))
         .toMatchObject({ method: "autoregressive", mechanism: "continuous" });
-      expect(binding.plan({ ...shape(), ...request }, options, { continuous: true, quantizedBatch: false, checkpoints: true }).mechanism)
+      expect(composed.plan(shape(), {}, { continuous: true, quantizedBatch: false, checkpoints: true }).mechanism)
         .toBe("unsupported");
     }
     expect(created).toBe(false);
@@ -331,9 +348,16 @@ test.skipIf(process.env.MLX_BUN_GEMMA2_NATIVE !== "1")("Gemma2 places shared gen
     for (const [request, options] of [[{ hasGrammar: true }, {}], [{ wantsLogprobs: true }, {}], [{}, fill]] as const)
       expect(enabled!.place({ ...shape(), ...request }, options)).toMatchObject({ mechanism: "continuous",
         execution: { checkpoint: false } });
-    for (const request of [{ hasDraft: true }, { hasVision: true }, { kvQuant: true }, { turboQuant: true }])
+    for (const request of [{ hasDraft: true }, { hasVision: true }])
       expect(() => enabled!.place({ ...shape(), ...request })).toThrow(UnsupportedExecutionError);
     expect(() => enabled!.place(shape(), { pagedKv: {} })).toThrow(UnsupportedExecutionError);
+    // A composed KV scheme the gateway was not configured to batch stays refused, checkpoints or not.
+    for (const kv of [{ kind: "affine", bits: 4, groupSize: 64, kernels: "unfused" }, { kind: "turbo", kBits: 8, vBits: 3 }] as const) {
+      const composed = bindMlxGateway(Object.assign(Object.create(UniversalDenseModel.prototype), { ...model, composition: { kv } }));
+      composed.createBatchGroup = () => { throw new Error("unexpected execution"); };
+      const refusing = new GenerationGateway(composed, 4, { checkpoints: true });
+      try { expect(() => refusing.place(shape())).toThrow(UnsupportedExecutionError); } finally { await refusing.close(); }
+    }
   } finally { for (const gateway of gateways) await gateway.close(); }
 });
 

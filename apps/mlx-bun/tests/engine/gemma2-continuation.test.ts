@@ -69,7 +69,7 @@ test.skipIf(!native || !modelDir)("Gemma2 plain-KV generation checkpoints surviv
       const options = (): GenerateOptions => ({ maxTokens, prefillChunkSize: 512, eosTokenIds: [], seed: 42,
         seedWasExplicit: true, ...sampling });
       const requestShape: RequestShape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false,
-        userSeed: true, kvQuant: false, turboQuant: false, hasLogitsExtras: false, hasGrammar: false,
+        userSeed: true, hasLogitsExtras: false, hasGrammar: false,
         wantsLogprobs: false, hasDraft: false, ...shape };
       /** One serve lifetime over `dir`: cache services, continuation, engine, one request, close. */
       const serve = async (dir: string, interrupt: boolean) => {

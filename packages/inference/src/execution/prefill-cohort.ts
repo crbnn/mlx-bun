@@ -63,11 +63,9 @@ export class MlxPrefillCohort extends MlxPrefillRows<PrefillState> {
             mechanism: "continuous", promptTokens: row.promptTokens, cachedTokens: row.cachedTokens,
           });
           const closeSetup = row.req.trace?.begin("prefill.batch_setup", { mechanism: "continuous" });
+          // The graph's composed caches, or a stored prefix composed again by
+          // the prompt cache: either converts inside its own appends.
           owned ??= { caches: row.req.statePolicy?.create() ?? host.model.makeCache() }; closeSetup?.();
-          // The first forward must read maintained state. A stored prefix can
-          // still owe the conversion its final append reached, so maintain
-          // every opened cache here.
-          host.maintain?.(owned.caches);
           return { row, solo: owned.caches, pos: hit?.tokens.length ?? 0, retain: owned.retain, snapAt, closePrefill };
         } catch (error) {
           return cleanupFailure(error, () => disposeResources([...(owned?.caches ?? []),

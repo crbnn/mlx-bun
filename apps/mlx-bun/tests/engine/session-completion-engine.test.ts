@@ -10,7 +10,7 @@ const execution = { method: "autoregressive", mechanism: "continuous", pagedKv: 
   grammarJump: false, reasons: [] } as const;
 const shape: RequestShape = {
   hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
-  kvQuant: false, turboQuant: false, hasLogitsExtras: false, hasGrammar: false,
+  hasLogitsExtras: false, hasGrammar: false,
   wantsLogprobs: false, hasDraft: false,
 };
 const stats = (generatedTokens: number): GenerateStats => ({

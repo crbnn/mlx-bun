@@ -49,7 +49,7 @@ import { disposeAttachments } from "../../state/checkpoint";
 import { type CheckpointAttachment } from "../../contracts/mlx/checkpoint";
 import type { Cache } from "../../contracts/mlx/cache";
 import { withModelUsageFlush, withModelWiredLimit, type GenerateOptions, type GenerateStats } from "../index";
-import { createKvMaintenance } from "../../state/kv-maintenance";
+import { BF16_KV } from "../../contracts/portable/composition";
 import { runtimeConfig, withRuntimeConfig } from "../../runtime/config";
 import { draftSamplerOptions } from "./draft-policy";
 import { makeSampler, makeStepSampler } from "../../sampling/index";
@@ -121,7 +121,6 @@ async function specRunInner(
   services: SpecRunServices = {},
 ): Promise<GenerateStats> {
   const maxTokens = options.maxTokens ?? 512;
-  const maintainKv = createKvMaintenance(options);
   const eos = options.eosTokenIds ?? [...binding.eosTokenIds];
   const sampler = makeSampler(options);
   const stepSampler = makeStepSampler(options, {
@@ -208,9 +207,9 @@ async function specRunInner(
     if (!Number.isSafeInteger(prefillChunk) || prefillChunk < 1)
       throw new Error("speculative prefill chunk must be a positive integer");
     assertMlxSpeculativeBinding(binding);
-    if (options.kvConfig?.length ||
-        (options.turboQuant && (options.quantizedKvStart ?? 0) !== 0) ||
-        (options.kvBits && ((options.kvBits !== 4 && options.kvBits !== 8) || options.quantizedKvStart !== 0)))
+    const kv = binding.kv ?? BF16_KV, kvStart = kv.kind === "bf16" ? 0 : kv.quantizedKvStart ?? 0;
+    if (kv.kind === "affine-layers" || (kv.kind === "turbo" && kvStart !== 0) ||
+        (kv.kind === "affine" && ((kv.bits !== 4 && kv.bits !== 8) || kvStart !== 0)))
       throw new Error("speculative KV requires uniform KV4/KV8 or TurboQuant start=0");
     caches = binding.makeCache();
     // Draft policy (see packages/inference/src/generation/speculative/draft-policy.ts): the target's stepSampler
@@ -221,10 +220,9 @@ async function specRunInner(
     tapLayers = src.tapLayers;
     const checkpoint = src.prefillMode === "full" ? src.checkpoint : undefined;
     const prefixCache = checkpoint ? services.prefixCache : undefined;
+    // The KV scheme is the composition's, shared by every entry this cache holds.
     const prefixNamespace = JSON.stringify({ method: checkpoint?.namespace,
-      adapters: services.cacheNamespace ?? options.adapters ?? [], kvBits: options.kvBits ?? null,
-      kvGroupSize: options.kvGroupSize ?? 64, quantizedKvStart: options.quantizedKvStart ?? null,
-      turboQuant: options.turboQuant ?? null });
+      adapters: services.cacheNamespace ?? options.adapters ?? [] });
     let cached = 0;
     const hit = prefixCache?.take(promptIds, prefixNamespace, options.cacheSessionId);
     if (hit) {
@@ -314,7 +312,6 @@ async function specRunInner(
             anchorHidden = h.slice([0, L - 1, 0], [1, L, H]); // position len-2
           }
         } finally { h.dispose(); } // no logits during the drain
-        maintainKv(caches);
         clearCache();
         pos += n;
         if (pos < end) await new Promise<void>((resolve) => setImmediate(resolve));
@@ -339,7 +336,6 @@ async function specRunInner(
             lastLogits = ops.reshape(lg, [1, V]);
           } finally { lg.dispose(); }
         } } finally { h.dispose(); }
-        maintainKv(caches);
         if (end === snapshotAt && snapshotAt > cached) {
           await seedSource(end);
           capture(promptIds.slice(0, end));

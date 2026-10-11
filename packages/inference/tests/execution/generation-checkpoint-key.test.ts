@@ -7,7 +7,7 @@ describe("generationCheckpointKey", () => {
   test("resolved compiled and grammar policies cannot share a resume key", () => {
     const execution = resolveExecution({
       hasVision: false, hasAdapters: false, hasRepetitionPenalty: false,
-      userSeed: false, kvQuant: false, turboQuant: false, hasLogitsExtras: false,
+      userSeed: false, hasLogitsExtras: false,
       hasGrammar: false, wantsLogprobs: false, hasDraft: false,
     }, { method: "autoregressive", continuous: false, quantizedBatch: false,
       grammarBatch: false, checkpoints: true });
@@ -24,9 +24,9 @@ describe("generationCheckpointKey", () => {
   });
 
   test("nested policy keys are canonical; adapter namespace remains significant", () => {
-    const a = { layerIdx: 0, bits: 4, groupSize: 64 };
-    const b = { groupSize: 64, bits: 4, layerIdx: 0 };
-    expect(generationCheckpointKey([1], { kvConfig: [a] })).toBe(generationCheckpointKey([1], { kvConfig: [b] }));
+    const hlg = (value: object) => ({ hlg: value }) as GenerateOptions;
+    expect(generationCheckpointKey([1], hlg({ gain: 1, width: 2 }))).toBe(generationCheckpointKey([1], hlg({ width: 2, gain: 1 })));
+    expect(generationCheckpointKey([1], hlg({ gain: 1, width: 2 }))).not.toBe(generationCheckpointKey([1], hlg({ gain: 1, width: 3 })));
     expect(generationCheckpointKey([1], {}, "adapter-v1")).not.toBe(generationCheckpointKey([1], {}, "adapter-v2"));
   });
   const policy = (seed: number, seedWasExplicit: boolean): GenerateOptions => ({
