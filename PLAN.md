@@ -575,7 +575,7 @@ Exit: acceptance rate on the paired MTP bench unchanged; no env read in `dflash2
         the choice becomes a constructor argument of the training kernel's owner.
 - [ ] Each new rule's failure message names the paved road, in the style of the existing
       "scheduling reaches storage through the row-layout port" message.
-- [ ] Make the library checks a required status check on `main`, so a PR with a failing gate is
+- [x] Make the library checks a required status check on `main`, so a PR with a failing gate is
       not mergeable (#312 merged with its checks still pending).
 - [ ] Automatic performance-regression check. GitHub's runners have no Apple GPU, so this needs
       a self-hosted runner on a quiet named Mac (the M4 Pro, or the M1 Max over SSH). For a PR
