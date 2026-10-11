@@ -248,7 +248,7 @@ describe("per-row extraction from batched caches (model-free)", () => {
       const [tk, tv] = c.temporalView();
       return { keys: tk, values: tv };
     });
-    const batched = BatchedRotatingQuantCache.merge(rows, [...lens], W, GS, BITS);
+    const batched = BatchedRotatingQuantCache.merge(rows, [...lens], W, GS, BITS, unfusedAffineKernels(BITS, GS, Dtype.bfloat16));
     for (const r of rows) dispose3(r);
 
     for (let s = 0; s < 8; s++) {

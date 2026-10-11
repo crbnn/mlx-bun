@@ -41,7 +41,7 @@ const plainRow = (rotating: boolean, length: number, seed: number): Cache => {
 };
 type Delayed = DelayedQuantizedKVCache | DelayedRotatingQuantizedKVCache;
 const delayed = (rotating: boolean, start: number, lengths: number[], seed: number): Delayed => {
-  const group = rotating ? new DelayedRotatingQuantizedKVCache(W, 64, 4, start) : new DelayedQuantizedKVCache(64, 4, start);
+  const group = rotating ? new DelayedRotatingQuantizedKVCache(W, 64, 4, start, unfusedAffineKernels) : new DelayedQuantizedKVCache(64, 4, start, unfusedAffineKernels);
   const rows = lengths.map((length, index) => plainRow(rotating, length, seed + 2 * index));
   try { group.mergeRows(rows); } finally { for (const row of rows) row.dispose(); }
   return group;
@@ -76,7 +76,7 @@ test(`${rotating ? "rotating" : "full"} start ${start}, rows ${lengths}${prefill
 
 test("an empty prepared row never converts, even from start 0", () => {
   for (const rotating of [false, true]) {
-    const group = rotating ? new DelayedRotatingQuantizedKVCache(W, 64, 4, 0) : new DelayedQuantizedKVCache(64, 4, 0);
+    const group = rotating ? new DelayedRotatingQuantizedKVCache(W, 64, 4, 0, unfusedAffineKernels) : new DelayedQuantizedKVCache(64, 4, 0, unfusedAffineKernels);
     try {
       group.preparePrefill({ lengths: [2, 2] });
       expect(appendable(group, 2)).toEqual([true, true]);
@@ -227,8 +227,8 @@ test("delayed TurboQuant rows stay dense-readable before, across and after conve
 test("prepared co-prefill rows answer through their current storage: padded full rows and aligned rotating rows", () => {
   // Row 0 (4 tokens) passes start 3 at the chunk's commit; row 1 (2 tokens) does not.
   const cases = [
-    ["affine full", () => new DelayedQuantizedKVCache(64, 4, 3), [false, true]],
-    ["affine rotating", () => new DelayedRotatingQuantizedKVCache(W, 64, 4, 3), [false, true]],
+    ["affine full", () => new DelayedQuantizedKVCache(64, 4, 3, unfusedAffineKernels), [false, true]],
+    ["affine rotating", () => new DelayedRotatingQuantizedKVCache(W, 64, 4, 3, unfusedAffineKernels), [false, true]],
     ["TurboQuant full", () => new DelayedTurboQuantKVCache(8, 3, 3, turboQuantFusedDecode(), deferredTurboQuantKernels), [true, true]],
   ] as const;
   for (const [label, make, converted] of cases) {

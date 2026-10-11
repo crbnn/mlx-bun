@@ -12,7 +12,6 @@ import type { AttentionCache, AttentionRead, Cache, Mask } from "../contracts/ml
 import { quantizedSdpa } from "../layers/quantized-attention";
 import { AttentionMasks, causalLease, unmaskedLease, withLease, type MaskLease } from "./attention-read";
 import { KVCache, type AffineKernelSet } from "./kv";
-import { unfusedAffineKernels } from "./affine-attention";
 import { QuantizedKVCache } from "./quantized-kv";
 import { disposeTriple } from "./quantized-tensor";
 import { RotatingKVCache, rotatingWindowMask } from "./rotating-kv";
@@ -43,14 +42,14 @@ export function completeConversion<C extends Cache>(converted: C, offset: number
 }
 
 /** The affine conversion `kv-maintenance` performs on one entry: the source's
- * own `toQuantized` (which consumes the source) with the unfused kernels, then
- * the shared bookkeeping. */
+ * own `toQuantized` (which consumes the source) with `kernelSet`, the set the
+ * converted storage attends with, then the shared bookkeeping. */
 export function convertToAffine<C extends Cache>(
   source: { readonly offset: number; toQuantized(groupSize: number, bits: number, kernels: AffineKernelSet): C },
-  groupSize: number, bits: number, start: number,
+  groupSize: number, bits: number, start: number, kernelSet: AffineKernelSet,
 ): C {
   const offset = source.offset;
-  return completeConversion(source.toQuantized(groupSize, bits, unfusedAffineKernels), offset, start);
+  return completeConversion(source.toQuantized(groupSize, bits, kernelSet), offset, start);
 }
 
 /** The TurboQuant conversion `kv-maintenance` performs on one entry: encode
@@ -113,11 +112,13 @@ function ownsItsRead(): never {
  *
  * Reads: before the transition, `KVCache`'s reads (stock fused SDPA); after it,
  * the affine read the graphs make today (`quantizedSdpa` over the quantized
- * append, no mask for decode, the causal mask for a window). `signature()`,
- * `state()` and the offsets are the current storage's, so a saved lego is the
- * storage the convert-after path saves. Persistence, cloning and the row
- * layouts dispatch on that signature and read storage fields, so they cannot
- * take this cache as it is: the composition that builds it routes it to them.
+ * append, no mask for decode, the causal mask for a window). The converted
+ * storage carries `kernelSet`, which its copies and row layouts attend with.
+ * `signature()`, `state()` and the offsets are the current storage's, so a
+ * saved lego is the storage the convert-after path saves. Persistence, cloning
+ * and the row layouts dispatch on that signature and read storage fields, so
+ * they cannot take this cache as it is: the composition that builds it routes
+ * it to them.
  */
 export class Bf16FirstQuantizedKVCache implements AttentionCache {
   #plain: KVCache | null;
@@ -128,6 +129,9 @@ export class Bf16FirstQuantizedKVCache implements AttentionCache {
     readonly bits: number,
     /** Positions held in bf16 before the conversion; 0 converts after the first append. */
     readonly start: number,
+    /** The affine kernel set the converted storage attends with, named by the
+     * composition (`unfusedAffineKernels`, `tiledCausalAffineKernels`). */
+    readonly kernelSet: AffineKernelSet,
     /** The per-forward masks of the model this cache belongs to. */
     readonly masks = new AttentionMasks(),
   ) {
@@ -153,7 +157,7 @@ export class Bf16FirstQuantizedKVCache implements AttentionCache {
   #settle(read: AttentionRead): AttentionRead {
     const plain = this.#plain!;
     if (!transitionDue(plain.offset, this.start)) return read;
-    try { this.#quantized = convertToAffine(plain, this.groupSize, this.bits, this.start); }
+    try { this.#quantized = convertToAffine(plain, this.groupSize, this.bits, this.start, this.kernelSet); }
     catch (error) { read.dispose(); throw error; }
     this.#plain = null;
     return read;
@@ -206,6 +210,9 @@ export class Bf16FirstRotatingQuantizedKVCache implements AttentionCache {
     readonly bits: number,
     /** Positions held in bf16 before the conversion; 0 converts after the first append. */
     readonly start: number,
+    /** The affine kernel set the converted storage attends with, named by the
+     * composition (`unfusedAffineKernels`, `tiledCausalAffineKernels`). */
+    readonly kernelSet: AffineKernelSet,
     /** The per-forward masks of the model this cache belongs to. */
     readonly masks = new AttentionMasks(),
   ) {
@@ -230,7 +237,7 @@ export class Bf16FirstRotatingQuantizedKVCache implements AttentionCache {
   #settle(read: AttentionRead): AttentionRead {
     const plain = this.#plain!;
     if (!transitionDue(plain.offset, this.start)) return read;
-    try { this.#quantized = convertToAffine(plain, this.groupSize, this.bits, this.start); }
+    try { this.#quantized = convertToAffine(plain, this.groupSize, this.bits, this.start, this.kernelSet); }
     catch (error) { read.dispose(); throw error; }
     this.#plain = null;
     return read;

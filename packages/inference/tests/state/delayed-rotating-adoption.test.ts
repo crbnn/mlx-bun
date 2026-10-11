@@ -20,6 +20,7 @@ import { captureKvAttention } from "../../src/state/kv-attention-view";
 import { disposeTriple } from "../../src/state/quantized-tensor";
 import { alignRotatingRows } from "../../src/state/rotating-kv-layout";
 import type { Cache } from "../../src/contracts/mlx/cache";
+import { unfusedAffineKernels } from "../../src/state/affine-attention";
 import { DelayedRotatingQuantizedKVCache } from "../../src/state/delayed-rotating-quantized-kv";
 import { cloneKvCaches } from "../../src/state/persistence";
 
@@ -185,8 +186,8 @@ test(`B1 plain reads keep the adopted ring's physical bytes and attend as the so
 
 test("B2 plain reads with unequal offsets join the aligned rows and attend as the plain row views do", () => {
   const source = soloRows([3, 11], 20), control = cloneKvCaches(source);
-  const group = new DelayedRotatingQuantizedKVCache(W, 64, 4, 1000); group.mergeRows(source);
-  const twin = new DelayedRotatingQuantizedKVCache(W, 64, 4, 1000); twin.mergeRows(source);
+  const group = new DelayedRotatingQuantizedKVCache(W, 64, 4, 1000, unfusedAffineKernels); group.mergeRows(source);
+  const twin = new DelayedRotatingQuantizedKVCache(W, 64, 4, 1000, unfusedAffineKernels); twin.mergeRows(source);
   try {
     for (const [step, n] of [1, 1, 3, 1, 1, 1, 1, 1].entries()) {
       using q = f16(2, 4, n, 400 + step), k = f16(2, 2, n, 500 + step), v = f16(2, 2, n, 600 + step);
@@ -223,7 +224,7 @@ test("B2 plain reads with unequal offsets join the aligned rows and attend as th
 });
 
 test("padded rotating prefill reads plain, finalizes its positions and decodes as the plain row views do", () => {
-  const group = new DelayedRotatingQuantizedKVCache(W, 64, 4, 1000), twin = new DelayedRotatingQuantizedKVCache(W, 64, 4, 1000);
+  const group = new DelayedRotatingQuantizedKVCache(W, 64, 4, 1000, unfusedAffineKernels), twin = new DelayedRotatingQuantizedKVCache(W, 64, 4, 1000, unfusedAffineKernels);
   const lengths = [3, 6], control = lengths.map(() => new RotatingKVCache(W));
   try {
     for (const cache of [group, twin]) { cache.preparePrefill({ lengths, rightPadding: [3, 0] }); cache.beginPrefill(); }
@@ -273,7 +274,7 @@ test("a rotating plain read appends to no row once any row is converted, before 
   using k = f16(2, 2, 1, 50), v = f16(2, 2, 1, 51);
   for (const lengths of [[3, 7], [7, 9]]) {
     const source = soloRows(lengths, 40); maintain(source);
-    const group = new DelayedRotatingQuantizedKVCache(W, 64, 4, 6); group.mergeRows(source);
+    const group = new DelayedRotatingQuantizedKVCache(W, 64, 4, 6, unfusedAffineKernels); group.mergeRows(source);
     try {
       const before = snapshot(group);
       expect(() => group.updateAndFetch(k, v)).toThrow("mixed precision rows use their attention state");
@@ -281,7 +282,7 @@ test("a rotating plain read appends to no row once any row is converted, before 
     } finally { group.dispose(); for (const c of source) c.dispose(); }
   }
   const source = soloRows([3, 5], 60), control = cloneKvCaches(source);
-  const group = new DelayedRotatingQuantizedKVCache(W, 64, 4, 6); group.mergeRows(source);
+  const group = new DelayedRotatingQuantizedKVCache(W, 64, 4, 6, unfusedAffineKernels); group.mergeRows(source);
   try {
     for (const a of group.updateAndFetch(k, v)) a.dispose();
     expect(group.rowOffsets).toEqual([4, 6]);

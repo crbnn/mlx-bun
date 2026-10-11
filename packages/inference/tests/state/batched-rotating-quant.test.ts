@@ -82,7 +82,7 @@ describe("BatchedRotatingQuantCache (milestone 2, model-free)", () => {
       k.dispose(); v.dispose();
     }
     const [sk0, sv0] = serial.temporalView();
-    const twin = BatchedRotatingQuantCache.merge([{ keys: sk0, values: sv0 }], [serial.offset], MAX, GROUP, BITS);
+    const twin = BatchedRotatingQuantCache.merge([{ keys: sk0, values: sv0 }], [serial.offset], MAX, GROUP, BITS, unfusedAffineKernels(BITS, GROUP, Dtype.bfloat16));
     disposeTriple(sk0); disposeTriple(sv0);
 
     // bf16 control with the same geometry (content irrelevant — we compare
@@ -151,7 +151,7 @@ describe("BatchedRotatingQuantCache (milestone 2, model-free)", () => {
     const [bk, bv] = B.c.temporalView();
     const twin = BatchedRotatingQuantCache.merge(
       [{ keys: ak, values: av }, { keys: bk, values: bv }],
-      [A.c.offset, B.c.offset], MAX, GROUP, BITS,
+      [A.c.offset, B.c.offset], MAX, GROUP, BITS, unfusedAffineKernels(BITS, GROUP, Dtype.bfloat16),
     );
     for (const t of [ak, av, bk, bv]) disposeTriple(t);
     expect(twin.leftPad).toEqual([0, 3]);

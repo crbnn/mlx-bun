@@ -345,7 +345,7 @@ test("quantized rows merge through their newest windows", () => {
   const solos = names.map(name => drive(() => new RotatingQuantizedKVCache(W, GROUP, BITS, unfusedAffineKernels(BITS, GROUP, Dtype.bfloat16)), CASES[name]!, () => {}));
   const offsets = names.map(name => CASES[name]!.reduce((a, b) => a + b, 0));
   const views = solos.map(solo => solo.temporalView());
-  const batched = BatchedRotatingQuantCache.merge(views.map(([keys, values]) => ({ keys, values })), offsets, W, GROUP, BITS);
+  const batched = BatchedRotatingQuantCache.merge(views.map(([keys, values]) => ({ keys, values })), offsets, W, GROUP, BITS, unfusedAffineKernels(BITS, GROUP, Dtype.bfloat16));
   for (const [keys, values] of views) { disposeTriple(keys); disposeTriple(values); }
   for (const solo of solos) solo.dispose();
   for (const [row, offset] of offsets.entries()) {

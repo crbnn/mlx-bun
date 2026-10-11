@@ -471,7 +471,7 @@ for (const [bits, groupSize] of BATCH_CONFIGS) for (const noFused of [false, tru
   for (const lengths of [[5, 20], [5, 40], [3, 40, 17, 70]]) {
     test(`BatchedRotatingQuantCache ${bits}-bit g${groupSize} vs ${noFused ? "unfused" : "fused"} dispatch: rows at offsets ${lengths}`, () => {
       const [a, b] = soloRows(() => new RotatingQuantizedKVCache(WINDOW, groupSize, bits, unfusedAffineKernels(bits, groupSize, Dtype.bfloat16)), lengths);
-      const pair = twice(() => BatchedRotatingQuantCache.empty(WINDOW, groupSize, bits, []));
+      const pair = twice(() => BatchedRotatingQuantCache.empty(WINDOW, groupSize, bits, unfusedAffineKernels(bits, groupSize, Dtype.bfloat16), []));
       try {
         pair[0].mergeRows(a); pair[1].mergeRows(b);
         const roomy = Math.max(...lengths) + 1 < WINDOW;
@@ -488,7 +488,7 @@ for (const padding of [{ leftPadding: [2, 0], lengths: [6, 8] }, { lengths: [5, 
     const B = padding.lengths.length;
     const failures: string[] = [];
     for (const noFused of [false, true]) {
-      const pair = twice(() => BatchedRotatingQuantCache.empty(WINDOW, 64, 4, Array(B).fill(0)));
+      const pair = twice(() => BatchedRotatingQuantCache.empty(WINDOW, 64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16), Array(B).fill(0)));
       try {
         for (const cache of pair) cache.preparePrefill(padding);
         const old: Old<BatchedRotatingQuantCache> = (c, k, v, q) => oldRead(c, WINDOW, k, v, q, noFused);
@@ -506,7 +506,7 @@ test("BatchedRotatingQuantCache: a one-row window after the ring wraps (document
   const failures: string[] = [];
   for (let trial = 0; trial < 3; trial++) {
     const [a, b] = soloRows(() => new RotatingQuantizedKVCache(WINDOW, 64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16)), [37, WINDOW + 50]);
-    const pair = twice(() => BatchedRotatingQuantCache.empty(WINDOW, 64, 4, []));
+    const pair = twice(() => BatchedRotatingQuantCache.empty(WINDOW, 64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16), []));
     try {
       pair[0].mergeRows(a); pair[1].mergeRows(b);
       advance(pair, 2, Array<Step>(WINDOW + 20 + trial).fill("D"));
@@ -523,8 +523,9 @@ for (const variant of VARIANTS) for (const lengths of [[9, 9], [5, 40]]) {
     const [a, b] = soloRows(() => new RotatingQuantizedKVCache(WINDOW, 64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16)), lengths);
     const pair = twice(() => new SpeculativeRotatingAffineLayout(WINDOW, 64, 4, variant.kernels(64, 4)));
     // Plain causal windows take the layout's window kernel; masked ones the
-    // ring's, which reads unfused in every composition.
-    const kernel: NewKernel = (phase, _L, masked) => phase === "window" && !masked ? windowKernel(variant, false) : "unfused";
+    // ring's, which the layout builds with its own kernels (B1f), so the
+    // always-tiled composition tiles them too.
+    const kernel = genericKernel(variant);
     try {
       pair[0].mergeRows(a); pair[1].mergeRows(b);
       // A one-row window only while the window has room (see the ring tests).
@@ -713,8 +714,8 @@ test("mask memo: per-row and ring masks once per forward across interleaved batc
   const masks = new AttentionMasks();
   const [full] = soloRows(() => new QuantizedKVCache(64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16)), [5, 17]);
   const [ring] = soloRows(() => new RotatingQuantizedKVCache(WINDOW, 64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16)), [5, 40]);
-  const layers: Array<BatchedRotatingQuantCache | BatchedQuantizedKVCache> = [BatchedRotatingQuantCache.empty(WINDOW, 64, 4, [], masks),
-    new BatchedQuantizedKVCache(64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16), masks), BatchedRotatingQuantCache.empty(WINDOW, 64, 4, [], masks), new BatchedQuantizedKVCache(64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16), masks)];
+  const layers: Array<BatchedRotatingQuantCache | BatchedQuantizedKVCache> = [BatchedRotatingQuantCache.empty(WINDOW, 64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16), [], masks),
+    new BatchedQuantizedKVCache(64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16), masks), BatchedRotatingQuantCache.empty(WINDOW, 64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16), [], masks), new BatchedQuantizedKVCache(64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16), masks)];
   try {
     for (const [i, layer] of layers.entries()) layer.mergeRows(i % 2 ? full : ring);
     for (const forward of [3, 1, 1]) {

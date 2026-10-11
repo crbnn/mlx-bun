@@ -260,7 +260,12 @@ export class PagedKVCache implements AttentionCache {
     return pagedAttentionView(this.pool!, [...this.blockTable], this.offset, this.direct);
   }
 
-  updateAndFetch(k: MlxArray, v: MlxArray): [MlxArray, MlxArray] {
+  updateAndFetch(k: MlxArray, v: MlxArray): [MlxArray, MlxArray] { return this.appendAndGather(k, v); }
+
+  /** Append, then the keys and values gathered from the blocks up to the new
+   * offset (dequantized for affine pages), each [1, H, offset, D]; the caller
+   * owns both. What the joined window read of `PagedKvRows` attends. */
+  appendAndGather(k: MlxArray, v: MlxArray): [MlxArray, MlxArray] {
     this.append(k, v);
     const H = this.pool!.keys.shape[1]!, kD = this.pool!.headDim, vD = this.pool!.vHeadDim;
     const [gk, gv] = this.pool!.gather(this.blockTable);

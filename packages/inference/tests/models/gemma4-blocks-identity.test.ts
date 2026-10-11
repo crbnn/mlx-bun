@@ -17,10 +17,11 @@
 // of 1 to 4 on solo caches and target rows, vision prefill with a
 // bidirectional image mask, two groups in one packed mixed forward, padded
 // batched prefill with batched decode and per-row rollback, the delayed
-// prefill-cohort layouts across their transition, the compiled decode step in
-// both forms, paged KV at one row and the training forwards (full-sequence
-// scoring, the padded mask wrapper, prefix-shared, segmented and gradient
-// checkpointed). No model, no download.
+// prefill-cohort layouts across their transition and the decode layouts made
+// from the rows they convert, the compiled decode step in both forms, paged KV
+// at one row and gathered bf16 paged rows at three, and the training forwards
+// (full-sequence scoring, the padded mask wrapper, prefix-shared, segmented
+// and gradient checkpointed). No model, no download.
 import { afterAll, describe, expect, test } from "bun:test";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
@@ -629,11 +630,11 @@ for (const kind of ["dense", "shared"] as const) {
         } finally { disposeAll(oldCaches, newCaches); }
       }, 120_000);
 
-    // B1a's recorded divergence, measured here and not held to the bit: paged
-    // bf16 rows at B > 1 read each row alone through the cache, where the old
-    // path joined the rows left-padded into one fused SDPA under the padding
-    // mask (PLAN B1, "Paged": the bit-stability decision owns it).
-    test(`${kind} paged bf16 rows at B = 3 (recorded divergence, not held to the bit)`, () => {
+    // Paged bf16 rows at B > 1: the batched paged cache joins the rows
+    // left-padded into one fused SDPA under the padding mask for decode and
+    // windows, as the old path did (B1f; B1a's per-row read measured 0.03
+    // here).
+    test(`${kind} paged bf16 rows at B = 3: decode, window`, () => {
       const p = pair(kind);
       const rows = (model: Graph) => model.makeCache().map(cache => {
         if (!(cache instanceof KVCache)) return targetCacheLayout(cache) as unknown as Cache;
@@ -656,31 +657,21 @@ for (const kind of ["dense", "shared"] as const) {
       try {
         for (const [set, sources] of [[oldRows, oldSources], [newRows, newSources]] as const)
           set.forEach((layout, layer) => (layout as unknown as BatchableCache).mergeRows(sources.map(source => source[layer]!)));
-        for (const [label, rows] of [["decode", [[40], [50], [60]]], ["window4", [prompt(4, 84), prompt(4, 85), prompt(4, 86)]]] as const) {
-          using input = ids(rows.map(row => [...row]));
-          using expected = p.old.forwardHidden(input, oldRows);
-          using actual = p.current.forwardHidden(input, newRows);
-          using left = actual.astype(Dtype.float32);
-          using right = expected.astype(Dtype.float32);
-          const x = left.toFloat32(), y = right.toFloat32();
-          let value = 0;
-          for (let i = 0; i < x.length; i++) value = Math.max(value, Math.abs(x[i]! - y[i]!));
-          expect(Number.isFinite(value)).toBe(true);
-          console.log(`gemma4-identity ${kind} paged bf16 rows B=3 ${label} (recorded divergence): maxDiff ${value}`);
-        }
+        for (const [label, rows] of [["decode", [[40], [50], [60]]], ["window4", [prompt(4, 84), prompt(4, 85), prompt(4, 86)]],
+          ["decode after window", [[41], [51], [61]]]] as const)
+          both(`${kind} paged bf16 rows B=3 ${label}`, p, oldRows, newRows, forwardHidden(rows.map(row => [...row])));
       } finally { disposeAll(...oldSources, ...newSources, oldRows, newRows); }
     }, 120_000);
 
-    // Not identical, measured here and not held to the bit: rows a prefill
-    // cohort converts inside its delayed affine layouts leave them with the
-    // unfused kernel set those layouts compose (delayed-quantized-kv.ts,
-    // delayed-rotating-quantized-kv.ts, bf16-first-kv.ts, the batched affine
-    // ring), and the decode group's layouts made from those rows keep it. The
-    // old graph attended them through quantizedSdpa, which tiles a plain causal
-    // window while MLX_BUN_NO_FUSED_SDPA is unset (`--kv-quant config`); with
-    // the flag set both are unfused and agree.
+    // Rows a prefill cohort converts inside its delayed affine layouts carry
+    // the kernel set the layouts took when kv-maintenance built them
+    // (servedAffineKernels: tiled-causal with MLX_BUN_NO_FUSED_SDPA unset,
+    // unfused with it set to 1), and the decode group's layouts made from those
+    // rows keep it. The old graph attended them through quantizedSdpa under the
+    // same flag. B1f; before it the layouts composed the unfused set and the
+    // flag-unset window measured 0.77.
     for (const flag of [undefined, "1"])
-      test(`${kind} delayed affine4 cohort rows in the decode layouts, flag=${flag ?? "unset"} (measured, not held to the bit)`, () =>
+      test(`${kind} delayed affine4 cohort rows in the decode layouts, flag=${flag ?? "unset"}`, () =>
         withScheme({ name: "", kvBits: 4, flag }, () => {
           const p = pair(kind);
           const maintain = createKvMaintenance({ kvBits: 4, quantizedKvStart: 0 });
@@ -714,18 +705,10 @@ for (const kind of ["dense", "shared"] as const) {
             expect(newRows.map(cache => cache.signature())).toEqual(oldRows.map(cache => cache.signature()));
             expect(newRows.map(cache => cache.signature().split(":").slice(0, 2).join(":")))
               .toEqual(LAYOUTS[kind].types.slice(0, newRows.length).map(type => type === S ? "kv:rotating-affine" : "kv:batched-quant"));
-            for (const [label, rows] of [["decode", [[40], [40], [40]]], ["window3", [prompt(3, 102), prompt(3, 102), prompt(3, 103)]]] as const) {
-              using input = ids(rows.map(row => [...row]));
-              using expected = p.old.forwardHidden(input, oldRows);
-              using actual = p.current.forwardHidden(input, newRows);
-              using left = actual.astype(Dtype.float32);
-              using right = expected.astype(Dtype.float32);
-              const x = left.toFloat32(), y = right.toFloat32();
-              let value = 0;
-              for (let i = 0; i < x.length; i++) value = Math.max(value, Math.abs(x[i]! - y[i]!));
-              expect(Number.isFinite(value)).toBe(true);
-              console.log(`gemma4-identity ${kind} delayed affine4 cohort rows B=3 ${label} flag=${flag ?? "unset"} (measured): maxDiff ${value}`);
-            }
+            for (const [label, rows] of [["decode", [[40], [40], [40]]], ["window3", [prompt(3, 102), prompt(3, 102), prompt(3, 103)]],
+              ["decode after window", [[41], [41], [41]]]] as const)
+              both(`${kind} delayed affine4 cohort rows B=3 ${label} (flag ${flag ?? "unset"})`, p, oldRows, newRows,
+                forwardHidden(rows.map(row => [...row])));
           } finally { disposeAll(oldCohort, newCohort, oldRows, newRows, ...extracted); }
         }), 120_000);
 

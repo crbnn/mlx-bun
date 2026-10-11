@@ -10,6 +10,7 @@ import { BatchedSSMCache } from "./batched-ssm";
 import { type BatchableCache, type Cache } from "../contracts/mlx/cache";
 import { DelayedRotatingQuantizedKVCache } from "./delayed-rotating-quantized-kv";
 import { RotatingAffineLayout } from "./rotating-kv-layout";
+import { servedAffineKernels } from "./served-affine-kernels";
 import { BatchedTurboQuantKVCache } from "./batched-turboquant-kv";
 import { targetRowLayoutFactory, type TargetRowLayout } from "./target-layout";
 import { PagedKVCache } from "./paged/cache";
@@ -27,7 +28,7 @@ export function ownedCacheLayoutFactory(cache: Cache): (() => BatchableCache) | 
   if (isPlainKvCache(cache)) return () => new PaddedKVRows(cache.masks);
   if (isQuantizedKvCache(cache)) return () => new PaddedQuantKVRows(cache.groupSize, cache.bits, cache.kernels, cache.masks);
   if (isRotatingPlainCache(cache)) return () => new BatchedRotatingCache(cache.maxSize, [], cache.masks);
-  if (isRotatingQuantizedCache(cache)) return () => BatchedRotatingQuantCache.empty(cache.maxSize, cache.groupSize, cache.bits, [], cache.masks);
+  if (isRotatingQuantizedCache(cache)) return () => BatchedRotatingQuantCache.empty(cache.maxSize, cache.groupSize, cache.bits, cache.kernels, [], cache.masks);
   if (isRecurrentCache(cache)) return () => new BatchedSSMCache();
   return undefined;
 }
@@ -42,7 +43,9 @@ export function prefillCacheLayout(cache: Cache): BatchableCache {
   if (cache instanceof PagedKVCache) return new PagedKvRows(cache.capacityTokens, cache.blockSize, cache.direct, cache.quantization);
   if (isBatchableCache(cache)) return cache.makeEmptyBatch();
   // Plain rotating rows never convert here; their dense reads say so.
-  if (cache instanceof RotatingKVCache) return new DelayedRotatingQuantizedKVCache(cache.maxSize, 64, 4, Infinity);
+  // E3 transition: E3 composes the set from the KV scheme at load and deletes
+  // the flag this reads (`servedAffineKernels`).
+  if (cache instanceof RotatingKVCache) return new DelayedRotatingQuantizedKVCache(cache.maxSize, 64, 4, Infinity, servedAffineKernels());
   if (cache instanceof RotatingQuantizedKVCache) return new RotatingAffineLayout(cache.maxSize, cache.groupSize, cache.bits, cache.kernels, cache.masks);
   return targetCacheLayout(cache);
 }
