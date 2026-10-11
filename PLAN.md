@@ -382,6 +382,13 @@ Exit: selection is data; `qwen38TrellisM4ProAccepts` and the nested ternary are 
 - [ ] The scheduler indexes the graph's operation table by the rows it batched: one request is
       one row and calls the one-row decode; four requests call the 2-to-4 decode; verify width is
       rows times depth+1. No flag and no mode; `--batch-size` is only the cap.
+- [ ] The Neural Engine is a compute unit the scheduler manages (Josh, 2026-10-11). The graph
+      exposes its prompt-chunk operation per execution unit, `prefillChunk.gpu` and, when the
+      composition built it, `prefillChunk.ane` (the ANE+GPU split for exactly the chunk size);
+      which unit a chunk runs on is the scheduler's dispatch decision, read once at bind as a
+      declared fact and chosen per chunk by the scheduler, which owns the ANE as a resource and
+      can overlap one request's ANE chunk with another's GPU work. No graph routes to the ANE by
+      itself. Until E2 dispatches to it, the deprecated entry points call the GPU operation.
 - [ ] Batching sends M rows through the row-wise layers; only `attend` and the recurrence see
       `rowOffsets`.
 - [ ] Call sites A2 found that do not fit the four phases, each resolved explicitly, none by
