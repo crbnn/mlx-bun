@@ -860,7 +860,6 @@ const seamRatchet: RatchetTable = {
   },
   "cache-escape": {
     "packages/inference/src/generation/speculative/bindings/projected-context-rows.ts": 1, // B1 (readBlock)
-    "packages/inference/src/models/diffusion-gemma/model.ts": 6, // B1 (appendBidirectional, readBlock)
     "packages/inference/src/models/gemma4/compiled-decode.ts": 2, // D3
     "packages/inference/src/models/gemma4/generated/gemma4-12b.ts": 5, // D2
     "packages/inference/src/models/gemma4/generated/gemma4-26b.ts": 6, // D2

@@ -1,12 +1,12 @@
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
-import type { AttentionRead,BidirectionalAttentionCache,BlockAttentionCache,CompiledDecodeCache,DecodeSlot,DecodeStepInputs,DecodeStepPlan,DecodeTrace,KvDonorRows,Mask } from "../contracts/mlx/cache";
+import type { AttentionRead,BidirectionalAttentionCache,BlockAttentionCache,CompiledDecodeCache,DecodeSlot,DecodeStepInputs,DecodeStepPlan,DecodeTrace,EncoderAttentionCache,KvDonorRows,Mask } from "../contracts/mlx/cache";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import { bidirMask, createCausalMask } from "../kernels/attention/masks";
 import { concatDecodeSlot, type AffineKernelSet } from "./kv";
 import { RotatingQuantizedKVCache } from "./rotating-quantized-kv";
 import { plainKvStorage } from "./dense-kv-reads";
-import { AttentionMasks, causalLease, sdpaRead, unmaskedLease, withLease, type MaskLease } from "./attention-read";
+import { AttentionMasks, causalLease, encoderWindowMask, sdpaRead, unmaskedLease, withLease, type MaskLease } from "./attention-read";
 
 
 /** Rotating (sliding-window) KV cache — port of mlx-lm RotatingKVCache
@@ -23,7 +23,7 @@ import { AttentionMasks, causalLease, sdpaRead, unmaskedLease, withLease, type M
  *  picks the in-place write for one position and concatenation otherwise. The
  *  method picks here, so a one-row window concatenates: the same bits until the
  *  ring wraps, a different key order after. */
-export class RotatingKVCache implements CompiledDecodeCache, BidirectionalAttentionCache, BlockAttentionCache {
+export class RotatingKVCache implements CompiledDecodeCache, BidirectionalAttentionCache, EncoderAttentionCache, BlockAttentionCache {
   readonly denseKvReads = plainKvStorage;
   declare minimumReusableOffset?: number;
   static readonly STEP = 256;
@@ -67,6 +67,17 @@ export class RotatingKVCache implements CompiledDecodeCache, BidirectionalAttent
     return withLease(mask, held => {
       const [keys, values] = this.#updateConcat(k, v);
       return sdpaRead(keys, values, held);
+    });
+  }
+
+  /** DiffusionGemma's vision encoder read on a sliding layer, as its encoder
+   * computes it: the window's concatenating append (every position kept, even
+   * past `maxSize`), then the fused SDPA under the encoder window's mask
+   * (`encoderWindowMask`), which this cache's window does not limit. */
+  appendEncoderWindow(k: MlxArray, v: MlxArray, bidirectional: MlxArray): AttentionRead {
+    return withLease(encoderWindowMask(this.masks, k.shape[2]!, bidirectional), mask => {
+      const [keys, values] = this.#updateConcat(k, v);
+      return sdpaRead(keys, values, mask);
     });
   }
 

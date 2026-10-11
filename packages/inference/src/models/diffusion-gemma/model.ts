@@ -46,23 +46,28 @@ import { QuantizedLinear } from "../../layers/quantized-linear";
 import { QuantizedSwitchLinear } from "../../layers/quantized-switch-linear";
 import { RMSNorm } from "../../layers/normalization";
 import { RotatingKVCache } from "../../state/rotating-kv";
-import { type Cache } from "../../contracts/mlx/cache";
+import { AttentionMasks } from "../../state/attention-read";
+import type { AttentionRead, BlockAttentionCache, Cache, EncoderAttentionCache } from "../../contracts/mlx/cache";
 import { DiffusionVisionTower, spliceImageTokens } from "./vision";
 
-/** A mask in the shape ops.sdpa wants: a mode string + optional bool array.
- *  `null` array with mode "" means "no mask" (full attention). */
-interface SdpaMask {
-  mode: "" | "causal" | "array";
-  arr: MlxArray | null;
-}
-const NO_MASK: SdpaMask = { mode: "", arr: null };
+/** The caches `makeCache` composes: each serves the window read (encoder
+ *  prefill over prompt tokens or an accepted canvas block), the block read (the
+ *  decoder canvas pass) and the encoder window read (the vision prompt). */
+type DiffusionCache = BlockAttentionCache & EncoderAttentionCache;
 
-/** KVCache / RotatingKVCache both expose temporalView(): the chronological
- *  live window (every position for KVCache, the newest min(offset, maxSize) for
- *  RotatingKVCache). The decoder needs the newest encoder positions: on sliding
- *  layers it keeps the last sliding_window - 1 of them. The base Cache interface
- *  does not declare it; the decoder only ever uses those two concrete caches. */
-type TemporalCache = Cache & { temporalView(): [MlxArray, MlxArray] };
+/** The read one pass makes on a layer's cache with that layer's keys and
+ *  values. The pass names it; no layer inspects its input or its cache. */
+type PassRead = (cache: Cache, k: MlxArray, v: MlxArray) => AttentionRead;
+
+/** Encoder prefill over tokens: append, causal, limited to the layer's sliding window. */
+const windowRead: PassRead = (cache, k, v) => (cache as DiffusionCache).appendWindow(k, v);
+/** Decoder canvas pass: the canvas attends the stored encoder positions (the
+ *  newest sliding_window - 1 on sliding layers) and itself, storing nothing. */
+const blockRead: PassRead = (cache, k, v) => (cache as DiffusionCache).readBlock(k, v);
+/** Vision encoder prefill: append, causal over the whole prompt with no sliding
+ *  window, image positions (`media`, bool [L]) attending each other both ways. */
+const encoderRead = (media: MlxArray): PassRead =>
+  (cache, k, v) => (cache as DiffusionCache).appendEncoderWindow(k, v, media);
 
 /** Router: pre-projection RMSNorm (no-scale) * scale * hidden**-0.5, top-8
  *  argpartition, softmax(precise) * per_expert_scale[idx]. Local, not gemma4's Router:
@@ -221,15 +226,14 @@ class SelfConditioning {
   }
 }
 
-/** Attention with the encoder (decoder=false, cache.updateAndFetch) and decoder
- *  (decoder=true, reads encoder K/V from cache temporal state and concatenates
- *  the canvas K/V) paths. scale=1.0, no softcap. */
+/** Attention through the read its pass names: the encoder passes append to the
+ *  cache, the decoder canvas pass reads the stored encoder K/V with the canvas
+ *  K/V without storing them. The cache builds the mask. scale=1.0, no softcap. */
 class DiffAttention {
   readonly isSliding: boolean;
   readonly headDim: number;
   readonly nHeads: number;
   readonly nKvHeads: number;
-  readonly slidingWindow: number;
   readonly qProj: QuantizedLinear;
   readonly kProj: QuantizedLinear;
   readonly vProj: QuantizedLinear | null;
@@ -243,7 +247,6 @@ class DiffAttention {
   constructor(weights: Weights, config: ModelConfig, prefix: string, layerType: string) {
     const t = config.text;
     this.isSliding = layerType === "sliding_attention";
-    this.slidingWindow = t.slidingWindow;
     this.headDim = this.isSliding ? t.headDim : t.globalHeadDim;
     this.nHeads = t.numAttentionHeads;
     this.nKvHeads = this.isSliding ? t.numKeyValueHeads : t.numGlobalKeyValueHeads;
@@ -301,13 +304,9 @@ class DiffAttention {
     return ops.rope(x, this.headDim, this.ropeBase, offset, this.ropeFreqs);
   }
 
-  forward(
-    x: MlxArray,
-    mask: SdpaMask,
-    cache: Cache | null,
-    decoder: boolean,
-    offset: number,
-  ): MlxArray {
+  /** `offset` is the RoPE position of `x`'s first token, which the pass chooses
+   *  (the reference encoder ropes every pass from 0). */
+  forward(x: MlxArray, cache: Cache, read: PassRead, offset: number): MlxArray {
     const [B, L] = x.shape as [number, number, number];
 
     const qFlat = this.qProj.forward(x);
@@ -338,60 +337,10 @@ class DiffAttention {
     if (vReshaped !== kReshaped) vReshaped.dispose();
     kReshaped.dispose();
 
-    let maskMode = mask.mode;
-    let maskArr = mask.arr;
-    let maskArrOwned = false;
-
-    if (decoder) {
-      // Read the encoder K/V (the chronological live window) from the cache
-      // and concatenate the canvas K/V. No cache update on the canvas pass.
-      if (cache) {
-        let [encK, encV] = (cache as TemporalCache).temporalView();
-        if (this.isSliding) {
-          const window = Math.max(this.slidingWindow - 1, 0);
-          const encoderLen = encK.shape[2]!;
-          if (window && encoderLen > window && offset >= encoderLen) {
-            const trimK = encK.slice([0, 0, encoderLen - window, 0], encK.shape);
-            const trimV = encV.slice([0, 0, encoderLen - window, 0], encV.shape);
-            encK.dispose();
-            encV.dispose();
-            encK = trimK;
-            encV = trimV;
-            if (maskArr) {
-              const ks = maskArr.shape;
-              const keep = window + L;
-              const trimmed = maskArr.slice(
-                [0, 0, 0, ks[3]! - keep],
-                ks,
-              );
-              maskArr = trimmed;
-              maskArrOwned = true;
-              maskMode = "array";
-            }
-          }
-        }
-        const kCat = ops.concatAxis([encK, k], 2);
-        const vCat = ops.concatAxis([encV, v], 2);
-        encK.dispose();
-        encV.dispose();
-        k.dispose();
-        v.dispose();
-        k = kCat;
-        v = vCat;
-      }
-    } else if (cache) {
-      const [fk, fv] = cache.updateAndFetch(k, v);
-      k.dispose();
-      v.dispose();
-      k = fk;
-      v = fv;
-    }
-
-    const attn = ops.sdpa(q, k, v, 1.0, maskMode, maskArr);
-    q.dispose();
-    k.dispose();
-    v.dispose();
-    if (maskArrOwned) maskArr!.dispose();
+    let attended: AttentionRead;
+    try { attended = read(cache, k, v); } finally { k.dispose(); v.dispose(); }
+    let attn: MlxArray;
+    try { attn = attended.attend(q, 1.0); } finally { attended.dispose(); q.dispose(); }
 
     let out = ops.transposeAxes(attn, [0, 2, 1, 3]);
     attn.dispose();
@@ -441,16 +390,15 @@ class DiffDecoderLayer {
 
   forward(
     x: MlxArray,
-    mask: SdpaMask,
-    cache: Cache | null,
-    decoder: boolean,
+    cache: Cache,
+    read: PassRead,
     offset: number,
     layerScalar: MlxArray | null,
   ): MlxArray {
     // attention
     let residual = x;
     let h = this.inputNorm.forward(x);
-    h = disposing(h, this.attn.forward(h, mask, cache, decoder, offset));
+    h = disposing(h, this.attn.forward(h, cache, read, offset));
     h = disposing(h, this.postAttnNorm.forward(h));
     h = disposing(h, ops.add(residual, h));
 
@@ -584,34 +532,30 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
     return embeds;
   }
 
-  /** Encoder attention mask for the vision prompt: causal, OR'd with the
-   *  bidirectional image-block overlay (tokens in the same <|image|> block
-   *  attend both ways). For N < sliding_window the sliding window is a no-op, so
-   *  one mask serves all layers. Reference _make_encoder_masks + _vision_block_overlay. */
-  #encoderVisionMask(splicedIds: number[]): MlxArray {
-    const N = splicedIds.length;
-    const isVision = splicedIds.map((id) => id === this.imageTokenId);
-    const bits = new Int32Array(N * N);
-    for (let i = 0; i < N; i++)
-      for (let j = 0; j < N; j++)
-        bits[i * N + j] = i >= j || (isVision[i] && isVision[j]) ? 1 : 0;
-    return MlxArray.fromInt32(bits, [1, 1, N, N]).astype(Dtype.bool);
+  /** The vision prompt's image positions, bool [N]: every <|image|> token. The
+   *  encoder window read lets them attend each other both ways (reference
+   *  _vision_block_overlay). */
+  #imagePositions(splicedIds: number[]): MlxArray {
+    const flags = splicedIds.map((id) => (id === this.imageTokenId ? 1 : 0));
+    using ints = MlxArray.fromInt32(Int32Array.from(flags), [flags.length]);
+    return ints.astype(Dtype.bool);
   }
 
-  /** Image-text-to-text encoder prefill: merged embeddings + the causal/overlay
-   *  mask through all layers (decoder=false), filling `cache`. The canvas decoder
-   *  then reads it like the text path. */
+  /** Image-text-to-text encoder prefill: merged embeddings through all layers,
+   *  each reading through the encoder window (causal over the whole prompt, no
+   *  sliding window, image positions both ways; reference _make_encoder_masks +
+   *  _vision_block_overlay, one mask for every layer), filling `cache`. The
+   *  canvas decoder then reads it like the text path. */
   encodeVisionPrefill(splicedIds: number[], pixels: MlxArray, cache: Cache[]): void {
     let h = this.#embedInputsVision(splicedIds, pixels); // [1, L, hidden] (*embed_scale)
-    const maskArr = this.#encoderVisionMask(splicedIds);
-    const mask: SdpaMask = { mode: "array", arr: maskArr };
+    using media = this.#imagePositions(splicedIds);
+    const read = encoderRead(media);
     for (let i = 0; i < this.layers.length; i++) {
       const layer = this.layers[i]!;
-      const next = layer.forward(h, mask, cache[i]!, false, 0, this.encoderLayerScalars[i]!);
+      const next = layer.forward(h, cache[i]!, read, 0, this.encoderLayerScalars[i]!);
       h.dispose();
       h = next;
     }
-    maskArr.dispose();
     h.dispose();
   }
 
@@ -622,30 +566,26 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
     catch (error) { cleanupFailure(error, () => disposeResources(cache)); }
   }
 
-  /** One KVCache (full) / RotatingKVCache (sliding) per layer — the encoder
-   *  prefill fills these, the decoder canvas pass reads them. */
+  /** One KVCache (full) / RotatingKVCache (sliding) per layer, sharing one mask
+   *  memo — the encoder prefill fills these, the decoder canvas pass reads them. */
   makeCache(): Cache[] {
+    const masks = new AttentionMasks();
     return this.layers.map((l) =>
       l.layerType === "sliding_attention"
-        ? new RotatingKVCache(this.slidingWindow)
-        : new KVCache(),
+        ? new RotatingKVCache(this.slidingWindow, masks)
+        : new KVCache(masks),
     );
   }
 
-  /** Encoder prefill: run all layers over the prompt (decoder=false), filling
-   *  the cache. Text-only (no vision merge yet — D3). Discards the hidden. */
+  /** Encoder prefill: run all layers over the prompt through the window read,
+   *  filling the cache. Discards the hidden. */
   encodePrompt(promptIds: number[], cache: Cache[]): void {
     const ids = MlxArray.fromInt32(Int32Array.from(promptIds), [1, promptIds.length]);
     let h = this.embed.encode(ids);
     ids.dispose();
     h = disposing(h, ops.mulScalar(h, this.embedScale));
-    const N = promptIds.length;
     for (let i = 0; i < this.layers.length; i++) {
-      const layer = this.layers[i]!;
-      const window = layer.layerType === "sliding_attention" ? this.slidingWindow : null;
-      const m = cache[i]!.makeMask(N, window) as SdpaMask;
-      const next = layer.forward(h, m, cache[i]!, false, 0, this.encoderLayerScalars[i]!);
-      if (m.arr) m.arr.dispose();
+      const next = this.layers[i]!.forward(h, cache[i]!, windowRead, 0, this.encoderLayerScalars[i]!);
       h.dispose();
       h = next;
     }
@@ -666,13 +606,8 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
     ids.dispose();
     h = disposing(h, ops.mulScalar(h, this.embedScale));
     onEmbed(h);
-    const N = promptIds.length;
     for (let i = 0; i < this.layers.length; i++) {
-      const layer = this.layers[i]!;
-      const window = layer.layerType === "sliding_attention" ? this.slidingWindow : null;
-      const m = cache[i]!.makeMask(N, window) as SdpaMask;
-      const next = layer.forward(h, m, cache[i]!, false, 0, this.encoderLayerScalars[i]!);
-      if (m.arr) m.arr.dispose();
+      const next = this.layers[i]!.forward(h, cache[i]!, windowRead, 0, this.encoderLayerScalars[i]!);
       h.dispose();
       h = next;
       onLayer(i, h);
@@ -688,16 +623,12 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
     ids.dispose();
     emb = disposing(emb, ops.mulScalar(emb, this.embedScale));
     const layer = this.layers[0]!;
-    const N = promptIds.length;
-    const window = layer.layerType === "sliding_attention" ? this.slidingWindow : null;
-    const m = cache[0]!.makeMask(N, window) as SdpaMask;
     const ls0 = this.encoderLayerScalars[0]!;
 
     const residual = emb;
     const hn = layer.inputNorm.forward(emb);
-    const attnOut = layer.attn.forward(hn, m, cache[0]!, false, 0);
+    const attnOut = layer.attn.forward(hn, cache[0]!, windowRead, 0);
     hn.dispose();
-    if (m.arr) m.arr.dispose();
     cb("attn_out", attnOut);
     const postAttn = layer.postAttnNorm.forward(attnOut);
     attnOut.dispose();
@@ -740,13 +671,8 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
     let h = this.embed.encode(ids);
     ids.dispose();
     h = disposing(h, ops.mulScalar(h, this.embedScale));
-    const N = promptIds.length;
     for (let i = 0; i < this.layers.length; i++) {
-      const layer = this.layers[i]!;
-      const window = layer.layerType === "sliding_attention" ? this.slidingWindow : null;
-      const m = cache[i]!.makeMask(N, window) as SdpaMask;
-      const next = layer.forward(h, m, cache[i]!, false, 0, this.encoderLayerScalars[i]!);
-      if (m.arr) m.arr.dispose();
+      const next = this.layers[i]!.forward(h, cache[i]!, windowRead, 0, this.encoderLayerScalars[i]!);
       h.dispose();
       h = next;
     }
@@ -791,83 +717,25 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
     return out;
   }
 
-  /** Build the per-layer-type decoder masks (reference _make_decoder_masks).
-   *  Returns a map layerType -> SdpaMask. For the dynamic caches used here
-   *  encoder_len == valid_encoder_len always, so the only non-None mask is the
-   *  sliding-window case once the prompt exceeds sliding_window-1 (1023). */
-  #makeDecoderMasks(canvasLength: number, cache: Cache[]): Map<string, SdpaMask> {
-    const masks = new Map<string, SdpaMask>();
-    const types = new Set(this.layers.map((l) => l.layerType));
-    for (const layerType of types) {
-      const li = this.layers.findIndex((l) => l.layerType === layerType);
-      const c = cache[li]!;
-      const offset = c.offset;
-      // encoder_len = chronological cache length; for dynamic caches this equals
-      // min(offset, maxSize), and valid_encoder_len = min(offset, encoder_len)
-      // == encoder_len, so the "trailing invalid" branches never fire here.
-      const [encK, encV] = (c as TemporalCache).temporalView();
-      const encoderLen = encK.shape[2]!;
-      encK.dispose();
-      encV.dispose();
-      const validEncoderLen = Math.min(offset, encoderLen);
-      const keyLen = encoderLen + canvasLength;
-
-      if (layerType === "full_attention") {
-        masks.set(layerType, NO_MASK); // encoder_len == valid_encoder_len
-        continue;
-      }
-      const windowPrefix = Math.max(this.slidingWindow - 1, 0);
-      if (encoderLen <= windowPrefix) {
-        masks.set(layerType, NO_MASK);
-        continue;
-      }
-      // Sliding + wrapped prompt: keep encoder positions [start, valid) + canvas.
-      const start = Math.max(0, validEncoderLen - windowPrefix);
-      const positions = ops.arange(0, encoderLen, 1, Dtype.int32);
-      const startArr = ops.scalarLike(start, positions);
-      const validArr = ops.scalarLike(validEncoderLen, positions);
-      const geStart = ops.greaterEqual(positions, startArr);
-      const ltValid = ops.less(positions, validArr);
-      const encMask = ops.logicalAnd(geStart, ltValid);
-      positions.dispose();
-      startArr.dispose();
-      validArr.dispose();
-      geStart.dispose();
-      ltValid.dispose();
-      const canvasMask = ops.fromInt32(new Array(canvasLength).fill(1), [canvasLength]).astype(
-        encMask.dtype,
-      );
-      const row = ops.concatAxis([encMask, canvasMask], 0);
-      encMask.dispose();
-      canvasMask.dispose();
-      const reshaped = ops.reshape(row, [1, 1, 1, keyLen]);
-      row.dispose();
-      masks.set(layerType, { mode: "array", arr: reshaped });
-    }
-    return masks;
-  }
-
-  /** Decoder canvas pass over an on-device canvas: embed canvas -> 30 layers
-   *  (decoder=true) -> final norm. Returns hidden [1, canvasLength, hidden].
-   *  The D2 engine drives this per denoising step (canvas stays on-device). */
+  /** Decoder canvas pass over an on-device canvas: embed canvas -> 30 layers,
+   *  each reading its cache through the block read (the cache builds the
+   *  reference _make_decoder_masks sliding mask and keeps the newest
+   *  sliding_window - 1 encoder positions) -> final norm. Returns hidden
+   *  [1, canvasLength, hidden]. The D2 engine drives this per denoising step
+   *  (canvas stays on-device). */
   decodeCanvasArr(
     canvasArr: MlxArray,
     cache: Cache[],
     scLogits: MlxArray | null = null,
     scEmbeddings: MlxArray | null = null,
   ): MlxArray {
-    const canvasLength = canvasArr.shape[canvasArr.shape.length - 1]!;
     let h = this.#embedCanvas(canvasArr, scLogits, scEmbeddings);
-    const masks = this.#makeDecoderMasks(canvasLength, cache);
     const offset = cache[0]!.offset;
     for (let i = 0; i < this.layers.length; i++) {
-      const layer = this.layers[i]!;
-      const m = masks.get(layer.layerType)!;
-      const next = layer.forward(h, m, cache[i]!, true, offset, null);
+      const next = this.layers[i]!.forward(h, cache[i]!, blockRead, offset, null);
       h.dispose();
       h = next;
     }
-    for (const m of masks.values()) if (m.arr) m.arr.dispose();
     h = disposing(h, this.finalNorm.forward(h));
     return h;
   }
@@ -928,13 +796,8 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
   extendPrefill(canvasArr: MlxArray, cache: Cache[]): void {
     let h = this.embed.encode(canvasArr);
     h = disposing(h, ops.mulScalar(h, this.embedScale));
-    const N = canvasArr.shape[canvasArr.shape.length - 1]!;
     for (let i = 0; i < this.layers.length; i++) {
-      const layer = this.layers[i]!;
-      const window = layer.layerType === "sliding_attention" ? this.slidingWindow : null;
-      const m = cache[i]!.makeMask(N, window) as SdpaMask;
-      const next = layer.forward(h, m, cache[i]!, false, 0, this.encoderLayerScalars[i]!);
-      if (m.arr) m.arr.dispose();
+      const next = this.layers[i]!.forward(h, cache[i]!, windowRead, 0, this.encoderLayerScalars[i]!);
       h.dispose();
       h = next;
     }
