@@ -189,6 +189,17 @@ without a gate change.
       flag the app writes today through `state/served-affine-kernels.ts` (`1` → unfused,
       otherwise tiled-causal where the configuration tiles). E3 composes the set from the KV
       scheme at load and the app stops writing the flag.
+- [ ] B1f, owed before the merge to main. (1) The delayed row layouts (`delayed-quantized-kv.ts`,
+      `delayed-rotating-quantized-kv.ts`, `bf16-first-kv.ts`, `batched-rotating-quant.ts`) take
+      their affine kernel set when `kv-maintenance`'s `preparePrefill` builds them, from the same
+      transition rule, instead of a hardcoded unfused set: D3 Gemma 4 measured that rows converted
+      inside a multi-row prefill cohort under `--kv-quant config` read windows unfused where the
+      old graph tiled them (0.77 on the window read; the e4b assistant-drafter cohort's draft
+      counts moved 37/5 → 28/11), and this likely reaches Qwen 3.5 since C1. (2) The batched paged
+      cache's window read joins its rows left-padded into one SDPA, as the old `PagedKvRows` path
+      did, so `gemma4-paged`'s "gathered bf16 equals plain KV" check at three rows holds again
+      (0.03 today); per-row reads are a change of served numbers and wait for the bit-stability
+      decision.
 - [ ] The quantized lego `--kv-quant N` composes is bf16 through its first append and quantized
       storage after, inside its own `appendWindow`/`appendDecode` (the state transition the
       three `delayed-*-kv.ts` caches do today, owned by one lego built at load), so the first
@@ -235,9 +246,16 @@ without a gate change.
       read through `attend` (D3) and the app stops writing it (E3).
 - [ ] Out of this step, each needing its own contract before its graph can move: GLM-5.2 MLA
       compressed attention (`models/glm52/mla.ts`), the Gemma assistant drafter's donor reads,
-      softcap attention in the universal dense graph and the training flash path (these become
-      the composed cache's read for those compositions), and the segmented backward's donor
-      checkpoints in `models/gemma4/trainable.ts`.
+      and the segmented backward's donor checkpoints in `models/gemma4/trainable.ts`. The
+      universal graph's softcap attention landed in D3 as `state/softcap-attention.ts`, a named
+      read chosen per layer at construction.
+- [ ] Training-side reads (owner: the training item): `TrainingCache.appendWindow` takes no
+      window, so perplexity of a universal model with sliding layers through it diverges (D3
+      measured 484.94 → 482.76 on a synthetic case; pinned as `test.failing` in the dense gate,
+      to flip back when `TrainingCache` takes its window from `trainForwardHidden`).
+      `PrefixSharedCache` has no read and the flash choice is a trainer global, so MiniCPM5's
+      training forward stays in its graph, deprecated, and its two remaining `cache-escape`
+      ratchet entries belong here.
 - [ ] The deprecated members leave the contract in D3, once every graph reads through `attend`.
 
 Exit: `quantizedSdpaUnfused` and `kv4DecodeAttention` have no callers outside `state/`; the
@@ -348,7 +366,11 @@ same phase; the Qwen generator (D2) produces it.
       `#matches`, named phases. Regenerate `gemma4-e4b.ts`, `gemma4-12b.ts`, `gemma4-26b.ts`.
 - [ ] Write `packages/inference/scripts/gen-qwen38.ts` taking the composition as input; the M4 Pro
       graph and the M1 Max graph are its outputs. The hand-written TQ graph is broken into its
-      reusable pieces and deleted.
+      reusable pieces and deleted. D1 landed the generator and the M4 Pro output (`--describe`
+      reads a snapshot's config and shard headers; the committed file regenerates with an empty
+      diff). The M1 Max output needs, first: layer classes for the fused gate/up reduce kernels
+      and the packed down (today functions), the TQ graph's three env A/B flags turned into
+      composition facts or separate kernels, and an identity gate run on that host.
 
 Exit: `git diff` of a regenerated file against its committed version is empty; the generated Gemma
 parity test passes on e4b and 12B; no generated graph extends a graph; no hand-written
@@ -371,6 +393,11 @@ Exit: no graph reads `quantizedAttention`; bit-identical generic forwards.
 - [ ] The `qwen3.5` entry in `models/factory.ts` becomes a table keyed by fingerprint, device,
       bridge, KV scheme, depth, chunk size, adapters and max rows. The generic graph is the entry
       yielded when nothing specialized matches. The same shape for Gemma's `GENERATED` map.
+
+- [ ] The key includes the KV scheme and max rows because the M4 Pro composition serves bf16 and
+      affine 4-bit group 64 only (D1: the old graph went generic for 8-bit and per-layer config;
+      the new one would run its width sets over whatever cache it is handed) and its
+      `Kv4Head256Cache` lego serves one sequence until E3's batched form lands.
 
 Exit: selection is data; `qwen38TrellisM4ProAccepts` and the nested ternary are gone.
 
@@ -434,7 +461,20 @@ paired batched-lane benchmark records the gain at one and four rows.
 
 #### E3. App
 
-- [ ] `--kv-quant` composes the cache lego before the model loads.
+- [ ] `--kv-quant` composes the cache lego before the model loads. D1 measured why this cannot
+      wait: the scheduler still calls `makeCache()` with no scheme and `kv-maintenance` converts
+      to the plain affine cache, so the entire M4 Pro graph (which reads through the cache
+      instead of injecting its KV4 and folded kernels) serves `--kv-quant 4` through the generic
+      read until the lego is composed (logits 0.028 at one row, up to 0.069 at eight). The M4 Pro
+      composition's lego is a bf16-first `Kv4Head256Cache` (first append bf16 as the old graph's
+      conversion-after-first-forward did, then the KV4 decode and folded window reads), and its
+      batched form reads with the KV4 kernels while its own row layout holds one row and with the
+      plain affine read when it holds more, which is what the old graph served (one sequence on
+      the KV4 cores, several on the generic path); the choice keys on the cache's own layout, as
+      the tiled-causal set does. E3's gate: the composed lego against the old graph's injected
+      cores at maxDiff 0 on the real artifact.
+- [ ] `MLX_BUN_QWEN_SPEC_KV4` (read once in the M4 Pro constructor since D1) and
+      `MLX_BUN_MIXED_PACKED_MLP` become composition facts.
 - [ ] The per-request `kvBits`, `kvConfig` and `quantizedKvStart` options leave `generation/types.ts` and the server request plan; the cache lego is composed at load from `--kv-quant` and `--quantized-kv-start`.
 - [ ] `--num-draft-tokens adaptive` is served by the scheduler choosing among the built widths; a number is fixed depth.
 
