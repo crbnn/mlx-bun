@@ -10,7 +10,7 @@ import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import type { MlxArray } from "@mlx-bun/mlx/array";
-import type { ReadPhase } from "../../src/models/qwen/blocks";
+import type { ReadPhase } from "../../src/models/graph";
 
 const artifact = process.env.MLX_BUN_TEST_TRELLIS_MODEL;
 if (artifact && !existsSync(`${artifact}/config.json`)) throw new Error(`unavailable packed artifact: ${artifact}`);

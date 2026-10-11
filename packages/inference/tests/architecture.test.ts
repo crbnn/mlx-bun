@@ -851,19 +851,16 @@ const seamRatchet: RatchetTable = {
     "packages/inference/src/generation/speculative/sources/two-model.ts": 1, // E2 (prefill tail split)
     "packages/inference/src/layers/geglu.ts": 1, // C2
     "packages/inference/src/layers/quantized-attention.ts": 2, // B1
-    "packages/inference/src/models/gemma4/compiled-decode.ts": 1, // D3
-    "packages/inference/src/models/gemma4/model.ts": 1, // E2 (mixed iteration)
     "packages/inference/src/models/glm52/model.ts": 2, // no item yet: B1 defers GLM-5.2 MLA
     "packages/inference/src/state/layout.ts": 3, // no item yet: prefillCacheLayout dispatches on cache class
     "packages/training/src/kernels/flash-cce.ts": 9, // C2 for now
   },
   "cache-escape": {
     "packages/inference/src/generation/speculative/bindings/projected-context-rows.ts": 1, // B1 (readBlock)
-    "packages/inference/src/models/gemma4/compiled-decode.ts": 2, // D3
     "packages/inference/src/models/gemma4/generated/gemma4-12b.ts": 5, // D2
     "packages/inference/src/models/gemma4/generated/gemma4-26b.ts": 6, // D2
     "packages/inference/src/models/gemma4/generated/gemma4-e4b.ts": 8, // D2
-    "packages/inference/src/models/gemma4/model.ts": 13, // D3
+    "packages/inference/src/models/gemma4/model.ts": 2, // no item yet: B1 defers the segmented backward's donor checkpoints (training forward)
     "packages/inference/src/models/minicpm5/model.ts": 2, // no item yet: the training flash path and prefix-shared caches (B1 lists them out of its step)
     "packages/inference/src/models/qwen/blocks.ts": 3, // D1
     "packages/inference/src/models/qwen/qwen38-27b-trellis-m4pro.ts": 2, // D1

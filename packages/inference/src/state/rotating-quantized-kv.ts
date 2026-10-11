@@ -511,6 +511,14 @@ class TracedRingQuantizedKVCache extends RotatingQuantizedKVCache implements Dec
       { packed: whole(updV.packed), scales: whole(updV.scales), biases: whole(updV.biases) },
     ];
   }
+
+  /** The decode read over the in-graph write: the whole updated ring with no
+   *  mask and the decode kernel, as `RotatingQuantizedKVCache.appendDecode`
+   *  reads the ring it writes in place. */
+  override appendDecode(k: MlxArray, v: MlxArray): AttentionRead {
+    const [keys, values] = this.updateAndFetchQuantized(k, v);
+    return affineRead(keys, values, unmaskedLease, this.kernels.decode);
+  }
 }
 
 function quantRingDecodeSlot(offset: number, maxSize: number, groupSize: number, bits: number): DecodeSlot {

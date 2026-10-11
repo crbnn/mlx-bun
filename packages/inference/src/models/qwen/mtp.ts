@@ -12,7 +12,7 @@ import type { RecurrentMtpModule } from "../../contracts/mlx/drafter";
 import { DenseLinear } from "../../layers/dense-linear";
 import { compiledSwiglu } from "../../layers/swiglu";
 import { Qwen3Attention } from "./blocks";
-import { deprecatedPhase } from "./qwen3_5";
+import { deprecatedPhase } from "../graph";
 
 type MtpLinear = DenseLinear | QuantizedLinear;
 

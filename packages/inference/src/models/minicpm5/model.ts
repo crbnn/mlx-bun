@@ -14,7 +14,7 @@ import type { TrainableGraph } from "../../contracts/mlx/trainable";
 import { activePrefixLayout, ropeBlocks } from "../../layers/prefix-layout";
 import { miniCpmTrainable } from "./trainable";
 import { declareGraph } from "../capabilities";
-import { atEveryWidth } from "../graph";
+import { atEveryWidth, deprecatedPhase, type ReadPhase } from "../graph";
 import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
 import { type Cache, type Mask } from "../../contracts/mlx/cache";
@@ -29,9 +29,7 @@ import { AttentionMasks } from "../../state/attention-read";
 import { deferredTurboQuantKernels } from "../../state/turboquant-attention";
 import { flashAttention, flashSupported, getTrainingAttn } from "../../kernels/attention/flash";
 import { compiledSwiglu } from "../../layers/swiglu";
-import { cacheRead, type AttentionReadStrategy, type ReadPhase } from "../qwen/blocks";
-// TODO(E2): the integration moves this adapter to models/graph.ts; swap the import.
-import { deprecatedPhase } from "../qwen/qwen3_5";
+import { cacheRead, type AttentionReadStrategy } from "../qwen/blocks";
 
 export class LlamaAttention {
   readonly qProj: QuantizedLinear;

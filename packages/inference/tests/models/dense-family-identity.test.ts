@@ -161,8 +161,6 @@ interface Family {
   schemes: Scheme[];
   /** Affine rows delayed until this many positions; the softcapped read stays below it. */
   delayedStart: number;
-  /** A sliding layer read through the cache's own read: the training cache takes no window (see the scoring test). */
-  trainingCacheWindowGap?: boolean;
 }
 
 function miniCpmPair(): Pair {
@@ -233,7 +231,7 @@ const FAMILIES: Family[] = [
   { name: "minicpm5", build: miniCpmPair, schemes: [BF16, ...CONVERTED], delayedStart: 40 },
   { name: "qwen3", build: qwen3Pair, schemes: [BF16, ...CONVERTED], delayedStart: 40 },
   { name: "qwen3-moe", build: qwen3MoePair, schemes: [BF16, ...CONVERTED], delayedStart: 40 },
-  { name: "universal llama (sliding)", build: llamaSlidingPair, schemes: [BF16, ...CONVERTED], delayedStart: 40, trainingCacheWindowGap: true },
+  { name: "universal llama (sliding)", build: llamaSlidingPair, schemes: [BF16, ...CONVERTED], delayedStart: 40 },
   { name: "universal gemma2 softcap", build: () => gemma2Pair(), schemes: [BF16, CONVERTED[4]!], delayedStart: 80 },
   { name: "universal gemma2 softcap (sliding)", build: () => gemma2Pair([F, S, F, S]), schemes: [BF16, CONVERTED[4]!], delayedStart: 80 },
 ];
@@ -504,14 +502,8 @@ for (const family of FAMILIES) {
     }, 120_000);
 
     // Perplexity rows run over the stateless training caches (`TrainingCache`),
-    // whose window read takes no sliding window (B1e composed it for full
-    // attention). The graph read their mask with its sliding layers' window
-    // before it read through the cache, so a sliding layer of the universal
-    // graph scores differently here until the training cache takes its window
-    // (state/training-cache.ts, from scoring/full-sequence.ts). Recorded, not
-    // worked around; flip to `test` when that lands.
-    const scoring = family.trainingCacheWindowGap ? test.failing : test;
-    scoring(`${family.name}: full-sequence scoring, perplexity rows over the training caches`, () => {
+    // each composed with its layer's sliding window by scoring/full-sequence.ts.
+    test(`${family.name}: full-sequence scoring, perplexity rows over the training caches`, () => {
       const p = pair(family), tag = `${family.name} scoring`;
       const rows = [Int32Array.from(prompt(33, 63)), Int32Array.from(prompt(33, 64)), Int32Array.from(prompt(33, 65))];
       const expected = evalPpl(p.old as unknown as RuntimeModel, rows, 2);

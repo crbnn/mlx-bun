@@ -46,10 +46,11 @@ import { kv4DecodeAttention } from "../../layers/kv4-decode-attention";
 import { foldedQuantizedSdpa } from "../../layers/quantized-attention";
 import { AneAffineSplit, AneTrellisMlpSplit, AneTrellisMlpSplitK3i, aneAvailable, type AneMlpSplit }
   from "../../layers/ane-prefill-split";
-import { Qwen35Model, deprecatedPhase } from "./qwen3_5";
+import { deprecatedPhase, type ReadPhase } from "../graph";
+import { Qwen35Model } from "./qwen3_5";
 import {
   GatedDeltaNet, Qwen3Attention, quantizedCoreRead, type AttentionLinear, type AttentionLinearLoader, type Qwen3Layer,
-  type QuantizedAttentionCore, type ReadPhase,
+  type QuantizedAttentionCore,
 } from "./blocks";
 import { qwen38TrellisTqFingerprint } from "./qwen38-27b-trellis-tq";
 import { qwenDraftTarget, qwenResidualBasis } from "./media-input";

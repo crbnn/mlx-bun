@@ -36,7 +36,8 @@ import { type Cache, type GatedDeltaCache } from "../../contracts/mlx/cache";
 import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
 import { compiledSwiglu } from "../../layers/swiglu";
 import { Qwen35Model } from "./qwen3_5";
-import type { Qwen3Layer, ReadPhase } from "./blocks";
+import type { ReadPhase } from "../graph";
+import type { Qwen3Layer } from "./blocks";
 import { qwenDraftTarget, qwenResidualBasis } from "./media-input";
 import {
   TRELLIS_MATVEC_MAX_M, fusedGateUpEligible, fusedGateUpSwiglu,

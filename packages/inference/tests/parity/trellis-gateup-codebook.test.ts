@@ -6,7 +6,7 @@ import { TrellisLinear } from "@mlx-bun/inference/layers";
 import { TRELLIS_MATVEC_MAX_M, fusedGateUpSwiglu, fusedGateUpSwigluMixed, trellisScatter, type ScatterRepresentation } from "@mlx-bun/inference/kernels/trellis";
 import { gateUpCodebookEligible } from "../../src/kernels/trellis/gate-up";
 import { scatterBitsEligible, scatterFloatCodebookEligible } from "../../src/kernels/trellis/scatter";
-import type { ReadPhase } from "../../src/models/qwen/blocks";
+import type { ReadPhase } from "../../src/models/graph";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import { createRuntimeConfig, runtimeConfig, withRuntimeConfig } from "../../src/runtime/config";
 import { deviceArchitecture, clearCache } from "@mlx-bun/mlx/ffi";

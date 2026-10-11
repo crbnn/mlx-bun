@@ -8,7 +8,7 @@ import type { UniversalDenseModel } from "../../../src/models/universal/dense";
 import type { ModelConfig } from "../../../src/artifacts/config";
 import type { Weights } from "../../../src/artifacts/weights";
 import type { Cache, Mask } from "../../../src/contracts/mlx/cache";
-import type { ReadPhase } from "../../../src/models/qwen/blocks";
+import type { ReadPhase } from "../../../src/models/graph";
 import type { DraftProvider } from "../../../src/generation/speculative/source";
 import type { GenerateOptions } from "../../../src/generation/index";
 

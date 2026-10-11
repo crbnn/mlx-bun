@@ -57,7 +57,8 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
   const { CompiledDecode } = await import("@mlx-bun/inference/models/gemma4/compiled-decode");
   const { generate } = await import("@mlx-bun/inference/generation");
   const { loadTokenizer } = await import("@mlx-bun/inference/input");
-  const { unfusedAffineKernels } = await import("../../src/state/affine-attention");
+  // The kernel set kv-maintenance composes for the flag the run has (the monolith reads through it).
+  const { servedAffineKernels } = await import("../../src/state/served-affine-kernels");
   // The fast-path counters live in each generated module.
   const modules = await Promise.all([import("../../src/models/gemma4/generated/gemma4-12b"),
     import("../../src/models/gemma4/generated/gemma4-e4b"), import("../../src/models/gemma4/generated/gemma4-26b")]);
@@ -99,7 +100,7 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
           // The serve scenario: each cache the kv_config names converts before any forward.
           for (let layer = 0; layer < caches.length; layer++) {
             const entry = kvConfig.find(item => item.layerIdx === layer);
-            if (entry) caches[layer] = caches[layer].toQuantized(entry.groupSize, entry.bits, unfusedAffineKernels);
+            if (entry) caches[layer] = caches[layer].toQuantized(entry.groupSize, entry.bits, servedAffineKernels());
           }
           const vectors: Buffer[] = [];
           let tokens = prompt;
@@ -165,7 +166,7 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
       try {
         for (let layer = 0; layer < caches.length; layer++) {
           const entry = kvConfig.find(item => item.layerIdx === layer);
-          if (entry) caches[layer] = caches[layer].toQuantized(entry.groupSize, entry.bits, unfusedAffineKernels);
+          if (entry) caches[layer] = caches[layer].toQuantized(entry.groupSize, entry.bits, servedAffineKernels());
         }
         const ids = ops.fromInt32([...prompt.slice(0, ROW_TOKENS), ...prompt.slice(-ROW_TOKENS)], [2, ROW_TOKENS]);
         try {

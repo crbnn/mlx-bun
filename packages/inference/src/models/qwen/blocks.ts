@@ -21,16 +21,9 @@ import { RMSNorm } from "../../layers/normalization";
 import type { AttentionRead, Cache, CommittedAttentionCache, GatedDeltaCache, GatedDeltaHeads, GatedDeltaParameters } from "../../contracts/mlx/cache";
 import { applyInterleavedRope } from "../../layers/qwen-mrope";
 import type { MropeForwardState } from "../../contracts/mlx/positions";
+import type { ReadPhase } from "../graph";
 
 const PREFIX = "language_model";
-
-/** The phase a forward runs, named by its caller: one new position per row
- * (`decode`), a causal window of positions (`window`: prefill chunks and tails,
- * speculative verify windows), or a span of already decided positions
- * (`committed`: token fill). The names are the cache's own reads
- * (`AttentionCache.appendDecode`, `appendWindow`,
- * `CommittedAttentionCache.appendCommitted`). */
-export type ReadPhase = "decode" | "window" | "committed";
 
 /** The attention read each phase names. A committed span reads through
  * `appendCommitted`, so the cache must be composed for committed appends. */

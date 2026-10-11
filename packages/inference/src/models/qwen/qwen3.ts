@@ -25,15 +25,13 @@ import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import type { MlxDeclaredGraph, MlxPhaseForward, MlxTokenPhases, MlxVerifyForward } from "../../contracts/mlx/graph";
 import { declareGraph } from "../capabilities";
-import { atEveryWidth } from "../graph";
+import { atEveryWidth, deprecatedPhase, type ReadPhase } from "../graph";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import { QuantizedLinear } from "../../layers/quantized-linear";
 import { RMSNorm } from "../../layers/normalization";
 import { type Cache } from "../../contracts/mlx/cache";
 import { compiledSwiglu } from "../../layers/swiglu";
-import { cacheRead, type AttentionReadStrategy, type ReadPhase } from "./blocks";
-// TODO(E2): the integration moves this adapter to models/graph.ts; swap the import.
-import { deprecatedPhase } from "./qwen3_5";
+import { cacheRead, type AttentionReadStrategy } from "./blocks";
 
 /** Qwen3 attention (per-head q/k RMSNorm over head_dim before full-head RoPE,
  *  GQA). qwen3 and qwen3_moe share it; they differ only in the `rope_theta`

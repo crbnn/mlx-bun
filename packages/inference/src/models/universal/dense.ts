@@ -26,7 +26,7 @@ import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import type { MlxDeclaredGraph, MlxPhaseForward, MlxTokenPhases, MlxVerifyForward } from "../../contracts/mlx/graph";
 import { PLAIN_KV_VERIFICATION, declareGraph } from "../capabilities";
-import { atEveryWidth } from "../graph";
+import { atEveryWidth, deprecatedPhase, type ReadPhase } from "../graph";
 import type { QuantizedLinear } from "../../layers/quantized-linear";
 import { TrellisLinear } from "../../layers/trellis-linear";
 import { RMSNorm } from "../../layers/normalization";
@@ -38,9 +38,7 @@ import { initializeRope, NoRope, phi3SuRope, UniversalRope } from "../../layers/
 import { loadEmbedding, loadLayerNorm, loadLinear, loadRmsNorm, type AnyEmbedding, type AnyLinear, type AnyNorm } from "../../layers/loading";
 import { WeightAudit } from "../../artifacts/weight-audit";
 import { cleanupFailure } from "../../runtime/resources";
-import { cacheRead, type AttentionReadStrategy, type ReadPhase } from "../qwen/blocks";
-// TODO(E2): the integration moves this adapter to models/graph.ts; swap the import.
-import { deprecatedPhase } from "../qwen/qwen3_5";
+import { cacheRead, type AttentionReadStrategy } from "../qwen/blocks";
 
 /** The score-softcapped read as a block's read strategy: decode reads
  * `appendDecode`, a window `appendWindow`; this graph has no committed append

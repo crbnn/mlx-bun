@@ -21,7 +21,7 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { createCausalMask } from "../kernels/attention/masks";
 import { type AttentionCache, type AttentionRead, type Cache, type Mask } from "../contracts/mlx/cache";
-import { sdpaRead } from "../state/attention-read";
+import { AttentionMasks, sdpaRead } from "../state/attention-read";
 import { isRecurrentCache } from "../state/capabilities";
 import { TrainingCache, TrainingSSMCache } from "../state/training-cache";
 import type { RuntimeModel } from "../models/factory";
@@ -59,10 +59,12 @@ export function trainForwardHidden(
   }
 
   // B=1 / no padding: stateless offset-0 caches (one per donor layer), so the
-  // forward is pure and safe to recompute under gradient checkpointing.
+  // forward is pure and safe to recompute under gradient checkpointing. Each
+  // keeps its layer's sliding window, and they share one mask memo.
   const probe = model.makeCache();
+  const masks = new AttentionMasks();
   const cache: Cache[] = probe.map((c) =>
-    isRecurrentCache(c) ? new TrainingSSMCache() : new TrainingCache());
+    isRecurrentCache(c) ? new TrainingSSMCache() : new TrainingCache(cacheWindow(c), masks));
   for (const c of probe) c.dispose();
   try {
     return model.forwardHidden(ids, cache); // [B, L, hidden]

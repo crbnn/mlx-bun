@@ -32,16 +32,13 @@ import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import type { MlxDeclaredGraph, MlxPhaseForward, MlxTokenPhases, MlxVerifyForward } from "../../contracts/mlx/graph";
 import { declareGraph } from "../capabilities";
-import { atEveryWidth } from "../graph";
+import { atEveryWidth, deprecatedPhase, type ReadPhase } from "../graph";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import { QuantizedLinear } from "../../layers/quantized-linear";
 import { QuantizedSwitchLinear } from "../../layers/quantized-switch-linear";
 import { RMSNorm } from "../../layers/normalization";
 import { type Cache } from "../../contracts/mlx/cache";
 import { Qwen3Attention } from "./qwen3";
-import type { ReadPhase } from "./blocks";
-// TODO(E2): the integration moves this adapter to models/graph.ts; swap the import.
-import { deprecatedPhase } from "./qwen3_5";
 
 // ── qwen3_moe.py Attention (== plain qwen3, rope_theta default 1e7) ───────────
 const MOE_ROPE_THETA = 10000000;                                        // args.rope_theta

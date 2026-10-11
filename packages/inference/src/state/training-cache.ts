@@ -4,7 +4,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { createCausalMask } from "../kernels/attention/masks";
 import { gatedDeltaUpdate } from "../kernels/delta/gated";
 import type { AttentionCache, AttentionRead, Cache, GatedDeltaCache, GatedDeltaParameters, Mask } from "../contracts/mlx/cache";
-import { causalLease, sdpaRead, unmaskedLease } from "./attention-read";
+import { AttentionMasks, causalLease, sdpaRead, unmaskedLease, withLease } from "./attention-read";
 import type { PrefixLayout } from "../contracts/mlx/trainable";
 
 /** Stateless cache for the training forward. Training is always a single
@@ -16,12 +16,19 @@ import type { PrefixLayout } from "../contracts/mlx/trainable";
  *  second run.
  *
  *  Reads: the pass-through views of `k` and `v` and the stock fused SDPA, the
- *  call a graph made after `makeMask(L, null)` and `updateAndFetch` here before
- *  it read through the cache (Qwen 3.5's training and scoring forward): no mask
- *  for one position, the fused causal mask for a window. A graph with a sliding
- *  window keeps the deprecated path; this cache is composed for full-attention
- *  reads only. */
+ *  call a graph made after `makeMask(L, window)` and `updateAndFetch` here
+ *  before it read through the cache (Qwen 3.5's and Gemma 4's training and
+ *  scoring forward): no mask for one position, the fused causal mask for a
+ *  window, and the offset-0 sliding-window mask once a window is longer than
+ *  `window`. A layer with a sliding window gets a cache composed with it; the
+ *  caches of one forward share `masks`, so its layers build that mask once. */
 export class TrainingCache implements AttentionCache {
+  constructor(
+    /** The layer's sliding window; null for full attention. */
+    readonly window: number | null = null,
+    /** The per-forward masks of the model this cache belongs to. */
+    readonly masks = new AttentionMasks(),
+  ) {}
   /** Training-only adapter; never admitted, merged, or persisted. */
   signature(): string { return "train:training"; }
   offset = 0;
@@ -30,8 +37,14 @@ export class TrainingCache implements AttentionCache {
     return sdpaRead(keys, values, unmaskedLease);
   }
   appendWindow(k: MlxArray, v: MlxArray): AttentionRead {
-    const [keys, values] = this.updateAndFetch(k, v);
-    return sdpaRead(keys, values, causalLease);
+    const L = k.shape[2]!, window = this.window;
+    const mask = window === null || L <= window ? causalLease
+      : this.masks.lease(`training-window:${window}`, `${L}`,
+        () => ({ mode: "array", arr: createCausalMask(L, 0, window) }));
+    return withLease(mask, held => {
+      const [keys, values] = this.updateAndFetch(k, v);
+      return sdpaRead(keys, values, held);
+    });
   }
   updateAndFetch(k: MlxArray, v: MlxArray): [MlxArray, MlxArray] {
     // Return fresh views: the caller disposes its input k/v right after (its
@@ -55,7 +68,8 @@ export class TrainingCache implements AttentionCache {
     /* offset is pinned at 0 */
   }
   dispose(): void {
-    /* owns no arrays */
+    // Owns no arrays; drops the memo's hold on a sliding-window mask.
+    this.masks.clear();
   }
 }
 

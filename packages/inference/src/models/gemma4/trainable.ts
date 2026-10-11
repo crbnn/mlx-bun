@@ -12,7 +12,7 @@ import type { RMSNorm } from "../../layers/normalization";
 import type { QuantizedEmbedding } from "../../layers/quantized-embedding";
 
 /** Optional gradient-checkpointing context for the training forward. When set,
- *  forwardLayers wraps each layer in a Checkpoint so its interior activations
+ *  the training forward wraps each layer in a Checkpoint so its interior activations
  *  are recomputed in the backward pass. `byLayer` maps a layer index to that
  *  layer's trainable LoRA weights, partitioned into the attention sub-block
  *  (q/k/v/o_proj) and the MLP sub-block (gate/up/down_proj + per-layer gate/
@@ -46,7 +46,9 @@ export interface Gemma4Training {
   readonly cacheIndex: readonly number[];
   readonly reusedDonors: Set<number>;
   gradCkpt: GradCheckpointCtx | null;
-  forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray;
+  /** The training forward over training caches, whose masks the caches build
+   * and whose donors hand their sharers plain keys and values. */
+  forwardTrainingHidden(ids: MlxArray, cache: Cache[]): MlxArray;
   embedForSegmented(ids: MlxArray): { hScaled: MlxArray; perLayer: MlxArray | null };
   makeTrainingMasks(cache: Cache[], L: number): Map<string, Mask>;
   runLayerRange(
@@ -166,11 +168,12 @@ export function gemma4Trainable(model: Gemma4Training): TrainableGraph {
     },
     prefixShared: {
       forwardHidden(ids: MlxArray, layout: PrefixLayout): MlxArray {
-        // One prefix cache per DONOR layer (sharers consume donors' fetched K/V inside forwardLayers).
+        // One prefix cache per DONOR layer (sharers consume donors' fetched K/V
+        // inside the training forward); the caches build the block-sparse masks.
         const caches: Cache[] = Array.from({ length: model.numDonors }, () => new PrefixSharedCache(layout));
         setActivePrefixLayout(layout);
         try {
-          return model.forwardHidden(ids, caches); // [1, T, hidden], post-finalNorm
+          return model.forwardTrainingHidden(ids, caches); // [1, T, hidden], post-finalNorm
         } finally {
           setActivePrefixLayout(null);
           for (const c of caches) c.dispose();

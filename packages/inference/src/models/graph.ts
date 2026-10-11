@@ -40,6 +40,34 @@ export function atEveryWidth<Operation>(operation: Operation): MlxWidthTable<Ope
   return Object.freeze({ one: operation, twoToFour: operation, fiveToEight: operation, wider: operation });
 }
 
+/** The phase a forward runs, named by its caller: one new position per row
+ * (`decode`), a causal window of positions (`window`: prefill chunks and tails,
+ * speculative verify windows), or a span of already decided positions
+ * (`committed`: token fill). The names are the cache's own reads
+ * (`AttentionCache.appendDecode`, `appendWindow`,
+ * `CommittedAttentionCache.appendCommitted`). */
+export type ReadPhase = "decode" | "window" | "committed";
+
+/** The phase of a forward reaching one of a graph's deprecated entry points
+ * (`forwardHidden`, `forwardHiddenMixed`, `forwardHiddenAtPositions`,
+ * `forwardEmbeddingsAtPositions`, `forwardEmbeddings`, `createAppend`'s
+ * `forwardHidden`, the Qwen MTP companion's `forward`, the generated Gemma 4
+ * graphs' `forwardLayers` fallback), derived from the shape of the input it was
+ * handed, [rows, tokens, ...]. A committed-append forward (`committedAppend`) of
+ * one row is a committed span; otherwise one position per row is a decode and
+ * more is a window. A padded forward of one position per row would read as a
+ * decode, which ignores prefill padding; no caller pads a one-position forward.
+ * @deprecated E2 deletes this adapter when the scheduler calls the named phases
+ * (`prefillChunk`, `prefillTail`, `decode`, `verify` and the committed append).
+ * Nothing else in a graph or its blocks derives the phase from a shape. */
+export function deprecatedPhase(input: MlxArray): "decode" | "window";
+export function deprecatedPhase(input: MlxArray, committedAppend: boolean): ReadPhase;
+export function deprecatedPhase(input: MlxArray, committedAppend = false): ReadPhase {
+  const [rows, tokens] = input.shape as [number, number];
+  if (committedAppend && rows === 1) return "committed";
+  return tokens === 1 ? "decode" : "window";
+}
+
 /** Bind once. No array wrapper, await, readback, or synchronization is added
  * to synchronous forward calls. Existing quant-specific kernels stay inside
  * the supplied operations. This adapter does not take ownership of weights. */
