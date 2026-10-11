@@ -3,7 +3,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import type { MlxArray } from "@mlx-bun/mlx";
 import type { Cache } from "@mlx-bun/inference/contracts/mlx";
-import type { KvSchemeOptions } from "@mlx-bun/inference/state/kv-scheme";
+import type { KvOptions } from "../models/test-composition";
 import { configureRuntime } from "@mlx-bun/inference/runtime/config";
 
 const timeout = 240_000;
@@ -21,6 +21,10 @@ for (const [family, checkpoint] of [
     let generate: typeof import("@mlx-bun/inference/generation").generate;
     let weights: import("@mlx-bun/inference/artifacts").Weights | undefined;
     let model: import("@mlx-bun/inference/models/gemma4").Gemma4Model;
+    /** The graph composed with a KV scheme: one per scheme, built on first use.
+     * Affine reads take the tiled-causal set this test read before E3 (its
+     * environment left MLX_BUN_NO_FUSED_SDPA unset). */
+    let modelFor: (kv: KvOptions) => import("@mlx-bun/inference/models/gemma4").Gemma4Model;
     let initialRetraces: number;
     let growingPrompt: number[];
     let wrappedPrompt: number[];
@@ -42,7 +46,15 @@ for (const [family, checkpoint] of [
       // These are different compiled paths: dense segmented vs e4b whole graph.
       expect(config.text.numKvSharedLayers > 0).toBe(family === "e4b");
       weights = await Weights.open(checkpoint!);
-      model = new Gemma4Model(weights, config);
+      const { kvOf, testComposition } = await import("../models/test-composition");
+      const models = new Map<string, InstanceType<typeof Gemma4Model>>();
+      modelFor = kv => {
+        const key = JSON.stringify(kv);
+        let built = models.get(key);
+        if (!built) { built = new Gemma4Model(weights!, config, testComposition(kvOf(kv, "tiled-causal"))); models.set(key, built); }
+        return built;
+      };
+      model = modelFor({});
       expect(model.windowSize).toBeGreaterThan(8);
       expect(model.perLayerWidth > 0).toBe(family === "e4b");
       initialRetraces = CompiledDecode.unexpectedRetraces;
@@ -81,7 +93,7 @@ for (const [family, checkpoint] of [
       if (mlx) { mlx.synchronize(mlx.gpuStream); mlx.clearCache(); }
     });
 
-    function kvOptions(mixed: boolean): KvSchemeOptions {
+    function kvOptions(mixed: boolean): KvOptions {
       return mixed ? { kvConfig: model.config.kvQuant!, quantizedKvStart: 0 } : {};
     }
     function evalState(cache: Cache[], extra: MlxArray[] = []): void {
@@ -92,17 +104,17 @@ for (const [family, checkpoint] of [
           if (cache.stateNeedsDispose) for (const plane of planes) plane.dispose();
       }
     }
-    function forward(ids: number[], cache: Cache[]): MlxArray {
+    function forward(graph: typeof model, ids: number[], cache: Cache[]): MlxArray {
       const input = mlx.ops.fromInt32(ids, [1, ids.length]);
-      try { return model.forwardHidden(input, cache); }
+      try { return graph.forwardHidden(input, cache); }
       finally { input.dispose(); }
     }
-    async function trajectory(prompt: number[], compiled: boolean, extra: KvSchemeOptions): Promise<number[]> {
+    async function trajectory(prompt: number[], compiled: boolean, kv: KvOptions): Promise<number[]> {
       const restore = configureRuntime({ MLX_BUN_COMPILED_DECODE: compiled ? "1" : "0" });
       try {
         const out: number[] = [];
-        for await (const token of generate(model, prompt, {
-          maxTokens: family === "12B" ? 32 : 24, temperature: 0, ...extra,
+        for await (const token of generate(modelFor(kv), prompt, {
+          maxTokens: family === "12B" ? 32 : 24, temperature: 0,
         })) out.push(token.token);
         return out;
       } finally { restore(); }
@@ -130,23 +142,25 @@ for (const [family, checkpoint] of [
     // Compare original native bytes, including dtype and shape. No float cast,
     // tolerance, argmax-only check, or independently chosen continuation tokens.
     function fullLogits(compiled: boolean, context: number, mixed: boolean) {
-      const cache = model.makeCache();
-      const maintain = state.createKvMaintenance(kvOptions(mixed));
+      // The graph composed with the scheme: its caches convert inside their own appends.
+      const graph = modelFor(kvOptions(mixed));
+      const cache = graph.makeCache();
       const restore = configureRuntime({ MLX_BUN_COMPILED_DECODE: compiled ? "1" : "0" });
       try {
         const prefix = promptOf(context);
         for (let position = 0; position < prefix.length; position += 128) {
-          const hidden = forward(prefix.slice(position, position + 128), cache);
-          try { evalState(cache, [hidden]); maintain(cache); }
+          const hidden = forward(graph, prefix.slice(position, position + 128), cache);
+          try { evalState(cache, [hidden]); }
           finally { hidden.dispose(); }
           mlx.clearCache();
         }
         expect(cache.every(c => c.offset === context)).toBe(true);
         if (mixed) {
           for (const entry of model.config.kvQuant!) {
-            const row = cache[entry.layerIdx];
+            const layer = cache[entry.layerIdx];
             // The e4b config may also name sharers; only donor layers own cache.
-            if (!row) continue;
+            if (!layer) continue;
+            const row = layer.composed?.storage() ?? layer;
             expect(row instanceof state.QuantizedKVCache || row instanceof state.RotatingQuantizedKVCache).toBe(true);
             expect((row as InstanceType<typeof state.QuantizedKVCache>).bits).toBe(entry.bits);
           }
@@ -159,19 +173,18 @@ for (const [family, checkpoint] of [
           let logits: MlxArray | undefined;
           try {
             if (compiled) {
-              const result = CompiledDecode.for(model).step(cur, cache);
+              const result = CompiledDecode.for(graph).step(cur, cache);
               logits = result.logits;
               mlx.ops.evalAll([logits, ...result.evalWith]);
             } else {
               const ids = mlx.ops.reshape(cur, [1, 1]);
               let hidden: MlxArray;
-              try { hidden = model.forwardHidden(ids, cache); }
+              try { hidden = graph.forwardHidden(ids, cache); }
               finally { ids.dispose(); }
-              try { logits = model.logitsFromHidden(hidden); }
+              try { logits = graph.logitsFromHidden(hidden); }
               finally { hidden.dispose(); }
             }
             evalState(cache, [logits]);
-            maintain(cache);
             const contiguous = mlx.ops.contiguous(logits);
             try {
               expect(contiguous.size).toBe(model.config.text.vocabSize);

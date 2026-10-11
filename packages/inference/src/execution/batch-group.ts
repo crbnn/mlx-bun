@@ -68,9 +68,8 @@ import { acquireModelWiredLimit } from "../generation/index";
 import { compiledDecodeStepOf } from "../models/capabilities";
 import type { MlxTokenGraph } from "../models/graph";
 import { runtimeConfig,withRuntimeConfig,type RuntimeConfig } from "../runtime/config";
-import type { PromptResponseTrace } from "../runtime/trace";
 import { independentGreedySampling } from "../sampling/index";
-import { isBatchableCache,isPlainKvCache,isRotatingPlainCache } from "../state/capabilities";
+import { composedStorageOf,isBatchableCache,isPlainKvCache,isRotatingPlainCache } from "../state/capabilities";
 import { createKvMaintenance,type KvMaintenance } from "../state/kv-maintenance";
 import type { KvScheme } from "../state/kv-scheme";
 import { ownedCacheLayout } from "../state/layout";
@@ -183,7 +182,7 @@ export class MlxBatchExecutionGroup {
     if (this.#kvScheme && !this.#kvScheme.batchable(
       model.config,
       (layerIdx) =>
-        isPlainKvCache(proto[layerIdx]) || isRotatingPlainCache(proto[layerIdx]),
+        isPlainKvCache(composedStorageOf(proto[layerIdx]!)) || isRotatingPlainCache(composedStorageOf(proto[layerIdx]!)),
       proto.length, opts.kvBatchCapabilities,
     )) {
       for (const cache of proto) cache.dispose();
@@ -203,7 +202,7 @@ export class MlxBatchExecutionGroup {
       ? Math.min(...proto.map((cache) => cache.maxTokens ?? Infinity))
       : null;
     this.#maintainKv = this.#kvScheme?.quantized
-      ? createKvMaintenance(this.#kvScheme.options)
+      ? createKvMaintenance(this.#kvScheme.storage)
       : null;
     for (const c of proto) c.dispose();
     this.#compiled = this.#runtime.flag("MLX_BUN_COMPILED_DECODE", true)
@@ -477,7 +476,7 @@ export class MlxBatchExecutionGroup {
           const executor = this;
           this.#method = row.req.method.open({
             get rows() { return executor.#running; }, runtime: this.#runtime,
-            prefillChunkSize: this.#prefillChunkSize, promptCache: this.#promptCache,
+            prefillChunkSize: this.#prefillChunkSize, promptCache: this.#promptCache, kvMaintenance: this.#maintainKv ?? undefined,
             join: row => { this.#running.push(row); },
             filterRows: keep => this.#applyFilter(keep),
             publish: async (row, token, logprobs) => {
@@ -553,26 +552,6 @@ export class MlxBatchExecutionGroup {
     disposeResources(resources);
   }
 
-  /** Per-layer mixed-precision conversion of a joiner's SOLO caches — the
-   *  scheduler-side mirror of the serial maybeQuantizeKv (generate.ts): same
-   *  per-layer map, same skip rules (empty cache, already quantized), same
-   *  streaming discipline (evalAll the converted layer's state so the bf16
-   *  source frees before the next layer converts). Called at every prefill
-   *  chunk boundary AND once before merge, exactly where the serial loop
-   *  calls maybeQuantizeKv — that placement is what makes a row's quantized
-   *  bytes bit-exact vs serial `--kv-quant config`. Gateway placement and the
-   *  constructor both guarantee every named cache can convert. */
-  #quantizeSolo(solo: Cache[], trace?: PromptResponseTrace): void {
-    if (!this.#maintainKv) return;
-    const close = trace?.begin("prefill.kv_maintenance", {
-      mechanism: "continuous",
-    });
-    try {
-      this.#maintainKv(solo);
-    } finally {
-      close?.();
-    }
-  }
 
   /** The target owns projection geometry; samplers receive individual rows. */
   #projectPrefill(hidden: MlxArray, caches: Cache[], completed: readonly PrefillState[]): MlxArray {
@@ -650,7 +629,6 @@ export class MlxBatchExecutionGroup {
       try {
         ops.asyncEvalAll([sampled]);
         p.row.sampled = 1;
-        this.#quantizeSolo(p.solo, p.row.req.trace);
         await this.#mergeJoiner(p);
         this.#pendingToks = sampled;
         this.#pendingReal = [true];
@@ -687,14 +665,10 @@ export class MlxBatchExecutionGroup {
       this.#finish(p.row, stop);
       return;
     }
-    // Default tail-split path: the caches were already converted at the head
-    // boundary above (oracle composition: prefill ids[:-1] → convert → L=1
-    // step-0), so this call is an idempotent no-op (converted caches match
-    // neither serial class). It is LOAD-BEARING only under
-    // MLX_BUN_PREFILL_TAIL_SPLIT=0 — the old serial order: token 0 sampled
-    // from the unconverted final-chunk logits, THEN the caches convert
-    // (before decode step 1 == before the merge).
-    this.#quantizeSolo(p.solo, p.row.req.trace);
+    // The composed caches converted inside their own appends (oracle
+    // composition: prefill ids[:-1] → convert → L=1 step-0 under the default
+    // tail split; under MLX_BUN_PREFILL_TAIL_SPLIT=0, token 0 sampled from the
+    // final chunk's bf16 read, then the conversion, before decode step 1).
     await this.#mergeJoiner(p);
     return;
   }

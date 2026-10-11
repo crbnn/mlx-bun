@@ -22,10 +22,37 @@ import { Qwen3Model } from "../../src/models/qwen/qwen3";
 import { Qwen3MoeModel } from "../../src/models/qwen/qwen3-moe";
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
 import { resolveKvScheme } from "../../src/state/kv-scheme";
+import { BF16_KV } from "../../src/contracts/portable/composition";
+import type { Composition, KvStorageScheme } from "../../src/contracts/portable/composition";
 
 // Placement only: bound graphs are prototype stand-ins and no tensors are created.
 const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
-  kvQuant: false, turboQuant: false, hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
+  hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
+
+/** The KV options a request named before E3, now the composition's KV scheme. */
+interface KvOptions {
+  readonly kvBits?: number;
+  readonly kvConfig?: readonly { layerIdx: number; bits: number; groupSize: number }[];
+  readonly quantizedKvStart?: number;
+  readonly turboQuant?: { readonly kBits: number; readonly vBits: number };
+}
+/** The composition's scheme for those options, with their starts: a uniform
+ * width converts at 5000 tokens unless a start is named, as before. */
+const kvOf = (options: KvOptions): KvStorageScheme => options.turboQuant
+  ? new KvScheme("turbo", { turboQuant: { ...options.turboQuant }, quantizedKvStart: options.quantizedKvStart ?? 0 }).storage
+  : options.kvConfig?.length
+    ? new KvScheme("affine-config", { kvConfig: options.kvConfig.map(entry => ({ ...entry })), quantizedKvStart: options.quantizedKvStart }).storage
+    : options.kvBits !== undefined
+      ? new KvScheme("affine-uniform", { kvBits: options.kvBits, quantizedKvStart: options.quantizedKvStart }).storage
+      : BF16_KV;
+/** The composition facts a graph reads: the KV scheme, and the defaults of the
+ * fields that were runtime flags. */
+const composition = (kv: KvStorageScheme = BF16_KV) =>
+  ({ kv, speculativeAffineKv: true, packedMixedMlp: true }) as unknown as Composition;
+/** `model`, composed with the KV scheme every request it serves stores. */
+const composedWith = <M extends object>(model: M, options: KvOptions): M =>
+  Object.assign(model, { composition: composition(kvOf(options)) });
+const AFFINE4 = { kvBits: 4 } as const, TURBO = { turboQuant: { kBits: 8, vBits: 3 } } as const;
 const grammar = { ...shape, hasGrammar: true };
 const schedule = { continuous: true, quantizedBatch: true, checkpoints: false };
 const environments: Record<string, string>[] = [{}, { MLX_BUN_GRAMMAR_BATCH: "0" }, { MLX_BUN_GRAMMAR_BATCH: "1" }];
@@ -51,7 +78,7 @@ const planUnder = (env: Record<string, string>, model: Gemma4Model | UniversalDe
 const standIn = (prototype: object, modelType: string, extra: object = {}): RuntimeModel =>
   Object.assign(Object.create(prototype), {
     config: { modelType, text: { enableMoeBlock: false }, eosTokenIds: [] },
-    makeCache: () => [new KVCache()], loraState: { active: [] }, ...extra,
+    makeCache: () => [new KVCache()], loraState: { active: [] }, composition: composition(), ...extra,
   });
 
 // Every autoregressive class the binding distinguishes. Stand-ins share plain
@@ -78,27 +105,28 @@ const refusals = (plan: ResolvedExecution) =>
 
 /** On graphs whose delayed affine rows are ordinary-only, the direct grammar
  * jump commits spans over delayed affine KV. */
-function expectOrdinaryAffineSpans(make: () => RuntimeModel, delayed: GenerateOptions, immediate: GenerateOptions) {
-  const jump = withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }),
-    () => bindMlxGateway(make(), { provider: new NgramProvider(), numDraftTokens: 3 }));
+function expectOrdinaryAffineSpans(make: () => RuntimeModel, delayed: KvOptions, immediate: KvOptions) {
+  const bind = (kv: KvOptions) => withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }),
+    () => bindMlxGateway(composedWith(make(), kv), { provider: new NgramProvider(), numDraftTokens: 3 }));
+  const jump = bind(delayed);
   const scheduling = { continuous: true, quantizedBatch: true, checkpoints: false };
-  const kv = { ...shape, kvQuant: true, hasGrammar: true };
-  const spans = jump.plan(kv, delayed, scheduling);
+  const kv = { ...shape, hasGrammar: true };
+  const spans = jump.plan(kv, {}, scheduling);
   expect(spans).toMatchObject({ method: "autoregressive", mechanism: "continuous", grammarJump: true, checkpoint: false });
   expect(refusals(spans)).toEqual([]);
-  expect(jump.methodRequest!(spans, delayed)!.key).toBe("grammar-forced-span");
+  expect(jump.methodRequest!(spans, {})!.key).toBe("grammar-forced-span");
   // Logprobs keep masking.
-  expect(jump.plan({ ...kv, wantsLogprobs: true }, delayed, scheduling)).toMatchObject({ method: "autoregressive", grammarJump: false });
+  expect(jump.plan({ ...kv, wantsLogprobs: true }, {}, scheduling)).toMatchObject({ method: "autoregressive", grammarJump: false });
   // An adapter request still ignores its configured draft; its grammar commits spans.
-  const options = { ...delayed, adapters: ["upper"] };
+  const options = { adapters: ["upper"] };
   const adapted = jump.plan({ ...kv, hasAdapters: true, hasDraft: true }, options, scheduling);
   expect(adapted).toMatchObject({ method: "autoregressive", mechanism: "continuous", grammarJump: true });
   expect(adapted.reasons).toContain("draft-incompatible-with-request");
   expect(jump.methodRequest!(adapted, options)!.key).toBe("grammar-forced-span");
   // Genuine delayed speculation stays refused.
-  expect(jump.plan({ ...kv, hasDraft: true }, delayed, scheduling)).toMatchObject({ mechanism: "unsupported" });
+  expect(jump.plan({ ...kv, hasDraft: true }, {}, scheduling)).toMatchObject({ mechanism: "unsupported" });
   // Where main batched, grammar keeps verified proposals.
-  expect(jump.plan(kv, immediate, scheduling)).toMatchObject({ method: "speculative", mechanism: "continuous", grammarJump: true });
+  expect(bind(immediate).plan(kv, {}, scheduling)).toMatchObject({ method: "speculative", mechanism: "continuous", grammarJump: true });
 }
 
 test("the retired MLX_BUN_GRAMMAR_BATCH switch no longer changes grammar placement", () => {
@@ -114,13 +142,12 @@ test("Gemma2 softcap grammar and adapter requests plan continuous; its KV scheme
       expect(planUnder(env, softcapUniversal(), request))
         .toMatchObject({ mechanism: "continuous", fill: false, checkpoint: false, grammarJump: false });
     // The gateway's scheduling fact carries the scheme's certification (kvBatchable).
-    for (const [request, reason] of [[{ ...grammar, kvQuant: true }, "kv-scheme-batch-unsupported"],
-      [{ ...grammar, turboQuant: true }, "turbo-kv-batch-unsupported"]] as const) {
-      const binding = withRuntimeConfig(createRuntimeConfig(env), () => bindMlxGateway(softcapUniversal()));
-      const refused = binding.plan(request, {}, { ...schedule, quantizedBatch: false });
+    for (const [kv, reason] of [[AFFINE4, "kv-scheme-batch-unsupported"], [TURBO, "turbo-kv-batch-unsupported"]] as const) {
+      const binding = withRuntimeConfig(createRuntimeConfig(env), () => bindMlxGateway(composedWith(softcapUniversal(), kv)));
+      const refused = binding.plan(grammar, {}, { ...schedule, quantizedBatch: false });
       expect(refused.mechanism).toBe("unsupported");
       expect(refused.reasons).toContain(reason);
-      expect(binding.plan(request, {}, schedule)).toMatchObject({ method: "autoregressive", mechanism: "continuous" });
+      expect(binding.plan(grammar, {}, schedule)).toMatchObject({ method: "autoregressive", mechanism: "continuous" });
     }
   }
 });
@@ -163,21 +190,21 @@ test("a dense-read graph takes KV schemes whose own maintenance certifies dense 
 });
 
 test("TurboQuant on a dense-read graph decodes as main did: drafts and supplied fill are ignored, certified grammar spans commit", () => {
-  const turbo = { turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: 0 } as GenerateOptions;
-  const request = { ...shape, turboQuant: true }, scheduling = { continuous: true, quantizedBatch: true, checkpoints: true };
-  const drafted = bindMlxGateway(softcapUniversal(), { provider: new NgramProvider(), numDraftTokens: 3 });
+  const turbo = { turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: 0 } as const;
+  const request = shape, scheduling = { continuous: true, quantizedBatch: true, checkpoints: true };
+  const drafted = bindMlxGateway(composedWith(softcapUniversal(), turbo), { provider: new NgramProvider(), numDraftTokens: 3 });
   drafted.configureContinuation!({ checkpointPersistence: {} } as never);
   // A configured draft is ignored: ordinary continuous decoding with its checkpoints.
-  const ignored = drafted.plan({ ...request, hasDraft: true }, turbo, scheduling);
+  const ignored = drafted.plan({ ...request, hasDraft: true }, {}, scheduling);
   expect(ignored).toMatchObject({ method: "autoregressive", mechanism: "continuous", checkpoint: true });
   expect(ignored.reasons).toContain("draft-incompatible-with-request");
-  expect(drafted.methodRequest!(ignored, turbo)).toBeUndefined();
+  expect(drafted.methodRequest!(ignored, {})).toBeUndefined();
   // Supplied fill decodes ordinarily, as main's did: main filled only through a
   // committed append declaring TurboQuant formats, which this graph lacks. No fill
   // method binds, and a request supplying fill stays ineligible for checkpoints.
-  const plain = bindMlxGateway(softcapUniversal());
+  const plain = bindMlxGateway(composedWith(softcapUniversal(), turbo));
   plain.configureContinuation!({ checkpointPersistence: {} } as never);
-  const withFill = { ...turbo, ...fillOptions(false) };
+  const withFill = fillOptions(false);
   for (const other of [{}, { userSeed: true }, { wantsLogprobs: true }, { hasGrammar: true }]) {
     const plan = plain.plan({ ...request, ...other }, withFill, scheduling);
     expect(plan, JSON.stringify(other)).toMatchObject({ method: "autoregressive", mechanism: "continuous", fill: false, checkpoint: false });
@@ -188,34 +215,38 @@ test("TurboQuant on a dense-read graph decodes as main did: drafts and supplied 
   // Direct grammar jump commits spans over TurboQuant, as main's serial path did,
   // once the gateway has certified the scheme; grammar keeps its checkpoint exclusion.
   const jumpRuntime = createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" });
-  const jumping = withRuntimeConfig(jumpRuntime, () => bindMlxGateway(softcapUniversal()));
-  jumping.configureContinuation!({ checkpointPersistence: {} } as never);
-  const spans = jumping.plan({ ...request, hasGrammar: true }, turbo, scheduling);
+  const jumpingWith = (kv: KvOptions) => {
+    const binding = withRuntimeConfig(jumpRuntime, () => bindMlxGateway(composedWith(softcapUniversal(), kv)));
+    binding.configureContinuation!({ checkpointPersistence: {} } as never);
+    return binding;
+  };
+  const jumping = jumpingWith(turbo);
+  const spans = jumping.plan({ ...request, hasGrammar: true }, {}, scheduling);
   expect(spans).toMatchObject({ method: "autoregressive", mechanism: "continuous", grammarJump: true, fill: false, checkpoint: false });
   expect(refusals(spans)).toEqual([]);
-  expect(jumping.methodRequest!(spans, turbo)!.key).toBe("grammar-forced-span");
+  expect(jumping.methodRequest!(spans, {})!.key).toBe("grammar-forced-span");
   // Logprobs keep masking; an uncertified scheme is refused.
-  expect(jumping.plan({ ...request, hasGrammar: true, wantsLogprobs: true }, turbo, scheduling))
+  expect(jumping.plan({ ...request, hasGrammar: true, wantsLogprobs: true }, {}, scheduling))
     .toMatchObject({ mechanism: "continuous", grammarJump: false });
-  expect(jumping.plan({ ...request, hasGrammar: true }, turbo, { ...scheduling, quantizedBatch: false }).mechanism).toBe("unsupported");
+  expect(jumping.plan({ ...request, hasGrammar: true }, {}, { ...scheduling, quantizedBatch: false }).mechanism).toBe("unsupported");
   // Certified delayed affine KV commits spans the same way; the span method
   // refuses a row before an append its storage would no longer read plain.
-  const affineKv = { kvBits: 4 }, affineRequest = { ...shape, kvQuant: true, hasGrammar: true };
-  const affine = jumping.plan(affineRequest, affineKv, scheduling);
+  const affineJumping = jumpingWith(AFFINE4), affineRequest = { ...shape, hasGrammar: true };
+  const affine = affineJumping.plan(affineRequest, {}, scheduling);
   expect(affine).toMatchObject({ method: "autoregressive", mechanism: "continuous", grammarJump: true, fill: false, checkpoint: false });
   expect(refusals(affine)).toEqual([]);
-  expect(jumping.methodRequest!(affine, affineKv)!.key).toBe("grammar-forced-span");
-  expect(jumping.plan({ ...affineRequest, wantsLogprobs: true }, affineKv, scheduling))
+  expect(affineJumping.methodRequest!(affine, {})!.key).toBe("grammar-forced-span");
+  expect(affineJumping.plan({ ...affineRequest, wantsLogprobs: true }, {}, scheduling))
     .toMatchObject({ mechanism: "continuous", grammarJump: false });
-  expect(jumping.plan(affineRequest, affineKv, { ...scheduling, quantizedBatch: false }).mechanism).toBe("unsupported");
+  expect(affineJumping.plan(affineRequest, {}, { ...scheduling, quantizedBatch: false }).mechanism).toBe("unsupported");
   // A configured draft is ignored and the spans still commit, as in main.
   const draftedJump = withRuntimeConfig(jumpRuntime,
-    () => bindMlxGateway(softcapUniversal(), { provider: new NgramProvider(), numDraftTokens: 3 }));
-  const ignoredJump = draftedJump.plan({ ...request, hasGrammar: true, hasDraft: true }, turbo, scheduling);
+    () => bindMlxGateway(composedWith(softcapUniversal(), turbo), { provider: new NgramProvider(), numDraftTokens: 3 }));
+  const ignoredJump = draftedJump.plan({ ...request, hasGrammar: true, hasDraft: true }, {}, scheduling);
   expect(ignoredJump).toMatchObject({ method: "autoregressive", mechanism: "continuous", grammarJump: true });
-  expect(draftedJump.methodRequest!(ignoredJump, turbo)!.key).toBe("grammar-forced-span");
+  expect(draftedJump.methodRequest!(ignoredJump, {})!.key).toBe("grammar-forced-span");
   // Without the jump flag, grammar masks as ever.
-  expect(plain.plan({ ...request, hasGrammar: true }, turbo, schedule)).toMatchObject({ mechanism: "continuous", grammarJump: false });
+  expect(plain.plan({ ...request, hasGrammar: true }, {}, schedule)).toMatchObject({ mechanism: "continuous", grammarJump: false });
 });
 
 test.each(families)("%s places ordinary grammar exactly like the same request without grammar", (_, model) => {
@@ -225,11 +256,13 @@ test.each(families)("%s places ordinary grammar exactly like the same request wi
   expect(ordinary).toMatchObject({ method: "autoregressive", mechanism: "continuous", grammarJump: false });
   expect(ordinary.reasons.filter(reason => reason.includes("grammar"))).toEqual([]);
   // Refused compositions keep their own reasons; grammar adds none.
-  for (const extra of [{}, { hasAdapters: true }, { wantsLogprobs: true }, { userSeed: true },
-    { hasRepetitionPenalty: true }, { hasLogitsExtras: true }, { kvQuant: true }, { turboQuant: true },
-    { hasVision: true }, { hasDraft: true }])
-    expect({ extra, plan: place(binding, { ...shape, ...extra, hasGrammar: true }) })
-      .toEqual({ extra, plan: place(binding, { ...shape, ...extra }) });
+  for (const kv of [{}, AFFINE4, TURBO]) {
+    const composed = bindMlxGateway(composedWith(model(), kv));
+    for (const extra of [{}, { hasAdapters: true }, { wantsLogprobs: true }, { userSeed: true },
+      { hasRepetitionPenalty: true }, { hasLogitsExtras: true }, { hasVision: true }, { hasDraft: true }])
+      expect({ kv, extra, plan: place(composed, { ...shape, ...extra, hasGrammar: true }) })
+        .toEqual({ kv, extra, plan: place(composed, { ...shape, ...extra }) });
+  }
 });
 
 test.each(qualifiedFamilies)("%s qualifies multi-token grammar jump when it is enabled", (_, model) => {
@@ -258,9 +291,11 @@ test("Gemma2 softcap selects committed grammar spans without changing the ordina
   // Once the gateway has certified the scheme, spans commit over TurboQuant,
   // which decodes on read, and over affine KV until a row stops reading plain;
   // an uncertified scheme stays refused.
-  for (const kv of [{ turboQuant: true }, { kvQuant: true }]) {
-    expect(place(binding, { ...grammar, ...kv }), JSON.stringify(kv)).toMatchObject({ mechanism: "continuous", grammarJump: true });
-    expect(binding.plan({ ...grammar, ...kv }, {}, { ...schedule, quantizedBatch: false }), JSON.stringify(kv))
+  for (const kv of [TURBO, AFFINE4]) {
+    const composed = withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }),
+      () => bindMlxGateway(composedWith(softcapUniversal(), kv)));
+    expect(place(composed, grammar), JSON.stringify(kv)).toMatchObject({ mechanism: "continuous", grammarJump: true });
+    expect(composed.plan(grammar, {}, { ...schedule, quantizedBatch: false }), JSON.stringify(kv))
       .toMatchObject({ mechanism: "unsupported", grammarJump: false });
   }
 });
@@ -287,18 +322,19 @@ describe("DiffusionGemma interleaved denoising binding", () => {
   });
 
   test.each([
-    [{ hasGrammar: true }, {}, "grammar-batch-unsupported"],
-    [{ hasDraft: true }, {}, "draft-method-unsupported"],
-    [{ wantsLogprobs: true }, {}, "logprobs-method-unsupported"],
-    [{ hasRepetitionPenalty: true }, {}, "repetition-penalty-method-unsupported"],
-    [{ hasLogitsExtras: true }, {}, "logits-extras-method-unsupported"],
-    [{}, { fill: { plan: {} } }, "fill-method-unsupported"],
-    [{}, { pagedKv: {} }, "paged-kv-batch-unsupported"],
-    [{ kvQuant: true }, { kvBits: 4 }, "kv-scheme-batch-unsupported"],
-    [{ turboQuant: true }, { turboQuant: { kBits: 8, vBits: 3 } }, "turbo-kv-batch-unsupported"],
-  ] as const)("an unsupported denoising shape is refused before execution: %#", (extra, options, reason) => {
-    for (const binding of [bindMlxGateway(diffusion()), bindMlxGateway(diffusion(), { provider: new NgramProvider(), numDraftTokens: 3 }),
-      withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }), () => bindMlxGateway(diffusion()))]) {
+    [{ hasGrammar: true }, {}, "grammar-batch-unsupported", {}],
+    [{ hasDraft: true }, {}, "draft-method-unsupported", {}],
+    [{ wantsLogprobs: true }, {}, "logprobs-method-unsupported", {}],
+    [{ hasRepetitionPenalty: true }, {}, "repetition-penalty-method-unsupported", {}],
+    [{ hasLogitsExtras: true }, {}, "logits-extras-method-unsupported", {}],
+    [{}, { fill: { plan: {} } }, "fill-method-unsupported", {}],
+    [{}, { pagedKv: {} }, "paged-kv-batch-unsupported", {}],
+    [{}, {}, "kv-scheme-batch-unsupported", AFFINE4],
+    [{}, {}, "turbo-kv-batch-unsupported", TURBO],
+  ] as const)("an unsupported denoising shape is refused before execution: %#", (extra, options, reason, kv: KvOptions) => {
+    const graph = () => composedWith(diffusion(), kv);
+    for (const binding of [bindMlxGateway(graph()), bindMlxGateway(graph(), { provider: new NgramProvider(), numDraftTokens: 3 }),
+      withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }), () => bindMlxGateway(graph()))]) {
       const plan = planWith(binding, { ...shape, ...extra }, options as GenerateOptions);
       expect(plan).toMatchObject({ method: "denoising", mechanism: "unsupported", fill: false, grammarJump: false });
       expect(refusals(plan)).toEqual([reason]);
@@ -327,8 +363,10 @@ describe("DiffusionGemma interleaved denoising binding", () => {
     const leave = context.enter();
     expect(model.loraState.active).toEqual([]);
     leave();
-    for (const kind of ["bf16", "affine-uniform", "affine-config", "turbo"] as const)
-      expect(binding.kvBatchable(new KvScheme(kind, {}))).toBe(false);
+    for (const scheme of [new KvScheme("bf16", {}), resolveKvScheme({ override: 4 }),
+      resolveKvScheme({ override: "config", config: [{ layerIdx: 0, bits: 4, groupSize: 64 }] }),
+      resolveKvScheme({ turboQuant: { kBits: 8, vBits: 3 } })])
+      expect(binding.kvBatchable(scheme)).toBe(false);
     // Token methods never bind to the denoising graph, even when configured.
     const drafted = bindMlxGateway(model, { provider: new NgramProvider(), numDraftTokens: 3 });
     const denoise = place(drafted, shape);
@@ -361,59 +399,63 @@ for (const [name, prototype, modelType] of [["qwen3", Qwen3Model.prototype, "qwe
 test(`${name} attends affine KV: delayed rows serve ordinary decoding, checkpoints and committed grammar spans`, () => {
   const make = () => standIn(prototype, modelType, { requiredDenseKvLayers: [], encodedKvAttention: true,
     config: { modelType, text: { enableMoeBlock: false, numHiddenLayers: 1, layerTypes: ["full_attention"] }, eosTokenIds: [] } });
-  const binding = bindMlxGateway(make(), { provider: new NgramProvider(), numDraftTokens: 3 });
-  binding.configureContinuation!({ checkpointPersistence: {} } as never);
+  const bind = (kv: KvOptions) => {
+    const binding = bindMlxGateway(composedWith(make(), kv), { provider: new NgramProvider(), numDraftTokens: 3 });
+    binding.configureContinuation!({ checkpointPersistence: {} } as never);
+    return binding;
+  };
   const scheduling = { continuous: true, quantizedBatch: true, checkpoints: true };
-  const kv = { ...shape, kvQuant: true }, delayed = { kvBits: 4, quantizedKvStart: 64 }, immediate = { kvBits: 4, quantizedKvStart: 0 };
+  const kv = shape, delayed = { kvBits: 4, quantizedKvStart: 64 }, immediate = { kvBits: 4, quantizedKvStart: 0 };
   for (const scheme of [resolveKvScheme({ override: 4, quantizedKvStart: 64 }), resolveKvScheme({ override: 8, quantizedKvStart: 0 }),
     resolveKvScheme({ override: "config", config: [{ layerIdx: 0, bits: 4, groupSize: 64 }], quantizedKvStart: 64 })])
-    expect(binding.kvBatchable(scheme), scheme.cacheKey).toBe(true);
-  expect(binding.plan(kv, delayed, scheduling)).toMatchObject({ method: "autoregressive", mechanism: "continuous", checkpoint: true });
-  const drafted = binding.plan({ ...kv, hasDraft: true }, delayed, scheduling);
+    expect(bind({}).kvBatchable(scheme), scheme.cacheKey).toBe(true);
+  expect(bind(delayed).plan(kv, {}, scheduling)).toMatchObject({ method: "autoregressive", mechanism: "continuous", checkpoint: true });
+  const drafted = bind(delayed).plan({ ...kv, hasDraft: true }, {}, scheduling);
   expect(drafted.mechanism).toBe("unsupported");
   expect(drafted.reasons).toContain("continuous-unavailable");
-  expect(binding.plan({ ...kv, hasDraft: true }, immediate, scheduling).method).toBe("speculative");
+  expect(bind(immediate).plan({ ...kv, hasDraft: true }, {}, scheduling).method).toBe("speculative");
   expectOrdinaryAffineSpans(make, delayed, immediate);
 });
 
 test("MiniCPM5 batches delayed affine KV for ordinary continuous decoding and its generation checkpoints", () => {
-  const binding = bindMlxGateway(minicpm5(), { provider: { grouped: {} } as never, numDraftTokens: 4 });
-  const unconfigured = bindMlxGateway(minicpm5(), { provider: { grouped: {} } as never, numDraftTokens: 4 });
+  const bind = (kv: KvOptions, configured = true) => {
+    const binding = bindMlxGateway(composedWith(minicpm5(), kv), { provider: { grouped: {} } as never, numDraftTokens: 4 });
+    if (configured) binding.configureContinuation!({ checkpointPersistence: {} } as never);
+    return binding;
+  };
   const config = [{ layerIdx: 0, bits: 8, groupSize: 64 }, { layerIdx: 2, bits: 4, groupSize: 64 }];
   for (const scheme of [resolveKvScheme({ override: 4, quantizedKvStart: 64 }), resolveKvScheme({ override: 8, quantizedKvStart: 64 }),
     resolveKvScheme({ override: "config", config, quantizedKvStart: 64 })])
-    expect(binding.kvBatchable(scheme)).toBe(true);
+    expect(bind({}, false).kvBatchable(scheme)).toBe(true);
   // A graph that neither converts rows itself nor declares dense reads still refuses a delayed start.
   expect(bindMlxGateway(standIn(Glm52Model.prototype, "glm_moe_dsa", { requiredDenseKvLayers: [] }))
     .kvBatchable(resolveKvScheme({ override: 4, quantizedKvStart: 64 }))).toBe(false);
   expect(bindMlxGateway(dense()).kvBatchable(resolveKvScheme({ override: 4, quantizedKvStart: 0 }))).toBe(true);
 
-  binding.configureContinuation!({ checkpointPersistence: {} } as never);
-  const kv = { ...shape, kvQuant: true }, scheduling = { continuous: true, quantizedBatch: true, checkpoints: true };
+  const kv = shape, scheduling = { continuous: true, quantizedBatch: true, checkpoints: true };
   const fill = { fill: { plan: { echo: false } } } as never;
   for (const delayed of [{ kvBits: 4, quantizedKvStart: 64 }, { kvBits: 8 }, { kvConfig: config, quantizedKvStart: 64 }] as const) {
+    const binding = bind(delayed);
     // Main checkpointed MiniCPM5's delayed affine generation through its serial executor.
-    expect(binding.plan(kv, delayed, scheduling)).toMatchObject({ method: "autoregressive", mechanism: "continuous", checkpoint: true });
-    expect(binding.plan({ ...kv, userSeed: true, hasRepetitionPenalty: true }, { ...delayed, seed: 3, repetitionPenalty: 1.1 }, scheduling))
+    expect(binding.plan(kv, {}, scheduling)).toMatchObject({ method: "autoregressive", mechanism: "continuous", checkpoint: true });
+    expect(binding.plan({ ...kv, userSeed: true, hasRepetitionPenalty: true }, { seed: 3, repetitionPenalty: 1.1 }, scheduling))
       .toMatchObject({ mechanism: "continuous", checkpoint: true });
-    expect(unconfigured.plan(kv, delayed, scheduling)).toMatchObject({ mechanism: "continuous", checkpoint: false });
+    expect(bind(delayed, false).plan(kv, {}, scheduling)).toMatchObject({ mechanism: "continuous", checkpoint: false });
     // Grammar and logprobs stay continuous without checkpoints, as for every family.
     for (const request of [{ hasGrammar: true }, { wantsLogprobs: true }])
-      expect(binding.plan({ ...kv, ...request }, delayed, scheduling)).toMatchObject({ mechanism: "continuous", checkpoint: false });
+      expect(binding.plan({ ...kv, ...request }, {}, scheduling)).toMatchObject({ mechanism: "continuous", checkpoint: false });
     // Genuine delayed speculation stays refused; supplied fill follows main's ordinary fallback.
-    for (const [request, options] of [[{ ...kv, hasDraft: true }, delayed]] as const) {
-      const refused = binding.plan(request, options, scheduling);
-      expect(refused.mechanism).toBe("unsupported");
-      expect(refused.reasons).toContain("continuous-unavailable");
-    }
+    const refused = binding.plan({ ...kv, hasDraft: true }, {}, scheduling);
+    expect(refused.mechanism).toBe("unsupported");
+    expect(refused.reasons).toContain("continuous-unavailable");
   }
   // Immediate quantization (start 0) keeps its existing speculative, fill and checkpoint placement.
-  const immediate = { kvBits: 4, quantizedKvStart: 0 };
-  expect(binding.plan(kv, immediate, scheduling)).toMatchObject({ mechanism: "continuous", checkpoint: true });
-  expect(binding.plan({ ...kv, hasDraft: true }, immediate, scheduling).method).toBe("speculative");
-  expect(binding.plan(kv, { ...immediate, ...(fill as object) }, scheduling).fill).toBe(true);
+  const immediate = { kvBits: 4, quantizedKvStart: 0 }, binding = bind(immediate);
+  expect(binding.plan(kv, {}, scheduling)).toMatchObject({ mechanism: "continuous", checkpoint: true });
+  expect(binding.plan({ ...kv, hasDraft: true }, {}, scheduling).method).toBe("speculative");
+  expect(binding.plan(kv, fill, scheduling).fill).toBe(true);
   // Plain KV is unaffected.
-  expect(binding.plan({ ...shape, hasDraft: true }, {}, scheduling).method).toBe("speculative");
+  expect(bind({}).plan({ ...shape, hasDraft: true }, {}, scheduling).method).toBe("speculative");
   expectOrdinaryAffineSpans(minicpm5, { kvBits: 4, quantizedKvStart: 64 }, immediate);
 });
 
@@ -453,38 +495,41 @@ for (const [name, make] of [
   expect(binding.kvBatchable(resolveKvScheme({ override: 4, quantizedKvStart: 0 }))).toBe(true);
 
   binding.configureContinuation!({ checkpointPersistence: {} } as never);
-  const kv = { ...shape, kvQuant: true }, scheduling = { continuous: true, quantizedBatch: true, checkpoints: true };
+  const bind = (kv: KvOptions, configured = true) => {
+    const composed = bindMlxGateway(composedWith(make(), kv), { provider: { grouped: {} } as never, numDraftTokens: 4 });
+    if (configured) composed.configureContinuation!({ checkpointPersistence: {} } as never);
+    return composed;
+  };
+  const kv = shape, scheduling = { continuous: true, quantizedBatch: true, checkpoints: true };
   const fill = { fill: { plan: { echo: false } } } as never;
   for (const delayed of [{ kvBits: 4, quantizedKvStart: 8 }, { kvBits: 8 }, { kvConfig: config, quantizedKvStart: 8 }] as const) {
+    const composed = bind(delayed);
     // Main checkpointed this generation through its serial executor.
-    expect(binding.plan(kv, delayed, scheduling)).toMatchObject({ method: "autoregressive", mechanism: "continuous", checkpoint: true });
-    expect(binding.plan({ ...kv, userSeed: true, hasRepetitionPenalty: true }, { ...delayed, seed: 3, repetitionPenalty: 1.1 }, scheduling))
+    expect(composed.plan(kv, {}, scheduling)).toMatchObject({ method: "autoregressive", mechanism: "continuous", checkpoint: true });
+    expect(composed.plan({ ...kv, userSeed: true, hasRepetitionPenalty: true }, { seed: 3, repetitionPenalty: 1.1 }, scheduling))
       .toMatchObject({ mechanism: "continuous", checkpoint: true });
-    expect(bindMlxGateway(make()).plan(kv, delayed, scheduling)).toMatchObject({ mechanism: "continuous", checkpoint: false });
+    expect(bindMlxGateway(composedWith(make(), delayed)).plan(kv, {}, scheduling)).toMatchObject({ mechanism: "continuous", checkpoint: false });
     // Grammar and logprobs ride shared sampling, without checkpoints as for every family.
     for (const request of [{ hasGrammar: true }, { wantsLogprobs: true }])
-      expect(binding.plan({ ...kv, ...request }, delayed, scheduling)).toMatchObject({ mechanism: "continuous", checkpoint: false });
+      expect(composed.plan({ ...kv, ...request }, {}, scheduling)).toMatchObject({ mechanism: "continuous", checkpoint: false });
     // Adapters compose with the ordinary row and its continuation, as on main.
     const adapted = { ...kv, hasAdapters: true };
-    const options = { ...delayed, adapters: ["upper"] };
-    const plan = binding.plan(adapted, options, scheduling);
+    const options = { adapters: ["upper"] };
+    const plan = composed.plan(adapted, options, scheduling);
     expect(plan).toMatchObject({ method: "autoregressive", mechanism: "continuous", checkpoint: true,
       fill: false, grammarJump: false, compiledDecode: false });
-    expect(binding.methodRequest!(plan, options)).toBeUndefined();
+    expect(composed.methodRequest!(plan, options)).toBeUndefined();
     for (const extra of [{ hasGrammar: true }, { wantsLogprobs: true }])
-      expect(binding.plan({ ...adapted, ...extra }, options, scheduling))
+      expect(composed.plan({ ...adapted, ...extra }, options, scheduling))
         .toMatchObject({ mechanism: "continuous", checkpoint: false });
-    expect(binding.plan({ ...adapted, hasDraft: true }, options, scheduling))
+    expect(composed.plan({ ...adapted, hasDraft: true }, options, scheduling))
       .toMatchObject({ method: "autoregressive", mechanism: "continuous", checkpoint: true, fill: false });
-    expect(binding.plan(adapted, { ...options, ...(fill as object) }, scheduling))
+    expect(composed.plan(adapted, { ...options, ...(fill as object) }, scheduling))
       .toMatchObject({ mechanism: "continuous", method: "autoregressive", fill: false, checkpoint: false });
     // Genuine delayed speculation remains refused.
-    const refusals: [typeof kv, GenerateOptions][] = [[{ ...kv, hasDraft: true }, delayed]];
-    for (const [request, options] of refusals) {
-      const refused = binding.plan(request, options, scheduling);
-      expect(refused.mechanism).toBe("unsupported");
-      expect(refused.reasons).toContain("continuous-unavailable");
-    }
+    const refused = composed.plan({ ...kv, hasDraft: true }, {}, scheduling);
+    expect(refused.mechanism).toBe("unsupported");
+    expect(refused.reasons).toContain("continuous-unavailable");
   }
   const previous = model.loraState.active;
   const selected = ["upper"];
@@ -495,10 +540,10 @@ for (const [name, make] of [
   leave();
   expect(model.loraState.active).toBe(previous);
   // Immediate quantization and plain KV keep their existing placement, adapters included.
-  const immediate = { kvBits: 4, quantizedKvStart: 0 };
-  expect(binding.plan(kv, immediate, scheduling)).toMatchObject({ mechanism: "continuous", checkpoint: true });
-  expect(binding.plan({ ...kv, hasDraft: true }, immediate, scheduling).method).toBe("speculative");
-  expect(binding.plan({ ...kv, hasAdapters: true }, { ...immediate, adapters: ["upper"] }, scheduling).mechanism).toBe("continuous");
+  const immediate = { kvBits: 4, quantizedKvStart: 0 }, composed = bind(immediate);
+  expect(composed.plan(kv, {}, scheduling)).toMatchObject({ mechanism: "continuous", checkpoint: true });
+  expect(composed.plan({ ...kv, hasDraft: true }, {}, scheduling).method).toBe("speculative");
+  expect(composed.plan({ ...kv, hasAdapters: true }, { adapters: ["upper"] }, scheduling).mechanism).toBe("continuous");
   expect(binding.plan({ ...shape, hasAdapters: true }, { adapters: ["upper"] }, scheduling).mechanism).toBe("continuous");
   expect(binding.plan({ ...shape, hasDraft: true }, {}, scheduling).method).toBe("speculative");
   expectOrdinaryAffineSpans(universal, { kvBits: 4, quantizedKvStart: 8 }, immediate);
@@ -559,15 +604,16 @@ test.each([["two-model", twoModelDraft, "gemma2-draft"], ["n-gram", () => new Ng
   // Over encoded KV, TurboQuant read decoded or affine until a row's transition,
   // a drafted request decodes ordinarily: the draft is ignored, and so is supplied
   // fill, as for any drafted request; checkpoints follow the ordinary rules.
-  const turbo = { turboQuant: { kBits: 8, vBits: 3 } } as GenerateOptions;
-  const affine = { kvBits: 4, quantizedKvStart: 64 } as GenerateOptions;
-  for (const [flag, kv] of [[{ turboQuant: true }, turbo], [{ kvQuant: true }, affine]] as const)
-    for (const supplied of [kv, { ...kv, ...fillOptions(true) }]) {
-      const plan = binding.plan({ ...draft, ...flag }, supplied, scheduling);
-      expect(plan, JSON.stringify(flag)).toMatchObject({ method: "autoregressive", mechanism: "continuous", fill: false, checkpoint: !supplied.fill });
+  for (const kv of [TURBO, { kvBits: 4, quantizedKvStart: 64 }]) {
+    const composed = bindMlxGateway(composedWith(softcapUniversal(), kv), { provider: provider(), numDraftTokens: 3 });
+    composed.configureContinuation!({ checkpointPersistence: {}, checkpoints: {}, checkpointEveryTokens: 4 } as never);
+    for (const supplied of [{}, fillOptions(true)] as GenerateOptions[]) {
+      const plan = composed.plan(draft, supplied, scheduling);
+      expect(plan, JSON.stringify(kv)).toMatchObject({ method: "autoregressive", mechanism: "continuous", fill: false, checkpoint: !supplied.fill });
       expect(plan.reasons).toContain("draft-incompatible-with-request");
-      expect(binding.methodRequest!(plan, supplied)).toBeUndefined();
+      expect(composed.methodRequest!(plan, supplied)).toBeUndefined();
     }
+  }
   // Drafted media and paging stay refused, including when fill is supplied.
   for (const [request, options, expected] of [
     [{ ...draft, hasVision: true }, {}, ["media-batch-unsupported"]],
@@ -669,13 +715,15 @@ test.each([["two-model", twoModelDraft], ["n-gram", () => new NgramProvider()], 
   // Over affine KV the adapter request likewise ignores the draft and decodes
   // ordinarily, as on the other graphs restricted to ordinary affine execution,
   // and over TurboQuant as main's serial path did, keeping its checkpoints.
-  for (const [extra, kv] of [[{ kvQuant: true }, { kvBits: 4 }], [{ turboQuant: true }, { turboQuant: { kBits: 8, vBits: 3 } }]] as const) {
-    const options = { ...kv, adapters: ["upper"] } as GenerateOptions;
-    const ordinary = binding.plan({ ...request, ...extra }, options, scheduling);
+  for (const kv of [AFFINE4, TURBO]) {
+    const composed = bindMlxGateway(composedWith(softcapUniversal(), kv), { provider: provider(), numDraftTokens: 3 });
+    composed.configureContinuation!({ checkpointPersistence: {}, checkpoints: {}, checkpointEveryTokens: 4 } as never);
+    const options: GenerateOptions = { adapters: ["upper"] };
+    const ordinary = composed.plan(request, options, scheduling);
     expect(ordinary, JSON.stringify(kv)).toMatchObject({ method: "autoregressive", mechanism: "continuous", fill: false,
       checkpoint: true, grammarJump: false });
     expect(ordinary.reasons).toContain("draft-incompatible-with-request");
-    expect(binding.methodRequest!(ordinary, options)).toBeUndefined();
+    expect(composed.methodRequest!(ordinary, options)).toBeUndefined();
   }
   for (const [extra, options, reason] of [
     [{ hasVision: true }, {}, "media-batch-unsupported"],
@@ -774,8 +822,8 @@ test("Gemma2 softcap fill runs with adapters and keeps uncertified KV schemes an
   const options = fillOptions(true);
   const plain = bindMlxGateway(softcapUniversal());
   for (const [binding, request, expected] of [
-    [plain, { ...shape, kvQuant: true }, ["kv-scheme-batch-unsupported"]],
-    [plain, { ...shape, turboQuant: true }, ["turbo-kv-batch-unsupported"]],
+    [bindMlxGateway(composedWith(softcapUniversal(), AFFINE4)), shape, ["kv-scheme-batch-unsupported"]],
+    [bindMlxGateway(composedWith(softcapUniversal(), TURBO)), shape, ["turbo-kv-batch-unsupported"]],
     [plain, { ...shape, hasDraft: true }, ["method-batch-unsupported"]],
   ] as const) {
     // A scheme the gateway found uncertified (kvBatchable) is refused.
@@ -807,16 +855,16 @@ test.each([["MiniCPM5", minicpm5], ["plain universal", universal]] as const)(
         grouped: { supportsTargetAdapters: false, checkpointNamespace: unexpected, open: unexpected, openPrefill: unexpected } },
       { id: "custom-legacy-only", weightsBytes: 0, open: unexpected }];
     for (const provider of providers) {
-      const binding = bindMlxGateway(model(), { provider: provider as never, numDraftTokens: 3 });
-      binding.configureContinuation!({ checkpointPersistence: {} } as never);
       for (const kv of [{ kvBits: 4, quantizedKvStart: 8 }, { kvBits: 8, quantizedKvStart: 8 },
         { kvConfig: [{ layerIdx: 0, bits: 4, groupSize: 64 }, { layerIdx: 2, bits: 8, groupSize: 64 }], quantizedKvStart: 8 }]) {
+        const binding = bindMlxGateway(composedWith(model(), kv), { provider: provider as never, numDraftTokens: 3 });
+        binding.configureContinuation!({ checkpointPersistence: {} } as never);
         const scheme = new KvScheme("kvBits" in kv ? "affine-uniform" : "affine-config", kv);
         const scheduling = { continuous: binding.cachesBatchable(), quantizedBatch: binding.kvBatchable(scheme), checkpoints: true };
         for (const fill of [undefined, fillOptions(false).fill, fillOptions(true).fill]) {
           for (const extra of [{}, { wantsLogprobs: true }, { hasGrammar: true }, { userSeed: true, hasRepetitionPenalty: true }]) {
-            const request = { ...shape, ...extra, kvQuant: true, hasAdapters: true, hasDraft: true };
-            const options = Object.freeze({ ...kv, adapters: ["upper"], ...(fill ? { fill } : {}) });
+            const request = { ...shape, ...extra, hasAdapters: true, hasDraft: true };
+            const options = Object.freeze({ adapters: ["upper"], ...(fill ? { fill } : {}) });
             const plan = binding.plan(request, options, scheduling);
             expect(plan).toMatchObject({ method: "autoregressive", mechanism: "continuous", fill: false,
               checkpoint: !fill && !request.wantsLogprobs && !request.hasGrammar, grammarJump: false, compiledDecode: false });
@@ -827,13 +875,11 @@ test.each([["MiniCPM5", minicpm5], ["plain universal", universal]] as const)(
             expect(options.fill).toBe(fill);
           }
         }
-        const refused: [typeof shape, GenerateOptions][] = [[{ ...shape, kvQuant: true, hasDraft: true }, kv]];
-        for (const [request, options] of refused)
-          expect(binding.plan(request, options, scheduling).mechanism).toBe("unsupported");
-        expect(binding.plan({ ...shape, kvQuant: true, hasAdapters: true, hasDraft: true },
-          { ...kv, adapters: ["upper"], pagedKv: {} } as GenerateOptions, scheduling).mechanism).toBe("unsupported");
-        expect(binding.plan({ ...shape, kvQuant: true, hasAdapters: true, hasDraft: true },
-          { ...kv, adapters: ["upper"] }, { ...scheduling, quantizedBatch: false }).mechanism).toBe("unsupported");
+        expect(binding.plan({ ...shape, hasDraft: true }, {}, scheduling).mechanism).toBe("unsupported");
+        expect(binding.plan({ ...shape, hasAdapters: true, hasDraft: true },
+          { adapters: ["upper"], pagedKv: {} } as GenerateOptions, scheduling).mechanism).toBe("unsupported");
+        expect(binding.plan({ ...shape, hasAdapters: true, hasDraft: true },
+          { adapters: ["upper"] }, { ...scheduling, quantizedBatch: false }).mechanism).toBe("unsupported");
       }
     }
     expect(opened).toBe(0);
@@ -842,18 +888,18 @@ test.each([["MiniCPM5", minicpm5], ["plain universal", universal]] as const)(
 
 test.each([["MiniCPM5", minicpm5], ["plain universal", universal]] as const)(
   "%s delayed affine requests ignore supplied fill without binding a fill method", (_, model) => {
-    const binding = bindMlxGateway(model());
-    binding.configureContinuation!({ checkpointPersistence: {} } as never);
     for (const kv of [{ kvBits: 4, quantizedKvStart: 8 }, { kvBits: 8 },
       { kvConfig: [{ layerIdx: 0, bits: 4, groupSize: 64 }, { layerIdx: 2, bits: 8, groupSize: 64 }], quantizedKvStart: 8 }]) {
+      const binding = bindMlxGateway(composedWith(model(), kv));
+      binding.configureContinuation!({ checkpointPersistence: {} } as never);
       const scheme = new KvScheme("kvBits" in kv ? "affine-uniform" : "affine-config", kv);
       const scheduling = { continuous: binding.cachesBatchable(), quantizedBatch: binding.kvBatchable(scheme), checkpoints: true };
       for (const echo of [false, true]) for (const extra of [{}, { hasAdapters: true }, { wantsLogprobs: true }, { userSeed: true }]) {
         const { fill } = fillOptions(echo);
         const stats = { ...fill.stats };
-        const options = Object.freeze({ ...kv, fill, ...(extra.hasAdapters ? { adapters: ["upper"] } : {}),
+        const options = Object.freeze({ fill, ...(extra.hasAdapters ? { adapters: ["upper"] } : {}),
           ...(extra.userSeed ? { seed: 3 } : {}) });
-        const request = { ...shape, ...extra, kvQuant: true };
+        const request = { ...shape, ...extra };
         const plan = binding.plan(request, options, scheduling);
         expect(plan).toMatchObject({ method: "autoregressive", mechanism: "continuous", fill: false,
           checkpoint: false, grammarJump: false });
@@ -943,7 +989,7 @@ test("storage is probed once per binding, released on every path and never touch
     expect(binding.kvBatchable(resolveKvScheme({ override: 4, quantizedKvStart: 0 }))).toBe(true);
     // Encoded-KV attention with every layer convertible: a delayed start batches too.
     expect(binding.kvBatchable(resolveKvScheme({ override: 4, quantizedKvStart: 64 }))).toBe(true);
-    for (const request of [shape, { ...shape, hasDraft: true }, { ...shape, kvQuant: true }]) place(binding, request);
+    for (const request of [shape, { ...shape, hasDraft: true }, { ...shape, hasGrammar: true }]) place(binding, request);
   }
   expect({ made, released: released.length }).toEqual({ made: 1, released: 4 });
 

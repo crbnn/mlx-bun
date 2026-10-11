@@ -109,7 +109,7 @@ const inputs = optIn(Bun.env);
 test.skipIf(!inputs)("Gemma4 paged KV: gathered bf16 equals plain KV; direct reads, cancellation and RAM/SSD reuse per encoding", async () => {
   const ops = await import("@mlx-bun/mlx/ops");
   const { clearCache } = await import("@mlx-bun/mlx/ffi");
-  const { loadModelConfig, Weights, createModel } = await import("@mlx-bun/inference");
+  const { loadModelConfig, Weights, createModel, resolveComposition } = await import("@mlx-bun/inference");
   const { bindMlxGateway, createRuntimeConfig, withRuntimeConfig } = await import("@mlx-bun/inference/execution");
   const { PromptCache, TieredPromptCache, SsdCacheStore, KVCache, RotatingKVCache, cloneKvCaches, resolveKvScheme } =
     await import("@mlx-bun/inference/state");
@@ -143,7 +143,21 @@ test.skipIf(!inputs)("Gemma4 paged KV: gathered bf16 equals plain KV; direct rea
   const weights = await Weights.open(path);
   const releases: (() => void)[] = [];
   try {
-    const model = createModel(weights, config) as A;
+    // One graph per encoding, composed with that server-wide scheme: the
+    // tiled-causal affine reads this test computed before E3, when its
+    // environment left fused SDPA on (MLX_BUN_NO_FUSED_SDPA unset).
+    const schemeFor = (encoding: Encoding) => encoding === "bf16" ? undefined : resolveKvScheme({ override: encoding, fusedSdpa: true });
+    const models = new Map<Encoding, A>();
+    const modelFor = (encoding: Encoding): A => {
+      let built = models.get(encoding);
+      if (!built) {
+        const scheme = schemeFor(encoding);
+        built = createModel(weights, config, resolveComposition(config, scheme ? { kv: { override: encoding as 4 | 8, fusedSdpa: true } } : {}));
+        models.set(encoding, built);
+      }
+      return built;
+    };
+    const model = modelFor("bf16");
     const layers = (() => { const probe: Cache[] = model.makeCache(); try { return probe.length; } finally { releaseAll(probe.map(c => () => c.dispose())); } })();
     const runtimeFor = (reader: Reader) => createRuntimeConfig({ MLX_BUN_COMPILED_DECODE: "0",
       MLX_BUN_PAGED_ATTN: reader === "direct" ? "1" : "0" });
@@ -177,13 +191,13 @@ test.skipIf(!inputs)("Gemma4 paged KV: gathered bf16 equals plain KV; direct rea
      * submit while admission is held, then release together (a real cohort). */
     const runGroup = async (setup: Setup, rows: RowSpec[], opts: RunOptions = {}) => {
       const runtime = runtimeFor(setup.reader);
-      const binding = withRuntimeConfig(runtime, () => bindMlxGateway(model));
-      const scheme = setup.encoding === "bf16" ? undefined : resolveKvScheme({ override: setup.encoding });
-      const options: A = { ...(scheme?.generationOptions ?? {}), ...(setup.paged ? { pagedKv: { blockSize: setup.blockSize } } : {}) };
+      const binding = withRuntimeConfig(runtime, () => bindMlxGateway(modelFor(setup.encoding)));
+      const scheme = schemeFor(setup.encoding);
+      const options: A = setup.paged ? { pagedKv: { blockSize: setup.blockSize } } : {};
       const quantizedBatch = scheme ? binding.kvBatchable(scheme) : false;
       assert(!scheme || quantizedBatch, `${scheme?.label} must batch on this graph`);
       const plan = binding.plan({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
-        kvQuant: !!scheme, turboQuant: false, hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false },
+        hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false },
       options, { continuous: true, quantizedBatch, checkpoints: false });
       assert.equal(plan.mechanism, "continuous", `placement: ${plan.reasons.join(", ")}`);
       assert.equal(plan.pagedKv, setup.paged);
@@ -314,8 +328,8 @@ test.skipIf(!inputs)("Gemma4 paged KV: gathered bf16 equals plain KV; direct rea
           tokenizerHash: "gemma4-paged", verify: true, storage: { layout: "blocks" as const } };
         const tier = (store: A, async: boolean) => ({
           find(tokens: number[], ns: string) { const hit = store.find(tokens, ns); return hit ? { prefixLen: hit.prefixLen, handle: hit.entry } : null; },
-          restore(handle: A) { const hit = store.restore(handle, model); return hit ? { ...hit, retain() {} } : null; },
-          ...(async ? { async restoreAsync(handle: A) { const hit = await store.restoreAsync(handle, model); return hit ? { ...hit, retain() {} } : null; } } : {}),
+          restore(handle: A) { const hit = store.restore(handle, modelFor(encoding)); return hit ? { ...hit, retain() {} } : null; },
+          ...(async ? { async restoreAsync(handle: A) { const hit = await store.restoreAsync(handle, modelFor(encoding)); return hit ? { ...hit, retain() {} } : null; } } : {}),
           store: (tokens: number[], caches: Cache[], ns: string, attachments: A) => store.store(tokens, caches, ns, attachments),
         });
         // Each SSD restore's caches, observed as the store hands them over.

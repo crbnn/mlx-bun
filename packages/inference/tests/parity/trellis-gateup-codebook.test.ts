@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { Weights, loadModelConfig } from "@mlx-bun/inference/artifacts";
 import { Qwen35Model } from "@mlx-bun/inference/models/qwen3_5";
+import { resolveComposition } from "@mlx-bun/inference";
 import { TrellisLinear } from "@mlx-bun/inference/layers";
 import { TRELLIS_MATVEC_MAX_M, fusedGateUpSwiglu, fusedGateUpSwigluMixed, trellisScatter, type ScatterRepresentation } from "@mlx-bun/inference/kernels/trellis";
 import { gateUpCodebookEligible } from "../../src/kernels/trellis/gate-up";
@@ -49,7 +50,8 @@ test.skipIf(!artifact || deviceArchitecture() !== "applegpu_g13s")(
   async () => {
     const weights = await Weights.open(artifact!);
     // The generic graph reads each layer's MLP per forward, so the representations below reach it.
-    const model = new Qwen35Model(weights, await loadModelConfig(artifact!));
+    const config = await loadModelConfig(artifact!);
+    const model = new Qwen35Model(weights, config, resolveComposition(config));
     expect(model.layers.length).toBe(64);
     expect(model.layers.filter(layer => layer.mlp.gate instanceof TrellisLinear &&
       gateUpCodebookEligible(layer.mlp.gate.geometry, 1, Dtype.bfloat16, 13, deviceArchitecture())).length).toBeGreaterThan(0);
@@ -63,8 +65,9 @@ test.skipIf(!artifact || deviceArchitecture() !== "applegpu_g13s")(
     const install = (mode: Mode) => model.layers.forEach((layer, i) => {
       (layer as unknown as { mlp: unknown }).mlp = representedMlp(loaded[i]!, representation(mode));
     });
+    // Plain KV: no affine read is composed, so no kernel choice applies.
     const run = (mode: Mode, prompt: number[]) => withRuntimeConfig(createRuntimeConfig({
-      ...runtimeConfig().values, MLX_BUN_NO_FUSED_SDPA: "1",
+      ...runtimeConfig().values,
     }), () => {
       install(mode);
       const caches = model.makeCache();

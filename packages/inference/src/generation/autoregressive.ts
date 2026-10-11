@@ -37,7 +37,7 @@ readStepExtras,
 stepExtrasArrays,
 type StepExtras
 } from "../sampling/index";
-import { createKvMaintenance } from "../state/kv-maintenance";
+import { BF16_KV, type KvStorageScheme } from "../contracts/portable/composition";
 import { maybePageKv } from "../state/request-policy";
 import { isRotatingPlainCache } from "../state/capabilities";
 import {
@@ -69,16 +69,14 @@ export function shouldUseGrammarJump(
  *   - logprobs/top_logprobs: injected tokens are never sampled, so they have
  *     no distribution row (same rule as shouldUseGrammarJump).
  *   - promptEmbeddings: vision/audio prompts (and mRoPE) — untested shape.
- *   - affine KV: the model's append binding declares its supported formats.
- *     Verify-policy quantized appends remain a separate gate. */
+ *   - quantized KV: the model's append binding declares the formats of the
+ *     composition's scheme `kv` it supports. Verify-policy quantized appends
+ *     remain a separate gate. */
 export function shouldUseFill(
-  options: Pick<
-    GenerateOptions,
-    "fill" | "grammar" | "logprobs" | "topLogprobs" | "promptEmbeddings"
-    | "kvBits" | "kvConfig" | "turboQuant"
-  >,
+  options: Pick<GenerateOptions, "fill" | "grammar" | "logprobs" | "topLogprobs" | "promptEmbeddings">,
   runtime: RuntimeConfig = runtimeConfig(),
   append?: Pick<MlxTokenAppend, "affineKvBits" | "turboQuantFormats"> | null,
+  kv: KvStorageScheme = BF16_KV,
 ): boolean {
   if (!options.fill) return false;
   if (resolveFillMode(runtime.value("MLX_BUN_FILL") ?? "off") === "off") return false;
@@ -86,13 +84,7 @@ export function shouldUseFill(
     !options.logprobs &&
     !(options.topLogprobs && options.topLogprobs > 0) &&
     options.promptEmbeddings === undefined &&
-    supportsCommittedAppendCache(append, options);
-}
-
-/** Compatibility entry point for callers that perform a single conversion.
- * Execution sessions compose createKvMaintenance once and reuse it. */
-export function maybeQuantizeKv(cache: Cache[], options: GenerateOptions): void {
-  createKvMaintenance(options)(cache);
+    supportsCommittedAppendCache(append, kv);
 }
 
 /** The rewind surface a verify-policy fill needs. `Cache` declares the
@@ -158,7 +150,6 @@ async function* generateInner(
     throw error;
   }
   const graph = binding.graph;
-  const maintainKv = createKvMaintenance(options);
 
   // logprobs capture (mlx_lm.server semantics — see GenerateOptions.logprobs).
   // Everything below is gated: when neither flag is set, no extra ops, evals,
@@ -186,6 +177,8 @@ async function* generateInner(
   const ownsCache = !options.cache;
   const resuming = options.initialPendingToken !== undefined;
   let cache: Cache[] = options.cache ?? [];
+  // The composition's KV scheme, which every request stores.
+  const kv = binding.kv ?? BF16_KV;
   let appender: MlxTokenAppend | null = null;
   try {
     if (ownsCache) cache = binding.makeCache();
@@ -200,7 +193,7 @@ async function* generateInner(
       );
     // Replace fresh full-attention caches before any forward. The deepest
     // write is prompt + maxTokens - 1, so capacity covers every decode step.
-    maybePageKv(cache, options, promptTokens.length + maxTokens);
+    maybePageKv(cache, kv, options, promptTokens.length + maxTokens);
     appender = options.fill ? binding.createAppend?.({
       hasAdapters: !!options.adapters?.length, pagedKv: !!options.pagedKv,
     }) ?? null : null;
@@ -216,7 +209,7 @@ async function* generateInner(
   // Token fast-forwarding gate (see shouldUseFill). Sliding-window layers take
   // part: a multi-token append is one concat write, and a rejected verify tail
   // leaves the ring by the bypass trim that write allows (see rewind below).
-  const fillOn = shouldUseFill(options, runtime, appender);
+  const fillOn = shouldUseFill(options, runtime, appender, kv);
   const fillTrace = fillOn && fillTraceEnabled();
   const fillTraceFile = fillOn ? fillTracePath() : null;
   // Verify-policy proposals (echo tier) need the rejected tail rewound. That
@@ -225,7 +218,7 @@ async function* generateInner(
   // restore a pre-round snapshot and bit-exactly replay the accepted prefix.
   // A model whose caches can do neither still gets assert-policy fills; verify
   // proposals are dropped and counted (stats.verifyUnsupported).
-  const verifyCapable = fillOn && !options.kvBits && !options.kvConfig?.length && !options.turboQuant && cache.every(
+  const verifyCapable = fillOn && kv.kind === "bf16" && cache.every(
     (c) => c.isTrimmable() || isRotatingPlainCache(c) || typeof rewindable(c).specRoundRollback === "function",
   );
   closeBatchSetup?.();
@@ -359,8 +352,6 @@ async function* generateInner(
     nextPending = null;
     disposeStepExtras(nextExtras);
     nextExtras = null;
-    // Conversion runs at the ordinary committed-token boundary as well.
-    maintainKv(cache);
 
     let checkpointMs = 0;
     let roundOpen = false;
@@ -374,17 +365,14 @@ async function* generateInner(
     let hf: MlxArray | null = null;
     let logitsAll: MlxArray | null = null;
     try {
+      // A committed span stops at any composed cache's pending transition,
+      // which that cache then runs inside its append.
       const chunkSize = (state: readonly Cache[]) => {
         const maxChunk = Math.min(appender?.maxChunkSize(state) ?? 1,
-          maintainKv.maxAppendTokens?.(state) ?? Number.POSITIVE_INFINITY);
+          ...state.map(c => c.maxAppendTokens?.() ?? Number.POSITIVE_INFINITY));
         return fill.appendChunkSize > 0 ? Math.min(fill.appendChunkSize, maxChunk) : maxChunk;
       };
-      const committedGraph = appender ? appender.forwardHidden.bind(appender) : graph.forwardHidden.bind(graph);
-      const forwardCommitted = maintainKv.maxAppendTokens ? async (ids: MlxArray, state: Cache[]) => {
-        const hidden = await committedGraph(ids, state);
-        try { maintainKv(state); return hidden; }
-        catch (error) { hidden.dispose(); throw error; }
-      } : committedGraph;
+      const forwardCommitted = appender ? appender.forwardHidden.bind(appender) : graph.forwardHidden.bind(graph);
       hf = await appendFillHidden(
         verify ? graph.forwardHidden.bind(graph) : forwardCommitted,
         cache, ids, verify ? () => ids.length : chunkSize,
@@ -494,13 +482,7 @@ async function* generateInner(
       closePrefill?.();
       tDecode = performance.now();
     } else {
-    // ---- prefill ----
-    const closeInitialKv = diagnostics.trace?.begin("prefill.kv_maintenance", {
-      mechanism: diagnostics.mechanism ?? "serial",
-      boundary: "initial",
-    });
-    maintainKv(cache);
-    closeInitialKv?.();
+    // ---- prefill ---- (composed caches convert inside their own appends)
     tPrefill = performance.now();
     let h0: MlxArray;
     if (options.promptEmbeddings) {
@@ -523,7 +505,6 @@ async function* generateInner(
         : undefined;
       const tailSplit = runtime.flag("MLX_BUN_PREFILL_TAIL_SPLIT", true);
       const forward = graph.forwardHidden.bind(graph);
-      const maintain = () => maintainKv(cache);
       while (true) {
         options.signal?.throwIfAborted();
         const step = nextPrefillStep({ length: promptTokens.length, position: pos,
@@ -534,7 +515,7 @@ async function* generateInner(
           tokens: step.end - step.start, ...(step.kind === "final" ? { final: true } : {}),
         });
         let hidden: MlxArray | null;
-        try { hidden = await executeMlxPrefillStep(forward, cache, promptTokens, step, maintain); }
+        try { hidden = await executeMlxPrefillStep(forward, cache, promptTokens, step); }
         finally { closeChunk?.(); }
         pos = step.end;
         if (hidden) { h0 = hidden; break; }
@@ -668,7 +649,6 @@ async function* generateInner(
         // contract); the next sampled token, if the budget and grammar allow
         // one, comes from its last position. Compiled decode resumes on the
         // following iteration (supports() re-checks the grown caches).
-        maintainKv(cache);
         pushHistory(cur);
         stepSampler.commitNumbers(jumpEmit);
         const chunk = [grammarTok, ...jumpEmit];
@@ -682,7 +662,6 @@ async function* generateInner(
           } : undefined);
         if (nextPending) ops.asyncEvalAll([nextPending, ...stepExtrasArrays(nextExtras)]);
       } else if (stepIndex + 1 < maxTokens && !options.grammar?.isTerminated) {
-        maintainKv(cache);
         pushHistory(cur);
         let logits: MlxArray | null = null;
         let evalWith: MlxArray[] = [];
@@ -834,7 +813,6 @@ async function* generateInner(
       // hit folds the token into an M>1 prefill and changes native reductions.
       // Aborted requests and caches owned by this run need no retained state.
       if (!ownsCache && !threw && !options.signal?.aborted && earlyUnforwardedToken !== null) {
-        maintainKv(cache);
         const ids = ops.reshape(pending!, [1, 1]);
         try {
           const hidden = await graph.forwardHidden(ids, cache);

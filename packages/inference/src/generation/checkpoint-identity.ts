@@ -14,7 +14,8 @@ function canonical(value: unknown): unknown {
 
 /** Stable identity for an exactly resumable generation. The prompt already
  * includes rendered messages and tool schemas; the remaining fields cover
- * every sampling policy that can change the continuation. */
+ * every sampling policy that can change the continuation. The KV scheme is
+ * the composition's: the store holding the checkpoint is keyed by it. */
 export function generationCheckpointKey(
   promptIds: number[], options: GenerateOptions & { stopSequences?: readonly string[] }, cacheNs = "",
   execution?: ResolvedExecution, bindingIdentity?: unknown,
@@ -54,11 +55,6 @@ export function generationCheckpointKey(
     presenceContextSize: options.presenceContextSize,
     frequencyPenalty: options.frequencyPenalty,
     frequencyContextSize: options.frequencyContextSize,
-    kvBits: options.kvBits,
-    kvGroupSize: options.kvGroupSize,
-    quantizedKvStart: options.quantizedKvStart,
-    kvConfig: options.kvConfig,
-    turboQuant: options.turboQuant,
   };
   return createHash("sha256").update(JSON.stringify(canonical(policy))).digest("hex");
 }

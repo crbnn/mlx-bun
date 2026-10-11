@@ -19,7 +19,6 @@ import { leaseCacheStates } from "../state/leases";
 import { bindSpeculativeTargetModel, type MlxSpeculativeTargetBinding } from "../generation/speculative/bindings/binding";
 import { bindLegacyDraftTarget } from "../generation/speculative/bindings/draft-target";
 import { bindRowCacheRollback } from "../state/rollback";
-import { createKvMaintenance } from "../state/kv-maintenance";
 import { disposeAttachments } from "../state/checkpoint";
 import { type CheckpointAttachment } from "../contracts/mlx/checkpoint";
 import { advanceSpeculativeOutputs } from "../generation/speculative/round";
@@ -58,9 +57,8 @@ export function bindSpeculativeGroupRequests(model: MlxTokenGraph, provider: Pic
   return (input: GenerateOptions): MlxGroupMethodRequest => {
     const options = captureSpeculativeOptions(input);
     return {
-      key: JSON.stringify(["speculative", provider.id, depth, adaptiveDepth, options.kvBits ?? null,
-        options.kvGroupSize ?? 64, options.quantizedKvStart ?? null, options.turboQuant ?? null,
-        ...(options.kvConfig?.length ? [options.kvConfig] : [])]),
+      // The KV scheme is the composition's, shared by every request.
+      key: JSON.stringify(["speculative", provider.id, depth, adaptiveDepth]),
       data: options,
       open: host => new SpeculativeGroup(host, model, provider, binding, depth, taps, adaptiveDepth),
     };
@@ -105,8 +103,7 @@ class SpeculativeGroup implements MlxGroupedMethod {
 
   prepare(first: Row): MlxGroupPreparation {
     const method = this;
-    const options = first.req.method!.data as GenerateOptions;
-    const maintain = createKvMaintenance(options);
+    const maintain = this.host.kvMaintenance;
     interface Preparation extends MlxPrefillState {
       request: RequestState;
       end: number;
@@ -187,10 +184,8 @@ class SpeculativeGroup implements MlxGroupedMethod {
             } finally { disposeResources([...hit.caches, { dispose: () => disposeAttachments(hit.attachments) },
               { dispose: () => hit.retain?.() }]); }
           } else { prefix.append([null]); appended = true; }
-          // The first forward must read maintained state. A stored prefix can
-          // still owe the conversion its final append reached (a round without
-          // drafts maintains only before its append), so maintain it here.
-          maintain(caches);
+          // The graph's composed caches, or a stored prefix composed again by
+          // the prompt cache: either converts inside its own appends.
           return { row, request, solo: caches, retain: retained, pos: row.cachedTokens,
             end: request.prefixLength, pendingPrompt, transferred: false, closed: false,
             chunkSize: options.prefillChunkSize ?? row.req.prefillChunkSize ?? method.host.prefillChunkSize,
@@ -283,7 +278,7 @@ class SpeculativeGroup implements MlxGroupedMethod {
                 state.row.reject(state.row.req.signal.reason);
                 continue;
               }
-              maintain.prepareBatch?.(state.caches);
+              maintain?.prepareBatch?.(state.caches);
               this.#target ??= new MlxStateRows(state.caches.map(targetCacheLayout));
               this.#draft ??= declaredTaps(this.provider, this.taps, this.provider.grouped!.open({ target: bindLegacyDraftTarget(this.model, this.#target.caches),
                 checkpoints: [], sampling: { sample: (lp, steps) => this.#sampleDraftRows(lp, steps), greedy: greedyDraftPolicy(),

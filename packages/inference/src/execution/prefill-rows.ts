@@ -201,9 +201,9 @@ export class MlxPrefillRows<State extends MlxPrefillState> implements MlxGroupPr
             evalCacheState(caches);
           }
           using span = traceRows(this.#states, "prefill.kv_maintenance", work);
-          if (this.#stateRows) {
-            for (const cache of caches) cache.prefillMaintenance?.commitPrefill(maintained);
-          } else if (maintained.length) this.operations.maintain?.(this.#states[0]!.solo);
+          // Cohort rows convert at their planned boundaries; a single row's
+          // composed caches converted inside their own appends.
+          if (this.#stateRows) for (const cache of caches) cache.prefillMaintenance?.commitPrefill(maintained);
           // A scheduler budget can split one planned chunk into many pieces.
           // Resolve state at each yield, but retain allocator reuse until the
           // method's maintenance boundary instead of purging it every piece.

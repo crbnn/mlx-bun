@@ -12,6 +12,7 @@ import { MlxStateRows } from "../../src/state/rows";
 import { BatchedKVCache } from "../../src/state/batched-kv";
 import { KVCache } from "../../src/state/kv";
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
+import { testComposition } from "../models/test-composition";
 import { bindSpeculativeGroupRequests } from "../../src/execution/speculative-group";
 
 let directory: string;
@@ -286,7 +287,8 @@ test("Qwen MTP declares the target tap its grouped rows consume, resolved from t
     // where the target forward captures hidden layers and refuses where it cannot.
     const qwen = (tap: boolean) => Object.assign(Object.create(Qwen35Model.prototype), {
       config: { modelType: "qwen3_5", eosTokenIds: [], text: { enableMoeBlock: false, hiddenSize: 8, numHiddenLayers: 3, vocabSize: 16 } },
-      embed: { encode: unused }, lmHead: null, makeCache: () => [], ...(tap ? { hiddenTap: null } : {}) }) as Qwen35Model;
+      embed: { encode: unused }, lmHead: null, makeCache: () => [], composition: testComposition(),
+      ...(tap ? { hiddenTap: null } : {}) }) as Qwen35Model;
     expect(bindSpeculativeGroupRequests(qwen(true), provider, 2)).toBeDefined();
     expect(bindSpeculativeGroupRequests(qwen(false), provider, 2)).toBeUndefined();
   } finally { provider.dispose(); }

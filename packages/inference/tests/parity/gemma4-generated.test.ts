@@ -53,12 +53,15 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
   const ops = await import("@mlx-bun/mlx/ops");
   const { loadModelConfig, Weights, configFingerprint } = await import("@mlx-bun/inference/artifacts");
   const { createModel } = await import("@mlx-bun/inference/models");
+  const { resolveComposition } = await import("@mlx-bun/inference");
   const { Gemma4Model } = await import("@mlx-bun/inference/models/gemma4");
   const { CompiledDecode } = await import("@mlx-bun/inference/models/gemma4/compiled-decode");
   const { generate } = await import("@mlx-bun/inference/generation");
   const { loadTokenizer } = await import("@mlx-bun/inference/input");
-  // The kernel set kv-maintenance composes for the flag the run has (the monolith reads through it).
-  const { servedAffineKernels } = await import("../../src/state/served-affine-kernels");
+  // The kernel set the converted caches read with: `--kv-quant config`'s,
+  // which this test's environment produced before E3 (MLX_BUN_NO_FUSED_SDPA unset).
+  const { composedAffineKernels } = await import("@mlx-bun/inference/state");
+  const configKernels = composedAffineKernels("tiled-causal");
   // The fast-path counters live in each generated module.
   const modules = await Promise.all([import("../../src/models/gemma4/generated/gemma4-12b"),
     import("../../src/models/gemma4/generated/gemma4-e4b"), import("../../src/models/gemma4/generated/gemma4-26b")]);
@@ -86,7 +89,7 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
     return { bytes: Buffer.from(exact.rawBytes()), next: arg.toIntTokens()[0]! };
   };
   try {
-    mono = new Gemma4Model(weights, config);
+    mono = new Gemma4Model(weights, config, resolveComposition(config));
     gen = createModel(weights, config);
     expect(gen).toBeInstanceOf(generated.GeneratedGemma4);
     expect(mono).not.toBeInstanceOf(generated.GeneratedGemma4);
@@ -100,7 +103,7 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
           // The serve scenario: each cache the kv_config names converts before any forward.
           for (let layer = 0; layer < caches.length; layer++) {
             const entry = kvConfig.find(item => item.layerIdx === layer);
-            if (entry) caches[layer] = caches[layer].toQuantized(entry.groupSize, entry.bits, servedAffineKernels());
+            if (entry) caches[layer] = caches[layer].toQuantized(entry.groupSize, entry.bits, configKernels);
           }
           const vectors: Buffer[] = [];
           let tokens = prompt;
@@ -122,22 +125,26 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
       specialized.forEach((vector, step) => expect({ step, equal: vector.equals(dedicated[step]!) }).toEqual({ step, equal: true }));
     } finally { restore(); }
 
-    // 2. Greedy trajectories under kv_config, uncompiled and compiled.
+    // 2. Greedy trajectories under kv_config, uncompiled and compiled: both
+    // graphs composed with the artifact's per-layer scheme (`--kv-quant config`).
+    const configComposition = resolveComposition(config, { kv: { override: "config", quantizedKvStart: 0 } });
+    const configured = { mono: new Gemma4Model(weights, config, configComposition), gen: createModel(weights, config, configComposition) };
+    expect(configured.gen).toBeInstanceOf(generated.GeneratedGemma4);
     for (const compiled of [false, true]) {
       const reset = configureRuntime({ MLX_BUN_COMPILED_DECODE: compiled ? "1" : "0" });
       try {
         const run = async (model: A) => {
           const out: number[] = [];
           // No stop tokens: every trajectory is TOKENS long whatever the artifact's first token (e4b's is EOS here).
-          const generation = generate(model, prompt, { maxTokens: TOKENS, temperature: 0, kvConfig, quantizedKvStart: 0, eosTokenIds: [] });
+          const generation = generate(model, prompt, { maxTokens: TOKENS, temperature: 0, eosTokenIds: [] });
           for await (const token of generation) out.push(token.token);
           ffi.clearCache();
           return out;
         };
         const before = generated.generatedForwardUses;
-        const specialized = await run(gen);
+        const specialized = await run(configured.gen);
         const used = generated.generatedForwardUses - before;
-        const dedicated = await run(mono);
+        const dedicated = await run(configured.mono);
         expect(specialized.length).toBe(TOKENS);
         expect({ compiled, specialized }).toEqual({ compiled, specialized: dedicated });
         if (!compiled) expect(used).toBeGreaterThanOrEqual(specialized.length - 1);
@@ -166,7 +173,7 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
       try {
         for (let layer = 0; layer < caches.length; layer++) {
           const entry = kvConfig.find(item => item.layerIdx === layer);
-          if (entry) caches[layer] = caches[layer].toQuantized(entry.groupSize, entry.bits, servedAffineKernels());
+          if (entry) caches[layer] = caches[layer].toQuantized(entry.groupSize, entry.bits, configKernels);
         }
         const ids = ops.fromInt32([...prompt.slice(0, ROW_TOKENS), ...prompt.slice(-ROW_TOKENS)], [2, ROW_TOKENS]);
         try {

@@ -17,7 +17,7 @@ import { expect, test, spyOn } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { KvSchemeOptions } from "@mlx-bun/inference/state/kv-scheme";
+import type { KvOptions } from "../models/test-composition";
 import type { Cache } from "@mlx-bun/inference/contracts/mlx";
 import { applyDescriptor, descriptorFor } from "./real-weight-inputs";
 const target = Bun.env.MLX_BUN_TEST_CONTINUATION_MODEL;
@@ -95,22 +95,24 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
   };
   try {
     const config = await continuationConfig();
-    const model = createModel(weights, config);
+    const prompt = [2, 105, 2364, 107, 1567, 506, 2390, 107];
+    const kv = await continuationKv(prompt.length);
+    const model = await composedModel(weights, config, kv);
     checkDescriptor(model as never, config);
     if (!("loraState" in model) || !model.loraState) throw new Error("continuation test requires adapter state");
     manager = new AdapterManager(model);
     const adapters = manager;
     if (adapter) await manager.mount("upper", adapter);
     const adapterNamespace = adapter ? adapters.cacheNamespace(["upper"]) : "";
-    const prompt = [2, 105, 2364, 107, 1567, 506, 2390, 107];
-    const kv = await continuationKv(prompt.length);
     /** A saved or restored checkpoint of `tokens` committed tokens (always
      * after the prefill). Delayed conversion gives each converted cache the
      * offset it converted at as its reuse floor. A start within the prompt
      * converts at the first prefill maintenance boundary at or past it (a drain
-     * chunk's end or the prompt's end); a later start converts inside the next
-     * decode append once the committed offset has reached it, so a checkpoint
-     * of exactly `start` tokens taken after a decode step is still plain.
+     * chunk's end or the prompt's end); a later start converts once the
+     * committed offset has reached it, and a row handed back to serial use is
+     * the graph's composed cache again, which converts storage already holding
+     * its start as it adopts it, so a checkpoint of exactly `start` tokens is
+     * converted too (its floor is `start`).
      * Other artifacts may carry recurrent or other non-KV state, so they check
      * only the floor's bound;
      * the custom window graph is sliding and full KV layers throughout, so it
@@ -124,7 +126,8 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
      * scheme's bits, each sliding cache stays a plain ring, and every KV
      * layer is at the checkpoint's offset. From token 0 there is no reuse
      * floor. Recurrent layers keep their own state and are not KV. */
-    const checkTurbo = (caches: readonly Cache[], tokens: number) => {
+    const checkTurbo = (composed: readonly Cache[], tokens: number) => {
+      const caches = composed.map(cache => cache.composed?.storage() ?? cache);
       const { kBits, vBits } = kv.options.turboQuant!;
       // One effective type per cache for both the check and the count: a
       // config without layer types is full attention throughout.
@@ -159,10 +162,11 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
       expect(encoded).toBeGreaterThan(0);
       expect(encoded).toBe(types.filter(type => type === "full_attention").length);
     };
-    const checkSaved = (caches: readonly Cache[], tokens: number) => {
-      if (kv.mode === "turbo" && (kv.start <= prompt.length || tokens > kv.start)) checkTurbo(caches, tokens);
+    const checkSaved = (composed: readonly Cache[], tokens: number) => {
+      const caches = composed.map(cache => cache.composed?.storage() ?? cache);
+      if (kv.mode === "turbo" && (kv.start <= prompt.length || tokens >= kv.start)) checkTurbo(caches, tokens);
       if (kv.mode === "bf16" || kv.start === 0) return;
-      const converted = kv.start <= prompt.length || tokens > kv.start;
+      const converted = kv.start <= prompt.length || tokens >= kv.start;
       const minimum = minimumReusableOffset(caches);
       if (windowSetting === undefined) {
         if (converted) expect(minimum).toBeGreaterThanOrEqual(kv.start);
@@ -235,10 +239,10 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
           binding.configureContinuation!({ promptCache: prefix, checkpoints: store, checkpointEveryTokens: 4,
             checkpointPersistence: persistence, identity: "same-B-fixture", cloneState: cloneKvCaches,
             adapterNamespace: ids => adapters.cacheNamespace(ids) });
-          const options = { ...kv.options, ...(useAdapter ? { adapters: ["upper"] } : {}), maxTokens: 16,
+          const options = { ...(useAdapter ? { adapters: ["upper"] } : {}), maxTokens: 16,
             temperature: 0.7, seedWasExplicit: true, repetitionPenalty: 1.1, repetitionContextSize: 32 };
           const execution = binding.plan({ hasVision: false, hasAdapters: useAdapter, hasRepetitionPenalty: true,
-            userSeed: true, kvQuant: kv.scheme.kind !== "bf16" && kv.scheme.kind !== "turbo", turboQuant: kv.scheme.kind === "turbo",
+            userSeed: true,
             hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: useDraft }, options,
           { continuous: binding.cachesBatchable(), quantizedBatch: binding.kvBatchable(kv.scheme), checkpoints: true });
           expect(execution).toMatchObject({ method: "autoregressive", mechanism: "continuous", checkpoint: true });
@@ -417,11 +421,12 @@ test.skipIf(!target || !adapter || !Bun.env.MLX_BUN_TEST_CONTINUATION_KV_START |
   let manager: InstanceType<typeof AdapterManager> | undefined;
   try {
     const config = await continuationConfig();
-    const model = createModel(weights, config);
+    const prompt = [2, 105, 2364, 107, 1567, 506, 2390, 107];
+    const kv = await continuationKv(prompt.length);
+    const model = await composedModel(weights, config, kv);
     checkDescriptor(model as never, config);
     manager = new AdapterManager(model);
-    const adapters = manager, prompt = [2, 105, 2364, 107, 1567, 506, 2390, 107];
-    const kv = await continuationKv(prompt.length);
+    const adapters = manager;
     if (!["4", "8", "per-layer"].includes(kv.mode) || kv.start <= 0 || kv.start >= prompt.length + 16)
       throw new Error("adapter lifecycle requires delayed affine conversion inside the generated sequence");
     const binding = bindMlxGateway(model);
@@ -502,10 +507,10 @@ test.skipIf(!target || !adapter || !Bun.env.MLX_BUN_TEST_CONTINUATION_KV_START |
           const tokens: number[] = []; outputs[row] = tokens;
           const abort = new AbortController(); aborts.push(abort);
           const ids = row === batch - 1 && adapted ? [...prompt, 42, 43] : prompt;
-          const options = { ...kv.options, maxTokens: row === 1 && !cancel ? 4 : 16, temperature: 0,
+          const options = { maxTokens: row === 1 && !cancel ? 4 : 16, temperature: 0,
             ...(adapted ? { adapters: ["upper"] } : {}) };
           const execution = binding.plan({ hasVision: false, hasAdapters: adapted, hasRepetitionPenalty: false,
-            userSeed: false, kvQuant: true, turboQuant: false, hasLogitsExtras: false,
+            userSeed: false, hasLogitsExtras: false,
             hasGrammar: false, wantsLogprobs: false, hasDraft: false }, options,
           { continuous: binding.cachesBatchable(), quantizedBatch: binding.kvBatchable(kv.scheme), checkpoints: false });
           expect(execution).toMatchObject({ mechanism: "continuous", method: "autoregressive", fill: false });
@@ -609,7 +614,7 @@ async function continuationKv(promptLength: number) {
   const interruptAt = Number(Bun.env.MLX_BUN_TEST_CONTINUATION_INTERRUPT ?? 6);
   if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(interruptAt) || interruptAt < 6 || interruptAt >= 16)
     throw new Error("continuation fixture requires start>=0 and 6<=interrupt<16");
-  let options: KvSchemeOptions = {};
+  let options: KvOptions = {};
   let kind: ConstructorParameters<typeof KvScheme>[0] = "bf16";
   if (mode === "4" || mode === "8") {
     kind = "affine-uniform";
@@ -621,5 +626,16 @@ async function continuationKv(promptLength: number) {
     kind = "affine-config";
     options = { kvConfig: [{ layerIdx: 0, bits: 4, groupSize: 64 }, { layerIdx: 1, bits: 8, groupSize: 64 }], quantizedKvStart: start };
   } else if (mode !== "bf16") throw new Error(`unknown continuation KV fixture: ${mode}`);
-  return { mode, start, interruptAt, options, scheme: new KvScheme(kind, options) };
+  // The graph composes this scheme. Affine reads take the tiled-causal set this
+  // test read before E3, when its environment left fused SDPA on.
+  const scheme = new KvScheme(kind, { ...options, kvConfig: options.kvConfig?.map(entry => ({ ...entry })) }, "tiled-causal");
+  return { mode, start, interruptAt, options, scheme };
+}
+
+/** `config`'s graph composed with the continuation fixture's KV scheme. */
+async function composedModel(weights: import("@mlx-bun/inference/artifacts").Weights, config: import("@mlx-bun/inference/artifacts").ModelConfig,
+  kv: Awaited<ReturnType<typeof continuationKv>>) {
+  const { createModel } = await import("@mlx-bun/inference/models");
+  const { resolveComposition } = await import("@mlx-bun/inference");
+  return createModel(weights, config, { ...resolveComposition(config), kv: kv.scheme.storage });
 }

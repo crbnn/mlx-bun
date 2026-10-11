@@ -10,8 +10,8 @@ export function resolveExecution(
     [!capabilities.continuous, "continuous-unavailable"],
     [request.hasVision && !capabilities.mediaBatch, "media-batch-unsupported"],
     [request.hasAdapters && !capabilities.adapterBatch, "adapter-batch-unsupported"],
-    [request.kvQuant && !capabilities.quantizedBatch, "kv-scheme-batch-unsupported"],
-    [request.turboQuant && !capabilities.turboQuantBatch, "turbo-kv-batch-unsupported"],
+    [capabilities.kvQuant === true && !capabilities.quantizedBatch, "kv-scheme-batch-unsupported"],
+    [capabilities.turboQuant === true && !capabilities.turboQuantBatch, "turbo-kv-batch-unsupported"],
     [request.hasGrammar && !capabilities.grammarBatch, "grammar-batch-unsupported"],
     [features.pagedKv && !capabilities.pagedBatch, "paged-kv-batch-unsupported"],
   ] as const;
@@ -21,13 +21,13 @@ export function resolveExecution(
   const grammarProposals = features.grammarJump === true && request.hasGrammar && !request.hasDraft && !request.hasVision &&
     (!request.wantsLogprobs || capabilities.speculativeLogprobs === true) && !features.pagedKv && capabilities.method === "autoregressive" &&
     capabilities.sharedGrammarProposals === true && capabilities.groupedMethods?.includes("speculative") === true &&
-    (!request.hasAdapters || sharedAdapterMethod) && (!request.kvQuant || capabilities.speculativeKvQuant === true) &&
-    (!request.turboQuant || capabilities.speculativeTurboQuant === true) &&
+    (!request.hasAdapters || sharedAdapterMethod) && (capabilities.kvQuant !== true || capabilities.speculativeKvQuant === true) &&
+    (capabilities.turboQuant !== true || capabilities.speculativeTurboQuant === true) &&
     !sharedRequestExclusions.some(([excluded]) => excluded);
   const speculative = grammarProposals || (capabilities.method === "autoregressive" && request.hasDraft &&
     !request.hasVision && (!request.hasAdapters || sharedAdapterMethod) && (!request.wantsLogprobs || capabilities.speculativeLogprobs === true) &&
-    (!request.kvQuant || capabilities.speculativeKvQuant === true) &&
-    (!request.turboQuant || capabilities.speculativeTurboQuant === true) && !features.pagedKv);
+    (capabilities.kvQuant !== true || capabilities.speculativeKvQuant === true) &&
+    (capabilities.turboQuant !== true || capabilities.speculativeTurboQuant === true) && !features.pagedKv);
   const method = speculative ? "speculative" : capabilities.method;
   // Token-level request features act on sampled tokens. A method that does not
   // sample tokens refuses them instead of silently discarding them.

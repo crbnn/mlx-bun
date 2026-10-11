@@ -35,50 +35,64 @@ function spanGrammar(spans: readonly (readonly number[])[]) {
 }
 
 test.skipIf(!target)("real-weight committed spans over delayed affine KV equal direct generation below and across the transition, and beside a peer", async () => {
-  const { Weights, loadModelConfig, createModel, generateAutoregressive } = await import("../../src/index");
+  const { Weights, loadModelConfig, createModel, generateAutoregressive, resolveComposition } = await import("../../src/index");
   const { bindMlxGateway, createRuntimeConfig, withRuntimeConfig } = await import("../../src/execution");
   const { bindMlxAutoregressiveGraph } = await import("../../src/generation/bindings/autoregressive");
   const { resolveKvScheme } = await import("../../src/state/kv-scheme");
   const weights = await Weights.open(target!);
   try {
-    const model = createModel(weights, await loadModelConfig(target!));
-    const dense = model.requiredDenseKvLayers.length > 0;
+    const config = await loadModelConfig(target!);
     type Projection = { shape: number[]; dtype: string; sha256: string };
     let lane: Projection[] | null = null, kinds: string[][] = [];
-    const project = model.logitsFromHidden.bind(model), forward = model.forwardHidden.bind(model);
-    model.logitsFromHidden = (hidden: MlxArray) => {
-      const logits = project(hidden);
-      lane?.push({ shape: [...logits.shape], dtype: logits.dtypeName, sha256: createHash("sha256").update(logits.rawBytes()).digest("hex") });
-      return logits;
+    // One graph per conversion start, composed with that scheme: the
+    // tiled-causal affine reads this test computed before E3, when its
+    // environment left fused SDPA on (MLX_BUN_NO_FUSED_SDPA unset).
+    const affine = (start: number) => resolveKvScheme({ override: 4, quantizedKvStart: start, fusedSdpa: true });
+    type Scheme = ReturnType<typeof affine>;
+    const graphs = new Map<number, { model: ReturnType<typeof createModel>; binding: ReturnType<typeof bindMlxGateway> }>();
+    const graphFor = (scheme: Scheme) => {
+      const start = scheme.options.quantizedKvStart ?? 0;
+      const existing = graphs.get(start);
+      if (existing) return existing;
+      const model = createModel(weights, config, resolveComposition(config, { kv: { override: 4, quantizedKvStart: start, fusedSdpa: true } }));
+      const project = model.logitsFromHidden.bind(model), forward = model.forwardHidden.bind(model);
+      model.logitsFromHidden = (hidden: MlxArray) => {
+        const logits = project(hidden);
+        lane?.push({ shape: [...logits.shape], dtype: logits.dtypeName, sha256: createHash("sha256").update(logits.rawBytes()).digest("hex") });
+        return logits;
+      };
+      (model as { forwardHidden: typeof forward }).forwardHidden = (ids, caches) => {
+        kinds.push(caches.map(cache => (cache.composed?.storage() ?? cache).constructor.name));
+        return forward(ids, caches as never);
+      };
+      const graph = { model, binding: withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }), () => bindMlxGateway(model)) };
+      graphs.set(start, graph);
+      return graph;
     };
-    (model as { forwardHidden: typeof forward }).forwardHidden = (ids, caches) => {
-      kinds.push(caches.map(cache => cache.constructor.name));
-      return forward(ids, caches as never);
-    };
-    const binding = withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }), () => bindMlxGateway(model));
-    const affine = (start: number) => resolveKvScheme({ override: 4, quantizedKvStart: start });
+    const dense = graphFor(affine(64)).model.requiredDenseKvLayers.length > 0;
     const chunk = 64;
-    const options = (scheme: ReturnType<typeof affine>, maxTokens: number, grammar: GrammarController): GenerateOptions =>
-      ({ temperature: 0, maxTokens, eosTokenIds: [], prefillChunkSize: chunk, ...scheme.generationOptions, grammar });
+    const options = (maxTokens: number, grammar: GrammarController): GenerateOptions =>
+      ({ temperature: 0, maxTokens, eosTokenIds: [], prefillChunkSize: chunk, grammar });
 
-    const direct = async (prompt: number[], maxTokens: number, scheme: ReturnType<typeof affine>, spans: number[][]) => {
+    const direct = async (prompt: number[], maxTokens: number, scheme: Scheme, spans: number[][]) => {
       const grammar = spanGrammar(spans), tokens: number[] = [], seen: Projection[] = [];
       let outcome = "length";
       lane = seen; kinds = [];
       try {
-        const generation = generateAutoregressive(bindMlxAutoregressiveGraph(model), prompt,
-          { ...options(scheme, maxTokens, grammar), decodePolicy: { compiledDecode: false, grammarJump: true } });
+        const generation = generateAutoregressive(bindMlxAutoregressiveGraph(graphFor(scheme).model), prompt,
+          { ...options(maxTokens, grammar), decodePolicy: { compiledDecode: false, grammarJump: true } });
         for await (const { token } of generation) tokens.push(token);
       } catch (error) { outcome = (error as Error).name; } finally { lane = null; }
       return { tokens, accepted: grammar.accepted, seen, outcome, kinds };
     };
-    const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false, kvQuant: true,
-      turboQuant: false, hasLogitsExtras: false, hasGrammar: true, wantsLogprobs: false, hasDraft: false };
-    const grouped = (scheme: ReturnType<typeof affine>) => {
+    const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
+      hasLogitsExtras: false, hasGrammar: true, wantsLogprobs: false, hasDraft: false };
+    const grouped = (scheme: Scheme) => {
+      const { binding } = graphFor(scheme);
       const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: chunk, kvScheme: scheme,
         runtime: createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1" }) });
       const submit = async (prompt: number[], maxTokens: number, spans: number[][], onToken?: () => void) => {
-        const grammar = spanGrammar(spans), tokens: number[] = [], request = options(scheme, maxTokens, grammar);
+        const grammar = spanGrammar(spans), tokens: number[] = [], request = options(maxTokens, grammar);
         const execution = binding.plan(shape, request, { continuous: true, quantizedBatch: binding.kvBatchable(scheme), checkpoints: false });
         expect(execution).toMatchObject({ method: "autoregressive", mechanism: "continuous", grammarJump: true });
         const outcome = await group.submit({ promptIds: prompt, maxTokens, eosTokenIds: [], grammar,

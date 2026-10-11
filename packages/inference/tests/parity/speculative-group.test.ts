@@ -126,9 +126,9 @@ export function attachmentMatches(kind: Kind, tokens: number, attachment: A): bo
 
 // ---- shared native setup ---------------------------------------------------------------
 async function load(inputs: Inputs) {
-  const { loadModelConfig, Weights, createModel, openGlm52RuntimeModel } = await import("@mlx-bun/inference");
+  const { loadModelConfig, Weights, createModel, openGlm52RuntimeModel, resolveComposition } = await import("@mlx-bun/inference");
   const speculative = await import("@mlx-bun/inference/generation/speculative");
-  const { KvScheme, resolveKvScheme } = await import("@mlx-bun/inference/state");
+  const { kvSchemeOf } = await import("@mlx-bun/inference/state");
   const config = await loadModelConfig(inputs.target);
   if (inputs.window !== undefined) {
     // One descriptor for both the parsed config and the raw arguments the graph is built from.
@@ -137,6 +137,14 @@ async function load(inputs: Inputs) {
     raw.layer_types = [...types]; raw.sliding_window = inputs.window;
     config.text.layerTypes = [...types]; config.text.slidingWindow = inputs.window;
   }
+  // The KV scheme the graph composes, which every request stores. Its affine
+  // reads are the tiled-causal kernels this test computed before E3, when its
+  // environment left fused SDPA on (MLX_BUN_NO_FUSED_SDPA unset).
+  const turboQuant = { kBits: 8, vBits: 3 };
+  if (inputs.kv === "config") assert(config.kvQuant?.length, "the target has no kv_config.json");
+  const kvRequest = inputs.kv === "bf16" ? undefined : inputs.kv === "turbo" ? { turboQuant, quantizedKvStart: inputs.start }
+    : { override: inputs.kv === "config" ? "config" as const : Number(inputs.kv), quantizedKvStart: inputs.start, fusedSdpa: true };
+  const composition = resolveComposition(config, kvRequest ? { kv: kvRequest } : {});
   let model: A, defaultDepth: number | undefined, dispose: () => void;
   if (inputs.kind === "glm-mtp") {
     // `serve --mtp on`, as the app's model host opens it: the Colibri runtime with
@@ -149,7 +157,7 @@ async function load(inputs: Inputs) {
     defaultDepth = opened.plan.mtpDraftTokens;
   } else {
     const weights = await Weights.open(inputs.target);
-    model = createModel(weights, config) as A;
+    model = createModel(weights, config, composition) as A;
     dispose = () => {
       try { weights.dispose(); }
       finally { for (const file of weights.shards.files.values()) file.mmap.unmap(); }
@@ -166,21 +174,9 @@ async function load(inputs: Inputs) {
     return (await registry.load(inputs.kind, { dir: inputs.draft,
       target: { vocabSize: config.text.vocabSize, tokenizer: await loadTokenizer(inputs.target) } })).provider;
   };
-  const turboQuant = { kBits: 8, vBits: 3 };
-  const kv = inputs.kv === "bf16" ? { options: {}, scheme: undefined }
-    : inputs.kv === "turbo" ? { options: { turboQuant, quantizedKvStart: inputs.start },
-      scheme: resolveKvScheme({ turboQuant, quantizedKvStart: inputs.start }) }
-    : inputs.kv === "config" ? (() => {
-      const kvConfig = config.kvQuant;
-      assert(kvConfig?.length, "the target has no kv_config.json");
-      return { options: { kvConfig, quantizedKvStart: inputs.start },
-        scheme: resolveKvScheme({ override: "config", config: kvConfig, quantizedKvStart: inputs.start }) };
-    })()
-    : { options: { kvBits: Number(inputs.kv), kvGroupSize: 64, quantizedKvStart: inputs.start },
-      scheme: new KvScheme("affine-uniform", { kvBits: Number(inputs.kv), kvGroupSize: 64, quantizedKvStart: inputs.start }) };
+  const kv = { scheme: kvRequest ? kvSchemeOf(composition.kv) : undefined };
   const requirements = (extra: Record<string, boolean> = {}) => ({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false,
-    userSeed: false, kvQuant: inputs.kv === "4" || inputs.kv === "8" || inputs.kv === "config", turboQuant: inputs.kv === "turbo",
-    hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true, ...extra });
+    userSeed: false, hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true, ...extra });
   const release = async () => {
     const { clearCache } = await import("@mlx-bun/mlx/ffi");
     try { dispose(); } finally { clearCache(); }
@@ -244,7 +240,7 @@ test.skipIf(!inputs)("grouped speculation: placement, the serial producer at B1,
     provider = await loaded.loadProvider();
     const depth = inputs!.depth ?? loaded.defaultDepth ?? 2;
     const { method, group: groupOf } = await bindFor(loaded, provider, depth);
-    const options: A = { temperature: 0, maxTokens: 24, eosTokenIds: [], ...loaded.kv.options };
+    const options: A = { temperature: 0, maxTokens: 24, eosTokenIds: [] };
     const prompt = [1, 2, 3, 4, 5, 6, 7];
     const reference: number[] = [];
     // The serial producer serves uniform KV4/KV8 or TurboQuant from start 0 only,
@@ -428,7 +424,7 @@ test.skipIf(!inputs)("generated prefixes: retired rows publish their companion s
   const { model } = loaded;
   const kind = inputs!.kind, depth = inputs!.depth ?? loaded.defaultDepth ?? 3;
   const directory = mkdtempSync(join(tmpdir(), "speculative-prefix-"));
-  const options: A = { temperature: 0, seed: 42, maxTokens: 20, ...loaded.kv.options };
+  const options: A = { temperature: 0, seed: 42, maxTokens: 20 };
   const storeOptions = { dir: directory, maxBytes: 4 * 1024 ** 3, modelId: inputs!.target,
     configFingerprint: "speculative-prefix", tokenizerHash: "speculative-prefix", verify: true, storage: { layout: "blocks" as const } };
   const tier = (store: A, async: boolean) => ({
@@ -567,7 +563,7 @@ test.skipIf(!inputs?.adapter)("adapter rows with a configured draft: placement, 
   try {
     provider = await loaded.loadProvider();
     await manager.mount("upper", inputs!.adapter!);
-    const optionsFor = ({ adapters, tokens = 12 }: Request, promptIds: number[], seeded = false) => ({ ...loaded.kv.options,
+    const optionsFor = ({ adapters, tokens = 12 }: Request, promptIds: number[], seeded = false) => ({
       logprobs: true, topLogprobs: 3, adapters, maxTokens: tokens, temperature: seeded ? 0.7 : 0, seed: 42, eosTokenIds: [],
       snapshotAt: promptIds.length - 1 });
     const upper = { adapters: ["upper"] }, base = { adapters: [] };

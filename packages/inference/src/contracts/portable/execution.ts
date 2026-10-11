@@ -7,8 +7,6 @@ export interface ExecutionRequirements {
   readonly hasAdapters: boolean;
   readonly hasRepetitionPenalty: boolean;
   readonly userSeed: boolean;
-  readonly kvQuant: boolean;
-  readonly turboQuant: boolean;
   readonly hasLogitsExtras: boolean;
   readonly hasGrammar: boolean;
   readonly wantsLogprobs: boolean;
@@ -18,6 +16,10 @@ export interface ExecutionRequirements {
 export interface ExecutionCapabilities {
   readonly method: "autoregressive" | "denoising";
   readonly continuous: boolean;
+  /** The composition's KV scheme, which every request stores: affine-quantized
+   * (`--kv-quant N` or `config`) or TurboQuant-encoded keys and values. */
+  readonly kvQuant?: boolean;
+  readonly turboQuant?: boolean;
   readonly quantizedBatch: boolean;
   /** Executor coordination, not a model capability: the shared group drives
    * each row's own grammar state (wait for its mask, advance it with the

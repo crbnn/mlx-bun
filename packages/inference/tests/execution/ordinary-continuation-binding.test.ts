@@ -8,17 +8,19 @@ import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
 import { KVCache } from "../../src/state/kv";
 import type { ContinuationServices, ContinuationStore } from "../../src/execution/continuation";
 import { ContinuationPersistence } from "../../src/execution/continuation-persistence";
+import { kvOf, testComposition, type KvOptions } from "../models/test-composition";
 
 const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
-  kvQuant: false, turboQuant: false, hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
+  hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
 
 for (const [name, prototype] of [["gemma4", Gemma4Model.prototype], ["qwen3_5", Qwen35Model.prototype]] as const) {
 test(`ordinary shared continuation binds ${name} through its loaded backend`, () => {
-  const model = Object.assign(Object.create(prototype), {
+  const make = (kv: KvOptions = {}) => Object.assign(Object.create(prototype), {
     config: { modelType: name, text: { enableMoeBlock: false }, eosTokenIds: [] },
-    makeCache: () => [new KVCache()],
+    makeCache: () => [new KVCache()], composition: testComposition(kvOf(kv)),
     loraState: { active: [] }, requiredDenseKvLayers: [],
   }) as Gemma4Model;
+  const model = make();
   const binding = bindMlxGateway(model);
   const unconfigured = bindMlxGateway(model);
   const schedule = { continuous: true, quantizedBatch: true, checkpoints: true };
@@ -42,20 +44,23 @@ test(`ordinary shared continuation binds ${name} through its loaded backend`, ()
   }
   for (const options of [{ kvBits: 4 }, { kvBits: 8, quantizedKvStart: 14 },
     { turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: 14 },
-    { kvConfig: [{ layerIdx: 0, bits: 4, groupSize: 64 }], quantizedKvStart: 14 }]) {
-    const request = { ...shape, kvQuant: !!(options.kvBits || options.kvConfig), turboQuant: !!options.turboQuant };
-    expect(binding.plan(request, options, schedule)).toMatchObject({ mechanism: "continuous", checkpoint: true });
-    expect(unconfigured.plan(request, options, schedule).checkpoint).toBe(false);
+    { kvConfig: [{ layerIdx: 0, bits: 4, groupSize: 64 }], quantizedKvStart: 14 }] as KvOptions[]) {
+    const composed = bindMlxGateway(make(options));
+    expect(bindMlxGateway(make(options)).plan(shape, {}, schedule).checkpoint).toBe(false);
+    composed.configureContinuation!({ checkpointPersistence: {}, checkpoints: {}, checkpointEveryTokens: 4 } as ContinuationServices);
+    expect(composed.plan(shape, {}, schedule)).toMatchObject({ mechanism: "continuous", checkpoint: true });
   }
 });
 }
 
 test("Gemma2 softcap plans shared continuation for plain, affine and TurboQuant KV, keeping every other exclusion", () => {
-  const model = Object.assign(Object.create(UniversalDenseModel.prototype), { encodedKvAttention: false,
+  const make = (kv: KvOptions = {}) => Object.assign(Object.create(UniversalDenseModel.prototype), { encodedKvAttention: false,
     args: { modelType: "gemma2", maskArray: true, attnLogitSoftcap: 50, layerTypes: null },
     config: { modelType: "gemma2", text: { enableMoeBlock: false }, eosTokenIds: [] },
     makeCache: () => [new KVCache()], loraState: { active: [] }, requiredDenseKvLayers: [0],
+    composition: testComposition(kvOf(kv)),
   }) as UniversalDenseModel;
+  const model = make();
   const binding = bindMlxGateway(model), unconfigured = bindMlxGateway(model);
   const schedule = { continuous: true, quantizedBatch: true, checkpoints: true };
   expect(binding.plan(shape, {}, schedule)).toMatchObject({ mechanism: "continuous", checkpoint: false });
@@ -72,13 +77,14 @@ test("Gemma2 softcap plans shared continuation for plain, affine and TurboQuant 
   // Affine KV (its rows rejected at their transition) and TurboQuant (read
   // decoded) place ordinarily and take continuation checkpoints; their placement
   // is otherwise the unconfigured binding's.
-  for (const [request, options] of [[{ ...shape, kvQuant: true }, { kvBits: 4 }],
-    [{ ...shape, turboQuant: true }, { turboQuant: { kBits: 8, vBits: 3 } }]] as const) {
-    const plan = binding.plan(request, options, schedule), baseline = unconfigured.plan(request, options, schedule);
+  for (const kv of [{ kvBits: 4 }, { turboQuant: { kBits: 8, vBits: 3 } }] as KvOptions[]) {
+    const configured = bindMlxGateway(make(kv)), bare = bindMlxGateway(make(kv));
+    configured.configureContinuation!({ checkpointPersistence: {}, checkpoints: {}, checkpointEveryTokens: 4 } as ContinuationServices);
+    const plan = configured.plan(shape, {}, schedule), baseline = bare.plan(shape, {}, schedule);
     const { checkpoint: planned, ...placement } = plan, { checkpoint: unplanned, ...unchanged } = baseline;
-    expect({ request, placement }).toEqual({ request, placement: unchanged });
-    expect({ request, method: plan.method, mechanism: plan.mechanism, planned, unplanned })
-      .toEqual({ request, method: "autoregressive", mechanism: "continuous", planned: true, unplanned: false });
+    expect({ kv, placement }).toEqual({ kv, placement: unchanged });
+    expect({ kv, method: plan.method, mechanism: plan.mechanism, planned, unplanned })
+      .toEqual({ kv, method: "autoregressive", mechanism: "continuous", planned: true, unplanned: false });
   }
   // Grammar, fill, drafts, media, logprobs and paging keep their
   // placement and bind no continuation: placed requests carry no checkpoint,
@@ -155,7 +161,7 @@ test("Gemma4 adapter requests bypass server-wide paging and checkpoint exactly a
   }
   const qwen = bindMlxGateway(Object.assign(Object.create(Qwen35Model.prototype), {
     config: { modelType: "qwen3_5", text: { enableMoeBlock: false }, eosTokenIds: [] },
-    makeCache: () => [new KVCache()], loraState: { active: [] }, requiredDenseKvLayers: [],
+    makeCache: () => [new KVCache()], loraState: { active: [] }, requiredDenseKvLayers: [], composition: testComposition(),
   }) as Qwen35Model);
   qwen.configureContinuation!({ checkpointPersistence: {}, checkpoints: {}, checkpointEveryTokens: 4 } as ContinuationServices);
   for (const request of [shape, adapterShape]) {

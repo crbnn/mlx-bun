@@ -16,6 +16,7 @@ import {
 } from "../../src/generation/fill/session";
 import { KVCache } from "../../src/state/kv";
 import { type Cache } from "../../src/contracts/mlx/cache";
+import type { KvStorageScheme } from "../../src/contracts/portable/composition";
 import type { RuntimeModel } from "../../src/models/factory";
 import type { MlxTokenAppend } from "../../src/generation/bindings/autoregressive";
 import { MlxArray } from "@mlx-bun/mlx/array";
@@ -105,20 +106,25 @@ const session = (rows: FillRow[], maxSpan?: number, appendChunkSize?: number) =>
 test("the append binding owns affine fill format support", () => {
   const restore = configureRuntime({ MLX_BUN_FILL: "strict" });
   try {
-    const options = { fill: session([row([TRIGGER], SPAN)]), kvBits: 4 };
+    // The composition's KV scheme names the formats the committed append must declare.
+    const options = { fill: session([row([TRIGGER], SPAN)]) };
     const supported = { affineKvBits: [4, 8] };
-    expect(shouldUseFill(options, runtimeConfig())).toBe(false);
-    expect(shouldUseFill(options, runtimeConfig(), supported)).toBe(true);
-    expect(shouldUseFill({ ...options, kvBits: 8 }, runtimeConfig(), supported)).toBe(true);
-    expect(shouldUseFill({ ...options, kvConfig: [{ layerIdx: 3, bits: 4, groupSize: 64 },
-      { layerIdx: 7, bits: 8, groupSize: 64 }] }, runtimeConfig(), supported)).toBe(true);
-    expect(shouldUseFill({ ...options, kvBits: 2 }, runtimeConfig(), supported)).toBe(false);
-    expect(shouldUseFill({ ...options, kvBits: 2, kvConfig: [{ layerIdx: 3, bits: 4, groupSize: 64 }] }, runtimeConfig(), supported)).toBe(true);
-    expect(shouldUseFill({ ...options, kvConfig: [{ layerIdx: 3, bits: 2, groupSize: 64 }] }, runtimeConfig(), supported)).toBe(false);
-    expect(shouldUseFill({ ...options, turboQuant: { kBits: 8, vBits: 3 } }, runtimeConfig(), supported)).toBe(false);
+    const uniform = (bits: number): KvStorageScheme => ({ kind: "affine", bits, groupSize: 64, kernels: "unfused" });
+    const layers = (...bits: number[]): KvStorageScheme => ({ kind: "affine-layers", kernels: "tiled-causal",
+      layers: bits.map((width, index) => ({ layer: 3 + 4 * index, bits: width, groupSize: 64 })) });
+    const turbo = (kBits: number): KvStorageScheme => ({ kind: "turbo", kBits, vBits: 3 });
+    expect(shouldUseFill(options, runtimeConfig())).toBe(true);
+    expect(shouldUseFill(options, runtimeConfig(), undefined, uniform(4))).toBe(false);
+    expect(shouldUseFill(options, runtimeConfig(), supported, uniform(4))).toBe(true);
+    expect(shouldUseFill(options, runtimeConfig(), supported, uniform(8))).toBe(true);
+    expect(shouldUseFill(options, runtimeConfig(), supported, layers(4, 8))).toBe(true);
+    expect(shouldUseFill(options, runtimeConfig(), supported, uniform(2))).toBe(false);
+    expect(shouldUseFill(options, runtimeConfig(), supported, layers(4))).toBe(true);
+    expect(shouldUseFill(options, runtimeConfig(), supported, layers(2))).toBe(false);
+    expect(shouldUseFill(options, runtimeConfig(), supported, turbo(8))).toBe(false);
     const rotated = { turboQuantFormats: [{ kBits: 8, vBits: 3 }] };
-    expect(shouldUseFill({ ...options, turboQuant: { kBits: 8, vBits: 3 } }, runtimeConfig(), rotated)).toBe(true);
-    expect(shouldUseFill({ ...options, turboQuant: { kBits: 4, vBits: 3 } }, runtimeConfig(), rotated)).toBe(false);
+    expect(shouldUseFill(options, runtimeConfig(), rotated, turbo(8))).toBe(true);
+    expect(shouldUseFill(options, runtimeConfig(), rotated, turbo(4))).toBe(false);
   } finally { restore(); }
 });
 
