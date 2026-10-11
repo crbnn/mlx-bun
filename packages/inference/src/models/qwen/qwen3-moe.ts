@@ -25,7 +25,8 @@ import { argmaxLastPosition } from "../../kernels/logits";
 import { disposing } from "../../layers/helpers";
 import { compiledSwiglu } from "../../layers/swiglu";
 import { isCompiledTrace } from "../../runtime/compiled-trace";
-import { KVCache } from "../../state/kv";
+import { composedFullAttentionCache } from "../../state/bf16-first-kv";
+import type { Composition } from "../../contracts/portable/composition";
 import { AttentionMasks } from "../../state/attention-read";
 import { denseTurboQuantKernels } from "../../state/turboquant-attention";
 import { LoraState } from "../../layers/lora";
@@ -233,6 +234,8 @@ class Qwen3MoeDecoderLayer {
 // ── qwen3_moe.py Qwen3MoeModel + Model ───────────────────────────────────────
 export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
+  /** The served configuration this graph was built for: its KV scheme is what `makeCache` composes. */
+  readonly composition: Composition;
   readonly weightsBytes: number;
   readonly prefixBase = "model";
   readonly loraState = new LoraState();
@@ -247,8 +250,9 @@ export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
   /** Untied lm_head (tie_word_embeddings=false for this family). */
   readonly lmHead: QuantizedLinear | null;
 
-  constructor(weights: Weights, config: ModelConfig) {
+  constructor(weights: Weights, config: ModelConfig, composition: Composition) {
     this.config = config;
+    this.composition = composition;
     this.weightsBytes = [...weights.shards.files.values()]
       .reduce((a, f) => a + f.mmap.size, 0);
     this.embed = QuantizedEmbedding.load(weights, "model.embed_tokens", config); // nn.Embedding
@@ -289,7 +293,7 @@ export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
    * the cache. */
   makeCache(): Cache[] {
     const masks = new AttentionMasks();
-    return this.layers.map(() => new KVCache(masks, denseTurboQuantKernels));
+    return this.layers.map((_, layer) => composedFullAttentionCache(this.composition.kv, layer, masks, denseTurboQuantKernels));
   }
 
   /** @deprecated E2 calls the named phases. */

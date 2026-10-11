@@ -43,7 +43,7 @@ import { KVCache } from "../../src/state/kv";
 import { LoraState } from "../../src/layers/lora";
 import { QuantizedEmbedding } from "../../src/layers/quantized-embedding";
 import { QuantizedLinear } from "../../src/layers/quantized-linear";
-import { quantizedSdpa } from "../../src/layers/quantized-attention";
+import { quantizedSdpa } from "./quantized-sdpa-reference";
 import { RMSNorm } from "../../src/layers/normalization";
 import { type Cache, type Mask } from "../../src/contracts/mlx/cache";
 import { qwen35WeightsView } from "../../src/models/qwen/checkpoint";

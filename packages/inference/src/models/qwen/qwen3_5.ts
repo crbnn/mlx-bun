@@ -12,7 +12,7 @@
 
 import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
-import { runtimeFlag } from "../../runtime/config";
+
 import { mapTokenGroups } from "../../input/token-groups";
 import { type TokenGroup } from "../../contracts/mlx/token-work";
 import type { MlxArray } from "@mlx-bun/mlx/array";
@@ -22,7 +22,8 @@ import { qwenAppendChunkSize } from "../../layers/qwen-append";
 import { TRELLIS_MATVEC_MAX_M } from "../../layers/trellis-linear";
 import { argmaxLastPosition } from "../../kernels/logits";
 import { disposing } from "../../layers/helpers";
-import { KVCache } from "../../state/kv";
+import { composedFullAttentionCache } from "../../state/bf16-first-kv";
+import type { Composition } from "../../contracts/portable/composition";
 import { AttentionMasks } from "../../state/attention-read";
 import { denseTurboQuantKernels } from "../../state/turboquant-attention";
 import { LoraState } from "../../layers/lora";
@@ -58,16 +59,15 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly requiredDenseKvLayers: readonly number[] = Object.freeze([]);
   /** Prepared image and video embeddings with request-owned mRoPE positions,
    * layer taps for drafts. Its caches convert delayed affine rows and every
-   * method is qualified over them. Speculation over affine KV is this graph's
-   * option `MLX_BUN_QWEN_SPEC_KV4`, read where the graph is bound; immediate
-   * 4-bit KV is qualified even without a grouped method. Its few
-   * full-attention layers materialize their scores at long context, so prefill
-   * chunks shrink to bound that workspace. */
+   * method is qualified over them. Speculation over affine KV is the
+   * composition's `speculativeAffineKv`; immediate 4-bit KV is qualified even
+   * without a grouped method. Its few full-attention layers materialize their
+   * scores at long context, so prefill chunks shrink to bound that workspace. */
   get graphCapabilities(): GraphCapabilities {
     return declareGraph({
       media: { input: "embeddings+positions", video: true }, hiddenLayerTaps: "hiddenTap" in this,
       kv: { delayedAffine: "all" }, prefill: { boundedWorkspace: true },
-      speculation: { affineKv: runtimeFlag("MLX_BUN_QWEN_SPEC_KV4", true), immediateAffine4: true },
+      speculation: { affineKv: this.composition.speculativeAffineKv, immediateAffine4: true },
     });
   }
   bindMediaInput(input: Vision): MlxPromptInput { return bindQwenMediaInput(this, input.embeddings, input.mrope!); }
@@ -80,11 +80,14 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly lmHead: QuantizedLinear | null;
   readonly tied: boolean;
   readonly faIdx: number;
-  /** `MLX_BUN_MIXED_PACKED_MLP`: the groups of a mixed forward share one MLP
-   *  call (on unless set to 0). Read once, when the graph is built. */
+  /** The served configuration this graph was built for: its KV scheme (what
+   *  `makeCache` composes) and its switches. */
+  readonly composition: Composition;
+  /** The composition's `packedMixedMlp`: the groups of a mixed forward share
+   *  one MLP call. */
   readonly #packMixedMlp: boolean;
 
-  constructor(weights: Weights, config: ModelConfig) {
+  constructor(weights: Weights, config: ModelConfig, composition: Composition) {
     // Checkpoint-generation normalization BEFORE the first tensor() call: the
     // 5.8-family export names the trunk `model.language_model.*` with a
     // top-level `lm_head`, ships `mtp.*` in-repo, and stores RMSNorm gains as
@@ -94,6 +97,7 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
     const view = qwen35WeightsView(weights);
     if (view) weights.setView(view);
     this.config = config;
+    this.composition = composition;
     this.tied = config.text.tieWordEmbeddings;
     this.weightsBytes = [...weights.shards.files.values()]
       .reduce((a, f) => a + f.mmap.size, 0);
@@ -107,7 +111,7 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
     // embed_tokens.as_linear (mlx-lm qwen3_5 TextModel.__call__).
     this.lmHead = this.tied ? null : QuantizedLinear.load(weights, `${PREFIX}.lm_head`, config);
     this.faIdx = config.text.fullAttentionInterval - 1;
-    this.#packMixedMlp = runtimeFlag("MLX_BUN_MIXED_PACKED_MLP", true);
+    this.#packMixedMlp = composition.packedMixedMlp;
   }
 
   loraTargets(): Map<string, QuantizedLinear> {
@@ -137,14 +141,15 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
     return out;
   }
 
-  /** One cache per layer, the full-attention caches sharing one mask memo.
-   * Their TurboQuant read is dense (`denseTurboQuantKernels`): this graph read
-   * TurboQuant storage decoded, through `updateAndFetch` and the fused SDPA,
-   * before its blocks read through the cache, so a conversion of these caches
-   * keeps its served numbers. */
+  /** One cache per layer, the full-attention caches sharing one mask memo:
+   * the cache the composition's KV scheme names for each attention layer
+   * (`composedFullAttentionCache`). Their TurboQuant read is dense
+   * (`denseTurboQuantKernels`): this graph read TurboQuant storage decoded,
+   * through `updateAndFetch` and the fused SDPA, before its blocks read through
+   * the cache, so the TurboQuant lego keeps its served numbers. */
   makeCache(): Cache[] {
-    const masks = new AttentionMasks();
-    return this.layers.map((l) => (l.isLinear ? new SSMCache() : new KVCache(masks, denseTurboQuantKernels)));
+    const masks = new AttentionMasks(), kv = this.composition.kv;
+    return this.layers.map((l, layer) => (l.isLinear ? new SSMCache() : composedFullAttentionCache(kv, layer, masks, denseTurboQuantKernels)));
   }
 
   /** The 27B append path keeps the native M1 affine arithmetic while Trellis

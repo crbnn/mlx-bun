@@ -53,7 +53,6 @@ import type {
   AttentionCache, AttentionRead, BidirectionalAttentionCache, Cache, Mask, SharedKv,
 } from "../../contracts/mlx/cache";
 import { isCompiledTrace } from "../../runtime/compiled-trace";
-import { runtimeFlag } from "../../runtime/config";
 import { mapPackedTokens } from "../../input/token-groups";
 import { type TokenGroup } from "../../contracts/mlx/token-work";
 import { flashAttention,flashSupported,getTrainingAttn } from "../../kernels/attention/flash";
@@ -67,9 +66,9 @@ import { argmaxLastPosition,logitSoftcap } from "../../kernels/logits";
 import { compiledLogitSoftcap } from "../../kernels/softcap";
 import { captureRopeOffsets } from "../../state/capabilities";
 import { AttentionMasks } from "../../state/attention-read";
-import { KVCache } from "../../state/kv";
+import { composedFullAttentionCache, composedSlidingAttentionCache } from "../../state/bf16-first-kv";
+import type { Composition } from "../../contracts/portable/composition";
 import { deferredTurboQuantKernels } from "../../state/turboquant-attention";
-import { RotatingKVCache } from "../../state/rotating-kv";
 
 /** The phase a Gemma 4 forward runs, named by its caller: one new position per
  * row (`decode`), a causal window of positions (`window`: prefill chunks and
@@ -770,16 +769,20 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly perLayerModelProjection: QuantizedLinear | null;
   readonly perLayerProjectionNorm: RMSNorm | null;
   readonly perLayerWidth: number;
-  /** `MLX_BUN_MIXED_PACKED_MLP`: the groups of a mixed forward share one MLP
-   *  call (on unless set to 0). Read once, when the graph is built. */
+  /** The served configuration this graph was built for: its KV scheme (what
+   *  `makeCache` composes) and its switches. */
+  readonly composition: Composition;
+  /** The composition's `packedMixedMlp`: the groups of a mixed forward share
+   *  one MLP call. */
   readonly #packMixedMlp: boolean;
 
-  constructor(weights: Weights, config: ModelConfig) {
+  constructor(weights: Weights, config: ModelConfig, composition: Composition) {
     const t = config.text;
     if (t.hiddenSize === 0 || !config.text.tieWordEmbeddings)
       throw new Error("only tied-embedding text configs are supported");
 
     this.config = config;
+    this.composition = composition;
     this.weightsBytes = [...weights.shards.files.values()]
       .reduce((a, f) => a + f.mmap.size, 0);
     // gemma4_unified prefixes weights with language_model.; gemma4_text doesn't
@@ -828,7 +831,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
       this.perLayerProjectionNorm = null;
       this.perLayerWidth = 0;
     }
-    this.#packMixedMlp = runtimeFlag("MLX_BUN_MIXED_PACKED_MLP", true);
+    this.#packMixedMlp = composition.packedMixedMlp;
   }
 
   /** LoRA-mountable linears, keyed by weight-file module path: optiq
@@ -866,11 +869,11 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    * the fused SDPA and the read un-rotates the output, the sequence this graph
    * ran after `updateAndFetchDeferredV` before its blocks read through the cache. */
   makeCache(): Cache[] {
-    const masks = new AttentionMasks();
-    return this.layers.slice(0, this.numDonors).map((l) =>
+    const masks = new AttentionMasks(), kv = this.composition.kv;
+    return this.layers.slice(0, this.numDonors).map((l, layer) =>
       l.layerType === "sliding_attention"
-        ? new RotatingKVCache(this.windowSize, masks)
-        : new KVCache(masks, deferredTurboQuantKernels),
+        ? composedSlidingAttentionCache(kv, layer, this.windowSize, masks)
+        : composedFullAttentionCache(kv, layer, masks, deferredTurboQuantKernels),
     );
   }
 

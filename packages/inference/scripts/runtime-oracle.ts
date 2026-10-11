@@ -161,7 +161,7 @@ export async function provenance(planBytes: Uint8Array, model: string, library: 
 }
 
 export async function emit(plan: Plan, planBytes: Uint8Array, hashWeights: boolean) {
-  const [{ Weights, loadModelConfig, createModel }, { gpuStream }, ffi, ops] = await Promise.all([
+  const [{ Weights, loadModelConfig, createModel, resolveComposition }, { gpuStream }, ffi, ops] = await Promise.all([
     import("@mlx-bun/inference"), import("@mlx-bun/mlx/array"), import("@mlx-bun/mlx/ffi"), import("@mlx-bun/mlx/ops"),
   ]);
   assert.equal(ffi.MLX_VERSION, plan.runtime);
@@ -194,9 +194,9 @@ export async function emit(plan: Plan, planBytes: Uint8Array, hashWeights: boole
   const rows = [];
   try {
     const config = await loadModelConfig(plan.model);
-    const model = createModel(weights, config);
+    // The mixed-KV run composes the artifact's kv_config legos, which convert inside their own appends.
+    const model = createModel(weights, config, resolveComposition(config, plan.kv ? { kv: { override: "config", quantizedKvStart: 0 } } : {}));
     if (plan.kv) assert(config.kvQuant?.length, "artifact has no mixed-KV configuration");
-    const maintain = plan.kv ? stateApi!.createKvMaintenance({ kvConfig: config.kvQuant!, quantizedKvStart: 0 }) : (_: Cache[]) => {};
     if (plan.kv) Object.assign(record.artifact, { kvConfigSha256: sha(await Bun.file(join(plan.model, "kv_config.json")).bytes()), kvConfig: config.kvQuant });
     function forward(ids: number[], caches: Cache[]) {
       const input = ops.fromInt32(ids, [1, ids.length]);
@@ -212,7 +212,6 @@ export async function emit(plan: Plan, planBytes: Uint8Array, hashWeights: boole
           try {
             for (const cache of caches) groups.push({ cache, planes: cache.state() });
             ops.evalAll([hidden, ...groups.flatMap(group => group.planes)]);
-            maintain(caches);
           } finally {
             for (const { cache, planes } of groups) if (cache.stateNeedsDispose)
               for (const plane of planes) plane.dispose();
@@ -224,7 +223,7 @@ export async function emit(plan: Plan, planBytes: Uint8Array, hashWeights: boole
         let logits: MlxArray;
         try { logits = model.logitsFromHidden(hidden); } finally { hidden.dispose(); }
         let current;
-        try { ops.evalAll([logits]); maintain(caches); current = { logits: array(logits), state: state(caches, context + m) }; }
+        try { ops.evalAll([logits]); current = { logits: array(logits), state: state(caches, context + m) }; }
         finally { logits.dispose(); }
         const directory = plan.restore ? await mkdtemp(join(tmpdir(), "mlx-parity-state-")) : null;
         let restored: ReturnType<NonNullable<typeof stateApi>["loadKvCache"]> | undefined;
@@ -242,13 +241,13 @@ export async function emit(plan: Plan, planBytes: Uint8Array, hashWeights: boole
           const next = model.forward([911], caches);
           let row;
           try {
-            ops.evalAll([next]); maintain(caches);
+            ops.evalAll([next]);
             row = { context, m, prefix, ...current, continuation: array(next), continuationState: state(caches, context + m + 1) };
           } finally { next.dispose(); }
           if (restored) {
             const resumed = model.forward([911], restored.caches);
             try {
-              ops.evalAll([resumed]); maintain(restored.caches);
+              ops.evalAll([resumed]);
               assert.deepEqual(array(resumed), row.continuation, "restored continuation logits");
               assert.deepEqual(state(restored.caches, context + m + 1), row.continuationState, "restored continuation state");
             } finally { resumed.dispose(); }

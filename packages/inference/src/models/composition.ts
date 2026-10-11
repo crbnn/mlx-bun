@@ -7,7 +7,6 @@ import type { Composition } from "../contracts/portable/composition";
 import { aneAvailable } from "../kernels/ane/linear";
 import { runtimeConfig, type RuntimeConfig } from "../runtime/config";
 import { resolveKvScheme, type KvQuantOverride } from "../state/kv-scheme";
-import { kvStorageOf } from "../state/kv-storage";
 
 /** Rows per forward when the caller states no cap (the app's `--batch` default). */
 export const DEFAULT_MAX_ROWS = 8;
@@ -26,13 +25,16 @@ function resolveChunkTokens(runtime: RuntimeConfig): number {
 
 /** What the caller decided; each absent value takes the default named on it. */
 export interface CompositionRequest {
-  /** The KV flags: `--kv-quant` (`override`), its TurboQuant spelling and
-   * `--quantized-kv-start`. Absent: bf16. A `config` override reads the
-   * artifact's `kv_config.json` from the model config. */
+  /** The KV flags: `--kv-quant` (`override`), its TurboQuant spelling,
+   * `--quantized-kv-start` and `--fused-sdpa` (the affine read kernels: on,
+   * tiled-causal; off, unfused; absent, by the scheme's kind). Absent: bf16.
+   * A `config` override reads the artifact's `kv_config.json` from the model
+   * config. */
   readonly kv?: {
     readonly override?: KvQuantOverride;
     readonly turboQuant?: TurboQuantScheme;
     readonly quantizedKvStart?: number;
+    readonly fusedSdpa?: boolean;
   };
   /** The loaded drafter's tokens per round, and whether the scheduler adapts
    * each round's count up to it. Absent or null: no drafter. */
@@ -41,6 +43,11 @@ export interface CompositionRequest {
   readonly adapters?: boolean;
   /** The most rows one forward carries. Default {@link DEFAULT_MAX_ROWS}. */
   readonly maxRows?: number;
+  /** Speculative verification over affine-quantized KV where a graph's
+   * verifier qualifies it. Default true. */
+  readonly speculativeAffineKv?: boolean;
+  /** The groups of a mixed forward share one MLP pass. Default true. */
+  readonly packedMixedMlp?: boolean;
 }
 
 /** Resolve the record for `config` on this machine. Reads the GPU architecture,
@@ -53,13 +60,16 @@ export function resolveComposition(config: ModelConfig, request: CompositionRequ
   const draft = request.draft;
   if (draft && (!Number.isSafeInteger(draft.numDraftTokens) || draft.numDraftTokens < 1))
     throw new Error("composition draft tokens must be a positive integer");
+  const runtime = runtimeConfig();
   return Object.freeze({
     device: deviceArchitecture(),
     aneBridge: aneAvailable(),
-    kv: kvStorageOf(resolveKvScheme({ ...request.kv, config: config.kvQuant })),
+    kv: resolveKvScheme({ ...request.kv, config: config.kvQuant }).storage,
     draftDepth: !draft ? 0 : draft.adaptive ? Object.freeze({ adaptive: true as const, max: draft.numDraftTokens }) : draft.numDraftTokens,
-    prefillChunkTokens: resolveChunkTokens(runtimeConfig()),
+    prefillChunkTokens: resolveChunkTokens(runtime),
     adapters: request.adapters ?? false,
     maxRows,
+    speculativeAffineKv: request.speculativeAffineKv ?? true,
+    packedMixedMlp: request.packedMixedMlp ?? true,
   });
 }

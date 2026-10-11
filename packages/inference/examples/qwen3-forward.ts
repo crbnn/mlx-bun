@@ -1,4 +1,5 @@
 import { loadModelConfig, Weights } from "@mlx-bun/inference/artifacts";
+import { resolveComposition } from "@mlx-bun/inference";
 import { Qwen3Model } from "@mlx-bun/inference/models/qwen3";
 import { argmaxLastPosition, lastPositionLogits } from "@mlx-bun/inference/scoring";
 
@@ -7,7 +8,7 @@ export async function forwardTokens(directory: string, promptTokens: number[]) {
   const config = await loadModelConfig(directory);
   const weights = await Weights.open(directory);
   try {
-    const graph = new Qwen3Model(weights, config);
+    const graph = new Qwen3Model(weights, config, resolveComposition(config));
     const state = graph.makeCache();
     try {
       using prefill = graph.forward(promptTokens, state);

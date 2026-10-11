@@ -61,6 +61,7 @@ import {
 import type { AttentionRead } from "../../src/contracts/mlx/cache";
 import { disposeTriple } from "../../src/state/quantized-tensor";
 import { qwen38TrellisTqFingerprint } from "../../src/models/qwen/qwen38-27b-trellis-tq";
+import { testComposition } from "./test-composition";
 
 // Moved here from src/models/qwen/blocks.ts, where nothing else used it once D1 landed. `cacheRead.read` is the
 // `appendFor[phase](cache, k, v)` it called there.
@@ -138,7 +139,7 @@ export class Qwen38TrellisM4Pro extends Qwen35Model {
   readonly #ane: boolean;
 
   constructor(weights: Weights, config: ModelConfig, ane = false) {
-    super(weights, config);
+    super(weights, config, testComposition());
     this.#ane = ane;
     // DeltaNet's q/k scale as the weight of the norm before it: bit-identical
     // (see GatedDeltaNet.qkScale), 96 fewer kernels per forward.

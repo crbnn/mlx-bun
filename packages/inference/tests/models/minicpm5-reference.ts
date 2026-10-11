@@ -32,7 +32,7 @@ import { runtimeValue } from "../../src/runtime/config";
 import { unrotateValues as tqUnrotateValues } from "../../src/kernels/turboquant/ops";
 import { disposing } from "../../src/layers/helpers";
 import { RMSNorm } from "../../src/layers/normalization";
-import { quantizedSdpa } from "../../src/layers/quantized-attention";
+import { quantizedSdpa } from "./quantized-sdpa-reference";
 import { QuantizedEmbedding } from "../../src/layers/quantized-embedding";
 import { QuantizedLinear } from "../../src/layers/quantized-linear";
 import { argmaxLastPosition } from "../../src/kernels/logits";

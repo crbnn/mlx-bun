@@ -34,6 +34,9 @@ import type { RuntimeModel } from "../../src/models/factory";
 import { createRuntimeConfig, runtimeConfig, withRuntimeConfig } from "../../src/runtime/config";
 import { trainForward } from "../../src/scoring/full-sequence";
 import { createKvMaintenance } from "../../src/state/kv-maintenance";
+import { composedAffineKernels } from "../../src/state/affine-attention";
+import { settleAffine, settleTurbo } from "../state/convert-after-reference";
+import { testComposition } from "./test-composition";
 import { KVCache } from "../../src/state/kv";
 import { prefillCacheLayout, targetCacheLayout } from "../../src/state/layout";
 import { PagedKVCache } from "../../src/state/paged/cache";
@@ -235,7 +238,7 @@ function pair(kind: Kind): Pair {
   let found = pairs.get(kind);
   if (!found) {
     const { weights, config } = artifact(kind);
-    found = { kind, old: new FrozenGemma4Model(weights, config), current: new Gemma4Model(weights, config) };
+    found = { kind, old: new FrozenGemma4Model(weights, config), current: new Gemma4Model(weights, config, testComposition()) };
     pairs.set(kind, found);
   }
   return found;
@@ -245,13 +248,18 @@ function withScheme<T>(scheme: Scheme, run: () => T): T {
   return withRuntimeConfig(createRuntimeConfig({ ...runtimeConfig().values, MLX_BUN_NO_FUSED_SDPA: scheme.flag }), run);
 }
 
-/** Convert after a forward, as the served path does (quantized_kv_start 0). */
+/** Convert after a forward, as the served path did before E3 (quantized_kv_start
+ * 0): the convert-after reference, whose affine storage reads with the kernel set
+ * the scheme's flag named (unset: tiled-causal, `--fused-sdpa on`; 1: unfused). */
 function convert(scheme: Scheme, ...sets: Cache[][]): void {
   if (scheme.kvBits === null && !scheme.turbo) return;
-  const maintain = createKvMaintenance(scheme.turbo
-    ? { turboQuant: scheme.turbo, quantizedKvStart: 0 } : { kvBits: scheme.kvBits!, quantizedKvStart: 0 });
-  for (const caches of sets) maintain(caches);
+  for (const caches of sets) {
+    if (scheme.turbo) settleTurbo(caches, scheme.turbo.kBits, scheme.turbo.vBits, 0);
+    else settleAffine(caches, scheme.kvBits!, 0, 64, composedAffineKernels(flagKernels(scheme.flag)));
+  }
 }
+/** The affine read kernels the flag named before E3. */
+const flagKernels = (flag: string | undefined) => flag === "1" ? "unfused" as const : "tiled-causal" as const;
 
 /** The old graph's and the current graph's call on the same input. */
 function both(label: string, p: Pair, oldCaches: Cache[], newCaches: Cache[], run: (model: Graph, caches: Cache[]) => MlxArray): void {
@@ -533,9 +541,9 @@ for (const kind of ["dense", "shared"] as const) {
     // maintenance (bf16 until 8 positions, then quantized), each layer's empty
     // prefill layout, padded prefill and decodes across the transition.
     const delayed: { name: string; options: Parameters<typeof createKvMaintenance>[0] }[] = [
-      { name: "delayed affine4", options: { kvBits: 4, quantizedKvStart: 8 } },
-      { name: "delayed affine8", options: { kvBits: 8, quantizedKvStart: 8 } },
-      { name: "delayed turbo k8v3", options: { turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: 8 } },
+      { name: "delayed affine4", options: { kind: "affine", bits: 4, groupSize: 64, quantizedKvStart: 8, kernels: "tiled-causal" } },
+      { name: "delayed affine8", options: { kind: "affine", bits: 8, groupSize: 64, quantizedKvStart: 8, kernels: "tiled-causal" } },
+      { name: "delayed turbo k8v3", options: { kind: "turbo", kBits: 8, vBits: 3, quantizedKvStart: 8 } },
     ];
     for (const { name, options } of delayed)
       test(`${kind} ${name}: padded prefill cohort from empty layouts, decodes across the transition, verify, rollback`, () => {
@@ -674,7 +682,7 @@ for (const kind of ["dense", "shared"] as const) {
       test(`${kind} delayed affine4 cohort rows in the decode layouts, flag=${flag ?? "unset"}`, () =>
         withScheme({ name: "", kvBits: 4, flag }, () => {
           const p = pair(kind);
-          const maintain = createKvMaintenance({ kvBits: 4, quantizedKvStart: 0 });
+          const maintain = createKvMaintenance({ kind: "affine", bits: 4, groupSize: 64, kernels: flagKernels(flag) });
           const cohort = (model: Graph) => {
             const serial = model.makeCache();
             maintain.preparePrefill!(serial);

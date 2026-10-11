@@ -66,9 +66,9 @@ out). `trainable`
 `lmHead` for fused linear-CE heads, `segmented` backward (how a range of layers
 runs and which reused K/V crosses segment boundaries), `prefixShared` forwards,
 `gradCheckpoint`, the `flashAttention` constraint, and the `denoising` objective.
-The trainer names the declaration a graph lacks. A model-level option stays
-with its graph: Qwen3.5 reads `MLX_BUN_QWEN_SPEC_KV4` (on by default) where it
-declares speculation over affine KV.
+The trainer names the declaration a graph lacks. A model-level option is a
+composition field its graph reads: Qwen3.5 reads `speculativeAffineKv` (on by
+default) where it declares speculation over affine KV.
 
 ## Numerical and execution policy
 

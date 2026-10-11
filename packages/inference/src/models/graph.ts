@@ -4,6 +4,7 @@ import type { ModelConfig } from "../artifacts/config";
 import type { Cache } from "../contracts/mlx/cache";
 import type { MlxDeclaredGraph, MlxModelMemory, MlxTokenAppend, MlxWidthTable } from "../contracts/mlx/graph";
 import type { MixedTokenModel } from "../contracts/mlx/token-work";
+import type { Composition } from "../contracts/portable/composition";
 
 /** Structural input: generated and hand-written graphs need no union membership. */
 export interface MlxGraphOperations<State> {
@@ -20,10 +21,15 @@ export interface MlxGraphOperations<State> {
 export interface MlxTokenGraph extends MlxGraphOperations<Cache[]>, MlxDeclaredGraph, MlxModelMemory,
     Partial<MixedTokenModel> {
   readonly config: ModelConfig;
+  /** The served configuration the graph was built for; absent for a graph
+   * that composes no KV scheme (its caches are its own). */
+  readonly composition?: Composition;
   /** The mounted-adapter selection; absent when the graph mounts none. */
   readonly loraState?: { active: string[] };
   /** Attention layers whose reads must be plain keys and values (see `kv.denseReads`). */
   readonly requiredDenseKvLayers: readonly number[];
+  /** One cache per cache layer: the caches the composition's KV scheme names
+   * (`composedFullAttentionCache`, `composedSlidingAttentionCache`). */
   makeCache(): Cache[];
   /** `hiddenLayerTaps`: the per-forward hidden-state capture the graph fills
    * while it is set (the caller owns and disposes what it captured). */

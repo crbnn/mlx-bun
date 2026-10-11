@@ -29,6 +29,9 @@ import { createRuntimeConfig, runtimeConfig, withRuntimeConfig } from "../../src
 import { trainForward } from "../../src/scoring/full-sequence";
 import { evalPpl } from "../../src/scoring/perplexity";
 import { createKvMaintenance } from "../../src/state/kv-maintenance";
+import { composedAffineKernels } from "../../src/state/affine-attention";
+import { settleAffine, settleTurbo } from "../state/convert-after-reference";
+import { testComposition } from "./test-composition";
 import { ownedCacheLayout, prefillCacheLayout, targetCacheLayout } from "../../src/state/layout";
 import { denseTurboQuantKernels, deferredTurboQuantKernels } from "../../src/state/turboquant-attention";
 import type { KVCache } from "../../src/state/kv";
@@ -168,13 +171,13 @@ function miniCpmPair(): Pair {
   decoder(t, false, denseMlp(t));
   t.linear("lm_head", [VOCAB, HIDDEN], true, 0.05);
   const weights = t.weights(), config = textConfig("llama", {});
-  return { old: new FrozenMiniCPM5Model(weights, config), current: new MiniCPM5Model(weights, config) };
+  return { old: new FrozenMiniCPM5Model(weights, config), current: new MiniCPM5Model(weights, config, testComposition()) };
 }
 function qwen3Pair(): Pair {
   const t = new Tensors();
   decoder(t, true, denseMlp(t));
   const weights = t.weights(), config = textConfig("qwen3", { tieWordEmbeddings: true, ropeParameters: {} });
-  return { old: new FrozenQwen3Model(weights, config), current: new Qwen3Model(weights, config) };
+  return { old: new FrozenQwen3Model(weights, config), current: new Qwen3Model(weights, config, testComposition()) };
 }
 function qwen3MoePair(): Pair {
   const t = new Tensors();
@@ -188,7 +191,7 @@ function qwen3MoePair(): Pair {
   t.linear("lm_head", [VOCAB, HIDDEN], true, 0.05);
   const weights = t.weights(), config = textConfig("qwen3_moe", {
     numExperts: EXPERTS, topKExperts: 2, normTopkProb: true, decoderSparseStep: 1, mlpOnlyLayers: [0], ropeParameters: {} });
-  return { old: new FrozenQwen3MoeModel(weights, config), current: new Qwen3MoeModel(weights, config) };
+  return { old: new FrozenQwen3MoeModel(weights, config), current: new Qwen3MoeModel(weights, config, testComposition()) };
 }
 /** llama with alternating full and sliding layers (mistral-style layer types). */
 function llamaSlidingPair(): Pair {
@@ -199,7 +202,7 @@ function llamaSlidingPair(): Pair {
     num_key_value_heads: KV_HEADS, head_dim: HEAD_DIM, intermediate_size: INTER, vocab_size: VOCAB, rms_norm_eps: 1e-6,
     rope_theta: 10000, tie_word_embeddings: false, layer_types: [F, S, F, S], sliding_window: WINDOW };
   const weights = t.weights(), config = textConfig("llama", {}, raw);
-  return { old: new FrozenUniversalDenseModel(weights, config), current: new UniversalDenseModel(weights, config) };
+  return { old: new FrozenUniversalDenseModel(weights, config), current: new UniversalDenseModel(weights, config, testComposition()) };
 }
 /** gemma2: softcapped attention scores over plain KV, bf16 (unquantized)
  * projections, every layer full attention unless `types` makes some sliding. */
@@ -224,7 +227,7 @@ function gemma2Pair(types: string[] | null = null): Pair {
     query_pre_attn_scalar: HEAD_DIM, attn_logit_softcapping: 30, final_logit_softcapping: 30 };
   const weights = t.weights(), config = textConfig("gemma2", {}, raw);
   const args: UniversalArgs = { ...genericArgsFor(config)!, ...(types ? { layerTypes: types, slidingWindow: WINDOW } : {}) };
-  return { old: new FrozenUniversalDenseModel(weights, config, { ...args }), current: new UniversalDenseModel(weights, config, { ...args }) };
+  return { old: new FrozenUniversalDenseModel(weights, config, { ...args }), current: new UniversalDenseModel(weights, config, testComposition(), { ...args }) };
 }
 
 const FAMILIES: Family[] = [
@@ -319,12 +322,16 @@ function withScheme<T>(scheme: Scheme, run: () => T): T {
   return withRuntimeConfig(createRuntimeConfig({ ...runtimeConfig().values, MLX_BUN_NO_FUSED_SDPA: scheme.flag }), run);
 }
 
-/** Convert after a forward, as the served path does (quantized_kv_start 0). */
+/** Convert after a forward, as the served path did before E3 (quantized_kv_start
+ * 0): the convert-after reference, whose affine storage reads with the kernel set
+ * the scheme's flag named (unset: OptiQ's tiled-causal set, `--fused-sdpa on`;
+ * 1: the unfused port, `--fused-sdpa off`). */
 function convert(scheme: Scheme, ...sets: Cache[][]): void {
   if (scheme.kvBits === undefined && !scheme.turbo) return;
-  const maintain = createKvMaintenance(scheme.turbo
-    ? { turboQuant: scheme.turbo, quantizedKvStart: 0 } : { kvBits: scheme.kvBits!, quantizedKvStart: 0 });
-  for (const caches of sets) maintain(caches);
+  for (const caches of sets) {
+    if (scheme.turbo) settleTurbo(caches, scheme.turbo.kBits, scheme.turbo.vBits, 0);
+    else settleAffine(caches, scheme.kvBits!, 0, 64, composedAffineKernels(scheme.flag === "1" ? "unfused" : "tiled-causal"));
+  }
 }
 
 /** The old graph's and the current graph's deprecated entry point on the same input. */
@@ -490,7 +497,9 @@ for (const family of FAMILIES) {
 
     test(`${family.name} delayed affine4 (start ${family.delayedStart}): prefill 37, decode, fill 1-4, decode`, () => {
       const p = pair(family), tag = `${family.name} delayed affine4`;
-      const maintain = createKvMaintenance({ kvBits: 4, quantizedKvStart: family.delayedStart });
+      // The delayed row layouts read with the set the unset flag named (tiled-causal).
+      const maintain = createKvMaintenance({ kind: "affine", bits: 4, groupSize: 64, quantizedKvStart: family.delayedStart,
+        kernels: "tiled-causal" });
       const oldCaches = p.old.makeCache(), newCaches = p.current.makeCache();
       maintain.preparePrefill!(oldCaches); maintain.preparePrefill!(newCaches);
       try {
@@ -561,7 +570,7 @@ describe("D3 dense family: what the graphs compose at construction", () => {
     const raw = { model_type: "llama", hidden_size: HIDDEN, num_hidden_layers: LAYERS, num_attention_heads: HEADS,
       num_key_value_heads: KV_HEADS, head_dim: HEAD_DIM, intermediate_size: INTER, vocab_size: VOCAB, rms_norm_eps: 1e-6 };
     const config = textConfig("llama", {}, raw);
-    expect(() => new UniversalDenseModel(t.weights(), config, { ...genericArgsFor(config)!, maskArray: true }))
+    expect(() => new UniversalDenseModel(t.weights(), config, testComposition(), { ...genericArgsFor(config)!, maskArray: true }))
       .toThrow("array masks without a score softcap");
   });
 });
@@ -576,7 +585,7 @@ describe("D3 dense family: MiniCPM5 construction choices and training forwards",
       decoder(t, false, denseMlp(t));
       t.linear("lm_head", [VOCAB, HIDDEN], true, 0.05);
       const weights = t.weights(), config = textConfig("llama", {});
-      const p: Pair = { old: new FrozenMiniCPM5Model(weights, config), current: new MiniCPM5Model(weights, config) };
+      const p: Pair = { old: new FrozenMiniCPM5Model(weights, config), current: new MiniCPM5Model(weights, config, testComposition()) };
       expect((p.current as MiniCPM5Model).layers.every(layer => layer.mlp.kind === "unfused")).toBe(true);
       const oldCaches = p.old.makeCache(), newCaches = p.current.makeCache();
       try {
