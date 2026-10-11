@@ -4,12 +4,13 @@
 
 import type { Weights } from "../../../artifacts/weights";
 import type { ModelConfig } from "../../../artifacts/config";
+import type { Composition } from "../../../contracts/portable/composition";
 import { Gemma4Model } from "../model";
 import * as g12b from "./gemma4-12b";
 import * as ge4b from "./gemma4-e4b";
 import * as g26b from "./gemma4-26b";
 
-type ModelCtor = new (weights: Weights, config: ModelConfig) => Gemma4Model;
+type ModelCtor = new (weights: Weights, config: ModelConfig, composition: Composition) => Gemma4Model;
 
 export const GENERATED = new Map<string, ModelCtor>([
   [g12b.FINGERPRINT, g12b.GeneratedGemma4],

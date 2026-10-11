@@ -63,23 +63,23 @@ function residentImplementation(
  * without changing sessions or files. */
 export const MLX_MODEL_IMPLEMENTATIONS = new ModelImplementationRegistry<Weights, RuntimeModel>([
   residentImplementation("diffusion-gemma", "diffusion-gemma", (weights, config) => new DiffusionGemmaModel(weights, config)),
-  residentImplementation("minicpm5", "minicpm5", (weights, config) => new MiniCPM5Model(weights, config)),
+  residentImplementation("minicpm5", "minicpm5", (weights, config, _profile, composition) => new MiniCPM5Model(weights, config, composition)),
   // Our published Trellis quant loads its own purpose-built graph — the M4 Pro
   // graph on that GPU family, the TQ graph elsewhere; every other
   // Qwen3.5-family artifact keeps the generic model.
   residentImplementation("qwen3.5", "qwen3.5", (weights, config, _profile, composition) =>
     qwen38TrellisM4ProAccepts(config, composition) ? new Qwen38TrellisM4Pro(weights, config, composition)
-      : qwen38TrellisTqAccepts(config) ? new Qwen38TrellisTQ(weights, config) : new Qwen35Model(weights, config)),
-  residentImplementation("qwen3-moe", "qwen3-moe", (weights, config) => new Qwen3MoeModel(weights, config)),
-  residentImplementation("qwen3", "qwen3", (weights, config) => new Qwen3Model(weights, config)),
-  residentImplementation("gemma4", "gemma4", (weights, config) => new Gemma4Model(weights, config)),
-  residentImplementation("gemma4-generated", "gemma4", (weights, config) => {
+      : qwen38TrellisTqAccepts(config) ? new Qwen38TrellisTQ(weights, config, composition) : new Qwen35Model(weights, config, composition)),
+  residentImplementation("qwen3-moe", "qwen3-moe", (weights, config, _profile, composition) => new Qwen3MoeModel(weights, config, composition)),
+  residentImplementation("qwen3", "qwen3", (weights, config, _profile, composition) => new Qwen3Model(weights, config, composition)),
+  residentImplementation("gemma4", "gemma4", (weights, config, _profile, composition) => new Gemma4Model(weights, config, composition)),
+  residentImplementation("gemma4-generated", "gemma4", (weights, config, _profile, composition) => {
     const Graph = GENERATED.get(configFingerprint(config));
     if (!Graph) throw new Error("no generated Gemma graph for this config; refusing to fall back");
-    return new Graph(weights, config);
+    return new Graph(weights, config, composition);
   }),
-  residentImplementation("universal-dense", "universal-dense", (weights, config) =>
-    new UniversalDenseModel(weights, config, genericArgsFor(config)!)),
+  residentImplementation("universal-dense", "universal-dense", (weights, config, _profile, composition) =>
+    new UniversalDenseModel(weights, config, composition, genericArgsFor(config)!)),
 ]);
 
 export interface ModelOpenOptions<Model = RuntimeModel> extends Glm52RuntimeOpenOptions {
