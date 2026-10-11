@@ -34,6 +34,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import type { Weights } from "../../artifacts/weights";
 import type { ModelConfig } from "../../artifacts/config";
 import type { Cache, GatedDeltaCache } from "../../contracts/mlx/cache";
+import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
 import type { TokenGroup } from "../../contracts/mlx/token-work";
 import { QuantizedLinear } from "../../layers/quantized-linear";
 import type { TrellisLinear } from "../../layers/trellis-linear";
@@ -51,6 +52,7 @@ import {
   type QuantizedAttentionCore, type ReadPhase,
 } from "./blocks";
 import { qwen38TrellisTqFingerprint } from "./qwen38-27b-trellis-tq";
+import { qwenDraftTarget, qwenResidualBasis } from "./media-input";
 
 export const QWEN38_TRELLIS_M4PRO_GRAPH = "qwen3.8-27b-trellis-3.2bpw-m4pro";
 const DEVICE = "applegpu_g16s";
@@ -93,9 +95,12 @@ export class Qwen38TrellisM4Pro extends Qwen35Model {
   readonly #qkScale: { q: MlxArray; k: MlxArray };
   /** The last ANE MLP split built; the next layer's split shares its buffers (layers run one at a time). */
   #aneMlpShare: AneMlpSplit | undefined;
+  /** The artifact's R1 basis, from its fold record (read once, here). */
+  readonly #residualBasis: ResidualBasis | undefined;
 
   constructor(weights: Weights, config: ModelConfig) {
     super(weights, config);
+    this.#residualBasis = qwenResidualBasis(this.graph, config.modelDir);
     // DeltaNet's q/k scale as the weight of the norm before it: bit-identical
     // (see GatedDeltaNet.qkScale), 96 fewer kernels per forward.
     const dim = config.text.linearKeyHeadDim, invScale = Math.pow(dim, -0.5);
@@ -122,6 +127,8 @@ export class Qwen38TrellisM4Pro extends Qwen35Model {
     this.#headMma = this.lmHead ? new Affine4MmaLinear(this.lmHead) : null;
     console.error(`[graph] ${this.graph} ${FINGERPRINT} ane-prefill=${this.#plans.prefillAne ? "on" : "off"}`);
   }
+
+  override draftTarget(_caches: Cache[]): TargetView { return qwenDraftTarget(this, this.#residualBasis); }
 
   /** One plan: per-layer closures over this plan's blocks and MLP layers.
    *  `loadLinear` null keeps the base model's QuantizedLinear blocks. */

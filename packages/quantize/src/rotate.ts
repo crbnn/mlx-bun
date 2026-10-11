@@ -513,6 +513,13 @@ export class QwenFoldContext {
     }
   }
 
+  /** The preloaded γ named `gamma`, read back: the gain every fold op naming it scales by. */
+  gain(gamma: string): Float32Array {
+    const g = this.#gammas.get(gamma);
+    if (!g) throw new Error(`fold context: γ ${gamma} not preloaded`);
+    return g.toFloat32();
+  }
+
   #vec(gamma?: string): MlxArray {
     if (!gamma) return this.#s1;
     let v = this.#gammaTimesS1.get(gamma);
