@@ -5,13 +5,14 @@ import type { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { unrotateValues } from "../kernels/turboquant/ops";
-import { type AttentionCache, type AttentionRead, type Cache, type RotatedValueAttentionState } from "../contracts/mlx/cache";
+import { type AttentionRead, type Cache, type CommittedAttentionCache, type RotatedValueAttentionState } from "../contracts/mlx/cache";
 import { TurboQuantKVCache } from "./turboquant-kv";
 import { BatchedTurboQuantKVCache } from "./batched-turboquant-kv";
 import { FullTransitioningKvRows } from "./full-transitioning-kv-rows";
 import { FullPrefillRow } from "./full-prefill-row";
 import { KVCache } from "./kv";
 import { completeConversion, convertToTurboQuant, transitionDue } from "./bf16-first-kv";
+import type { TurboQuantKernels } from "./turboquant-attention";
 
 /** The TurboQuant transition of `Bf16FirstTurboQuantKVCache` over
  * full-attention rows: a bf16 row (`KVCache`, or a padded `FullPrefillRow`
@@ -34,21 +35,32 @@ function settleTurboQuantRows(rows: Cache[], kBits: number, vBits: number, start
  * for continuous batching: TurboQuant tensor access and value-domain handling
  * over the shared row-transition lifecycle (when a row converts is described on
  * `TransitioningKvRows`). Model projections and attention remain batched.
- * `fusedDecode` is resolved by whoever builds the layout. The reads are the
- * graph's call today: this layout's mask before the append, the deferred-V
- * fetch and the stock fused SDPA, then the value transform the fetch captured. */
+ * `fusedDecode` is resolved by whoever builds the layout. `turboQuantKernels` is
+ * the read of the graph whose caches these rows hold (dense for Qwen 3.5,
+ * deferred for Gemma 4 and MiniCPM5); the rows this layout makes and the
+ * layout it packs them into carry it, and a converted row attends with its
+ * source's.
+ *
+ * The reads are the graph's call today: this layout's mask before the append
+ * (no sliding window), then the kernel set's fetch and attention. The dense set
+ * fetches every row decoded (`updateAndFetch`) and runs the fused SDPA, Qwen
+ * 3.5's call; the deferred set fetches converted rows rotated
+ * (`updateAndFetchDeferredV`), runs the fused SDPA and applies the value
+ * transform that fetch captured, Gemma 4's and MiniCPM5's. */
 export class DelayedTurboQuantKVCache extends FullTransitioningKvRows<BatchedTurboQuantKVCache>
-  implements RotatedValueAttentionState, AttentionCache {
+  implements RotatedValueAttentionState, CommittedAttentionCache {
   #rotated: boolean[] = [];
   constructor(readonly kBits: number, readonly vBits: number, readonly start: number,
-    readonly fusedDecode: boolean, row?: Cache) {
+    readonly fusedDecode: boolean, readonly turboQuantKernels: TurboQuantKernels, row?: Cache) {
     super({ signature: `kv:delayed-turboquant:${kBits}:${vBits}:${start}`, conversionOffset: start,
       settle: rows => settleTurboQuantRows(rows, kBits, vBits, start, fusedDecode),
       // The conversion leaves storage that decodes on read.
       keepsDenseReads: () => true,
       converted: row => row instanceof TurboQuantKVCache,
-      makeLayout: () => new BatchedTurboQuantKVCache(kBits, vBits, fusedDecode) }, row);
+      makeLayout: () => new BatchedTurboQuantKVCache(kBits, vBits, turboQuantKernels, fusedDecode) }, row);
   }
+  /** Rows made for an empty layout carry the graph's read into their conversion. */
+  protected override plainRow(): KVCache { return new KVCache(undefined, this.turboQuantKernels); }
   captureDonorRows(): import("../contracts/mlx/cache").KvDonorRows {
     return this.packed?.captureDonorRows() ?? captureFullKvDonorRows(this.rows, this.leftPad, this.offset);
   }
@@ -59,20 +71,24 @@ export class DelayedTurboQuantKVCache extends FullTransitioningKvRows<BatchedTur
 
   appendDecode(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v); }
   appendWindow(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v); }
+  /** The window read over the deprecated fetches, like the other two:
+   * Qwen 3.5's committed append read this layout through `updateAndFetch` and
+   * the fused SDPA under the mask its `makeMask` builds, the same call as its
+   * window.
+   * TODO(B1c): the TurboQuant layout's own reads replace these fetches, one
+   * call per phase. */
+  appendCommitted(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v); }
   /** The graph's read today: the mask from this layout before the append (no
-   * sliding window), the deferred-V fetch and its value transform. */
+   * sliding window), then the kernel set's fetch and attention. */
   #read(k: MlxArray, v: MlxArray): AttentionRead {
     const mask = this.makeMask(k.shape[2]!, null);
-    let keys: MlxArray, values: MlxArray;
-    try { [keys, values] = this.updateAndFetchDeferredV(k, v); } catch (error) { mask.arr?.dispose(); throw error; }
-    const restore = this.captureValueTransform();
-    return {
-      attend(q, scale) {
-        const rotated = ops.sdpa(q, keys, values, scale, mask.mode, mask.arr);
-        try { return restore(rotated); } finally { rotated.dispose(); }
+    return this.turboQuantKernels.read({
+      decoded: () => this.updateAndFetch(k, v),
+      rotated: () => {
+        const [keys, values] = this.updateAndFetchDeferredV(k, v);
+        return { keys, values, restore: this.captureValueTransform() };
       },
-      dispose() { keys.dispose(); values.dispose(); mask.arr?.dispose(); },
-    };
+    }, { mask, release: () => mask.arr?.dispose() });
   }
 
   #append(k: MlxArray, v: MlxArray, deferred: boolean): [MlxArray, MlxArray] {
@@ -100,5 +116,7 @@ export class DelayedTurboQuantKVCache extends FullTransitioningKvRows<BatchedTur
       return ops.where(mask, restored, output);
     };
   }
-  makeEmptyBatch(): DelayedTurboQuantKVCache { return new DelayedTurboQuantKVCache(this.kBits, this.vBits, this.start, this.fusedDecode); }
+  makeEmptyBatch(): DelayedTurboQuantKVCache {
+    return new DelayedTurboQuantKVCache(this.kBits, this.vBits, this.start, this.fusedDecode, this.turboQuantKernels);
+  }
 }

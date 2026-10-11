@@ -4,6 +4,7 @@ export { tiledAffineKernels, tiledCausalAffineKernels, unfusedAffineKernels, typ
 export * from "./rotating-kv";
 export * from "./rotating-quantized-kv";
 export * from "./turboquant-kv";
+export { deferredTurboQuantKernels, denseTurboQuantKernels, uncomposedTurboQuantKernels, type TurboQuantKernels } from "./turboquant-attention";
 export * from "./turboquant-codec";
 export * from "./ssm";
 export * from "./glm52-cache";

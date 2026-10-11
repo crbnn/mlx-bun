@@ -54,7 +54,7 @@ export function restoreCacheAttachment(attachment: CheckpointAttachment, makeCac
   try {
     for (const [index, entry] of headers.entries()) {
       if (!entry) continue;
-      const cache = codecs.forHeader(entry).load(entry, { path: attachment.schema, arr, grownArr: arr,
+      const cache = codecs.forHeader(entry).load(entry, { path: attachment.schema, prototype: caches[index]!, arr, grownArr: arr,
         triple: (slots, at) => ({ packed: arr(slots[at]!), scales: arr(slots[at + 1]!), biases: arr(slots[at + 2]!) }),
       });
       pending.length = 0;

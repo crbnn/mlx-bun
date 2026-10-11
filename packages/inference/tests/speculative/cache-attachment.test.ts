@@ -5,6 +5,7 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import { KVCache } from "../../src/state/kv";
 import { unfusedAffineKernels } from "../../src/state/affine-attention";
 import { TurboQuantKVCache } from "../../src/state/turboquant-kv";
+import { deferredTurboQuantKernels } from "../../src/state/turboquant-attention";
 import { type Cache } from "../../src/contracts/mlx/cache";
 import { SSMCache } from "../../src/state/ssm";
 import { captureCacheAttachment, restoreCacheAttachment } from "../../src/state/attachment";
@@ -33,7 +34,7 @@ test("companion cache codecs retain encoded and recurrent state after donor disp
   };
   const ssm = new SSMCache(); ssm.offset = 3;
   ssm.conv = ones([1, 2, 64]); ssm.recurrent = ones([1, 2, 64, 64]);
-  const affine = full().toQuantized(64, 4, unfusedAffineKernels), turbo = TurboQuantKVCache.fromKVCache(full(), 8, 3);
+  const affine = full().toQuantized(64, 4, unfusedAffineKernels), turbo = TurboQuantKVCache.fromKVCache(full(), 8, 3, deferredTurboQuantKernels);
   const caches: Cache[] = [full(), affine, turbo, ssm];
   caches[1]!.minimumReusableOffset = 3; caches[2]!.minimumReusableOffset = 3;
   const expected = bytes(caches);

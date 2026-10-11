@@ -2,7 +2,7 @@ import type { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { RotatingKVCache } from "./rotating-kv";
-import { type AttentionCache, type AttentionRead, type Cache, type KvAttentionState, type KvAttentionView, type PaddedPrefillCache, type PrefillPadding } from "../contracts/mlx/cache";
+import { type AttentionRead, type Cache, type CommittedAttentionCache, type KvAttentionState, type KvAttentionView, type PaddedPrefillCache, type PrefillPadding } from "../contracts/mlx/cache";
 import { SpeculativeTransitioningKvRows } from "./transitioning-kv-rows";
 import { AlignedRotatingCache, alignRotatingRows, RotatingAffineLayout, SpeculativeRotatingAffineLayout, RotatingKvPositions } from "./rotating-kv-layout";
 import { BatchedRotatingQuantCache } from "./batched-rotating-quant";
@@ -29,7 +29,7 @@ function settleAffineRings(rows: Cache[], groupSize: number, bits: number, start
  * the graph's call today: this layout's mask before the append, under the
  * ring's window, then its attention view. */
 export class DelayedRotatingQuantizedKVCache extends SpeculativeTransitioningKvRows<RotatingAffineLayout>
-  implements KvAttentionState, PaddedPrefillCache, AttentionCache {
+  implements KvAttentionState, PaddedPrefillCache, CommittedAttentionCache {
   constructor(readonly maxSize: number, readonly groupSize: number, readonly bits: number, readonly start: number,
     row?: Cache, readonly speculative = false) {
     super({ signature: `kv:delayed-rotating-quant:${maxSize}:${bits}:${groupSize}:${start}`, conversionOffset: start,
@@ -63,15 +63,22 @@ export class DelayedRotatingQuantizedKVCache extends SpeculativeTransitioningKvR
     return super.makeMask(tokens, window);
   }
 
-  appendDecode(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v); }
-  appendWindow(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v); }
+  appendDecode(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v, false); }
+  appendWindow(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v, false); }
+  /** The graph's committed read today (Qwen 3.5's `createAppend`): the same
+   * mask and attention view, attended with independent positions, which the
+   * packed layout's view honours and the per-row views ignore, as they do in
+   * that call.
+   * TODO(B1b): the affine caches' own reads replace this, one call per phase. */
+  appendCommitted(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v, true); }
   /** The graph's read today: the mask from this layout before the append, with
    * the ring's window, then the attention view the append returns. */
-  #read(k: MlxArray, v: MlxArray): AttentionRead {
+  #read(k: MlxArray, v: MlxArray, independentPositions: boolean): AttentionRead {
     const mask = this.makeMask(k.shape[2]!, this.maxSize);
     let view: KvAttentionView;
     try { view = this.appendAndFetch(k, v); } catch (error) { mask.arr?.dispose(); throw error; }
-    return { attend: (q, scale) => view.attend(q, scale, mask), dispose() { view.dispose(); mask.arr?.dispose(); } };
+    return { attend: (q, scale) => view.attend(q, scale, mask, independentPositions),
+      dispose() { view.dispose(); mask.arr?.dispose(); } };
   }
 
   preparePrefill(padding: PrefillPadding): void {

@@ -4,12 +4,20 @@
 // on small synthetic weights: 64 layers in the 27B pattern (48 DeltaNet, 16
 // attention), once with Trellis MLPs and once with affine MLPs. Every hidden
 // output, every logit row and every cache tensor must agree to the bit, for
-// bf16 KV and for affine 4- and 8-bit KV converted after the first forward by
+// bf16 KV, for affine 4- and 8-bit KV converted after the first forward by
 // kv-maintenance with MLX_BUN_NO_FUSED_SDPA unset (tiled kernel set) and set to
-// 1 (unfused set). The phase operations (prefillChunk, prefillTail, decode,
-// verify) run a third cache set and are held to the same bits. No model, no
-// download.
+// 1 (unfused set), and for TurboQuant k8v3 and k4v4 KV (B1e: the dense
+// TurboQuant read Qwen35Model.makeCache composes). The phase operations
+// (prefillChunk, prefillTail, decode, verify) run a third cache set and are held
+// to the same bits. B1e adds fills over the delayed affine, rotating affine and
+// TurboQuant layouts across their transition, the served TurboQuant prefill
+// cohort (delayed layouts from empty), the training forward (TrainingCache),
+// full-sequence scoring (perplexity and the padded mask wrapper) and SSD save
+// and restore followed by reads. No model, no download.
 import { afterAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype, deviceArchitecture } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
@@ -17,9 +25,18 @@ import { parseQuantization, type ModelConfig } from "../../src/artifacts/config"
 import type { Weights } from "../../src/artifacts/weights";
 import type { BatchableCache, Cache, PaddedPrefillCache } from "../../src/contracts/mlx/cache";
 import type { TokenGroup } from "../../src/contracts/mlx/token-work";
+import type { RuntimeModel } from "../../src/models/factory";
 import { createRuntimeConfig, runtimeConfig, withRuntimeConfig } from "../../src/runtime/config";
+import { trainForward } from "../../src/scoring/full-sequence";
+import { evalPpl } from "../../src/scoring/perplexity";
+import { DelayedRotatingQuantizedKVCache } from "../../src/state/delayed-rotating-quantized-kv";
 import { createKvMaintenance } from "../../src/state/kv-maintenance";
+import { KVCache } from "../../src/state/kv";
 import { targetCacheLayout } from "../../src/state/layout";
+import { loadKvCache, saveKvCache } from "../../src/state/persistence";
+import { RotatingKVCache } from "../../src/state/rotating-kv";
+import { denseTurboQuantKernels, uncomposedTurboQuantKernels } from "../../src/state/turboquant-attention";
+import type { TurboQuantKVCache } from "../../src/state/turboquant-kv";
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
 import { Qwen35Model as FrozenQwen35Model } from "./qwen3_5-reference";
 
@@ -210,13 +227,17 @@ function outputDiff(label: string, model: Qwen35Model, actual: MlxArray, expecte
 const prompt = (n: number, salt: number) => Array.from({ length: n }, (_, i) => (i * 37 + salt * 11 + 5) % VOCAB);
 const ids = (rows: number[][]) => ops.fromInt32(rows.flat(), [rows.length, rows[0]!.length]);
 
-type Scheme = { name: string; kvBits: number | null; flag: string | undefined };
+type Scheme = { name: string; kvBits: number | null; flag: string | undefined; turbo?: { kBits: number; vBits: number } };
 const SCHEMES: Scheme[] = [
   { name: "bf16", kvBits: null, flag: undefined },
   { name: "affine4 flag=unset", kvBits: 4, flag: undefined },
   { name: "affine4 flag=1", kvBits: 4, flag: "1" },
   { name: "affine8 flag=unset", kvBits: 8, flag: undefined },
   { name: "affine8 flag=1", kvBits: 8, flag: "1" },
+  // B1e: TurboQuant storage. The current graph's caches carry the dense read
+  // (Qwen35Model.makeCache), which the conversion hands the converted cache.
+  { name: "turbo k8v3", kvBits: null, flag: undefined, turbo: { kBits: 8, vBits: 3 } },
+  { name: "turbo k4v4", kvBits: null, flag: undefined, turbo: { kBits: 4, vBits: 4 } },
 ];
 
 /** The frozen and current graphs over one synthetic artifact. */
@@ -239,8 +260,9 @@ function withScheme<T>(scheme: Scheme, run: () => T): T {
 
 /** Convert after a forward, as the served path does (quantized_kv_start 0). */
 function convert(scheme: Scheme, ...sets: Cache[][]): void {
-  if (scheme.kvBits === null) return;
-  const maintain = createKvMaintenance({ kvBits: scheme.kvBits, quantizedKvStart: 0 });
+  if (scheme.kvBits === null && !scheme.turbo) return;
+  const maintain = createKvMaintenance(scheme.turbo
+    ? { turboQuant: scheme.turbo, quantizedKvStart: 0 } : { kvBits: scheme.kvBits!, quantizedKvStart: 0 });
   for (const caches of sets) maintain(caches);
 }
 
@@ -482,36 +504,164 @@ for (const kind of ["trellis", "affine"] as const) {
   });
 }
 
-// Recorded, not identical (reported in the C1 PR). The pre-C1 block read a
-// TurboQuant cache through `updateAndFetch`: values decoded back to their own
-// domain, then the fused SDPA. The TurboQuant caches' own reads (B1c) run the
-// fused SDPA on rotated values and un-rotate its output, Gemma's arithmetic.
-// The first forward reads bf16 storage on both sides; reads after the
-// conversion differ. Whether the TurboQuant lego composed for Qwen keeps the
-// decoded read or Qwen takes the rotated one is open.
-test("recorded: TurboQuant k8v3 KV reads differ after the conversion", () => {
-  const p = pair("affine");
-  const oldCaches = p.old.makeCache(), newCaches = p.current.makeCache();
-  const measure = (label: string, rows: number[][]) => {
-    using input = ids(rows);
-    using expected = p.old.forwardHidden(input, oldCaches);
-    using actual = p.current.forwardHidden(input, newCaches);
-    using la = p.old.logitsFromHidden(expected);
-    using lb = p.current.logitsFromHidden(actual);
-    using x = la.astype(Dtype.float32);
-    using y = lb.astype(Dtype.float32);
-    const a = x.toFloat32(), b = y.toFloat32();
-    let worst = 0;
-    for (let i = 0; i < a.length; i++) worst = Math.max(worst, Math.abs(a[i]! - b[i]!));
-    expect(Number.isFinite(worst)).toBe(true);
-    console.log(`qwen35-identity recorded turbo k8v3 ${label}: logits maxDiff ${worst}`);
-    return worst;
-  };
-  try {
-    expect(measure("prefill37 (bf16 storage)", [prompt(37, 1)])).toBe(0);
-    const maintain = createKvMaintenance({ turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: 0 });
-    maintain(oldCaches); maintain(newCaches);
-    for (let step = 0; step < 2; step++) measure(`decode${step}`, [[40 + step]]);
-    measure("window5", [prompt(5, 2)]);
-  } finally { disposeAll(oldCaches, newCaches); }
-}, 120_000);
+// ── B1e: delayed layouts, training, scoring and SSD restore ─────────────────
+
+/** Read every row of a row layout as the serial cache it extracts to. */
+function extractedRows(cache: Cache): Cache[] {
+  const layout = cache as unknown as BatchableCache;
+  return layout.rowOffsets.map((_, row) => layout.extractRow(row));
+}
+
+/** The full-attention layers' caches replaced by a delayed row layout (bf16
+ * until `DELAYED_START` positions, quantized after): the affine and TurboQuant
+ * layouts kv-maintenance's preparePrefill builds for a prefill cohort, and a
+ * rotating affine layout over an empty ring. Qwen 3.5 has no sliding layer, so
+ * no maintenance builds the rotating one for it; its window never binds here. */
+const DELAYED_START = 40;
+const DELAYED: { name: string; converted: string; delay(caches: Cache[]): void }[] = [
+  { name: "delayed affine4", converted: "kv:quant:4:64",
+    delay: caches => createKvMaintenance({ kvBits: 4, quantizedKvStart: DELAYED_START }).preparePrefill!(caches) },
+  { name: "delayed rotating affine4", converted: "kv:rotating-quant:4:64",
+    delay(caches) {
+      for (const [layer, cache] of caches.entries()) if (cache instanceof KVCache) {
+        caches[layer] = new DelayedRotatingQuantizedKVCache(512, 64, 4, DELAYED_START, new RotatingKVCache(512));
+        cache.dispose();
+      }
+    } },
+  { name: "delayed turbo k8v3", converted: "kv:turboquant:8:3",
+    delay: caches => createKvMaintenance({ turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: DELAYED_START }).preparePrefill!(caches) },
+];
+
+for (const kind of ["trellis", "affine"] as const) {
+  describe(`B1e: ${kind} MLP`, () => {
+    for (const delayed of DELAYED) test.skipIf(!g16s)(`${kind} ${delayed.name}: prefill 37, fill 1-4 across the transition, decode`, () => {
+      const p = pair(kind), tag = `${kind} ${delayed.name}`;
+      const oldCaches = p.old.makeCache(), newCaches = p.current.makeCache();
+      delayed.delay(oldCaches); delayed.delay(newCaches);
+      try {
+        both(`${tag} prefill37`, p, oldCaches, newCaches, forwardHidden([prompt(37, 41)]));
+        // 38 and 40 positions are bf16 when filled; the rows convert before the
+        // third fill reads them.
+        for (const span of [1, 2, 3, 4])
+          both(`${tag} fill${span}`, p, oldCaches, newCaches, (model, caches) => fill(model, caches, [prompt(span, 43 + span)]));
+        both(`${tag} decode after fill`, p, oldCaches, newCaches, forwardHidden([[29]]));
+        const rows = extractedRows(newCaches[3]!);
+        try { expect(rows.map(row => row.signature())).toEqual([delayed.converted]); }
+        finally { disposeAll(rows); }
+      } finally { disposeAll(oldCaches, newCaches); }
+    }, 120_000);
+
+    for (const turbo of [{ kBits: 8, vBits: 3 }, { kBits: 4, vBits: 4 }])
+      test(`${kind} delayed turbo k${turbo.kBits}v${turbo.vBits}: padded batched prefill from empty layouts, conversion, batched decode, verify, rollback, fill`, () => {
+        const p = pair(kind), tag = `${kind} delayed turbo k${turbo.kBits}v${turbo.vBits}`;
+        const maintain = createKvMaintenance({ turboQuant: turbo, quantizedKvStart: 0 });
+        // The served prefill cohort: the graph's caches wrapped by the scheme's
+        // maintenance, then each layer's empty row layout.
+        const layouts = (model: Qwen35Model | FrozenQwen35Model) => {
+          const serial = model.makeCache();
+          maintain.preparePrefill!(serial);
+          try { return serial.map(cache => targetCacheLayout(cache) as unknown as Cache); }
+          finally { disposeAll(serial); }
+        };
+        const oldRows = layouts(p.old), newRows = layouts(p.current);
+        try {
+          const real = [6, 2, 4], width = 6;
+          for (const set of [oldRows, newRows]) for (const cache of set)
+            (cache as unknown as PaddedPrefillCache).preparePrefill({ lengths: real, rightPadding: real.map(n => width - n) });
+          const window = real.map((n, row) => [...prompt(n, 52 + row), ...Array(width - n).fill(0)]);
+          both(`${tag} padded prefill 6/2/4`, p, oldRows, newRows, forwardHidden(window));
+          for (const set of [oldRows, newRows]) for (const cache of set) (cache as unknown as PaddedPrefillCache).finalizePrefill();
+          for (let step = 0; step < 2; step++)
+            both(`${tag} batched decode`, p, oldRows, newRows, forwardHidden([[3 + step], [5 + step], [7 + step]]));
+          const rows = extractedRows(newRows[3]!);
+          try {
+            expect(rows.map(row => row.signature())).toEqual(real.map(() => `kv:turboquant:${turbo.kBits}:${turbo.vBits}`));
+            expect(rows.every(row => (row as TurboQuantKVCache).turboQuantKernels === denseTurboQuantKernels)).toBe(true);
+          } finally { disposeAll(rows); }
+
+          for (const set of [oldRows, newRows]) for (const cache of set) cache.specRoundBegin?.();
+          {
+            const verify = [prompt(4, 55), prompt(4, 56), prompt(4, 57)];
+            const expected = mixedVerify(p.old, oldRows, verify);
+            const actual = mixedVerify(p.current, newRows, verify);
+            tapsDiff(`${tag} batched verify4`, actual.taps, expected.taps);
+            outputDiff(`${tag} batched verify4`, p.current, actual.hidden, expected.hidden);
+          }
+          for (const set of [oldRows, newRows]) for (const cache of set) (cache as unknown as { specRoundRollback(keep: readonly number[]): void }).specRoundRollback([1, 3, 2]);
+          stateDiff(`${tag} batched rollback keep 1/3/2`, newRows, oldRows);
+          both(`${tag} batched decode after rollback`, p, oldRows, newRows, forwardHidden([[70], [71], [72]]));
+          if (g16s) both(`${tag} batched fill (one position per row)`, p, oldRows, newRows, (model, caches) => fill(model, caches, [[80], [81], [82]]));
+        } finally { disposeAll(oldRows, newRows); }
+      }, 120_000);
+
+    test(`${kind}: training forward through TrainingCache, loss and logits`, () => {
+      const p = pair(kind), tag = `${kind} training`;
+      const tokens = prompt(49, 61);
+      using input = ids([tokens.slice(0, -1)]);
+      using targets = ops.fromInt32(tokens.slice(1), [1, tokens.length - 1, 1]);
+      /** Per-token cross-entropy (f32, as the trainers and evalPpl take it) and its mean. */
+      const loss = (logits: MlxArray): [MlxArray, MlxArray] => {
+        using wide = logits.astype(Dtype.float32);
+        using lse = ops.logsumexpAxis(wide, 2, false);
+        using picked = ops.takeAlongAxis(wide, targets, 2);
+        using flat = ops.reshape(picked, lse.shape);
+        const perToken = ops.sub(lse, flat);
+        return [perToken, ops.meanAxis(perToken, 1, false)];
+      };
+      using expected = trainForward(p.old as unknown as RuntimeModel, input);
+      using actual = trainForward(p.current as unknown as RuntimeModel, input);
+      const [expectedTokens, expectedMean] = loss(expected), [actualTokens, actualMean] = loss(actual);
+      try {
+        record(`${tag} logits`, maxDiff(actual, expected, `${tag} logits`), 1);
+        record(`${tag} loss`, Math.max(maxDiff(actualTokens, expectedTokens, `${tag} per-token loss`),
+          maxDiff(actualMean, expectedMean, `${tag} mean loss`)), 2);
+        expect(Number.isFinite(expectedMean.toFloat32()[0]!)).toBe(true);
+      } finally { for (const array of [expectedTokens, expectedMean, actualTokens, actualMean]) array.dispose(); }
+    }, 120_000);
+
+    test(`${kind}: full-sequence scoring (perplexity rows and a padded batch through the mask wrapper)`, () => {
+      const p = pair(kind), tag = `${kind} scoring`;
+      const rows = [Int32Array.from(prompt(33, 63)), Int32Array.from(prompt(33, 64)), Int32Array.from(prompt(33, 65))];
+      const expected = evalPpl(p.old as unknown as RuntimeModel, rows, 2);
+      const actual = evalPpl(p.current as unknown as RuntimeModel, rows, 2);
+      expect(actual).toEqual(expected);
+      expect(Number.isFinite(expected.ppl)).toBe(true);
+      record(`${tag} perplexity (ppl, mean loss, standard error)`, Math.max(Math.abs(actual.ppl - expected.ppl),
+        Math.abs(actual.meanLoss - expected.meanLoss), Math.abs(actual.standardError - expected.standardError)), 3);
+      // Rows of 24, 19 and 15 real tokens in one batch: BatchedMaskCache.
+      const valid = [24, 19, 15];
+      using input = ids(valid.map((n, row) => [...prompt(n, 66 + row), ...Array(24 - n).fill(0)]));
+      using expectedLogits = trainForward(p.old as unknown as RuntimeModel, input, valid);
+      using actualLogits = trainForward(p.current as unknown as RuntimeModel, input, valid);
+      record(`${tag} padded batch logits`, maxDiff(actualLogits, expectedLogits, `${tag} padded batch logits`), 1);
+    }, 120_000);
+
+    const ssdSchemes: Scheme[] = [SCHEMES[3]!, SCHEMES[4]!, SCHEMES[5]!];   // affine8 flag unset and 1, turbo k8v3
+    for (const scheme of ssdSchemes)
+      test(`${kind} ${scheme.name}: SSD save and restore, then a window read and a decode`, () => withScheme(scheme, () => {
+        const p = pair(kind), tag = `${kind} ${scheme.name} SSD`;
+        const dir = mkdtempSync(join(tmpdir(), "qwen35-b1e-ssd-"));
+        const source = p.current.makeCache(), tokens = prompt(37, 71);
+        let oldCaches: Cache[] = [], newCaches: Cache[] = [];
+        try {
+          { using input = ids([tokens]); using hidden = p.current.forwardHidden(input, source); }
+          convert(scheme, source);
+          const path = join(dir, "entry.kv");
+          saveKvCache(path, tokens, source);
+          // Both graphs restore the same file; each restore takes its graph's caches.
+          oldCaches = loadKvCache(path, p.old).caches;
+          newCaches = loadKvCache(path, p.current).caches;
+          stateDiff(`${tag} restored`, newCaches, oldCaches);
+          if (scheme.turbo) {
+            expect((newCaches[3] as TurboQuantKVCache).turboQuantKernels).toBe(denseTurboQuantKernels);
+            expect((oldCaches[3] as TurboQuantKVCache).turboQuantKernels).toBe(uncomposedTurboQuantKernels);
+          }
+          both(`${tag} window5 after restore`, p, oldCaches, newCaches, forwardHidden([prompt(5, 72)]));
+          both(`${tag} decode after restore`, p, oldCaches, newCaches, forwardHidden([[13]]));
+        } finally {
+          disposeAll(source, oldCaches, newCaches);
+          rmSync(dir, { recursive: true, force: true });
+        }
+      }), 120_000);
+  });
+}

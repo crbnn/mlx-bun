@@ -7,6 +7,7 @@ import { QuantizedKVCache } from "./quantized-kv";
 import { plainKvStorage } from "./dense-kv-reads";
 import { AttentionMasks, causalLease, sdpaRead, unmaskedLease, withLease } from "./attention-read";
 import type { AffineKernels } from "./affine-attention";
+import { uncomposedTurboQuantKernels, type TurboQuantKernels } from "./turboquant-attention";
 
 /** A kernel set named by the composition it serves (`unfusedAffineKernels`,
  * `tiledCausalAffineKernels`, `tiledAffineKernels`), which a conversion builds
@@ -37,6 +38,13 @@ export class KVCache implements CompiledDecodeCache, CommittedAttentionCache, Bi
     /** The per-forward masks of the model this cache belongs to. Row layouts
      * made from this cache (`state/layout`) share them. */
     readonly masks = new AttentionMasks(),
+    /** The TurboQuant read of the graph that built this cache: a TurboQuant
+     * conversion of this storage (`TurboQuantKVCache.fromKVCache`, the delayed
+     * TurboQuant rows) attends with it, and copies of this cache carry it.
+     * Qwen 3.5's `makeCache` passes `denseTurboQuantKernels`, Gemma 4's and
+     * MiniCPM5's `deferredTurboQuantKernels`; a graph that reads TurboQuant
+     * storage only through the deprecated fetches passes none. */
+    readonly turboQuantKernels: TurboQuantKernels = uncomposedTurboQuantKernels,
   ) {}
 
   signature(): string { return "kv:plain"; }

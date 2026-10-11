@@ -11,6 +11,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import { KVCache } from "../../src/state/kv";
+import { deferredTurboQuantKernels } from "../../src/state/turboquant-attention";
 import { RotatingKVCache } from "../../src/state/rotating-kv";
 import { QuantizedKVCache } from "../../src/state/quantized-kv";
 import { RotatingQuantizedKVCache } from "../../src/state/rotating-quantized-kv";
@@ -166,11 +167,11 @@ test("a start the rows never reach keeps every row plain, and the capability is 
 test("plain storage and storage that decodes on read declare dense reads; affine storage does not", () => {
   const fused = turboQuantFusedDecode();
   const dense: Cache[] = [new KVCache(), new RotatingKVCache(W), new BatchedKVCache(), new BatchedRotatingCache(W, []),
-    new TurboQuantKVCache(8, 3), new BatchedTurboQuantKVCache(8, 3),
-    new DelayedTurboQuantKVCache(8, 3, 0, fused, new KVCache())];   // one real (empty) row: its row 0
+    new TurboQuantKVCache(8, 3, deferredTurboQuantKernels), new BatchedTurboQuantKVCache(8, 3, deferredTurboQuantKernels),
+    new DelayedTurboQuantKVCache(8, 3, 0, fused, deferredTurboQuantKernels, new KVCache(undefined, deferredTurboQuantKernels))];   // one real (empty) row: its row 0
   // Capability presence is the storage's declaration; appendability is asked of
   // an actual row. An empty delayed layout declares, but has no row 0 to append.
-  const empty = new DelayedTurboQuantKVCache(8, 3, 0, fused);
+  const empty = new DelayedTurboQuantKVCache(8, 3, 0, fused, deferredTurboQuantKernels);
   const encoded: Cache[] = [new QuantizedKVCache(64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16)), new RotatingQuantizedKVCache(W, 64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16)), new BatchedQuantizedKVCache(64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16)),
     new RotatingAffineLayout(W, 64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16))];
   try {
@@ -207,7 +208,7 @@ test("a TurboQuant conversion keeps dense reads: the converted entry declares th
 });
 
 test("delayed TurboQuant rows stay dense-readable before, across and after conversion, and packed", () => {
-  const group = new DelayedTurboQuantKVCache(8, 3, 4, turboQuantFusedDecode());
+  const group = new DelayedTurboQuantKVCache(8, 3, 4, turboQuantFusedDecode(), deferredTurboQuantKernels);
   const rows = [plainRow(false, 2, 130), plainRow(false, 5, 132)];
   try { group.mergeRows(rows); } finally { for (const row of rows) row.dispose(); }
   try {
@@ -228,7 +229,7 @@ test("prepared co-prefill rows answer through their current storage: padded full
   const cases = [
     ["affine full", () => new DelayedQuantizedKVCache(64, 4, 3), [false, true]],
     ["affine rotating", () => new DelayedRotatingQuantizedKVCache(W, 64, 4, 3), [false, true]],
-    ["TurboQuant full", () => new DelayedTurboQuantKVCache(8, 3, 3, turboQuantFusedDecode()), [true, true]],
+    ["TurboQuant full", () => new DelayedTurboQuantKVCache(8, 3, 3, turboQuantFusedDecode(), deferredTurboQuantKernels), [true, true]],
   ] as const;
   for (const [label, make, converted] of cases) {
     const group: Cache & { beginPrefill(): void; endPrefill(): void; commitPrefill(rows: number[]): void;

@@ -24,6 +24,7 @@ import { argmaxLastPosition } from "../../kernels/logits";
 import { disposing } from "../../layers/helpers";
 import { KVCache } from "../../state/kv";
 import { AttentionMasks } from "../../state/attention-read";
+import { denseTurboQuantKernels } from "../../state/turboquant-attention";
 import { LoraState } from "../../layers/lora";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import { QuantizedLinear } from "../../layers/quantized-linear";
@@ -167,10 +168,14 @@ export class Qwen35Model implements MlxDeclaredGraph {
     return out;
   }
 
-  /** One cache per layer, the full-attention caches sharing one mask memo. */
+  /** One cache per layer, the full-attention caches sharing one mask memo.
+   * Their TurboQuant read is dense (`denseTurboQuantKernels`): this graph read
+   * TurboQuant storage decoded, through `updateAndFetch` and the fused SDPA,
+   * before its blocks read through the cache, so a conversion of these caches
+   * keeps its served numbers. */
   makeCache(): Cache[] {
     const masks = new AttentionMasks();
-    return this.layers.map((l) => (l.isLinear ? new SSMCache() : new KVCache(masks)));
+    return this.layers.map((l) => (l.isLinear ? new SSMCache() : new KVCache(masks, denseTurboQuantKernels)));
   }
 
   /** The 27B append path keeps the native M1 affine arithmetic while Trellis

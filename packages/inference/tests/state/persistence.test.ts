@@ -6,13 +6,13 @@ import { Dtype, MlxArray } from "@mlx-bun/mlx";
 import type { Cache } from "@mlx-bun/inference/contracts";
 import {
   KVCache, QuantizedKVCache, RotatingKVCache, RotatingQuantizedKVCache,
-  TurboQuantKVCache, cloneKvCaches, saveKvCache, loadKvCache, SsdCacheStore, unfusedAffineKernels,
+  TurboQuantKVCache, cloneKvCaches, saveKvCache, loadKvCache, SsdCacheStore, unfusedAffineKernels, deferredTurboQuantKernels,
 } from "@mlx-bun/inference/state";
 
 const factories = [
   () => new KVCache(), () => new QuantizedKVCache(64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16)),
   () => new RotatingKVCache(8), () => new RotatingQuantizedKVCache(8, 64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16)),
-  () => new TurboQuantKVCache(8, 3),
+  () => new TurboQuantKVCache(8, 3, deferredTurboQuantKernels),
 ];
 
 function append(cache: Cache, x: MlxArray): Buffer[] {

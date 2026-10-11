@@ -61,6 +61,7 @@ import { argmaxLastPosition,logitSoftcap } from "../../kernels/logits";
 import { compiledLogitSoftcap } from "../../kernels/softcap";
 import { captureRopeOffsets } from "../../state/capabilities";
 import { KVCache } from "../../state/kv";
+import { deferredTurboQuantKernels } from "../../state/turboquant-attention";
 import { RotatingKVCache } from "../../state/rotating-kv";
 
 class Attention {
@@ -712,12 +713,15 @@ export class Gemma4Model implements MlxDeclaredGraph {
     return out;
   }
 
-  /** Caches for donor layers only (sharers consume donors' fetched KV). */
+  /** Caches for donor layers only (sharers consume donors' fetched KV). The
+   * full-attention caches' TurboQuant read is deferred
+   * (`deferredTurboQuantKernels`), the rotated-value sequence this graph runs
+   * after `updateAndFetchDeferredV`; sliding layers stay bf16 under TurboQuant. */
   makeCache(): Cache[] {
     return this.layers.slice(0, this.numDonors).map((l) =>
       l.layerType === "sliding_attention"
         ? new RotatingKVCache(this.windowSize)
-        : new KVCache(),
+        : new KVCache(undefined, deferredTurboQuantKernels),
     );
   }
 

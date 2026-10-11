@@ -11,7 +11,7 @@ import { KVCache } from "./kv";
 import { QuantizedKVCache } from "./quantized-kv";
 import { convertToAffine, transitionDue } from "./bf16-first-kv";
 import { unfusedAffineKernels } from "./affine-attention";
-import { type AttentionCache, type AttentionRead, type Cache, type Mask, type KvAttentionState, type KvAttentionView } from "../contracts/mlx/cache";
+import { type AttentionRead, type Cache, type CommittedAttentionCache, type Mask, type KvAttentionState, type KvAttentionView } from "../contracts/mlx/cache";
 
 /** The bf16 source of a full-attention row: a `KVCache`, or a padded
  * `FullPrefillRow` over one. Converted rows have none. */
@@ -37,7 +37,7 @@ function settleAffineRows(rows: Cache[], groupSize: number, bits: number, start:
  * a row converts is described on `TransitioningKvRows`. The reads are the
  * graph's call today: this layout's mask before the append, then its attention
  * view. */
-export class DelayedQuantizedKVCache extends FullTransitioningKvRows<BatchedQuantizedKVCache> implements KvAttentionState, AttentionCache {
+export class DelayedQuantizedKVCache extends FullTransitioningKvRows<BatchedQuantizedKVCache> implements KvAttentionState, CommittedAttentionCache {
   constructor(readonly groupSize: number, readonly bits: number, readonly start: number, row?: Cache) {
     super({ signature: `kv:delayed-quant:${bits}:${groupSize}:${start}`, conversionOffset: start,
       settle: rows => settleAffineRows(rows, groupSize, bits, start),
@@ -52,15 +52,21 @@ export class DelayedQuantizedKVCache extends FullTransitioningKvRows<BatchedQuan
   }
   makeEmptyBatch(): DelayedQuantizedKVCache { return new DelayedQuantizedKVCache(this.groupSize, this.bits, this.start); }
 
-  appendDecode(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v); }
-  appendWindow(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v); }
+  appendDecode(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v, false); }
+  appendWindow(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v, false); }
+  /** The graph's committed read today (Qwen 3.5's `createAppend`): the same
+   * mask and attention view, attended with independent positions, so a
+   * converted row keeps the single-position reduction order.
+   * TODO(B1b): the affine caches' own reads replace this, one call per phase. */
+  appendCommitted(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v, true); }
   /** The graph's read today: the mask from this layout before the append (no
    * sliding window), then the attention view the append returns. */
-  #read(k: MlxArray, v: MlxArray): AttentionRead {
+  #read(k: MlxArray, v: MlxArray, independentPositions: boolean): AttentionRead {
     const mask = this.makeMask(k.shape[2]!, null);
     let view: KvAttentionView;
     try { view = this.appendAndFetch(k, v); } catch (error) { mask.arr?.dispose(); throw error; }
-    return { attend: (q, scale) => view.attend(q, scale, mask), dispose() { view.dispose(); mask.arr?.dispose(); } };
+    return { attend: (q, scale) => view.attend(q, scale, mask, independentPositions),
+      dispose() { view.dispose(); mask.arr?.dispose(); } };
   }
   /** Plain keys and values at the model's B while every row is still plain,
    * assembled as the plain attention view does; the caller owns them. Once a

@@ -2,11 +2,13 @@ import { decodedKvDonorAttention } from "./decoded-kv-donor";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import { KvTensorRows, type KvTensorRowView } from "./kv-tensor-rows";
 import { disposeResources } from "../runtime/resources";
-import { TurboQuantKVCache, rotatedValueRead } from "./turboquant-kv";
-import { type AttentionCache, type AttentionRead, type BatchableCache, type Cache, type Mask, type RotatedValueAttentionState, type PaddedPrefillCache, type PrefillPadding } from "../contracts/mlx/cache";
+import { TurboQuantKVCache } from "./turboquant-kv";
+import { type AttentionRead, type BatchableCache, type Cache, type CommittedAttentionCache, type Mask, type RotatedValueAttentionState, type PaddedPrefillCache, type PrefillPadding } from "../contracts/mlx/cache";
+import * as tq from "../kernels/turboquant/ops";
 import { TurboQuantCodec, turboQuantFusedDecode, disposeTurboQuant, type TurboQuantTensor } from "./turboquant-codec";
 import { decodedKvStorage } from "./dense-kv-reads";
-import { AttentionMasks, causalLease, unmaskedLease, withLease, type MaskLease } from "./attention-read";
+import { AttentionMasks, causalLease, unmaskedLease, type MaskLease } from "./attention-read";
+import type { TurboQuantKernels } from "./turboquant-attention";
 
 const fields = ["kIdx", "kScales", "kZeros", "vPacked", "vScales"] as const;
 function encoded(planes: readonly MlxArray[]): TurboQuantTensor {
@@ -16,20 +18,23 @@ function encoded(planes: readonly MlxArray[]): TurboQuantTensor {
 /** The existing TurboQuant codec over shared tensor-row storage. Row changes
  * copy encoded bytes without decoding, rotating or requantizing their values.
  *
- * Reads: append as `updateAndFetchDeferredV` does, then `rotatedValueRead`
- * (the fused SDPA on rotated values, then the inverse value rotation of its
- * output), so no caller sees rotated values. While every row is unpadded and at
- * one position, decode passes no mask and a window the fused causal mask;
- * otherwise both pass the per-row mask (causal, past each row's left padding)
- * that `makeMask` builds for their query count, built once per forward through
- * `masks`. */
-export class BatchedTurboQuantKVCache implements AttentionCache, BatchableCache, PaddedPrefillCache {
+ * Reads: append, then attend with the kernel set the layout was built with
+ * (`turboQuantKernels`, the graph's: dense for Qwen 3.5, deferred for Gemma 4
+ * and MiniCPM5), so no caller sees rotated values. While every row is unpadded
+ * and at one position, decode passes no mask and a window the fused causal
+ * mask; otherwise both pass the per-row mask (causal, past each row's left
+ * padding) that `makeMask` builds for their query count, built once per forward
+ * through `masks`. Those are the masks the graphs build with `makeMask` before
+ * the append. A committed span is the window read. */
+export class BatchedTurboQuantKVCache implements CommittedAttentionCache, BatchableCache, PaddedPrefillCache {
   readonly denseKvReads = decodedKvStorage;
   readonly #storage = new KvTensorRows();
   readonly #codec: TurboQuantCodec;
   #reuseOffsets: number[] = [];
   #headDim: number | null = null;
   constructor(readonly kBits: number, readonly vBits: number,
+    /** How the named reads attend, named by the graph the layout serves. */
+    readonly turboQuantKernels: TurboQuantKernels,
     readonly fusedDecode = turboQuantFusedDecode(),
     /** The per-forward masks of the model this layout serves. */
     readonly masks = new AttentionMasks()) {
@@ -44,11 +49,19 @@ export class BatchedTurboQuantKVCache implements AttentionCache, BatchableCache,
     return this.#read(k, v, this.#mask(k.shape[2]!, causalLease));
   }
 
+  /** The window read, as on `TurboQuantKVCache`. */
+  appendCommitted(k: MlxArray, v: MlxArray): AttentionRead {
+    return this.appendWindow(k, v);
+  }
+
   #read(k: MlxArray, v: MlxArray, mask: MaskLease): AttentionRead {
-    return withLease(mask, held => {
-      const [keys, values] = this.#append(k, v, true);
-      return rotatedValueRead(keys, values, held);
-    });
+    return this.turboQuantKernels.read({
+      decoded: () => this.#append(k, v, false),
+      rotated: () => {
+        const [keys, values] = this.#append(k, v, true);
+        return { keys, values, restore: tq.unrotateValues };
+      },
+    }, mask);
   }
 
   /** `aligned` while every row is unpadded at one position; otherwise the
@@ -82,7 +95,7 @@ export class BatchedTurboQuantKVCache implements AttentionCache, BatchableCache,
   get batchSize(): number | null { return this.#storage.batchSize; }
   get offset(): number { return this.#storage.offset; }
   get ropeOffsetArr(): MlxArray | undefined { return this.#storage.ropeOffsetArr; }
-  makeEmptyBatch(): BatchedTurboQuantKVCache { return new BatchedTurboQuantKVCache(this.kBits, this.vBits, this.fusedDecode, this.masks); }
+  makeEmptyBatch(): BatchedTurboQuantKVCache { return new BatchedTurboQuantKVCache(this.kBits, this.vBits, this.turboQuantKernels, this.fusedDecode, this.masks); }
   bytesPerToken(): number { return this.#storage.bytesPerToken(); }
   projectedBytes(tokens: number): number { return this.bytesPerToken() * tokens; }
   makeMask(tokens: number, window: number | null): Mask { return this.#storage.makeMask(tokens, window); }
@@ -123,7 +136,7 @@ export class BatchedTurboQuantKVCache implements AttentionCache, BatchableCache,
   }
   state(): MlxArray[] { return this.#storage.planes; }
   extractRow(row: number): TurboQuantKVCache {
-    const result = new TurboQuantKVCache(this.kBits, this.vBits, this.fusedDecode), count = this.rowOffsets[row]!;
+    const result = new TurboQuantKVCache(this.kBits, this.vBits, this.turboQuantKernels, this.fusedDecode), count = this.rowOffsets[row]!;
     if (count) result.restoreState(encoded(this.#storage.extractRow(row)), count, this.#headDim!);
     result.minimumReusableOffset = this.#reuseOffsets[row] ?? 0;
     return result;

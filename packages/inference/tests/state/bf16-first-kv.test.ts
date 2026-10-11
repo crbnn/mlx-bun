@@ -22,6 +22,7 @@ import { DelayedQuantizedKVCache } from "../../src/state/delayed-quantized-kv";
 import { DelayedRotatingQuantizedKVCache } from "../../src/state/delayed-rotating-quantized-kv";
 import { DelayedTurboQuantKVCache } from "../../src/state/delayed-turboquant-kv";
 import { KVCache } from "../../src/state/kv";
+import { deferredTurboQuantKernels } from "../../src/state/turboquant-attention";
 import { createKvMaintenance } from "../../src/state/kv-maintenance";
 import { QuantizedKVCache } from "../../src/state/quantized-kv";
 import { disposeTriple } from "../../src/state/quantized-tensor";
@@ -72,9 +73,9 @@ const SCHEMES: readonly Scheme[] = [
 const maintenanceOf = (scheme: Scheme, start: number) => createKvMaintenance(scheme.bits
   ? { kvBits: scheme.bits, kvGroupSize: GROUP, quantizedKvStart: start }
   : { turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: start });
-const plainOf = (scheme: Scheme): Cache => scheme.rotating ? new RotatingKVCache(W) : new KVCache();
+const plainOf = (scheme: Scheme): Cache => scheme.rotating ? new RotatingKVCache(W) : new KVCache(undefined, deferredTurboQuantKernels);
 const legoOf = (scheme: Scheme, start: number): AttentionCache => !scheme.bits
-  ? new Bf16FirstTurboQuantKVCache(8, 3, start, turboQuantFusedDecode())
+  ? new Bf16FirstTurboQuantKVCache(8, 3, start, turboQuantFusedDecode(), deferredTurboQuantKernels)
   : scheme.rotating ? new Bf16FirstRotatingQuantizedKVCache(W, GROUP, scheme.bits, start)
   : new Bf16FirstQuantizedKVCache(GROUP, scheme.bits, start);
 /** Evaluate a cache's state, releasing the views a cache hands out fresh. */
@@ -189,12 +190,12 @@ for (const scheme of SCHEMES) for (const start of [0, 512]) {
 /** The quantized-from-token-zero cache a lego is not: built empty, it
  * quantizes the first append too. Its kernels are not composed yet (B1):
  * unfused, the uniform `--kv-quant N` composition. */
-const fromZeroOf = (scheme: Scheme): Cache => !scheme.bits ? new TurboQuantKVCache(8, 3, turboQuantFusedDecode())
+const fromZeroOf = (scheme: Scheme): Cache => !scheme.bits ? new TurboQuantKVCache(8, 3, deferredTurboQuantKernels, turboQuantFusedDecode())
   : scheme.rotating ? new RotatingQuantizedKVCache(W, GROUP, scheme.bits, unfusedAffineKernels(scheme.bits, GROUP, Dtype.bfloat16))
   : new QuantizedKVCache(GROUP, scheme.bits, unfusedAffineKernels(scheme.bits, GROUP, Dtype.bfloat16));
 /** The conversion `kv-maintenance` performs, applied by hand. */
 const convertedOf = (scheme: Scheme, plain: Cache): Cache => !scheme.bits
-  ? TurboQuantKVCache.fromKVCache(plain as KVCache, 8, 3, turboQuantFusedDecode())
+  ? TurboQuantKVCache.fromKVCache(plain as KVCache, 8, 3, deferredTurboQuantKernels, turboQuantFusedDecode())
   : (plain as KVCache | RotatingKVCache).toQuantized(GROUP, scheme.bits, unfusedAffineKernels);
 
 for (const scheme of SCHEMES) {
@@ -247,7 +248,7 @@ function joiningRows(scheme: Scheme, start: number, lengths: readonly number[]):
   return rows;
 }
 const rowsOf = (scheme: Scheme, start: number): AttentionCache & Cache & { mergeRows(rows: readonly Cache[]): void } =>
-  !scheme.bits ? new DelayedTurboQuantKVCache(8, 3, start, turboQuantFusedDecode())
+  !scheme.bits ? new DelayedTurboQuantKVCache(8, 3, start, turboQuantFusedDecode(), deferredTurboQuantKernels)
     : scheme.rotating ? new DelayedRotatingQuantizedKVCache(16, GROUP, scheme.bits, start)
     : new DelayedQuantizedKVCache(GROUP, scheme.bits, start);
 

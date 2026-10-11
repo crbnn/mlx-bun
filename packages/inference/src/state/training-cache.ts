@@ -3,7 +3,8 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { createCausalMask } from "../kernels/attention/masks";
 import { gatedDeltaUpdate } from "../kernels/delta/gated";
-import type { Cache, GatedDeltaCache, GatedDeltaParameters, Mask } from "../contracts/mlx/cache";
+import type { AttentionCache, AttentionRead, Cache, GatedDeltaCache, GatedDeltaParameters, Mask } from "../contracts/mlx/cache";
+import { causalLease, sdpaRead, unmaskedLease } from "./attention-read";
 import type { PrefixLayout } from "../contracts/mlx/trainable";
 
 /** Stateless cache for the training forward. Training is always a single
@@ -12,11 +13,26 @@ import type { PrefixLayout } from "../contracts/mlx/trainable";
  *  mask — identical to KVCache at offset 0. The statelessness is REQUIRED for
  *  gradient checkpointing: mlx_checkpoint re-runs the layer closure during the
  *  backward recompute, and a stateful (appending) cache would corrupt on the
- *  second run. */
-export class TrainingCache implements Cache {
+ *  second run.
+ *
+ *  Reads: the pass-through views of `k` and `v` and the stock fused SDPA, the
+ *  call a graph made after `makeMask(L, null)` and `updateAndFetch` here before
+ *  it read through the cache (Qwen 3.5's training and scoring forward): no mask
+ *  for one position, the fused causal mask for a window. A graph with a sliding
+ *  window keeps the deprecated path; this cache is composed for full-attention
+ *  reads only. */
+export class TrainingCache implements AttentionCache {
   /** Training-only adapter; never admitted, merged, or persisted. */
   signature(): string { return "train:training"; }
   offset = 0;
+  appendDecode(k: MlxArray, v: MlxArray): AttentionRead {
+    const [keys, values] = this.updateAndFetch(k, v);
+    return sdpaRead(keys, values, unmaskedLease);
+  }
+  appendWindow(k: MlxArray, v: MlxArray): AttentionRead {
+    const [keys, values] = this.updateAndFetch(k, v);
+    return sdpaRead(keys, values, causalLease);
+  }
   updateAndFetch(k: MlxArray, v: MlxArray): [MlxArray, MlxArray] {
     // Return fresh views: the caller disposes its input k/v right after (its
     // contract with the real KVCache, which returns buffer slices). A

@@ -111,6 +111,10 @@ export interface CloneContext {
 
 export interface LoadContext {
   path: string;
+  /** The restoring graph's own empty cache for this entry's layer (from its
+   * `makeCache()`), borrowed for the load: what the graph composed into its
+   * caches (the TurboQuant read a `KVCache` carries) reaches the restored one. */
+  prototype: Cache;
   arr(slot: TensorSlot): MlxArray;
   grownArr(slot: TensorSlot, offset: number): MlxArray;
   triple(slots: TensorSlot[], at: number): ops.QuantizedTensor;

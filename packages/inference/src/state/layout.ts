@@ -23,7 +23,7 @@ import { PagedKvRows } from "./paged/rows";
 export function ownedCacheLayoutFactory(cache: Cache): (() => BatchableCache) | undefined {
   if (cache instanceof PagedKVCache) return () => new PagedKvRows(cache.capacityTokens, cache.blockSize, cache.direct, cache.quantization);
   if (isBatchableCache(cache)) return () => cache.makeEmptyBatch();
-  if (cache instanceof TurboQuantKVCache) return () => new BatchedTurboQuantKVCache(cache.kBits, cache.vBits, cache.fusedDecode, cache.masks);
+  if (cache instanceof TurboQuantKVCache) return () => new BatchedTurboQuantKVCache(cache.kBits, cache.vBits, cache.turboQuantKernels, cache.fusedDecode, cache.masks);
   if (isPlainKvCache(cache)) return () => new PaddedKVRows(cache.masks);
   if (isQuantizedKvCache(cache)) return () => new PaddedQuantKVRows(cache.groupSize, cache.bits, cache.kernels, cache.masks);
   if (isRotatingPlainCache(cache)) return () => new BatchedRotatingCache(cache.maxSize, [], cache.masks);

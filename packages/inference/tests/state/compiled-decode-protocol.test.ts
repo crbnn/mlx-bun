@@ -15,6 +15,7 @@ import { isCompiledDecodeCache } from "../../src/state/capabilities";
 import { decodeStepInputs } from "../../src/state/decode-step-inputs";
 import { BatchedKVCache } from "../../src/state/batched-kv";
 import { KVCache } from "../../src/state/kv";
+import { deferredTurboQuantKernels } from "../../src/state/turboquant-attention";
 import { QuantizedKVCache } from "../../src/state/quantized-kv";
 import { RotatingKVCache } from "../../src/state/rotating-kv";
 import { RotatingQuantizedKVCache } from "../../src/state/rotating-quantized-kv";
@@ -108,6 +109,6 @@ test("only the caches that implement the protocol answer the compiled-decode pro
   try {
     for (const cache of caches) expect(isCompiledDecodeCache(cache)).toBe(true);
     expect(isCompiledDecodeCache(new BatchedKVCache())).toBe(false);
-    expect(isCompiledDecodeCache(new TurboQuantKVCache(4, 4, false))).toBe(false);
+    expect(isCompiledDecodeCache(new TurboQuantKVCache(4, 4, deferredTurboQuantKernels, false))).toBe(false);
   } finally { for (const cache of caches) cache.dispose(); }
 });

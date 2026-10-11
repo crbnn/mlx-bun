@@ -62,7 +62,7 @@ export class FullPrefillRow implements Cache {
   private restored(planes: MlxArray[], offset: number): FullCache {
     const source = this.inner;
     if (source instanceof KVCache) {
-      const result = new KVCache();
+      const result = new KVCache(undefined, source.turboQuantKernels);
       if (planes.length) result.restoreState(planes[0]!, planes[1]!, offset);
       return result;
     }
@@ -72,7 +72,7 @@ export class FullPrefillRow implements Cache {
         { packed: planes[3]!, scales: planes[4]!, biases: planes[5]! }, offset);
       return result;
     }
-    const result = new TurboQuantKVCache(source.kBits, source.vBits, source.fusedDecode);
+    const result = new TurboQuantKVCache(source.kBits, source.vBits, source.turboQuantKernels, source.fusedDecode);
     if (planes.length) result.restoreState({ kIdx: planes[0]!, kScales: planes[1]!, kZeros: planes[2]!,
       vPacked: planes[3]!, vScales: planes[4]! }, offset, source.headDim!);
     return result;
@@ -101,7 +101,8 @@ export class FullPrefillRow implements Cache {
     return this;
   }
   toTurboQuantized(kBits: number, vBits: number, fusedDecode?: boolean): FullPrefillRow {
-    this.inner = TurboQuantKVCache.fromKVCache(this.inner as KVCache, kBits, vBits, fusedDecode);
+    const source = this.inner as KVCache;
+    this.inner = TurboQuantKVCache.fromKVCache(source, kBits, vBits, source.turboQuantKernels, fusedDecode);
     return this;
   }
   dispose(): void { this.inner.dispose(); this.padding.clear(); }

@@ -9,7 +9,6 @@ import type { MlxArray } from "@mlx-bun/mlx/array";
 import { clearCache } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { AttentionCache, AttentionRead, Cache, Mask } from "../contracts/mlx/cache";
-import { unrotateValues } from "../kernels/turboquant/ops";
 import { quantizedSdpa } from "../layers/quantized-attention";
 import { AttentionMasks, causalLease, unmaskedLease, withLease, type MaskLease } from "./attention-read";
 import { KVCache, type AffineKernelSet } from "./kv";
@@ -19,6 +18,7 @@ import { disposeTriple } from "./quantized-tensor";
 import { RotatingKVCache, rotatingWindowMask } from "./rotating-kv";
 import { RotatingQuantizedKVCache } from "./rotating-quantized-kv";
 import { TurboQuantKVCache } from "./turboquant-kv";
+import type { TurboQuantKernels } from "./turboquant-attention";
 
 /** Whether bf16 storage holding `offset` positions converts under a
  * conversion start of `start` tokens: once it holds at least `start`
@@ -55,11 +55,12 @@ export function convertToAffine<C extends Cache>(
 
 /** The TurboQuant conversion `kv-maintenance` performs on one entry: encode
  * the source's live window (consuming the source), then the shared
- * bookkeeping. `fusedDecode` is the converted cache's decode policy. */
+ * bookkeeping. The converted cache attends with the source's TurboQuant read
+ * (`turboQuantKernels`); `fusedDecode` is its decode policy. */
 export function convertToTurboQuant(source: KVCache, kBits: number, vBits: number, start: number,
   fusedDecode: boolean): TurboQuantKVCache {
   const offset = source.offset;
-  return completeConversion(TurboQuantKVCache.fromKVCache(source, kBits, vBits, fusedDecode), offset, start);
+  return completeConversion(TurboQuantKVCache.fromKVCache(source, kBits, vBits, source.turboQuantKernels, fusedDecode), offset, start);
 }
 
 /** The affine read as the graphs compute it over quantized storage today: the
@@ -74,22 +75,6 @@ function affineRead(storage: QuantizedKVCache | RotatingQuantizedKVCache, k: Mlx
     return {
       attend: (q, scale) => quantizedSdpa(q, keys, values, scale, held.mask, groupSize, bits),
       dispose() { disposeTriple(keys); disposeTriple(values); held.release(); },
-    };
-  });
-}
-
-/** The TurboQuant read as the graphs compute it today: the deferred-V append,
- * the stock fused SDPA under the mask, then the inverse rotation of the output.
- * Takes ownership of `mask`. */
-function turboQuantRead(storage: TurboQuantKVCache, k: MlxArray, v: MlxArray, mask: MaskLease): AttentionRead {
-  return withLease(mask, held => {
-    const [keys, values] = storage.updateAndFetchDeferredV(k, v);
-    return {
-      attend(q, scale) {
-        const rotated = ops.sdpa(q, keys, values, scale, held.mask.mode, held.mask.arr);
-        try { return unrotateValues(rotated); } finally { rotated.dispose(); }
-      },
-      dispose() { keys.dispose(); values.dispose(); held.release(); },
     };
   });
 }
@@ -285,11 +270,13 @@ export class Bf16FirstRotatingQuantizedKVCache implements AttentionCache {
  * below the offset equal the convert-after path's bit for bit. The transition
  * has the obligations described on {@link Bf16FirstQuantizedKVCache}.
  *
- * Reads: before the transition, `KVCache`'s reads; after it, the read the
- * graphs make today: the deferred-V fetch, the stock fused SDPA (no mask for
- * decode, the causal mask for a window), then the inverse rotation of the
- * output. `fusedDecode` is resolved by whoever builds the cache; nothing here
- * reads the runtime configuration.
+ * Reads: before the transition, `KVCache`'s reads; after it, the encoded
+ * storage's reads, which attend with `turboQuantKernels` (no mask for decode,
+ * the causal mask for a window): decoded values and the stock fused SDPA for
+ * Qwen 3.5's graph, or the deferred-V fetch, the stock fused SDPA and the
+ * inverse rotation of the output for Gemma 4's and MiniCPM5's. `fusedDecode` is
+ * resolved by whoever builds the cache; nothing here reads the runtime
+ * configuration.
  */
 export class Bf16FirstTurboQuantKVCache implements AttentionCache {
   #plain: KVCache | null;
@@ -302,10 +289,14 @@ export class Bf16FirstTurboQuantKVCache implements AttentionCache {
     readonly start: number,
     /** The codec's decode policy for the converted storage. */
     readonly fusedDecode: boolean,
+    /** How the converted storage attends, named by the graph the cache serves
+     * (`denseTurboQuantKernels` for Qwen 3.5, `deferredTurboQuantKernels` for
+     * Gemma 4 and MiniCPM5). */
+    readonly turboQuantKernels: TurboQuantKernels,
     /** The per-forward masks of the model this cache belongs to. */
     readonly masks = new AttentionMasks(),
   ) {
-    this.#plain = new KVCache(masks);
+    this.#plain = new KVCache(masks, turboQuantKernels);
   }
 
   get #storage(): KVCache | TurboQuantKVCache { return this.#encoded ?? this.#plain!; }
@@ -315,12 +306,12 @@ export class Bf16FirstTurboQuantKVCache implements AttentionCache {
   get stateNeedsDispose(): boolean { return this.#encoded !== null; }
 
   appendDecode(k: MlxArray, v: MlxArray): AttentionRead {
-    if (this.#encoded) return turboQuantRead(this.#encoded, k, v, unmaskedLease);
+    if (this.#encoded) return this.#encoded.appendDecode(k, v);
     return this.#settle(this.#plain!.appendDecode(k, v));
   }
 
   appendWindow(k: MlxArray, v: MlxArray): AttentionRead {
-    if (this.#encoded) return turboQuantRead(this.#encoded, k, v, causalLease);
+    if (this.#encoded) return this.#encoded.appendWindow(k, v);
     return this.#settle(this.#plain!.appendWindow(k, v));
   }
 
@@ -348,7 +339,7 @@ export class Bf16FirstTurboQuantKVCache implements AttentionCache {
     this.#encoded?.dispose();
     this.#plain?.dispose();
     this.#encoded = null;
-    this.#plain = new KVCache(this.masks);
+    this.#plain = new KVCache(this.masks, this.turboQuantKernels);
     this.masks.clear();
   }
 }

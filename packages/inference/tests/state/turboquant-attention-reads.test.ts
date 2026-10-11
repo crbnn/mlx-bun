@@ -5,7 +5,8 @@
 // `rotatedValueAttention.updateAndFetchDeferredV`, `ops.sdpa` with that mask,
 // then `captureValueTransform?.()` or `unrotateValues` on the output. "New" is
 // the phase-named append and `attend`, which un-rotates inside the read. Same
-// random q/k/v; maxDiff must be 0.
+// random q/k/v; maxDiff must be 0. The caches are built with
+// `deferredTurboQuantKernels`, the set those two graphs compose.
 import { expect, test } from "bun:test";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
@@ -16,6 +17,7 @@ import { AttentionMasks } from "../../src/state/attention-read";
 import { BatchedTurboQuantKVCache } from "../../src/state/batched-turboquant-kv";
 import { ownedCacheLayoutFactory } from "../../src/state/layout";
 import { TurboQuantKVCache } from "../../src/state/turboquant-kv";
+import { deferredTurboQuantKernels } from "../../src/state/turboquant-attention";
 import { disposeResources } from "../../src/runtime/resources";
 
 const HKV = 2, HQ = 8, D = 128, SCALE = 0.088;
@@ -126,7 +128,7 @@ for (const [kb, vb] of COMBOS) {
   test(`TurboQuantKVCache k${kb}v${vb}: decode and windows of 1, 3, 8, 37, 200 across the 256 step`, () => {
     const diffs: number[] = [];
     for (const fused of FUSED) for (const steps of [SOLO_STEPS, FULL_STEP]) {
-      const pair = twice(() => new TurboQuantKVCache(kb, vb, fused));
+      const pair = twice(() => new TurboQuantKVCache(kb, vb, deferredTurboQuantKernels, fused));
       try { diffs.push(...compareSteps(`TurboQuantKVCache k${kb}v${vb} ${fusedName(fused)} d${D}`, pair, 1, steps)); }
       finally { disposeResources(pair); }
     }
@@ -138,7 +140,7 @@ for (const [kb, vb] of NAMED) for (const d of [64, 256, 512]) {
   test(`TurboQuantKVCache k${kb}v${vb}: head dim ${d}`, () => {
     const diffs: number[] = [];
     for (const fused of FUSED) {
-      const pair = twice(() => new TurboQuantKVCache(kb, vb, fused));
+      const pair = twice(() => new TurboQuantKVCache(kb, vb, deferredTurboQuantKernels, fused));
       try { diffs.push(...compareSteps(`TurboQuantKVCache k${kb}v${vb} ${fusedName(fused)} d${d}`, pair, 1, SOLO_STEPS, d)); }
       finally { disposeResources(pair); }
     }
@@ -153,9 +155,9 @@ for (const [kb, vb] of COMBOS) {
   test(`BatchedTurboQuantKVCache k${kb}v${vb}: rows at unequal offsets, across the 256 step`, () => {
     const diffs: number[] = [];
     for (const fused of FUSED) for (const lengths of ROW_LENGTHS) {
-      const make = () => new TurboQuantKVCache(kb, vb, fused);
+      const make = () => new TurboQuantKVCache(kb, vb, deferredTurboQuantKernels, fused);
       const [a, b] = soloRows(make, lengths);
-      const pair = twice(() => new BatchedTurboQuantKVCache(kb, vb, fused));
+      const pair = twice(() => new BatchedTurboQuantKVCache(kb, vb, deferredTurboQuantKernels, fused));
       try {
         pair[0].mergeRows(a); pair[1].mergeRows(b);
         diffs.push(...compareSteps(`BatchedTurboQuantKVCache k${kb}v${vb} ${fusedName(fused)}[${lengths}]`,
@@ -170,8 +172,8 @@ for (const [kb, vb] of NAMED) for (const d of [64, 256, 512]) {
   test(`BatchedTurboQuantKVCache k${kb}v${vb}: rows at offsets 5,17,3,40, head dim ${d}`, () => {
     const diffs: number[] = [];
     for (const fused of FUSED) {
-      const [a, b] = soloRows(() => new TurboQuantKVCache(kb, vb, fused), [5, 17, 3, 40], d);
-      const pair = twice(() => new BatchedTurboQuantKVCache(kb, vb, fused));
+      const [a, b] = soloRows(() => new TurboQuantKVCache(kb, vb, deferredTurboQuantKernels, fused), [5, 17, 3, 40], d);
+      const pair = twice(() => new BatchedTurboQuantKVCache(kb, vb, deferredTurboQuantKernels, fused));
       try {
         pair[0].mergeRows(a); pair[1].mergeRows(b);
         diffs.push(...compareSteps(`BatchedTurboQuantKVCache k${kb}v${vb} ${fusedName(fused)} d${d}[5,17,3,40]`,
@@ -191,7 +193,7 @@ for (const [kb, vb] of NAMED) for (const padding of PADDINGS) {
     const diffs: number[] = [];
     for (const fused of FUSED) {
       const label = `BatchedTurboQuantKVCache k${kb}v${vb} ${fusedName(fused)}`;
-      const pair = twice(() => new BatchedTurboQuantKVCache(kb, vb, fused));
+      const pair = twice(() => new BatchedTurboQuantKVCache(kb, vb, deferredTurboQuantKernels, fused));
       try {
         for (const cache of pair) cache.preparePrefill(padding);
         diffs.push(...compareSteps(`${label} prefill`, pair, B, [8]));
@@ -208,8 +210,8 @@ for (const [kb, vb] of NAMED) {
     const diffs: number[] = [];
     for (const fused of FUSED) {
       const label = `BatchedTurboQuantKVCache k${kb}v${vb} ${fusedName(fused)} speculative`;
-      const [a, b] = soloRows(() => new TurboQuantKVCache(kb, vb, fused), [12, 30]);
-      const pair = twice(() => new BatchedTurboQuantKVCache(kb, vb, fused));
+      const [a, b] = soloRows(() => new TurboQuantKVCache(kb, vb, deferredTurboQuantKernels, fused), [12, 30]);
+      const pair = twice(() => new BatchedTurboQuantKVCache(kb, vb, deferredTurboQuantKernels, fused));
       try {
         pair[0].mergeRows(a); pair[1].mergeRows(b);
         for (const keep of [[1, 3], [0, 2], [4, 4]]) {
@@ -231,9 +233,9 @@ for (const [kb, vb] of NAMED) {
   test(`KV-shared queries on one read match the graph's sharer path, k${kb}v${vb}`, () => {
     const diffs: number[] = [];
     for (const fused of FUSED) {
-      const [a, b] = soloRows(() => new TurboQuantKVCache(kb, vb, fused), [5, 17]);
-      const solo = twice(() => new TurboQuantKVCache(kb, vb, fused));
-      const batched = twice(() => new BatchedTurboQuantKVCache(kb, vb, fused));
+      const [a, b] = soloRows(() => new TurboQuantKVCache(kb, vb, deferredTurboQuantKernels, fused), [5, 17]);
+      const solo = twice(() => new TurboQuantKVCache(kb, vb, deferredTurboQuantKernels, fused));
+      const batched = twice(() => new BatchedTurboQuantKVCache(kb, vb, deferredTurboQuantKernels, fused));
       try {
         batched[0].mergeRows(a); batched[1].mergeRows(b);
         for (const [name, pair, B] of [["TurboQuantKVCache", solo, 1], ["BatchedTurboQuantKVCache", batched, 2]] as const) {
@@ -271,11 +273,11 @@ for (const [kb, vb] of NAMED) {
 
 test("mask memo: row layouts made from a TurboQuantKVCache share its masks, one build per forward", () => {
   const masks = new AttentionMasks();
-  const source = new TurboQuantKVCache(8, 3, true, masks);
+  const source = new TurboQuantKVCache(8, 3, deferredTurboQuantKernels, true, masks);
   const make = ownedCacheLayoutFactory(source)!;
-  const [a] = soloRows(() => new TurboQuantKVCache(8, 3, true), [5, 17]);
+  const [a] = soloRows(() => new TurboQuantKVCache(8, 3, deferredTurboQuantKernels, true), [5, 17]);
   const layers = Array.from({ length: 4 }, () => make() as BatchedTurboQuantKVCache);
-  const reference = Array.from({ length: 4 }, () => new BatchedTurboQuantKVCache(8, 3, true));
+  const reference = Array.from({ length: 4 }, () => new BatchedTurboQuantKVCache(8, 3, deferredTurboQuantKernels, true));
   const held: AttentionRead[] = [];
   try {
     for (const layer of layers) expect(layer.masks).toBe(masks);

@@ -23,6 +23,7 @@ import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import { QuantizedLinear } from "../../layers/quantized-linear";
 import { argmaxLastPosition } from "../../kernels/logits";
 import { KVCache } from "../../state/kv";
+import { deferredTurboQuantKernels } from "../../state/turboquant-attention";
 import { disposeTriple } from "../../state/quantized-tensor";
 
 import { flashAttention,flashSupported,getTrainingAttn } from "../../kernels/attention/flash";
@@ -246,8 +247,11 @@ export class MiniCPM5Model implements MlxDeclaredGraph {
     return out;
   }
 
+  /** One cache per layer. Their TurboQuant read is deferred
+   * (`deferredTurboQuantKernels`), the rotated-value sequence this graph runs
+   * after `updateAndFetchDeferredV`. */
   makeCache(): Cache[] {
-    return this.layers.map(() => new KVCache());
+    return this.layers.map(() => new KVCache(undefined, deferredTurboQuantKernels));
   }
 
   forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray {

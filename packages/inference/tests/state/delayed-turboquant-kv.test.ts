@@ -4,6 +4,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import { KVCache } from "../../src/state/kv";
+import { deferredTurboQuantKernels } from "../../src/state/turboquant-attention";
 import { TurboQuantKVCache } from "../../src/state/turboquant-kv";
 import { type Cache } from "../../src/contracts/mlx/cache";
 import { DelayedTurboQuantKVCache } from "../../src/state/delayed-turboquant-kv";
@@ -18,7 +19,7 @@ function input(B: number, N: number, seed: number): MlxArray {
   return data.astype(Dtype.bfloat16);
 }
 function plain(length: number): Cache {
-  const row = new KVCache();
+  const row = new KVCache(undefined, deferredTurboQuantKernels);
   using k = input(1, length, length); using v = input(1, length, length + 100);
   for (const a of row.updateAndFetch(k, v)) a.dispose();
   return row;
@@ -41,7 +42,7 @@ for (const fused of ["0", "1"]) test(`delayed TQ preserves exact row boundaries,
   const maintain = createKvMaintenance({ turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: 5 });
   let reference = [plain(3), plain(6)];
   const copies = cloneKvCaches(reference);
-  let group = new DelayedTurboQuantKVCache(8, 3, 5, turboQuantFusedDecode());
+  let group = new DelayedTurboQuantKVCache(8, 3, 5, turboQuantFusedDecode(), deferredTurboQuantKernels);
   group.mergeRows(copies); copies.forEach(c => c.dispose());
   let sawMixed = false, sawPacked = false;
   try {
@@ -123,7 +124,7 @@ for (const fused of ["0", "1"]) test(`speculative delayed TQ converts committed 
   const restore = configureRuntime({ MLX_BUN_TURBOQUANT_FUSED_DECODE: fused });
   const maintain = createKvMaintenance({ turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: 5 });
   let reference = [plain(3), plain(6)];
-  let group = new DelayedTurboQuantKVCache(8, 3, 5, turboQuantFusedDecode());
+  let group = new DelayedTurboQuantKVCache(8, 3, 5, turboQuantFusedDecode(), deferredTurboQuantKernels);
   group.mergeRows(reference);
   try {
     for (let round = 0; round < 5; round++) {

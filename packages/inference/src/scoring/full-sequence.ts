@@ -20,7 +20,8 @@ import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { createCausalMask } from "../kernels/attention/masks";
-import { type Cache, type Mask } from "../contracts/mlx/cache";
+import { type AttentionCache, type AttentionRead, type Cache, type Mask } from "../contracts/mlx/cache";
+import { sdpaRead } from "../state/attention-read";
 import { isRecurrentCache } from "../state/capabilities";
 import { TrainingCache, TrainingSSMCache } from "../state/training-cache";
 import type { RuntimeModel } from "../models/factory";
@@ -130,8 +131,14 @@ export function buildBatchedPadMask(
  *  window) and shared across all caches of that type; ownership of the mask
  *  arrays stays with the wrapper (disposeOwnMask), NOT the model — the model's
  *  forwardLayers only disposes the mask it pulled from makeMask, so makeMask
- *  hands back a fresh view each call and keeps the canonical copy itself. */
-class BatchedMaskCache implements Cache {
+ *  hands back a fresh view each call and keeps the canonical copy itself.
+ *
+ *  Reads: the inner cache's `updateAndFetch` and the stock fused SDPA under a
+ *  view of the canonical mask, the call a graph made after `makeMask` and
+ *  `updateAndFetch` here before it read through the cache (Qwen 3.5's padded
+ *  training forward). The mask is the same for every query count, so decode and
+ *  window read alike. The inner cache is the graph's own plain cache. */
+class BatchedMaskCache implements AttentionCache {
   /** Training-only adapter; never admitted, merged, or persisted. */
   signature(): string { return "train:batched-mask"; }
   constructor(
@@ -142,6 +149,15 @@ class BatchedMaskCache implements Cache {
 
   get offset(): number {
     return this.inner.offset;
+  }
+
+  appendDecode(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v); }
+  appendWindow(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v); }
+  #read(k: MlxArray, v: MlxArray): AttentionRead {
+    const mask = this.makeMask(k.shape[2]!, this.window);
+    let keys: MlxArray, values: MlxArray;
+    try { [keys, values] = this.inner.updateAndFetch(k, v); } catch (error) { mask.arr?.dispose(); throw error; }
+    return sdpaRead(keys, values, { mask, release: () => mask.arr?.dispose() });
   }
 
   updateAndFetch(k: MlxArray, v: MlxArray): [MlxArray, MlxArray] {

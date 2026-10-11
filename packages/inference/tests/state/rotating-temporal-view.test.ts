@@ -23,6 +23,7 @@ import { plainRowStorage, quantizedRowStorage, temporalStorageView } from "../..
 import { cloneKvCaches, loadKvCache, saveKvCache } from "../../src/state/persistence";
 import { disposeTriple } from "../../src/state/quantized-tensor";
 import { KVCache } from "../../src/state/kv";
+import { deferredTurboQuantKernels } from "../../src/state/turboquant-attention";
 import { TurboQuantKVCache } from "../../src/state/turboquant-kv";
 
 const W = 8, H = 2, D = 64, GROUP = 64, BITS = 8;
@@ -215,12 +216,12 @@ test("TurboQuant conversion encodes the newest window of a rotating cache", () =
   // window's rows, built from the history alone.
   for (const [name, writes] of Object.entries(CASES)) {
     const [from, to] = windowOf(writes.reduce((a, b) => a + b, 0));
-    const turbo = TurboQuantKVCache.fromKVCache(drive(() => new RotatingKVCache(W), writes, () => {}), 8, 3);
+    const turbo = TurboQuantKVCache.fromKVCache(drive(() => new RotatingKVCache(W), writes, () => {}), 8, 3, deferredTurboQuantKernels);
     const reference = new KVCache();
     using k = block(from, to, 1);
     using v = block(from, to, -1);
     for (const a of reference.updateAndFetch(k, v)) a.dispose();
-    const expected = TurboQuantKVCache.fromKVCache(reference, 8, 3);
+    const expected = TurboQuantKVCache.fromKVCache(reference, 8, 3, deferredTurboQuantKernels);
     expect({ name, state: turbo.state().map(sha) }).toEqual({ name, state: expected.state().map(sha) });
     turbo.dispose();
     expected.dispose();
