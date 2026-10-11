@@ -177,7 +177,18 @@ without a gate change.
       codec still picks its decode kernel per call (`tryDecodePackedKv` returns null and the
       eager decode runs): the kernel is fixed at construction with the rest of the scheme, and
       the null path goes. `appendBidirectional` on the TurboQuant caches (Gemma 4 image prefill)
-      is still to implement.
+      is still to implement. B1e: two kernel sets at construction, `denseTurboQuantKernels`
+      (Qwen's read before C1: decode keys and values, then SDPA) and
+      `deferredTurboQuantKernels` (Gemma 4 and MiniCPM5: SDPA on rotated values, un-rotate the
+      output); the graph puts its set on the bf16 caches `makeCache` builds and every
+      conversion, copy and restore takes it from the cache it converts. A graph that passes no
+      set leaves a placeholder whose named reads throw; D3 gives every graph its set and the
+      placeholder goes.
+- [ ] Transition reads, all marked E3 and deleted there: the conversion site in
+      `kv-maintenance.ts` and the two SSD restore sites choose the affine kernel set from the
+      flag the app writes today through `state/served-affine-kernels.ts` (`1` → unfused,
+      otherwise tiled-causal where the configuration tiles). E3 composes the set from the KV
+      scheme at load and the app stops writing the flag.
 - [ ] The quantized lego `--kv-quant N` composes is bf16 through its first append and quantized
       storage after, inside its own `appendWindow`/`appendDecode` (the state transition the
       three `delayed-*-kv.ts` caches do today, owned by one lego built at load), so the first
@@ -254,6 +265,17 @@ warm-reuse test is unchanged; no `toQuantized` caller outside `state/`.
       `independentRows` goes.
 - [ ] Follow-up, after the DeltaNet block takes the SSM cache contract instead of the concrete
       class: move the blocks to `layers/`.
+
+- [ ] Landed in C1 (#337) with B1e (#338): the attention block holds one read strategy taken at
+      construction (the cache's own read; a deprecated strategy reproduces the Trellis graphs'
+      injected cores until D1); the DeltaNet block calls `recurDecode`/`recurWindow`; the MLP
+      is `TrellisMlp` or `AffineMlp`, chosen by `loadQwenMlp` from the quant table at load; the
+      phase is a value passed down `forwardLayers`, derived from a shape only in
+      `deprecatedPhase`, the one adapter E2 deletes. Still inside the generic blocks and owned
+      by E2's width tables: `TrellisMlp`'s "4 rows or fewer → fused gate/up" choice.
+      `MLX_BUN_MIXED_PACKED_MLP` is read once at construction and becomes a composition fact in
+      E3. `verify` on the TQ graph now runs the TQ plan where A2's delegation ran the generic
+      mixed loop: E2's capture-path decision.
 
 Exit: `Qwen35Model` and the M4 Pro graph both import from `blocks.ts`; no `extends` between
 them; bit-identical generic forward.
@@ -360,6 +382,13 @@ Exit: selection is data; `qwen38TrellisM4ProAccepts` and the nested ternary are 
 - [ ] The scheduler indexes the graph's operation table by the rows it batched: one request is
       one row and calls the one-row decode; four requests call the 2-to-4 decode; verify width is
       rows times depth+1. No flag and no mode; `--batch-size` is only the cap.
+- [ ] The Neural Engine is a compute unit the scheduler manages (Josh, 2026-10-11). The graph
+      exposes its prompt-chunk operation per execution unit, `prefillChunk.gpu` and, when the
+      composition built it, `prefillChunk.ane` (the ANE+GPU split for exactly the chunk size);
+      which unit a chunk runs on is the scheduler's dispatch decision, read once at bind as a
+      declared fact and chosen per chunk by the scheduler, which owns the ANE as a resource and
+      can overlap one request's ANE chunk with another's GPU work. No graph routes to the ANE by
+      itself. Until E2 dispatches to it, the deprecated entry points call the GPU operation.
 - [ ] Batching sends M rows through the row-wise layers; only `attend` and the recurrence see
       `rowOffsets`.
 - [ ] Call sites A2 found that do not fit the four phases, each resolved explicitly, none by
@@ -422,7 +451,11 @@ new flag.
       the published `mlx-bun/Qwen3.8-27B-Trellis-3.2bpw` sidecar gets the values computed
       from the bf16 source (a one-off, where that source is available); each Trellis graph
       reads the sidecar once at construction and declares `residualBasis` through
-      `draftTarget`. The old basis JSON the env var pointed at is not on the M4 Pro.
+      `draftTarget`. Resolved 2026-10-11: the basis JSON was on the M1 Max share
+      (`mlx-bun-perf/models/Qwen3.8-27B-Trellis-3.2bpw-dflash2-basis.json`, gain taken from
+      the bf16 final norm of a sibling quant of the same source, effective 1+w), and the
+      published artifact's `turboquant_fold.json` now carries `final_gain`, its convention and
+      its source (hub commit `d5a4fc64`). E4b makes the graphs read it and the quantizer write it.
 - [ ] The drafter builds its matrix-unit layer for its fixed block width at construction and uses
       the ordinary quantized matmul for context projection; no per-call row switch in `matmulW`.
 
