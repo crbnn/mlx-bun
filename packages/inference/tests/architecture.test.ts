@@ -854,7 +854,6 @@ const seamRatchet: RatchetTable = {
     "packages/inference/src/models/gemma4/compiled-decode.ts": 1, // D3
     "packages/inference/src/models/gemma4/model.ts": 1, // E2 (mixed iteration)
     "packages/inference/src/models/glm52/model.ts": 2, // no item yet: B1 defers GLM-5.2 MLA
-    "packages/inference/src/models/minicpm5/model.ts": 1, // no item yet: D3 leaves other branches out of scope
     "packages/inference/src/state/layout.ts": 3, // no item yet: prefillCacheLayout dispatches on cache class
     "packages/training/src/kernels/flash-cce.ts": 9, // C2 for now
   },
@@ -865,12 +864,9 @@ const seamRatchet: RatchetTable = {
     "packages/inference/src/models/gemma4/generated/gemma4-26b.ts": 6, // D2
     "packages/inference/src/models/gemma4/generated/gemma4-e4b.ts": 8, // D2
     "packages/inference/src/models/gemma4/model.ts": 13, // D3
-    "packages/inference/src/models/minicpm5/model.ts": 11, // D3
+    "packages/inference/src/models/minicpm5/model.ts": 2, // no item yet: the training flash path and prefix-shared caches (B1 lists them out of its step)
     "packages/inference/src/models/qwen/blocks.ts": 3, // D1
-    "packages/inference/src/models/qwen/qwen3-moe.ts": 1, // D3
-    "packages/inference/src/models/qwen/qwen3.ts": 1, // D3
     "packages/inference/src/models/qwen/qwen38-27b-trellis-m4pro.ts": 2, // D1
-    "packages/inference/src/models/universal/dense.ts": 2, // D3
     "packages/inference/src/scoring/full-sequence.ts": 3, // D3 (B1e reads over the deprecated members)
   },
   "phase-by-shape": {
