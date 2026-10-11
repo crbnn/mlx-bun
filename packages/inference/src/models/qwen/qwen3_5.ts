@@ -32,10 +32,13 @@ import { RMSNorm } from "../../layers/normalization";
 import { type Cache } from "../../contracts/mlx/cache";
 import { qwen35WeightsView } from "./checkpoint";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
-import type { MlxDeclaredGraph } from "../../contracts/mlx/graph";
+import type {
+  MlxDeclaredGraph, MlxLayerCapture, MlxPhaseForward, MlxTokenPhases, MlxVerifyForward, MlxWidthTable,
+} from "../../contracts/mlx/graph";
 import type { TargetView } from "../../contracts/mlx/draft-target";
 import type { MediaEncoders, MlxPromptInput, Vision } from "../../contracts/mlx/media";
 import { declareGraph } from "../capabilities";
+import { atEveryWidth } from "../graph";
 import { bindQwenMediaInput, qwenDraftTarget, qwenMediaEncoders } from "./media-input";
 import { SSMCache } from "../../state/ssm";
 import { buildMropePositions, mropeInvFreq } from "../../layers/qwen-mrope";
@@ -43,23 +46,6 @@ import { type MropeRequestState } from "../../contracts/mlx/positions";
 import { Qwen3Layer, type ReadPhase } from "./blocks";
 
 const PREFIX = "language_model";
-
-// A2's phase types (`contracts/mlx/graph.ts` and `atEveryWidth` in
-// `models/graph.ts` on refactor/composition-a2), copied so this graph names the
-// same phases before A2 merges. The merge replaces them with A2's imports.
-type MlxLayerCapture = (layer: number, hidden: MlxArray) => void;
-type MlxPhaseForward = (ids: MlxArray, state: Cache[]) => MlxArray | Promise<MlxArray>;
-type MlxVerifyForward = (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
-  MlxArray | Promise<MlxArray>;
-interface MlxWidthTable<Operation> {
-  readonly one: Operation;
-  readonly twoToFour: Operation;
-  readonly fiveToEight: Operation;
-  readonly wider: Operation;
-}
-function atEveryWidth<Operation>(operation: Operation): MlxWidthTable<Operation> {
-  return Object.freeze({ one: operation, twoToFour: operation, fiveToEight: operation, wider: operation });
-}
 
 /** The phase of a forward reaching one of the deprecated entry points
  * (`forwardHidden`, `forwardHiddenMixed`, `forwardHiddenAtPositions`,
@@ -79,7 +65,7 @@ export function deprecatedPhase(input: MlxArray, committedAppend = false): ReadP
   return tokens === 1 ? "decode" : "window";
 }
 
-export class Qwen35Model implements MlxDeclaredGraph {
+export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
   readonly weightsBytes: number;
   /** Base path for LoRA target keys (weights carry the language_model prefix). */
