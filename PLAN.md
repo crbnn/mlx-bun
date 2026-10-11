@@ -105,8 +105,6 @@ Closed by Josh, 2026-10-10:
   one-row class only, so a request never shares a forward and its bits never depend on another
   request. The batched paged read follows the same rule (joined rows, as served today).
 
-After the merge to main, the next program is performance optimization on this structure.
-
 ### Phase A: contracts (no behavior change)
 
 #### A1. The cache owns the read
