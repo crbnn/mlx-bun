@@ -293,11 +293,14 @@ export interface Cache {
     endPrefill(): void;
   };
   /** Optional representation-owned affine conversion. Logical position can
-   * differ from the physical write head in a padded rotating layout.
+   * differ from the physical write head in a padded rotating layout. `kernels`
+   * builds the kernel set the converted storage attends with (state's
+   * `AffineKernelSet`) for its bits, group size and activation dtype.
    * @deprecated The loader composes the affine, TurboQuant or
    * delayed-quantization cache, which converts inside its own append and keeps
    * serving {@link AttentionCache}. Removed in B1. */
-  readonly affineConversion?: { readonly offset: number; toQuantized(groupSize: number, bits: number): Cache };
+  readonly affineConversion?: { readonly offset: number;
+    toQuantized(groupSize: number, bits: number, kernels: (bits: number, groupSize: number, dtype: Dtype) => unknown): Cache };
   /** Optional representation-owned TurboQuant conversion.
    * @deprecated The same replacement as `affineConversion`. Removed in B1. */
   readonly turboConversion?: { readonly offset: number; toTurboQuantized(kBits: number, vBits: number): Cache };

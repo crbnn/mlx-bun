@@ -8,15 +8,16 @@ import { AlignedRotatingCache, alignRotatingRows, RotatingAffineLayout, Speculat
 import { BatchedRotatingQuantCache } from "./batched-rotating-quant";
 import { captureKvAttention, combineKvDonorAttention } from "./kv-attention-view";
 import { convertToAffine, transitionDue } from "./bf16-first-kv";
-import { unfusedAffineKernels } from "./affine-attention";
+import type { AffineKernelSet } from "./kv";
 
 /** The affine transition of `Bf16FirstRotatingQuantizedKVCache` over aligned
  * ring rows: a plain ring converts its physical columns with its own
- * `toQuantized` once it holds `start` positions. */
-function settleAffineRings(rows: Cache[], groupSize: number, bits: number, start: number): void {
+ * `toQuantized` once it holds `start` positions, and attends with `kernelSet`
+ * after. */
+function settleAffineRings(rows: Cache[], groupSize: number, bits: number, start: number, kernelSet: AffineKernelSet): void {
   for (let index = 0; index < rows.length; index++) {
     const source = (rows[index] as AlignedRotatingCache).affineConversion;
-    if (source && transitionDue(source.offset, start)) rows[index] = convertToAffine(source, groupSize, bits, start);
+    if (source && transitionDue(source.offset, start)) rows[index] = convertToAffine(source, groupSize, bits, start, kernelSet);
   }
 }
 
@@ -27,20 +28,23 @@ function settleAffineRings(rows: Cache[], groupSize: number, bits: number, start
  * converts is described on `TransitioningKvRows`). A `start` of `Infinity`
  * never converts: the prefill cohort's layout for plain rings. The reads are
  * the graph's call today: this layout's mask before the append, under the
- * ring's window, then its attention view. */
+ * ring's window, then its attention view. Converted rings and the packed
+ * layout attend with `kernelSet`, taken when the layout is built; the rows a
+ * cohort extracts carry it into the layouts they join. */
 export class DelayedRotatingQuantizedKVCache extends SpeculativeTransitioningKvRows<RotatingAffineLayout>
   implements KvAttentionState, PaddedPrefillCache, CommittedAttentionCache {
   constructor(readonly maxSize: number, readonly groupSize: number, readonly bits: number, readonly start: number,
-    row?: Cache, readonly speculative = false) {
+    /** The affine kernel set converted rings attend with, named by the
+     * composition (`unfusedAffineKernels`, `tiledCausalAffineKernels`). */
+    readonly kernelSet: AffineKernelSet, row?: Cache, readonly speculative = false) {
     super({ signature: `kv:delayed-rotating-quant:${maxSize}:${bits}:${groupSize}:${start}`, conversionOffset: start,
-      settle: rows => settleAffineRings(rows, groupSize, bits, start),
+      settle: rows => settleAffineRings(rows, groupSize, bits, start, kernelSet),
       keepsDenseReads: row => {
         const source = (row as AlignedRotatingCache).affineConversion;
         return !source || !transitionDue(source.offset, start);
       },
       converted: row => row instanceof AlignedRotatingCache && row.inner instanceof BatchedRotatingQuantCache,
-      // The delayed lego is not composed yet (B1): unfused, the uniform `--kv-quant N` composition.
-      makeLayout: () => { const kernels = unfusedAffineKernels(bits, groupSize, Dtype.bfloat16);
+      makeLayout: () => { const kernels = kernelSet(bits, groupSize, Dtype.bfloat16);
         return speculative ? new SpeculativeRotatingAffineLayout(maxSize, groupSize, bits, kernels) : new RotatingAffineLayout(maxSize, groupSize, bits, kernels); },
       prepareRows: alignRotatingRows,
       packRows: (layout, rows) => layout.adoptAlignedRows(rows as readonly AlignedRotatingCache[]),
@@ -105,7 +109,7 @@ export class DelayedRotatingQuantizedKVCache extends SpeculativeTransitioningKvR
   get maxTokens(): number { return this.maxSize; }
   projectedBytes(tokens: number): number { return this.bytesPerToken() * Math.min(tokens, this.maxSize); }
   makeEmptyBatch(): DelayedRotatingQuantizedKVCache {
-    return new DelayedRotatingQuantizedKVCache(this.maxSize, this.groupSize, this.bits, this.start, undefined, this.speculative);
+    return new DelayedRotatingQuantizedKVCache(this.maxSize, this.groupSize, this.bits, this.start, this.kernelSet, undefined, this.speculative);
   }
   /** Plain keys and values while every row is still plain: each row's own
    * ring answers (one row keeps its physical columns and phase; several share

@@ -131,16 +131,20 @@ export function createKvMaintenance(options: Readonly<Omit<KvSchemeOptions, "kvC
     return remaining;
   };
   // The rows layouts convert their own rows, each with its layer's scheme;
-  // this maintenance never converts them.
+  // this maintenance never converts them. Each layout takes the kernel set its
+  // converted rows attend with when it is built here.
   maintain.preparePrefill = (cache) => {
+    // E3 transition: E3 composes the set from the KV scheme at load and
+    // deletes the flag this reads (`servedAffineKernels`).
+    const kernels = servedAffineKernels();
     for (let layer = 0; layer < cache.length; layer++) {
       const row = cache[layer]!;
       if (!(row instanceof KVCache || row instanceof QuantizedKVCache || row instanceof RotatingKVCache || row instanceof RotatingQuantizedKVCache)) continue;
       const spec = byLayer ? byLayer.get(layer) : { bits: kvBits!, groupSize };
       if (!spec) continue;
       cache[layer] = row instanceof RotatingKVCache || row instanceof RotatingQuantizedKVCache
-        ? new DelayedRotatingQuantizedKVCache(row.maxSize, spec.groupSize, spec.bits, start, row)
-        : new DelayedQuantizedKVCache(spec.groupSize, spec.bits, start, row);
+        ? new DelayedRotatingQuantizedKVCache(row.maxSize, spec.groupSize, spec.bits, start, kernels, row)
+        : new DelayedQuantizedKVCache(spec.groupSize, spec.bits, start, kernels, row);
     }
   };
   if (start > 0) maintain.prepareBatch = maintain.preparePrefill;

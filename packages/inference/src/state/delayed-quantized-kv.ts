@@ -7,10 +7,9 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { FullTransitioningKvRows } from "./full-transitioning-kv-rows";
 import { BatchedQuantizedKVCache } from "./batched-quantized-kv";
-import { KVCache } from "./kv";
+import { KVCache, type AffineKernelSet } from "./kv";
 import { QuantizedKVCache } from "./quantized-kv";
 import { convertToAffine, transitionDue } from "./bf16-first-kv";
-import { unfusedAffineKernels } from "./affine-attention";
 import { type AttentionRead, type Cache, type CommittedAttentionCache, type Mask, type KvAttentionState, type KvAttentionView } from "../contracts/mlx/cache";
 
 /** The bf16 source of a full-attention row: a `KVCache`, or a padded
@@ -21,11 +20,11 @@ function affineSource(row: Cache): KVCache | FullPrefillRow | undefined {
 
 /** The affine transition of `Bf16FirstQuantizedKVCache` over full-attention
  * rows: each row converts with its own `toQuantized` once it holds `start`
- * positions. */
-function settleAffineRows(rows: Cache[], groupSize: number, bits: number, start: number): void {
+ * positions, and attends with `kernelSet` after. */
+function settleAffineRows(rows: Cache[], groupSize: number, bits: number, start: number, kernelSet: AffineKernelSet): void {
   for (let index = 0; index < rows.length; index++) {
     const source = affineSource(rows[index]!);
-    if (source && transitionDue(source.offset, start)) rows[index] = convertToAffine<Cache>(source, groupSize, bits, start);
+    if (source && transitionDue(source.offset, start)) rows[index] = convertToAffine<Cache>(source, groupSize, bits, start, kernelSet);
   }
 }
 
@@ -36,21 +35,25 @@ function settleAffineRows(rows: Cache[], groupSize: number, bits: number, start:
  * their packed planes use the existing batched attention implementation. When
  * a row converts is described on `TransitioningKvRows`. The reads are the
  * graph's call today: this layout's mask before the append, then its attention
- * view. */
+ * view. Converted rows and the packed layout attend with `kernelSet`, taken
+ * when the layout is built; the rows a cohort extracts carry it into the
+ * layouts they join. */
 export class DelayedQuantizedKVCache extends FullTransitioningKvRows<BatchedQuantizedKVCache> implements KvAttentionState, CommittedAttentionCache {
-  constructor(readonly groupSize: number, readonly bits: number, readonly start: number, row?: Cache) {
+  constructor(readonly groupSize: number, readonly bits: number, readonly start: number,
+    /** The affine kernel set converted rows attend with, named by the
+     * composition (`unfusedAffineKernels`, `tiledCausalAffineKernels`). */
+    readonly kernelSet: AffineKernelSet, row?: Cache) {
     super({ signature: `kv:delayed-quant:${bits}:${groupSize}:${start}`, conversionOffset: start,
-      settle: rows => settleAffineRows(rows, groupSize, bits, start),
+      settle: rows => settleAffineRows(rows, groupSize, bits, start, kernelSet),
       keepsDenseReads: row => { const source = affineSource(row); return !source || !transitionDue(source.offset, start); },
       converted: row => row instanceof QuantizedKVCache,
-      // The delayed lego is not composed yet (B1): unfused, the uniform `--kv-quant N` composition.
-      makeLayout: () => new BatchedQuantizedKVCache(groupSize, bits, unfusedAffineKernels(bits, groupSize, Dtype.bfloat16)) }, row);
+      makeLayout: () => new BatchedQuantizedKVCache(groupSize, bits, kernelSet(bits, groupSize, Dtype.bfloat16)) }, row);
   }
   get attentionState(): KvAttentionState { return this; }
   captureDonorAttention() {
     return this.packed?.captureDonorAttention() ?? captureFullKvDonorAttention(this.rows, this.leftPad, this.offset);
   }
-  makeEmptyBatch(): DelayedQuantizedKVCache { return new DelayedQuantizedKVCache(this.groupSize, this.bits, this.start); }
+  makeEmptyBatch(): DelayedQuantizedKVCache { return new DelayedQuantizedKVCache(this.groupSize, this.bits, this.start, this.kernelSet); }
 
   appendDecode(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v, false); }
   appendWindow(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v, false); }

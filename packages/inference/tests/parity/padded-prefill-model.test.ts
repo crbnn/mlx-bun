@@ -83,7 +83,7 @@ test.skipIf(!artifact || !reportPath)("padded prompt batches and continuation ma
   const { createModel } = await import("@mlx-bun/inference/models");
   const { RotatingKVCache, SSMCache, BatchedSSMCache, BatchedKVCache, SpeculativeRotatingKVCache,
     BatchedRotatingCache, DelayedQuantizedKVCache, DelayedTurboQuantKVCache,
-    DelayedRotatingQuantizedKVCache, KVCache, turboQuantFusedDecode } = await import("@mlx-bun/inference/state");
+    DelayedRotatingQuantizedKVCache, KVCache, turboQuantFusedDecode, unfusedAffineKernels } = await import("@mlx-bun/inference/state");
   const { MlxArray } = await import("@mlx-bun/mlx/array");
   const { Dtype, clearCache, MLX_VERSION } = await import("@mlx-bun/mlx/ffi");
   expect(report.runtime).toBe(MLX_VERSION);
@@ -96,9 +96,9 @@ test.skipIf(!artifact || !reportPath)("padded prompt batches and continuation ma
       // conversion. Mixed-precision attention/state has its separate geometry
       // gate; the live model oracle here retains its plain KV representation.
       const caches=source.map(c=>c instanceof SSMCache ? new BatchedSSMCache() : c instanceof RotatingKVCache
-        ? speculativeRotatingLayout ? new SpeculativeRotatingKVCache(c.maxSize) : delayedRotatingLayout ? new DelayedRotatingQuantizedKVCache(c.maxSize,64,4,Infinity)
+        ? speculativeRotatingLayout ? new SpeculativeRotatingKVCache(c.maxSize) : delayedRotatingLayout ? new DelayedRotatingQuantizedKVCache(c.maxSize,64,4,Infinity,unfusedAffineKernels)
           : new BatchedRotatingCache(c.maxSize,Array(B).fill(0))
-          : delayedFullLayout === "affine" ? new DelayedQuantizedKVCache(64,4,Infinity)
+          : delayedFullLayout === "affine" ? new DelayedQuantizedKVCache(64,4,Infinity,unfusedAffineKernels)
           : delayedFullLayout === "turbo" ? new DelayedTurboQuantKVCache(8,3,Infinity,turboQuantFusedDecode(),(c as InstanceType<typeof KVCache>).turboQuantKernels) : new BatchedKVCache());
       for(const c of source)c.dispose();
       try {

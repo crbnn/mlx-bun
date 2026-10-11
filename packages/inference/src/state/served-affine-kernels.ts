@@ -10,7 +10,9 @@ import { tiledCausalAffineKernels, unfusedAffineKernels, type AffineKernels } fr
  * config`, OptiQ parity): tiled while the cache's own mask is causal, which
  * needs a configuration the tiled port takes; `quantizedSdpa` runs any other
  * configuration unfused, and so does the cache. Read where `kv-maintenance`
- * converts a cache and where `persistence` restores one.
+ * converts a cache, where `persistence` restores one and where the delayed row
+ * layouts are built (`kv-maintenance`'s `preparePrefill`, `prefillCacheLayout`),
+ * which pass it to the rows they convert.
  * E3 transition: E3 composes the set from the KV scheme at load and deletes
  * the flag; this read of it goes then. */
 export function servedAffineKernels(): (bits: number, groupSize: number, dtype: Dtype) => AffineKernels {

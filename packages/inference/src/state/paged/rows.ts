@@ -9,17 +9,30 @@ import { PagedKVCache, poolBlocksFor, type PagedQuantization } from "./cache";
 /** Block storage owns row membership; attention consumes the same gathered
  * K/V representation as the existing paged cache. No scheduler policy here.
  *
- * Reads: each row appends to its own blocks and reads with that row's
- * `PagedKVCache` read for the phase; the outputs join along the batch. A row
- * never sees another row's padding, so its output is what it would be alone.
- * The deprecated `updateAndFetch` instead joins several rows' gathered keys
- * left-padded for one fused SDPA under the padding mask. */
+ * Reads: fixed at construction by the pages' representation, as the graphs
+ * read these rows before the cache owned the read. Gathered bf16 pages (not
+ * `direct`, no `quantization`): each row appends to its own blocks, the rows'
+ * gathered keys and values join left-padded along the batch, and one fused
+ * SDPA attends under the padding mask of the append (`buildBatchedDecodeMask`),
+ * for decode and windows alike. Reading each row alone over its own length
+ * reduces in another order than this read over the padded length and differs
+ * in the last bits (up to 4e-3 on decode at head dim 512). Direct or affine
+ * pages: each row reads with its own `PagedKVCache` read for the phase and the
+ * outputs join along the batch. */
 export class PagedKvRows implements AttentionCache, BatchableCache {
   #rows: PagedKVCache[] = [];
   #rope?: MlxArray;
   #ropeOffset = -1;
+  readonly #decode: (keys: MlxArray, values: MlxArray) => AttentionRead;
+  readonly #window: (keys: MlxArray, values: MlxArray) => AttentionRead;
 
-  constructor(readonly capacityTokens: number, readonly blockSize: number, readonly direct = runtimeFlag("MLX_BUN_PAGED_ATTN", false), readonly quantization?: PagedQuantization) {}
+  constructor(readonly capacityTokens: number, readonly blockSize: number, readonly direct = runtimeFlag("MLX_BUN_PAGED_ATTN", false), readonly quantization?: PagedQuantization) {
+    const alone = direct || quantization !== undefined;
+    this.#decode = alone ? (keys, values) => this.#rowReads(keys, values, (row, k, v) => row.appendDecode(k, v))
+      : (keys, values) => this.#joinedRead(keys, values);
+    this.#window = alone ? (keys, values) => this.#rowReads(keys, values, (row, k, v) => row.appendWindow(k, v))
+      : (keys, values) => this.#joinedRead(keys, values);
+  }
   signature(): string { return "kv:paged-rows"; }
   get batchSize(): number { return this.#rows.length; }
   get offset(): number { return Math.max(0, ...this.#rows.map(row => row.offset)); }
@@ -60,11 +73,43 @@ export class PagedKvRows implements AttentionCache, BatchableCache {
   }
 
   appendDecode(keys: MlxArray, values: MlxArray): AttentionRead {
-    return this.#rowReads(keys, values, (row, k, v) => row.appendDecode(k, v));
+    return this.#decode(keys, values);
   }
 
   appendWindow(keys: MlxArray, values: MlxArray): AttentionRead {
-    return this.#rowReads(keys, values, (row, k, v) => row.appendWindow(k, v));
+    return this.#window(keys, values);
+  }
+
+  /** The graphs' read of gathered bf16 rows before the cache owned it: the
+   * padding mask of an `N`-position append built before it, each row's
+   * gathered keys and values joined left-padded along the batch, one fused
+   * SDPA. */
+  #joinedRead(keys: MlxArray, values: MlxArray): AttentionRead {
+    const N = keys.shape[2]!;
+    const mask = buildBatchedDecodeMask(this.batchSize, N, this.offset + N, this.leftPad, null);
+    let joined: [MlxArray, MlxArray];
+    try { joined = this.#joinRows(keys, values); } catch (error) { mask.dispose(); throw error; }
+    const [k, v] = joined;
+    return {
+      attend: (q, scale) => ops.sdpa(q, k, v, scale, "array", mask),
+      dispose() { k.dispose(); v.dispose(); mask.dispose(); },
+    };
+  }
+
+  /** Append each row's slice to its blocks, then join the rows' gathered keys
+   * and values left-padded to the longest row; the caller owns both. */
+  #joinRows(keys: MlxArray, values: MlxArray): [MlxArray, MlxArray] {
+    const fetched: Array<{ keys: MlxArray; values: MlxArray }> = [];
+    try {
+      for (const [row, storage] of this.#rows.entries()) {
+        using k = keys.slice([row, 0, 0, 0], [row + 1, ...keys.shape.slice(1)]);
+        using v = values.slice([row, 0, 0, 0], [row + 1, ...values.shape.slice(1)]);
+        const [nextK, nextV] = storage.appendAndGather(k, v);
+        fetched.push({ keys: nextK, values: nextV });
+      }
+      const result = mergeKVRows(fetched);
+      return [result.keys, result.values];
+    } finally { disposeResources(fetched.flatMap(row => [row.keys, row.values])); }
   }
 
   #rowReads(keys: MlxArray, values: MlxArray,
@@ -119,17 +164,7 @@ export class PagedKvRows implements AttentionCache, BatchableCache {
 
   updateAndFetch(keys: MlxArray, values: MlxArray): [MlxArray, MlxArray] {
     if (this.#rows.length === 1) return this.#rows[0]!.updateAndFetch(keys, values);
-    const fetched: Array<{ keys: MlxArray; values: MlxArray }> = [];
-    try {
-      for (const [row, storage] of this.#rows.entries()) {
-        using k = keys.slice([row, 0, 0, 0], [row + 1, ...keys.shape.slice(1)]);
-        using v = values.slice([row, 0, 0, 0], [row + 1, ...values.shape.slice(1)]);
-        const [nextK, nextV] = storage.updateAndFetch(k, v);
-        fetched.push({ keys: nextK, values: nextV });
-      }
-      const result = mergeKVRows(fetched);
-      return [result.keys, result.values];
-    } finally { disposeResources(fetched.flatMap(row => [row.keys, row.values])); }
+    return this.#joinRows(keys, values);
   }
   makeMask(tokens: number, window: number | null): Mask {
     if (this.attentionState && window === null) return { mode: tokens === 1 ? "" : "causal", arr: null };

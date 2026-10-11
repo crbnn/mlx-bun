@@ -76,8 +76,8 @@ const maintenanceOf = (scheme: Scheme, start: number) => createKvMaintenance(sch
 const plainOf = (scheme: Scheme): Cache => scheme.rotating ? new RotatingKVCache(W) : new KVCache(undefined, deferredTurboQuantKernels);
 const legoOf = (scheme: Scheme, start: number): AttentionCache => !scheme.bits
   ? new Bf16FirstTurboQuantKVCache(8, 3, start, turboQuantFusedDecode(), deferredTurboQuantKernels)
-  : scheme.rotating ? new Bf16FirstRotatingQuantizedKVCache(W, GROUP, scheme.bits, start)
-  : new Bf16FirstQuantizedKVCache(GROUP, scheme.bits, start);
+  : scheme.rotating ? new Bf16FirstRotatingQuantizedKVCache(W, GROUP, scheme.bits, start, unfusedAffineKernels)
+  : new Bf16FirstQuantizedKVCache(GROUP, scheme.bits, start, unfusedAffineKernels);
 /** Evaluate a cache's state, releasing the views a cache hands out fresh. */
 function materialize(cache: Cache): void {
   const state = cache.state();
@@ -249,8 +249,8 @@ function joiningRows(scheme: Scheme, start: number, lengths: readonly number[]):
 }
 const rowsOf = (scheme: Scheme, start: number): AttentionCache & Cache & { mergeRows(rows: readonly Cache[]): void } =>
   !scheme.bits ? new DelayedTurboQuantKVCache(8, 3, start, turboQuantFusedDecode(), deferredTurboQuantKernels)
-    : scheme.rotating ? new DelayedRotatingQuantizedKVCache(16, GROUP, scheme.bits, start)
-    : new DelayedQuantizedKVCache(GROUP, scheme.bits, start);
+    : scheme.rotating ? new DelayedRotatingQuantizedKVCache(16, GROUP, scheme.bits, start, unfusedAffineKernels)
+    : new DelayedQuantizedKVCache(GROUP, scheme.bits, start, unfusedAffineKernels);
 
 /** The graphs' call on a rows layout today: its mask before the append, then its
  * attention view (affine) or its deferred-V fetch and captured value transform

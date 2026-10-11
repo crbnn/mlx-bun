@@ -29,6 +29,7 @@ import type { RuntimeModel } from "../../src/models/factory";
 import { createRuntimeConfig, runtimeConfig, withRuntimeConfig } from "../../src/runtime/config";
 import { trainForward } from "../../src/scoring/full-sequence";
 import { evalPpl } from "../../src/scoring/perplexity";
+import { unfusedAffineKernels } from "../../src/state/affine-attention";
 import { DelayedRotatingQuantizedKVCache } from "../../src/state/delayed-rotating-quantized-kv";
 import { createKvMaintenance } from "../../src/state/kv-maintenance";
 import { KVCache } from "../../src/state/kv";
@@ -524,7 +525,7 @@ const DELAYED: { name: string; converted: string; delay(caches: Cache[]): void }
   { name: "delayed rotating affine4", converted: "kv:rotating-quant:4:64",
     delay(caches) {
       for (const [layer, cache] of caches.entries()) if (cache instanceof KVCache) {
-        caches[layer] = new DelayedRotatingQuantizedKVCache(512, 64, 4, DELAYED_START, new RotatingKVCache(512));
+        caches[layer] = new DelayedRotatingQuantizedKVCache(512, 64, 4, DELAYED_START, unfusedAffineKernels, new RotatingKVCache(512));
         cache.dispose();
       }
     } },

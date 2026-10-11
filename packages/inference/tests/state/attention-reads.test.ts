@@ -12,7 +12,7 @@ import type { AttentionCache, AttentionRead, Cache } from "../../src/contracts/m
 import { bidirMask } from "../../src/kernels/attention/masks";
 import { AttentionMasks } from "../../src/state/attention-read";
 import { BatchedKVCache } from "../../src/state/batched-kv";
-import { PaddedKVRows } from "../../src/state/batched-mask";
+import { PaddedKVRows, buildBatchedDecodeMask, mergeKVRows } from "../../src/state/batched-mask";
 import { BatchedRotatingCache } from "../../src/state/batched-rotating";
 import { KVCache } from "../../src/state/kv";
 import { PagedKVCache, type PagedQuantization } from "../../src/state/paged/cache";
@@ -286,19 +286,79 @@ for (const config of pagedConfigs) for (const lengths of [[29], [29, 41], [29, 4
     try {
       pair[0].mergeRows(a); pair[1].mergeRows(b);
       const B = lengths.length;
-      // Without an attention state, several rows today join left-padded for one
-      // SDPA; the new read keeps each row alone, as the attention-state path does.
-      const merged = !config.direct && !config.quantization && B > 1;
-      const label = `PagedKvRows ${config.name}[${lengths}]${merged ? " [divergent: old merged rows]" : ""}`;
+      // Without an attention state the rows join left-padded for one SDPA, as
+      // the old path did (B1f); with one, each row reads alone, as it did.
+      const label = `PagedKvRows ${config.name}[${lengths}]`;
       const long = compareSteps(label, pair, B, ["D", 37, "D"], oldPagedRead);
       const short = compareSteps(`${label}${config.direct ? " [divergent: old used the direct kernel]" : ""}`,
         pair, B, [3], oldPagedRead);
-      if (merged) expect(Math.max(...long, ...short)).toBeLessThan(0.05);
-      else {
-        expectAllZero(long);
-        if (config.direct) expect(short[0]!).toBeLessThan(0.05); else expectAllZero(short);
-      }
+      expectAllZero(long);
+      if (config.direct) expect(short[0]!).toBeLessThan(0.05); else expectAllZero(short);
     } finally { disposeResources([...pair, ...a, ...b]); }
+  });
+}
+
+/** The graphs' read of gathered bf16 paged rows before B1a, copied from the old
+ * `PagedKvRows` path at two or more rows: the padding mask of the append built
+ * from the rows' offsets before it (`makeMask`), each row's append and its
+ * keys and values gathered from the blocks to its offset (`updateAndFetch`),
+ * joined left-padded along the batch (`mergeKVRows`), one fused SDPA. */
+function oldJoinedPagedRead(rows: readonly PagedKVCache[], k: MlxArray, v: MlxArray, q: MlxArray): MlxArray {
+  const N = k.shape[2]!, width = Math.max(...rows.map(row => row.offset));
+  const mask = buildBatchedDecodeMask(rows.length, N, width + N, rows.map(row => width - row.offset), null);
+  const fetched: Array<{ keys: MlxArray; values: MlxArray }> = [];
+  try {
+    for (const [index, row] of rows.entries()) {
+      using kr = k.slice([index, 0, 0, 0], [index + 1, ...k.shape.slice(1)]);
+      using vr = v.slice([index, 0, 0, 0], [index + 1, ...v.shape.slice(1)]);
+      row.append(kr, vr);
+      const H = row.pool!.keys.shape[1]!, kD = row.pool!.headDim, vD = row.pool!.vHeadDim;
+      const [gk, gv] = row.pool!.gather(row.blockTable);
+      fetched.push({ keys: gk.slice([0, 0, 0, 0], [1, H, row.offset, kD]), values: gv.slice([0, 0, 0, 0], [1, H, row.offset, vD]) });
+      gk.dispose(); gv.dispose();
+    }
+    const joined = mergeKVRows(fetched);
+    try { return ops.sdpa(q, joined.keys, joined.values, SCALE, "array", mask); }
+    finally { joined.keys.dispose(); joined.values.dispose(); }
+  } finally { disposeResources(fetched.flatMap(row => [row.keys, row.values])); mask.dispose(); }
+}
+
+// B1f: gathered bf16 paged rows join for one SDPA, as the graphs read them
+// before the cache owned the read. Gemma 4's head dims (sliding 256, full 512,
+// one KV head on the 12B's full layers) included.
+for (const [d, hkv] of [[128, 2], [256, 2], [512, 2], [512, 1]] as const) for (const lengths of [[29, 41], [29, 41, 63, 87]]) {
+  test(`PagedKvRows bf16 at ${lengths.length} rows (offsets ${lengths.join(",")}, head dim ${d}, ${hkv} KV heads): the old joined-rows read`, () => {
+    const B = lengths.length;
+    const make = () => new PagedKVCache(1024, 16, false);
+    const reference: PagedKVCache[] = [], sources: PagedKVCache[] = [];
+    const rows = new PagedKvRows(1024, 16, false);
+    const pair = (shape: number[]): [MlxArray, MlxArray] => [tensor(shape), tensor(shape)];
+    try {
+      for (const length of lengths) {
+        const [k, v] = pair([1, hkv, length, d]);
+        try {
+          const [x, y] = [make(), make()];
+          for (const cache of [x, y]) for (const a of cache.updateAndFetch(k, v)) a.dispose();
+          reference.push(x); sources.push(y);
+        } finally { k.dispose(); v.dispose(); }
+      }
+      rows.mergeRows(sources);
+      const diffs: number[] = [];
+      for (const step of ["D", 37, "D", 3, "D", 8, 200, "D"] as const) {
+        const L = step === "D" ? 1 : step;
+        const [k, v] = pair([B, hkv, L, d]);
+        using q = tensor([B, HQ, L, d]);
+        try {
+          using expected = oldJoinedPagedRead(reference, k, v, q);
+          using actual = attendOnce(step === "D" ? rows.appendDecode(k, v) : rows.appendWindow(k, v), q);
+          const diff = maxDiff(actual, expected);
+          diffs.push(diff);
+          outcomes.push({ label: `PagedKvRows bf16 joined[${lengths}] d${d} hkv${hkv} ${step === "D" ? "decode" : `window ${L}`} @${rows.offset - L}`, diff });
+        } finally { k.dispose(); v.dispose(); }
+      }
+      expect(rows.rowOffsets).toEqual(reference.map(row => row.offset));
+      expectAllZero(diffs);
+    } finally { disposeResources([rows, ...reference, ...sources]); }
   });
 }
 
