@@ -297,7 +297,7 @@ export class FillSession {
       )
       : null;
     // Priority: determined before guessed, then anything the caller injected
-    // (the seam the spec lane's DraftSources would adapt onto — see
+    // (the seam the spec lane's draft rows would adapt onto — see
     // proposal.ts MIGRATION NOTE).
     this.#sources = [
       this.#strict,

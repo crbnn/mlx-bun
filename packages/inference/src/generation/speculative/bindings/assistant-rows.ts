@@ -3,7 +3,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { materializeCopy } from "@mlx-bun/mlx/materialize";
 import { disposeResources, applyStateChanges } from "../../../runtime/resources";
 import type { PreparedStateChange } from "../../../contracts/portable/resources";
-import type { AssistantRowsTarget, DraftPrefillGroup, DraftRowGroup, GroupedDraftProvider } from "../source";
+import { targetLacks, type AssistantRowsTarget, type DraftPrefillGroup, type DraftRowGroup, type GroupedDraftProvider, type TargetView } from "../source";
 import { DRAFT_CHECKPOINT_SCHEMA, type DraftRowCheckpoint } from "../../../contracts/mlx/draft-checkpoint";
 import type { AssistantDrafterModel } from "../../../contracts/mlx/drafter";
 import { widthClass } from "../../../contracts/mlx/width";
@@ -87,10 +87,16 @@ class AssistantRows implements DraftPrefillGroup, DraftRowGroup {
   dispose(): void { this.#hidden?.dispose(); this.#hidden=null; this.#processed=[]; }
 }
 
+/** A target without the donor port refuses the pairing before any row state exists. */
+function assistantTarget(target: TargetView): AssistantRowsTarget {
+  if (!target.assistantRows) throw targetLacks("assistantRows");
+  return target.assistantRows;
+}
+
 export function assistantGroups(drafter: AssistantDrafterModel, namespace: string): GroupedDraftProvider {
   return {
     checkpointNamespace: () => namespace,
-    openPrefill: ({target,checkpoints}) => new AssistantRows(target.assistantRows!,drafter,namespace,checkpoints),
-    open: ({target,checkpoints}) => new AssistantRows(target.assistantRows!,drafter,namespace,checkpoints),
+    openPrefill: ({target,checkpoints}) => new AssistantRows(assistantTarget(target),drafter,namespace,checkpoints),
+    open: ({target,checkpoints}) => new AssistantRows(assistantTarget(target),drafter,namespace,checkpoints),
   };
 }

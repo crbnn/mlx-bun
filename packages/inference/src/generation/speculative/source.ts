@@ -1,34 +1,20 @@
-// DraftSource — the seam between the serve-time speculative verify loop
-// (packages/inference/src/generation/speculative/run.ts) and whatever produces
-// draft tokens. Designed in `02d723a:docs/design/speculative-decoding.md` §1 so
-// every drafter shares ONE
-// verify/accept executor:
-//   - TwoModelSource (packages/inference/src/generation/speculative/sources/two-model.ts)
-//     — mlx-lm parity (L1 oracle:
-//     mlx_lm.server --draft-model), a full second model. Ignores `target`.
-//   - AssistantSource
-//     (packages/inference/src/generation/speculative/sources/assistant-source.ts)
-//     — the optiq KV-borrowing Gemma drafter (packages/inference/src/models/gemma4/assistant.ts; L2
-//     oracle: optiq spec_generate).
-//     Reads the target's donor K/V + anchor hidden each step.
-//   - DflashSource
-//     (packages/inference/src/generation/speculative/sources/dflash-source.ts)
-//     — DSpark (L3, KL/quality-gated).
-//     Taps the target's multi-layer hiddens (prefill + verify) into a growing
-//     H_ctx (`02d723a:docs/design/speculative-decoding.md` §4.1).
-//   - NgramSource
-//     (packages/inference/src/generation/speculative/sources/ngram-source.ts)
-//     — model-free prompt lookup.
-//   - Glm52NativeMtpSource
-//     (packages/inference/src/generation/speculative/sources/glm52-mtp-source.ts)
-//     — the target
-//     artifact's native Colibri MTP row.
-//
-// The sources differ ONLY in what fills the draft; the serve loop, admission
-// accounting, and stats never change. The KV-borrowing sources need target
-// state the two-model source doesn't — carried by the `target` view at open()
-// and the optional prefill/draft/commit arguments below (all no-ops for
-// two-model). See [[dspark-seam-kv-borrowing]].
+// The draft contract: a provider owns the draft machinery for the server's
+// lifetime and opens row groups that the speculative group (the one served
+// lane, `execution/speculative-group.ts`) drafts, verifies and commits through.
+// A single request is a group of one row. Every drafter shares that one
+// verify/accept executor (designed in `02d723a:docs/design/speculative-decoding.md`
+// §1); the providers differ only in what fills the draft:
+//   - TwoModelProvider — mlx-lm parity (L1 oracle: mlx_lm.server --draft-model),
+//     a full second model; reads no target port.
+//   - AssistantProvider — the optiq KV-borrowing Gemma drafter
+//     (models/gemma4/assistant.ts; L2 oracle: optiq spec_generate): reads the
+//     target's donor K/V and the true hidden at each row's anchor.
+//   - DflashProvider, Dflash2Provider, DeepspecProvider — block drafters over
+//     the target's tapped hidden layers, projected once into context rows.
+//   - QwenMtpProvider, Glm52NativeMtpProvider — multi-token-prediction heads.
+//   - NgramProvider — model-free prompt lookup.
+// KV-borrowing providers read target state through the `target` view their
+// rows open with (see [[dspark-seam-kv-borrowing]]).
 
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { PreparedStateChange } from "../../contracts/portable/resources";
@@ -36,82 +22,6 @@ import type { MlxDraftRows } from "./round";
 
 export { targetLacks, type AssistantRowsTarget, type HiddenLayerTapsTarget, type RecurrentMtpTarget, type TargetPort, type TargetView } from "../../contracts/mlx/draft-target";
 import type { TargetView } from "../../contracts/mlx/draft-target";
-
-/** A per-request draft-token producer. Created per generation (owns its own
- *  draft-side state), disposed by the serve loop's finally. */
-export interface DraftSource {
-  /** Method-owned companion state, independent of retention and storage.
-   * Capture returns owned immutable views. Restore borrows its attachment;
-   * the source retains the views it needs before returning. */
-  readonly checkpoint?: {
-    readonly namespace: string;
-    capture(processedTokens: number): import("../../contracts/mlx/checkpoint").CheckpointAttachment;
-    restore(processedTokens: number, attachment: import("../../contracts/mlx/checkpoint").CheckpointAttachment): void;
-  };
-  /** Target prefill shape required by this source's oracle. Most mlx-lm
-   *  sources leave the final prompt token pending; native Colibri MTP starts
-   *  from a full-prompt target forward. */
-  readonly prefillMode?: "tail-split" | "full";
-  /** This source can vary its requested draft depth between rounds without
-   * changing sampling semantics. Used by Qwen MTP for context-aware depth. */
-  readonly adaptiveDraftDepth?: boolean;
-
-  /** Multi-layer target tap the source needs captured on the target's prefill
-   *  AND every verify forward (DSpark's H_ctx; e4b {20,31,41,42}). When set,
-   *  the target binding captures them in those forwards and passes the
-   *  captured context [1,L,m*H] into prefill()/commit(). Undefined for sources
-   *  that don't tap (two-model, assistant). */
-  readonly tapLayers?: number[];
-
-  /** Process the prompt (two-model: prefill the draft model's cache;
-   *  assistant/dflash: read the target's state — mostly a no-op, but DSpark
-   *  seeds H_ctx from `ctxML`, the tapped prefill context [1,Lp,m*H], present
-   *  iff tapLayers is set). A composed prefill may supply its exact processed
-   *  token count, so a history source need not infer the target's boundary. */
-  prefill(promptIds: number[], ctxML?: MlxArray, processedTokens?: number): void | Promise<void>;
-
-  /** Propose 0..n tokens (RETURN LENGTH IS AUTHORITATIVE — a source may
-   *  return fewer than n, e.g. DSpark's confidence-scheduled draft-length
-   *  pruning; ZERO means "skip drafting this round" — DeepSpec ℓ=0 semantics,
-   *  the serve loop degenerates to one plain target step, still tapped +
-   *  committed for context-growing sources). The serve loop verifies over
-   *  exactly the returned length. `feed` is the token(s) the draft has not
-   *  yet consumed: [pending]
-   *  after a rejection/first round, or [lastDraft, bonus] after an all-accept
-   *  round (mlx-lm's re-feed rule, generate.py:645-648). `stepBase` is the
-   *  emitted-token index, threaded to the sampler for per-step RNG streams.
-   *  `anchorHidden` is the target's final hidden [1,1,H] at the pending/anchor
-   *  position — the assistant source borrows it for its first draft step;
-   *  two-model and dflash ignore it. */
-  draft(
-    feed: number[],
-    n: number,
-    stepBase: number,
-    anchorHidden?: MlxArray,
-  ): number[] | Promise<number[]>;
-
-  /** Verify outcome for the last round: kAccept of d accepted, where d is the
-   *  length draft() actually RETURNED (≤ n). Two-model: trim the draft cache
-   *  by max(d - kAccept - 1, 0) — mlx-lm's rewind rule (generate.py:589-591).
-   *  DSpark: grow H_ctx by the accepted window from `vCtxML`, the verified
-   *  window's tapped context [1,d+1,m*H] (present iff tapLayers is set), and
-   *  drop the rejected tips. Native GLM MTP receives the target's verified
-   *  hidden window [1,d+1,H] in `verifiedHidden` and the kAccept accepted token
-   *  ids in `acceptedTokens`; it uses them to rebuild accepted MTP KV rows
-   *  from target state rather than recursively drafted hidden state. */
-  commit(
-    d: number,
-    kAccept: number,
-    vCtxML?: MlxArray,
-    verifiedHidden?: MlxArray,
-    acceptedTokens?: readonly number[],
-  ): void | Promise<void>;
-
-  /** Resident per-request draft weights, for admission accounting (0 when the
-   *  provider owns the weights). */
-  readonly weightsBytes: number;
-  dispose(): void;
-}
 
 /** How a draft group's rows choose their tokens: each row's draw, and the
  *  selection the group resolved when it bound its requests. A drafter that
@@ -173,7 +83,10 @@ export interface DraftRowGroup extends MlxDraftRows {
  * state after at least one target token has been consumed for that row. */
 export interface DraftPrefillGroup {
   readonly namespace: string;
-  readonly prefillMode: NonNullable<DraftSource["prefillMode"]>;
+  /** Target prefill shape required by this provider's oracle. Most mlx-lm
+   *  providers leave the final prompt token pending (`tail-split`); the MTP
+   *  heads start from a full-prompt target forward. */
+  readonly prefillMode: "tail-split" | "full";
   readonly tapLayers: readonly number[];
   readonly rowCount: number;
   append(checkpoints: readonly (DraftRowCheckpoint | null)[]): void;
@@ -209,21 +122,13 @@ export interface GroupedDraftProvider {
     checkpoints: readonly DraftRowCheckpoint[] }): DraftRowGroup;
 }
 
-/** Server-lifetime owner of the draft machinery (the loaded draft model);
- * open() mints a per-request DraftSource; grouped opens shared row state. */
+/** Server-lifetime owner of the draft machinery (the loaded draft model). Its
+ * grouped rows are how every request drafts, one request or several. */
 export interface DraftProvider {
   /** Human-readable id (registry id / path tail) for logs + cache namespacing. */
   readonly id: string;
   readonly weightsBytes: number;
-  readonly grouped?: GroupedDraftProvider;
-  open(opts: {
-    /** The request's sampler over logprobs [1,V] → token array [1] (the SAME
-     *  sampler as the target — mlx-lm parity; greedy drafting under a
-     *  temperature>0 request is NOT parity). */
-    sampler: (logprobs: MlxArray, step: number) => MlxArray;
-    /** Bound target capabilities, with explicit donor-view ownership. */
-    target: TargetView;
-  }): DraftSource;
+  readonly grouped: GroupedDraftProvider;
   dispose(): void;
 }
 

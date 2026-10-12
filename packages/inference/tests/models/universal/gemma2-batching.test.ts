@@ -1333,7 +1333,7 @@ test.skipIf(!native || !artifact)("a structurally equivalent delegating provider
     /** The n-gram provider's operations behind a plain object: no class identity, same contracts. */
     const delegating = (): DraftProvider => {
       const inner = new NgramProvider(), grouped = inner.grouped;
-      return { id: "ngram-delegate", weightsBytes: 0, open: options => inner.open(options), dispose: () => inner.dispose(),
+      return { id: "ngram-delegate", weightsBytes: 0, dispose: () => inner.dispose(),
         grouped: { checkpointNamespace: () => grouped.checkpointNamespace!(), supportsTargetAdapters: grouped.supportsTargetAdapters,
           open: options => grouped.open(options), openPrefill: options => grouped.openPrefill(options) } };
     };

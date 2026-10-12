@@ -338,27 +338,15 @@ export async function loadContext(
 
     if (draft && validateDraft) {
       const { provider } = draft;
-      // Fail-fast pairing validation (2026-07-07 review): a source validates the
-      // (target, drafter) pairing in open() — a target that lacks the port it
-      // reads, DeepSpec target-layer-count mismatch — which used to surface as a
-      // 500 from inside specServeRun on EVERY text request. Probe-open once with
-      // throwaway caches here so a mismatch refuses at load; open() allocates no
-      // per-request tensors before prefill/draft, so this is free. The probe
-      // sampler is never called during open().
+      // Fail-fast pairing validation (2026-07-07 review): a provider's grouped
+      // rows validate the (target, drafter) pairing when they open — a target
+      // that lacks the port they read, a DeepSpec or DFlash 2 target-layer-count
+      // mismatch — so a mismatch refuses at load instead of failing every drafted
+      // request. Opening prefill rows with no members allocates no row tensors.
       {
         const probeCaches = model.makeCache();
         try {
-          const target = bindLegacyDraftTarget(model, probeCaches);
-          try {
-            provider
-              .open({ sampler: () => { throw new Error("probe sampler never samples"); }, target })
-              .dispose();
-          } catch (err) {
-            // A batched-lane-only provider (DFlash 2) has no per-request source;
-            // its grouped binding validates the pairing instead (no rows, no tensors).
-            if (!provider.grouped) throw err;
-            provider.grouped.openPrefill({ target, checkpoints: [] }).dispose();
-          }
+          provider.grouped.openPrefill({ target: bindLegacyDraftTarget(model, probeCaches), checkpoints: [] }).dispose();
         } catch (err) {
           release(provider);
           throw new Error(

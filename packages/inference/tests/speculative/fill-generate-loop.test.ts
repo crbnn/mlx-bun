@@ -23,8 +23,6 @@ import { stubPhases } from "../models/phase-forward";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { configureRuntime, runtimeConfig } from "../../src/runtime/config";
 import { cloneKvCaches } from "../../src/state/persistence";
-import { specServeRun } from "../../src/generation/speculative/run";
-import type { DraftProvider, DraftSource } from "../../src/generation/speculative/source";
 import { declareGraph } from "../../src/models/capabilities";
 
 const VOCAB = 128;
@@ -192,35 +190,6 @@ describe("generate(): cancellation", () => {
     await expect(run({ signal: abort.signal }, Infinity, model))
       .rejects.toHaveProperty("name", "AbortError");
     expect(model.forwards).toEqual([]);
-  });
-
-  test("speculative cancellation between target prefill chunks releases target and draft state", async () => {
-    const abort = new AbortController();
-    let cacheDisposals = 0;
-    let sourceDisposals = 0;
-    class OwnedCache extends KVCache {
-      override dispose(): void { cacheDisposals++; super.dispose(); }
-    }
-    class CancellingModel extends StubModel {
-      override forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray {
-        const hidden = super.forwardHidden(ids, cache);
-        abort.abort(new DOMException("cancelled during spec prefill", "AbortError"));
-        return hidden;
-      }
-    }
-    const model = new CancellingModel(SCRIPT, () => [new OwnedCache()]);
-    const source = {
-      prefill() { throw new Error("cancelled target must not start draft prefill"); },
-      dispose() { sourceDisposals++; },
-    } as unknown as DraftSource;
-    const provider = { open: () => source } as unknown as DraftProvider;
-    await expect(specServeRun(model as unknown as RuntimeModel, provider, 3,
-      Array.from({ length: 4098 }, () => 1), { temperature: 0, signal: abort.signal },
-      () => { throw new Error("cancelled prefill must not emit"); }))
-      .rejects.toHaveProperty("name", "AbortError");
-    expect(model.forwards).toHaveLength(1);
-    expect(cacheDisposals).toBe(1);
-    expect(sourceDisposals).toBe(1);
   });
 });
 

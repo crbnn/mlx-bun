@@ -9,15 +9,15 @@
 import type { RuntimeModel } from "@mlx-bun/inference/models";
 import type { ChatTemplate, ChatMessage, LoadedTokenizer } from "@mlx-bun/inference/input";
 import { bindMlxGateway } from "@mlx-bun/inference/execution";
-import { DflashSource, projectedDraftGroups, targetLacks, type DraftProvider, type DraftRowGroup, type DraftSource,
-  type GroupedDraftProvider, type TargetView } from "@mlx-bun/inference/generation/speculative";
+import { projectedDraftGroups, targetLacks, type DraftProvider, type DraftRowGroup,
+  type GroupedDraftProvider } from "@mlx-bun/inference/generation/speculative";
 import { loadDsparkDrafter, type DflashDrafter, type StsCalibration } from "@mlx-bun/inference/generation/speculative/loader";
 import { fitStsThresholds, type ConfSample } from "./sts";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 /** The drafter operations calibration drafts with. */
-type CalibrationDrafter = Pick<DflashDrafter, "cfg" | "forwardRows" | "projectContextRows" | "forwardInfer" | "dispose">;
+type CalibrationDrafter = Pick<DflashDrafter, "cfg" | "forwardRows" | "projectContextRows" | "dispose">;
 
 /** Rows that report, at each commit, every drafted position's confidence and
  *  whether the target accepted it. `confidence` is the last draft's, per row. */
@@ -71,33 +71,6 @@ export class CalibrationProvider implements DraftProvider {
       };
     });
     this.grouped = { ...groups, open: options => observedRows(groups.open(options), () => confidence, observe) };
-  }
-
-  open({ target }: { target: TargetView }): DraftSource {
-    let confidence: number[] = [];
-    const drafter = this.drafter;
-    const unpruned: Pick<DflashDrafter, "cfg" | "forwardInfer"> = {
-      cfg: { ...drafter.cfg, sts: undefined },
-      forwardInfer(model, hCtx, anchor, gamma, opts) {
-        const block = drafter.forwardInfer(model, hCtx, anchor, gamma, { ...opts, thresholds: [], minConf: undefined });
-        confidence = block.conf;
-        return block;
-      },
-    };
-    const inner = new DflashSource(unpruned, target);
-    const observe = this.observe;
-    return {
-      weightsBytes: 0,
-      tapLayers: inner.tapLayers,
-      prefill: (ids, context) => inner.prefill(ids, context),
-      draft: (...args) => inner.draft(...args),
-      commit(drafted, accepted, context) {
-        // `drafted` = positions this round verified; the first `accepted` matched.
-        observe(Array.from({ length: drafted }, (_, pos) => ({ pos, conf: confidence[pos]!, accepted: pos < accepted })));
-        return inner.commit(drafted, accepted, context);
-      },
-      dispose: () => inner.dispose(),
-    };
   }
 
   dispose(): void { this.drafter.dispose(); }

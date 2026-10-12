@@ -581,7 +581,7 @@ function twoModelDraft(): TwoModelProvider {
 /** The n-gram provider's operations behind a plain object: no class identity, same contracts. */
 function delegatingNgram(): DraftProvider {
   const inner = new NgramProvider(), grouped = inner.grouped;
-  return { id: "ngram-delegate", weightsBytes: 0, open: options => inner.open(options), dispose: () => inner.dispose(),
+  return { id: "ngram-delegate", weightsBytes: 0, dispose: () => inner.dispose(),
     grouped: { checkpointNamespace: () => grouped.checkpointNamespace!(), supportsTargetAdapters: grouped.supportsTargetAdapters,
       ...(grouped.targetTapLayers ? { targetTapLayers: target => grouped.targetTapLayers!(target) } : {}),
       open: options => grouped.open(options), openPrefill: options => grouped.openPrefill(options) } };

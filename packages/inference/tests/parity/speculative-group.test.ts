@@ -5,11 +5,9 @@
 // execution group, as the app composes them. Checked within this tree:
 // - placement: the configured provider/target/KV combination resolves to
 //   continuous speculation (a refusal fails with the plan's reasons);
-// - B1 equals the serial producer (`specServeRun`) in tokens and draft counts
-//   when that producer serves the settings (no per-layer KV, start 0, no custom
-//   window, whose wrap ends its speculation), or repeats exactly otherwise; B4
-//   cohorts (submitted under an admission hold, released together) prefill as
-//   one cohort, repeat exactly and run real rounds;
+// - B1 (one request is a batch of one) repeats exactly in tokens and draft
+//   counts; B4 cohorts (submitted under an admission hold, released together)
+//   prefill as one cohort, repeat exactly and run real rounds;
 // - retirement in a B4 cohort: a stop, a consumer failure and an abort at exact
 //   counts, no token published after retirement, a survivor to its budget, a
 //   drained group, and EOS on the first token; a late joiner with a longer prompt and a joiner
@@ -227,12 +225,10 @@ function watchPrefill(loaded: Loaded, outputs: number[][]) {
 
 const inputs = optIn(Bun.env);
 
-test.skipIf(!inputs)("grouped speculation: placement, the serial producer at B1, B4 rounds, retirement, joins and RAM prefix reuse", async () => {
-  const { specServeRun } = await import("@mlx-bun/inference/generation/speculative");
+test.skipIf(!inputs)("grouped speculation: placement, B1 repeats, B4 rounds, retirement, joins and RAM prefix reuse", async () => {
   const { PromptCache } = await import("@mlx-bun/inference/state");
   const { clearCache } = await import("@mlx-bun/mlx/ffi");
   const loaded = await load(inputs!);
-  const { model } = loaded;
   // Full-prefill providers feed the whole prompt; tail-split ones hold its last token for the first round.
   const prefillLength = (prompt: number[]) => prompt.length - (FULL_PREFILL.includes(inputs!.kind) ? 0 : 1);
   let provider: A;
@@ -243,11 +239,6 @@ test.skipIf(!inputs)("grouped speculation: placement, the serial producer at B1,
     const options: A = { temperature: 0, maxTokens: 24, eosTokenIds: [] };
     const prompt = [1, 2, 3, 4, 5, 6, 7];
     const reference: number[] = [];
-    // The serial producer serves uniform KV4/KV8 or TurboQuant from start 0 only,
-    // and stops speculating once a sliding ring wraps (the custom window does).
-    const old = inputs!.kv !== "config" && inputs!.start === 0 && inputs!.window === undefined
-      ? await specServeRun(model, provider, depth, prompt, options, token => { reference.push(token); }) : undefined;
-    clearCache();
     // Rows submitted under an admission hold, released together: one prefill cohort.
     const run = async (count: number) => {
       const group = groupOf({ held: true });
@@ -268,18 +259,12 @@ test.skipIf(!inputs)("grouped speculation: placement, the serial producer at B1,
         return { tokens, stats, maxRows };
       } finally { prefill.restore(); await group.close(); clearCache(); }
     };
+    // One request is a batch of one: it repeats exactly.
     const single = await run(1);
-    if (old) {
-      expect(single.tokens[0]).toEqual(reference);
-      expect(single.stats[0]!.generatedTokens).toBe(old.generatedTokens);
-      expect(single.stats[0]!.spec?.drafted).toBe(old.spec?.drafted);
-      expect(single.stats[0]!.spec?.accepted).toBe(old.spec?.accepted);
-    } else {
-      reference.push(...single.tokens[0]!);
-      const repeated = await run(1);
-      expect(repeated.tokens).toEqual(single.tokens);
-      expect(repeated.stats.map(stat => stat.spec)).toEqual(single.stats.map(stat => stat.spec));
-    }
+    reference.push(...single.tokens[0]!);
+    const repeated = await run(1);
+    expect(repeated.tokens).toEqual(single.tokens);
+    expect(repeated.stats.map(stat => stat.spec)).toEqual(single.stats.map(stat => stat.spec));
     const batch = await run(4), repeat = await run(4);
     expect(batch.maxRows).toBe(4);
     expect(repeat.maxRows).toBe(4);
