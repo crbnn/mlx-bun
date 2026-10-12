@@ -21,9 +21,9 @@ export function generationCheckpointKey(
   execution?: ResolvedExecution, bindingIdentity?: unknown,
 ): string {
   const policy = {
-    version: 4,
+    version: 5,
     execution: execution && { method: execution.method, mechanism: execution.mechanism,
-      pagedKv: execution.pagedKv, fill: execution.fill,
+      fill: execution.fill,
       compiledDecode: execution.compiledDecode, grammarJump: execution.grammarJump },
     bindingIdentity,
     stopSequences: options.stopSequences ?? [],

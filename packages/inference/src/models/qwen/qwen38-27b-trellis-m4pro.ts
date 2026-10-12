@@ -47,9 +47,10 @@
 //   - mixed groups of rows in one forward (mixed), each group on its own phase's operation for its width;
 //   - the scoring forward over a whole sequence (sequenceHidden, prefillTail's operation for its width);
 //   - mounted LoRA adapters when the composition mounts them: every operation then runs the generic blocks,
-//     whose QuantizedLinear projections apply them, and the Neural Engine operation is not built.
-// The loader refuses, from the declared capabilities and never by routing to another graph: adapter requests
-// when the composition mounts none (adapter-batch-unsupported) and paged KV (paged-kv-batch-unsupported).
+//     whose QuantizedLinear projections apply them, and the Neural Engine operation is not built;
+//   - paged KV (the paged legos' own reads in place of the plain full-attention storage).
+// The planner refuses, from the declared capabilities and never by routing to another graph, adapter requests
+// when the composition mounts none (adapter-batch-unsupported).
 // Bf16FirstKv4Head256Cache's row layouts read with its KV4 kernels while they hold one unpadded row and with the
 // composition's affine kernels while they hold more.
 

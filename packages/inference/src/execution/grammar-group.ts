@@ -49,8 +49,8 @@ class GrammarGroup implements MlxGroupedMethod {
   prepare(row: Row): MlxGroupPreparation {
     const options = row.req.method!.data as GenerateOptions;
     if (!row.req.grammar || options.logprobs || (options.topLogprobs ?? 0) > 0 ||
-        row.req.continuation || row.req.promptInput || options.pagedKv)
-      throw new Error("forced grammar span requires an ordinary grammar request without logprobs, media, paging, or continuation");
+        row.req.continuation || row.req.promptInput)
+      throw new Error("forced grammar span requires an ordinary grammar request without logprobs, media, or continuation");
     const sampling = makeStepSampler(options, { tokenRepresentation: "device", grammarWait: "external",
       historyUpdate: "manual", initialHistory: row.req.promptIds });
     this.#requests.set(row, { sampling, caches: [], pending: null });

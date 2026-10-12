@@ -139,7 +139,7 @@ test("closing the app drains borrowed execution before disposing the model", asy
   const events: string[] = [];
   const entered = Promise.withResolvers<void>(); const finish = Promise.withResolvers<void>();
   const host = ownModelContext(context(), [{ dispose() { events.push("model disposed"); } }]);
-  const execution = { method: "autoregressive", mechanism: "continuous", pagedKv: false,
+  const execution = { method: "autoregressive", mechanism: "continuous",
     promptCache: false, checkpoint: false, fill: false, compiledDecode: false,
     grammarJump: false, reasons: [] } as const;
   const supplied = { gateway: { runtime: runtimeConfig(), config: { eosTokenIds: [2] },

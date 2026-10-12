@@ -7,7 +7,7 @@ import { join } from "node:path";
 import type { ModelRecord } from "@mlx-bun/hub/registry";
 import { commandInvocation, parseCommand } from "../src/cli/args";
 import { resolveKvScheme } from "@mlx-bun/inference/state/kv-scheme";
-import { browserUrl, focusTabScript, installShutdownHandlers, openChatUi, parseServeOptions, probeServer, resolveServingLimits, runServe, validatePagedServingOptions, type ServeDependencies, type ServeOptions } from "../src/cli/serve";
+import { browserUrl, focusTabScript, installShutdownHandlers, openChatUi, parseServeOptions, probeServer, resolveServingLimits, runServe, type ServeDependencies, type ServeOptions } from "../src/cli/serve";
 import { decodeLaunch, encodeLaunch } from "../src/jobs/worker-process";
 
 const parse = (...args: string[]) => parseServeOptions(parseCommand("serve", args));
@@ -118,10 +118,8 @@ test("serving parses main's TurboQuant spec into the cache scheme, through the i
     ["turbo:k8v6", "vBits must be one of 2,3,4,5,8 (got 6)"], ["turbo:8", 'must look like "turbo:k<bits>v<bits>"'],
     ["turbo8", "--kv-quant expects off|config|4|8|turbo[:k<bits>v<bits>]"]] as const)
     expect(() => parse("--kv-quant", spec)).toThrow(message);
-  // Paging keeps refusing TurboQuant at startup.
-  const paged = parse("--paged-kv", "--kv-quant", "turbo");
-  expect(() => validatePagedServingOptions(paged.request.pagedKv, resolveKvScheme({ turboQuant: paged.cache.turboQuant }).storage, false))
-    .toThrow("per-layer and TurboQuant pages are not implemented");
+  // Paging is a KV flag the composition resolves with the scheme (the resolver refuses pages it cannot store).
+  expect(parse("--paged-kv", "--kv-quant", "turbo").cache).toMatchObject({ turboQuant: { kBits: 8, vBits: 3 }, pagedKv: {} });
 });
 
 test("invalid serving input fails before model selection", async () => {
@@ -584,7 +582,7 @@ test("startup wires the memory budget, runtime context, allocator limit, expert 
     mock.module(app + "src/server/generated-token-history.ts", () => ({ GeneratedTokenHistory: class { remember() {} } }));
     mock.module(app + "src/server/routes.ts", () => ({ createCompletionRoutes(_engine, options) {
       contextLimit = options.contextLimit; defaultAdapter = options.defaultAdapter;
-      assert.deepEqual(options.pagedKv, { blockSize: 128 });
+      assert.equal(options.pagedKv, undefined);
       return { handle: async () => null, invalidateLibrary() {} };
     } }));
     mock.module(app + "src/server/status-routes.ts", () => ({ createStatusRoutes(input) { statusBudget = input.memoryBudgetBytes; return { handle: async () => null }; } }));
@@ -600,7 +598,7 @@ test("startup wires the memory budget, runtime context, allocator limit, expert 
     assert.deepEqual(events, ["offload /unused", "activate /offload", "load wire=1 media=1", "mount my-lora /unused/adapters/my-lora", "allocator 8000000000"]);
     assert.equal(defaultAdapter, "my-lora");
     assert.deepEqual(loadOptions, { memoryBudgetBytes: 8e9, runtime: { batchSize: 2, maxGenerationTokens: 128, memoryBudgetBytes: 8e9, contextTokens: 4096, nativeDraft: false },
-      kv: { override: "off", fusedSdpa: true }, adapters: true, maxRows: 2, draftKind: "ngram", numDraftTokens: 4, ngramMax: 5, ngramMin: 2 });
+      kv: { override: "off", fusedSdpa: true }, adapters: true, maxRows: 2, pagedKv: { blockSize: 128 }, draftKind: "ngram", numDraftTokens: 4, ngramMax: 5, ngramMin: 2 });
     assert.equal(cacheOptions.allocatorLimitBytes, 8e9);
     assert.equal(statusBudget, 8e9);
     assert.equal(contextLimit, expected);
@@ -735,71 +733,15 @@ test("a draft model query resolves through model selection before startup and re
 });
 
 test("paged KV follows main's flag and env mirror, with the block size only alongside paging", () => {
-  expect(parse("--paged-kv").request.pagedKv).toEqual({});
-  expect(parse("--paged-kv", "--paged-kv-block-size", "512").request.pagedKv).toEqual({ blockSize: 512 });
-  expect(parse().request).not.toHaveProperty("pagedKv");
+  expect(parse("--paged-kv").cache.pagedKv).toEqual({});
+  expect(parse("--paged-kv", "--paged-kv-block-size", "512").cache.pagedKv).toEqual({ blockSize: 512 });
+  expect(parse().cache).not.toHaveProperty("pagedKv");
+  expect(parse("--paged-kv").request).not.toHaveProperty("pagedKv");
   expect(() => parse("--paged-kv-block-size", "512")).toThrow("--paged-kv-block-size requires --paged-kv");
   expect(() => parse("--paged-kv", "--paged-kv-block-size", "0")).toThrow();
   const restore = configureRuntime({ MLX_BUN_PAGED_KV: "1" });
-  try { expect(parse().request.pagedKv).toEqual({}); expect(parse("--paged-kv-block-size", "128").request.pagedKv).toEqual({ blockSize: 128 }); }
+  try { expect(parse().cache.pagedKv).toEqual({}); expect(parse("--paged-kv-block-size", "128").cache.pagedKv).toEqual({ blockSize: 128 }); }
   finally { restore(); }
-});
-
-test("paged startup validates the resolved KV codec and loaded draft, preserving explicit overrides", () => {
-  const config = [{ layerIdx: 0, bits: 4, groupSize: 64 }];
-  const validate = (input: Parameters<typeof resolveKvScheme>[0], hasDraft = false, paged = true) =>
-    validatePagedServingOptions(paged ? {} : undefined, resolveKvScheme(input).storage, hasDraft);
-  for (const override of ["off", 4, 8] as const)
-    expect(() => validate({ override, config })).not.toThrow();
-  // Config mode without a sidecar resolves to bf16, just as on main.
-  expect(() => validate({ override: "config", config: null })).not.toThrow();
-  expect(() => validate({ override: "config", config: [] })).not.toThrow();
-  expect(() => validate({ override: "config", config })).toThrow("per-layer and TurboQuant pages are not implemented");
-  expect(() => validate({ turboQuant: { kBits: 4, vBits: 3 } })).toThrow("per-layer and TurboQuant pages are not implemented");
-  expect(() => validate({ override: "off" }, true)).toThrow("cannot combine with --draft-model");
-  expect(() => validate({ override: "config", config }, true, false)).not.toThrow();
-  expect(() => validate({ turboQuant: { kBits: 4, vBits: 3 } }, true, false)).not.toThrow();
-});
-
-test("incompatible paged startup closes caches and the loaded model before engine or listener ownership", async () => {
-  // Keep native-free startup mocks private to this process.
-  const app = new URL("../", import.meta.url).pathname;
-  const script = `
-    import { mock } from "bun:test";
-    import { strict as assert } from "node:assert";
-    import { resolveKvScheme } from "@mlx-bun/inference/state/kv-scheme";
-    import { runtimeValue } from "@mlx-bun/inference/runtime/config";
-    const app = ${JSON.stringify(app)}, events = [];
-    const context = { modelId: "test", model: { config: { modelType: "gemma4" } },
-      template: {}, draft: null, dispose() { events.push("model close"); } };
-    let scheme;
-    mock.module(app + "src/engine/index.ts", () => ({
-      loadContext: async () => context,
-      modelServingBinding: async () => ({ gateway: { configureContinuation() { events.push("continuation"); } } }),
-      createCacheServices: async () => ({ resolvedKvScheme: scheme,
-        async close() { events.push("cache close"); return { durable: true }; } }),
-      createAppEngine: async () => { events.push("engine"); throw new Error("must not construct engine"); },
-    }));
-    mock.module(app + "src/web/assets.ts", () => ({ createWebHandler: async () => () => null }));
-    mock.module(app + "src/server/start.ts", () => ({ startServer() { events.push("listener"); throw new Error("must not bind"); } }));
-    const { parseServeOptions, startModelServer } = await import(app + "src/cli/serve.ts");
-    const options = parseServeOptions({ values: { "paged-kv": true, "force-wire": true, "in-process": true }, positionals: [] });
-    const beforeWire = runtimeValue("MLX_BUN_FORCE_WIRE");
-    for (const [input, draft, message] of [
-      [{ override: "config", config: [{ layerIdx: 0, bits: 4, groupSize: 64 }] }, null, /per-layer and TurboQuant/],
-      [{ turboQuant: { kBits: 4, vBits: 3 } }, null, /per-layer and TurboQuant/],
-      [{ override: "off" }, { provider: {}, numDraftTokens: 3 }, /cannot combine with --draft-model/],
-    ]) {
-      scheme = resolveKvScheme(input); context.draft = draft; events.length = 0;
-      await assert.rejects(startModelServer({ path: "/unused", repoId: "test" }, options), message);
-      assert.deepEqual(events, ["cache close", "model close"]);
-      assert.equal(runtimeValue("MLX_BUN_FORCE_WIRE"), beforeWire);
-    }
-  `;
-  const child = Bun.spawn([process.execPath, "--eval", script], { stdout: "pipe", stderr: "pipe", cwd: app,
-    env: { ...process.env, MLX_BUN_LIBMLXC: "/nonexistent" } });
-  const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
-  expect({ code, stdout, stderr }).toEqual({ code: 0, stdout: "", stderr: "" });
 });
 
 test("startup composes the lazy Whisper companion with the parsed policy, shares it with discovery, audio routes, and web chat, and closes it before the model", async () => {

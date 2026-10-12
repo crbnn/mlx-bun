@@ -114,6 +114,8 @@ export interface LoadContextOptions<Model extends ServedModelInfo = RuntimeModel
   /** The KV flags the composition's scheme resolves from (`--kv-quant`, its
    * TurboQuant spelling, `--quantized-kv-start`); absent means bf16. */
   kv?: CompositionRequest["kv"];
+  /** Paged KV (`--paged-kv`, `--paged-kv-block-size`); absent means unpaged. */
+  pagedKv?: CompositionRequest["pagedKv"];
   /** Adapters are mounted at load (`--adapter`). Default false. */
   adapters?: boolean;
   /** Most rows one forward carries (`--batch`). Default 8. */
@@ -205,7 +207,7 @@ export async function loadContext(
     return implementation.create({ modelDir, modelId, options }, config, profile);
   }
   const [{ Weights }, { createModel, declaredGraph, openPlannedRuntime, plansMemory, loadModelChatTemplate,
-      sentinelDeclarationFor, mediaTokenDeclarationFor, generationDefaultsFor, resolveComposition },
+      sentinelDeclarationFor, mediaTokenDeclarationFor, generationDefaultsFor, resolveComposition, assertComposedCaches },
     { loadTokenizer, resolveSentinelTokens, resolveVisionTokenIds, resolveAudioTokenIds },
     { AdapterManager }, { bindLegacyDraftTarget }, { defaultDraftProviders }] = await Promise.all([
     import("@mlx-bun/inference/artifacts"), import("@mlx-bun/inference/models"),
@@ -321,8 +323,10 @@ export async function loadContext(
     if (!draft && planned) draft = await declaredDraftHead();
     // Resolved once, before the resident graph is built, which receives it. A
     // planned runtime built its graph from its own memory plan above.
-    const composition = resolveComposition(config, { kv: opts.kv, adapters: opts.adapters, maxRows: opts.maxRows, aneBridge: opts.aneBridge,
+    const composition = resolveComposition(config, { kv: opts.kv, pagedKv: opts.pagedKv, adapters: opts.adapters, maxRows: opts.maxRows, aneBridge: opts.aneBridge,
       draft: draft && { numDraftTokens: draft.numDraftTokens, adaptive: opts.adaptiveDraftDepth } });
+    // A planned runtime built its graph and caches above: the record cannot change them.
+    if (planned) assertComposedCaches(model, composition);
     if (!planned) {
       model = createModel(weights!, config, composition, profile);
       if ("dispose" in model && typeof model.dispose === "function") owned.add(model);

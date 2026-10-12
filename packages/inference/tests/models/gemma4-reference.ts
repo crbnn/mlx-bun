@@ -601,7 +601,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    * every method is qualified over them. */
   get graphCapabilities(): GraphCapabilities {
     return declareGraph({
-      media: { input: "embeddings", video: false }, pagedAttention: true, hiddenLayerTaps: "hiddenTap" in this,
+      media: { input: "embeddings", video: false }, hiddenLayerTaps: "hiddenTap" in this,
       compiledDecode: this.config?.modelType?.startsWith("gemma4") === true && !this.config.text.enableMoeBlock,
       kv: { delayedAffine: "all" },
     });

@@ -203,13 +203,13 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly loraState = new LoraState();
   /** Layers whose attention reads plain keys and values: none; it attends the storage its caches hold. */
   readonly requiredDenseKvLayers: readonly number[] = Object.freeze([]);
-  /** Paged attention, prepared image/audio embeddings, layer taps for drafts,
-   * and a compiled decode step, except through experts: shapeless replay
+  /** Prepared image/audio embeddings, layer taps for drafts, and a compiled
+   * decode step, except through experts: shapeless replay
    * retraces their growing windows. Its caches convert delayed affine rows and
    * every method is qualified over them. */
   get graphCapabilities(): GraphCapabilities {
     return declareGraph({
-      media: { input: "embeddings", video: false }, pagedAttention: true, hiddenLayerTaps: true,
+      media: { input: "embeddings", video: false }, hiddenLayerTaps: true,
       compiledDecode: this.config?.modelType?.startsWith("gemma4") === true && !this.config.text.enableMoeBlock,
       kv: { delayedAffine: "all" },
     });

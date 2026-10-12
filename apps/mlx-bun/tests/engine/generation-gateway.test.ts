@@ -13,7 +13,7 @@ const shape = (): RequestShape => ({ hasVision: false, hasAdapters: false,
   hasRepetitionPenalty: false, userSeed: false,
   hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false });
 const execution: ResolvedExecution = { method: "autoregressive", mechanism: "continuous",
-  pagedKv: false, promptCache: true, checkpoint: false, fill: false,
+  promptCache: true, checkpoint: false, fill: false,
   compiledDecode: false, grammarJump: false, reasons: [] };
 const result = { promptTokens: 1, cachedTokens: 0, generatedTokens: 1,
   finishReason: "length" as const, prefillMs: 1, decodeMs: 1 };
@@ -284,8 +284,6 @@ test.skipIf(process.env.MLX_BUN_GEMMA2_NATIVE !== "1")("Gemma2 admits plain KV, 
     }
     for (const request of [{ hasDraft: true, wantsLogprobs: true }, { hasAdapters: true, hasDraft: true }])
       expect(gateway.place({ ...shape(), ...request })).toMatchObject({ mechanism: "continuous", execution: { method: "autoregressive" } });
-    expect(() => gateway.place({ ...shape(), hasAdapters: true }, { pagedKv: {} })).toThrow(UnsupportedExecutionError);
-    expect(() => gateway.place(shape(), { pagedKv: {} })).toThrow(UnsupportedExecutionError);
     const fill = { fill: { plan: { echo: null } } } as GenerateOptions;
     expect(gateway.place(shape(), fill)).toMatchObject({ mechanism: "continuous",
       execution: { method: "autoregressive", compiledDecode: false, fill: true, checkpoint: false } });
@@ -342,7 +340,7 @@ test.skipIf(process.env.MLX_BUN_GEMMA2_NATIVE !== "1")("Gemma2 places shared gen
     binding.configureContinuation!({ checkpointPersistence: {}, checkpoints: {}, checkpointEveryTokens: 4 } as never);
     for (const request of [{}, { userSeed: true, hasRepetitionPenalty: true }])
       expect(enabled!.place({ ...shape(), ...request })).toMatchObject({ mechanism: "continuous",
-        execution: { method: "autoregressive", promptCache: true, checkpoint: true, fill: false, pagedKv: false } });
+        execution: { method: "autoregressive", promptCache: true, checkpoint: true, fill: false } });
     expect(disabled!.place(shape()).execution.checkpoint).toBe(false);
     const fill = { fill: { plan: { echo: null } } } as GenerateOptions;
     for (const [request, options] of [[{ hasGrammar: true }, {}], [{ wantsLogprobs: true }, {}], [{}, fill]] as const)
@@ -350,7 +348,6 @@ test.skipIf(process.env.MLX_BUN_GEMMA2_NATIVE !== "1")("Gemma2 places shared gen
         execution: { checkpoint: false } });
     for (const request of [{ hasDraft: true }, { hasVision: true }])
       expect(() => enabled!.place({ ...shape(), ...request })).toThrow(UnsupportedExecutionError);
-    expect(() => enabled!.place(shape(), { pagedKv: {} })).toThrow(UnsupportedExecutionError);
     // A composed KV scheme the gateway was not configured to batch stays refused, checkpoints or not.
     for (const kv of [{ kind: "affine", bits: 4, groupSize: 64, kernels: "unfused" }, { kind: "turbo", kBits: 8, vBits: 3 }] as const) {
       const composed = bindMlxGateway(Object.assign(Object.create(UniversalDenseModel.prototype), { ...model, composition: { kv } }));

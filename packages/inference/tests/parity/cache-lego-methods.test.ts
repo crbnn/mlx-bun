@@ -101,7 +101,7 @@ async function loadTarget() {
 async function cachesOf(model: A, paged: boolean) {
   const { maybePageKv } = await import("../../src/state/request-policy");
   const caches = model.makeCache();
-  if (paged) maybePageKv(caches, model.composition?.kv ?? { kind: "bf16" }, { pagedKv: { blockSize: BLOCK } }, CAPACITY);
+  if (paged) maybePageKv(caches, model.composition?.kv ?? { kind: "bf16" }, { blockSize: BLOCK }, CAPACITY);
   return caches;
 }
 
@@ -202,7 +202,7 @@ test.skipIf(!target)("the speculative group with the assistant drafter over page
         const make = model.makeCache.bind(model);
         spyOn(model, "makeCache").mockImplementation(() => {
           const caches = make();
-          maybePageKv(caches, model.composition?.kv ?? { kind: "bf16" }, { pagedKv: { blockSize: BLOCK } }, CAPACITY);
+          maybePageKv(caches, model.composition?.kv ?? { kind: "bf16" }, { blockSize: BLOCK }, CAPACITY);
           return caches;
         });
       }

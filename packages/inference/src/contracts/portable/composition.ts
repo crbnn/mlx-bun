@@ -46,6 +46,11 @@ export interface Composition {
   readonly aneBridge: boolean;
   /** The storage and reads of every attention cache the graph's `makeCache` composes. */
   readonly kv: KvStorageScheme;
+  /** Full-attention keys and values held in pages of `blockSize` positions
+   * (`--paged-kv`), or null. Every request's state takes the paged lego in place
+   * of the plain full-attention storage the graph composes; its pages store
+   * what `kv` names. */
+  readonly pagedKv: { readonly blockSize: number } | null;
   readonly draftDepth: DraftDepth;
   /** The prefill chunk size, in prompt tokens, the composition is built for.
    * The prefill planner may hand the graph fewer rows than this as a prompt's
@@ -87,6 +92,7 @@ export interface Composition {
 /** The value of each composition fact a caller leaves unstated: what
  * `resolveComposition` resolves, and what a graph built without a record runs. */
 export const COMPOSITION_DEFAULTS = Object.freeze({
+  pagedKv: null,
   speculativeAffineKv: true,
   packedMixedMlp: true,
   vectorGreedySampling: true,

@@ -102,7 +102,7 @@ test.skipIf(!native || !modelDir)("Gemma2 plain-KV generation checkpoints surviv
         try {
           const placement = engine.gateway.place(requestShape, options());
           expect(placement.execution).toMatchObject({ method: "autoregressive", mechanism: "continuous",
-            promptCache: true, checkpoint: true, fill: false, pagedKv: false });
+            promptCache: true, checkpoint: true, fill: false });
           outcome = await engine.gateway.run(prompt, options(), token => {
             tokens.push(token);
             if (interrupt && tokens.length === interruptAt) abort.abort(new Error("interrupted by test"));

@@ -196,11 +196,10 @@ async function* generateInner(
       );
     // Replace fresh full-attention caches before any forward. The deepest
     // write is prompt + maxTokens - 1, so capacity covers every decode step.
-    maybePageKv(cache, kv, options, promptTokens.length + maxTokens);
+    maybePageKv(cache, kv, binding.pagedKv ?? null, promptTokens.length + maxTokens);
     // Committed known-token spans, where the graph declares them and the run
-    // mounts no adapter and pages nothing; otherwise known tokens append one
-    // position at a time.
-    appender = options.fill && binding.knownSpans && !options.adapters?.length && !options.pagedKv
+    // mounts no adapter; otherwise known tokens append one position at a time.
+    appender = options.fill && binding.knownSpans && !options.adapters?.length
       ? binding.knownSpans : null;
   } catch (error) {
     if (ownsCache) for (const state of cache) state.dispose();
@@ -564,9 +563,8 @@ async function* generateInner(
 
     // ---- decode (pipelined) ----
     // The compiled step is the graph binding's, chosen once for this run's caches; it has no fallback.
-    decoder = options.decodePolicy?.compiledDecode === false ? null : binding.createDecode?.({
-      hasAdapters: !!options.adapters?.length, pagedKv: !!options.pagedKv,
-    }, cache) ?? null;
+    decoder = options.decodePolicy?.compiledDecode === false ? null
+      : binding.createDecode?.({ hasAdapters: !!options.adapters?.length }, cache) ?? null;
     let stop = false;
     /** Token id read eagerly at the top of the loop for grammar (reused for
      *  the yield, avoiding a second readback). -1 when grammar is off — the

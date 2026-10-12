@@ -112,16 +112,15 @@ test("a graph that promises a compiled step and provides none is refused where i
   expect(compiledDecodeStepOf(graph({}).model)).toBeNull();
 });
 
-test("the autoregressive binding offers the declared step for a run whose caches it drives, unless adapters or paging rule replay out", () => {
+test("the autoregressive binding offers the declared step for a run whose caches it drives, unless adapters rule replay out", () => {
   const fixture = graph({ compiledDecode: true });
   const declared = countingStep(fixture);
   const binding = bindMlxAutoregressiveGraph({ ...fixture.model, compiledDecodeStep: () => declared.step });
   const caches = fixture.model.makeCache();
   try {
-    expect(binding.createDecode!({ hasAdapters: true, pagedKv: false }, caches)).toBeNull();
-    expect(binding.createDecode!({ hasAdapters: false, pagedKv: true }, caches)).toBeNull();
-    expect(binding.createDecode!({ hasAdapters: false, pagedKv: false }, unreplayable())).toBeNull();
-    const decoder = binding.createDecode!({ hasAdapters: false, pagedKv: false }, caches)!;
+    expect(binding.createDecode!({ hasAdapters: true }, caches)).toBeNull();
+    expect(binding.createDecode!({ hasAdapters: false }, unreplayable())).toBeNull();
+    const decoder = binding.createDecode!({ hasAdapters: false }, caches)!;
     try {
       using token = MlxArray.fromFloat32(new Float32Array([0]), [1]);
       const result = decoder.step(token, caches);
@@ -133,5 +132,5 @@ test("the autoregressive binding offers the declared step for a run whose caches
   } finally { for (const cache of caches) cache.dispose(); }
   // A graph declaring nothing has no decoder, whatever methods it carries.
   expect(bindMlxAutoregressiveGraph({ ...graph({}).model, compiledDecodeStep: () => declared.step })
-    .createDecode!({ hasAdapters: false, pagedKv: false }, caches)).toBeNull();
+    .createDecode!({ hasAdapters: false }, caches)).toBeNull();
 });

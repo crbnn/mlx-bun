@@ -164,7 +164,8 @@ class SpeculativeGroup implements MlxGroupedMethod {
         let appended = false;
         const previous = prefix?.rowCount ?? 0;
         try {
-          caches = method.binding.makeCache();
+          // The request's state (the composition's paging over the graph's caches), else the graph's caches.
+          caches = row.req.statePolicy?.create() ?? method.binding.makeCache();
           prefix ??= declaredTaps(method.provider, method.taps,
             method.provider.grouped!.openPrefill({ target: bindLegacyDraftTarget(method.model, caches), checkpoints: [] }));
           const prompt = row.req.promptIds;

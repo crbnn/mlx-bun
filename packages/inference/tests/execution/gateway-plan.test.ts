@@ -285,11 +285,6 @@ test("Gemma2 softcap selects committed grammar spans without changing the ordina
   expect(plan.reasons).not.toContain("grammar-jump-incompatible-with-request");
   expect(binding.methodRequest!(plan, {})!.key).toBe("grammar-forced-span");
   expect(refusals(plan)).toEqual([]);
-  // This preexisting paging admission limitation is not changed by adding a
-  // grammar method. Actual paged Gemma2 remains unqualified, including the
-  // separately tracked adapter-bypass request shape.
-  expect(binding.plan({ ...grammar, hasAdapters: true }, { pagedKv: {} }, schedule))
-    .toMatchObject({ mechanism: "unsupported", pagedKv: false, grammarJump: false });
   for (const request of [{ ...grammar, wantsLogprobs: true }, { ...grammar, hasVision: true }])
     expect(place(binding, request).grammarJump).toBe(false);
   // Once the gateway has certified the scheme, spans commit over TurboQuant,
@@ -331,7 +326,6 @@ describe("DiffusionGemma interleaved denoising binding", () => {
     [{ hasRepetitionPenalty: true }, {}, "repetition-penalty-method-unsupported", {}],
     [{ hasLogitsExtras: true }, {}, "logits-extras-method-unsupported", {}],
     [{}, { fill: { plan: {} } }, "fill-method-unsupported", {}],
-    [{}, { pagedKv: {} }, "paged-kv-batch-unsupported", {}],
     [{}, {}, "kv-scheme-batch-unsupported", AFFINE4],
     [{}, {}, "turbo-kv-batch-unsupported", TURBO],
   ] as const)("an unsupported denoising shape is refused before execution: %#", (extra, options, reason, kv: KvOptions) => {
@@ -617,10 +611,9 @@ test.each([["two-model", twoModelDraft, "gemma2-draft"], ["n-gram", () => new Ng
       expect(composed.methodRequest!(plan, supplied)).toBeUndefined();
     }
   }
-  // Drafted media and paging stay refused, including when fill is supplied.
+  // Drafted media stays refused, including when fill is supplied.
   for (const [request, options, expected] of [
     [{ ...draft, hasVision: true }, {}, ["media-batch-unsupported"]],
-    [draft, { pagedKv: {} }, ["paged-kv-batch-unsupported"]],
   ] as const) {
     for (const supplied of [options, { ...options, ...fillOptions(true) }]) {
       const plan = binding.plan(request, supplied as GenerateOptions, scheduling);
@@ -729,7 +722,6 @@ test.each([["two-model", twoModelDraft], ["n-gram", () => new NgramProvider()], 
   }
   for (const [extra, options, reason] of [
     [{ hasVision: true }, {}, "media-batch-unsupported"],
-    [{}, { pagedKv: {} }, "paged-kv-batch-unsupported"],
   ] as const) {
     const plan = binding.plan({ ...request, ...extra }, { ...options, adapters: ["upper"] } as GenerateOptions, scheduling);
     expect(plan.mechanism).toBe("unsupported");
@@ -877,8 +869,6 @@ test.each([["MiniCPM5", minicpm5], ["plain universal", universal]] as const)(
         }
         expect(binding.plan({ ...shape, hasDraft: true }, {}, scheduling).mechanism).toBe("unsupported");
         expect(binding.plan({ ...shape, hasAdapters: true, hasDraft: true },
-          { adapters: ["upper"], pagedKv: {} } as GenerateOptions, scheduling).mechanism).toBe("unsupported");
-        expect(binding.plan({ ...shape, hasAdapters: true, hasDraft: true },
           { adapters: ["upper"] }, { ...scheduling, quantizedBatch: false }).mechanism).toBe("unsupported");
       }
     }
@@ -908,7 +898,6 @@ test.each([["MiniCPM5", minicpm5], ["plain universal", universal]] as const)(
         expect(options.fill).toBe(fill);
         expect(fill.stats).toEqual(stats);
         expect(binding.plan(request, options, { ...scheduling, quantizedBatch: false }).mechanism).toBe("unsupported");
-        expect(binding.plan(request, { ...options, pagedKv: {} } as GenerateOptions, scheduling).mechanism).toBe("unsupported");
         expect(binding.plan({ ...request, hasVision: true }, options, scheduling).mechanism).toBe("unsupported");
       }
     }

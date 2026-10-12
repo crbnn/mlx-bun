@@ -1,4 +1,4 @@
-const execution = { method: "autoregressive", mechanism: "continuous" as const, pagedKv: false, promptCache: true, checkpoint: true, fill: false, compiledDecode: false, grammarJump: false, reasons: [] };
+const execution = { method: "autoregressive", mechanism: "continuous" as const, promptCache: true, checkpoint: true, fill: false, compiledDecode: false, grammarJump: false, reasons: [] };
 import { describe, expect, test } from "bun:test";
 import type { GenerateOptions, GenerateStats, TokenLogprobs } from "@mlx-bun/inference/generation";
 import {

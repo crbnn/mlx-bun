@@ -1,7 +1,7 @@
 import { speculativePrefixNamespace, captureSpeculativeOptions } from "../generation/speculative/cache-identity";
 import { createOrdinaryContinuationRequest } from "./continuation-request";
 import type { ContinuationServices } from "./continuation";
-import { bindPagedRequestState, pagedPrefixNamespace, type MlxRequestStatePolicy } from "../state/request-policy";
+import { bindRequestState, type MlxRequestStatePolicy } from "../state/request-policy";
 import type { ExecutionContext } from "../contracts/portable/scheduling";
 import type { ModelConfig } from "../artifacts/config";
 import type { KvScheme } from "../state/kv-scheme";
@@ -105,6 +105,8 @@ export function bindMlxGateway(model: MlxTokenGraph,
   // The composition facts this binding plans with: the graph's record, else the defaults.
   const facts = model.composition ?? COMPOSITION_DEFAULTS;
   const runtime = runtimeConfig();
+  // How every request holds its state: the composition's paging over the graph's caches.
+  const requestState = bindRequestState(model, kv, facts.pagedKv ?? null, runtime);
   let continuationServices: ContinuationServices | undefined;
   // The declarations are resolved once, when the graph is bound; planning reads
   // only these and the request.
@@ -186,27 +188,24 @@ export function bindMlxGateway(model: MlxTokenGraph,
       const services = continuationServices;
       if (!services?.checkpoints || !services.checkpointPersistence)
         throw new Error("qualified continuation requires bound persistence services");
-      // A checkpointed plan never pages: a media or adapter request that bypassed
-      // the server-wide paging flag runs without it.
-      const { pagedKv: _bypassed, ...scoped } = options;
-      return createOrdinaryContinuationRequest({ options: scoped, prompt, onToken, execution,
+      // Checkpoints are keyed in the request state's namespace, as its prefixes are.
+      return createOrdinaryContinuationRequest({ options, prompt, onToken, execution, stateNamespace: requestState.namespace,
         store: services.checkpoints, persistence: services.checkpointPersistence,
         // A restored entry takes the caches the graph composes.
         restore: entry => services.checkpoints!.restore(entry, model),
         interval: services.checkpointEveryTokens!, identity: services.identity });
     },
-    statePolicy: (execution, options, capacity) => {
-      // Media token IDs alone do not identify the prepared embeddings.
-      // Preserve the existing uncached media policy through the state port.
-      if (execution?.method === "autoregressive" && !execution.promptCache)
-        return { key: "uncached-prepared-input", create: () => model.makeCache() };
-      return execution?.pagedKv ? bindPagedRequestState(model, kv, options, capacity, continuationServices?.promptCache, runtime) : undefined;
-    },
-    prefixNamespace: (execution, options, adapters) => {
-      if (execution?.pagedKv) return pagedPrefixNamespace(kv, options, adapters, runtime.flag("MLX_BUN_PAGED_ATTN", false));
-      if (execution?.method !== "speculative") return adapters;
+    // Every request's state is the composition's (its paging over the graph's
+    // caches). Media token IDs alone do not identify the prepared embeddings,
+    // so an unidentified media prefix takes fresh state and reuses none.
+    statePolicy: (execution, _options, capacity) => requestState.policy(capacity, continuationServices?.promptCache,
+      execution?.method === "autoregressive" && !execution.promptCache),
+    // The method's namespace (the request's base, or the speculative group's over it) in the request state's.
+    prefixNamespace: (execution, options, base) => {
+      if (execution?.method !== "speculative") return requestState.namespace(base);
       const namespace = (execution.grammarJump ? grammarProvider : draft?.provider)?.grouped?.checkpointNamespace?.();
-      return namespace === undefined ? null : speculativePrefixNamespace(namespace, adapters, captureSpeculativeOptions(options));
+      return namespace === undefined ? null
+        : requestState.namespace(speculativePrefixNamespace(namespace, base, captureSpeculativeOptions(options)));
     },
     methodRequest: (execution, options) => execution?.method === "denoising" ? denoising?.(options)
       : execution?.method === "speculative"
@@ -254,7 +253,7 @@ export function bindMlxGateway(model: MlxTokenGraph,
         sharedCheckpoints: (!ordinaryOnly || ordinaryAffineRows || denseReads) && !!continuationServices?.checkpointPersistence &&
           (!request.hasDraft || ignoredDraft) && !request.hasVision && !request.hasGrammar &&
           !request.wantsLogprobs && !options.fill,
-        adapterBatch: caps.adapters.batched, pagedBatch: caps.pagedAttention,
+        adapterBatch: caps.adapters.batched,
         mediaBatch: !!mediaInput,
         mediaPrefixCache: runtime.flag("MLX_BUN_MEDIA_PREFIX_CACHE", true),
         groupedMethods: denoising ? ["denoising"] : sharedMethod ? ["autoregressive", "speculative"] : ["autoregressive"],
@@ -266,7 +265,7 @@ export function bindMlxGateway(model: MlxTokenGraph,
         // that append. Elsewhere spans serve only ordinary-only delayed affine
         // requests; other grammar requests keep verified proposals.
         sharedGrammarJump: !!grammarSpans && (denseReads || ordinaryOnly) && !request.hasVision &&
-          (!(affineKv || turboKv) || scheduling.quantizedBatch) && !options.pagedKv,
+          (!(affineKv || turboKv) || scheduling.quantizedBatch),
         // Fill needs a committed append declaring the scheme's formats; a graph
         // reading dense KV declares none for TurboQuant, so supplied fill decodes
         // ordinarily there.
@@ -290,7 +289,7 @@ export function bindMlxGateway(model: MlxTokenGraph,
             (kvStart === 0 || (scheduling.continuous && !!sharedMethod)))
         ),
       }, {
-        pagedKv: !!options.pagedKv, fill: !!options.fill,
+        fill: !!options.fill,
         compiledDecode: facts.compiledDecode, grammarJump: facts.grammarJump,
       });
     },

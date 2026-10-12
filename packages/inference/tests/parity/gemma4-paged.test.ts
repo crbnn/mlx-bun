@@ -1,7 +1,7 @@
 // Gemma4 paged KV through the shared execution group on real weights. Full
-// attention layers live in block pools (`--paged-kv`); requests enter through
-// the public gateway binding (plan, statePolicy, createBatchGroup), as the app
-// composes them. Two readers: the gathered arm (block gather into stock SDPA;
+// attention layers live in block pools (`--paged-kv`, the composition's paging);
+// requests enter through the public gateway binding (plan, statePolicy,
+// createBatchGroup), as the app composes them. Two readers: the gathered arm (block gather into stock SDPA;
 // for bf16 pages this is main's bit-exact contract against plain KV) and the
 // direct Metal reader (MLX_BUN_PAGED_ATTN=1, Lab numerics). Pages store bf16 or
 // affine KV4/KV8, encoded from their first token; sliding layers follow the
@@ -63,7 +63,7 @@ export function optIn(env: Record<string, string | undefined>) {
   if (!model.trim()) throw new Error(`${MODEL} is blank`);
   assert(existsSync(join(model, "config.json")), `${MODEL}: no config.json in ${model}`);
   const raw = JSON.parse(readFileSync(join(model, "config.json"), "utf8"));
-  assert(String(raw.model_type).startsWith("gemma4"), `paged KV binds Gemma4 graphs only, not ${raw.model_type}`);
+  assert(String(raw.model_type).startsWith("gemma4"), `this test's checks are written for Gemma4 graphs, not ${raw.model_type}`);
   const vocab = (raw.text_config ?? raw).vocab_size;
   assert(Number.isSafeInteger(vocab) && vocab > 4000, `${MODEL}: invalid vocab_size ${vocab}`);
   return { model, vocab: vocab as number };
@@ -147,13 +147,16 @@ test.skipIf(!inputs)("Gemma4 paged KV: gathered bf16 equals plain KV; direct rea
     // tiled-causal affine reads this test computed before E3, when its
     // environment left fused SDPA on (MLX_BUN_NO_FUSED_SDPA unset).
     const schemeFor = (encoding: Encoding) => encoding === "bf16" ? undefined : resolveKvScheme({ override: encoding, fusedSdpa: true });
-    const models = new Map<Encoding, A>();
-    const modelFor = (encoding: Encoding): A => {
-      let built = models.get(encoding);
+    // One graph per encoding and paging (block size, or null unpaged): the composition pages every request.
+    const models = new Map<string, A>();
+    const modelFor = (encoding: Encoding, blockSize: number | null = null): A => {
+      const key = `${encoding}:${blockSize}`;
+      let built = models.get(key);
       if (!built) {
         const scheme = schemeFor(encoding);
-        built = createModel(weights, config, resolveComposition(config, scheme ? { kv: { override: encoding as 4 | 8, fusedSdpa: true } } : {}));
-        models.set(encoding, built);
+        built = createModel(weights, config, resolveComposition(config, { ...(scheme ? { kv: { override: encoding as 4 | 8, fusedSdpa: true } } : {}),
+          ...(blockSize === null ? {} : { pagedKv: { blockSize } }) }));
+        models.set(key, built);
       }
       return built;
     };
@@ -190,16 +193,17 @@ test.skipIf(!inputs)("Gemma4 paged KV: gathered bf16 equals plain KV; direct rea
      * submit while admission is held, then release together (a real cohort). */
     const runGroup = async (setup: Setup, rows: RowSpec[], opts: RunOptions = {}) => {
       const runtime = runtimeFor(setup.reader);
-      const binding = withRuntimeConfig(runtime, () => bindMlxGateway(modelFor(setup.encoding)));
+      const binding = withRuntimeConfig(runtime, () => bindMlxGateway(modelFor(setup.encoding, setup.paged ? setup.blockSize : null)));
       const scheme = schemeFor(setup.encoding);
-      const options: A = setup.paged ? { pagedKv: { blockSize: setup.blockSize } } : {};
+      const options: A = {};
       const quantizedBatch = scheme ? binding.kvBatchable(scheme) : false;
       assert(!scheme || quantizedBatch, `${scheme?.label} must batch on this graph`);
       const plan = binding.plan({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
         hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false },
       options, { continuous: true, quantizedBatch, checkpoints: false });
       assert.equal(plan.mechanism, "continuous", `placement: ${plan.reasons.join(", ")}`);
-      assert.equal(plan.pagedKv, setup.paged);
+      // A paged composition gives every request the paged state; an unpaged one, the group's own caches.
+      assert.equal(binding.statePolicy!(plan, options, 1) !== undefined, setup.paged);
       if (opts.cache) binding.configureContinuation!({ promptCache: opts.cache, checkpoints: null, identity: "gemma4-paged",
         adapterNamespace: (adapters: string[]) => adapters.join(","), cloneState: (caches: Cache[]) => cloneKvCaches(caches) } as A);
       const policy = (prompt: number[]) => binding.statePolicy!(plan, options, prompt.length + TOKENS);

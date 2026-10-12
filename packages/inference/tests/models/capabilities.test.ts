@@ -17,11 +17,11 @@ const graph = (prototype: object, facts: object = {}) => declaredGraph(Object.as
 const plainCaps = declareGraph();
 
 describe("every graph declares its capabilities", () => {
-  test("Gemma4: paged attention, prepared image/audio embeddings, taps, compiled decode except through experts", () => {
+  test("Gemma4: prepared image/audio embeddings, taps, compiled decode except through experts", () => {
     // Taps are every phase's capture parameter, so the graph always declares them.
     const text = (enableMoeBlock: boolean, modelType = "gemma4") => ({ config: { modelType, text: { enableMoeBlock } } });
     expect(graph(Gemma4Model.prototype, text(false)).graphCapabilities).toEqual(declareGraph({
-      media: { input: "embeddings", video: false }, pagedAttention: true, hiddenLayerTaps: true, compiledDecode: true,
+      media: { input: "embeddings", video: false }, hiddenLayerTaps: true, compiledDecode: true,
       kv: { delayedAffine: "all" } }));
     expect(graph(Gemma4Model.prototype, text(true)).graphCapabilities.compiledDecode).toBe(false);
     expect(graph(Gemma4Model.prototype, text(false, "gemma3n")).graphCapabilities.compiledDecode).toBe(false);

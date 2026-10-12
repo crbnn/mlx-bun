@@ -15,7 +15,7 @@ export interface GenerationPlacement {
 const sharedExecutionExclusions = new Set<ExecutionReason>([
   "continuous-unavailable", "media-batch-unsupported", "adapter-batch-unsupported",
   "kv-scheme-batch-unsupported", "turbo-kv-batch-unsupported", "grammar-batch-unsupported",
-  "paged-kv-batch-unsupported", "method-batch-unsupported",
+  "method-batch-unsupported",
 ]);
 
 /** A migrated request shape whose shared executor is not available yet. The

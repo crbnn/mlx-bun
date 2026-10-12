@@ -28,7 +28,7 @@ afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 test("the default record: this machine, bf16, no drafter, the 2048-token chunk, no adapters, eight rows", () => {
   const composition = resolveComposition(config);
-  expect(composition).toEqual({ device: deviceArchitecture(), aneBridge: true, kv: { kind: "bf16" },
+  expect(composition).toEqual({ device: deviceArchitecture(), aneBridge: true, kv: { kind: "bf16" }, pagedKv: null,
     draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 8, speculativeAffineKv: true, packedMixedMlp: true,
     vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
     grammarJump: false });
@@ -146,4 +146,32 @@ test("openModel, the convenience load, takes the same record and the same defaul
   try { expect(given.composition).toBe(chosen); } finally { given.weights.dispose(); }
   const defaulted = await openModel(dir, { implementations: registry });
   try { expect(defaulted.composition).toEqual(resolveComposition(config)); } finally { defaulted.weights.dispose(); }
+});
+
+test("paging is a composition fact: bf16 and uniform 4- or 8-bit pages, the block size given or 256", () => {
+  expect(resolveComposition(config).pagedKv).toBeNull();
+  expect(resolveComposition(config, { pagedKv: {} }).pagedKv).toEqual({ blockSize: 256 });
+  expect(resolveComposition(config, { pagedKv: { blockSize: 16 }, kv: { override: 8 } })).toMatchObject({
+    pagedKv: { blockSize: 16 }, kv: { kind: "affine", bits: 8 } });
+  expect(() => resolveComposition(config, { pagedKv: { blockSize: 0 } })).toThrow("composition paged KV block size must be a positive integer");
+  // The paged lego has no per-layer, other-width or TurboQuant pages yet: such a composition cannot be built as named.
+  const listed = { ...config, kvQuant: [{ layerIdx: 0, bits: 4, groupSize: 64 }] };
+  for (const kv of [{ override: "config" as const }, { turboQuant: { kBits: 8, vBits: 3 } }, { override: 3 }]) {
+    expect(resolveComposition(listed, { kv }).kv.kind).not.toBe("bf16");
+    expect(() => resolveComposition(listed, { kv, pagedKv: {} })).toThrow("per-layer and TurboQuant pages are not implemented");
+  }
+});
+
+test("a graph that carries no composition record composes its own caches: a KV scheme or paging for it is refused", () => {
+  let released = 0;
+  const registry = new ModelImplementationRegistry<Weights, { weights: Weights; dispose(): void }>([{
+    id: "qwen3", graph: "qwen3", loader: "safetensors", loop: "autoregressive",
+    create: weights => ({ weights, dispose() { released++; } }),
+  }]);
+  const profile = resolveModelProfile(config);
+  expect(() => createModel({} as Weights, config, resolveComposition(config), profile, registry)).not.toThrow();
+  for (const request of [{ kv: { override: 4 as const } }, { pagedKv: {} }])
+    expect(() => createModel({} as Weights, config, resolveComposition(config, request), profile, registry))
+      .toThrow("this graph composes its own caches");
+  expect(released).toBe(2);
 });

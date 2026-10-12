@@ -6,6 +6,8 @@ import type { ModelConfig, TurboQuantScheme } from "../artifacts/config";
 import { COMPOSITION_DEFAULTS, type Composition } from "../contracts/portable/composition";
 import { runtimeConfig, type RuntimeConfig } from "../runtime/config";
 import { resolveKvScheme, type KvQuantOverride } from "../state/kv-scheme";
+import { PagedKVCache } from "../state/paged/cache";
+import { pagesStore } from "../state/request-policy";
 
 /** Rows per forward when the caller states no cap (the app's `--batch` default). */
 export const DEFAULT_MAX_ROWS = 8;
@@ -35,6 +37,10 @@ export interface CompositionRequest {
     readonly quantizedKvStart?: number;
     readonly fusedSdpa?: boolean;
   };
+  /** Paged KV (`--paged-kv`): full-attention storage in pages of `blockSize`
+   * positions (default 256). Absent or null: unpaged. Pages store bf16 or a
+   * uniform 4- or 8-bit affine scheme; another scheme with paging is refused. */
+  readonly pagedKv?: { readonly blockSize?: number } | null;
   /** The loaded drafter's tokens per round, and whether the scheduler adapts
    * each round's count up to it. Absent or null: no drafter. */
   readonly draft?: { readonly numDraftTokens: number; readonly adaptive?: boolean } | null;
@@ -76,11 +82,18 @@ export function resolveComposition(config: ModelConfig, request: CompositionRequ
   const mixedTokenBudget = request.mixedTokenBudget ?? COMPOSITION_DEFAULTS.mixedTokenBudget;
   if (!Number.isSafeInteger(mixedTokenBudget) || mixedTokenBudget < 1)
     throw new Error("composition mixedTokenBudget must be a positive integer");
+  const kv = resolveKvScheme({ ...request.kv, config: config.kvQuant }).storage;
+  const pagedKv = request.pagedKv ? Object.freeze({ blockSize: request.pagedKv.blockSize ?? PagedKVCache.DEFAULT_BLOCK_SIZE }) : null;
+  if (pagedKv && (!Number.isSafeInteger(pagedKv.blockSize) || pagedKv.blockSize < 1))
+    throw new Error("composition paged KV block size must be a positive integer");
+  if (pagedKv && !pagesStore(kv))
+    throw new Error("paged KV stores bf16 or uniform 4- or 8-bit affine pages; per-layer and TurboQuant pages are not implemented");
   const runtime = runtimeConfig();
   return Object.freeze({
     device: deviceArchitecture(),
     aneBridge: request.aneBridge ?? true,
-    kv: resolveKvScheme({ ...request.kv, config: config.kvQuant }).storage,
+    kv,
+    pagedKv,
     draftDepth: !draft ? 0 : draft.adaptive ? Object.freeze({ adaptive: true as const, max: draft.numDraftTokens }) : draft.numDraftTokens,
     prefillChunkTokens: resolveChunkTokens(runtime),
     adapters: request.adapters ?? false,
@@ -94,4 +107,16 @@ export function resolveComposition(config: ModelConfig, request: CompositionRequ
     prefillTailSplit: request.prefillTailSplit ?? COMPOSITION_DEFAULTS.prefillTailSplit,
     grammarJump: request.grammarJump ?? COMPOSITION_DEFAULTS.grammarJump,
   });
+}
+
+/** Refuse `composition` for a graph that carries no composition record: such a
+ * graph composes its own caches (DiffusionGemma's denoising state, GLM-5.2's
+ * compressed MLA), and no lego of a quantized or paged KV scheme exists for
+ * them yet, so the record could not be served as named. Serving it as bf16
+ * would report an option as implemented when it is not. */
+export function assertComposedCaches(model: object, composition: Composition): void {
+  if ((model as { composition?: Composition }).composition) return;
+  if (composition.kv.kind === "bf16" && !composition.pagedKv) return;
+  const named = composition.pagedKv ? "paged KV" : `${composition.kv.kind} KV`;
+  throw new Error(`this graph composes its own caches, which have no ${named} form yet (--kv-quant, --paged-kv)`);
 }

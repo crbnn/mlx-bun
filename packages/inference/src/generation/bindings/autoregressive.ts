@@ -52,6 +52,8 @@ export interface MlxAutoregressiveBinding {
   readonly adapters?: { active: string[] };
   /** The composition's KV scheme, which `makeCache` composes; absent: bf16. */
   readonly kv?: KvStorageScheme;
+  /** The composition's paging (`pagedKv`); absent: none. */
+  readonly pagedKv?: { readonly blockSize: number } | null;
   /** The composition's `prefillTailSplit`; absent: the default. */
   readonly prefillTailSplit?: boolean;
   /** The composition's `grammarJump`; absent: the default. */
@@ -69,7 +71,7 @@ export interface MlxAutoregressiveBinding {
    * every cache is one the step drives. A compiled/fused decoder belongs to
    * THIS graph, never to a model inferred from a name or inherited by a
    * replacement. */
-  createDecode?(policy: { hasAdapters: boolean; pagedKv: boolean }, state: readonly Cache[]): MlxDecodeStep | null;
+  createDecode?(policy: { hasAdapters: boolean }, state: readonly Cache[]): MlxDecodeStep | null;
 }
 
 /** Bind a resident graph to the autoregressive method: its phases, caches and
@@ -89,14 +91,14 @@ export function bindMlxAutoregressiveGraph(model: MlxTokenGraph): MlxAutoregress
     memory: model,
     adapters: model.loraState,
     ...(model.composition ? { kv: model.composition.kv } : {}),
-    prefillTailSplit: facts.prefillTailSplit, grammarJump: facts.grammarJump,
+    pagedKv: facts.pagedKv ?? null, prefillTailSplit: facts.prefillTailSplit, grammarJump: facts.grammarJump,
     ...(model.knownSpans ? { knownSpans: model.knownSpans } : {}),
     makeCache: model.makeCache.bind(model),
     prefillEmbeddings: model.prefillEmbeddings?.bind(model),
     createDecode(policy, state) {
       // Only a graph that declares a compiled step has one. Adapters would bake
       // residuals into the tape.
-      if (!compiledOn || policy.hasAdapters || policy.pagedKv ||
+      if (!compiledOn || policy.hasAdapters ||
           !state.every(cache => isCompiledDecodeCache(cache) && !isRowBatchCache(cache))) return null;
       const compiled: MlxCompiledDecodeStep | null = compiledDecodeStepOf(model);
       if (!compiled) return null;

@@ -252,10 +252,11 @@ export class GenerationGateway implements CompletionEngine {
       try {
         const adapters = options.adapters?.length
           ? this.opts.adapterNamespace?.(options.adapters) ?? JSON.stringify(options.adapters) : "";
-        const baseNamespace = this.#binding.prefixNamespace?.(placement.execution, options, adapters) ??
-          (placement.execution?.method === "speculative" ? null : adapters);
-        const namespace = baseNamespace !== null && vision?.prefixIdentity
-          ? JSON.stringify(["prepared-prefix-v1", vision.prefixIdentity, baseNamespace]) : baseNamespace;
+        // A prepared media prefix is identified within the request's own namespace, which the
+        // binding places in its method's and its request state's (the rows' cache namespace, below).
+        const base = vision?.prefixIdentity ? JSON.stringify(["prepared-prefix-v1", vision.prefixIdentity, adapters]) : adapters;
+        const namespace = this.#binding.prefixNamespace?.(placement.execution, options, base) ??
+          (placement.execution?.method === "speculative" ? null : base);
         if ((!vision || placement.execution?.promptCache) && namespace !== null) {
           const closePrefetch = this.opts.promptCache?.prefetch ? trace?.begin("cache.prefetch") : undefined;
           try { releasePrefix = await this.opts.promptCache?.prefetch?.(promptIds, namespace, options.cacheSessionId); }

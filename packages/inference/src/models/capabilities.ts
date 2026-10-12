@@ -11,11 +11,11 @@ type Declaration = Partial<Omit<GraphCapabilities, "adapters" | "kv" | "prefill"
 
 /** Build a graph's declaration from the defaults an ordinary autoregressive
  * graph has (batched and mountable adapters, verification qualified for every
- * request shape, no media, no paging, no compiled step, no delayed affine KV, unbounded prefill chunks)
+ * request shape, no media, no compiled step, no delayed affine KV, unbounded prefill chunks)
  * and what the graph does differently. */
 export function declareGraph(declared: Declaration = {}): GraphCapabilities {
   return Object.freeze({
-    method: "autoregressive", media: null, pagedAttention: false, compiledDecode: false,
+    method: "autoregressive", media: null, compiledDecode: false,
     sparseAttention: false, embeddings: false, hiddenLayerTaps: false, nativeDraft: null,
     ...declared,
     adapters: Object.freeze({ batched: true, mountable: true, ...declared.adapters }),

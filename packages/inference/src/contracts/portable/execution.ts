@@ -30,7 +30,6 @@ export interface ExecutionCapabilities {
   /** Prepared media can enter the ordinary shared execution group. */
   readonly mediaBatch?: boolean;
   readonly mediaPrefixCache?: boolean;
-  readonly pagedBatch?: boolean;
   readonly checkpoints: boolean;
   /** Bound ordinary driver can restore/capture this request configuration. */
   readonly sharedCheckpoints?: boolean;
@@ -56,7 +55,6 @@ export interface ExecutionCapabilities {
 }
 
 export interface ExecutionFeatures {
-  readonly pagedKv: boolean;
   readonly fill: boolean;
   readonly compiledDecode?: boolean;
   readonly grammarJump?: boolean;
@@ -68,10 +66,10 @@ export interface ExecutionFeatures {
 export type ExecutionReason =
   | "continuous-unavailable" | "media-batch-unsupported" | "adapter-batch-unsupported"
   | "kv-scheme-batch-unsupported" | "turbo-kv-batch-unsupported" | "grammar-batch-unsupported"
-  | "paged-kv-batch-unsupported" | "method-batch-unsupported"
+  | "method-batch-unsupported"
   | "draft-method-unsupported" | "logprobs-method-unsupported" | "repetition-penalty-method-unsupported"
   | "logits-extras-method-unsupported" | "fill-method-unsupported"
-  | "draft-incompatible-with-request" | "paged-kv-bypassed-for-media-or-adapters"
+  | "draft-incompatible-with-request"
   | "fill-incompatible-with-request" | "compiled-decode-unavailable-for-request"
   | "grammar-jump-incompatible-with-request";
 
@@ -82,7 +80,6 @@ export interface ResolvedExecution {
   readonly method: string;
   /** `unsupported`: no shared executor serves this request; `reasons` names why. */
   readonly mechanism: "continuous" | "unsupported";
-  readonly pagedKv: boolean;
   readonly promptCache: boolean;
   readonly checkpoint: boolean;
   readonly fill: boolean;

@@ -39,7 +39,6 @@ export interface RequestPrepOptions {
   defaultTopP?: number;
   defaultTopK?: number;
   hlg?: HlgConfig;
-  pagedKv?: { blockSize?: number };
 }
 
 export function createRequestPrep(input: {
@@ -123,9 +122,6 @@ export function createRequestPrep(input: {
       // decode layer below and halts the loop via onToken → false.
       stopSequences: (typeof req.stop === "string" ? [req.stop] : req.stop ?? [])
         .filter((s) => typeof s === "string" && s.length > 0),
-      // Cache layout is supplied by the application; the execution binding
-      // validates whether the selected method can consume it.
-      ...(serverOptions.pagedKv ? { pagedKv: serverOptions.pagedKv } : {}),
     };
   };
 

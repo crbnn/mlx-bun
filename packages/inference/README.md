@@ -22,8 +22,8 @@ targets; prompt preparation accepts encoder interfaces. Callers can supply their
 own implementations without subclassing a concrete model or cache.
 
 Each graph declares what it can do (`GraphCapabilities`, portable; a model exposes
-it as `graphCapabilities`): its method, batched adapters, media input, paged
-attention, compiled decode, hidden-layer taps for drafts, a draft head its
+it as `graphCapabilities`): its method, batched adapters, media input, compiled
+decode, hidden-layer taps for drafts, a draft head its
 checkpoint carries (`nativeDraft`), which delayed affine KV levels its attention is
 qualified for, dense reads, whether long prompts prefill in workspace-bounded
 chunks, and what its verifier qualifies (adapters, logprobs, affine and TurboQuant
@@ -460,16 +460,14 @@ adapter identity and unmount restoration. Separate candidate B2/B4 tests without
 a configured draft passed joins, cancellation, queued adapter/base isolation
 and reuse after drain.
 
-Gemma4 adapter rows also take ordinary generation checkpoints when the server's
-paging option is enabled: the resolved row uses plain KV, so checkpoint identity
-and continuation are the same with paging enabled or disabled. Paired B1 checks
+Gemma4 adapter rows take ordinary generation checkpoints. Paired B1 checks, recorded
+while adapter rows still bypassed paging (so on plain KV),
 on Gemma4 e2b OptiQ-4bit (snapshot `b0162532`, MacBookPro18,2, MLX 0.32.2)
 matched main `02d723a` at capacity 1 against continuous capacity 8 for 16 tokens,
 greedy and seeded sampling, and fresh-process restoration across both settings.
 Full logits and all 15 donor KV states matched; all 35 layer outputs and the
 final norm matched by hash. The nonzero adapter changed logits and unmounting
-restored the base. Actual paged rows remained checkpoint-ineligible. This covers
-one active row within the sliding window, not grouped rows, paged numerics,
+restored the base. This covers one active row within the sliding window, not grouped rows, paged numerics,
 hard-kill durability, external-oracle parity or performance.
 
 An adapter request whose draft cannot serve target adapters (the two-model
@@ -1289,7 +1287,7 @@ after the last row's run closes. Each unit runs with only its row's adapters
 active. An image request passes its pixels as the row's prefill input: only the
 first unit reads them (the vision encoder runs there), and the request owner
 releases them after the row settles. Grammar, draft, logprobs, logits processors,
-fill, encoded and paged KV requests are refused with typed plan reasons. `DenoisingKeys` reproduces MLX's
+fill and encoded KV requests are refused with typed plan reasons, and a paged composition at load. `DenoisingKeys` reproduces MLX's
 global key sequence per request, so denoising never reads or reseeds the process
 key. The [denoising tests](tests/generation/denoising-binding.test.ts) take
 `MLX_BUN_DIFFUSION_MODEL=/cached/diffusiongemma` for the real-weight check and

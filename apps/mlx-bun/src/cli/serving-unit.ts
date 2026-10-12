@@ -16,7 +16,7 @@ import { createEngineTelemetry } from "../engine/telemetry";
 import type { TranscriptionInfo } from "../server/discovery-routes";
 import type { ModelPromptBuilder } from "../server/prompt-contracts";
 import type { ResponseHistory } from "../server/responses";
-import { resolveServingLimits, validatePagedServingOptions, type ServeOptions } from "./serve-options";
+import { resolveServingLimits, type ServeOptions } from "./serve-options";
 import type { RouteGroup } from "./serve-state";
 
 /** The serving policy one host applies to every unit: serve's options minus the loader's and the CLI process's own. */
@@ -101,7 +101,6 @@ export async function createServingUnit(context: LoadedModelContext, options: Co
       if (!result.durable) console.warn(`[server] cache flush incomplete: ${result.pendingSnapshots} snapshots, ${result.pendingSpills} spills, ${result.failedSpills} failed`);
     };
     cleanup = async () => { try { await closeCaches(); } finally { releaseContext(context, input.ownership); } };
-    validatePagedServingOptions(options.request.pagedKv, caches.resolvedKvScheme.storage, !!context.draft);
     binding.gateway.configureContinuation?.(caches.continuationServices);
     // createAppEngine takes ownership even when its constructor rejects.
     cleanup = undefined;

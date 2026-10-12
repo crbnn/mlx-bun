@@ -1,7 +1,6 @@
-// Opt-in with real weights: `--paged-kv` on a cached Gemma4 snapshot named by
-// MLX_BUN_COMPILED_GEMMA_E4B serves completions through the paged path, and
-// on a non-Gemma4 model (MLX_BUN_APP_TEST_MODEL) the request answers the
-// typed capability error instead of a hidden serial fallback.
+// Opt-in with real weights: `--paged-kv` composes the paged KV lego at load, so a
+// cached Gemma4 snapshot named by MLX_BUN_COMPILED_GEMMA_E4B and any other model
+// (MLX_BUN_APP_TEST_MODEL) serve completions through paged state.
 //
 // HTTP cancellation, once per paged reader (the gathered SDPA reader and the
 // direct reader MLX_BUN_PAGED_ATTN=1 selects, which the app reads from its
@@ -52,16 +51,15 @@ test.skipIf(!gemma)("paged KV serves a Gemma4 completion", async () => {
   } finally { try { await app?.close(); } finally { rmSync(root, { recursive: true, force: true }); } }
 }, 300_000);
 
-test.skipIf(!other)("paged KV on a non-Gemma4 model answers the typed capability error", async () => {
+test.skipIf(!other)("paged KV serves a completion on a model of another family", async () => {
   const root = mkdtempSync(join(tmpdir(), "mlx-paged-")); mkdirSync(join(root, "project"));
   let app: RunningApp | undefined;
   try {
     app = await serveWithPaging(root, other!);
     const response = await chat(app);
-    expect(response.status).toBe(501);
+    expect(response.status).toBe(200);
     const body = await response.json();
-    expect(body.error).toMatchObject({ type: "not_implemented", code: "unsupported_execution" });
-    expect(body.error.reasons).toContain("paged-kv-batch-unsupported");
+    expect(body.usage.completion_tokens).toBeGreaterThan(0);
   } finally { try { await app?.close(); } finally { rmSync(root, { recursive: true, force: true }); } }
 }, 300_000);
 

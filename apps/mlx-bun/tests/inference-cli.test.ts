@@ -32,7 +32,7 @@ function harness(template = true) {
   const engine: OneShotEngine = {
     context, completion: {
       place(shape) { placed++; return { shape, mechanism: "continuous", execution: { method: "autoregressive", mechanism: "continuous",
-        pagedKv: false, promptCache: false, checkpoint: false, fill: false, compiledDecode: false, grammarJump: false, reasons: [] } }; },
+        promptCache: false, checkpoint: false, fill: false, compiledDecode: false, grammarJump: false, reasons: [] } }; },
       async run(...args) { runs.push(args); await args[2](1); await args[2](2);
         return { promptTokens: 2, cachedTokens: 0, generatedTokens: 2, prefillTps: 0, decodeTps: 0, prefillMs: 0, decodeMs: 0, cacheTokens: [7, 8, 1, 2] }; },
     }, binding: { embed(texts, instruction) { embeds.push([texts, instruction]); return texts.map(text => ({ vector: Float32Array.from([1, 2]), tokens: text.length })); } },

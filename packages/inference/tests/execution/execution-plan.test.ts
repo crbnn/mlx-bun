@@ -25,7 +25,7 @@ test("prepared media uses ordinary shared decode without token-only reuse or spe
     sharedFill: true, sharedCheckpoints: true, groupedMethods: ["autoregressive", "speculative"] };
   for (const options of [{}, { hasDraft: true }, { hasGrammar: true }, { wantsLogprobs: true }]) {
     const plan = resolveExecution({ ...request, hasVision: true, ...options }, supported,
-      { pagedKv: false, fill: true, grammarJump: true });
+      { fill: true, grammarJump: true });
     expect(plan).toMatchObject({ mechanism: "continuous", method: "autoregressive",
       promptCache: false, checkpoint: false, fill: false, grammarJump: false });
   }
@@ -85,7 +85,6 @@ test("qualified speculative KV without a grouped verifier is unsupported; other 
   for (const key of ["hasVision", "hasAdapters", "wantsLogprobs"] as const)
     expect(resolveExecution({ ...draft, [key]: true }, qualified).method).toBe("autoregressive");
   expect(resolveExecution(draft, { ...qualified, ...turboKv }).method).toBe("autoregressive");
-  expect(resolveExecution(draft, qualified, { pagedKv: true, fill: false }).method).toBe("autoregressive");
 });
 
 test("supported affine KV batches; unavailable layouts and TurboQuant are unsupported", () => {
@@ -94,24 +93,8 @@ test("supported affine KV batches; unavailable layouts and TurboQuant are unsupp
   expect(resolveExecution(request, { ...capabilities, ...turboKv }).mechanism).toBe("unsupported");
 });
 
-test("paged placement keeps prefix reuse separate from interruption checkpoints", () => {
-  const features = { pagedKv: true, fill: false };
-  const paged = { ...capabilities, pagedBatch: true };
-  expect(resolveExecution(request, paged, features))
-    .toMatchObject({ mechanism: "continuous", pagedKv: true, promptCache: true, checkpoint: false });
-  expect(resolveExecution(request, capabilities, features).reasons).toEqual(["paged-kv-batch-unsupported"]);
-  const adapted = resolveExecution({ ...request, hasAdapters: true }, paged, features);
-  expect(adapted).toMatchObject({ mechanism: "unsupported", pagedKv: false, promptCache: true, checkpoint: false });
-  expect(adapted.reasons).toEqual(["adapter-batch-unsupported", "paged-kv-bypassed-for-media-or-adapters"]);
-  // With adapter batching and a bound checkpoint store, adapters bypass paging into resumable continuation.
-  expect(resolveExecution({ ...request, hasAdapters: true }, { ...paged, adapterBatch: true, sharedCheckpoints: true }, features))
-    .toMatchObject({ mechanism: "continuous", pagedKv: false, promptCache: true, checkpoint: true });
-  expect(resolveExecution({ ...request, hasVision: true }, paged, features))
-    .toMatchObject({ pagedKv: false, promptCache: false, checkpoint: false });
-});
-
 test("fill requires a qualified shared binding and cannot run in another method or resumable checkpoint", () => {
-  const features = { pagedKv: false, fill: true };
+  const features = { fill: true };
   expect(resolveExecution(request, capabilities, features).fill).toBe(false);
   for (const kv of [{}, affineKv, turboKv]) {
     const plan = resolveExecution(request, { ...capabilities, ...kv, continuous: false }, features);
@@ -125,9 +108,9 @@ test("fill requires a qualified shared binding and cannot run in another method 
   expect(Object.isFrozen(denoising.reasons)).toBe(true);
 });
 
-test("qualified shared fill retains seeded sampling and excludes paging, grammar and metadata", () => {
+test("qualified shared fill retains seeded sampling and excludes grammar and metadata", () => {
   const supported = { ...capabilities, sharedFill: true, turboQuantBatch: true, compiledDecode: true };
-  const features = { pagedKv: false, fill: true, compiledDecode: true };
+  const features = { fill: true, compiledDecode: true };
   for (const [shape, kv] of [[request, {}], [{ ...request, userSeed: true }, {}], [request, affineKv],
     [request, turboKv]] as const) {
     expect(resolveExecution(shape, { ...supported, ...kv }, features)).toMatchObject({
@@ -137,12 +120,11 @@ test("qualified shared fill retains seeded sampling and excludes paging, grammar
   }
   for (const extra of [{ hasGrammar: true }, { wantsLogprobs: true }, { hasDraft: true }])
     expect(resolveExecution({ ...request, ...extra }, supported, features).fill).toBe(false);
-  expect(resolveExecution(request, { ...supported, pagedBatch: true }, { ...features, pagedKv: true }).fill).toBe(false);
   expect(resolveExecution({ ...request, userSeed: true }, { ...supported, continuous: false }, features).fill).toBe(false);
 });
 
 test("compiled replay permission is fixed by graph capability and request composition", () => {
-  const features = { pagedKv: false, fill: false, compiledDecode: true };
+  const features = { fill: false, compiledDecode: true };
   const supported = { ...capabilities, compiledDecode: true };
   expect(resolveExecution(request, supported, features).compiledDecode).toBe(true);
   expect(resolveExecution(request, capabilities, features).compiledDecode).toBe(false);
@@ -152,13 +134,12 @@ test("compiled replay permission is fixed by graph capability and request compos
     expect(plan.compiledDecode).toBe(false);
     expect(plan.reasons).toContain("compiled-decode-unavailable-for-request");
   }
-  expect(resolveExecution(request, supported, { ...features, pagedKv: true }).compiledDecode).toBe(false);
-  // Media bypasses paged KV and still uses the graph's ordinary decode path.
-  expect(resolveExecution({ ...request, hasVision: true }, supported, { ...features, pagedKv: true }).compiledDecode).toBe(true);
+  // Media uses the graph's ordinary decode path, compiled where the composition allows it.
+  expect(resolveExecution({ ...request, hasVision: true }, { ...supported, mediaBatch: true }, features).compiledDecode).toBe(true);
 });
 
 test("grammar jump requires a qualified shared method, never an unsupported plan", () => {
-  const features = { pagedKv: false, fill: false, grammarJump: true };
+  const features = { fill: false, grammarJump: true };
   const grammar = { ...request, hasGrammar: true };
   const unavailable = { ...capabilities, continuous: false };
   const rejected = resolveExecution(grammar, unavailable, features);
@@ -172,7 +153,7 @@ test("grammar jump requires a qualified shared method, never an unsupported plan
 
 test("adapter-capable groups retain ordinary sampling features", () => {
   const plan = resolveExecution({ ...request, hasAdapters: true, wantsLogprobs: true,
-    userSeed: true }, { ...capabilities, adapterBatch: true }, { pagedKv: false, fill: false, compiledDecode: true });
+    userSeed: true }, { ...capabilities, adapterBatch: true }, { fill: false, compiledDecode: true });
   expect(plan).toMatchObject({ method: "autoregressive", mechanism: "continuous", compiledDecode: false });
 });
 
@@ -217,12 +198,12 @@ test("bound ordinary checkpoint capability qualifies shared requests without cha
     expect(resolveExecution({ ...request, ...excluded }, supported).checkpoint).toBe(false);
   expect(resolveExecution({ ...request, hasDraft: true }, { ...supported,
     speculativeLogprobs: true, groupedMethods: ["autoregressive", "speculative"] }).checkpoint).toBe(false);
-  expect(resolveExecution(request, supported, { pagedKv: false, fill: true }).checkpoint).toBe(false);
+  expect(resolveExecution(request, supported, { fill: true }).checkpoint).toBe(false);
 });
 
 test("grammar proposals select the shared verifier only when its request combination is supported", () => {
   const grammar = { ...request, hasGrammar: true };
-  const features = { pagedKv: false, fill: false, grammarJump: true };
+  const features = { fill: false, grammarJump: true };
   const supported = { ...capabilities, sharedGrammarProposals: true,
     groupedMethods: ["autoregressive", "speculative"] };
   expect(resolveExecution(grammar, supported, features)).toMatchObject({
@@ -248,7 +229,7 @@ test("a provider consuming external tokens composes echo with shared speculation
   const shape = { ...request, hasDraft: true, userSeed: true };
   const supported = { ...capabilities, ...affineKv, groupedMethods: ["autoregressive", "speculative"],
     speculativeKvQuant: true, sharedSpeculativeEcho: true };
-  const features = { fill: true, pagedKv: false };
+  const features = { fill: true };
   expect(resolveExecution(shape, supported, features)).toMatchObject({
     method: "speculative", mechanism: "continuous", fill: true });
   for (const disabled of [{ sharedSpeculativeEcho: false }, { continuous: false }])
@@ -261,12 +242,12 @@ describe("interleaved denoising placement", () => {
   const denoising: ExecutionCapabilities = { method: "denoising", continuous: true, quantizedBatch: false,
     grammarBatch: false, checkpoints: true, adapterBatch: true, sharedCheckpoints: true,
     groupedMethods: ["denoising"] };
-  const features = { pagedKv: false, fill: false, compiledDecode: true, grammarJump: false };
+  const features = { fill: false, compiledDecode: true, grammarJump: false };
 
   test("plain, seeded and adapted requests run continuously with AR-only reuse disabled", () => {
     for (const extra of [{}, { userSeed: true }, { hasAdapters: true }, { userSeed: true, hasAdapters: true }])
       expect(resolveExecution({ ...request, ...extra }, denoising, features)).toEqual({
-        method: "denoising", mechanism: "continuous", pagedKv: false, promptCache: false, checkpoint: false,
+        method: "denoising", mechanism: "continuous", promptCache: false, checkpoint: false,
         fill: false, compiledDecode: false, grammarJump: false, reasons: ["compiled-decode-unavailable-for-request"] });
   });
 
@@ -279,7 +260,6 @@ describe("interleaved denoising placement", () => {
     [{}, { fill: true }, "fill-method-unsupported", {}],
     [{}, {}, "kv-scheme-batch-unsupported", affineKv],
     [{}, {}, "turbo-kv-batch-unsupported", turboKv],
-    [{}, { pagedKv: true }, "paged-kv-batch-unsupported", {}],
     [{ hasVision: true }, {}, "media-batch-unsupported", {}],
   ] as const)("a token-level or AR-state request is refused, never discarded: %#", (shape, feature, reason, kv: Partial<ExecutionCapabilities>) => {
     const plan = resolveExecution({ ...request, ...shape }, { ...denoising, ...kv }, { ...features, ...feature });
@@ -301,14 +281,14 @@ describe("interleaved denoising placement", () => {
 test("accepted plans keep their selected features", () => {
   const supported = { ...capabilities, sharedCheckpoints: true, sharedFill: true, compiledDecode: true,
     sharedGrammarProposals: true, groupedMethods: ["autoregressive", "speculative"] };
-  expect(resolveExecution(request, supported, { pagedKv: false, fill: false, compiledDecode: true })).toEqual({
-    method: "autoregressive", mechanism: "continuous", pagedKv: false, promptCache: true, checkpoint: true,
+  expect(resolveExecution(request, supported, { fill: false, compiledDecode: true })).toEqual({
+    method: "autoregressive", mechanism: "continuous", promptCache: true, checkpoint: true,
     fill: false, compiledDecode: true, grammarJump: false, reasons: [] });
-  expect(resolveExecution({ ...request, userSeed: true }, supported, { pagedKv: false, fill: true, compiledDecode: true })).toEqual({
-    method: "autoregressive", mechanism: "continuous", pagedKv: false, promptCache: true, checkpoint: false,
+  expect(resolveExecution({ ...request, userSeed: true }, supported, { fill: true, compiledDecode: true })).toEqual({
+    method: "autoregressive", mechanism: "continuous", promptCache: true, checkpoint: false,
     fill: true, compiledDecode: false, grammarJump: false, reasons: ["compiled-decode-unavailable-for-request"] });
-  expect(resolveExecution({ ...request, hasGrammar: true }, supported, { pagedKv: false, fill: false, grammarJump: true })).toEqual({
-    method: "speculative", mechanism: "continuous", pagedKv: false, promptCache: false, checkpoint: false,
+  expect(resolveExecution({ ...request, hasGrammar: true }, supported, { fill: false, grammarJump: true })).toEqual({
+    method: "speculative", mechanism: "continuous", promptCache: false, checkpoint: false,
     fill: false, compiledDecode: false, grammarJump: true, reasons: [] });
 });
 
@@ -319,11 +299,10 @@ test.each([
   [{}, { ...affineKv, quantizedBatch: false }, {}, "kv-scheme-batch-unsupported"],
   [{}, turboKv, {}, "turbo-kv-batch-unsupported"],
   [{ hasGrammar: true }, { grammarBatch: false }, {}, "grammar-batch-unsupported"],
-  [{}, {}, { pagedKv: true }, "paged-kv-batch-unsupported"],
   [{}, { method: "denoising" }, {}, "method-batch-unsupported"],
 ] as const)("an unsupported plan names its rejection reason: %#", (shape, capability, feature, reason) => {
   const plan = resolveExecution({ ...request, ...shape }, { ...capabilities, ...capability },
-    { pagedKv: false, fill: false, ...feature });
+    { fill: false, ...feature });
   expect(plan).toMatchObject({ mechanism: "unsupported", fill: false, grammarJump: false });
   expect(plan.reasons[0]).toBe(reason);
   expect(plan.reasons.filter(entry => entry.endsWith("-unsupported") || entry === "continuous-unavailable")).toEqual([reason]);
@@ -331,7 +310,7 @@ test.each([
 
 
 test("committed grammar spans stay AR and do not replace verified grammar proposals", () => {
-  const features = { pagedKv: false, fill: true, grammarJump: true };
+  const features = { fill: true, grammarJump: true };
   const grammar = { ...request, hasGrammar: true };
   const spans = { ...capabilities, adapterBatch: true, sharedGrammarJump: true };
   expect(resolveExecution(grammar, spans, features)).toMatchObject({

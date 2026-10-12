@@ -98,7 +98,7 @@ const prelude = (mocks = "") => `
   const binding = (stateCompatibility = "synthetic-runtime-v1") => ({ stateCompatibility,
     gateway: { config, runtime: runtimeConfig(), cachesBatchable: () => true, kvBatchable: () => false,
       plan: (_shape, options) => ({ method: options.temperature === 0 ? "custom-exact" : "custom-alternate", mechanism: "continuous",
-        pagedKv: false, promptCache: false, checkpoint: false, fill: false, compiledDecode: false, grammarJump: false, reasons: [] }),
+        promptCache: false, checkpoint: false, fill: false, compiledDecode: false, grammarJump: false, reasons: [] }),
       methodRequest: execution => ({ id: execution.method }), createBatchGroup: () => group, configureContinuation() {} },
     restore: () => null, signal: async () => ({ bins: [1], vocab: 16 }),
     diagnostics: () => ({ custom_model: { method_count: 2 } }),

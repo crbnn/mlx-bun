@@ -36,22 +36,31 @@ const refusals = (plan: { reasons: readonly string[] }) => plan.reasons.filter(r
 
 describe("placement follows the graph's declarations", () => {
   test("the binding reports what the graph declared, once", () => {
-    const declared = declareGraph({ pagedAttention: true });
-    expect(bind(replacement({ pagedAttention: true })).capabilities).toEqual(declared);
+    const declared = declareGraph({ hiddenLayerTaps: true });
+    expect(bind(replacement({ hiddenLayerTaps: true })).capabilities).toEqual(declared);
   });
 
   test("a model type or class name declares nothing", () => {
     // Named like the graphs whose declarations grant these capabilities, this graph declares none.
     const binding = bind(replacement({}, {}, "gemma4"));
     expect(refusals(binding.plan({ ...shape, hasVision: true }, {}, schedule))).toEqual(["media-batch-unsupported"]);
-    expect(refusals(binding.plan(shape, { pagedKv: {} }, schedule))).toEqual(["paged-kv-batch-unsupported"]);
     expect(binding.plan(shape, {}, schedule).compiledDecode).toBe(false);
     expect(binding.kvBatchable(resolveKvScheme({ override: 4, quantizedKvStart: 64 }))).toBe(false);
   });
 
-  test("paged attention, adapters and compiled decode are placed from their declarations", () => {
-    const paged = bind(replacement({ pagedAttention: true }));
-    expect(paged.plan(shape, { pagedKv: {} }, schedule)).toMatchObject({ mechanism: "continuous", pagedKv: true });
+  test("a paged composition pages every request's state; adapters and compiled decode are placed from their declarations", () => {
+    // Paging is the composition's, not the graph's: any graph's plain full-attention storage pages, and
+    // requests are planned exactly as without it.
+    const paged = bind(replacement({}, { composition: testComposition(undefined, { pagedKv: { blockSize: 16 } }) }));
+    for (const request of [shape, { ...shape, hasAdapters: true }, { ...shape, hasGrammar: true }]) {
+      const plan = paged.plan(request, {}, schedule);
+      expect(plan).toEqual(bind(replacement()).plan(request, {}, schedule));
+      const state = paged.statePolicy!(plan, {}, 64)!;
+      const caches = state.create();
+      try { expect(caches.map(cache => cache.signature())).toEqual(["kv:paged"]); }
+      finally { for (const cache of caches) cache.dispose(); }
+    }
+    expect(bind(replacement()).statePolicy!(bind(replacement()).plan(shape, {}, schedule), {}, 64)).toBeUndefined();
     const unadapted = bind(replacement({ adapters: { batched: false } }));
     expect(refusals(unadapted.plan({ ...shape, hasAdapters: true }, {}, schedule))).toEqual(["adapter-batch-unsupported"]);
     expect(unadapted.bindAdapterContext).toBeUndefined();

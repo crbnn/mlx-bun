@@ -170,7 +170,7 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
   readonly loraState = new LoraState();
   /** Layers whose attention reads plain keys and values: none; it attends the storage its caches hold. */
   readonly requiredDenseKvLayers: readonly number[] = Object.freeze([]);
-  /** Prepared image and audio embeddings, paged attention, layer taps for drafts;
+  /** Prepared image and audio embeddings, layer taps for drafts;
    *  its caches convert delayed affine rows. No training operations. */
   readonly graphCapabilities: GraphCapabilities;
   readonly embed: QuantizedEmbedding;
@@ -221,7 +221,7 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
     };
     this.#packMixedMlp = composition.packedMixedMlp;
     this.graphCapabilities = declareGraph({
-      media: { input: "embeddings", video: false }, pagedAttention: true, hiddenLayerTaps: true, compiledDecode: false,
+      media: { input: "embeddings", video: false }, hiddenLayerTaps: true, compiledDecode: false,
       kv: { delayedAffine: "all" },
     });
 
