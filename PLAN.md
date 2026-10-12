@@ -338,6 +338,47 @@ to callers outside `state/`. Every one of these is a method learning the represe
       `plan.ts` (paged, kvQuant, turbo terms), `generation/autoregressive.ts`
       (`isRotatingPlainCache`), `models/gemma4/compiled-decode.ts` (`isCompiledDecodeCache`),
       `scoring/full-sequence.ts` (`isRecurrentCache`), and `state/kv-scheme.ts`'s `batchable`.
+- [x] Planner side landed (`refactor/composition-b3-planner`, 8508f16b, eight commits on
+      832ac8b1; merging onto the integration head with E5 and the ratchet item). Deleted: the
+      planner's paged / kvQuant / turbo conditions and reasons; `ExecutionCapabilities.
+      quantizedBatch / turboQuantBatch / pagedBatch / speculativeKvQuant / speculativeTurboQuant
+      / continuous`; `GraphCapabilities.pagedAttention / kv / speculation.affineKv / turboKv /
+      immediateAffine4` and with them `Composition.speculativeAffineKv`; the gateway's
+      `convertible`, `kvBatchCapabilities`, `delayedAffine`, `affineKv`, `cachesBatchable`,
+      `kvBatchable`, `delayedAffineOrdinaryOnly`, `isRecurrentCache`, the `MLX_BUN_BATCH_SSM`
+      read, the ignored-draft affine branch (a draft is ignored only for adapter rows whose
+      verifier cannot serve adapters) and the `kvScheme` option with its startup refusal; the
+      batch group's cache-class reads (behind `state/layout`) and both compiled-decode probes;
+      `state/kv-scheme`'s `batchable`, `captureRopeOffsets`, `isCompiledDecodeCache`;
+      `state/capabilities` is no longer exported from state. Composition fields, defaults:
+      `compiledDecode` on, `mixedPrefill` off, `mixedTokenBudget` 256, `prefillTailSplit` on,
+      `grammarJump` off, `greedyDraft` off, `pagedKv` null (`--paged-kv` sets the block size);
+      media and adapter rows page like every row. Compiled decode is settled once in
+      `resolveComposition`: on for bf16 and affine from token 0, off for TurboQuant, a delayed
+      start and paging, because those legos have no compiled form yet (owed below). Gates:
+      every served path bit-identical to 832ac8b1 (20 digest cells at one and four rows with
+      compiled-step counts, speculative-group under five schemes, gemma4-paged, continuation,
+      spans, compiled-decode, gemma4-generated, gemma4-assistant); Gemma 2 native suite 58
+      pass (a gateway test that failed on base passes). Newly served through the server path
+      on e4b: speculation over paged bf16/4/8, TurboQuant and affine from token 40; grammar,
+      fill and image rows on paged storage; paged bf16 equals the bf16 lego token for token
+      for plain, grammar, fill, media and single drafted rows. Teacher-forced verification
+      rows, KL mean/max vs bf16 at one row: paged 4 0.016/0.17, paged 8 0.010/0.064,
+      TurboQuant 8/3 0.016/0.18, affine 4 from 32 0/0, against the tiled null 0.102/1.31.
+      Behaviour change, accepted: grammar jump over delayed affine KV on encoded-read graphs
+      is planned as verified proposals rather than committed spans (not measured on real
+      weights); library `generate()` with delayed affine on Gemma 4 runs eager (logits
+      bit-exact). Not run: compiled-decode on 12B, any Qwen3-MoE cell (no weights here).
+      Still owed under the additive rule, each a lego form or a graph fix, none a flag:
+      compiled decode on the TurboQuant, delayed and paged legos; pages under a per-layer
+      scheme or TurboQuant (refused at load today); the graphs that build their own caches
+      (GLM-5.2's MLA storage, DiffusionGemma's `makeCache`) composing the KV scheme and paging
+      (refused at load today); Gemma 2's softcap read over affine storage after the
+      conversion point (`DenseKvReadError`, HTTP 501, on ordinary and grammar rows; no Gemma
+      2 weights here); fill choosing committed spans or single tokens by
+      `MlxKnownSpans.affineKvBits / turboQuantFormats`, a capability naming KV formats, which
+      goes when `appendKnown` works over every lego. These are the last "not with that cache"
+      answers in the tree; the plan does not close with them unless Josh scopes one out.
 
 Exit: on e4b, speculative-group (assistant drafter), grammar-group, fill, prefix reuse and the SSD
 round-trip each run under every lego the composition can name (bf16, affine uniform, affine
