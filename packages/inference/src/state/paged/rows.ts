@@ -4,7 +4,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { runtimeFlag } from "../../runtime/config";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { disposeResources } from "../../runtime/resources";
-import { PagedKVCache, poolBlocksFor, type PagedQuantization } from "./cache";
+import { PagedKVCache, poolBlocksFor, type PagedQuantization, type PagedTurboQuant } from "./cache";
 
 /** Block storage owns row membership; attention consumes the same gathered
  * K/V representation as the existing paged cache. No scheduler policy here.
@@ -16,9 +16,9 @@ import { PagedKVCache, poolBlocksFor, type PagedQuantization } from "./cache";
  * SDPA attends under the padding mask of the append (`buildBatchedDecodeMask`),
  * for decode and windows alike. Reading each row alone over its own length
  * reduces in another order than this read over the padded length and differs
- * in the last bits (up to 4e-3 on decode at head dim 512). Direct or affine
- * pages: each row reads with its own `PagedKVCache` read for the phase and the
- * outputs join along the batch. A committed span is the window read, as on
+ * in the last bits (up to 4e-3 on decode at head dim 512). Direct, affine or
+ * TurboQuant pages: each row reads with its own `PagedKVCache` read for the
+ * phase and the outputs join along the batch. A committed span is the window read, as on
  * the serial pages.
  *
  * The same layout serves continuous decoding, prefill cohorts and
@@ -35,8 +35,9 @@ export class PagedKvRows implements CommittedAttentionCache, SpeculativeRowLayou
   readonly #decode: (keys: MlxArray, values: MlxArray) => AttentionRead;
   readonly #window: (keys: MlxArray, values: MlxArray) => AttentionRead;
 
-  constructor(readonly capacityTokens: number, readonly blockSize: number, readonly direct = runtimeFlag("MLX_BUN_PAGED_ATTN", false), readonly quantization?: PagedQuantization) {
-    const alone = direct || quantization !== undefined;
+  constructor(readonly capacityTokens: number, readonly blockSize: number, readonly direct = runtimeFlag("MLX_BUN_PAGED_ATTN", false),
+    readonly quantization?: PagedQuantization, readonly turbo?: PagedTurboQuant) {
+    const alone = direct || quantization !== undefined || turbo !== undefined;
     this.#decode = alone ? (keys, values) => this.#rowReads(keys, values, (row, k, v) => row.appendDecode(k, v))
       : (keys, values) => this.#joinedRead(keys, values);
     this.#window = alone ? (keys, values) => this.#rowReads(keys, values, (row, k, v) => row.appendWindow(k, v))
@@ -57,7 +58,7 @@ export class PagedKvRows implements CommittedAttentionCache, SpeculativeRowLayou
     return this.#rope;
   }
   releaseRopeArr(): void { this.#rope?.dispose(); this.#rope = undefined; this.#ropeOffset = -1; }
-  makeEmptyBatch(): PagedKvRows { return new PagedKvRows(this.capacityTokens, this.blockSize, this.direct, this.quantization); }
+  makeEmptyBatch(): PagedKvRows { return new PagedKvRows(this.capacityTokens, this.blockSize, this.direct, this.quantization, this.turbo); }
 
   mergeRows(rows: readonly Cache[]): void {
     const next: PagedKVCache[] = [];

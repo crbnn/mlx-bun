@@ -46,7 +46,7 @@ const commands = {
     "ngram-max": { type: "string", description: "Prompt-lookup longest k-gram, integer >= 1 (ngram only) [default: 3]" },
     "ngram-min": { type: "string", description: "Prompt-lookup shortest k-gram, integer >= 1 (ngram only) [default: 1]" },
     mtp: { type: "string", description: "Checkpoint-native multi-token-prediction draft head: on | off [default: on]; models without one ignore it" },
-    "paged-kv": { type: "boolean", description: "Paged KV cache, composed when the model loads (env mirror MLX_BUN_PAGED_KV=1): every request keeps its full-attention keys and values in fixed blocks; pages are bf16 or --kv-quant 4|8 (config and turbo pages are not implemented)" },
+    "paged-kv": { type: "boolean", description: "Paged KV cache, composed when the model loads (env mirror MLX_BUN_PAGED_KV=1): every request keeps its full-attention keys and values in fixed blocks, stored as --kv-quant names for each layer" },
     "paged-kv-block-size": { type: "string", description: "Tokens per KV block with --paged-kv, integer >= 1 [default: 256]" },
     adapter: { type: "string", description: "Mount a LoRA adapter directory at startup as the default for requests without an adapter field" },
     "adapter-path": { type: "string", description: "Alias for --adapter (mlx_lm spelling)" },

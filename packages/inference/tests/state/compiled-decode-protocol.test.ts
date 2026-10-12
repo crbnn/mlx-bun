@@ -164,6 +164,11 @@ const LEGOS: Lego[] = [
   { name: "paged bf16", make: () => new PagedKVCache(64, 4, false) },
   { name: "paged affine 4", make: () => new PagedKVCache(64, 4, false, { bits: 4, groupSize: 64 }) },
   { name: "paged affine 8", make: () => new PagedKVCache(64, 4, false, { bits: 8, groupSize: 64 }) },
+  { name: "paged affine 3", make: () => new PagedKVCache(64, 4, false, { bits: 3, groupSize: 64 }) },
+  { name: "paged TurboQuant 8/3, deferred read", make: () => new PagedKVCache(64, 4, false, undefined, undefined,
+    { kBits: 8, vBits: 3, fusedDecode: true, kernels: deferredTurboQuantKernels }) },
+  { name: "paged TurboQuant 4/2, dense read, eager codec", make: () => new PagedKVCache(64, 4, false, undefined, undefined,
+    { kBits: 4, vBits: 2, fusedDecode: false, kernels: denseTurboQuantKernels }) },
 ];
 
 /** One recorded graph per closure key: [ropeOffset, k, v, ...slot inputs, q] -> [output, ...slot outputs]. */

@@ -51,6 +51,7 @@ import { createKvMaintenance } from "../../src/state/kv-maintenance";
 import { captureKvDonorAttention } from "../../src/state/kv-attention-view";
 import { ownedCacheLayout, prefillCacheLayout, targetCacheLayout } from "../../src/state/layout";
 import { PagedKVCache, type PagedQuantization } from "../../src/state/paged/cache";
+import { maybePageKv } from "../../src/state/request-policy";
 import { cloneKvCaches, loadKvCache, saveKvCache } from "../../src/state/persistence";
 import { bindRowCacheRollback, type RowSpeculativeState } from "../../src/state/rollback";
 import { SSMCache } from "../../src/state/ssm";
@@ -176,6 +177,22 @@ const paged = (name: string, quantization?: PagedQuantization, direct = false): 
   make: () => new PagedKVCache(256, 16, direct, quantization),
 });
 
+/** The paged lego the request policy pages layer `layer` of a composition with
+ * (`maybePageKv` over the graph's cache for that layer), its pages storing what
+ * `scheme` names there. */
+const pagedAs = (name: string, scheme: KvStorageScheme, layer: number, tolerance: number, exact = false,
+  kernels = denseTurboQuantKernels): Lego => ({
+  name, g: FULL, scheme, exact, firstWindowBf16: exact, tolerance,
+  make: masks => {
+    const held = masks ?? new AttentionMasks();
+    const caches = Array.from({ length: layer + 1 }, (_, index) => composedFullAttentionCache(scheme, index, held, kernels));
+    maybePageKv(caches, scheme, { blockSize: 16 }, 256);
+    for (const cache of caches.slice(0, layer)) cache.dispose();
+    expect(caches[layer]).toBeInstanceOf(PagedKVCache);
+    return caches[layer]!;
+  },
+});
+
 const LEGOS: readonly Lego[] = [
   full("bf16 full (KVCache)", BF16_KV),
   sliding("bf16 sliding (RotatingKVCache)", BF16_KV),
@@ -195,6 +212,13 @@ const LEGOS: readonly Lego[] = [
   paged("paged bf16, direct read (Lab)", undefined, true),
   paged("paged 4-bit", { bits: 4, groupSize: 64 }),
   paged("paged 8-bit", { bits: 8, groupSize: 64 }),
+  // Pages as the request policy builds them for the composition's scheme (`maybePageKv`), per layer.
+  pagedAs("paged per-layer, a listed 8-bit layer", perLayer(8), 0, 0.2),
+  pagedAs("paged per-layer, an unlisted layer (bf16 pages)", perLayer(8), 1, 0, true),
+  pagedAs("paged 3-bit (a width the direct read cannot take)", affine(3), 0, 0.5),
+  pagedAs("paged TurboQuant 8/3, dense read", turbo(), 0, 0.5, false, denseTurboQuantKernels),
+  pagedAs("paged TurboQuant 8/3, deferred read", turbo(), 0, 0.5, false, deferredTurboQuantKernels),
+  pagedAs("paged TurboQuant 4/2, deferred read", { kind: "turbo", kBits: 4, vBits: 2 }, 0, 1, false, deferredTurboQuantKernels),
 ];
 
 /** The bf16 lego of the same layer geometry: the numerical reference. */

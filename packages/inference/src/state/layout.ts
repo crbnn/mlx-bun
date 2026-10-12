@@ -49,7 +49,7 @@ const entry = <C extends Cache>(storage: StorageClass<C>, layouts: RowLayouts<No
 const ownEmptyBatch = <C extends SpeculativeRowLayout>(storage: StorageClass<C>): RowLayoutEntry<C> =>
   entry(storage, { decode: cache => cache.makeEmptyBatch(), prefill: cache => cache.makeEmptyBatch(), verify: cache => cache.makeEmptyBatch() });
 
-const pagedRows = (cache: PagedKVCache) => new PagedKvRows(cache.capacityTokens, cache.blockSize, cache.direct, cache.quantization);
+const pagedRows = (cache: PagedKVCache) => new PagedKvRows(cache.capacityTokens, cache.blockSize, cache.direct, cache.quantization, cache.turbo);
 const rotatingAffineVerify = (cache: { readonly maxSize: number; readonly groupSize: number; readonly bits: number;
   readonly kernels: RotatingAffineLayout["kernels"]; readonly masks: RotatingAffineLayout["masks"] }) =>
   new SpeculativeRotatingAffineLayout(cache.maxSize, cache.groupSize, cache.bits, cache.kernels, cache.masks);

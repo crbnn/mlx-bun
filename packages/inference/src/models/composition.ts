@@ -7,7 +7,6 @@ import { COMPOSITION_DEFAULTS, type Composition } from "../contracts/portable/co
 import { runtimeConfig, type RuntimeConfig } from "../runtime/config";
 import { resolveKvScheme, type KvQuantOverride } from "../state/kv-scheme";
 import { PagedKVCache } from "../state/paged/cache";
-import { pagesStore } from "../state/request-policy";
 
 /** Rows per forward when the caller states no cap (the app's `--batch` default). */
 export const DEFAULT_MAX_ROWS = 8;
@@ -38,8 +37,8 @@ export interface CompositionRequest {
     readonly fusedSdpa?: boolean;
   };
   /** Paged KV (`--paged-kv`): full-attention storage in pages of `blockSize`
-   * positions (default 256). Absent or null: unpaged. Pages store bf16 or a
-   * uniform 4- or 8-bit affine scheme; another scheme with paging is refused. */
+   * positions (default 256). Absent or null: unpaged. Pages store what the KV
+   * scheme names for each layer. */
   readonly pagedKv?: { readonly blockSize?: number } | null;
   /** The loaded drafter's tokens per round, and whether the scheduler adapts
    * each round's count up to it. Absent or null: no drafter. */
@@ -98,8 +97,6 @@ function compose(request: Omit<CompositionRequest, "kv">, kv: Composition["kv"])
   const pagedKv = request.pagedKv ? Object.freeze({ blockSize: request.pagedKv.blockSize ?? PagedKVCache.DEFAULT_BLOCK_SIZE }) : null;
   if (pagedKv && (!Number.isSafeInteger(pagedKv.blockSize) || pagedKv.blockSize < 1))
     throw new Error("composition paged KV block size must be a positive integer");
-  if (pagedKv && !pagesStore(kv))
-    throw new Error("paged KV stores bf16 or uniform 4- or 8-bit affine pages; per-layer and TurboQuant pages are not implemented");
   const runtime = runtimeConfig();
   return Object.freeze({
     device: deviceArchitecture(),

@@ -215,6 +215,72 @@ for (const [family, checkpoint] of [
       }
     }
 
+    // Every cache lego the composition can name decodes a lone row through the
+    // compiled step, bit-identical to the decode operation: the library's
+    // generate loop and the gateway's batch group (the app's path), each against
+    // the same composition with compiled decode off.
+    const legoCells = (prompt: number): [string, Record<string, unknown>][] => [
+      ["TurboQuant 8/3", { kv: { turboQuant: { kBits: 8, vBits: 3 } } }],
+      ["affine 4 converting during decode", { kv: { override: 4, quantizedKvStart: prompt + 6 } }],
+      ["artifact config converting during decode", { kv: { override: "config", quantizedKvStart: prompt + 6 } }],
+      ["TurboQuant 8/3 converting during decode", { kv: { turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: prompt + 6 } }],
+      ["paged bf16", { pagedKv: { blockSize: 16 } }],
+      ["paged affine 4", { pagedKv: { blockSize: 16 }, kv: { override: 4 } }],
+      ["paged artifact config", { pagedKv: { blockSize: 16 }, kv: { override: "config" } }],
+      ["paged TurboQuant 8/3", { pagedKv: { blockSize: 16 }, kv: { turboQuant: { kBits: 8, vBits: 3 } } }],
+    ];
+    test("every cache lego: the lone row's compiled steps equal the decode operation, in generate and in the batch group", async () => {
+      const { createModel, resolveComposition } = await import("@mlx-bun/inference");
+      const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
+      const prompt = growingPrompt, maxTokens = family === "12B" ? 24 : 20;
+      const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
+        hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
+      const lines: string[] = [];
+      for (const [name, request] of legoCells(prompt.length)) {
+        const graphs = [true, false].map(compiledDecode =>
+          createModel(weights!, model.config, resolveComposition(model.config, { ...request, compiledDecode })) as typeof model);
+        try {
+          // generate(): the library loop.
+          const library: number[][] = [];
+          let compiledSteps = 0;
+          for (const graph of graphs) {
+            const before = CompiledDecode.stepsExecuted, out: number[] = [];
+            for await (const token of generate(graph, prompt, { maxTokens, temperature: 0 })) out.push(token.token);
+            if (graph === graphs[0]) compiledSteps = CompiledDecode.stepsExecuted - before;
+            library.push(out);
+          }
+          expect(library[0]!.length, name).toBeGreaterThan(4);
+          expect(library[0], `${name}: generate`).toEqual(library[1]);
+          expect(compiledSteps, `${name}: generate's compiled steps`).toBeGreaterThanOrEqual(library[0]!.length - 1);
+          // The batch group: one row, placed by the planner, with the request state the composition gives it.
+          const served: number[][] = [];
+          let groupSteps = 0;
+          for (const graph of graphs) {
+            const binding = bindMlxGateway(graph);
+            const options = { temperature: 0, maxTokens, eosTokenIds: [] as number[] };
+            const plan = binding.plan(shape, options, { checkpoints: false });
+            const group = binding.createBatchGroup({ maxBatch: 1 });
+            const before = CompiledDecode.stepsExecuted, out: number[] = [];
+            try {
+              await group.submit({ method: binding.methodRequest!(plan, options)!,
+                statePolicy: binding.statePolicy?.(plan, options, prompt.length + maxTokens), compiledDecode: plan.compiledDecode,
+                promptIds: prompt, maxTokens, eosTokenIds: [], onToken(token: number) { out.push(token); } });
+            } finally { await group.close(); }
+            if (graph === graphs[0]) groupSteps = CompiledDecode.stepsExecuted - before;
+            served.push(out);
+          }
+          expect(served[0], `${name}: batch group`).toEqual(served[1]);
+          expect(groupSteps, `${name}: the batch group's compiled steps`).toBeGreaterThanOrEqual(served[0]!.length - 2);
+          lines.push(`${name}: graph ${graphs[0]!.constructor.name}, generate ${library[0]!.length} tokens (${compiledSteps} compiled steps), ` +
+            `batch group ${served[0]!.length} tokens (${groupSteps} compiled steps), both equal to the decode operation`);
+        } finally {
+          for (const graph of graphs) CompiledDecode.release(graph);
+          mlx.synchronize(mlx.gpuStream); mlx.clearCache();
+        }
+      }
+      console.log(`compiled decode over every lego (${family}):\n  ${lines.join("\n  ")}`);
+    }, timeout * 4);
+
     if (family === "12B") {
       test("a mid-step segment failure fails its generation: the compiled step has no fallback", async () => {
         const extra = { kvBits: 8, kvGroupSize: 64, quantizedKvStart: 0 };
