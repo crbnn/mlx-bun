@@ -935,6 +935,35 @@ unchanged.
       - `models/qwen/mtp.ts` `makeMask`: D3, the MTP companion reads through `attend`.
       - `packages/training/src/kernels/flash-cce.ts` per-dispatch `runtimeValue`: C2's rule,
         the choice becomes a constructor argument of the training kernel's owner.
+- [x] Ratchet emptied (`refactor/composition-ratchet-zero`, 6b7593e6, thirteen commits on
+      6fe59e7c; merging with E5 and the B3 planner side). `cache-escape`: the DFlash 2 context
+      rows append through `appendWindow`; the Gemma 4 and MiniCPM5 training forwards and the
+      padded scoring batch run on stateless `TrainingCache`s (the KV-sharing layer reads its
+      donor through the donor's training cache; `makeTrainingMasks` gone); the contract's
+      seven hatches and their three interfaces are deleted, their state-internal callers
+      reach storage through `state/kv-storage.ts`. `hot-path-read`: `geglu` takes `compiled`
+      as an argument stored by its owners' constructors; GLM-5.2's MLA block takes its read as
+      a strategy at construction through the new `LatentAttentionCache` contract (six
+      conformance cells; the `instanceof MLACache` reads gone); the training flash-CCE kernel
+      is owned by `FlashCce`, constructed with options the trainer reads once when it composes
+      a run (`MLX_BUN_FLASH_MIN_M` moved there from a per-dispatch read in `loss.ts`). The
+      three `trainDrafter` failures (the synthetic target without the width-classed head
+      since E2) are fixed: training native 64 pass / 0 fail; with MiniCPM5 weights 80/0, with
+      e4b 77/3 (the three refuse e4b by design, as on the head). Gates: synthetic identity at
+      maxDiff 0 against frozen copies for Gemma 4, dense, Qwen 3.5, DiffusionGemma, the
+      generated Gemma graphs (395 cases, every training path, padded scoring, GeGLU off) and
+      GLM-5.2 (84 tensors); training forwards' real-weight digests identical (e4b 7, MiniCPM5
+      10, Llama 2); `perplexity` identical on Llama 1B and e4b; DFlash 2 teacher-forced blocks
+      identical; 30 app-path row digests identical. Left, owed: `MLX_BUN_COMPILED_GEGLU` is
+      read once in the Gemma 4, generated and DiffusionGemma constructors (a composition
+      field, `compiledGeglu`, with B4); the MLA block still chooses absorbed or reconstructed
+      attention by token count ("auto"), a phase the scheduler names (with B4's GLM-5.2
+      legos); `activePrefixLayout()` inside the training forwards' block RoPE and
+      `isCompiledTrace()` in `geglu` are run-time reads the gate does not flag (training and
+      compile-context queries; decide or list by name); the frozen references
+      `tests/models/full-sequence-reference.ts` and `geglu-reference.ts` go with the other
+      oracles after the merge; the preserved bug that the flash path ignores the block-sparse
+      mask under prefix-shared training stays as found.
 - [ ] Each new rule's failure message names the paved road, in the style of the existing
       "scheduling reaches storage through the row-layout port" message.
 - [x] Make the library checks a required status check on `main`, so a PR with a failing gate is
