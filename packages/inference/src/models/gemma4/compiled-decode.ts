@@ -30,16 +30,15 @@
 //   ring — bit-exact with the rotating steady state, where a concat
 //   would permute KV positions and change reduction order.
 //
-// The scheduler chooses this step once, for a row it can express, and never falls
-// back: it refuses active LoRA
-// adapters (their weights would bake into the trace as constants) and
-// caches without the compiled-decode capability; a step this module cannot take throws.
+// The composition chooses this step at load, for storage whose every cache it
+// drives, and the scheduler never falls back: it refuses active LoRA
+// adapters (their weights would bake into the trace as constants); a step this
+// module cannot take throws.
 
 import { disposeResources } from "../../runtime/resources";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { CompiledFunction } from "@mlx-bun/mlx/compile";
 import * as ops from "@mlx-bun/mlx/ops";
-import { isCompiledDecodeCache, isRowBatchCache } from "../../state/capabilities";
 import { decodeStepInputs } from "../../state/decode-step-inputs";
 import { setCompiledTrace } from "../../runtime/compiled-trace";
 import type { Cache, CompiledDecodeCache, DecodeSlot, DecodeTrace } from "../../contracts/mlx/cache";
@@ -218,14 +217,6 @@ export class CompiledDecode implements MlxCompiledDecodeStep {
     if (runner) runner.dispose();
   }
 
-  /** Compilable this step? (Cheap; checked per decode step.) Only caches that
-   *  declare the compiled-decode capability, and not a batched layout: even one that
-   *  inherits it (a filtered-to-one rotating quantized ring) carries per-row state
-   *  the trace does not express. */
-  #replayable(caches: readonly Cache[]): boolean {
-    return caches.every((c) => !isRowBatchCache(c) && isCompiledDecodeCache(c));
-  }
-
   /** One decode step: consumes the pending token array (uint32 [1],
    *  unevaluated is fine), advances every cache by one position, returns
    *  the logits node plus the cache-update nodes that must ride the same
@@ -237,7 +228,6 @@ export class CompiledDecode implements MlxCompiledDecodeStep {
     for (const c of caches)
       if (c.offset !== offset0)
         throw new Error("compiled decode: cache offsets diverged");
-    if (!this.#replayable(caches)) throw new Error("compiled decode: a cache does not declare the compiled-decode capability");
     const decodable = caches as CompiledDecodeCache[];
     return this.#segmented
       ? this.#stepSegmented(cur, decodable, offset0)

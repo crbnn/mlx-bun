@@ -31,7 +31,11 @@ function replacement(declared: Parameters<typeof declareGraph>[0] = {}, extra: o
 }
 const bind = (model: RuntimeModel, draft = false) => bindMlxGateway(model,
   draft ? { provider: new NgramProvider(), numDraftTokens: 3 } : undefined);
-const refusals = (plan: { reasons: readonly string[] }) => plan.reasons.filter(reason => reason.endsWith("-unsupported") || reason === "continuous-unavailable");
+const refusals = (plan: { reasons: readonly string[] }) => plan.reasons.filter(reason => reason.endsWith("-unsupported"));
+/** A plan without its compiled-decode note: the loader, not the planner, resolves
+ * compiled decode off for storage with no compiled form (paged, TurboQuant, delayed). */
+const placement = (plan: { reasons: readonly string[] }) =>
+  ({ ...plan, reasons: plan.reasons.filter(reason => reason !== "compiled-decode-unavailable-for-request") });
 
 describe("placement follows the graph's declarations", () => {
   test("the binding reports what the graph declared, once", () => {
@@ -52,7 +56,7 @@ describe("placement follows the graph's declarations", () => {
     const paged = bind(replacement({}, { composition: testComposition(undefined, { pagedKv: { blockSize: 16 } }) }));
     for (const request of [shape, { ...shape, hasAdapters: true }, { ...shape, hasGrammar: true }]) {
       const plan = paged.plan(request, {}, schedule);
-      expect(plan).toEqual(bind(replacement()).plan(request, {}, schedule));
+      expect(placement(plan)).toEqual(placement(bind(replacement()).plan(request, {}, schedule)));
       const state = paged.statePolicy!(plan, {}, 64)!;
       const caches = state.create();
       try { expect(caches.map(cache => cache.signature())).toEqual(["kv:paged"]); }
@@ -85,7 +89,7 @@ describe("placement follows the graph's declarations", () => {
     const reference = bind(replacement({}, composed({})), true).plan(request, {}, schedule);
     expect(reference).toMatchObject({ method: "speculative", mechanism: "continuous" });
     for (const kv of [{ kvBits: 4, quantizedKvStart: 64 }, { kvBits: 8 }, { turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: 0 }])
-      expect(bind(replacement({}, composed(kv)), true).plan(request, {}, schedule), JSON.stringify(kv)).toEqual(reference);
+      expect(placement(bind(replacement({}, composed(kv)), true).plan(request, {}, schedule)), JSON.stringify(kv)).toEqual(placement(reference));
   });
 
   test("a verifier that does not qualify a request shape leaves it ordinary", () => {

@@ -564,7 +564,7 @@ async function* generateInner(
     // ---- decode (pipelined) ----
     // The compiled step is the graph binding's, chosen once for this run's caches; it has no fallback.
     decoder = options.decodePolicy?.compiledDecode === false ? null
-      : binding.createDecode?.({ hasAdapters: !!options.adapters?.length }, cache) ?? null;
+      : binding.createDecode?.({ hasAdapters: !!options.adapters?.length }) ?? null;
     let stop = false;
     /** Token id read eagerly at the top of the loop for grammar (reused for
      *  the yield, avoiding a second readback). -1 when grammar is off — the

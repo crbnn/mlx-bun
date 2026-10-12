@@ -4,6 +4,7 @@ import { Gemma4Model } from "../../src/models/gemma4/model";
 import { UniversalDenseModel } from "../../src/models/universal/dense";
 import { FillSession } from "../../src/generation/fill";
 import type { GenerateOptions } from "../../src/generation";
+import type { ResolvedExecution } from "../../src/contracts/portable/execution";
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
 import { KVCache } from "../../src/state/kv";
 import type { ContinuationServices, ContinuationStore } from "../../src/execution/continuation";
@@ -120,11 +121,17 @@ test("a paged composition pages plain, adapter and media requests alike and keys
   const prompt = [2, 651, 9];
   const fill = { fill: new FillSession({ rows: [], eos: [], echo: null }, prompt) };
   // Paging is the composition's state, never a planner input: every request is
-  // planned exactly as on the unpaged composition, checkpoints included.
+  // planned exactly as on the unpaged composition, checkpoints included. Only
+  // compiled decode differs, which the loader resolves off for paged blocks.
+  const placed = ({ compiledDecode: _compiled, ...plan }: ResolvedExecution) =>
+    ({ ...plan, reasons: plan.reasons.filter(reason => reason !== "compiled-decode-unavailable-for-request") });
   for (const [request, options] of [[shape, {}], [adapterShape, adapters], [{ ...shape, hasVision: true }, {}],
     [{ ...adapterShape, hasGrammar: true }, adapters], [adapterShape, { ...adapters, ...fill }],
     [{ ...adapterShape, wantsLogprobs: true }, adapters]] as const)
-    expect({ request, plan: binding.plan(request, options, schedule) }).toEqual({ request, plan: unpaged.plan(request, options, schedule) });
+    expect({ request, plan: placed(binding.plan(request, options, schedule)) })
+      .toEqual({ request, plan: placed(unpaged.plan(request, options, schedule)) });
+  expect(binding.plan(shape, {}, schedule).compiledDecode).toBe(false);
+  expect(unpaged.plan(shape, {}, schedule).compiledDecode).toBe(true);
   // The adapter row pages; its prefixes and checkpoints live in the paged namespace over its own.
   const plan = binding.plan(adapterShape, adapters, schedule);
   expect(plan).toMatchObject({ method: "autoregressive", mechanism: "continuous", promptCache: true, checkpoint: true });

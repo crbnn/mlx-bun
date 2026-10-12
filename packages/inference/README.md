@@ -42,7 +42,10 @@ The batch group and the autoregressive binding take the structural `MlxTokenGrap
 the registry's `RuntimeModel` union. A graph's compiled decode step lives with that
 graph (`models/gemma4/compiled-decode`) and reaches them through `compiledDecodeStep`;
 it drives caches through the `CompiledDecodeCache` protocol (`contracts/mlx/cache`,
-implemented by the KV caches in `state/`) and names no cache class.
+implemented by the KV caches in `state/`) and names no cache class. The loader
+keeps `Composition.compiledDecode` on only where every serial cache a row holds
+has that form (`decodesCompiled` in `state/kv-maintenance`: not TurboQuant, a
+delayed start or paged blocks); nothing asks a cache at run time.
 The architecture gate rejects concrete model imports, model-class `instanceof`,
 model-type and `architectures` checks, family predicates and model-scoped flags there,
 in the app's engine, server and CLI, and in `@mlx-bun/training`. What those need to

@@ -108,6 +108,18 @@ test("the scheduler switches are composition fields at their defaults; the runti
     expect(() => resolveComposition(config, { mixedTokenBudget })).toThrow("composition mixedTokenBudget must be a positive integer");
 });
 
+test("compiled decode is resolved at load from the storage's compiled form: bf16 and affine converting at the first append keep it", () => {
+  const compiled = (request: Parameters<typeof resolveComposition>[1]) => resolveComposition(config, request).compiledDecode;
+  expect(compiled({})).toBe(true);
+  expect(compiled({ kv: { override: 4, quantizedKvStart: 0 } })).toBe(true);
+  expect(compiled({ kv: { override: 8 } })).toBe(true);
+  // TurboQuant storage, a delayed start and paged blocks have no compiled form, whatever is asked.
+  for (const request of [{ kv: { turboQuant: { kBits: 8, vBits: 3 } } }, { kv: { override: 4 as const, quantizedKvStart: 40 } },
+    { pagedKv: {} }, { pagedKv: {}, compiledDecode: true }])
+    expect(compiled(request), JSON.stringify(request)).toBe(false);
+  expect(compiled({ compiledDecode: false })).toBe(false);
+});
+
 test("the loaded drafter fixes the depth, or caps it when the scheduler adapts; rows and adapters are recorded as given", () => {
   expect(resolveComposition(config, { draft: { numDraftTokens: 3 } }).draftDepth).toBe(3);
   expect(resolveComposition(config, { draft: { numDraftTokens: 7, adaptive: true } }).draftDepth).toEqual({ adaptive: true, max: 7 });

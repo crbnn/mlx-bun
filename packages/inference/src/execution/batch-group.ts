@@ -71,7 +71,6 @@ import { compiledDecodeStepOf, tokenPhasesOf } from "../models/capabilities";
 import type { MlxTokenGraph } from "../models/graph";
 import { runtimeConfig,withRuntimeConfig,type RuntimeConfig } from "../runtime/config";
 import { independentGreedySampling } from "../sampling/index";
-import { isCompiledDecodeCache,isRowBatchCache } from "../state/capabilities";
 import { createKvMaintenance,type KvMaintenance } from "../state/kv-maintenance";
 import { kvSchemeOf,type KvScheme } from "../state/kv-scheme";
 import { extractSoleRow,filterLayoutRows,ownedCacheLayout,publishRow,rowAdmission } from "../state/layout";
@@ -206,9 +205,9 @@ export class MlxBatchExecutionGroup {
     catch (error) { for (const cache of proto) cache.dispose(); throw error; }
     this.#denseKvLayers = denseKvLayers.length ? denseKvLayers : null;
     this.#rowAdmission = rowAdmission(proto);
-    const replayable = proto.every(cache => isCompiledDecodeCache(cache) && !isRowBatchCache(cache));
     for (const c of proto) c.dispose();
-    this.#compiled = replayable && facts.compiledDecode
+    // The composition decided at load whether its storage has a compiled form.
+    this.#compiled = facts.compiledDecode
       ? withRuntimeConfig(this.#runtime, () => compiledDecodeStepOf(model))
       : null;
     this.#dispatch = new MlxPhaseDispatch(tokenPhasesOf(model));
@@ -684,11 +683,10 @@ export class MlxBatchExecutionGroup {
     // mergeRows takes such an adopted row as its first row.
     if (!this.#inners) {
       // The adopted row decodes through the compiled step when its request
-      // allows replay and every cache it holds is one the step drives (a
-      // stored prefix comes back as the graph's composed caches, a cohort row
-      // as its layout's serial form).
-      this.#compiledRow = this.#compiled !== null && p.row.req.compiledDecode !== false &&
-        p.solo.every(cache => isCompiledDecodeCache(cache) && !isRowBatchCache(cache));
+      // allows replay. The composition has the step only when every serial
+      // cache a row holds is one it drives (a stored prefix comes back as the
+      // graph's composed caches, a cohort row as its layout's serial form).
+      this.#compiledRow = this.#compiled !== null && p.row.req.compiledDecode !== false;
       this.#inners = p.solo; p.solo = [];
       this.#adoptedRetain = p.retain ?? null; p.retain = undefined;
       this.#running.push(p.row);

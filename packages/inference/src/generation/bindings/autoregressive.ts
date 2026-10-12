@@ -8,7 +8,6 @@ import type { MlxTokenGraph } from "../../models/graph";
 import type { PrefillPolicy } from "../../contracts/portable/prefill";
 import { resolveMlxPrefillPolicy } from "./prefill-policy";
 import { COMPOSITION_DEFAULTS, type KvStorageScheme } from "../../contracts/portable/composition";
-import { isCompiledDecodeCache, isRowBatchCache } from "../../state/capabilities";
 import { MlxPhaseDispatch } from "../phase-dispatch";
 
 export type { MlxModelMemory };
@@ -66,12 +65,12 @@ export interface MlxAutoregressiveBinding {
     embeddings: MlxArray, state: Cache[], imageMask: MlxArray | null,
     ids: MlxArray, multimodalMask: MlxArray | null, width: MlxWidthClass,
   ): MlxArray;
-  /** The graph's compiled decode step for this run's `state`, chosen once after
+  /** The graph's compiled decode step for this run, chosen once after
    * prefill: present when the graph declares one, the run allows replay and
-   * every cache is one the step drives. A compiled/fused decoder belongs to
+   * its composition kept compiled decode on. A compiled/fused decoder belongs to
    * THIS graph, never to a model inferred from a name or inherited by a
    * replacement. */
-  createDecode?(policy: { hasAdapters: boolean }, state: readonly Cache[]): MlxDecodeStep | null;
+  createDecode?(policy: { hasAdapters: boolean }): MlxDecodeStep | null;
 }
 
 /** Bind a resident graph to the autoregressive method: its phases, caches and
@@ -95,11 +94,11 @@ export function bindMlxAutoregressiveGraph(model: MlxTokenGraph): MlxAutoregress
     ...(model.knownSpans ? { knownSpans: model.knownSpans } : {}),
     makeCache: model.makeCache.bind(model),
     prefillEmbeddings: model.prefillEmbeddings?.bind(model),
-    createDecode(policy, state) {
-      // Only a graph that declares a compiled step has one. Adapters would bake
-      // residuals into the tape.
-      if (!compiledOn || policy.hasAdapters ||
-          !state.every(cache => isCompiledDecodeCache(cache) && !isRowBatchCache(cache))) return null;
+    createDecode(policy) {
+      // Only a graph that declares a compiled step has one, and only a
+      // composition whose storage the step drives keeps it on. Adapters would
+      // bake residuals into the tape.
+      if (!compiledOn || policy.hasAdapters) return null;
       const compiled: MlxCompiledDecodeStep | null = compiledDecodeStepOf(model);
       if (!compiled) return null;
       // The graph owns the compiled closures; its unload releases them.

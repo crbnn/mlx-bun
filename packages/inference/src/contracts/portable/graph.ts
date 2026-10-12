@@ -34,7 +34,8 @@ export interface GraphCapabilities {
    * embeddings need a `bindMediaInput` operation; `video` says video frames
    * are accepted input. */
   readonly media: { readonly input: GraphMediaInput; readonly video: boolean } | null;
-  /** The graph owns a compiled decode step. Cache geometry can still decline it. */
+  /** The graph owns a compiled decode step. The composition keeps it on only
+   * where its storage has a compiled form (`Composition.compiledDecode`). */
   readonly compiledDecode: boolean;
   /** Attention selects a sparse subset of positions (surfaced to clients). */
   readonly sparseAttention: boolean;

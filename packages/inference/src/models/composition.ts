@@ -8,6 +8,7 @@ import { runtimeConfig, type RuntimeConfig } from "../runtime/config";
 import { resolveKvScheme, type KvQuantOverride } from "../state/kv-scheme";
 import { PagedKVCache } from "../state/paged/cache";
 import { pagesStore } from "../state/request-policy";
+import { decodesCompiled } from "../state/kv-maintenance";
 
 /** Rows per forward when the caller states no cap (the app's `--batch` default). */
 export const DEFAULT_MAX_ROWS = 8;
@@ -52,7 +53,8 @@ export interface CompositionRequest {
   readonly packedMixedMlp?: boolean;
   /** One argmax over a decode step whose live rows are all plain greedy. Default true. */
   readonly vectorGreedySampling?: boolean;
-  /** A lone ordinary row decodes through the graph's compiled step. Default true. */
+  /** A lone ordinary row decodes through the graph's compiled step. Default true;
+   * off whatever is asked for a KV scheme or paging with no compiled form. */
   readonly compiledDecode?: boolean;
   /** One forward carries a decode group and a prefill group. Default false. */
   readonly mixedPrefill?: boolean;
@@ -97,7 +99,8 @@ export function resolveComposition(config: ModelConfig, request: CompositionRequ
     maxRows,
     packedMixedMlp: request.packedMixedMlp ?? COMPOSITION_DEFAULTS.packedMixedMlp,
     vectorGreedySampling: request.vectorGreedySampling ?? COMPOSITION_DEFAULTS.vectorGreedySampling,
-    compiledDecode: request.compiledDecode ?? COMPOSITION_DEFAULTS.compiledDecode,
+    // A cache lego without a compiled form decodes eagerly: decided here, once.
+    compiledDecode: (request.compiledDecode ?? COMPOSITION_DEFAULTS.compiledDecode) && decodesCompiled(kv, pagedKv !== null),
     mixedPrefill: request.mixedPrefill ?? COMPOSITION_DEFAULTS.mixedPrefill,
     mixedTokenBudget,
     prefillTailSplit: request.prefillTailSplit ?? COMPOSITION_DEFAULTS.prefillTailSplit,
