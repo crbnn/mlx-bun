@@ -1,13 +1,15 @@
-// GLM-5.2's graph against its frozen copy (tests/models/glm52-reference, the
-// graph, MLA block, MTP row and compressed cache at the B4 base) over synthetic
-// weights, at maxDiff 0: a dense layer and two MoE layers (shared and routed
-// experts), DSA on and off (a full indexer layer, a layer that shares its
-// selection, and selections past `index_topk`, so the token-serial DSA loops
-// run), native MTP. Every phase the scheduler calls: a prompt chunk, a prompt
-// tail, decodes, a verify window, known tokens, two batched rows of different
-// lengths (decode and verify), the scoring forward; the hidden states, the
-// logits and every stored cache tensor after each. No artifact exists on this
-// machine; this is the oracle for the graph's own changes.
+// GLM-5.2's graph over synthetic weights, held to its recorded digest
+// (tests/fixtures/synthetic-digests/glm52.json; tests/models/synthetic-digest.ts):
+// a dense layer and two MoE layers (shared and routed experts), DSA on and off
+// (a full indexer layer, a layer that shares its selection, and selections past
+// `index_topk`, so the token-serial DSA loops run), native MTP. Every phase the
+// scheduler calls: a prompt chunk, a prompt tail, decodes, a verify window, known
+// tokens, two batched rows of different lengths (decode and verify), the scoring
+// forward; the hidden states, the logits and every stored cache tensor after
+// each. No artifact holds GLM-5.2 numbers on either machine; the digest was
+// recorded from the tree whose graph equalled the B4 base's at maxDiff 0 on
+// these cases, so it carries that check forward. The latent legos follow: f32
+// pages against the f32 lego at maxDiff 0, the encoded forms by KL.
 import { afterAll, describe, expect, test } from "bun:test";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
@@ -18,10 +20,9 @@ import type { Cache, LatentAttentionCache } from "../../../src/contracts/mlx/cac
 import type { Glm52WeightSource } from "../../../src/contracts/mlx/glm52-weights";
 import { widthClass } from "../../../src/contracts/mlx/width";
 import { Glm52Model } from "../../../src/models/glm52/model";
-import { Glm52Model as FrozenGlm52Model } from "../glm52-reference/model";
-import { MLACache as FrozenMLACache } from "../glm52-reference/cache";
 import { MLACache } from "../../../src/state/glm52-cache";
 import type { KvStorageScheme } from "../../../src/contracts/portable/composition";
+import { syntheticDigests, type DigestCase } from "../synthetic-digest";
 
 // ---------------------------------------------------------------------------
 // Synthetic geometry and weights
@@ -30,7 +31,7 @@ const HIDDEN = 16, HEADS = 2, Q_RANK = 8, KV_RANK = 8, NOPE = 4, ROPE = 4, VALUE
 const INTER = 16, MOE_INTER = 8, EXPERTS = 4, VOCAB = 48, LAYERS = 3;
 const INDEX_TOPK = 6, INDEX_HEADS = 2, INDEX_DIM = 8;
 
-/** The latent widths: the identity scenarios' small ones, or widths every latent lego encodes (affine groups of 64, TurboQuant's widths). */
+/** The latent widths: the digest scenarios' small ones, or widths every latent lego encodes (affine groups of 64, TurboQuant's widths). */
 interface LatentWidths { readonly kvRank: number; readonly rope: number; readonly index: number }
 const SMALL: LatentWidths = { kvRank: KV_RANK, rope: ROPE, index: INDEX_DIM };
 
@@ -146,51 +147,26 @@ class SyntheticWeights implements Glm52WeightSource {
 }
 
 // ---------------------------------------------------------------------------
-// Comparison
+// Digest
 
-const totals = new Map<string, { tensors: number; worst: number }>();
-afterAll(() => {
-  for (const [label, { tensors, worst }] of totals)
-    console.log(`glm52-identity ${label}: maxDiff ${worst} over ${tensors} tensors`);
-});
+const digests = syntheticDigests("glm52");
 
 function host(a: MlxArray): Float32Array {
   using wide = a.astype(Dtype.float32);
   using flat = ops.contiguous(wide);
   return flat.toFloat32();
 }
-function expectSame(label: string, scenario: string, actual: MlxArray, expected: MlxArray): void {
+/** Same shape, dtype and bytes. */
+function expectSame(label: string, actual: MlxArray, expected: MlxArray): void {
   expect(actual.shape, `${label} shape`).toEqual(expected.shape);
   expect(actual.dtype, `${label} dtype`).toBe(expected.dtype);
-  const x = host(actual), y = host(expected);
-  let worst = 0;
-  for (let i = 0; i < x.length; i++) {
-    const d = Math.abs(x[i]! - y[i]!);
-    if (!(d <= worst)) worst = Number.isNaN(d) ? Infinity : d;
-  }
-  const total = totals.get(scenario) ?? { tensors: 0, worst: 0 };
-  totals.set(scenario, { tensors: total.tensors + 1, worst: Math.max(total.worst, worst) });
-  expect(worst, `${label} maxDiff`).toBe(0);
-}
-/** Every stored tensor of both cache lists, in order. */
-function expectCaches(label: string, scenario: string, actual: Cache[], expected: Cache[]): void {
-  expect(actual.length).toBe(expected.length);
-  for (let layer = 0; layer < actual.length; layer++) {
-    const a = actual[layer]!, e = expected[layer]!;
-    expect(a.offset, `${label} layer ${layer} offset`).toBe(e.offset);
-    expect([...(a as LatentAttentionCache).rowOffsets], `${label} layer ${layer} rows`)
-      .toEqual([...(e as LatentAttentionCache).rowOffsets]);
-    const as = a.state(), es = e.state();
-    expect(as.length, `${label} layer ${layer} planes`).toBe(es.length);
-    for (let plane = 0; plane < as.length; plane++)
-      expectSame(`${label} layer ${layer} plane ${plane}`, scenario, as[plane]!, es[plane]!);
-  }
+  using left = ops.contiguous(actual), right = ops.contiguous(expected);
+  expect(Buffer.from(left.rawBytes()).equals(Buffer.from(right.rawBytes())), `${label} maxDiff 0`).toBe(true);
 }
 
-type Graph = Glm52Model | FrozenGlm52Model;
 type Phase = "chunk" | "tail" | "decode" | "verify" | "known";
 /** The phase operation for the rows of `ids` (sequences times tokens), as the scheduler indexes it. */
-async function phase(graph: Graph, which: Phase, ids: MlxArray, cache: Cache[]): Promise<MlxArray> {
+async function phase(graph: Glm52Model, which: Phase, ids: MlxArray, cache: Cache[]): Promise<MlxArray> {
   const width = widthClass(ids.shape[0]! * ids.shape[1]!);
   switch (which) {
     case "chunk": return await graph.prefillChunk.gpu(ids, cache, null);
@@ -202,116 +178,102 @@ async function phase(graph: Graph, which: Phase, ids: MlxArray, cache: Cache[]):
 }
 const tokens = (count: number, salt: number) => Array.from({ length: count }, (_, i) => 3 + (i * 7 + salt * 5) % (VOCAB - 3));
 
-/** Run one phase on both graphs over the same ids and compare the hidden, the
- * logits and the caches. */
-async function both(scenario: string, label: string, graphs: { current: Graph; frozen: Graph },
-  caches: { current: Cache[]; frozen: Cache[] }, which: Phase, rows: number[][]): Promise<void> {
+/** Run one phase over `rows` and hand the hidden, the logits and the caches to the digest. */
+async function step(digest: DigestCase, label: string, graph: Glm52Model, caches: Cache[], which: Phase,
+  rows: number[][]): Promise<void> {
   using ids = ops.fromInt32(rows.flat(), [rows.length, rows[0]!.length]);
-  using actual = await phase(graphs.current, which, ids, caches.current);
-  using expected = await phase(graphs.frozen, which, ids, caches.frozen);
-  expectSame(`${scenario} ${label} hidden`, scenario, actual, expected);
-  using actualLogits = graphs.current.logitsFromHidden(actual);
-  using expectedLogits = graphs.frozen.logitsFromHidden(expected);
-  expectSame(`${scenario} ${label} logits`, scenario, actualLogits, expectedLogits);
-  expectCaches(`${scenario} ${label}`, scenario, caches.current, caches.frozen);
+  using hidden = await phase(graph, which, ids, caches);
+  using logits = graph.logitsFromHidden(hidden);
+  digest.tensors(`${label} hidden`, hidden);
+  digest.tensors(`${label} logits`, logits);
+  digest.caches(`${label} caches`, caches);
 }
 
 function dispose(...lists: Cache[][]): void { for (const list of lists) for (const cache of list) cache.dispose(); }
 
-for (const dsa of [true, false]) describe(`GLM-5.2 graph identity (DSA ${dsa ? "on" : "off"})`, () => {
+for (const dsa of [true, false]) describe(`GLM-5.2 graph (DSA ${dsa ? "on" : "off"})`, () => {
   const glm = glmConfig(dsa);
   const config = { modelType: "glm_moe_dsa", text: { numHiddenLayers: LAYERS }, eosTokenIds: [1] } as unknown as ModelConfig;
   const weights = new SyntheticWeights(glm);
   const capabilities = { dsa, mtpMetadata: true, mtpEnabled: true, mtpDraftTokens: 3 };
-  const graphs = { current: new Glm52Model(weights, config, glm, capabilities), frozen: new FrozenGlm52Model(weights, config, glm, capabilities) };
+  const graph = new Glm52Model(weights, config, glm, capabilities);
   const scenario = `DSA ${dsa ? "on" : "off"}`;
   afterAll(() => weights.dispose());
 
-  test("one sequence: chunk past index_topk, tail, decodes, verify, known tokens", async () => {
-    const caches = { current: graphs.current.makeCache() as Cache[], frozen: graphs.frozen.makeCache() as Cache[] };
+  digests.test(`${scenario}: one sequence: chunk past index_topk, tail, decodes, verify, known tokens`, async digest => {
+    const caches = graph.makeCache() as Cache[];
     try {
       const modes: string[] = [];
-      graphs.current.setDsaSelectionObserver(selection => modes.push(selection.mode));
-      await both(scenario, "chunk 12", graphs, caches, "chunk", [tokens(12, 1)]);
-      await both(scenario, "tail 3", graphs, caches, "tail", [tokens(3, 2)]);
-      for (let step = 0; step < 3; step++) await both(scenario, `decode ${step}`, graphs, caches, "decode", [tokens(1, 3 + step)]);
-      await both(scenario, "verify 4", graphs, caches, "verify", [tokens(4, 7)]);
-      await both(scenario, "known 2", graphs, caches, "known", [tokens(2, 8)]);
-      await both(scenario, "known 1", graphs, caches, "known", [tokens(1, 9)]);
-      await both(scenario, "decode after", graphs, caches, "decode", [tokens(1, 10)]);
+      graph.setDsaSelectionObserver(selection => modes.push(selection.mode));
+      await step(digest, "chunk 12", graph, caches, "chunk", [tokens(12, 1)]);
+      await step(digest, "tail 3", graph, caches, "tail", [tokens(3, 2)]);
+      for (let index = 0; index < 3; index++) await step(digest, `decode ${index}`, graph, caches, "decode", [tokens(1, 3 + index)]);
+      await step(digest, "verify 4", graph, caches, "verify", [tokens(4, 7)]);
+      await step(digest, "known 2", graph, caches, "known", [tokens(2, 8)]);
+      await step(digest, "known 1", graph, caches, "known", [tokens(1, 9)]);
+      await step(digest, "decode after", graph, caches, "decode", [tokens(1, 10)]);
       // The DSA scenario reads sparse selections past index_topk (the token-serial loops) as well as dense ones.
       if (dsa) expect([...new Set(modes)].sort()).toEqual(["dense", "sparse"]);
       else expect(modes).toEqual([]);
-    } finally { graphs.current.setDsaSelectionObserver(null); dispose(caches.current, caches.frozen); }
+    } finally { graph.setDsaSelectionObserver(null); dispose(caches); }
   });
 
-  test("a short prompt below index_topk, then decodes across it", async () => {
-    const caches = { current: graphs.current.makeCache() as Cache[], frozen: graphs.frozen.makeCache() as Cache[] };
+  digests.test(`${scenario}: a short prompt below index_topk, then decodes across it`, async digest => {
+    const caches = graph.makeCache() as Cache[];
     try {
-      await both(scenario, "chunk 4", graphs, caches, "chunk", [tokens(4, 11)]);
-      for (let step = 0; step < 4; step++) await both(scenario, `decode ${step}`, graphs, caches, "decode", [tokens(1, 12 + step)]);
-      await both(scenario, "verify 3", graphs, caches, "verify", [tokens(3, 16)]);
-    } finally { dispose(caches.current, caches.frozen); }
+      await step(digest, "chunk 4", graph, caches, "chunk", [tokens(4, 11)]);
+      for (let index = 0; index < 4; index++) await step(digest, `decode ${index}`, graph, caches, "decode", [tokens(1, 12 + index)]);
+      await step(digest, "verify 3", graph, caches, "verify", [tokens(3, 16)]);
+    } finally { dispose(caches); }
   });
 
-  test("two batched rows of different lengths: decode and verify", async () => {
-    const serial = (graph: Graph) => graph.makeCache() as Cache[];
-    const rows = { current: [serial(graphs.current), serial(graphs.current)], frozen: [serial(graphs.frozen), serial(graphs.frozen)] };
-    const batched: { current: Cache[]; frozen: Cache[] } = { current: [], frozen: [] };
+  digests.test(`${scenario}: two batched rows of different lengths: decode and verify`, async digest => {
+    const rows = [graph.makeCache() as Cache[], graph.makeCache() as Cache[]];
+    const batched: Cache[] = [];
     try {
-      for (const [row, length] of [9, 5].entries()) {
-        await both(scenario, `row ${row} prompt`, graphs, { current: rows.current[row]!, frozen: rows.frozen[row]! }, "chunk",
-          [tokens(length, 21 + row)]);
+      for (const [row, length] of [9, 5].entries())
+        await step(digest, `row ${row} prompt`, graph, rows[row]!, "chunk", [tokens(length, 21 + row)]);
+      for (let layer = 0; layer < LAYERS; layer++) {
+        const first = rows[0]![layer]! as LatentAttentionCache & { makeEmptyBatch(): Cache; };
+        const layout = first.makeEmptyBatch() as Cache & { mergeRows(rows: readonly Cache[]): void };
+        layout.mergeRows(rows.map(list => list[layer]!));
+        batched.push(layout);
       }
-      for (const side of ["current", "frozen"] as const) {
-        for (let layer = 0; layer < LAYERS; layer++) {
-          const first = rows[side][0]![layer]! as LatentAttentionCache & { makeEmptyBatch(): Cache; };
-          const layout = first.makeEmptyBatch() as Cache & { mergeRows(rows: readonly Cache[]): void };
-          layout.mergeRows(rows[side].map(list => list[layer]!));
-          batched[side].push(layout);
-        }
-      }
-      expectCaches(`${scenario} merged`, scenario, batched.current, batched.frozen);
-      for (let step = 0; step < 2; step++)
-        await both(scenario, `rows decode ${step}`, graphs, batched, "decode", [tokens(1, 30 + step), tokens(1, 40 + step)]);
-      await both(scenario, "rows verify 3", graphs, batched, "verify", [tokens(3, 50), tokens(3, 51)]);
-    } finally { dispose(...rows.current, ...rows.frozen, batched.current, batched.frozen); }
+      digest.caches("merged", batched);
+      for (let index = 0; index < 2; index++)
+        await step(digest, `rows decode ${index}`, graph, batched, "decode", [tokens(1, 30 + index), tokens(1, 40 + index)]);
+      await step(digest, "rows verify 3", graph, batched, "verify", [tokens(3, 50), tokens(3, 51)]);
+    } finally { dispose(...rows, batched); }
   });
 
-  test("the scoring forward over the whole sequence", () => {
-    const caches = { current: graphs.current.makeCache() as Cache[], frozen: graphs.frozen.makeCache() as Cache[] };
+  digests.test(`${scenario}: the scoring forward over the whole sequence`, digest => {
+    const caches = graph.makeCache() as Cache[];
     try {
       using ids = ops.fromInt32(tokens(5, 60), [1, 5]);
-      using actual = graphs.current.sequenceHidden(ids, caches.current, "fiveToEight");
-      using expected = graphs.frozen.sequenceHidden(ids, caches.frozen, "fiveToEight");
-      expectSame(`${scenario} scoring hidden`, scenario, actual, expected);
-      expectCaches(`${scenario} scoring`, scenario, caches.current, caches.frozen);
-    } finally { dispose(caches.current, caches.frozen); }
+      using hidden = graph.sequenceHidden(ids, caches, "fiveToEight");
+      digest.tensors("scoring hidden", hidden);
+      digest.caches("scoring caches", caches);
+    } finally { dispose(caches); }
   });
 
-  test("native MTP: the draft row's forward and head over its own compressed state", async () => {
-    const current = graphs.current.nativeDraftHead(), frozen = graphs.frozen.nativeDraftHead();
-    const caches = { current: graphs.current.makeCache() as Cache[], frozen: graphs.frozen.makeCache() as Cache[] };
-    const geometry = { ...current.cache, role: "mtp" as const };
-    const mtpCache = { current: new MLACache(geometry) as Cache, frozen: new FrozenMLACache(geometry) as Cache };
+  digests.test(`${scenario}: native MTP: the draft row's forward and head over its own compressed state`, async digest => {
+    const head = graph.nativeDraftHead();
+    const caches = graph.makeCache() as Cache[];
+    const mtpCache = new MLACache({ ...head.cache, role: "mtp" as const });
     try {
       using ids = ops.fromInt32(tokens(4, 70), [1, 4]);
-      using hidden = await graphs.current.prefillChunk.gpu(ids, caches.current, null);
-      using hiddenFrozen = await graphs.frozen.prefillChunk.gpu(ids, caches.frozen, null);
-      expectSame(`${scenario} mtp anchor`, scenario, hidden, hiddenFrozen);
-      for (let step = 0; step < 2; step++) {
-        using draftIds = ops.fromInt32(tokens(step === 0 ? 4 : 1, 71 + step), [1, step === 0 ? 4 : 1]);
-        using anchor = step === 0 ? ops.contiguous(hidden) : hidden.slice([0, 3, 0], [1, 4, HIDDEN]);
-        // The current head names the phase; the frozen one chose it by token count.
-        using out = await (step === 0 ? current.window(draftIds, anchor, mtpCache.current as LatentAttentionCache) : current.decode(draftIds, anchor, mtpCache.current as LatentAttentionCache));
-        using outFrozen = await frozen.forward(draftIds, anchor, mtpCache.frozen as LatentAttentionCache);
-        expectSame(`${scenario} mtp ${step} hidden`, scenario, out, outFrozen);
-        using logits = current.project(out);
-        using logitsFrozen = frozen.project(outFrozen);
-        expectSame(`${scenario} mtp ${step} logits`, scenario, logits, logitsFrozen);
+      using hidden = await graph.prefillChunk.gpu(ids, caches, null);
+      digest.tensors("mtp anchor", hidden);
+      for (let index = 0; index < 2; index++) {
+        using draftIds = ops.fromInt32(tokens(index === 0 ? 4 : 1, 71 + index), [1, index === 0 ? 4 : 1]);
+        using anchor = index === 0 ? ops.contiguous(hidden) : hidden.slice([0, 3, 0], [1, 4, HIDDEN]);
+        using out = await (index === 0 ? head.window(draftIds, anchor, mtpCache) : head.decode(draftIds, anchor, mtpCache));
+        using logits = head.project(out);
+        digest.tensors(`mtp ${index} hidden`, out);
+        digest.tensors(`mtp ${index} logits`, logits);
       }
-      expectCaches(`${scenario} mtp`, scenario, [mtpCache.current], [mtpCache.frozen]);
-    } finally { dispose(caches.current, caches.frozen, [mtpCache.current, mtpCache.frozen]); }
+      digest.caches("mtp caches", [mtpCache]);
+    } finally { dispose(caches, [mtpCache]); }
   });
 });
 
@@ -319,7 +281,7 @@ for (const dsa of [true, false]) describe(`GLM-5.2 graph identity (DSA ${dsa ? "
 // The latent legos (B4): the caches GLM-5.2's graph composes for the
 // composition's KV scheme and paging. Latent widths every lego encodes (affine
 // groups of 64; TurboQuant's widths). f32 pages read the f32 lego's bits, so the
-// paged graph equals the frozen f32 graph at maxDiff 0 (hidden and logits; the
+// paged graph equals the graph over the f32 lego at maxDiff 0 (hidden and logits; the
 // pages are a different layout, so their tensors are not compared). The encoded
 // forms have no oracle: their logits are compared with the f32 graph's over the
 // same teacher-forced phases, by KL, and reported.
@@ -347,7 +309,7 @@ for (const dsa of [true, false]) describe(`GLM-5.2 latent legos (DSA ${dsa ? "on
   const config = { modelType: "glm_moe_dsa", text: { numHiddenLayers: LAYERS }, eosTokenIds: [1] } as unknown as ModelConfig;
   const weights = new SyntheticWeights(glm);
   const capabilities = { dsa, mtpMetadata: true, mtpEnabled: true, mtpDraftTokens: 3 };
-  const frozen = new FrozenGlm52Model(weights, config, glm, capabilities);
+  const plain = new Glm52Model(weights, config, glm, capabilities);
   const composed = (kv: KvStorageScheme, paged: boolean) => new Glm52Model(weights, config, glm, capabilities, null, null,
     "exact", 0, { kv, pagedKv: paged ? { blockSize: 4 } : null });
   const scenario = `latent legos DSA ${dsa ? "on" : "off"}`;
@@ -357,30 +319,30 @@ for (const dsa of [true, false]) describe(`GLM-5.2 latent legos (DSA ${dsa ? "on
     ["decode", [tokens(1, 3)]], ["decode", [tokens(1, 4)]], ["decode", [tokens(1, 5)]], ["verify", [tokens(4, 7)]],
     ["known", [tokens(2, 8)]], ["decode", [tokens(1, 10)]]];
 
-  test("f32 pages: every phase, and two merged rows, equal the frozen f32 graph at maxDiff 0", async () => {
+  test("f32 pages: every phase, and two merged rows, equal the f32 lego at maxDiff 0", async () => {
     const paged = composed({ kind: "bf16" }, true);
-    const caches = { current: paged.makeCache(), frozen: frozen.makeCache() as Cache[] };
+    const caches = { paged: paged.makeCache(), plain: plain.makeCache() as Cache[] };
     try {
-      expect(caches.current.every(cache => cache.signature().startsWith("kv:latent-paged:"))).toBe(true);
+      expect(caches.paged.every(cache => cache.signature().startsWith("kv:latent-paged:"))).toBe(true);
       for (const [index, [which, rows]] of sequence.entries()) {
         using ids = ops.fromInt32(rows.flat(), [rows.length, rows[0]!.length]);
-        using actual = await phase(paged, which, ids, caches.current);
-        using expected = await phase(frozen, which, ids, caches.frozen);
-        expectSame(`${scenario} paged ${which} ${index} hidden`, scenario, actual, expected);
-        using a = paged.logitsFromHidden(actual), b = frozen.logitsFromHidden(expected);
-        expectSame(`${scenario} paged ${which} ${index} logits`, scenario, a, b);
+        using actual = await phase(paged, which, ids, caches.paged);
+        using expected = await phase(plain, which, ids, caches.plain);
+        expectSame(`${scenario} paged ${which} ${index} hidden`, actual, expected);
+        using a = paged.logitsFromHidden(actual), b = plain.logitsFromHidden(expected);
+        expectSame(`${scenario} paged ${which} ${index} logits`, a, b);
       }
-    } finally { dispose(caches.current, caches.frozen); }
+    } finally { dispose(caches.paged, caches.plain); }
     // Two rows of different lengths, merged into each storage's own layout.
-    const rows = { current: [paged.makeCache(), paged.makeCache()], frozen: [frozen.makeCache() as Cache[], frozen.makeCache() as Cache[]] };
-    const batched: { current: Cache[]; frozen: Cache[] } = { current: [], frozen: [] };
+    const rows = { paged: [paged.makeCache(), paged.makeCache()], plain: [plain.makeCache() as Cache[], plain.makeCache() as Cache[]] };
+    const batched: { paged: Cache[]; plain: Cache[] } = { paged: [], plain: [] };
     try {
       for (const [row, length] of [9, 5].entries()) {
         using ids = ops.fromInt32(tokens(length, 21 + row), [1, length]);
-        (await phase(paged, "chunk", ids, rows.current[row]!)).dispose();
-        (await phase(frozen, "chunk", ids, rows.frozen[row]!)).dispose();
+        (await phase(paged, "chunk", ids, rows.paged[row]!)).dispose();
+        (await phase(plain, "chunk", ids, rows.plain[row]!)).dispose();
       }
-      for (const side of ["current", "frozen"] as const)
+      for (const side of ["paged", "plain"] as const)
         for (let layer = 0; layer < LAYERS; layer++) {
           const layout = (rows[side][0]![layer] as Cache & { makeEmptyBatch(): Cache & { mergeRows(rows: readonly Cache[]): void } }).makeEmptyBatch();
           layout.mergeRows(rows[side].map(list => list[layer]!));
@@ -388,11 +350,11 @@ for (const dsa of [true, false]) describe(`GLM-5.2 latent legos (DSA ${dsa ? "on
         }
       for (const [which, ids] of [["decode", [tokens(1, 30), tokens(1, 40)]], ["verify", [tokens(3, 50), tokens(3, 51)]]] as const) {
         using input = ops.fromInt32(ids.flat(), [2, ids[0]!.length]);
-        using actual = await phase(paged, which, input, batched.current);
-        using expected = await phase(frozen, which, input, batched.frozen);
-        expectSame(`${scenario} paged rows ${which} hidden`, scenario, actual, expected);
+        using actual = await phase(paged, which, input, batched.paged);
+        using expected = await phase(plain, which, input, batched.plain);
+        expectSame(`${scenario} paged rows ${which} hidden`, actual, expected);
       }
-    } finally { dispose(...rows.current, ...rows.frozen, batched.current, batched.frozen); }
+    } finally { dispose(...rows.paged, ...rows.plain, batched.paged, batched.plain); }
   });
 
   test("encoded and paged encoded forms serve every phase, reported by KL against the f32 graph", async () => {
