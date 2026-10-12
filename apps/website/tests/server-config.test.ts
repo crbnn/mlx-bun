@@ -129,7 +129,9 @@ test("removing a read site removes it from the output", () => {
   // One of a key's read sites goes; the rest stay listed.
   const site = "packages/inference/src/generation/bindings/prefill-policy.ts";
   const one = configInventory(mutate(site, 'runtime.number("MLX_BUN_RD_PREFILL_CHUNK", 2048)', "2048"));
+  const composition = "packages/inference/src/models/composition.ts";
+  const value = 'runtime.value("MLX_BUN_RD_PREFILL_CHUNK")', number = 'runtime.number("MLX_BUN_RD_PREFILL_CHUNK", 2048)';
   expect(rows(one, "MLX_BUN_RD_PREFILL_CHUNK").map(row => row.split(" | ").slice(1, 4).join(" | "))).toEqual([
-    "value | computed | [generation/bindings/prefill-policy.ts:20], [models/composition.ts:20] |",
-    "number | `2048` | [models/composition.ts:21] |"]);
+    `value | computed | [generation/bindings/prefill-policy.ts:${lineOf(site, value)}], [models/composition.ts:${lineOf(composition, value)}] |`,
+    `number | \`2048\` | [models/composition.ts:${lineOf(composition, number)}] |`]);
 });
