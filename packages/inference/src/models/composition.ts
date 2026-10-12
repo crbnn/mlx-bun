@@ -120,9 +120,9 @@ function compose(request: Omit<CompositionRequest, "kv">, kv: Composition["kv"])
 }
 
 /** Refuse `composition` for a graph that carries no composition record: such a
- * graph composes its own caches (DiffusionGemma's denoising state, GLM-5.2's
- * compressed MLA), and no lego of a quantized or paged KV scheme exists for
- * them yet, so the record could not be served as named. Serving it as bf16
+ * graph composes its own caches (GLM-5.2's compressed MLA), and no lego of a
+ * quantized or paged KV scheme exists for them yet, so the record could not be
+ * served as named. Serving it as bf16
  * would report an option as implemented when it is not. */
 export function assertComposedCaches(model: object, composition: Composition): void {
   if ((model as { composition?: Composition }).composition) return;

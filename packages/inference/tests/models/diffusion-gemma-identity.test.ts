@@ -26,6 +26,7 @@ import { disposeResources } from "../../src/runtime/resources";
 import { DiffusionGemmaModel } from "../../src/models/diffusion-gemma/model";
 import { DiffusionGemmaModel as FrozenDiffusionGemmaModel } from "./diffusion-gemma-reference";
 import { testComposition } from "./test-composition";
+import type { KvStorageScheme } from "../../src/contracts/portable/composition";
 
 const HIDDEN = 128, VOCAB = 256, HEADS = 4, SLIDING_KV = 2, SLIDING_DIM = 256, FULL_KV = 1, FULL_DIM = 512;
 const INTER = 128, EXPERTS = 8, TOP_K = 2, MOE_INTER = 64, WINDOW = 16, CANVAS = 24;
@@ -356,3 +357,95 @@ test("seeded generation: the denoising engine produces identical tokens, step lo
     }
   }
 }, 120_000);
+
+// The composition's KV scheme and paging (B4): makeCache composes the legos
+// they name. Bf16 pages read the bf16 lego's bits, so the paged graph's canvas
+// logits equal the frozen bf16 graph's at maxDiff 0 over text and vision
+// prompts and continuations. The quantized forms have no oracle (no DiffusionGemma
+// weights run here): their canvas logits are compared with the bf16 graph's on
+// the same canvases, by KL, and reported.
+const composedGraph = (kv: KvStorageScheme, paged: boolean) =>
+  new DiffusionGemmaModel(weights, config, testComposition(kv, paged ? { pagedKv: { blockSize: 16 } } : {}));
+
+test("the composition's paging: paged bf16 canvas passes equal the frozen bf16 graph's", () => {
+  const paged = composedGraph({ kind: "bf16" }, true);
+  for (const length of [5, 37]) {
+    const ids = prompt(length, length);
+    const caches = { current: paged.prefill(ids), frozen: frozen.prefill(ids) };
+    try {
+      expect(caches.current.filter(cache => cache.signature() === "kv:paged").length).toBe(2);
+      const step = (label: string, salt: number) => {
+        using canvas = ops.fromInt32(prompt(CANVAS, salt), [1, CANVAS]);
+        outputDiff("paged bf16 canvas logits", label, paged.decoderLogits(canvas, caches.current, null),
+          frozen.decoderLogits(canvas, caches.frozen, null));
+      };
+      step(`paged text ${length}`, 3);
+      using block = ops.fromInt32(prompt(CANVAS, 7), [1, CANVAS]);
+      paged.extendPrefill(block, caches.current);
+      frozen.extendPrefill(block, caches.frozen);
+      step(`paged text ${length} +${CANVAS}`, 4);
+    } finally { disposeResources([...caches.current, ...caches.frozen]); }
+  }
+  const ids = visionPrompt(8, VISION.output, 13);
+  using image = pixels(9);
+  const caches = { current: paged.prefillVision(ids, image), frozen: frozen.prefillVision(ids, image) };
+  try {
+    using canvas = ops.fromInt32(prompt(CANVAS, 5), [1, CANVAS]);
+    outputDiff("paged bf16 canvas logits", "paged vision", paged.decoderLogits(canvas, caches.current, null),
+      frozen.decoderLogits(canvas, caches.frozen, null));
+  } finally { disposeResources([...caches.current, ...caches.frozen]); }
+}, 120_000);
+
+/** KL(bf16 ‖ form) per canvas position, from two logit tensors [1, positions, vocab]. */
+function klRows(reference: MlxArray, form: MlxArray): { mean: number; max: number; agree: number } {
+  using a = reference.astype(Dtype.float32), b = form.astype(Dtype.float32);
+  const x = a.toFloat32(), y = b.toFloat32(), positions = x.length / VOCAB;
+  let sum = 0, max = 0, agree = 0;
+  for (let p = 0; p < positions; p++) {
+    const row = (v: Float32Array) => Array.from(v.subarray(p * VOCAB, (p + 1) * VOCAB));
+    const lx = row(x), ly = row(y);
+    const lse = (r: number[]) => { const m = Math.max(...r); return m + Math.log(r.reduce((s, v) => s + Math.exp(v - m), 0)); };
+    const zx = lse(lx), zy = lse(ly);
+    let kl = 0;
+    for (let i = 0; i < VOCAB; i++) kl += Math.exp(lx[i]! - zx) * ((lx[i]! - zx) - (ly[i]! - zy));
+    sum += kl; max = Math.max(max, kl);
+    agree += Number(lx.indexOf(Math.max(...lx)) === ly.indexOf(Math.max(...ly)));
+  }
+  return { mean: sum / positions, max, agree: agree / positions };
+}
+
+test("the composition's KV scheme: quantized and paged quantized forms serve the canvas, reported by KL against bf16", () => {
+  const reference = composedGraph({ kind: "bf16" }, false);
+  const forms: [string, KvStorageScheme, boolean][] = [
+    ["affine 4", { kind: "affine", bits: 4, groupSize: 64, kernels: "unfused" }, false],
+    ["affine 8", { kind: "affine", bits: 8, groupSize: 64, kernels: "unfused" }, false],
+    ["affine per-layer (full layers 8-bit)", { kind: "affine-layers", layers: [{ layer: 2, bits: 8, groupSize: 64 }, { layer: 5, bits: 8, groupSize: 64 }], kernels: "tiled-causal" }, false],
+    ["TurboQuant 8/3", { kind: "turbo", kBits: 8, vBits: 3 }, false],
+    ["paged affine 4", { kind: "affine", bits: 4, groupSize: 64, kernels: "unfused" }, true],
+    ["paged TurboQuant 8/3", { kind: "turbo", kBits: 8, vBits: 3 }, true],
+  ];
+  const report: Record<string, unknown> = {};
+  for (const [name, kv, paged] of forms) {
+    const graph = composedGraph(kv, paged);
+    const totals = { mean: 0, max: 0, agree: 0, passes: 0 };
+    for (const length of [5, 37]) {
+      const ids = prompt(length, length);
+      const caches = { form: graph.prefill(ids), reference: reference.prefill(ids) };
+      try {
+        for (const salt of [3, 4]) {
+          using canvas = ops.fromInt32(prompt(CANVAS, salt), [1, CANVAS]);
+          using x = reference.decoderLogits(canvas, caches.reference, null);
+          using y = graph.decoderLogits(canvas, caches.form, null);
+          const kl = klRows(x, y);
+          expect(Number.isFinite(kl.mean), name).toBe(true);
+          totals.mean += kl.mean; totals.max = Math.max(totals.max, kl.max); totals.agree += kl.agree; totals.passes++;
+          using block = ops.fromInt32(prompt(CANVAS, salt + 10), [1, CANVAS]);
+          graph.extendPrefill(block, caches.form);
+          reference.extendPrefill(block, caches.reference);
+        }
+      } finally { disposeResources([...caches.form, ...caches.reference]); }
+    }
+    report[name] = { klMean: totals.mean / totals.passes, klMax: totals.max, argmaxAgree: totals.agree / totals.passes };
+  }
+  console.log(`diffusion-gemma composed KV (synthetic weights, canvas KL vs bf16): ${JSON.stringify(report)}`);
+}, 240_000);

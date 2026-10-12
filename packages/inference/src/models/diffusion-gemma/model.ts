@@ -10,7 +10,7 @@ import { cleanupFailure, disposeResources } from "../../runtime/resources";
 //
 // Ported verbatim from optiq/vlm/_mlxvlm/models/diffusion_gemma/language.py.
 // Reuses mlx-bun's quantized primitives (QuantizedLinear/Embedding/SwitchLinear,
-// RMSNorm, KVCache/RotatingKVCache) from packages/inference/src/layers/ and
+// RMSNorm, the composed cache legos) from packages/inference/src/layers/ and
 // packages/inference/src/state/. Architecture deltas vs
 // gemma4 (verified against the checkpoint, see `02d723a:docs/design/generic-model-support.md` §6.5):
 //   - attention scale=1.0, NO attention softcap (only final-logit softcap 30 fp32)
@@ -31,7 +31,6 @@ import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { disposing } from "../../layers/helpers";
-import { KVCache } from "../../state/kv";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import type { MlxDeclaredGraph, MlxDenoisingOperations, MlxWidthClass } from "../../contracts/mlx/graph";
@@ -46,8 +45,10 @@ import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import { QuantizedLinear } from "../../layers/quantized-linear";
 import { QuantizedSwitchLinear } from "../../layers/quantized-switch-linear";
 import { RMSNorm } from "../../layers/normalization";
-import { RotatingKVCache } from "../../state/rotating-kv";
 import { AttentionMasks } from "../../state/attention-read";
+import { composedFullAttentionCache, composedSlidingAttentionCache } from "../../state/bf16-first-kv";
+import { maybePageKv } from "../../state/request-policy";
+import { deferredTurboQuantKernels } from "../../state/turboquant-attention";
 import type { AttentionRead, BlockAttentionCache, Cache, EncoderAttentionCache } from "../../contracts/mlx/cache";
 import { DiffusionVisionTower, spliceImageTokens } from "./vision";
 
@@ -457,7 +458,7 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
   // Shared RuntimeModel surface. LoRA mounts onto the (quantized) decoder
   // linears like the AR models; the diffusion engine activates it per request.
   readonly loraState = new LoraState();
-  /** Layers whose attention reads plain keys and values: none; denoising takes no encoded KV scheme. */
+  /** Layers whose attention reads plain keys and values: none; every pass reads through its cache's own reads. */
   readonly requiredDenseKvLayers: readonly number[] = Object.freeze([]);
   /** Denoising rows interleave through their own grouped method; images enter as
    * the method's pixel prefill input. */
@@ -486,10 +487,13 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
    * (the reference's mx.compile'd geglu and softcap), unless the composition's
    * `compiledGeglu` is off: the spelled-out ops. */
   readonly #compiledGeglu: boolean;
+  /** The composition this graph was built for: its KV scheme and paging are its caches' (`makeCache`). */
+  readonly composition: Composition;
 
   constructor(weights: Weights, config: ModelConfig, composition: Composition) {
     const t = config.text;
     this.config = config;
+    this.composition = composition;
     this.#compiledGeglu = composition.compiledGeglu;
     this.weightsBytes = [...weights.shards.files.values()].reduce((a, f) => a + f.mmap.size, 0);
     this.embed = QuantizedEmbedding.load(weights, "model.decoder.embed_tokens", config);
@@ -573,15 +577,23 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
     catch (error) { cleanupFailure(error, () => disposeResources(cache)); }
   }
 
-  /** One KVCache (full) / RotatingKVCache (sliding) per layer, sharing one mask
-   *  memo — the encoder prefill fills these, the decoder canvas pass reads them. */
+  /** One cache per layer, the lego the composition's KV scheme names for it
+   *  (bf16, bf16-first affine, per listed layer under a per-layer scheme, or
+   *  TurboQuant on full-attention layers, read deferred as Gemma 4 reads it), a
+   *  ring of the sliding window on sliding layers, all sharing one mask memo;
+   *  under the composition's paging the full-attention layers hold pages of
+   *  what the scheme names (`maybePageKv`, growing from one block). The encoder
+   *  prefill fills them, the decoder canvas pass reads them. */
   makeCache(): Cache[] {
-    const masks = new AttentionMasks();
-    return this.layers.map((l) =>
+    const masks = new AttentionMasks(), { kv, pagedKv } = this.composition;
+    const caches: Cache[] = this.layers.map((l, layer) =>
       l.layerType === "sliding_attention"
-        ? new RotatingKVCache(this.slidingWindow, masks)
-        : new KVCache(masks),
+        ? composedSlidingAttentionCache(kv, layer, this.slidingWindow, masks)
+        : composedFullAttentionCache(kv, layer, masks, deferredTurboQuantKernels),
     );
+    try { maybePageKv(caches, kv, pagedKv, pagedKv?.blockSize ?? 0); }
+    catch (error) { disposeResources(caches); throw error; }
+    return caches;
   }
 
   /** Encoder prefill: run all layers over the prompt through the window read,
