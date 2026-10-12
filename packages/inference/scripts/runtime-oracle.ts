@@ -8,7 +8,7 @@ import { cpus, hostname, release, totalmem, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import type { MlxArray } from "@mlx-bun/mlx/array";
-import type { Cache } from "@mlx-bun/inference/contracts/mlx";
+import { widthClass, type Cache } from "@mlx-bun/inference/contracts/mlx";
 
 export interface Plan {
   model: string;
@@ -198,16 +198,32 @@ export async function emit(plan: Plan, planBytes: Uint8Array, hashWeights: boole
     const model = createModel(weights, config, resolveComposition(config, plan.kv ? { kv: { override: "config", quantizedKvStart: 0 } } : {}));
     if (plan.kv) assert(config.kvQuant?.length, "artifact has no mixed-KV configuration");
     if (plan.kv) Object.assign(record.artifact, { kvConfigSha256: sha(await Bun.file(join(plan.model, "kv_config.json")).bytes()), kvConfig: config.kvQuant });
-    function forward(ids: number[], caches: Cache[]) {
+    if (!("decode" in model)) throw new Error("runtime oracle: the graph runs no token phases");
+    const graph = model;
+    /** Logits for `ids` appended to `caches`, through the phase a scheduler names for them: one
+     *  token a decode, more a prompt tail, each table at the class of its rows. */
+    async function forwardLogits(ids: number[], caches: Cache[]) {
       const input = ops.fromInt32(ids, [1, ids.length]);
-      try { return model.forwardHidden(input, caches); } finally { input.dispose(); }
+      let hidden: MlxArray | null = null;
+      try {
+        hidden = await (ids.length === 1 ? graph.decode.one(input, caches, null)
+          : graph.prefillTail[widthClass(ids.length)](input, caches, null));
+        return graph.logits[widthClass(ids.length)](hidden);
+      } finally { input.dispose(); hidden?.dispose(); }
+    }
+    async function forward(ids: number[], caches: Cache[]) {
+      const input = ops.fromInt32(ids, [1, ids.length]);
+      try {
+        return await (ids.length === 1 ? graph.decode.one(input, caches, null)
+          : graph.prefillTail[widthClass(ids.length)](input, caches, null));
+      } finally { input.dispose(); }
     }
     for (const context of plan.contexts) for (const m of plan.lengths) {
-      const caches = model.makeCache();
+      const caches: Cache[] = graph.makeCache();
       try {
         for (let pos = 0; pos < context; pos += plan.prefixChunk) {
           const count = Math.min(plan.prefixChunk, context - pos);
-          const hidden = forward(Array.from({ length: count }, (_, i) => 100 + (pos + i) * 7 % 1000), caches);
+          const hidden = await forward(Array.from({ length: count }, (_, i) => 100 + (pos + i) * 7 % 1000), caches);
           const groups: { cache: Cache; planes: MlxArray[] }[] = [];
           try {
             for (const cache of caches) groups.push({ cache, planes: cache.state() });
@@ -219,9 +235,7 @@ export async function emit(plan: Plan, planBytes: Uint8Array, hashWeights: boole
           }
         }
         const prefix = state(caches, context);
-        const hidden = forward(Array.from({ length: m }, (_, i) => 600 + i * 3), caches);
-        let logits: MlxArray;
-        try { logits = model.logitsFromHidden(hidden); } finally { hidden.dispose(); }
+        const logits = await forwardLogits(Array.from({ length: m }, (_, i) => 600 + i * 3), caches);
         let current;
         try { ops.evalAll([logits]); current = { logits: array(logits), state: state(caches, context + m) }; }
         finally { logits.dispose(); }
@@ -238,14 +252,14 @@ export async function emit(plan: Plan, planBytes: Uint8Array, hashWeights: boole
             assert.deepEqual(restored.tokens, tokens, "restored token prefix");
             assert.deepEqual(state(restored.caches, context + m), current.state, "restored live state");
           }
-          const next = model.forward([911], caches);
+          const next = await forwardLogits([911], caches);
           let row;
           try {
             ops.evalAll([next]);
             row = { context, m, prefix, ...current, continuation: array(next), continuationState: state(caches, context + m + 1) };
           } finally { next.dispose(); }
           if (restored) {
-            const resumed = model.forward([911], restored.caches);
+            const resumed = await forwardLogits([911], restored.caches);
             try {
               ops.evalAll([resumed]);
               assert.deepEqual(array(resumed), row.continuation, "restored continuation logits");

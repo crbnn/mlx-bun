@@ -95,7 +95,8 @@ export async function regenDrafterData(
     const caches = target.makeCache();
     try {
       using input = ops.fromInt32(ids, [1, ids.length]);
-      const { hidden, ctxML } = await target.forward(input, caches, [...tapLayers]);
+      // The whole sequence in one window: a prompt piece that is not a planned chunk.
+      const { hidden, ctxML } = await target.prefill(input, caches, { phase: "tail", sequences: 1, tokens: ids.length }, tapLayers);
       hidden.dispose();
       using context = ctxML!;
       using rows = ops.reshape(context, [ids.length, tapLayers.length * hiddenSize]);
