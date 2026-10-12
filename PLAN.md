@@ -278,6 +278,39 @@ cache class against its pre-refactor read on the existing parity inputs; `grep` 
 Exit: saved KV under `MLX_BUN_HOME/kv` round-trips as before; prefix hit rate on the existing
 warm-reuse test is unchanged; no `toQuantized` caller outside `state/`.
 
+#### B3. The cache is swappable: nothing else knows or cares
+
+Josh, 2026-10-11: "I can swap between paged KV, quantized KV, regular KV, TurboQuant KV; nothing
+else should know or care." Today the planner and the gateway do know: `execution/plan.ts` refuses
+speculation when the composition is paged (`!features.pagedKv`) and gates it on
+`speculativeKvQuant` / `speculativeTurboQuant`; batching is gated on `quantizedBatch`,
+`turboQuantBatch` and `pagedBatch`; shared fill is off under paging; `gateway-binding.ts` derives
+`kvBatchCapabilities`, `delayedAffine`, `affineKv` and `cachesBatchable()` from the cache format
+and `state/capabilities.ts` answers `isPlainKvCache` / `isRotatingPlainCache` / `isRecurrentCache`
+to callers outside `state/`. Every one of these is a method learning the representation.
+
+- [ ] Every cache lego implements the whole contract: append and `attend` for each phase, the
+      row layout for batching, the speculative transaction (`specRoundCommit` /
+      `specRoundRollback` to the accepted length, and the known-token append), the prefix
+      snapshot and restore, and the SSD form. The paged lego and the TurboQuant legos implement
+      the transaction and the batched layout they lack today; a lego that cannot implement an
+      operation is a bug in the lego, not a capability flag.
+- [ ] Delete the cache-format terms from the planner and the gateway: `pagedKv`, `kvQuant` and
+      `turboQuant` conditions in `plan.ts`; `quantizedBatch`, `turboQuantBatch`, `pagedBatch`,
+      `speculativeKvQuant`, `speculativeTurboQuant` from `GraphCapabilities`; `kvBatchCapabilities`,
+      `delayedAffine`, `affineKv`, `cachesBatchable` from `gateway-binding.ts`; the `state/capabilities.ts`
+      predicates have no caller outside `state/`. Media and adapter rows no longer bypass paging
+      (`paged-kv-bypassed-for-media-or-adapters`); the adapter namespace is the cache's.
+- [ ] Order: after the merge of E1 + D2 + E3. The lego work (state/) runs beside E2; the planner
+      and gateway deletions share E2's files and land with it.
+
+Exit: on e4b, speculative-group (assistant drafter), grammar-group, fill, prefix reuse and the SSD
+round-trip each run under every lego the composition can name (bf16, affine uniform, affine
+config, TurboQuant, paged, bf16-first KV4 on the M4 Pro composition) with per-line output
+identical to the same lego on `30412523` where that lego served the method today, and KL-gated
+against bf16 where it did not; `plan.ts` and `gateway-binding.ts` contain no cache-format term;
+the served-surface inventory lists no cache × method exclusion.
+
 ### Phase C: layers
 
 #### C1. Qwen blocks become legos
@@ -553,6 +586,29 @@ new flag.
       the ordinary quantized matmul for context projection; no per-call row switch in `matmulW`.
 
 Exit: acceptance rate on the paired MTP bench unchanged; no env read in `dflash2-source.ts`.
+
+#### E5. Drafters compose like graphs
+
+Found by review on 2026-10-11 against the integration tree.
+
+- [ ] The MTP draft loop (`generation/speculative/bindings/qwen-mtp-rows.ts`) decides per token
+      whether a listed draft vocabulary exists, tries that projection, falls back to the full
+      head, then chooses greedy or sampled selection. The draft group binds one selection
+      operation at composition (projection over the listed vocabulary or the full head; greedy
+      argmax or the sampler's draw) and the loop calls it on the hidden output; no branch in the
+      loop. The same for the DeepSpec and assistant sources where they repeat the pattern.
+- [ ] `DraftProvider.open()` (the serial source) is deleted from the contract. The grouped lane
+      is the only lane and a single request drafts at one row, as the architecture already says
+      for serving; `Dflash2Provider.open()` throwing "runs only in the batched speculative lane"
+      is the evidence that the serial method is a promise no composition keeps.
+- [ ] The MTP companion's forward calls its named phase, not `deprecatedPhase` (rides E2's
+      deletion); its draft operation is width-classed like the graph's `verify` (the DFlash 2
+      entry under E2 covers both drafters).
+
+Exit: no `sampling!.vocabulary` / `greedy` branch inside a draft loop; no `open()` on
+`DraftProvider`; for fixed inputs under teacher forcing the drafted tokens on e4b (assistant) and
+on the M4 Pro composition (MTP, DFlash 2) equal today's bit for bit; paired MTP bench acceptance
+unchanged.
 
 ### Phase F: gate and documentation
 
