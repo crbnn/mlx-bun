@@ -4,7 +4,7 @@ import type { CellResult, MemoryReading, RawRequest, ReqResult, StopResult } fro
 import { decodeStable, median, probeVerdict, spreadOf } from "./measure";
 import { basename } from "node:path";
 import type { Configuration, Plan, Tree } from "./plan";
-import { planCells, REQUIRED_PHASES, sessionsOf, WORKLOAD } from "./plan";
+import { isContext, planCells, REQUIRED_PHASES, sessionsOf, WORKLOAD } from "./plan";
 
 export interface CellRecord {
   key: string;
@@ -162,11 +162,13 @@ export function qualification(run: RunRecord) {
     } else if (!result.loadedLibraries) notes.push(`${cell.key}: reference loaded libraries not observable`);
   }
   // Baseline and candidate must render the same prompts and produce the same greedy text,
-  // and every required phase's final accepted attempt must pair completely.
+  // and every required phase's final accepted attempt must pair completely. A context configuration's
+  // trees run different settings, so for it these are reported, not required.
   for (const { model, configuration, session } of PAIRS(run.plan)) {
     const ca = cellFor(run, model, "baseline", configuration, session), cb = cellFor(run, model, "candidate", configuration, session);
     const a = ca?.result, b = cb?.result, label = pairLabel(run.plan, model, configuration, session);
     if (!a || !b) continue;
+    const required = isContext(configuration) ? notes : problems;
     const pairs = pairRequests(run, ca!, cb!);
     for (const phase of REQUIRED_PHASES.filter(p => run.plan.workload.withContext || (p !== "ctx" && p !== "restart"))) {
       const fa = finalRequests(run, ca!, phase), fb = finalRequests(run, cb!, phase);
@@ -174,14 +176,14 @@ export function qualification(run: RunRecord) {
       const unpaired = fa.filter(q => !q.result || !valid.has(`${q.phase}|${q.attempt}|${q.index}|${q.requestSha256}`));
       if (!fa.length || fa.length !== fb.length || fb.some(q => !q.result) || unpaired.length) {
         const invalid = pairs.filter(p => p.phase === phase && !p.valid).map(p => p.reason);
-        problems.push(`${label} ${phase}: final attempts do not pair (baseline ${fa.length} requests ` +
+        required.push(`${label} ${phase}: final attempts do not pair (baseline ${fa.length} requests ` +
           `attempt ${fa[0]?.attempt ?? "-"}, candidate ${fb.length} attempt ${fb[0]?.attempt ?? "-"}` +
           `${invalid.length ? `; ${invalid.join("; ")}` : ""})`);
       }
     }
     for (const probe of ["completion", "chat"] as const) {
       const verdict = probeVerdict(probe, label, a.parity?.[probe], b.parity?.[probe]);
-      if (verdict.ok !== true) problems.push(`${label} ${probe} probe: ${verdict.line.replace(/^- /, "")}`);
+      if (verdict.ok !== true) required.push(`${label} ${probe} probe: ${verdict.line.replace(/^- /, "")}`);
     }
   }
   const complete = problems.length === 0;

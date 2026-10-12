@@ -21,8 +21,17 @@ export const CONFIGURATIONS = {
   /** The served DFlash 2 composition: the model's DFlash 2 drafter (`--dflash2-draft ID=PATH[=BASIS]`),
    * adaptive depth over 4-bit KV. Models without a drafter are not applicable. */
   dflash2: { args: ["--kv-quant", "4", "--num-draft-tokens", "adaptive"], note: "DFlash 2 drafter, adaptive depth, 4-bit KV", dflash2: true },
+  /** The served DFlash 2 composition against a baseline that cannot serve it: a graph that declares no verify costs
+   * refuses `--num-draft-tokens adaptive` (main's TQ graph on the M1 Max), so the baseline drafts 7 every round and
+   * the candidate adapts, both over 4-bit KV. The trees run different configurations, so the pair is context and
+   * never gates, and its probes and request pairing are reported, not required. */
+  "dflash2-d7-baseline": { args: ["--kv-quant", "4"],
+    treeArgs: { baseline: ["--num-draft-tokens", "7"], candidate: ["--num-draft-tokens", "adaptive"] },
+    note: "DFlash 2 drafter over 4-bit KV: the baseline at depth 7, the candidate adaptive (context, not gated)", dflash2: true, context: true },
 } as const;
 export type Configuration = keyof typeof CONFIGURATIONS;
+/** A configuration whose trees run different settings: its pairs are shown beside the gate, never in it. */
+export const isContext = (name: Configuration): boolean => "context" in CONFIGURATIONS[name];
 
 /** Main's canonical `all` matrix: every model, every configuration, the stock reference. */
 export const CANONICAL = {
@@ -299,8 +308,9 @@ export function cellArgs(plan: Plan, cell: PlannedCell, port: number, ssdDir: st
     const draft = "draftDepth" in spec
       ? ["--draft-kind", "mtp", "--draft-model", model.draft!.path, "--num-draft-tokens", String(spec.draftDepth)]
       : "dflash2" in spec ? ["--draft-model", model.dflash2!.path] : [];
+    const own = "treeArgs" in spec ? spec.treeArgs[cell.tree!] : [];
     return [...plan.trees[cell.tree!].command, "--model", model.path, "--port", String(port), "--no-open",
-      "--ssd-cache", ssdDir, ...spec.args, ...draft];
+      "--ssd-cache", ssdDir, ...spec.args, ...own, ...draft];
   }
   const ref = plan.references.find(r => r.label === cell.reference)!;
   return [...(needsRegister(model) ? ref.registerCommand! : ref.command), "--model", model.path, "--port", String(port)];
