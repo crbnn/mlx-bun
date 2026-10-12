@@ -76,10 +76,10 @@ for each layer: bf16, affine at the scheme's width (per layer under `config`),
 or TurboQuant. `--paged-kv-direct` reads them with the direct Metal kernel
 (Lab numerics) for decode and windows of up to eight queries; the kernel has
 no compiled form, so that composition decodes without the compiled step.
-As main's server did, startup also rejects `--kv-quant turbo` when the model's
-full-attention head dimension is not one the TurboQuant codec encodes
-(`TURBOQUANT_HEAD_DIMS`), before any request, instead of failing each request in
-prefill.
+The TurboQuant sign tables are generated for the served head dimensions (64, 96, 128,
+256, 512; `packages/inference/scripts/gen-turboquant-signs.ts`, held to the generator by a
+drift test), so `--kv-quant turbo` composes for every served model; the fused decode kernel
+covers 64, 128, 256 and 512, and 96 decodes on the plain path.
 The graphs that compose their own caches take the scheme and paging too:
 GLM-5.2's compressed MLA state (the latent, RoPE key and DSA index key) is stored
 as the scheme names and paged under `--paged-kv`, and DiffusionGemma's denoising

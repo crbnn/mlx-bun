@@ -80,7 +80,7 @@ GPU (`device`), the Neural Engine bridge (`aneBridge`), the KV scheme and paging
 (`kv`, `pagedKv`), draft depth, the prefill chunk, adapters, rows per forward
 (`maxRows`), and the layers' and scheduler's choices (`packedMixedMlp`,
 `vectorGreedySampling`, `compiledDecode`, `mixedPrefill`, `mixedTokenBudget`,
-`prefillTailSplit`, `grammarJump`, `greedyDraft`, `compiledGeglu`). The app sets
+`prefillTailSplit`, `grammarJump`, `greedyDraft`, `compiledGeglu`, `compiledSwiglu`). The app sets
 the KV scheme, paging, adapters, rows and drafter from `serve`'s flags; the other
 fields keep their defaults there. Nothing below the loader reads them from the
 environment.
@@ -560,9 +560,11 @@ read, not a quantized kernel), so affine KV serves its ordinary, grammar,
 speculative and fill rows, with checkpoints, before and after each row's
 transition; main threw at the first forward past it. No artifact
 holds those numbers, so the native Gemma2 suite (`MLX_BUN_GEMMA2_NATIVE=1`)
-gates every phase against a frozen synthetic oracle at maxDiff 0: the plain
-storage the graph composes without a scheme, its fetched window requantized by
-mlx past the transition. Direct grammar jump commits its spans over any storage
+gates every phase at maxDiff 0 against the plain storage the graph composes
+without a scheme, its fetched window requantized by mlx past the transition, and
+holds the descriptor and mask cases to recorded synthetic digests
+(`tests/models/synthetic-digest.ts`, fixtures under `tests/fixtures/synthetic-digests/`,
+`scripts/synthetic-digests.ts record|check`, recorded per GPU architecture). Direct grammar jump commits its spans over any storage
 through the shared span method, as main's jump did: one maintenance
 call, then one unsplit forward of the pending token and the forced span, plain
 across the start and over the converted layers after it. On 2026-09-28 UTC (M1 Max, MLX 0.32.2) the opt-in

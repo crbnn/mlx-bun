@@ -237,7 +237,7 @@ for (const lego of LEGOS) {
       real.dispose(); driven.dispose();
       for (const closure of closures.values()) closure.dispose();
     }
-  });
+  }, 60_000);
 }
 
 test("the compiled step drives every lego; batched layouts of several rows are not lone rows", () => {

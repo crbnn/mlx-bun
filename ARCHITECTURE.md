@@ -46,7 +46,8 @@ graphs, state, sampling, and generation directly. A small convenience API does
 not require hiding those components.
 
 `@mlx-bun/training` owns adapter training and production above the inference
-graphs, layers, state contracts, and MLX autograd. Training progress is a
+graphs, layers, state contracts, and MLX autograd. Training caches own their rope
+positions (`TrainingAttentionCache.ropePositions`); there is no module-level prefix layout. Training progress is a
 library contract; job lifecycle and terminal output stay in apps.
 Inference and quantization never depend on training.
 
@@ -85,7 +86,8 @@ allowlists. For example, a missing draft head is a missing component. Dynamic
 request data, batch membership, cancellation, and state transitions still need
 runtime handling. Graphs declare their capabilities when constructed; the gateway
 plans from those declarations and the app engine binds media through graph
-operations. Facts the server and CLI need (memory plans, native draft heads,
+operations. Every graph implements `dispose()` and releases what it built;
+providers and the host call it. Facts the server and CLI need (memory plans, native draft heads,
 pooled-embedding recipes, tool-call and reasoning marker tokens, media soft
 tokens, chat defaults, template fallbacks) are declared by the model layer, in
 the family record (`models/families`, one record per family) or the opened
@@ -347,7 +349,9 @@ the host's automatic choice (`pickDefault`), which the app supplies from the sel
   composition rules: a graph class that extends a graph or reads `super.` of one, a
   runtime flag, env read, `deviceArchitecture()`, `globalThis` access or layer, cache
   or model `instanceof` inside a forward, read, append or kernel body (construction,
-  acceptance and the loader are exempt, profiling hooks by name), a
+  acceptance and the loader are exempt; profiling hooks and the two compile-context
+  queries, `isCompiledTrace` and `isShapelessTracing`, which ask whether the graph is
+  being recorded rather than run, by name), a
   representation-specific cache read outside `state/`, and the removed whole-forward
   entry points reached from `execution/` or `generation/`. Code that breaks them is
   listed per file in `seamRatchet`, whose counts may only fall; the table is empty,

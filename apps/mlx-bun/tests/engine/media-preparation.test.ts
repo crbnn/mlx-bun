@@ -66,7 +66,7 @@ describe.skipIf(nativeMissing)("media preparation routes", () => {
     // The tower check precedes extraction: a URL that would fail to fetch is never read.
     expect(await diffusion.prepare(request(unreachable))).toEqual({ rejected: "vision-tower-absent" });
 
-    // The generated Trellis graphs declare Qwen 3.5's media (tests/models/qwen38-m1max-identity.test.ts in the library).
+    // The generated Trellis graphs declare Qwen 3.5's media the way the family's generic graph does (`qwenMediaEncoders` in models/qwen/media-input.ts).
     const qwen = await bind(Qwen35Model.prototype);
     expect(qwen.video).toBe(true);
     const call = request(user(image()));
