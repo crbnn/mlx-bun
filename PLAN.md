@@ -1041,7 +1041,35 @@ unchanged.
       adaptive` needs `verifyRoundCosts` measured on the host, which only the M4 Pro graph
       declares. Owed: the generated M1 Max graph declares verify costs measured on the M1 Max
       (a generator input, like the widths), and `perf.yml` measures DFlash 2 there, at fixed
-      depth 7 until then.
+      depth 7 until then. Landed (merged into `refactor/composition` at 6f27a434). Verify costs
+      are a composition's measured numbers, declared in `QWEN38_COMPOSITIONS` and emitted by
+      the generator (the M4 Pro's had sat in the GPU's kernel table, where another composition
+      on that GPU would have inherited them; moved, the M4 Pro graph byte-identical). The M4
+      Pro's method, recovered from a 2026-10-09 transcript, is now in Git: `bench-mtp.ts`
+      gains a depth-0 arm (plain greedy decode) so each width's round cost is relative to a
+      plain step measured in the same plan. M1 Max measurement (32 GB, preflight clear,
+      generated graph, real artifact and drafter, two prompts × 128 tokens, bf16 KV, four
+      repetitions in fresh alternating processes; plain decode 69.73 ms per token): rows 2 /
+      3 / 4 cost 1.89 / 2.35 / 2.97 plain steps (intervals under 1%); rows 5 / 6 / 7 / 8 cost
+      12.22 / 13.16 / 13.02 / 12.88, because above four rows the generic Trellis MLP takes the
+      prefill kernels. Declared as measured, no flattening. The M1 Max identity gate: 14 tests,
+      80,556 tensors at maxDiff 0 with the costs on the generated graph. `--num-draft-tokens
+      adaptive` now starts there; unqualified sanity decode 14.2 to 18.0 tok/s against plain
+      14.3. The paired benchmark gained `dflash2-d7-baseline` (main refuses adaptive, so main
+      runs depth 7 against the head adaptive, reported as context, never gated); the one
+      completed M1 Max run of it (75f33088 vs main): decode 3.7 → 11.5 tok/s, prefill 1k 102.9
+      → 115.0, cold TTFT 7358 → 6580 ms, aggregate ×4 10.6 → 8.5, peak MLX active 16795 →
+      17768 MB; the decision no longer voids a check for a context configuration's spread.
+      Facts for the M1 Max, recorded, not planned here: DFlash 2 barely pays on that chip
+      (depth 2 beats plain decode by about 12%); the adaptive gate never drafts fewer than one
+      token, so on low-acceptance text it runs 0.9 to 1.0× plain; its per-row costs ignore how
+      many requests are batched, so aggregate ×4 is lower adaptive than at depth 7. The same
+      record flagged Trellis default prefill 1k 122.0 → 121.8 (0.998 [0.996, 0.999]) and cold
+      TTFT 6206 → 6218 ms (1.003 [1.001, 1.004]) with two sessions: the band for prefill and
+      TTFT is still narrower than their drift; the numerical check had every digest identical.
+      Not run: a 4-bit KV sweep in `bench-mtp` (its KV option fails on the first drafted arm
+      with "No target row layout for kv:bf16-first:kv:quant:4:64"; `serve --kv-quant 4`
+      works), owed to the final gate pass.
 - [x] ARCHITECTURE.md: the cache owns the read; phases are named; a specialized graph extends
       nothing; the exemplar sentence points at the regenerated graphs; the loader-level generic
       fallback is stated and the in-graph one forbidden; the one-way-per-pattern list above.
