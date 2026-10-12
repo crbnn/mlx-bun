@@ -39,14 +39,16 @@ function syntheticTarget() {
   const table = MlxArray.fromFloat32(Float32Array.from({ length: V * H }, () => (r() - 0.5) * 0.4), [V, H]).eval();
   const head = MlxArray.fromFloat32(Float32Array.from({ length: H * V }, () => (r() - 0.5) * 0.4), [H, V]).eval();
   const scales = MlxArray.fromFloat32(new Float32Array([1]), [1]).astype(Dtype.bfloat16).eval();
+  const logits = (h: MlxArray) => {
+    const f = h.dtype === Dtype.float32 ? h : h.astype(Dtype.float32);
+    const out = ops.matmul(f, head);
+    if (f !== h) f.dispose();
+    return out;
+  };
   const projection = {
     embed: { scales, encode: (ids: MlxArray) => ops.takeAxis(table, ids, 0) },
-    logitsFromHidden: (h: MlxArray) => {
-      const f = h.dtype === Dtype.float32 ? h : h.astype(Dtype.float32);
-      const out = ops.matmul(f, head);
-      if (f !== h) f.dispose();
-      return out;
-    },
+    // The output head per width class (`DraftProjection.logits`): one head at every width.
+    logits: { one: logits, twoToThree: logits, four: logits, fiveToEight: logits, wider: logits },
   };
   const model = {
     graphCapabilities: declareGraph({ hiddenLayerTaps: true }),
@@ -246,7 +248,9 @@ describe.skipIf(!native)("calibration provider", () => {
     };
     const rounds: { pos: number; conf: number; accepted: boolean }[][] = [];
     const provider = new CalibrationProvider(fake as never, round => rounds.push(round), "fake");
-    const projection = { embed: { encode: () => { throw new Error("unused"); }, scales: { dtype: Dtype.bfloat16 } }, logitsFromHidden: () => { throw new Error("unused"); } };
+    const unused = () => { throw new Error("unused"); };
+    const projection = { embed: { encode: unused, scales: { dtype: Dtype.bfloat16 } },
+      logits: { one: unused, twoToThree: unused, four: unused, fiveToEight: unused, wider: unused } };
     const source = provider.open({ target: { identity: {}, hiddenLayerTaps: { layerCount: 3, projection } } as never });
     const context = MlxArray.fromFloat32(new Float32Array(1 * 4 * M * H), [1, 4, M * H]);
     source.prefill([1, 2, 3], context);
