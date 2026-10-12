@@ -54,8 +54,6 @@ export interface DsparkDrafterModel {
     readonly sts?: { readonly thresholds: number[] };
   };
   projectContextRows(hidden: MlxArray): { k: MlxArray; v: MlxArray }[];
-  forwardInfer(model: DraftProjection, hCtx: MlxArray, anchor: number, gamma: number,
-    opts?: DsparkDraftOptions): { tokens: number[] };
   forwardRows(model: DraftProjection, hCtx: MlxArray | null, anchors: readonly number[], gamma: number,
     opts?: DsparkDraftOptions, context?: DsparkContextAttention): { tokens: number[][] };
   dispose(): void;
@@ -72,15 +70,6 @@ export interface DeepspecDraftRows {
   baseLogits?: MlxArray;
 }
 
-export interface DeepspecDraftBlock {
-  /** Sequentially sampled draft tokens, length 0..gamma (0 iff confidence truncation fires first). */
-  tokens: number[];
-  /** Per-position sigmoid confidence, aligned with `tokens`. */
-  conf: number[];
-  /** Base logits of the full block [1, gamma, vocab]; the caller disposes. */
-  baseLogits: MlxArray;
-}
-
 /** DeepSeek's released DSpark drafter (DeepSpec): a block forward over cached, already projected context K/V. */
 export interface DeepspecDrafterModel {
   readonly cfg: { readonly num_target_layers: number; readonly num_hidden_layers: number };
@@ -90,9 +79,7 @@ export interface DeepspecDrafterModel {
   readonly gamma: number;
   readonly hidden: number;
   projectContext(targetHiddens: MlxArray): MlxArray;
-  projectContextKV(contextHidden: MlxArray, positions: number[]): ContextKV[];
   projectContextKVRows(contextHidden: MlxArray, position: number | MlxArray): ContextKV[];
-  draftBlock(ctxKV: ContextKV[], anchorTok: number, anchorPos: number): DeepspecDraftBlock;
   draftRows(context: DeepspecContextAttention, anchors: readonly number[], position: number | MlxArray,
     collectLogits?: boolean): DeepspecDraftRows;
   dispose(): void;
