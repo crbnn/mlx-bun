@@ -430,6 +430,25 @@ export interface BatchableCache extends Cache {
   canPublishRow?(row: number, tokens: number): boolean;
 }
 
+/**
+ * Verification rows: the row layout a speculative method keeps its target rows
+ * in, holding the speculative transaction. Every storage a cache lego holds
+ * names one (state's `targetCacheLayout`), so any lego serves speculation.
+ *
+ * The method arms a round before the verify window (`specRoundBegin`), appends
+ * the window, then resolves it: `specRoundCommit` keeps every row's window;
+ * `specRoundRollback(keep)` keeps the first `keep` positions of each row's
+ * window (one count for every row, or one per row). After either, every row is
+ * exactly as if only its kept positions had been appended: the same offsets and
+ * stored positions, the same reads from then on.
+ */
+export interface SpeculativeRowLayout extends BatchableCache {
+  makeEmptyBatch(): SpeculativeRowLayout;
+  specRoundBegin(): void;
+  specRoundCommit(): void;
+  specRoundRollback(keep: number | readonly number[]): void;
+}
+
 /** Padding is interpreted by cache geometry, independently of scheduling.
  * Left padding initializes an empty group; lengths count input columns before
  * trailing padding. Finalize before ordinary decode or publishing checkpoints. */

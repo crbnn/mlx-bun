@@ -1,4 +1,4 @@
-import type { AttentionCache, AttentionRead, BatchableCache, Cache, Mask, KvAttentionView } from "../../contracts/mlx/cache";
+import type { AttentionRead, Cache, CommittedAttentionCache, KvAttentionView, KvDonorRows, Mask, SpeculativeRowLayout } from "../../contracts/mlx/cache";
 import { buildBatchedDecodeMask, mergeKVRows } from "../batched-mask";
 import * as ops from "@mlx-bun/mlx/ops";
 import { runtimeFlag } from "../../runtime/config";
@@ -18,11 +18,20 @@ import { PagedKVCache, poolBlocksFor, type PagedQuantization } from "./cache";
  * reduces in another order than this read over the padded length and differs
  * in the last bits (up to 4e-3 on decode at head dim 512). Direct or affine
  * pages: each row reads with its own `PagedKVCache` read for the phase and the
- * outputs join along the batch. */
-export class PagedKvRows implements AttentionCache, BatchableCache {
+ * outputs join along the batch. A committed span is the window read, as on
+ * the serial pages.
+ *
+ * The same layout serves continuous decoding, prefill cohorts and
+ * verification: every row owns its blocks and its offset, so the speculative
+ * transaction keeps each row's accepted prefix by trimming that row's blocks
+ * back to it, which returns the rejected tail's blocks to the row's pool in the
+ * order they were taken. The donor rows are each row's gathered positions,
+ * joined left-padded as the joined read joins them. */
+export class PagedKvRows implements CommittedAttentionCache, SpeculativeRowLayout {
   #rows: PagedKVCache[] = [];
   #rope?: MlxArray;
   #ropeOffset = -1;
+  #beforeRound?: number[];
   readonly #decode: (keys: MlxArray, values: MlxArray) => AttentionRead;
   readonly #window: (keys: MlxArray, values: MlxArray) => AttentionRead;
 
@@ -78,6 +87,35 @@ export class PagedKvRows implements AttentionCache, BatchableCache {
 
   appendWindow(keys: MlxArray, values: MlxArray): AttentionRead {
     return this.#window(keys, values);
+  }
+
+  /** The window read, as on the serial pages. */
+  appendCommitted(keys: MlxArray, values: MlxArray): AttentionRead {
+    return this.#window(keys, values);
+  }
+
+  specRoundBegin(): void { this.#beforeRound = this.rowOffsets; }
+  specRoundCommit(): void { this.#beforeRound = undefined; }
+  specRoundRollback(keep: number | readonly number[]): void {
+    const before = this.#beforeRound!;
+    for (const [row, storage] of this.#rows.entries())
+      storage.trim(storage.offset - before[row]! - (typeof keep === "number" ? keep : keep[row]!));
+    this.#beforeRound = undefined;
+    this.releaseRopeArr();
+  }
+
+  /** Each row's gathered positions, joined left-padded to the longest row. */
+  captureDonorRows(): KvDonorRows {
+    const gathered: MlxArray[] = [];
+    try {
+      const rows = this.#rows.map(row => {
+        const { keys, values } = row.captureDonorRows();
+        gathered.push(keys, values);
+        return { keys, values };
+      });
+      const { keys, values, leftPad, width } = mergeKVRows(rows);
+      return { keys, values, offsets: this.rowOffsets, starts: leftPad, ends: leftPad.map(() => width) };
+    } finally { disposeResources(gathered); }
   }
 
   /** The graphs' read of gathered bf16 rows before the cache owned it: the
@@ -181,5 +219,5 @@ export class PagedKvRows implements AttentionCache, BatchableCache {
     const bytesPerBlock = pool.arrays().reduce((bytes, array) => bytes + array.nbytes, 0) / pool.numBlocks;
     return poolBlocksFor(tokens, this.blockSize) * bytesPerBlock;
   }
-  dispose(): void { const rows = this.#rows; this.#rows = []; this.releaseRopeArr(); disposeResources(rows); }
+  dispose(): void { const rows = this.#rows; this.#rows = []; this.#beforeRound = undefined; this.releaseRopeArr(); disposeResources(rows); }
 }
