@@ -4,7 +4,8 @@ import { clearCache } from "@mlx-bun/mlx/ffi";
 import type { Cache } from "../contracts/mlx/cache";
 import type { MlxTokenGraph } from "../models/graph";
 import type { GenerateOptions } from "../generation/index";
-import { bindMlxAutoregressiveGraph } from "../generation/bindings/autoregressive";
+import { MlxPhaseDispatch } from "../generation/phase-dispatch";
+import { tokenPhasesOf } from "../models/capabilities";
 import { appendGrammarSpan } from "../generation/grammar-step";
 import { makeStepSampler, type DeviceStepSampler } from "../sampling/index";
 import { cleanupFailure, disposeResources } from "../runtime/resources";
@@ -36,13 +37,13 @@ export function bindGrammarGroupRequests(model: MlxTokenGraph, denseKvReads: rea
 }
 
 class GrammarGroup implements MlxGroupedMethod {
-  readonly #binding;
+  readonly #dispatch: MlxPhaseDispatch;
   readonly #requests = new Map<Row, RequestState>();
   #next = 0;
 
   constructor(readonly host: MlxGroupMethodHost, readonly model: MlxTokenGraph,
     readonly denseKvReads: readonly number[]) {
-    this.#binding = bindMlxAutoregressiveGraph(model);
+    this.#dispatch = new MlxPhaseDispatch(tokenPhasesOf(model));
   }
 
   prepare(row: Row): MlxGroupPreparation {
@@ -57,11 +58,11 @@ class GrammarGroup implements MlxGroupedMethod {
       model: this.model, chunkSize: this.host.prefillChunkSize,
       tailSplit: this.host.runtime.flag("MLX_BUN_PREFILL_TAIL_SPLIT", true),
       promptCache: this.host.promptCache, maintain: this.host.kvMaintenance, denseKvReads: this.denseKvReads,
-      forward: (ids, caches) => Promise.resolve(this.#binding.graph.forwardHidden(ids, caches)),
-      project: hidden => {
+      forward: async (ids, caches, step) => this.#dispatch.prompt(step.phase, step.sequences, step.tokens)(ids, caches, null),
+      project: (hidden, _caches, _completed, step) => {
         const [, length, width] = hidden.shape as [number, number, number];
         using last = hidden.slice([0, length - 1, 0], [1, length, width]);
-        return this.#binding.graph.projectLogits(last, { type: "all" });
+        return this.#dispatch.logits(step.sequences)(last);
       },
       complete: async (state, logits) => {
         const request = this.#requests.get(row)!;
@@ -144,7 +145,7 @@ class GrammarGroup implements MlxGroupedMethod {
         state.sampling.commitDevice(current);
         state.sampling.commitNumbers(forced);
         const after = step + 1 + forced.length;
-        await appendGrammarSpan(this.#binding.graph, state.caches, [token, ...forced],
+        await appendGrammarSpan(this.#dispatch, state.caches, [token, ...forced],
           ids => { row.fed.push(...ids); },
           after < row.req.maxTokens && !grammar.isTerminated
             ? logits => { next = state.sampling.sample(logits, after).token; } : undefined);
@@ -152,8 +153,8 @@ class GrammarGroup implements MlxGroupedMethod {
         this.#readable(state);
         state.sampling.commitDevice(current);
         using ids = ops.reshape(current, [1, 1]);
-        using hidden = await this.#binding.graph.forwardHidden(ids, state.caches);
-        using logits = this.#binding.graph.projectLogits(hidden, { type: "all" });
+        using hidden = await this.#dispatch.decode(1)(ids, state.caches, null);
+        using logits = this.#dispatch.logits(1)(hidden);
         next = state.sampling.sample(logits, step + 1).token;
         row.fed.push(token);
       }
