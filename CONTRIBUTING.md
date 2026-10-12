@@ -29,7 +29,7 @@ and explain and test intentional behavior corrections.
 
 - **L1:** compare logits with the pinned mlx-lm oracle, bit-exact where that
   path's contract requires it. Keep application policy separate from numerics.
-- **L2:** use the applicable mlx-optiq reference for its specialized paths.
+- **L2:** use the applicable mlx-optiq reference for its mixed-precision KV paths.
 - **Lab:** a path without an oracle needs explicit numerical acceptance criteria;
   it must win a paired A/B before becoming a default.
 
@@ -45,10 +45,22 @@ identical artifacts, tokens, settings, and state transitions; compare the
 migrated path with both its applicable oracle and pre-refactor main. State
 exactly which models and paths the evidence covers.
 
+Two tools in `packages/inference/scripts/` compare trees through the app's
+generate path, each documented by `--help`: `digest.ts` hashes the token ids and
+top-8 logprobs of greedy tokens per KV scheme, row count and prefill chunk, and
+`teacher-forced-kl.ts` captures teacher-forced decode logits over its default
+prompts and reports the KL between two captures, the measure for a composition
+that is not bit-identical to its control.
+
 Performance claims require paired runs on a quiet, named machine with identical
 artifacts and configuration. Compare decode, prefill, complete-request time,
 and memory as applicable. Investigate gaps against the applicable oracle rather
-than dismissing them as framework differences. Paired reports live outside this
+than dismissing them as framework differences. The paired serve benchmark is
+`scripts/bench-serve.ts`; `scripts/bench/perf-check.ts` runs the machine
+preflight and decides a saved run from its paired interval (both `--help`).
+`.github/workflows/perf.yml` runs them, with the two numerical tools as a report,
+for pull requests to `main` that touch kernels, layers, models, state, execution,
+native code, the MLX binding or the benchmark itself, on the self-hosted M1 Max runner. Paired reports live outside this
 repository, for example as a published dataset; quote results as text in
 documentation with their provenance, following the architecture's [documentation rules](ARCHITECTURE.md#documentation).
 

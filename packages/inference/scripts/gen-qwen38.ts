@@ -55,8 +55,9 @@ export interface Qwen38Composition {
   readonly maxRows: number | null;
   readonly aneBridge: boolean;
   /** Layers whose gate and up widths differ, at one to four rows, on the reduce kernels. `"split"`, the default and
-   *  measured best: `ReduceMixedGateUp` with MLX's compiled-SwiGLU tail, bit-identical to the two projections plus a separate SwiGLU and one kernel instead of
-   *  three (about 1 ms less per verify forward over the artifact's ten such layers on the M1 Max). `"fused"`:
+   *  measured best: `ReduceMixedGateUp` with MLX's compiled-SwiGLU tail, bit-identical to the two projections plus a
+   *  separate SwiGLU and one kernel instead of three (about 1 ms less per verify forward on the M1 Max over the
+   *  artifact's ten such layers). `"fused"`:
    *  the same kernel with the same-width kernel's float32 sigmoid (last bits differ). `"off"`: those layers keep the
    *  generic blocks' two projections and separate SwiGLU, the A/B control. Only a device whose table names
    *  `ReduceMixedGateUp` reads it. */
@@ -87,8 +88,7 @@ export const QWEN38_COMPOSITIONS: Readonly<Record<string, Qwen38Composition>> = 
     // token, bf16 KV, greedy; six to eight rows (131.8 to 137.5 ms, not monotone) declared at the depth-7 plateau.
     verifyRoundCosts: { host: "M4 Pro 24 GB", costs: [[1, 1], [2, 1.3], [3, 1.46], [4, 1.68], [5, 1.82], [6, 1.92], [7, 1.93], [8, 1.94]] },
   },
-  // This artifact on the M1 Max GPU, whatever its KV
-  // scheme or rows.
+  // This artifact on the M1 Max GPU, under every KV scheme and any number of rows per forward.
   "qwen38-27b-trellis-m1max": {
     stem: "qwen38-27b-trellis-m1max",
     graph: "qwen3.8-27b-trellis-3.2bpw-m1max",
@@ -216,7 +216,7 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     ane: { fraction: 0.55, rowMajorMlp: "AneTrellisMlpSplit", k3InterleavedMlp: "AneTrellisMlpSplitK3i", affine: "AneAffineSplit",
       projections: ["in_proj_z", "out_proj", "o_proj"] },
   },
-  // The kernels and evaluation measured best on the M1 Max: the reduce gate/up and scatter down kernels up to
+  // The M1 Max GPU's kernels and evaluation, measured there: the reduce gate/up and scatter down kernels up to
   // four rows (the representations qualified on this GPU family, through TrellisLinear), the generic blocks above;
   // MLX's QuantizedLinear for every projection and the head; no graph submission; mixed rows packed on the generic
   // blocks; known tokens as windows.

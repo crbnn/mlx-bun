@@ -34,10 +34,10 @@ stack, in publish order, and a handler that throws is counted and skipped). The 
 loads, unloads and memory. `apps/mlx-bun/src/engine/telemetry.ts` is the engine adapter: it wraps the completion
 engine to time each request from the run's own stats (`prefillMs`, `decodeTps`) and the first token's arrival, and
 samples the gateway (`activeRows`, `kvBytes`) and prompt cache every second, quiet while idle and unchanged, from the
-same counters `/stats` reads. `serve-host.ts` publishes the served model's `model.load` with the loader's measured
-time. The chat model's unload is not published (the process exits with it), and no
-producer publishes swaps yet: residency and swapping arrive with the model host
-([PLAN](../../PLAN.md#split-the-app-into-modules) (e)), which will publish `model.unload` with reason `evicted`.
+same counters `/stats` reads, plus each model's memory. The residency manager
+(`apps/mlx-bun/src/residency/model-residency.ts`) publishes every served model's `model.load` (the startup model's
+with the loader's measured time, `resumed` when saved state was found), `model.unload` (reason `evicted` or
+`requested`, and whether its saved state flushed) and `model.memory`, so a swap is an evicting unload followed by a load.
 The module requires `jobs`, so the app activates it in its persistent state (`installedModules("state")`), beside
 datasets: it subscribes to the state's bus before any model loads and outlives a model host. In the default isolated
 server each worker's events are relayed onto the parent's bus, so the view covers every resident model.

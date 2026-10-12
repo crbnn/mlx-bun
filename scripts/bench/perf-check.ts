@@ -1,4 +1,4 @@
-// Automatic performance-regression check (PLAN, Phase F) around the existing
+// Automatic performance-regression check around the existing
 // paired serve benchmark. bench-serve.ts measures, unchanged; this file adds
 // what a CI gate needs around it: main's machine preflight before measuring
 // (src/preflight.ts at 02d723a, ported), the label of the graph the candidate's
@@ -113,7 +113,7 @@ async function graphLabel(modelDir: string): Promise<string> {
 }
 
 // ---- the decision -----------------------------------------------------------------------
-/** The report's paired request metrics that gate (PLAN: prefill, decode, TTFT). */
+/** The report's paired request metrics that gate: decode, prefill and TTFT. */
 export const GATED = ["decode", "prefill (nominal 1k prompt)", "TTFT cold (nominal 1k prompt)"] as const;
 /** Shown beside them, never gated: one pair per session. Memory is the worker's MLX allocator and the
  * physical footprint, never `ps` RSS (measure.ts `MemoryReading` says why). */

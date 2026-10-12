@@ -73,8 +73,8 @@ name-drop unrelated remembered facts to sound familiar.
 
 The memory panel can browse the vault and explicitly initialize one with the
 user's agreement. These tools only read existing articles and references.
-Synthesis runs on demand: `mlx-bun memory synthesize` loads the memory task
-model itself, and the web app's synthesize route uses the served model.
+Synthesis runs on demand on the memory task model: `mlx-bun memory synthesize`
+loads it itself, and the web app's synthesize route runs it inside the server.
 `mlx-bun memory schedule` installs a nightly launchd job that runs that same
 command. `memory_status` reports whether that job is installed and loaded
 plus the last synthesis commit; do not claim a scheduled run happened unless

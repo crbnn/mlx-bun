@@ -1,6 +1,6 @@
 /** Teacher-forced decode KL through the app's one-shot `generate` path, the serving-decode
  * method of 02d723a:scripts/eval.ts `kl --decode` (src/eval/kl.ts evaluateKlServingDecode)
- * as the Trellis checks ran it. Every gate in PLAN that accepts a numerical change quotes it.
+ * as the Trellis checks ran it. A gate that accepts a numerical change quotes it.
  *
  * capture: each of the 16 default prompts is tokenized raw and cut to 256 tokens;
  * prefillLen = max(1, L - 32); the head tokens[0:prefillLen] is the request's prompt and

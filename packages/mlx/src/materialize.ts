@@ -10,7 +10,7 @@ let zero: MlxArray | undefined;
  * Values and dtype are unchanged. Evaluation stays lazy and never reads data
  * back to the host. Use only when independent compact storage is required;
  * immutable array aliases normally avoid this allocation and dispatch.
- * Slice sizes are concrete, so use shape-specialized compiled graphs. */
+ * Slice sizes are concrete, so compile it only in fixed-shape (not shapeless) functions. */
 export function materializeCopy(input: MlxArray): MlxArray {
   zero ??= MlxArray.fromInt32(new Int32Array([0]), []);
   if (input.ndim > 0) return ops.sliceDynamic(input, zero, [0], input.shape);

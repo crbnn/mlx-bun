@@ -66,7 +66,7 @@ function disposeReservedUnstarted(options: GenerateOptions): void {
   options.grammar?.dispose();
 }
 
-/** One app execution lane: lone and concurrent requests use the same library
+/** The app's one execution path: lone and concurrent requests use the same library
  * scheduler. Exclusive leases protect mutations and managed jobs. */
 export class GenerationGateway implements CompletionEngine {
   #closed = false;
@@ -234,7 +234,7 @@ export class GenerationGateway implements CompletionEngine {
       // The request transferred its native inputs to this run; this is their
       // one release after reservation. A denoising row borrows its pixels for
       // its first unit and closes its run before the submission settles, so
-      // they are released here, as main's serial run did.
+      // they are released here, as main's one-request run did.
       disposeResources([{ dispose: () => releasePrefix?.() }, reservation,
         ...[vision?.embeddings, vision?.imageMask, vision?.multimodalMask, options.visionPixels]
           .filter(value => value != null)]);
@@ -325,7 +325,7 @@ export class GenerationGateway implements CompletionEngine {
     }
 
     // Autoregressive decode time starts at the first token. Denoising computes
-    // every published token inside its decode span, as main's serial method did.
+    // every published token inside its decode span, as main's one-request method did.
     const decodedTokens = placement.execution?.method === "denoising" ? st.generatedTokens : st.generatedTokens - 1;
     return {
       promptTokens: st.promptTokens,

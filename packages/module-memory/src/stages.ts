@@ -365,13 +365,13 @@ export async function runExtractStage(
     return { extracted, remaining: pending.length - extracted };
   }
 
-  // SERIAL fallback (injected `call`, single chunk, or batching disabled).
+  // One call at a time (injected `call`, single chunk, or batching disabled).
   let extracted = 0;
   for (const id of targetIds) {
     opts.signal?.throwIfAborted();
     // Pass the (possibly empty) policy through: `|| undefined` made extractEntities
     // re-load Meta/Entities.md and THROW on a vault without it, while the batched
-    // path above proceeds with "" — the serial path must match.
+    // path above proceeds with "" — this one-at-a-time path must match.
     await extractEntities(store, id, { resolver, policy, call: opts.call ?? ((p, o) => calls.callLocal("entity", { user: p }, o)) });
     extracted++;
     if (extracted % 10 === 0) {

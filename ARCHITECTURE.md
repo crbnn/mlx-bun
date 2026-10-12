@@ -19,12 +19,12 @@ needs a separate installation or release boundary.
 - Preserve behavior during migration; numerical optimization is separate work.
   A model graph composes layers and kernels; its layers own whether
   operations compile. Keep this implementation choice out of app options.
-- The app uses continuous batching by default, including a single request: one
-  request is a batch of one, and `--batch-size` is only the cap. Choosing a cap
-  above one opts into batching, which may move the last bits of a result;
-  `--batch-size 1` says nothing can be batched, so nothing changes. Do not add a
-  separate serial serving lane. Preserve main's application behavior while
-  giving each domain a clear owner; benchmark the full draft afterward.
+- The app runs every request on the continuous batching scheduler: one request
+  is a batch of one, and `--batch` is only the cap on rows per forward. Choosing
+  a cap above one opts into batching, which may move the last bits of a result;
+  `--batch 1` says nothing can be batched, so nothing changes. There is no second
+  engine for one request. Preserve main's application behavior while giving each
+  domain a clear owner; benchmark the full draft afterward.
 - Inference and the app do not require a Python environment. Separately runnable
   verification and evaluation tools may use pinned Python environments; their
   reusable code, launch configuration, and instructions belong in Git. Runtime
@@ -97,17 +97,18 @@ readers.
 Scheduling (`execution/`) is written against the structural `MlxTokenGraph`, not
 the registry's closed `RuntimeModel` union of model classes, and moves cache rows
 through each layer's row layout (`state/layout`, the `BatchableCache` port) rather
-than a concrete cache class. The gate rejects both there. Elsewhere this remains the target design and a review criterion
-for remaining migration work, not a claim that every existing path already
-satisfies it.
+than a concrete cache class. The gate rejects both there, and its composition
+rules (the seam ratchet below) hold the mechanical part of this section across
+the library. What no rule can see remains a review criterion, not a claim that
+every existing path already satisfies it.
 
 Two contracts carry the composition. The cache owns its storage and its read:
 a layer appends through `AttentionCache` and reads through `AttentionRead.attend`,
 and no caller reaches a representation-specific escape hatch; the cache also
 owns prefix reuse, paging, SSD offload and eviction behind that interface and
 answers hit or miss. The graph names its phases (`MlxTokenPhases`:
-`prefillChunk` per execution unit, `prefillTail`, and `decode`, `verify` and
-`logits` as width tables); the scheduler calls the phase it is in for the rows
+`prefillChunk` per execution unit, and `prefillTail`, `decode`, `verify`,
+`appendKnown` and `logits` as width tables); the scheduler calls the phase it is in for the rows
 it batched and dispatches prompt chunks to the GPU or the Neural Engine as a
 resource it manages. Row-wise layers take M rows and do not know whether they
 are one sequence or M; only `attend` and the recurrence see the row layout.
@@ -127,14 +128,14 @@ Inside `packages/inference/src/`:
 | `kernels/` | Numerical operations and their input layouts. No concrete cache, artifact loader, model, or scheduler imports. |
 | `artifacts/` | Configuration, weights, formats, auxiliary checkpoint files, expert storage/residency, and conversion of artifact layouts into kernel descriptors. |
 | `layers/` | Reusable graph building blocks, including LoRA application and positional operations. |
-| `state/` | Cache implementations that own their storage and their read (`attend`), snapshots, row storage, prefix reuse, retention, and SSD persistence. |
+| `state/` | Cache legos that own their storage and their read (`attend`), the KV scheme they compose from, the row layouts the scheduler moves rows through (`layout`), snapshots, and the cache service (`cache-service`): one per loaded model, owning prefix reuse, the KV budget, SSD persistence, retention and eviction behind acquire and release. |
 | `input/` | Tokenizers, templates, media preprocessing, and prompt assembly through encoder interfaces. |
 | `sampling/` | Sampling policy, processors, constraints, and draft sampling. |
 | `adapters/` | Loading and mounting adapter weights through named target interfaces. |
-| `models/` | Entire graphs, generated per model, quantization and machine or generic per family, and the composition tables that select them. |
-| `generation/` | Autoregressive, denoising, fill, and speculative methods. `bindings/` connects concrete graphs to those methods. |
+| `models/` | Family records and profiles; entire graphs, generated per model, quantization and machine, or a family's generic graph; the composition resolver (`composition`) and the selection tables the loader picks a graph from (`factory`); drafter loaders; the Neural Engine programs the shipped compositions load (`ane-install`). |
+| `generation/` | Autoregressive, denoising, fill, and speculative methods, and the phase dispatch (`phase-dispatch`) that resolves the operation a graph built for the phase and rows its caller names. `bindings/` connects concrete graphs to those methods. |
 | `scoring/`, `embeddings/`, `transcription/` | Operations consuming graphs and caller-supplied inputs. |
-| `execution/` | Admission, scheduling, sessions, and coordination of generation work: the one component that decides at run time. |
+| `execution/` | Admission, the plan from declared capabilities, the batch groups that call the graph's phases for the rows they batched, sessions, coordination, and fit estimates: the one component that decides at run time. |
 | `index.ts` | High-level public entry point consuming these components. |
 
 Dependencies form a DAG, with independent branches rather than one universal
@@ -283,7 +284,7 @@ lets a host that also generates make room first), the registry-backed catalog, s
 entries under `MLX_BUN_HOME`, verb parsing and help from manifests, route
 mounting, module activation and verb running. A host adds only its own execution
 lock and serving; `apps/mlx-bun` also owns the generation side of `modelHost`
-(`src/engine/model-residency.ts`: residency by memory fit over serving units, with
+(`src/residency/model-residency.ts`: residency by memory fit over serving units, with
 `src/server/model-routes.ts` routing requests by model id). A module's manifest is also importable alone
 (`@mlx-bun/module-<id>/manifest`, data only), so a host lists commands and
 `--help` and the documentation generators read verbs and routes without loading
@@ -342,9 +343,15 @@ the host's automatic choice (`pickDefault`), which the app supplies from the sel
 - Seam ratchet: model-class and cache-class `instanceof`, imports of concrete model
   modules (`models/<family>`, from other inference layers and other packages), model-type,
   `architectures` and repo-id/name checks, family-named env flags read outside
-  `models/`, and scheduler-core imports beyond contracts and runtime. The code that
-  still breaks them is listed per file in `seamRatchet` (a count may only fall; a
-  drop prints a reminder to lower it); each cleanup PR shrinks the table.
+  `models/`, and scheduler-core imports beyond contracts and runtime; and the
+  composition rules: a graph class that extends a graph or reads `super.` of one, a
+  runtime flag, env read, `deviceArchitecture()`, `globalThis` access or layer, cache
+  or model `instanceof` inside a forward, read, append or kernel body (construction,
+  acceptance and the loader are exempt, profiling hooks by name), a
+  representation-specific cache read outside `state/`, and the removed whole-forward
+  entry points reached from `execution/` or `generation/`. Code that breaks them is
+  listed per file in `seamRatchet`, whose counts may only fall; the table is empty,
+  so any finding fails the gate with the paved road in its message.
 - Panel code imports only panel files and its `protocol.ts`, which imports
   nothing; this generalizes the browser rule for `chat/` and `jobs/`.
 - `web-shell` is browser code with no workspace dependencies and no imports beyond its own files; no module imports
@@ -386,7 +393,7 @@ One supported way per pattern; a second way is a gate failure, not a style note:
   resolves, never as a flag read inside a forward.
 
 The architecture gate holds these rules where they are mechanical, with a
-ratchet of remaining violators whose counts only fall; every failure message
+ratchet of violators (empty) whose counts only fall; every failure message
 names the paved road.
 
 For every newly supported model, the target is to compile its description into
@@ -397,7 +404,8 @@ model, artifact, layer, and selected option facts into specific kernels, layers,
 state layouts, and bound operations. The generated graphs demonstrate the
 pattern for model support generally: `packages/inference/scripts/gen-gemma4.ts`
 emits `models/gemma4/generated/*` from `models/gemma4/blocks.ts`, and
-`gen-qwen38.ts` emits the M4 Pro Qwen3.8 graph; drift tests keep the committed
+`gen-qwen38.ts` emits the M4 Pro and M1 Max Qwen3.8 graphs from
+`models/qwen/blocks.ts`; drift tests keep the committed
 graphs equal to what the generators emit. Adding support means generating the
 graph from reusable blocks and implementing any missing operation in its owning
 layer.

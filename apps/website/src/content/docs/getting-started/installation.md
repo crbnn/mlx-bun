@@ -14,7 +14,10 @@ curl -fsSL https://mlx-bun.dev/install.sh | sh
 
 The [installer](/install.sh) downloads the signed, notarized release bundle,
 which includes its runtime and native libraries. Keep the executable and its
-native sidecars together.
+native sidecars together. The installer then runs `mlx-bun compile-ane`, which
+compiles the Neural Engine programs your Mac's models use into the system's
+cache, so no model load or prompt compiles them; where the Neural Engine cannot
+compile, it warns and keeps the installation.
 
 `MLX_BUN_VERSION` selects a release tag (default `latest`); `MLX_BUN_INSTALL_DIR` changes the bundle
 installation root (default `~/.mlx-bun`), not the app's data location. The app writes
@@ -33,7 +36,10 @@ on `PATH`. Restart a running app after upgrading to use the new version.
 brew install joshuarossi/tap/mlx-bun
 ```
 
-Homebrew installs the same bundle and links the `mlx-bun` command.
+Homebrew installs the same bundle and links the `mlx-bun` command. The app checks
+the Neural Engine programs before every model load and compiles only what the
+system's cache lacks, so Homebrew and npm installs get them before their first
+model load; `mlx-bun compile-ane --check` lists them.
 
 ## npm package
 
