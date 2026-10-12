@@ -385,6 +385,10 @@ to callers outside `state/`. Every one of these is a method learning the represe
 
 #### B4. The last lego forms
 
+The cache layer is independent of the model and the method (Josh, 2026-10-12): a refusal that
+names a cache is not a rule broken, it is a cache lego that has not been built yet. Each bullet
+below is a missing lego; the refusals disappear because the legos exist, not the other way round.
+
 - [ ] Compiled decode on the TurboQuant, delayed-start and paged legos, so `compiledDecode`
       resolves from the composition alone and `decodesCompiled` in `state/kv-maintenance` goes.
 - [ ] Pages under a per-layer affine scheme and under TurboQuant (paged pages are bf16, 4 or 8
@@ -399,9 +403,9 @@ to callers outside `state/`. Every one of these is a method learning the represe
 - [ ] Order: after the merge of E5, the B3 planner side and the ratchet item, which own the
       contract and the legos these build on.
 
-Exit: no load-time or run-time error anywhere in the tree whose text names a cache
-representation together with a model, method or row kind; the conformance suite covers each new
-form; where the artifact exists (e4b, MiniCPM5, Llama, the Trellis artifact) the forms are gated
+Exit: every lego the composition can name serves every model and method, so nothing in the tree
+has a reason to name a cache together with a model, method or row kind; the conformance suite
+covers each new form; where the artifact exists (e4b, MiniCPM5, Llama, the Trellis artifact) the forms are gated
 by digest or KL against the tiled null as B3 did, and elsewhere by a frozen oracle over synthetic
 weights at maxDiff 0.
 
