@@ -109,6 +109,9 @@ export interface Composition {
    * closures, the reference's `mx.compile`d geglu and softcap (default on); off,
    * the spelled-out ops, which compute the same bits. */
   readonly compiledGeglu: boolean;
+  /** The SwiGLU activations run the compiled closure, mlx-lm's `mx.compile`d
+   * swiglu (default on); off, separate silu and multiply kernels. */
+  readonly compiledSwiglu: boolean;
 }
 
 /** The value of each composition fact a caller leaves unstated: what
@@ -124,4 +127,5 @@ export const COMPOSITION_DEFAULTS = Object.freeze({
   grammarJump: false,
   greedyDraft: false,
   compiledGeglu: true,
+  compiledSwiglu: true,
 } satisfies Partial<Composition>);

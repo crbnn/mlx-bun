@@ -21,7 +21,6 @@ import type { Weights } from "../../src/artifacts/weights";
 import type { BatchableCache, Cache, PaddedPrefillCache } from "../../src/contracts/mlx/cache";
 import type { MlxPhaseForward, MlxPrefillChunk, MlxVerifyForward, MlxWidthTable } from "../../src/contracts/mlx/graph";
 import type { RuntimeModel } from "../../src/models/factory";
-import { createRuntimeConfig, runtimeConfig, withRuntimeConfig } from "../../src/runtime/config";
 import { trainForward } from "../../src/scoring/full-sequence";
 import { evalPpl } from "../../src/scoring/perplexity";
 import { createKvMaintenance } from "../../src/state/layout";
@@ -154,11 +153,11 @@ interface Family {
   delayedStart: number;
 }
 
-function miniCpmGraph(): MiniCPM5Model {
+function miniCpmGraph(compiledSwiglu = true): MiniCPM5Model {
   const t = new Tensors();
   decoder(t, false, denseMlp(t));
   t.linear("lm_head", [VOCAB, HIDDEN], true, 0.05);
-  return new MiniCPM5Model(t.weights(), textConfig("llama", {}), testComposition());
+  return new MiniCPM5Model(t.weights(), textConfig("llama", {}), testComposition(undefined, { compiledSwiglu }));
 }
 function qwen3Graph(): Qwen3Model {
   const t = new Tensors();
@@ -473,9 +472,8 @@ describe("dense family: what the graphs compose at construction", () => {
       .toThrow("array masks without a score softcap");
   });
 
-  test("MiniCPM5 reads MLX_BUN_COMPILED_SWIGLU once at construction: 0 builds the unfused MLP, unset the compiled one", () => {
-    const unfused = createRuntimeConfig({ ...runtimeConfig().values, MLX_BUN_COMPILED_SWIGLU: "0" });
-    expect(withRuntimeConfig(unfused, () => miniCpmGraph()).layers.every(layer => layer.mlp.kind === "unfused")).toBe(true);
+  test("MiniCPM5 builds its MLP from the composition: compiledSwiglu off builds the unfused MLP, on the compiled one", () => {
+    expect(miniCpmGraph(false).layers.every(layer => layer.mlp.kind === "unfused")).toBe(true);
     expect(miniCpmGraph().layers.every(layer => layer.mlp.kind === "compiled")).toBe(true);
   });
 });

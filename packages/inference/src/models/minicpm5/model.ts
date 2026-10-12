@@ -21,7 +21,6 @@ import { atEveryWidth, type ReadPhase } from "../graph";
 import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
 import type { AttentionCache, Cache } from "../../contracts/mlx/cache";
-import { runtimeValue } from "../../runtime/config";
 import { disposing } from "../../layers/helpers";
 import { RMSNorm } from "../../layers/normalization";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
@@ -166,7 +165,7 @@ export class LlamaMLP {
 }
 
 /** The MLP with the swiglu as separate silu and multiply kernels: the explicit
- *  opt-out (`MLX_BUN_COMPILED_SWIGLU=0`), chosen when the graph is built. */
+ *  composition with `compiledSwiglu` off, chosen when the graph is built. */
 export class LlamaUnfusedMLP {
   readonly kind = "unfused";
   readonly gate: QuantizedLinear;
@@ -271,8 +270,7 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
     this.weightsBytes = [...weights.shards.files.values()]
       .reduce((a, f) => a + f.mmap.size, 0);
     this.embed = QuantizedEmbedding.load(weights, "model.embed_tokens", config);
-    // E3: the swiglu opt-out becomes a composition choice; read once, here.
-    const Mlp = runtimeValue("MLX_BUN_COMPILED_SWIGLU") === "0" ? LlamaUnfusedMLP : LlamaMLP;
+    const Mlp = composition.compiledSwiglu ? LlamaMLP : LlamaUnfusedMLP;
     this.layers = Array.from(
       { length: config.text.numHiddenLayers },
       (_, i) => new LlamaLayer(weights, config, `model.layers.${i}`, Mlp),
