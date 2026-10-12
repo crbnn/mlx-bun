@@ -23,15 +23,16 @@ targets; prompt preparation accepts encoder interfaces. Callers can supply their
 own implementations without subclassing a concrete model or cache.
 
 Each graph declares what it can do (`GraphCapabilities`, portable; a model exposes
-it as `graphCapabilities`): its method, batched adapters, media input, compiled
-decode, hidden-layer taps for drafts, a draft head its
-checkpoint carries (`nativeDraft`), whether long prompts prefill in workspace-bounded
+it as `graphCapabilities`): its method, adapters (batched rows, mountable), media
+input, compiled decode, sparse attention, pooled embeddings, hidden-layer taps for
+drafts, a draft head its checkpoint carries (`nativeDraft`), whether long prompts prefill in workspace-bounded
 chunks, and what its verifier qualifies (adapters, logprobs, external tokens,
 grammar proposals). None names a cache format: the composition's caches serve
 every method, and the planner never reads how they store keys and values.
-`MlxDeclaredGraph` names the operations behind those promises (`bindMediaInput`,
-`mediaEncoders`, `pixelInput`, `draftTarget`, `nativeDraftHead`, `compiledDecodeStep` and
-`releaseCompiledDecode`, `trainable`, `expertResidency`), and
+`MlxDeclaredGraph` names the operations behind those promises (`embed`, `bindMediaInput`,
+`embedPooled`, `mediaEncoders`, `pixelInput`, `draftTarget`, `nativeDraftHead`, `trainable`,
+`compiledDecodeStep` and `releaseCompiledDecode`, `expertResidency`) and the facts its
+composition declares (`verifyRoundCosts`, `knownSpans`, `mixed`), and
 `declaredGraph` in `models/capabilities` checks the pairing once when composition
 binds the graph: an undeclared graph, or a declaration without its operation, is
 refused. The gateway plans from the declarations, the request and dynamic state
