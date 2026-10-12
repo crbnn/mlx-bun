@@ -17,10 +17,15 @@
 //               window shift a compile-time constant); simd_sum.
 //   - scatter  (M <= 4, axis=0): lane-per-WORD of a block, running sums per
 //               position in the word, split-K over input rows (partials folded
-//               by one mlx sum).
+//               by one mlx sum). One kernel each: scatterRow / balancedScatterRow
+//               (one row; balanced = 3-bit codes at T 256) and scatterRows /
+//               balancedScatterRows (2..4 rows sharing each decoded weight);
+//               trellisScatter chooses among them by row count and geometry.
 //   - expand   (M > 4 fallback): decode the whole tensor to bf16, then a stock
 //               matmul; the transient is one tensor.
-//   - gate-up / mixed-gate-up: fused gate+up+SwiGLU for M <= 4 rows. The mixed
+//   - gate-up / mixed-gate-up: fused gate+up+SwiGLU for M <= 4 rows
+//               (gateUpReduceRow one row, gateUpReduceRows 2..4 shared rows;
+//               fusedGateUpSwiglu chooses between them by row count). The mixed
 //               kernel serves layers whose gate and up bit widths differ (one
 //               word layout and bit offset each); TAIL "split" reproduces MLX's
 //               compiled swiglu over two bf16 projections bit for bit (no output
@@ -62,9 +67,9 @@ export type { TrellisGeometry, TrellisWeights } from "./geometry";
 export { vectorTrellisExpand, vectorTrellisExpandEligible } from "./vector-expand";
 export { expandTrellis } from "./expand";
 export { trellisReduce, TRELLIS_MATVEC_MAX_M } from "./reduce";
-export { trellisScatter } from "./scatter";
+export { trellisScatter, scatterRow, scatterRows, balancedScatterRow, balancedScatterRows } from "./scatter";
 export { qualifiedRepresentations, type ScatterRepresentation, type TrellisRepresentations } from "./qualified";
-export { fusedGateUpSwiglu } from "./gate-up";
+export { fusedGateUpSwiglu, gateUpReduceRow, gateUpReduceRows } from "./gate-up";
 export { fusedGateUpSwigluMixed, type MixedGateUpTail } from "./mixed-gate-up";
 export { tiledTrellisPrefill, tiledTrellisPrefillEligible } from "./tiled-prefill";
 export { splitKTrellisPrefill, splitKTrellisPrefillEligible } from "./splitk-prefill";

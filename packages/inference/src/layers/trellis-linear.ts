@@ -101,6 +101,9 @@ export function trellisStoredRows(lin: TrellisLinear, start: number, stop: numbe
 export class TrellisLinear {
   readonly geometry: TrellisGeometry;
   readonly spec: QuantSpec;
+  /** The decode variant every kernel over these weights runs (kernels/trellis/index.ts): the row-form layers
+   *  built on this projection take it at their construction. */
+  readonly variant = VARIANT;
   /** What the kernels take from this machine's GPU family (single-row
    *  representations, wide prefill), fixed here and passed on every call. */
   readonly representations: TrellisRepresentations;
