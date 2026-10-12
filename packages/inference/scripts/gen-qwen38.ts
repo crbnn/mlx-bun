@@ -492,12 +492,12 @@ ${k.mixed === "perGroup" ? "//   - mixed groups of rows in one forward (mixed), 
 //     its own caches, the prompt and decode groups' MLP rows packed into one call (the composition's packedMixedMlp);`}
 //   - the scoring forward over a whole sequence (sequenceHidden, prefillTail's operation for its width);
 ${adapterSafe ? `//   - mounted LoRA adapters: the attention and DeltaNet projections are the generic blocks' QuantizedLinear at
-//     every width, which apply them (the Trellis MLP is no adapter target).
-// The loader refuses, from the declared capabilities and never by routing to another graph: paged KV
-// (paged-kv-batch-unsupported).` : `//   - mounted LoRA adapters when the composition mounts them: every operation then runs the generic blocks,
-//     whose QuantizedLinear projections apply them, and the Neural Engine operation is not built.
-// The loader refuses, from the declared capabilities and never by routing to another graph: adapter requests
-// when the composition mounts none (adapter-batch-unsupported) and paged KV (paged-kv-batch-unsupported).`}${kvLego ? `
+//     every width, which apply them (the Trellis MLP is no adapter target);
+//   - paged KV (the paged legos' own reads in place of the plain full-attention storage).` : `//   - mounted LoRA adapters when the composition mounts them: every operation then runs the generic blocks,
+//     whose QuantizedLinear projections apply them, and the Neural Engine operation is not built;
+//   - paged KV (the paged legos' own reads in place of the plain full-attention storage).
+// The planner refuses, from the declared capabilities and never by routing to another graph, adapter requests
+// when the composition mounts none (adapter-batch-unsupported).`}${kvLego ? `
 // ${kvLego}'s row layouts read with its KV4 kernels while they hold one unpadded row and with the
 // composition's affine kernels while they hold more.` : ""}
 
@@ -649,9 +649,7 @@ export class ${c.className} implements MlxDeclaredGraph, MlxTokenPhases {
   readonly finalNorm: RMSNorm;
   readonly lmHead: QuantizedLinear;
   /** Prepared image and video embeddings with request mRoPE positions, layer
-   *  taps for drafts (verify's capture), delayed affine rows, bounded prefill
-   *  workspace; adapters ${adapterSafe ? "at every width" : "only when the composition mounts them"}. Speculation over
-   *  affine KV is the composition's \`speculativeAffineKv\`. */
+   *  taps for drafts (verify's capture), bounded prefill workspace; adapters ${adapterSafe ? "at\n   *  every width" : "only\n   *  when the composition mounts them"}. */
   readonly graphCapabilities: GraphCapabilities;
 ${k.verifyRoundCosts ? `  /** Verify forward cost by rows relative to one decode step (${k.verifyRoundCosts.host}). */
   readonly verifyRoundCosts: ReadonlyMap<number, number> = new Map([
@@ -774,9 +772,8 @@ ${ane ? `    // The Neural Engine chunk operation, for exactly the composition's
 
     this.graphCapabilities = declareGraph({
       media: { input: "embeddings+positions", video: true }, hiddenLayerTaps: true,
-      kv: { delayedAffine: "all" }, prefill: { boundedWorkspace: true },
-${adapterSafe ? "" : "      adapters: composition.adapters ? {} : { batched: false, mountable: false },\n"}      speculation: { affineKv: composition.speculativeAffineKv, immediateAffine4: true },
-    });
+      prefill: { boundedWorkspace: true },
+${adapterSafe ? "" : "      adapters: composition.adapters ? {} : { batched: false, mountable: false },\n"}    });
 
 ${kvLego ? `    // The attention cache the composition's KV scheme names, chosen once: affine ${(c.kv as { bits: number }).bits}-bit group ${(c.kv as { groupSize: number }).groupSize}
     // composes ${kvLego}; bf16, the table's other scheme for this graph, the plain cache with the dense

@@ -96,7 +96,7 @@ class FillGroup implements MlxGroupedMethod {
     const ready: { row: Row; caches: Cache[]; retain?: () => void }[] = [];
     const target = new MlxPrefillCohort({
       model: this.model, chunkSize: this.host.prefillChunkSize,
-      tailSplit: this.host.runtime.flag("MLX_BUN_PREFILL_TAIL_SPLIT", true),
+      tailSplit: this.host.prefillTailSplit,
       promptCache: this.host.promptCache, maintain: this.host.kvMaintenance,
       forward: async (ids, caches, step) => this.#dispatch.prompt(step.phase, step.sequences, step.tokens)(ids, caches, null),
       project: (hidden, _caches, _completed, step) => this.#dispatch.logits(step.sequences * step.tokens)(hidden),

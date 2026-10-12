@@ -239,6 +239,10 @@ export class DeepspecDrafter implements DeepspecDrafterModel {
   #layers: Layer[] = [];
   #markovW1: TableW | null; // [vocab, markovRank] embedding
   #markovW2: MatW | null;   // markov_w2.weight [vocab, rank] Linear storage
+  /** One block step's token per row, bound once: the argmax of the step's
+   *  logits [B, V], plus the Markov head's bias from the previous tokens [B]
+   *  when the checkpoint carries one. Borrows both; owns the ids. */
+  readonly #selectStep: (logits: MlxArray, previous: MlxArray) => MlxArray;
   #confProj: MatW | null;   // proj.weight [1, confDim] Linear storage (bf16
                             // keeps the once-built transpose view — per-call
                             // transpose+cast leaked, 2026-07-06 review fix)
@@ -333,9 +337,15 @@ export class DeepspecDrafter implements DeepspecDrafterModel {
     if (cfg.markov_rank > 0) {
       this.#markovW1 = table("markov_head.markov_w1"); // [vocab, rank] embedding
       this.#markovW2 = mat("markov_head.markov_w2");   // stored [vocab, rank] Linear
+      this.#selectStep = (logits, previous) => {
+        using bias = this.#markovStepBias(previous);
+        using corrected = ops.add(logits, bias);
+        return ops.argmaxAxis(corrected, -1);
+      };
     } else {
       this.#markovW1 = null;
       this.#markovW2 = null;
+      this.#selectStep = logits => ops.argmaxAxis(logits, -1);
     }
 
     if (cfg.enable_confidence_head) {
@@ -686,9 +696,7 @@ export class DeepspecDrafter implements DeepspecDrafterModel {
       for (let step = 0; step < G; step++) {
         using row = base.slice([0, step, 0], [B, step + 1, V]);
         using logits = ops.reshape(row, [B, V]);
-        using bias = this.#markovW1 ? this.#markovStepBias(previous) : null;
-        using corrected = bias ? ops.add(logits, bias) : null;
-        const token = ops.argmaxAxis(corrected ?? logits, -1);
+        const token = this.#selectStep(logits, previous);
         sampled.push(token); previous = token;
       }
       // Serving does not consume confidence when truncation is disabled.

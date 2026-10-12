@@ -4,7 +4,8 @@ import * as ops from "@mlx-bun/mlx/ops";
 import type { PreparedStateChange } from "../../../contracts/portable/resources";
 import { normalizedArgmax } from "../../../kernels/sampling/normalized-argmax";
 import type { RecurrentMtpModule } from "../../../contracts/mlx/drafter";
-import { widthClass } from "../../../contracts/mlx/graph";
+import { widthClass, type MlxWidthTable } from "../../../contracts/mlx/graph";
+import { byWidth } from "../../../models/graph";
 import { applyStateChanges,cleanupFailure,disposeResources } from "../../../runtime/resources";
 import { toLogprobs } from "../../../sampling/index";
 import { BatchedKVCache } from "../../../state/batched-kv";
@@ -16,6 +17,49 @@ import type { DraftRowSampling,RecurrentMtpTarget } from "../source";
  * the returned owned [B] token array stays on device through the draft chain. */
 export type MtpRowSampling = DraftRowSampling;
 
+/** One draft step's token selection: the module output [B, 1, H] (borrowed) and
+ *  each row's step in, owned full-vocabulary ids [B] out. */
+type MtpSelect = (output: MlxArray, steps: readonly number[]) => MlxArray;
+
+/** The selection the draft group bound, per width class of the rows it drafts
+ *  for: the listed vocabulary's projection and each row's coupled draw over it,
+ *  the full head and its fused normalized argmax, or the full head and each
+ *  row's sampler over its log-probabilities. Resolved once when the rows open;
+ *  `owned` receives the listed projection, which the rows dispose. */
+function bindMtpSelection(target: RecurrentMtpTarget, sampling: MtpRowSampling,
+  owned: { vocabulary: DraftVocabularyHead | null }): MlxWidthTable<MtpSelect> {
+  const selection = sampling.selection;
+  if (selection.kind === "listed") {
+    // Frequency-ranked draft vocabulary: project onto the listed rows only.
+    // The target still verifies over the full vocabulary.
+    if (!target.vocabularyHead) throw new Error("a listed draft vocabulary needs the target's quantized vocabulary head");
+    const head = owned.vocabulary = new DraftVocabularyHead(target.vocabularyHead, selection.ids);
+    return byWidth(() => (output, steps) => {
+      using subsetLogits = head.project(output);
+      using subsetFlat = ops.reshape(subsetLogits, [steps.length, head.size]);
+      return selection.sample(subsetFlat, head, steps);
+    });
+  }
+  // Greedy drafting: one fused normalized-argmax over [B,V]; no logsumexp
+  // pass, no per-row top-p/top-k sort, no categorical draw.
+  if (selection.kind === "greedy") return byWidth(width => (output, steps) => {
+    using logits = target.logits[width](output);
+    using flat = ops.reshape(logits, [steps.length, logits.shape.at(-1)!]);
+    return normalizedArgmax(flat);
+  });
+  return byWidth(width => (output, steps) => {
+    using logits = target.logits[width](output);
+    using flat = ops.reshape(logits, [steps.length, logits.shape.at(-1)!]);
+    using logprobs = toLogprobs(flat);
+    return sampling.sample(logprobs, steps);
+  });
+}
+
+/** Prefill membership drafts nothing, so its rows bind no selection. */
+const prefillOnly: MlxWidthTable<MtpSelect> = byWidth(() => () => {
+  throw new Error("Qwen MTP prefill rows do not draft");
+});
+
 /** The same draft graph and state lifecycle for one or several requests.
  * Admission, target verification, output publication and persistence belong to
  * the caller. Rows remain fixed within a draft/commit round. */
@@ -25,16 +69,21 @@ export class QwenMtpRows {
   #prefilled: boolean[] = [];
   #drafts: number[][] = [];
   #depth = 0;
-  /** Row subset of the target's vocabulary projection; built on first use. */
-  #vocabulary: DraftVocabularyHead | null = null;
+  /** The listed vocabulary's row subset of the target's projection, when the
+   *  bound selection drafts over it. */
+  readonly #owned: { vocabulary: DraftVocabularyHead | null } = { vocabulary: null };
+  /** The draft token selection, bound once from the group's sampling. */
+  readonly #select: MlxWidthTable<MtpSelect>;
 
   constructor(
     readonly target: RecurrentMtpTarget,
     readonly module: RecurrentMtpModule,
-    readonly sampling: MtpRowSampling | null,
+    sampling: MtpRowSampling | null,
     states: readonly (MtpRowState | null)[],
   ) {
-    this.append(states);
+    this.#select = sampling ? bindMtpSelection(target, sampling, this.#owned) : prefillOnly;
+    try { this.append(states); }
+    catch (error) { cleanupFailure(error, () => this.dispose()); }
   }
 
   get rowCount(): number { return this.#cache.rowOffsets.length; }
@@ -86,7 +135,8 @@ export class QwenMtpRows {
 
   /** Retire/reorder committed requests without involving their sampler policy. */
   filterRows(keep: readonly number[]): void {
-    if (!keep.length) { this.dispose(); return; }
+    // A drained group keeps its bound selection for the requests that rejoin it.
+    if (!keep.length) { this.#releaseRows(); return; }
     using indices = ops.fromInt32([...keep], [keep.length]);
     const hidden = this.#hidden ? ops.takeAxis(this.#hidden, indices, 0) : null;
     try { this.#cache.filterRows(keep); }
@@ -189,35 +239,12 @@ export class QwenMtpRows {
         this.#hidden!.dispose(); this.#hidden = null;
         return this.#drafts;
       }
+      const width = widthClass(B), select = this.#select[width];
       for (let position = 0; position < depth; position++) {
         using embeds = this.target.embed(ids!);
-        const output = this.module.decode[widthClass(B)](embeds, chained ?? this.#hidden!, this.#cache);
+        const output = this.module.decode[width](embeds, chained ?? this.#hidden!, this.#cache);
         chained?.dispose(); chained = output;
-        // Frequency-ranked draft vocabulary: project onto the listed rows only.
-        // The target still verifies over the full vocabulary.
-        const listed = this.sampling!.vocabulary, fullHead = this.target.vocabularyHead;
-        if (listed && fullHead) {
-          this.#vocabulary ??= new DraftVocabularyHead(fullHead, listed.ids);
-          using subsetLogits = this.#vocabulary.project(output);
-          using subsetFlat = ops.reshape(subsetLogits, [B, this.#vocabulary.size]);
-          const drafted = listed.sample(subsetFlat, this.#vocabulary, steps.map(step => step + position));
-          if (drafted) {
-            tokens.push(drafted);
-            ids!.dispose(); ids = ops.reshape(drafted, [B, 1]);
-            continue;
-          }
-        }
-        using logits = this.target.logits[widthClass(B)](output);
-        using flat = ops.reshape(logits, [B, logits.shape.at(-1)!]);
-        let token: MlxArray;
-        if (this.sampling!.greedy) {
-          // Greedy drafting: one fused normalized-argmax over [B,V]; no
-          // logsumexp pass, no per-row top-p/top-k sort, no categorical draw.
-          token = normalizedArgmax(flat);
-        } else {
-          using logprobs = toLogprobs(flat);
-          token = this.sampling!.sample(logprobs, steps.map(step => step + position));
-        }
+        const token = select(output, steps.map(step => step + position));
         tokens.push(token);
         ids!.dispose(); ids = ops.reshape(token, [B, 1]);
       }
@@ -267,10 +294,15 @@ export class QwenMtpRows {
     } catch (error) { cache.dispose(); throw error; }
   }
 
-  dispose(): void {
-    this.#vocabulary?.dispose(); this.#vocabulary = null;
+  /** Release every row's state; the bound selection stays. */
+  #releaseRows(): void {
     this.#cache.dispose(); this.#hidden?.dispose(); this.#hidden = null;
     this.#drafts = []; this.#depth = 0; this.#prefilled = [];
+  }
+
+  dispose(): void {
+    this.#owned.vocabulary?.dispose(); this.#owned.vocabulary = null;
+    this.#releaseRows();
   }
 }
 

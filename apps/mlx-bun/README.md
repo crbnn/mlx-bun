@@ -69,23 +69,24 @@ The opt-in [draft flags test](tests/engine/draft-flags.test.ts) serves with
 ngram drafting and checks the speculation telemetry and exactness against a
 plain run.
 `--paged-kv` (env mirror `MLX_BUN_PAGED_KV=1`) with `--paged-kv-block-size`
-(only alongside paging) sets the paged KV request default; Gemma4-family
-requests use the paged path and other families answer the typed capability
-error, never a hidden serial lane.
-Startup rejects paging combined with a loaded draft, per-layer KV quantization,
-or TurboQuant; bf16 and uniform KV4/KV8 remain supported.
+(only alongside paging) composes the paged KV lego when the model loads: every
+request, drafted, grammar, fill, media and adapter rows included, keeps its
+full-attention keys and values in blocks. Pages store bf16 or uniform
+KV4/KV8; startup rejects paging with per-layer KV quantization or TurboQuant,
+whose pages are not implemented.
 As main's server did, startup also rejects `--kv-quant turbo` when the model's
 full-attention head dimension is not one the TurboQuant codec encodes
 (`TURBOQUANT_HEAD_DIMS`), before any request, instead of failing each request in
 prefill.
-Startup, and `generate`, also reject a requested KV scheme the model's cache
-layers cannot take, since every request carries it: GLM-5.2's MLA cache takes no
-KV scheme, so `--kv-quant 4|8|turbo` (and `config` or `--l2` when a
-`kv_config.json` exists) is refused there; main accepted the option and served GLM-5.2 in bf16
-while reporting the requested scheme.
+Startup, and `generate`, also reject a requested KV scheme or paging for a graph
+that composes its own caches, which have no quantized or paged form yet: GLM-5.2's
+MLA cache and DiffusionGemma's denoising state, so `--kv-quant 4|8|turbo` (and
+`config` or `--l2` when a `kv_config.json` exists) or `--paged-kv` is refused
+there; main accepted the option and served GLM-5.2 in bf16 while reporting the
+requested scheme.
 `--kv-quant config` without the model's `kv_config.json` stays bf16.
-The opt-in [paged KV test](tests/engine/paged-kv.test.ts) covers both family
-outcomes.
+The opt-in [paged KV test](tests/engine/paged-kv.test.ts) serves a Gemma4 and
+a model of another family.
 
 Shutdown stops background cache demotion, closes chat sessions, drains active
 HTTP responses, then flushes caches and releases the engine. The CLI bounds this
@@ -490,8 +491,8 @@ than running a hidden serial path. Diffusion models are served through the same
 scheduler by the library's interleaved denoising method. An image request's pixels
 ride its options, and the gateway releases them exactly once, whether the row
 settles or fails before submission. Requests the method cannot apply (grammar,
-draft, logprobs, logits processors, fill, encoded or paged KV) receive the typed
-capability error.
+draft, logprobs, logits processors, fill) receive the typed
+capability error; a KV scheme or paging is refused when the model loads.
 
 `engine/cache-services` composes the library prompt cache and persistence. Its
 default is 8 GB of RAM with plain KV; a caller supplies `ssdCacheDir` for saved state.

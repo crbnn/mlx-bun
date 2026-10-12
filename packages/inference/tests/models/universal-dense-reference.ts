@@ -36,7 +36,7 @@ import type { GraphCapabilities } from "../../src/contracts/portable/graph";
 import type {
   MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward,
 } from "../../src/contracts/mlx/graph";
-import { PLAIN_KV_VERIFICATION, declareGraph } from "../../src/models/capabilities";
+import { ORDINARY_VERIFICATION, declareGraph } from "../../src/models/capabilities";
 import { atEveryWidth } from "../../src/models/graph";
 import { QuantizedLinear } from "../../src/layers/quantized-linear";
 import { RMSNorm } from "../../src/layers/normalization";
@@ -48,6 +48,7 @@ import { initializeRope, NoRope, phi3SuRope, UniversalRope } from "../../src/lay
 import { loadEmbedding, loadLayerNorm, loadLinear, loadRmsNorm, type AnyEmbedding, type AnyLinear, type AnyNorm } from "../../src/layers/loading";
 import { WeightAudit } from "../../src/artifacts/weight-audit";
 import { cleanupFailure, disposeResources } from "../../src/runtime/resources";
+import { kvStorage } from "../../src/state/kv-storage";
 
 /** Rope for one attention module, per the descriptor (llama's
  *  initialize_rope, the plain-nn.RoPE archs, or phi3's Su/linear branch). */
@@ -169,7 +170,7 @@ class UniversalAttention {
     let attn: MlxArray;
     try {
       if (this.softcap !== null) {
-        const [keys, values] = cache.updateAndFetch(k, v);
+        const [keys, values] = kvStorage(cache).updateAndFetch(k, v);
         try { attn = this.#softcapAttention(q, keys, values, mask, B, L); }
         finally { keys.dispose(); values.dispose(); }
       } else {
@@ -484,11 +485,7 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
    * convert per layer and serve ordinary decoding only. Before the attention
    * facts are bound, neither is declared. */
   get graphCapabilities(): GraphCapabilities {
-    const denseReads = this.encodedKvAttention === false;
-    return declareGraph({
-      kv: { denseReads, delayedAffine: this.encodedKvAttention === true ? "ordinary" : "none" },
-      ...(denseReads ? { speculation: PLAIN_KV_VERIFICATION } : {}),
-    });
+    return declareGraph(this.encodedKvAttention === false ? { speculation: ORDINARY_VERIFICATION } : {});
   }
   readonly #cacheWindows: readonly (number | null)[];
 
@@ -614,7 +611,7 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
    * needs the ordinary causal spelling materialized, preserving B1 math: a
    * cache answers "causal" only while it holds exactly `offset` earlier keys. */
   #groupMask(cache: Cache, L: number, window: number | null): Mask {
-    const mask = cache.makeMask(L, window);
+    const mask = kvStorage(cache).makeMask(L, window);
     return this.#masks.array && mask.mode === "causal"
       ? { mode: "array", arr: createCausalMask(L, cache.offset, window) } : mask;
   }

@@ -8,6 +8,7 @@ import type { MtpModule } from "../../src/models/qwen/mtp";
 import type { Cache } from "../../src/contracts/mlx/cache";
 import { atEveryWidth } from "../../src/models/graph";
 import { mtpModule } from "../models/phase-forward";
+import { kvStorage } from "../../src/state/kv-storage";
 
 function fixture() {
   const forwards: number[][] = [];
@@ -23,7 +24,7 @@ function fixture() {
     const [B, N] = embeds.shape;
     using k = ops.reshape(embeds, [B!, 1, N!, 1]);
     using v = ops.reshape(hidden, [B!, 1, N!, 1]);
-    for (const view of cache.updateAndFetch(k, v)) view.dispose();
+    for (const view of kvStorage(cache).updateAndFetch(k, v)) view.dispose();
     return ops.copyOf(hidden);
   }) as unknown as MtpModule;
   const rows = new QwenMtpRows(target, module, null, []);

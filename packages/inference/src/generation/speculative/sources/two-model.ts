@@ -1,7 +1,7 @@
 // Two-model speculative drafting — mlx-lm parity (`mlx_lm.server
-// --draft-model`). A full second model drafts autoregressively; the serve
-// loop (packages/inference/src/generation/speculative/run.ts) verifies with the
-// target. L1 oracle:
+// --draft-model`). A full second model drafts autoregressively in the grouped
+// draft rows (bindings/two-model-rows.ts); the shared speculative group
+// verifies with the target. L1 oracle:
 // mlx_lm.server with the same target/draft pair, greedy, token-for-token
 // (spec-vs-spec — both batch the verify lm-head, so neither is bit-exact to
 // stock decode at knife-edges).
@@ -10,28 +10,18 @@
 //  - drafts are sampled with the REQUEST sampler (generate.py:593-601) —
 //    greedy drafting under a temperature>0 request is not parity;
 //  - draft-cache rewind is max(n - kAccept - 1, 0) (generate.py:589-591),
-//    with the all-accept re-feed of the last draft handled by the serve
-//    loop's `feed` (generate.py:645-648);
+//    with the all-accept re-feed of the last draft kept pending in the rows
+//    and joined with the next target token (generate.py:645-648);
 //  - logits processors do NOT run on draft steps (they're target-side).
 
-import { MlxArray } from "@mlx-bun/mlx/array";
-import * as ops from "@mlx-bun/mlx/ops";
-import { clearCache } from "@mlx-bun/mlx/ffi";
-import { runtimeFlag } from "../../../runtime/config";
 import { loadModelConfig } from "../../../artifacts/config";
 import { Weights } from "../../../artifacts/weights";
 import { createModel, type RuntimeModel } from "../../../models/factory";
-import type { DraftProvider, DraftSource, GroupedDraftProvider } from "../source";
-import { standaloneDraftGroups, openStandaloneDraftRows } from "../bindings/two-model-rows";
+import type { DraftProvider, GroupedDraftProvider } from "../source";
+import { standaloneDraftGroups } from "../bindings/two-model-rows";
 import { bindMlxAutoregressiveGraph } from "../../bindings/autoregressive";
 import { artifactIdentity } from "../../../artifacts/identity";
 import { configFingerprint } from "../../../artifacts/fingerprint";
-
-/** mlx-lm's prefill_step_size — the draft drain chunks at the same stride
- *  as the target's (packages/inference/src/generation/speculative/run.ts);
- *  chunking is numerically exact for
- *  causal attention. */
-const PREFILL_CHUNK = 2048;
 
 export class TwoModelProvider implements DraftProvider {
   readonly id: string;
@@ -42,7 +32,7 @@ export class TwoModelProvider implements DraftProvider {
     readonly model: RuntimeModel,
     private readonly weights: Weights,
     id: string,
-    private readonly namespace: string,
+    namespace: string,
   ) {
     this.id = id;
     this.grouped = standaloneDraftGroups(bindMlxAutoregressiveGraph(model), namespace);
@@ -75,43 +65,7 @@ export class TwoModelProvider implements DraftProvider {
     } catch (error) { weights.dispose(); throw error; }
   }
 
-  open(opts: Parameters<DraftProvider["open"]>[0]): DraftSource {
-    return new TwoModelSource(this.model, opts.sampler, this.namespace);
-  }
-
   dispose(): void {
     this.weights.dispose();
   }
-}
-
-/** Compatibility adapter: the existing request loop also uses the shared
- * draft graph at B=1. Proposal generation and state recovery have one owner. */
-class TwoModelSource implements DraftSource {
-  readonly weightsBytes = 0;
-  private readonly rows: ReturnType<typeof openStandaloneDraftRows>;
-  /** The prefill tail split (`MLX_BUN_PREFILL_TAIL_SPLIT`), read once when the source opens. */
-  private readonly tailSplit: boolean;
-  private processed = 0;
-  constructor(model: RuntimeModel, sampler: (lp: MlxArray, step: number) => MlxArray, namespace: string) {
-    this.rows = openStandaloneDraftRows(bindMlxAutoregressiveGraph(model), namespace,
-      { sample: (logprobs, steps) => sampler(logprobs, steps[0]!) }, [null]);
-    this.tailSplit = runtimeFlag("MLX_BUN_PREFILL_TAIL_SPLIT", true);
-  }
-  async prefill(promptIds: number[]): Promise<void> {
-    const upTo = this.tailSplit && promptIds.length > 1 ? promptIds.length - 1 : promptIds.length;
-    for (let at = this.processed; at < upTo; at += PREFILL_CHUNK) {
-      const end = Math.min(at + PREFILL_CHUNK, upTo);
-      using ids = ops.fromInt32(promptIds.slice(at, end), [1, end - at]);
-      await this.rows.prefill(ids); clearCache();
-    }
-    this.processed = upTo;
-  }
-  async draft(feed: number[], count: number, step: number): Promise<number[]> {
-    return (await this.rows.draft([feed.at(-1)!], count, [step]))[0]!;
-  }
-  async commit(_drafted: number, accepted: number): Promise<void> {
-    await this.rows.commit([accepted]);
-    this.processed += accepted + 1;
-  }
-  dispose(): void { this.rows.dispose(); }
 }

@@ -2,8 +2,9 @@
 // Port target: mlx_lm.models.llama from the oracle venv. Each block is built
 // once and reads its cache through the cache contract for the phase its caller
 // names (`ReadPhase`); the cache was composed with its read, so no block builds
-// a mask or chooses an attention kernel. Training forwards keep their own
-// deprecated read (`forwardTraining`), described there.
+// a mask or chooses an attention kernel. The training forward
+// (`forwardTraining`) reads its training caches the same way and adds only the
+// prefix-shared block RoPE.
 
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
@@ -19,7 +20,7 @@ import { declareGraph } from "../capabilities";
 import { atEveryWidth, type ReadPhase } from "../graph";
 import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
-import { type Cache, type Mask } from "../../contracts/mlx/cache";
+import type { AttentionCache, Cache } from "../../contracts/mlx/cache";
 import { runtimeValue } from "../../runtime/config";
 import { disposing } from "../../layers/helpers";
 import { RMSNorm } from "../../layers/normalization";
@@ -29,7 +30,6 @@ import { composedFullAttentionCache } from "../../state/bf16-first-kv";
 import type { Composition } from "../../contracts/portable/composition";
 import { AttentionMasks } from "../../state/attention-read";
 import { deferredTurboQuantKernels } from "../../state/turboquant-attention";
-import { flashAttention, flashSupported, getTrainingAttn } from "../../kernels/attention/flash";
 import { compiledSwiglu } from "../../layers/swiglu";
 import { cacheRead, type AttentionReadStrategy } from "../qwen/blocks";
 
@@ -83,17 +83,12 @@ export class LlamaAttention {
     return this.#output(attn, B, L);
   }
 
-  /** The training forward: the plain keys and values of a training cache
-   *  (`TrainingCache`, `PrefixSharedCache`, scoring's padded mask wrapper)
-   *  under the caller's mask, with the prefix-shared block RoPE while a layout
-   *  is active, and the backward routed through the validated flash kernel
-   *  while a training run selects it (ops.sdpa's dK vjp was once suspect;
-   *  MiniCPM5 is full-attention, so window 0).
-   *  @deprecated The training item composes these reads into the training
-   *  caches (B1 lists the training flash path out of its step): the prefix-
-   *  shared cache has no read yet, and the flash choice is the trainer's mode,
-   *  set around a run. */
-  forwardTraining(x: MlxArray, mask: Mask, cache: Cache): MlxArray {
+  /** The training forward over a training cache (`TrainingCache`,
+   *  `PrefixSharedCache`), with the prefix-shared block RoPE while a layout is
+   *  active: the cache's window read, which owns the mask (causal, padded or
+   *  block-sparse) and the kernel the run composed (the SDPA, or the validated
+   *  flash kernel). */
+  forwardTraining(x: MlxArray, cache: AttentionCache): MlxArray {
     const [B, L] = x.shape as [number, number, number];
     let [q, k, v] = this.#heads(x, B, L);
     const offsetArr = cache.ropeOffsetArr;
@@ -107,18 +102,11 @@ export class LlamaAttention {
     };
     q = disposing(q, ropeStep(q));
     k = disposing(k, ropeStep(k));
-    const [keys, values] = cache.updateAndFetch(k, v);
+    const read = cache.appendWindow(k, v);
     k.dispose();
     v.dispose();
     let attn: MlxArray;
-    const ta = getTrainingAttn();
-    if (ta === "flash" && flashSupported(q) && (mask.mode === "causal" || mask.mode === "array")) {
-      attn = flashAttention(q, keys, values, this.scale, true, 0);
-    } else {
-      attn = ops.sdpa(q, keys, values, this.scale, mask.mode, mask.arr);
-    }
-    keys.dispose();
-    values.dispose();
+    try { attn = read.attend(q, this.scale); } finally { read.dispose(); }
     q.dispose();
     return this.#output(attn, B, L);
   }
@@ -237,11 +225,10 @@ export class LlamaLayer {
     return this.#mlp(x, a);
   }
 
-  /** The training forward (`LlamaAttention.forwardTraining`).
-   *  @deprecated With the attention's training read. */
-  forwardTraining(x: MlxArray, mask: Mask, cache: Cache): MlxArray {
+  /** The training forward (`LlamaAttention.forwardTraining`). */
+  forwardTraining(x: MlxArray, cache: AttentionCache): MlxArray {
     const xn = this.inputNorm.forward(x);
-    const a = this.attn.forwardTraining(xn, mask, cache);
+    const a = this.attn.forwardTraining(xn, cache);
     xn.dispose();
     return this.#mlp(x, a);
   }
@@ -268,8 +255,8 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly loraState = new LoraState();
   /** Layers whose attention reads plain keys and values: none; it attends the storage its caches hold. */
   readonly requiredDenseKvLayers: readonly number[] = Object.freeze([]);
-  /** Delayed affine rows convert per layer and serve ordinary decoding only. */
-  get graphCapabilities(): GraphCapabilities { return declareGraph({ kv: { delayedAffine: "ordinary" } }); }
+  /** An ordinary autoregressive graph: every method over every cache lego. */
+  get graphCapabilities(): GraphCapabilities { return declareGraph(); }
   #trainable: TrainableGraph | undefined;
   /** The separate quantized head, segmented backward, prefix-shared ORPO and flash training attention. */
   get trainable(): TrainableGraph { return this.#trainable ??= miniCpmTrainable(this); }
@@ -321,13 +308,10 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
   }
 
   /** The scoring and training forward (`MlxSequenceForward`, `trainForward`
-   *  over the training caches): the window read at every width. While a
-   *  training run selects flash attention it runs the training forward, as
-   *  every attention call did before the blocks read through the cache.
-   *  @deprecated The mode read: the training item composes the flash read into
-   *  the training caches, which removes it. */
+   *  over the training caches): the window read at every width. The training
+   *  caches were composed with the run's training attention, so a run that
+   *  selects flash attention reads with it here. */
   sequenceHidden(ids: MlxArray, cache: Cache[], _width: MlxWidthClass): MlxArray {
-    if (getTrainingAttn() === "flash") return this.#forwardTraining(ids, cache);
     return this.forwardLayers(this.embed.encode(ids), cache, "window");
   }
 
@@ -367,38 +351,22 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
     return disposing(h, this.finalNorm.forward(h));
   }
 
-  /** The training forward over every layer: embeddings, `runLayerRange`, the
-   *  final norm (the prefix-shared forward composes the same in `trainable`).
-   *  @deprecated With `runLayerRange`. */
-  #forwardTraining(ids: MlxArray, cache: Cache[]): MlxArray {
-    const h0 = this.embed.encode(ids);
-    const h = this.runLayerRange(h0, 0, this.layers.length, cache);
-    h0.dispose(); // runLayerRange keeps its input alive; we own h0 here
-    return disposing(h, this.finalNorm.forward(h));
-  }
-
   /** Run decoder layers `[aIdx, bIdx)` on hidden `h`, returning the residual
    *  stream after the last layer in the range (NO finalNorm). The input `h` is
    *  NEVER disposed — the caller owns it (for segmented backward `h` is a leaf
    *  whose lifetime is managed by the autograd closure); intra-range
-   *  intermediates ARE disposed. The segmented-backward training path's
-   *  building block (`02d723a:docs/design/orpo-training.md` §5.3). MiniCPM5 is
-   *  plain full-attention with no KV-sharing, so each layer reads its own
-   *  stateless `cache[i]` and a single causal mask.
-   *  @deprecated The training forward (`LlamaAttention.forwardTraining`): the
-   *  training caches build this mask in their own reads once the training item
-   *  composes them. */
+   *  intermediates ARE disposed. The segmented-backward and prefix-shared
+   *  training paths' building block (`02d723a:docs/design/orpo-training.md`
+   *  §5.3). MiniCPM5 is plain full-attention with no KV-sharing, so each layer
+   *  reads its own stateless training cache `cache[i]`. */
   runLayerRange(h: MlxArray, aIdx: number, bIdx: number, cache: Cache[]): MlxArray {
     if (aIdx >= bIdx) return h;
-    const L = h.shape[1]!;
-    const mask = cache[aIdx]!.makeMask(L, null);
     let cur = h;
     for (let i = aIdx; i < bIdx; i++) {
-      const next = this.layers[i]!.forwardTraining(cur, mask, cache[i]!);
+      const next = this.layers[i]!.forwardTraining(cur, cache[i] as AttentionCache);
       if (i > aIdx) cur.dispose(); // keep the input boundary leaf; drop interiors
       cur = next;
     }
-    mask.arr?.dispose();
     return cur;
   }
 

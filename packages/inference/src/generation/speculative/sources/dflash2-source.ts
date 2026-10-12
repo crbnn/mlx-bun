@@ -15,7 +15,7 @@ import { projectedDraftGroups, type ProjectedDraftMethod } from "../bindings/pro
 import { widthClass } from "../../../contracts/mlx/graph";
 import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import type { DraftProvider, DraftSource, GroupedDraftProvider } from "../source";
+import type { DraftProvider, GroupedDraftProvider } from "../source";
 import { targetLacks } from "../source";
 import type { Dflash2DrafterModel } from "../../../contracts/mlx/drafter";
 import { loadDflash2Drafter } from "../../../models/drafter-loaders";
@@ -75,10 +75,6 @@ export class Dflash2Provider implements DraftProvider {
       const bytes = files.reduce((total, file) => total + statSync(join(modelDir, file)).size, 0);
       return new Dflash2Provider(drafter, id, bytes, `dflash2-context-v1:${identity}:b${bits}`);
     } catch (error) { drafter.dispose(); throw error; }
-  }
-
-  open(): DraftSource {
-    throw new Error("the DFlash 2 drafter runs only in the batched speculative lane");
   }
 
   dispose(): void { this.drafter.dispose(); }

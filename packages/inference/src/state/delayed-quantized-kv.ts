@@ -10,7 +10,8 @@ import { BatchedQuantizedKVCache } from "./batched-quantized-kv";
 import { KVCache, type AffineKernelSet } from "./kv";
 import { QuantizedKVCache } from "./quantized-kv";
 import { convertToAffine, transitionDue } from "./bf16-first-kv";
-import { type AttentionRead, type Cache, type CommittedAttentionCache, type Mask, type KvAttentionState, type KvAttentionView } from "../contracts/mlx/cache";
+import { type AttentionRead, type Cache, type CommittedAttentionCache, type Mask, type KvAttentionView } from "../contracts/mlx/cache";
+import { kvStorage, type KvAttentionState } from "./kv-storage";
 
 /** The bf16 source of a full-attention row: a `KVCache`, or a padded
  * `FullPrefillRow` over one. Converted rows have none. */
@@ -95,7 +96,7 @@ export class DelayedQuantizedKVCache extends FullTransitioningKvRows<BatchedQuan
     this.advance();
     const kernels = this.kernelSet(this.bits, this.groupSize, k.dtype);
     if (this.packed) return captureKvAttention(this.packed, k, v, kernels);
-    if (this.rows.every(row => !row.quantizedAttention)) {
+    if (this.rows.every(row => !kvStorage(row).quantizedAttention)) {
       const [keys, values] = this.#appendPlain(k, v);
       return { attend: (q, scale, mask) => ops.sdpa(q, keys, values, scale, mask.mode, mask.arr),
         dispose() { keys.dispose(); values.dispose(); } };

@@ -7,8 +7,7 @@ import { runtimeConfig, type RuntimeConfig } from "../../runtime/config";
 import type { MlxTokenGraph } from "../../models/graph";
 import type { PrefillPolicy } from "../../contracts/portable/prefill";
 import { resolveMlxPrefillPolicy } from "./prefill-policy";
-import type { KvStorageScheme } from "../../contracts/portable/composition";
-import { isCompiledDecodeCache, isRowBatchCache } from "../../state/capabilities";
+import { COMPOSITION_DEFAULTS, type KvStorageScheme } from "../../contracts/portable/composition";
 import { MlxPhaseDispatch } from "../phase-dispatch";
 
 export type { MlxModelMemory };
@@ -52,6 +51,12 @@ export interface MlxAutoregressiveBinding {
   readonly adapters?: { active: string[] };
   /** The composition's KV scheme, which `makeCache` composes; absent: bf16. */
   readonly kv?: KvStorageScheme;
+  /** The composition's paging (`pagedKv`); absent: none. */
+  readonly pagedKv?: { readonly blockSize: number } | null;
+  /** The composition's `prefillTailSplit`; absent: the default. */
+  readonly prefillTailSplit?: boolean;
+  /** The composition's `grammarJump`; absent: the default. */
+  readonly grammarJump?: boolean;
   /** The graph's committed known-token spans, when it declares them. */
   readonly knownSpans?: MlxKnownSpans;
   makeCache(): Cache[];
@@ -60,12 +65,12 @@ export interface MlxAutoregressiveBinding {
     embeddings: MlxArray, state: Cache[], imageMask: MlxArray | null,
     ids: MlxArray, multimodalMask: MlxArray | null, width: MlxWidthClass,
   ): MlxArray;
-  /** The graph's compiled decode step for this run's `state`, chosen once after
+  /** The graph's compiled decode step for this run, chosen once after
    * prefill: present when the graph declares one, the run allows replay and
-   * every cache is one the step drives. A compiled/fused decoder belongs to
+   * its composition kept compiled decode on. A compiled/fused decoder belongs to
    * THIS graph, never to a model inferred from a name or inherited by a
    * replacement. */
-  createDecode?(policy: { hasAdapters: boolean; pagedKv: boolean }, state: readonly Cache[]): MlxDecodeStep | null;
+  createDecode?(policy: { hasAdapters: boolean }): MlxDecodeStep | null;
 }
 
 /** Bind a resident graph to the autoregressive method: its phases, caches and
@@ -73,7 +78,8 @@ export interface MlxAutoregressiveBinding {
  * model the graph is. */
 export function bindMlxAutoregressiveGraph(model: MlxTokenGraph): MlxAutoregressiveBinding {
   const runtime = runtimeConfig();
-  const compiledOn = runtime.flag("MLX_BUN_COMPILED_DECODE", true);
+  const facts = model.composition ?? COMPOSITION_DEFAULTS;
+  const compiledOn = facts.compiledDecode;
   return {
     runtime,
     prefillPolicy: resolveMlxPrefillPolicy(model, runtime),
@@ -84,14 +90,15 @@ export function bindMlxAutoregressiveGraph(model: MlxTokenGraph): MlxAutoregress
     memory: model,
     adapters: model.loraState,
     ...(model.composition ? { kv: model.composition.kv } : {}),
+    pagedKv: facts.pagedKv ?? null, prefillTailSplit: facts.prefillTailSplit, grammarJump: facts.grammarJump,
     ...(model.knownSpans ? { knownSpans: model.knownSpans } : {}),
     makeCache: model.makeCache.bind(model),
     prefillEmbeddings: model.prefillEmbeddings?.bind(model),
-    createDecode(policy, state) {
-      // Only a graph that declares a compiled step has one. Adapters would bake
-      // residuals into the tape.
-      if (!compiledOn || policy.hasAdapters || policy.pagedKv ||
-          !state.every(cache => isCompiledDecodeCache(cache) && !isRowBatchCache(cache))) return null;
+    createDecode(policy) {
+      // Only a graph that declares a compiled step has one, and only a
+      // composition whose storage the step drives keeps it on. Adapters would
+      // bake residuals into the tape.
+      if (!compiledOn || policy.hasAdapters) return null;
       const compiled: MlxCompiledDecodeStep | null = compiledDecodeStepOf(model);
       if (!compiled) return null;
       // The graph owns the compiled closures; its unload releases them.

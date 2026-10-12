@@ -114,6 +114,8 @@ export interface LoadContextOptions<Model extends ServedModelInfo = RuntimeModel
   /** The KV flags the composition's scheme resolves from (`--kv-quant`, its
    * TurboQuant spelling, `--quantized-kv-start`); absent means bf16. */
   kv?: CompositionRequest["kv"];
+  /** Paged KV (`--paged-kv`, `--paged-kv-block-size`); absent means unpaged. */
+  pagedKv?: CompositionRequest["pagedKv"];
   /** Adapters are mounted at load (`--adapter`). Default false. */
   adapters?: boolean;
   /** Most rows one forward carries (`--batch`). Default 8. */
@@ -205,7 +207,7 @@ export async function loadContext(
     return implementation.create({ modelDir, modelId, options }, config, profile);
   }
   const [{ Weights }, { createModel, declaredGraph, openPlannedRuntime, plansMemory, loadModelChatTemplate,
-      sentinelDeclarationFor, mediaTokenDeclarationFor, generationDefaultsFor, resolveComposition },
+      sentinelDeclarationFor, mediaTokenDeclarationFor, generationDefaultsFor, resolveComposition, assertComposedCaches },
     { loadTokenizer, resolveSentinelTokens, resolveVisionTokenIds, resolveAudioTokenIds },
     { AdapterManager }, { bindLegacyDraftTarget }, { defaultDraftProviders }] = await Promise.all([
     import("@mlx-bun/inference/artifacts"), import("@mlx-bun/inference/models"),
@@ -321,8 +323,10 @@ export async function loadContext(
     if (!draft && planned) draft = await declaredDraftHead();
     // Resolved once, before the resident graph is built, which receives it. A
     // planned runtime built its graph from its own memory plan above.
-    const composition = resolveComposition(config, { kv: opts.kv, adapters: opts.adapters, maxRows: opts.maxRows, aneBridge: opts.aneBridge,
+    const composition = resolveComposition(config, { kv: opts.kv, pagedKv: opts.pagedKv, adapters: opts.adapters, maxRows: opts.maxRows, aneBridge: opts.aneBridge,
       draft: draft && { numDraftTokens: draft.numDraftTokens, adaptive: opts.adaptiveDraftDepth } });
+    // A planned runtime built its graph and caches above: the record cannot change them.
+    if (planned) assertComposedCaches(model, composition);
     if (!planned) {
       model = createModel(weights!, config, composition, profile);
       if ("dispose" in model && typeof model.dispose === "function") owned.add(model);
@@ -338,27 +342,15 @@ export async function loadContext(
 
     if (draft && validateDraft) {
       const { provider } = draft;
-      // Fail-fast pairing validation (2026-07-07 review): a source validates the
-      // (target, drafter) pairing in open() — a target that lacks the port it
-      // reads, DeepSpec target-layer-count mismatch — which used to surface as a
-      // 500 from inside specServeRun on EVERY text request. Probe-open once with
-      // throwaway caches here so a mismatch refuses at load; open() allocates no
-      // per-request tensors before prefill/draft, so this is free. The probe
-      // sampler is never called during open().
+      // Fail-fast pairing validation (2026-07-07 review): a provider's grouped
+      // rows validate the (target, drafter) pairing when they open — a target
+      // that lacks the port they read, a DeepSpec or DFlash 2 target-layer-count
+      // mismatch — so a mismatch refuses at load instead of failing every drafted
+      // request. Opening prefill rows with no members allocates no row tensors.
       {
         const probeCaches = model.makeCache();
         try {
-          const target = bindLegacyDraftTarget(model, probeCaches);
-          try {
-            provider
-              .open({ sampler: () => { throw new Error("probe sampler never samples"); }, target })
-              .dispose();
-          } catch (err) {
-            // A batched-lane-only provider (DFlash 2) has no per-request source;
-            // its grouped binding validates the pairing instead (no rows, no tensors).
-            if (!provider.grouped) throw err;
-            provider.grouped.openPrefill({ target, checkpoints: [] }).dispose();
-          }
+          provider.grouped.openPrefill({ target: bindLegacyDraftTarget(model, probeCaches), checkpoints: [] }).dispose();
         } catch (err) {
           release(provider);
           throw new Error(

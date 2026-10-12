@@ -7,9 +7,9 @@ import { join } from "node:path";
 import { Dtype, MlxArray, ops } from "@mlx-bun/mlx";
 import { loadModelConfig, Weights } from "@mlx-bun/inference";
 import { Qwen3Model } from "@mlx-bun/inference/models/qwen3";
-import { generateSpeculative, TwoModelProvider } from "@mlx-bun/inference/generation/speculative";
+import { TwoModelProvider } from "@mlx-bun/inference/generation/speculative";
 import { forwardSequence, klPerToken, evalPpl } from "@mlx-bun/inference/scoring";
-import { createInferenceEngine, createAutoregressiveMethod } from "@mlx-bun/inference/execution";
+import { bindMlxGateway, createInferenceEngine, createAutoregressiveMethod } from "@mlx-bun/inference/execution";
 import { bindMlxAutoregressiveGraph } from "@mlx-bun/inference/generation/bindings/autoregressive";
 import { generate } from "@mlx-bun/inference";
 import { phaseGreedy } from "./phase-forward";
@@ -102,12 +102,22 @@ test("a caller loads a graph, owns its state, names each phase, selects logits a
         expect(generation.stats).toMatchObject({ promptTokens: 3, generatedTokens: 4 });
         const draft = await TwoModelProvider.load(dir, 64);
         try {
+          // Speculation runs in the gateway's speculative group; one request is one row.
+          const binding = bindMlxGateway(model, { provider: draft, numDraftTokens: 2 });
+          const options = { temperature: 0, maxTokens: 4, eosTokenIds: [] };
+          const plan = binding.plan({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
+            hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true }, options,
+            { checkpoints: false });
+          expect(plan).toMatchObject({ method: "speculative", mechanism: "continuous" });
+          const group = binding.createBatchGroup({ maxBatch: 1 });
           const speculative: number[] = [];
-          const stats = await generateSpeculative(model, draft, 2, [1, 2, 3],
-            { temperature: 0, maxTokens: 4, eosTokenIds: [] }, token => { speculative.push(token); });
-          expect(speculative).toEqual(tokens);
-          expect(stats.generatedTokens).toBe(4);
-          expect(stats.spec?.accepted).toBeGreaterThan(0);
+          try {
+            const stats = await group.submit({ method: binding.methodRequest!(plan, options)!, promptIds: [1, 2, 3],
+              maxTokens: 4, eosTokenIds: [], onToken(token: number) { speculative.push(token); } });
+            expect(speculative).toEqual(tokens);
+            expect(stats.generatedTokens).toBe(4);
+            expect(stats.spec?.accepted).toBeGreaterThan(0);
+          } finally { await group.close(); }
         } finally { draft.dispose(); }
         const engine = createInferenceEngine({ async plan(prompt: number[]) {
           return { id: "caller-plan", outputTokenLimit: 4,

@@ -8,7 +8,6 @@ export { deferredTurboQuantKernels, denseTurboQuantKernels, uncomposedTurboQuant
 export * from "./turboquant-codec";
 export * from "./ssm";
 export * from "./glm52-cache";
-export * from "./capabilities";
 export * from "./views";
 export * from "./checkpoint";
 export * from "./kv-maintenance";

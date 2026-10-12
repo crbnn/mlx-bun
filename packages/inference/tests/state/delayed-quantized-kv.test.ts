@@ -12,6 +12,7 @@ import { cloneKvCaches } from "../../src/state/persistence";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { MlxArray } from "@mlx-bun/mlx/array";
+import { kvStorage } from "../../src/state/kv-storage";
 const digest = (a: MlxArray) => { using contiguous = ops.contiguous(a); return createHash("sha256").update(contiguous.rawBytes()).digest("hex"); };
 const hashes = (cache: Cache) => cache.state().map(a => {
   using view = a.slice([0,0,0,0], [a.shape[0]!,a.shape[1]!,cache.offset,a.shape[3]!]); return digest(view);
@@ -57,7 +58,7 @@ for (const bits of [4,8]) test(`delayed KV${bits} retains independent precision,
             const [keys,values]=cache.updateAndFetchQuantized(kr,vr);
             try {expected=quantizedSdpa(qr,keys,values,0.125,local,64,bits);} finally {disposeTriple(keys);disposeTriple(values);}
           } else {
-            const [keys,values]=cache.updateAndFetch(kr,vr);
+            const [keys,values]=kvStorage(cache).updateAndFetch(kr,vr);
             try {expected=ops.sdpa(qr,keys,values,0.125,"array",arr);} finally {keys.dispose();values.dispose();}
           }
           try {expect(digest(got)).toBe(digest(expected));} finally {expected.dispose();}
@@ -140,7 +141,7 @@ test("plain reads before conversion equal each row's plain cache at B1 and at B2
             for (let row = 0; row < B; row++) {
               const at = (a: MlxArray, from: number, to: number) => a.slice([row, 0, from, 0], [row + 1, a.shape[1]!, to, a.shape[3]!]);
               using kr = k.slice([row, 0, 0, 0], [row + 1, 1, n, 64]), vr = v.slice([row, 0, 0, 0], [row + 1, 1, n, 64]);
-              const [ck, cv] = control[row]!.updateAndFetch(kr, vr);
+              const [ck, cv] = kvStorage(control[row]!).updateAndFetch(kr, vr);
               try {
                 using gk = at(keys, pads[row]!, pads[row]! + offsets[row]! + n), gv = at(values, pads[row]!, pads[row]! + offsets[row]! + n);
                 expect([digest(gk), digest(gv)], `step ${step} row ${row}`).toEqual([digest(ck), digest(cv)]);
@@ -175,7 +176,7 @@ test("plain reads are owned by the caller and outlive later appends", () => {
     for (let row = 0; row < 2; row++) {
       for (const [k, v] of [[k1, v1], [k2, v2]] as const) {
         using kr = k.slice([row, 0, 0, 0], [row + 1, 1, 1, 64]), vr = v.slice([row, 0, 0, 0], [row + 1, 1, 1, 64]);
-        for (const a of control[row]!.updateAndFetch(kr, vr)) a.dispose();
+        for (const a of kvStorage(control[row]!).updateAndFetch(kr, vr)) a.dispose();
       }
       const state = group.extractRow(row);
       try { expect(hashes(state)).toEqual(hashes(control[row]!)); } finally { state.dispose(); }
@@ -208,7 +209,7 @@ test("a plain read appends to no row once any row is converted, before or by the
     expect(() => group.updateAndFetch(k, v)).toThrow("mixed precision rows use their attention state");
     expect(group.rowOffsets).toEqual([3, 5]);
     using k0 = k.slice([0, 0, 0, 0], [1, 1, 1, 64]), v0 = v.slice([0, 0, 0, 0], [1, 1, 1, 64]);
-    for (const a of control[0]!.updateAndFetch(k0, v0)) a.dispose();
+    for (const a of kvStorage(control[0]!).updateAndFetch(k0, v0)) a.dispose();
     const first = group.extractRow(0), second = group.extractRow(1);
     try {
       expect([first.constructor.name, ...hashes(first)]).toEqual([control[0]!.constructor.name, ...hashes(control[0]!)]);
@@ -227,7 +228,7 @@ test("prefill defers conversion: a plain read past the offset appends while pref
     try {
       for (let row = 0; row < 2; row++) {
         using kr = k.slice([row, 0, 0, 0], [row + 1, 1, 2, 64]), vr = v.slice([row, 0, 0, 0], [row + 1, 1, 2, 64]);
-        const [ck, cv] = control[row]!.updateAndFetch(kr, vr);
+        const [ck, cv] = kvStorage(control[row]!).updateAndFetch(kr, vr);
         try {
           const pad = group.leftPad[row]!, end = pad + control[row]!.offset;
           using gk = keys.slice([row, 0, pad, 0], [row + 1, 1, end, 64]), gv = values.slice([row, 0, pad, 0], [row + 1, 1, end, 64]);

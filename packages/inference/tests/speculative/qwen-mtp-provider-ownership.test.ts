@@ -89,19 +89,15 @@ test("provider disposal releases weight maps and transpose views once", async ()
   provider.dispose();
   expect(disposeCalls).toBe(1);
   expect(liveBytes()).toBe(baseline);
-  expect(() => provider.open({} as Parameters<QwenMtpProvider["open"]>[0]))
+  expect(() => provider.grouped.openPrefill({ target: { identity: {} }, checkpoints: [] }))
     .toThrow("qwen MTP provider is disposed");
 });
 
 test("checkpoint identity survives provider reload and changes with draft bytes", async () => {
   const namespace = async () => {
     const provider = await QwenMtpProvider.load(directory);
-    const unused = () => { throw new Error("identity inspection must not execute the model"); };
-    const source = provider.open({ sampler: unused, target: { identity: {}, recurrentMtp: {
-      hiddenSize: 8, layerCount: 1, embed: unused, logits: atEveryWidth(unused),
-    } } });
-    try { return source.checkpoint!.namespace; }
-    finally { source.dispose(); provider.dispose(); }
+    try { return provider.grouped.checkpointNamespace!(); }
+    finally { provider.dispose(); }
   };
   const original = await namespace();
   expect(await namespace()).toBe(original);
@@ -112,8 +108,10 @@ test("checkpoint identity survives provider reload and changes with draft bytes"
 test("a target without the recurrent MTP port is refused by port, not by family", async () => {
   const provider = await QwenMtpProvider.load(directory);
   try {
-    expect(() => provider.open({ sampler: () => { throw new Error("unused"); }, target: { identity: {} } }))
-      .toThrow("target graph does not provide recurrentMtp");
+    for (const open of [() => provider.grouped.openPrefill({ target: { identity: {} }, checkpoints: [] }),
+      () => provider.grouped.open({ target: { identity: {} }, checkpoints: [],
+        sampling: { selection: { kind: "sampled" }, sample: () => { throw new Error("unused"); } } })])
+      expect(open).toThrow("target graph does not provide recurrentMtp");
   } finally { provider.dispose(); }
 });
 
@@ -156,11 +154,10 @@ test("group membership borrows committed checkpoints and survives reorder, drain
     metadata: state.attachment.metadata,
     tensors: state.attachment.tensors.map(array => [...array.toFloat32()]) });
   const expected = donors.map(values);
-  const group = provider.grouped.open({ target, sampling: { sample: unused }, checkpoints: [] });
-  const source = provider.open({ target, sampler: unused });
+  const group = provider.grouped.open({ target, sampling: { selection: { kind: "sampled" }, sample: unused }, checkpoints: [] });
   try {
     expect(group.rowCount).toBe(0);
-    expect(group.namespace).toBe(source.checkpoint!.namespace);
+    expect(group.namespace).toBe(provider.grouped.checkpointNamespace!());
     expect(group.tapLayers).toEqual([0]);
     group.append(donors.slice(0, 1));
     group.append(donors.slice(1));
@@ -188,12 +185,7 @@ test("group membership borrows committed checkpoints and survives reorder, drain
     expect(donors.map(values)).toEqual(expected);
     group.dispose();
     expect(disposeCalls).toBe(0);
-    // The same attachment can move between grouped and request execution.
-    source.checkpoint!.restore(donors[1]!.processedTokens, donors[1]!.attachment);
-    const restored = { processedTokens: 4, attachment: source.checkpoint!.capture(4) };
-    try { expect(values(restored)).toEqual(expected[1]!); }
-    finally { release(restored); }
-  } finally { group.dispose(); source.dispose(); donors.forEach(release); provider.dispose(); }
+  } finally { group.dispose(); donors.forEach(release); provider.dispose(); }
   expect(disposeCalls).toBe(1);
 });
 
@@ -203,7 +195,7 @@ test("target and draft admission publish together after every state owner prepar
   const unused = () => { throw new Error("admission must not execute the model"); };
   const draft = provider.grouped.open({ target: { identity: {}, recurrentMtp: {
     hiddenSize: 8, layerCount: 1, embed: unused, logits: atEveryWidth(unused),
-  } }, sampling: { sample: unused }, checkpoints: [] });
+  } }, sampling: { selection: { kind: "sampled" }, sample: unused }, checkpoints: [] });
   const target = new MlxStateRows([new BatchedKVCache()]);
   const pending = MlxArray.fromFloat32(new Float32Array(8).fill(17), [1, 1, 8]);
   const checkpoint: DraftRowCheckpoint = { processedTokens: 1,
@@ -262,7 +254,7 @@ test("prefill membership borrows the same checkpoints without constructing a sam
     expect(prefill.rowCount).toBe(2);
     prefill.filterRows([1]);
     const restored = prefill.capture(0);
-    const decode = provider.grouped.open({ target, sampling: { sample: unused }, checkpoints: [restored] });
+    const decode = provider.grouped.open({ target, sampling: { selection: { kind: "sampled" }, sample: unused }, checkpoints: [restored] });
     try {
       expect(decode.namespace).toBe(prefill.namespace);
       const captured = decode.capture(0);
@@ -280,7 +272,7 @@ test("Qwen MTP declares the target tap its grouped rows consume, resolved from t
     const target = { identity: {}, recurrentMtp: { hiddenSize: 8, layerCount: 3, embed: unused, logits: atEveryWidth(unused) } };
     const declared = provider.grouped.targetTapLayers!(target);
     expect(declared).toEqual([2]);
-    for (const open of [() => provider.grouped.open({ target, sampling: { sample: unused }, checkpoints: [] }),
+    for (const open of [() => provider.grouped.open({ target, sampling: { selection: { kind: "sampled" }, sample: unused }, checkpoints: [] }),
       () => provider.grouped.openPrefill({ target, checkpoints: [] })]) {
       const rows = open();
       try { expect(rows.tapLayers).toEqual(declared); } finally { rows.dispose(); }

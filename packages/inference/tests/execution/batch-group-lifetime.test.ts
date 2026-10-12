@@ -17,6 +17,8 @@ import { declareGraph } from "../../src/models/capabilities";
 import type { Cache } from "../../src/contracts/mlx/cache";
 import type { MlxMixedForward } from "../../src/contracts/mlx/graph";
 import { stubPhases } from "../models/phase-forward";
+import { kvStorage } from "../../src/state/kv-storage";
+import { testComposition } from "../models/test-composition";
 
 /** The fixture graph: its one forward and head, which tests replace, and the mixed forward a test may declare. */
 type StandIn = RuntimeModel & { forward(ids: MlxArray, caches: Cache[]): MlxArray; logitsFromHidden(hidden: MlxArray): MlxArray;
@@ -32,8 +34,8 @@ function fixture() {
     config: { modelType: "fixture", text: { numHiddenLayers: 1, layerTypes: ["full_attention"],
       numGlobalKeyValueHeads: 1, globalHeadDim: 8, slidingWindow: 0 } },
     makeCache() { calls.allocations++; return [new TrackedCache()]; },
-    // Its one layer's keys and values are read plain (updateAndFetch).
-    requiredDenseKvLayers: [0], graphCapabilities: declareGraph({ kv: { denseReads: true } }),
+    // Its one layer's keys and values are read plain (updateAndFetch, requiredDenseKvLayers).
+    requiredDenseKvLayers: [0], graphCapabilities: declareGraph(),
     // Every phase runs the fixture's one forward and head, which a test replaces (late-bound).
     forward(): MlxArray { throw new Error("unexpected forward"); },
     logitsFromHidden(): MlxArray { throw new Error("unexpected projection"); },
@@ -237,7 +239,7 @@ test("automatic request chunks reach ordinary and grouped preparation without re
   Object.assign(f.model.config.text, { numHiddenLayers: 2, numAttentionHeads: 24,
     globalHeadDim: 256, headDim: 256, layerTypes: ["linear_attention", "full_attention"] });
   // A recurrent-attention graph declares its bounded prefill workspace.
-  Object.assign(f.model, { graphCapabilities: declareGraph({ kv: { denseReads: true }, prefill: { boundedWorkspace: true } }) });
+  Object.assign(f.model, { graphCapabilities: declareGraph({ prefill: { boundedWorkspace: true } }) });
   f.model.forward = ids => { chunks.push(ids.shape[1]!); throw new Error("observed chunk"); };
   const runtime = createRuntimeConfig({});
   const ordinary = new MlxBatchExecutionGroup(f.model, { maxBatch: 2, runtime });
@@ -384,7 +386,7 @@ test("a request arriving during a forward joins the next prefill chunk", async (
     if (shapes.length > 1) throw new Error("observed staggered batch");
     late = group.submit({ ...f.request, promptIds: Array(9).fill(2) }).catch(error => error);
     using kv = ops.zeros([1, 1, 4, 8], Dtype.float32);
-    const [k, v] = caches[0]!.updateAndFetch(kv, kv); k.dispose(); v.dispose();
+    const [k, v] = kvStorage(caches[0]!).updateAndFetch(kv, kv); k.dispose(); v.dispose();
     return ops.zeros([1, 4, 8], Dtype.float32);
   };
   try {
@@ -406,7 +408,7 @@ test("a nearly completed prefill keeps its admission weight until it retires", a
     if (shapes.length > 1) throw new Error("observed separate preparation");
     late = group.submit({ ...f.request, promptIds: Array(9).fill(2) }).catch(error => error);
     using kv = ops.zeros([1, 1, 4, 8], Dtype.float32);
-    const [k, v] = caches[0]!.updateAndFetch(kv, kv); k.dispose(); v.dispose();
+    const [k, v] = kvStorage(caches[0]!).updateAndFetch(kv, kv); k.dispose(); v.dispose();
     return ops.zeros([1, 4, 8], Dtype.float32);
   };
   try {
@@ -439,7 +441,7 @@ test.each(["finish", "cancel", "consumer", "grammar"])("mixed work preserves row
     using expanded = ops.add(reshaped, zeros);
     using kv = expanded.astype(Dtype.float32);
     for (const cache of caches) {
-      const view = cache.attentionState?.appendAndFetch(kv, kv) ?? captureKvAttention(cache, kv, kv, unfusedAffineKernels(4, 64, kv.dtype));
+      const view = kvStorage(cache).attentionState?.appendAndFetch(kv, kv) ?? captureKvAttention(cache, kv, kv, unfusedAffineKernels(4, 64, kv.dtype));
       view.dispose();
     }
     return ops.zeros([batch!, count!, 8], Dtype.float32);
@@ -451,8 +453,9 @@ test.each(["finish", "cancel", "consumer", "grammar"])("mixed work preserves row
     shapes.push(groups.map(group => [...group.ids.shape]));
     return groups.map(group => forward(group.ids, group.state));
   };
-  const group = new MlxBatchExecutionGroup(f.model, { maxBatch: 4, prefillChunkSize: 32,
-    runtime: createRuntimeConfig({ MLX_BUN_MIXED_PREFILL: "1", MLX_BUN_MIXED_TOKEN_BUDGET: "9" }) });
+  // Its composition turns the mixed iteration on, nine prompt tokens beside the decode rows.
+  (f.model as { composition?: unknown }).composition = testComposition(undefined, { mixedPrefill: true, mixedTokenBudget: 9 });
+  const group = new MlxBatchExecutionGroup(f.model, { maxBatch: 4, prefillChunkSize: 32 });
   const request = (index: number): BatchRequest => ({
     promptIds: Array.from({ length: index ? 31 + index : 5 }, (_, t) => t + index * 100),
     maxTokens: index ? 3 : 12, eosTokenIds: [], sample: logits => ops.argmaxAxis(logits, -1),
@@ -500,7 +503,7 @@ function grammarGroupFixture() {
     if (!owners.has(caches[0]!)) owners.set(caches[0]!, owners.size);
     forwards.push({ owner: owners.get(caches[0]!)!, ids: tokens });
     using kv = MlxArray.fromFloat32(new Float32Array(tokens.length * 8), [1, 1, tokens.length, 8]);
-    const results = caches[0]!.updateAndFetch(kv, kv);
+    const results = kvStorage(caches[0]!).updateAndFetch(kv, kv);
     for (const result of results) result.dispose();
     return MlxArray.fromFloat32(Float32Array.from(tokens), [1, tokens.length, 1]);
   };

@@ -1,7 +1,8 @@
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
-import type { AttentionRead,BlockAttentionCache,Cache,CommittedAttentionCache,KvDonorAttention,KvDonorRows,Mask,RotatedValueAttentionState } from "../contracts/mlx/cache";
+import type { AttentionRead,BlockAttentionCache,Cache,CommittedAttentionCache,KvDonorAttention,KvDonorRows,Mask } from "../contracts/mlx/cache";
+import type { RotatedValueAttentionState } from "./kv-storage";
 import type { KvCodec } from "../contracts/mlx/kv-codec";
 import * as tq from "../kernels/turboquant/ops";
 import { createCausalMask } from "../kernels/attention/masks";

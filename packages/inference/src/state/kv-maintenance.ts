@@ -78,6 +78,16 @@ export function createKvMaintenance(kv: KvStorageScheme): KvMaintenance {
     : { preparePrefill, prepareBatch: routeStorage });
 }
 
+/** Whether every serial cache a decoding row of a composition holds is one the
+ * compiled decode step drives (`CompiledDecodeCache`): bf16 storage, and affine
+ * storage converting at the first append. TurboQuant storage, the delayed row
+ * layouts a later start routes rows into and paged blocks have no compiled form
+ * yet. The loader resolves `Composition.compiledDecode` with this, once; nothing
+ * at run time asks a cache. */
+export function decodesCompiled(kv: KvStorageScheme, paged: boolean): boolean {
+  return !paged && (kv.kind === "bf16" || (kv.kind !== "turbo" && (kv.quantizedKvStart ?? 0) === 0));
+}
+
 /** A prefilled row joins decode under a scheme that converts after the first
  * append: every lego has converted (or holds a layer the scheme leaves bf16),
  * so its storage joins the batch layouts as it is. */

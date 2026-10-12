@@ -76,7 +76,7 @@ function boundedHeadFromHidden(
   chunkSize: number, sink: Array<{ dispose(): void }>, span?: HeadSpan,
 ): MlxArray {
   return SEG_HEAD === "fused"
-    ? fusedLogpMeanFromHidden(model, h, ids, mask, chunkSize, sink, 0, false, span)
+    ? fusedLogpMeanFromHidden(model, h, ids, mask, chunkSize, sink, 0, null, span)
     : chunkedLogpMeanFromHidden(model, h, ids, mask, chunkSize, sink, span);
 }
 

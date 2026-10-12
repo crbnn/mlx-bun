@@ -40,6 +40,7 @@ import { RMSNorm } from "../../src/layers/normalization";
 import { type Cache, type Mask } from "../../src/contracts/mlx/cache";
 import { compiledSwiglu } from "../../src/layers/swiglu";
 import { referenceKvAttention as captureKvAttention } from "./quantized-sdpa-reference";
+import { kvStorage } from "../../src/state/kv-storage";
 
 /** Qwen3 attention (per-head q/k RMSNorm over head_dim before full-head RoPE,
  *  GQA). qwen3 and qwen3_moe share it; they differ only in the `rope_theta`
@@ -176,7 +177,7 @@ export class Qwen3Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly requiredDenseKvLayers: readonly number[] = Object.freeze([]);
   /** Attends the storage its caches hold: delayed affine rows convert per layer
    * and serve ordinary decoding only. Exposes the pooled embedding path. */
-  get graphCapabilities(): GraphCapabilities { return declareGraph({ embeddings: true, kv: { delayedAffine: "ordinary" } }); }
+  get graphCapabilities(): GraphCapabilities { return declareGraph({ embeddings: true }); }
   readonly embed: QuantizedEmbedding;
   readonly layers: Qwen3Layer[];
   readonly finalNorm: RMSNorm;
@@ -239,7 +240,7 @@ export class Qwen3Model implements MlxDeclaredGraph, MlxTokenPhases {
 
   protected forwardLayers(h0: MlxArray, cache: Cache[]): MlxArray {
     const L = h0.shape[1]!;
-    const mask = cache[0]!.makeMask(L, null);
+    const mask = kvStorage(cache[0]!).makeMask(L, null);
     let cur = h0;
     for (let i = 0; i < this.layers.length; i++) {
       const next = this.layers[i]!.forward(cur, mask, cache[i]!);

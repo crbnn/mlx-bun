@@ -52,7 +52,7 @@ import { closeSync,fsyncSync,openSync,readFileSync,readSync,renameSync,rmSync,wr
 import { dirname,join } from "node:path";
 import { MADV_DONTNEED,MmapFile } from "../artifacts/mmap";
 import { type Cache } from "../contracts/mlx/cache";
-import { cacheSignature, composeAtLayer } from "./capabilities";
+import { cacheSignature } from "./capabilities";
 import { MLACache } from "./glm52-cache";
 import { KVCache } from "./kv";
 import { pagedCacheCodec } from "./paged/codec";
@@ -863,6 +863,16 @@ function withStepCapacity(a: MlxArray, offset: number): MlxArray {
     z?.dispose();
     grown?.dispose();
   }
+}
+
+/** `stored` (restored or cloned storage) as the cache of a layer whose graph
+ * cache is `layer`: composed again by that layer's lego (`ComposedStorage.over`),
+ * so it converts as the lego that stored it would have. A cache that already is
+ * a lego stays, and so do paged pages, which the paged request state holds in
+ * the lego's place (`state/request-policy.ts`). */
+export function composeAtLayer(layer: Cache, stored: Cache): Cache {
+  const composed = layer.composed;
+  return !composed || stored.composed || cacheSignature(stored) === "kv:paged" ? stored : composed.over(stored);
 }
 
 /** Checks the header against the expectations and the restoring graph's

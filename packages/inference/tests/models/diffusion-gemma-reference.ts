@@ -50,7 +50,7 @@ import type { MlxDeclaredGraph, MlxDenoisingOperations } from "../../src/contrac
 import type { TrainableGraph } from "../../src/contracts/mlx/trainable";
 import { declareGraph } from "../../src/models/capabilities";
 import type { PixelInput } from "../../src/contracts/mlx/media";
-import { compiledGegluActive,geglu,GegluMLP } from "../../src/layers/geglu";
+import { compiledGegluActive,geglu,GegluMLP } from "./geglu-reference";
 import { logitSoftcap } from "../../src/kernels/logits";
 import { compiledLogitSoftcap } from "../../src/kernels/softcap";
 import { QuantizedEmbedding } from "../../src/layers/quantized-embedding";
@@ -60,6 +60,7 @@ import { RMSNorm } from "../../src/layers/normalization";
 import { RotatingKVCache } from "../../src/state/rotating-kv";
 import { type Cache } from "../../src/contracts/mlx/cache";
 import { DiffusionVisionTower, spliceImageTokens } from "../../src/models/diffusion-gemma/vision";
+import { kvStorage } from "../../src/state/kv-storage";
 
 /** A mask in the shape ops.sdpa wants: a mode string + optional bool array.
  *  `null` array with mode "" means "no mask" (full attention). */
@@ -392,7 +393,7 @@ class DiffAttention {
         v = vCat;
       }
     } else if (cache) {
-      const [fk, fv] = cache.updateAndFetch(k, v);
+      const [fk, fv] = kvStorage(cache).updateAndFetch(k, v);
       k.dispose();
       v.dispose();
       k = fk;
@@ -655,7 +656,7 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
     for (let i = 0; i < this.layers.length; i++) {
       const layer = this.layers[i]!;
       const window = layer.layerType === "sliding_attention" ? this.slidingWindow : null;
-      const m = cache[i]!.makeMask(N, window) as SdpaMask;
+      const m = kvStorage(cache[i]!).makeMask(N, window) as SdpaMask;
       const next = layer.forward(h, m, cache[i]!, false, 0, this.encoderLayerScalars[i]!);
       if (m.arr) m.arr.dispose();
       h.dispose();
@@ -682,7 +683,7 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
     for (let i = 0; i < this.layers.length; i++) {
       const layer = this.layers[i]!;
       const window = layer.layerType === "sliding_attention" ? this.slidingWindow : null;
-      const m = cache[i]!.makeMask(N, window) as SdpaMask;
+      const m = kvStorage(cache[i]!).makeMask(N, window) as SdpaMask;
       const next = layer.forward(h, m, cache[i]!, false, 0, this.encoderLayerScalars[i]!);
       if (m.arr) m.arr.dispose();
       h.dispose();
@@ -702,7 +703,7 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
     const layer = this.layers[0]!;
     const N = promptIds.length;
     const window = layer.layerType === "sliding_attention" ? this.slidingWindow : null;
-    const m = cache[0]!.makeMask(N, window) as SdpaMask;
+    const m = kvStorage(cache[0]!).makeMask(N, window) as SdpaMask;
     const ls0 = this.encoderLayerScalars[0]!;
 
     const residual = emb;
@@ -756,7 +757,7 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
     for (let i = 0; i < this.layers.length; i++) {
       const layer = this.layers[i]!;
       const window = layer.layerType === "sliding_attention" ? this.slidingWindow : null;
-      const m = cache[i]!.makeMask(N, window) as SdpaMask;
+      const m = kvStorage(cache[i]!).makeMask(N, window) as SdpaMask;
       const next = layer.forward(h, m, cache[i]!, false, 0, this.encoderLayerScalars[i]!);
       if (m.arr) m.arr.dispose();
       h.dispose();
@@ -944,7 +945,7 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
     for (let i = 0; i < this.layers.length; i++) {
       const layer = this.layers[i]!;
       const window = layer.layerType === "sliding_attention" ? this.slidingWindow : null;
-      const m = cache[i]!.makeMask(N, window) as SdpaMask;
+      const m = kvStorage(cache[i]!).makeMask(N, window) as SdpaMask;
       const next = layer.forward(h, m, cache[i]!, false, 0, this.encoderLayerScalars[i]!);
       if (m.arr) m.arr.dispose();
       h.dispose();

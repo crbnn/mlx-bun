@@ -8,6 +8,7 @@ import {
   KVCache, QuantizedKVCache, RotatingKVCache, RotatingQuantizedKVCache,
   TurboQuantKVCache, cloneKvCaches, saveKvCache, loadKvCache, SsdCacheStore, unfusedAffineKernels, deferredTurboQuantKernels,
 } from "@mlx-bun/inference/state";
+import { kvStorage } from "../../src/state/kv-storage";
 
 const factories = [
   () => new KVCache(), () => new QuantizedKVCache(64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16)),
@@ -16,9 +17,9 @@ const factories = [
 ];
 
 function append(cache: Cache, x: MlxArray): Buffer[] {
-  const arrays = cache.quantizedAttention
-    ? cache.quantizedAttention.updateAndFetchQuantized(x, x).flatMap(t => [t.packed, t.scales, t.biases])
-    : cache.updateAndFetch(x, x);
+  const arrays = kvStorage(cache).quantizedAttention
+    ? kvStorage(cache).quantizedAttention!.updateAndFetchQuantized(x, x).flatMap(t => [t.packed, t.scales, t.biases])
+    : kvStorage(cache).updateAndFetch(x, x);
   try { return arrays.map(a => Buffer.from(a.rawBytes())); }
   finally { for (const a of arrays) a.dispose(); }
 }

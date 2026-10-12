@@ -49,14 +49,14 @@ class GrammarGroup implements MlxGroupedMethod {
   prepare(row: Row): MlxGroupPreparation {
     const options = row.req.method!.data as GenerateOptions;
     if (!row.req.grammar || options.logprobs || (options.topLogprobs ?? 0) > 0 ||
-        row.req.continuation || row.req.promptInput || options.pagedKv)
-      throw new Error("forced grammar span requires an ordinary grammar request without logprobs, media, paging, or continuation");
+        row.req.continuation || row.req.promptInput)
+      throw new Error("forced grammar span requires an ordinary grammar request without logprobs, media, or continuation");
     const sampling = makeStepSampler(options, { tokenRepresentation: "device", grammarWait: "external",
       historyUpdate: "manual", initialHistory: row.req.promptIds });
     this.#requests.set(row, { sampling, caches: [], pending: null });
     const target = new MlxPrefillCohort({
       model: this.model, chunkSize: this.host.prefillChunkSize,
-      tailSplit: this.host.runtime.flag("MLX_BUN_PREFILL_TAIL_SPLIT", true),
+      tailSplit: this.host.prefillTailSplit,
       promptCache: this.host.promptCache, maintain: this.host.kvMaintenance, denseKvReads: this.denseKvReads,
       forward: async (ids, caches, step) => this.#dispatch.prompt(step.phase, step.sequences, step.tokens)(ids, caches, null),
       project: (hidden, _caches, _completed, step) => {

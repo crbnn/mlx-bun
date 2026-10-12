@@ -28,7 +28,10 @@
 //   rows bit for bit as twins that appended only the kept positions, commit as
 //   twins that appended all of them.
 // The recurrent state (`SSMCache`, the gated-DeltaNet contract) runs its own
-// operations: recurrence per phase, rows, transaction, snapshot and SSD.
+// operations: recurrence per phase, rows, transaction, snapshot and SSD; so
+// does the latent attention state (`MLACache`, GLM-5.2's compressed MLA state,
+// with and without DSA index keys): the latent read per phase, snapshot, SSD,
+// rows and the transaction.
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -53,6 +56,8 @@ import { bindRowCacheRollback, type RowSpeculativeState } from "../../src/state/
 import { SSMCache } from "../../src/state/ssm";
 import { deferredTurboQuantKernels, denseTurboQuantKernels } from "../../src/state/turboquant-attention";
 import { leaseCacheStates } from "../../src/state/leases";
+import { MLACache } from "../../src/state/glm52-cache";
+import type { LatentAttentionCache, LatentAttentionState } from "../../src/contracts/mlx/cache";
 
 // ---------------------------------------------------------------------------
 // Inputs and comparisons
@@ -638,6 +643,117 @@ describe("recurrent state (SSMCache)", () => {
       }
       for (let index = 0; index < 2; index++) extracted.push(layout.extractRow(index));
       for (const [index, cache] of extracted.entries()) statesEqual(cache, twins[index]!);
+    } finally { dispose(layout, ...extracted, ...rows, ...twins); }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The latent attention state: GLM-5.2's compressed MLA state
+// (`LatentAttentionCache`), with and without DSA index keys
+
+for (const dsa of [false, true]) describe(`latent attention state (MLACache${dsa ? ", DSA index keys" : ""})`, () => {
+  const RANK = 8, ROPE_DIM = 4, INDEX = 6;
+  const make = () => new MLACache({ kvLoraRank: RANK, ropeHeadDim: ROPE_DIM, maxTokens: 64,
+    ...(dsa ? { dsa: { headDim: INDEX } } : {}) });
+  /** `L` float32 positions of each row's stream (`seeds` name the rows). */
+  const inputs = (L: number, seeds: readonly number[]) => {
+    const part = (width: number, shift: number) =>
+      rowsOf(seeds.map(seed => MlxArray.fromFloat32(noise(L * width, seed + shift), [1, L, width])));
+    return { latent: part(RANK, 0), rope: part(ROPE_DIM, 0.3), indexKeys: dsa ? part(INDEX, 0.6) : null };
+  };
+  const release = (state: LatentAttentionState) => { state.latent.dispose(); state.rope.dispose(); state.indexKeys?.dispose(); };
+  const appendRows = (cache: Cache, L: number, seeds: readonly number[]): LatentAttentionState => {
+    const { latent, rope, indexKeys } = inputs(L, seeds);
+    try { return (cache as LatentAttentionCache).appendLatent(latent, rope, indexKeys); }
+    finally { latent.dispose(); rope.dispose(); indexKeys?.dispose(); }
+  };
+  const expectStates = (label: string, a: LatentAttentionState, b: LatentAttentionState) => {
+    expect(maxDiff(a.latent, b.latent), `${label} latent`).toBe(0);
+    expect(maxDiff(a.rope, b.rope), `${label} rope`).toBe(0);
+    if (dsa) expect(maxDiff(a.indexKeys!, b.indexKeys!), `${label} index keys`).toBe(0);
+    else expect([a.indexKeys, b.indexKeys]).toEqual([null, null]);
+  };
+  const row = (length: number, seed: number) => { const cache = make(); release(appendRows(cache, length, [seed])); return cache; };
+  const tail = (a: MlxArray, from: number, to: number) => a.slice([0, from, 0], [a.shape[0]!, to, a.shape[2]!]);
+
+  test("phases: window, decode, window; each read returns every stored position", () => {
+    const cache = make() as MLACache & LatentAttentionCache;
+    try {
+      let position = 0;
+      for (const [L, seed] of [[5, 1], [1, 2], [3, 3]] as const) {
+        const stored = cache.storedIndexKeys();
+        const { latent, rope, indexKeys } = inputs(L, [seed]);
+        try {
+          const state = cache.appendLatent(latent, rope, indexKeys);
+          try {
+            expect(cache.offset).toBe(position + L);
+            expect(state.latent.shape).toEqual([1, position + L, RANK]);
+            expect(state.rope.shape).toEqual([1, position + L, ROPE_DIM]);
+            using lastLatent = tail(state.latent, position, position + L);
+            using lastRope = tail(state.rope, position, position + L);
+            expect(maxDiff(lastLatent, latent)).toBe(0);
+            expect(maxDiff(lastRope, rope)).toBe(0);
+            if (dsa) {
+              using lastIndex = tail(state.indexKeys!, position, position + L);
+              expect(maxDiff(lastIndex, indexKeys!)).toBe(0);
+              if (position === 0) expect(stored).toBeNull();
+              else { using before = tail(state.indexKeys!, 0, position); expect(maxDiff(before, stored!)).toBe(0); }
+            } else expect([state.indexKeys, stored]).toEqual([null, null]);
+            position += L;
+          } finally { release(state); }
+        } finally { latent.dispose(); rope.dispose(); indexKeys?.dispose(); stored?.dispose(); }
+      }
+    } finally { cache.dispose(); }
+  });
+
+  test("snapshot and SSD continue as the source", () => {
+    const cache = row(6, 11), path = join(tmp, `mla${dsa ? "-dsa" : ""}.kv`);
+    const [clone] = cloneKvCaches([cache]);
+    try {
+      evaluate([cache]);
+      saveKvCache(path, Array.from({ length: 6 }, (_, i) => i), [cache]);
+      const restored = loadKvCache(path, { makeCache: () => [make()] }).caches[0]!;
+      try {
+        expect(restored.offset).toBe(6);
+        const source = appendRows(cache, 1, [12]);
+        try {
+          for (const [label, other] of [["clone", clone!], ["restored", restored]] as const) {
+            const next = appendRows(other, 1, [12]);
+            try { expectStates(label, next, source); } finally { release(next); }
+          }
+        } finally { release(source); }
+      } finally { restored.dispose(); }
+    } finally { dispose(cache, clone); }
+  });
+
+  test("rows and the speculative transaction", () => {
+    const rows = [row(5, 21), row(9, 22)], twins = [row(5, 21), row(9, 22)];
+    let layout: (BatchableCache & RowSpeculativeState) | undefined;
+    const extracted: Cache[] = [];
+    try {
+      layout = targetCacheLayout(rows[0]!) as unknown as BatchableCache & RowSpeculativeState;
+      layout.mergeRows(rows);
+      expect([...layout.rowOffsets]).toEqual([5, 9]);
+      // Two drafts: row 0 accepts none (keeps one position), row 1 accepts both (keeps three).
+      const transaction = bindRowCacheRollback([layout], 2);
+      transaction.begin(2);
+      release(appendRows(layout, 3, [23, 24]));
+      transaction.resolve([0, 2]);
+      expect([...layout.rowOffsets]).toEqual([6, 12]);
+      for (const [index, keep] of [1, 3].entries()) {
+        const { latent, rope, indexKeys } = inputs(3, [23 + index]);
+        try {
+          using keptLatent = tail(latent, 0, keep), keptRope = tail(rope, 0, keep);
+          using keptIndex = indexKeys ? tail(indexKeys, 0, keep) : null;
+          release((twins[index] as LatentAttentionCache).appendLatent(keptLatent, keptRope, keptIndex));
+        } finally { latent.dispose(); rope.dispose(); indexKeys?.dispose(); }
+      }
+      for (let index = 0; index < 2; index++) extracted.push(layout.extractRow(index));
+      for (const [index, cache] of extracted.entries()) {
+        expect(cache.offset).toBe(twins[index]!.offset);
+        const a = appendRows(cache, 1, [25 + index]), b = appendRows(twins[index]!, 1, [25 + index]);
+        try { expectStates(`row ${index}`, a, b); } finally { release(a); release(b); }
+      }
     } finally { dispose(layout, ...extracted, ...rows, ...twins); }
   });
 });

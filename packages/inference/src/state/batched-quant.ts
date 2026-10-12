@@ -21,7 +21,8 @@
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import { QuantizedKVCache } from "./quantized-kv";
-import { type AttentionCache, type AttentionRead, type BatchableCache, type Cache, type Mask, type QuantizedAttentionState } from "../contracts/mlx/cache";
+import { type AttentionCache, type AttentionRead, type BatchableCache, type Cache, type Mask } from "../contracts/mlx/cache";
+import type { QuantizedAttentionState } from "./kv-storage";
 import { buildBatchedDecodeMask } from "./batched-mask";
 import { isQuantizedKvCache } from "./capabilities";
 import { runtimeValue } from "../runtime/config";

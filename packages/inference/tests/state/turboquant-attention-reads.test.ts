@@ -19,6 +19,7 @@ import { ownedCacheLayoutFactory } from "../../src/state/layout";
 import { TurboQuantKVCache } from "../../src/state/turboquant-kv";
 import { deferredTurboQuantKernels } from "../../src/state/turboquant-attention";
 import { disposeResources } from "../../src/runtime/resources";
+import { kvStorage } from "../../src/state/kv-storage";
 
 const HKV = 2, HQ = 8, D = 128, SCALE = 0.088;
 /** Every k/v width the codec accepts (`TURBOQUANT_VALID_KBITS`/`VBITS`). */
@@ -56,13 +57,13 @@ function maxDiff(a: MlxArray, b: MlxArray): number {
  * the `rotatedValueAttention` branch; the mask is the forward's, built from the
  * cache before any layer appends). */
 function oldRead(cache: Cache, k: MlxArray, v: MlxArray, q: MlxArray): MlxArray {
-  const mask = cache.makeMask(k.shape[2]!, null);
+  const mask = kvStorage(cache).makeMask(k.shape[2]!, null);
   try {
-    const [keys, values] = cache.rotatedValueAttention!.updateAndFetchDeferredV(k, v);
+    const [keys, values] = kvStorage(cache).rotatedValueAttention!.updateAndFetchDeferredV(k, v);
     const rotated = ops.sdpa(q, keys, values, SCALE, mask.mode, mask.arr);
     keys.dispose();
     values.dispose();
-    const attn = cache.rotatedValueAttention!.captureValueTransform?.()(rotated) ?? unrotateValues(rotated);
+    const attn = kvStorage(cache).rotatedValueAttention!.captureValueTransform?.()(rotated) ?? unrotateValues(rotated);
     rotated.dispose();
     return attn;
   } finally { mask.arr?.dispose(); }

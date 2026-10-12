@@ -27,6 +27,7 @@ import type { RuntimeModel } from "../../src/models/factory";
 import { setTrainingAttn } from "../../src/kernels/attention/flash";
 import { createRuntimeConfig, runtimeConfig, withRuntimeConfig } from "../../src/runtime/config";
 import { trainForward } from "../../src/scoring/full-sequence";
+import { trainForward as frozenTrainForward } from "./full-sequence-reference";
 import { evalPpl } from "../../src/scoring/perplexity";
 import { createKvMaintenance } from "../../src/state/kv-maintenance";
 import { composedAffineKernels } from "../../src/state/affine-attention";
@@ -530,7 +531,7 @@ for (const family of FAMILIES) {
       const p = pair(family), tag = `${family.name} scoring`;
       const valid = [24, 19, 15];
       using input = ids(valid.map((n, row) => [...prompt(n, 66 + row), ...Array(24 - n).fill(0)]));
-      using expectedLogits = trainForward(p.old as unknown as RuntimeModel, input, valid);
+      using expectedLogits = frozenTrainForward(p.old as unknown as RuntimeModel, input, valid);
       using actualLogits = trainForward(p.current as unknown as RuntimeModel, input, valid);
       record(`${tag} padded batch logits`, maxDiff(actualLogits, expectedLogits, `${tag} padded batch logits`), 1);
     }, 120_000);
@@ -607,14 +608,14 @@ describe("D3 dense family: MiniCPM5 construction choices and training forwards",
     try {
       {
         using input = ids([prompt(48, 91)]);
-        using expected = trainForward(old as unknown as RuntimeModel, input);
+        using expected = frozenTrainForward(old as unknown as RuntimeModel, input);
         using actual = trainForward(current as unknown as RuntimeModel, input);
         record(`${tag} B=1 logits`, maxDiff(actual, expected, `${tag} B=1 logits`), 1);
       }
       {
         const valid = [40, 33, 36];
         using input = ids(valid.map((n, row) => [...prompt(n, 92 + row), ...Array(40 - n).fill(0)]));
-        using expected = trainForward(old as unknown as RuntimeModel, input, valid);
+        using expected = frozenTrainForward(old as unknown as RuntimeModel, input, valid);
         using actual = trainForward(current as unknown as RuntimeModel, input, valid);
         record(`${tag} padded batch logits`, maxDiff(actual, expected, `${tag} padded batch logits`), 1);
       }

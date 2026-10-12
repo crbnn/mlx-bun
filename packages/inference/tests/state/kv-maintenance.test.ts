@@ -15,12 +15,13 @@ import type { KvStorageScheme } from "../../src/contracts/portable/composition";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
+import { kvStorage } from "../../src/state/kv-storage";
 
 function populate(cache: Cache, length: number): void {
   const source = MlxArray.fromFloat32(Float32Array.from({ length: length * 64 }, (_, i) => Math.sin(i * 0.13)), [1, 1, length, 64]);
   const value = source.astype(Dtype.bfloat16);
   source.dispose();
-  const fetched = cache.updateAndFetch(value, value);
+  const fetched = kvStorage(cache).updateAndFetch(value, value);
   ops.evalAll(fetched);
   for (const array of fetched) array.dispose();
   value.dispose();

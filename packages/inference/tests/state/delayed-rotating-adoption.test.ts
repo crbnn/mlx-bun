@@ -25,13 +25,14 @@ import { unfusedAffineKernels } from "../../src/state/affine-attention";
 import { settleAffine } from "./convert-after-reference";
 import { DelayedRotatingQuantizedKVCache } from "../../src/state/delayed-rotating-quantized-kv";
 import { cloneKvCaches } from "../../src/state/persistence";
+import { kvStorage } from "../../src/state/kv-storage";
 
 const W = 8;
 const digest = (a: MlxArray) => { using c = ops.contiguous(a); return createHash("sha256").update(c.rawBytes()).digest("hex"); };
 /** One attention step as the model runs it: the group mask from the cache
  * before its write, then the cache's own attention view. */
 const attend = (cache: Cache, q: MlxArray, k: MlxArray, v: MlxArray, scale: number, bits: number): string => {
-  const mask = cache.makeMask(k.shape[2]!, W);
+  const mask = kvStorage(cache).makeMask(k.shape[2]!, W);
   try {
     const view = captureKvAttention(cache, k, v, unfusedAffineKernels(bits, 64, q.dtype));
     try { using out = view.attend(q, scale, mask); return digest(out); } finally { view.dispose(); }
@@ -173,9 +174,9 @@ test(`B1 plain reads keep the adopted ring's physical bytes and attend as the so
     for (const [step, n] of [1, 1, 1, 10, 1, 1].entries()) {
       using q = f16(1, 4, n, 100 + step), k = f16(1, 2, n, 200 + step), v = f16(1, 2, n, 300 + step);
       // Each cache's own mask before its write, as the model builds it.
-      const am = adopted[0]!.makeMask(n, W), sm = solo[0]!.makeMask(n, W);
+      const am = kvStorage(adopted[0]!).makeMask(n, W), sm = kvStorage(solo[0]!).makeMask(n, W);
       try {
-        const [ak, av] = adopted[0]!.updateAndFetch(k, v), [sk, sv] = solo[0]!.updateAndFetch(k, v);
+        const [ak, av] = kvStorage(adopted[0]!).updateAndFetch(k, v), [sk, sv] = kvStorage(solo[0]!).updateAndFetch(k, v);
         try {
           expect([digest(ak), digest(av)], `step ${step} (${n} tokens) physical bytes`).toEqual([digest(sk), digest(sv)]);
           using ao = ops.sdpa(q, ak, av, 1 / 8, am.mode, am.arr), so = ops.sdpa(q, sk, sv, 1 / 8, sm.mode, sm.arr);

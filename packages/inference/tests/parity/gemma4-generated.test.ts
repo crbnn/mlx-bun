@@ -32,7 +32,6 @@ import { expect, test } from "bun:test";
 import { strict as assert } from "node:assert";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { configureRuntime } from "@mlx-bun/inference/runtime/config";
 import { releaseAll, sha256 } from "./real-weight-inputs";
 
 type A = any;
@@ -138,8 +137,7 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
     }
 
     // 1. Per-step vectors over caches converted before the first forward.
-    const restore = configureRuntime({ MLX_BUN_COMPILED_DECODE: "0" });
-    try {
+    {
       const steps = (model: A) => {
         const caches = converted();
         try {
@@ -157,7 +155,7 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
       const dedicated = steps(mono);
       specialized.forEach((vector, step) => expect({ step, equal: vector.equals(dedicated[step]!) }).toEqual({ step, equal: true }));
       digest("kv_config step vectors", specialized);
-    } finally { restore(); }
+    }
 
     // 2. Greedy trajectories under the kv_config composition, uncompiled and compiled: both
     // graphs composed with the artifact's per-layer scheme, each reading its own caches.
@@ -166,15 +164,15 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
     expect(configured.gen).toBeInstanceOf(generated.GeneratedGemma4);
     try {
       for (const compiled of [false, true]) {
-        const reset = configureRuntime({ MLX_BUN_COMPILED_DECODE: compiled ? "1" : "0" });
-        try {
+        {
           const run = async (model: A, log: string[][] | null) => {
             const out: number[] = [];
             const caches: A[] = model.makeCache();
             const read = log ? recordReads(caches, composedStorageOf, log) : caches;
             try {
               // No stop tokens: every trajectory is TOKENS long whatever the artifact's first token (e4b's is EOS here).
-              const generation = generate(model, prompt, { maxTokens: TOKENS, temperature: 0, eosTokenIds: [], cache: read });
+              const generation = generate(model, prompt, { maxTokens: TOKENS, temperature: 0, eosTokenIds: [], cache: read,
+                ...(compiled ? {} : { decodePolicy: { compiledDecode: false, grammarJump: false } }) });
               for await (const token of generation) out.push(token.token);
             } finally { releaseAll(caches.map(cache => () => cache.dispose())); ffi.clearCache(); }
             return out;
@@ -206,7 +204,7 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
           else expect(steps).toBeGreaterThan(0);
           digest(`compiled ${compiled} trajectory`, [specialized]);
           console.log(`[generated ${fingerprint}] compiled ${compiled}: ${specialized.length} tokens identical, ${steps} compiled steps`);
-        } finally { reset(); }
+        }
       }
     } finally {
       try { releaseAll([configured.mono, configured.gen].map(model => () => CompiledDecode.release(model))); }

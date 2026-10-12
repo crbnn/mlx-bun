@@ -16,7 +16,7 @@ import { FullPrefillPadding } from "./full-prefill-padding";
 import type { PrefillPadding } from "../contracts/mlx/cache";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
-import { type BatchableCache, type Cache, type Mask } from "../contracts/mlx/cache";
+import { type BatchableCache, type Cache, type LatentAttentionCache, type LatentAttentionState, type Mask } from "../contracts/mlx/cache";
 import { createCausalMask } from "../kernels/attention/masks";
 
 export interface DSAIndexGeometry {
@@ -191,7 +191,7 @@ export class DSAIndexCache {
   }
 }
 
-export class MLACache implements BatchableCache {
+export class MLACache implements BatchableCache, LatentAttentionCache {
   readonly kvLoraRank: number;
   readonly ropeHeadDim: number;
   readonly maxTokens: number;
@@ -301,16 +301,17 @@ export class MLACache implements BatchableCache {
     return this.fetch();
   }
 
-  /**
-   * GLM attention integration seam. The returned arrays are caller-owned
-   * chronological views; the cache retains its own full state.
-   */
-  appendCompressed(
-    latent: MlxArray,
-    rope: MlxArray,
-    dsa: MlxArray | null = null,
-  ): MLACompressedState {
-    return this.appendAndFetch(latent, rope, dsa);
+  /** The latent attention read (`LatentAttentionCache.appendLatent`): append,
+   * then caller-owned chronological views of all stored state. The cache
+   * retains its own full state. */
+  appendLatent(latent: MlxArray, rope: MlxArray, indexKeys: MlxArray | null): LatentAttentionState {
+    const state = this.appendAndFetch(latent, rope, indexKeys);
+    return { latent: state.latent, rope: state.rope, indexKeys: state.dsa };
+  }
+
+  /** The DSA index keys stored so far (`LatentAttentionCache.storedIndexKeys`). */
+  storedIndexKeys(): MlxArray | null {
+    return this.dsa?.offset ? this.dsa.fetch() : null;
   }
 
   /** Caller-owned chronological views of all valid compressed state. */
@@ -366,8 +367,9 @@ export class MLACache implements BatchableCache {
   }
 
   /**
-   * Compatibility with the generic Cache interface. GLM layers with DSA use
-   * appendAndFetch so all three state families advance atomically.
+   * The storage fetch (`state/kv-storage.ts`) of an MLA-only layer. The MLA
+   * block reads through `appendLatent`, so all three state families advance
+   * atomically.
    */
   updateAndFetch(latent: MlxArray, rope: MlxArray): [MlxArray, MlxArray] {
     if (this.dsa)

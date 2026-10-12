@@ -23,9 +23,8 @@ import { stubPhases } from "../models/phase-forward";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { configureRuntime, runtimeConfig } from "../../src/runtime/config";
 import { cloneKvCaches } from "../../src/state/persistence";
-import { specServeRun } from "../../src/generation/speculative/run";
-import type { DraftProvider, DraftSource } from "../../src/generation/speculative/source";
 import { declareGraph } from "../../src/models/capabilities";
+import { kvStorage } from "../../src/state/kv-storage";
 
 const VOCAB = 128;
 const EOS = 2;
@@ -86,7 +85,7 @@ class StubModel {
     const L = list.length;
     const k = MlxArray.fromFloat32(new Float32Array(L * 4), [1, 1, L, 4]);
     const v = MlxArray.fromFloat32(new Float32Array(L * 4), [1, 1, L, 4]);
-    const [outK, outV] = cache[0]!.updateAndFetch(k, v);
+    const [outK, outV] = kvStorage(cache[0]!).updateAndFetch(k, v);
     for (const a of [k, v, outK, outV]) a.dispose();
     // The "hidden state" carries each position's token id, so logits can be
     // produced PER POSITION — which is what the verify policy reads.
@@ -192,35 +191,6 @@ describe("generate(): cancellation", () => {
     await expect(run({ signal: abort.signal }, Infinity, model))
       .rejects.toHaveProperty("name", "AbortError");
     expect(model.forwards).toEqual([]);
-  });
-
-  test("speculative cancellation between target prefill chunks releases target and draft state", async () => {
-    const abort = new AbortController();
-    let cacheDisposals = 0;
-    let sourceDisposals = 0;
-    class OwnedCache extends KVCache {
-      override dispose(): void { cacheDisposals++; super.dispose(); }
-    }
-    class CancellingModel extends StubModel {
-      override forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray {
-        const hidden = super.forwardHidden(ids, cache);
-        abort.abort(new DOMException("cancelled during spec prefill", "AbortError"));
-        return hidden;
-      }
-    }
-    const model = new CancellingModel(SCRIPT, () => [new OwnedCache()]);
-    const source = {
-      prefill() { throw new Error("cancelled target must not start draft prefill"); },
-      dispose() { sourceDisposals++; },
-    } as unknown as DraftSource;
-    const provider = { open: () => source } as unknown as DraftProvider;
-    await expect(specServeRun(model as unknown as RuntimeModel, provider, 3,
-      Array.from({ length: 4098 }, () => 1), { temperature: 0, signal: abort.signal },
-      () => { throw new Error("cancelled prefill must not emit"); }))
-      .rejects.toHaveProperty("name", "AbortError");
-    expect(model.forwards).toHaveLength(1);
-    expect(cacheDisposals).toBe(1);
-    expect(sourceDisposals).toBe(1);
   });
 });
 

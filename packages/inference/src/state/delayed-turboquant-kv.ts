@@ -5,7 +5,8 @@ import type { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { unrotateValues } from "../kernels/turboquant/ops";
-import { type AttentionRead, type Cache, type CommittedAttentionCache, type RotatedValueAttentionState } from "../contracts/mlx/cache";
+import { type AttentionRead, type Cache, type CommittedAttentionCache } from "../contracts/mlx/cache";
+import { kvStorage, type RotatedValueAttentionState } from "./kv-storage";
 import { TurboQuantKVCache } from "./turboquant-kv";
 import { BatchedTurboQuantKVCache } from "./batched-turboquant-kv";
 import { FullTransitioningKvRows } from "./full-transitioning-kv-rows";
@@ -101,7 +102,7 @@ export class DelayedTurboQuantKVCache extends FullTransitioningKvRows<BatchedTur
       this.#rotated = Array.from({ length: this.batchSize! }, () => true);
       return deferred ? this.packed.updateAndFetchDeferredV(k, v) : this.packed.updateAndFetch(k, v);
     }
-    this.#rotated = this.rows.map(row => !!row.rotatedValueAttention);
+    this.#rotated = this.rows.map(row => !!kvStorage(row).rotatedValueAttention);
     const result = appendFullKvRows(this.rows, this.leftPad, this.offset + k.shape[2]!, k, v, deferred);
     try { this.syncPositions(true); } catch (error) { result[0].dispose(); result[1].dispose(); throw error; }
     return result;

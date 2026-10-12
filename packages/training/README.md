@@ -53,7 +53,7 @@ held-out expected accepted length (τ) as `<outDir>` (`dspark.json`, `model.safe
 path). `calibrateDrafter` runs speculative generations through a provider that drafts the
 unpruned block, fits per-position confidence thresholds with `fitStsThresholds`, and
 `writeSts` sets them in `dspark.json`. The target is any graph declaring hidden-layer taps and
-the draft projection (`embed`, `logitsFromHidden`); `tapLayers` must be identical for regen
+the draft projection (`embed`, and `logits`, its output head per width class); `tapLayers` must be identical for regen
 and train (shards record them, and a mismatch is refused). Losses, shard sampling geometry,
 seeded reproducibility, resume and the calibration provider have [synthetic-target
 tests](tests/native/dspark.test.ts); the fit's math is a [CPU test](tests/cpu/dspark-sts.test.ts).

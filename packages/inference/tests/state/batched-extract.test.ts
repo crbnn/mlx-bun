@@ -31,11 +31,13 @@ import { mergeQuantRows, extractQuantRow, type QuantRow } from "../../src/state/
 import { BatchedRotatingCache } from "../../src/state/batched-rotating";
 import { BatchedRotatingQuantCache } from "../../src/state/batched-rotating-quant";
 import { SSMCache } from "../../src/state/ssm";
-import { KvScheme, resolveKvScheme } from "../../src/state/kv-scheme";
+import { resolveKvScheme } from "../../src/state/kv-scheme";
+import { testComposition } from "../models/test-composition";
 import { MlxBatchExecutionGroup, type RowPromptCache } from "../../src/execution/batch-group";
 import type { RuntimeModel } from "../../src/models/factory";
 import { declareGraph } from "../../src/models/capabilities";
 import { stubPhases } from "../models/phase-forward";
+import { kvStorage } from "../../src/state/kv-storage";
 
 /** Contiguous raw bytes of a (possibly strided) view, as a plain array. */
 const bytes = (a: MlxArray): number[] => {
@@ -427,13 +429,13 @@ const stubModel = phased({
     text: { numHiddenLayers: 1, layerTypes: ["full_attention"] },
   },
   weightsBytes: 0,
-  requiredDenseKvLayers: [0], graphCapabilities: declareGraph({ kv: { denseReads: true } }),
+  requiredDenseKvLayers: [0], graphCapabilities: declareGraph(),
   makeCache: (): Cache[] => [new KVCache()],
   forward(ids: MlxArray, caches: Cache[]): MlxArray {
     const [B, L] = ids.shape as [number, number];
     const k = kvFromIds(ids);
     for (const c of caches) {
-      const [rk, rv] = c.updateAndFetch(k, k);
+      const [rk, rv] = kvStorage(c).updateAndFetch(k, k);
       rk.dispose(); rv.dispose();
     }
     k.dispose();
@@ -467,27 +469,19 @@ const newGroup = (model: RuntimeModel, opts: ConstructorParameters<typeof MlxBat
 afterEach(async () => { for (const group of groups.splice(0)) await group.close(); });
 
 describe("MlxBatchExecutionGroup per-row extraction (stub model)", () => {
-  test("rejects delayed affine conversion that cannot execute after rows merge", () => {
-    expect(() =>
-      new MlxBatchExecutionGroup(stubModel, {
-        maxBatch: 2,
-        kvScheme: new KvScheme("affine-uniform", { kvBits: 4, quantizedKvStart: 5 }),
-      }),
-    ).toThrow("unsupported KV scheme");
-  });
-
-  test("authoritative kvScheme converts scheduled rows before cache storage", async () => {
+  test("the composition's KV scheme converts scheduled rows before cache storage", async () => {
     const scheme = resolveKvScheme({
       override: "config",
       config: [{ layerIdx: 0, bits: 4, groupSize: 32 }],
     });
     // This graph composes the scheme's lego and reads through its window read,
-    // so it declares no plain-KV reads: the scheduler may convert its rows.
+    // so it declares no plain-KV reads: the scheduler converts its rows.
     const quantModel = phased({
       ...stubModel,
+      composition: testComposition(scheme.storage),
       makeCache: () => [composedFullAttentionCache(scheme.storage, 0, new AttentionMasks(), denseTurboQuantKernels)],
       requiredDenseKvLayers: [],
-      graphCapabilities: declareGraph({ kv: { denseReads: false } }),
+      graphCapabilities: declareGraph(),
       forward(ids: MlxArray, caches: Cache[]): MlxArray {
         const [B, L] = ids.shape as [number, number];
         const f = ids.astype(Dtype.float32);
@@ -509,7 +503,6 @@ describe("MlxBatchExecutionGroup per-row extraction (stub model)", () => {
     };
     const sched = newGroup(quantModel, {
       maxBatch: 2,
-      kvScheme: scheme,
       promptCache: pc,
     });
 
@@ -646,7 +639,7 @@ const ssmUpdate = (ids: MlxArray, c: SSMCache): void => {
 const hybridStub = phased({
   config: { modelType: "stub" },
   weightsBytes: 0,
-  requiredDenseKvLayers: [0], graphCapabilities: declareGraph({ kv: { denseReads: true } }),
+  requiredDenseKvLayers: [0], graphCapabilities: declareGraph(),
   makeCache: (): Cache[] => [new KVCache(), new SSMCache()],
   forward(ids: MlxArray, caches: Cache[]): MlxArray {
     const [B, L] = ids.shape as [number, number];
@@ -656,7 +649,7 @@ const hybridStub = phased({
         continue;
       }
       const k = kvFromIds(ids);
-      const [rk, rv] = c.updateAndFetch(k, k);
+      const [rk, rv] = kvStorage(c).updateAndFetch(k, k);
       rk.dispose(); rv.dispose(); k.dispose();
     }
     return ops.zeros([B, L, HD], Dtype.float32);

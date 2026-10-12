@@ -9,7 +9,7 @@
 //   before it) and every projection's complete logits; the scheduler may add
 //   one discarded single-token lookahead step. Rows prepared together or
 //   joining late (B2) each equal their B1 direct output.
-// - Grammar with MLX_BUN_GRAMMAR_JUMP=1: the graph binds grammar proposals, so
+// - Grammar with the composition's grammarJump on: the graph binds grammar proposals, so
 //   the gateway places the request on the speculative group, which verifies
 //   the matcher's forced string rather than committing it (no forced span is
 //   taken from the matcher). At B1 and B2 its tokens equal direct
@@ -246,8 +246,7 @@ async function setup() {
 
   /** The scenario's runtime, active while `run` binds and generates. */
   const under = async <T>(shape: Shape, fill: FillMode | undefined, run: () => Promise<T>) => {
-    const restore = configureRuntime({ MLX_BUN_PREFILL_TAIL_SPLIT: "1", MLX_BUN_COMPILED_DECODE: "0", MLX_BUN_GRAMMAR: "1",
-      MLX_BUN_GRAMMAR_JUMP: shape === "jump" ? "1" : "0", MLX_BUN_FILL: fill === "reject" ? "echo" : fill ?? "off" });
+    const restore = configureRuntime({ MLX_BUN_GRAMMAR: "1", MLX_BUN_FILL: fill === "reject" ? "echo" : fill ?? "off" });
     try { return await run(); } finally { restore(); clearCache(); }
   };
   /** A matcher that reports each forced span it commits (none is expected on
@@ -356,7 +355,9 @@ async function setup() {
     hold(held: boolean): void;
     drained(): Promise<void>;
   }) => Promise<T>) => under(shape, fill, async () => {
-    const binding = bindMlxGateway(view);
+    // The jump scenario binds the view under a composition that turns grammar jump on.
+    const binding = bindMlxGateway(shape === "jump"
+      ? Object.create(view, { composition: { value: { ...(view as { composition?: object }).composition, grammarJump: true } } }) as typeof view : view);
     let held = false;
     const group = binding.createBatchGroup({ maxBatch, runtime: binding.runtime, prefillChunkSize: CHUNK, admissionHeld: () => held });
     const prepare = async (request: Request, end: { cancelAt?: number; onToken?: (emitted: number) => void } = {}) => {
@@ -367,7 +368,7 @@ async function setup() {
           hasLogitsExtras: false, hasGrammar: !!options.grammar, wantsLogprobs: false, hasDraft: false };
         let sampling: ReturnType<typeof createRowSampling> | undefined;
         try {
-          const execution = binding.plan(shape, options, { continuous: binding.cachesBatchable(), quantizedBatch: false, checkpoints: false });
+          const execution = binding.plan(shape, options, { checkpoints: false });
           assert.equal(execution.mechanism, "continuous", `placement refused ${JSON.stringify(request)}: ${execution.reasons.join(", ")}`);
           const method = binding.methodRequest?.(execution, options);
           const sink = (token: number) => {

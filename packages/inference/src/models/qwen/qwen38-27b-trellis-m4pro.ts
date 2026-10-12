@@ -47,9 +47,10 @@
 //   - mixed groups of rows in one forward (mixed), each group on its own phase's operation for its width;
 //   - the scoring forward over a whole sequence (sequenceHidden, prefillTail's operation for its width);
 //   - mounted LoRA adapters when the composition mounts them: every operation then runs the generic blocks,
-//     whose QuantizedLinear projections apply them, and the Neural Engine operation is not built.
-// The loader refuses, from the declared capabilities and never by routing to another graph: adapter requests
-// when the composition mounts none (adapter-batch-unsupported) and paged KV (paged-kv-batch-unsupported).
+//     whose QuantizedLinear projections apply them, and the Neural Engine operation is not built;
+//   - paged KV (the paged legos' own reads in place of the plain full-attention storage).
+// The planner refuses, from the declared capabilities and never by routing to another graph, adapter requests
+// when the composition mounts none (adapter-batch-unsupported).
 // Bf16FirstKv4Head256Cache's row layouts read with its KV4 kernels while they hold one unpadded row and with the
 // composition's affine kernels while they hold more.
 
@@ -269,9 +270,8 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph, MlxTokenPhases {
   readonly finalNorm: RMSNorm;
   readonly lmHead: QuantizedLinear;
   /** Prepared image and video embeddings with request mRoPE positions, layer
-   *  taps for drafts (verify's capture), delayed affine rows, bounded prefill
-   *  workspace; adapters only when the composition mounts them. Speculation over
-   *  affine KV is the composition's `speculativeAffineKv`. */
+   *  taps for drafts (verify's capture), bounded prefill workspace; adapters only
+   *  when the composition mounts them. */
   readonly graphCapabilities: GraphCapabilities;
   /** Verify forward cost by rows relative to one decode step (M4 Pro 24 GB). */
   readonly verifyRoundCosts: ReadonlyMap<number, number> = new Map([
@@ -430,9 +430,8 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph, MlxTokenPhases {
 
     this.graphCapabilities = declareGraph({
       media: { input: "embeddings+positions", video: true }, hiddenLayerTaps: true,
-      kv: { delayedAffine: "all" }, prefill: { boundedWorkspace: true },
+      prefill: { boundedWorkspace: true },
       adapters: composition.adapters ? {} : { batched: false, mountable: false },
-      speculation: { affineKv: composition.speculativeAffineKv, immediateAffine4: true },
     });
 
     // The attention cache the composition's KV scheme names, chosen once: affine 4-bit group 64

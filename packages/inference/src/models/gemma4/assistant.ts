@@ -27,8 +27,10 @@ import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { Weights } from "../../artifacts/weights";
-import type { AssistantDrafterModel, DrafterRowsStep } from "../../contracts/mlx/drafter";
+import type { AssistantDrafterModel, AssistantDraftStep, DrafterRowsStep } from "../../contracts/mlx/drafter";
+import type { MlxWidthTable } from "../../contracts/mlx/width";
 import { disposeResources } from "../../runtime/resources";
+import { atEveryWidth, byWidth } from "../graph";
 
 /** Legacy plain donor adapter. The common graph never reads cache geometry. */
 export function plainAssistantDonors(shared: { sliding: [MlxArray, MlxArray]; full: [MlxArray, MlxArray] },
@@ -46,6 +48,9 @@ export function plainAssistantDonors(shared: { sliding: [MlxArray, MlxArray]; fu
 }
 
 export type { DrafterRowsStep };
+
+/** The head's token per row: the final hidden [B, 1, H] (borrowed) and B in, owned ids [B] out. */
+type RowSelect = (h: MlxArray, rows: number) => MlxArray;
 
 export interface DrafterStep {
   /** Drafted token id. */
@@ -90,6 +95,7 @@ export class GemmaAssistantDrafter implements AssistantDrafterModel {
   #ordering: MlxArray | null = null;   // [numCentroids, vocabPerCentroid] int32
   #embed: MlxArray;      // drafter token embeddings [vocab, hidden]
   #norm: MlxArray;
+  readonly forwardRows: MlxWidthTable<AssistantDraftStep>;
 
   private constructor(w: Weights, cfg: Record<string, any>) {
     const t = cfg.text_config ?? cfg;
@@ -165,6 +171,14 @@ export class GemmaAssistantDrafter implements AssistantDrafterModel {
         });
       }
     } catch (error) { disposeResources(this.#owned.splice(0)); throw error; }
+    // The head's token selection, bound once: the centroid candidates at every
+    // width, or the tied embedding's full-vocabulary argmax, whose one-row form
+    // multiplies by the hidden column and whose wider form by the rows' transpose.
+    const select: MlxWidthTable<RowSelect> = this.useCentroids
+      ? atEveryWidth((h, rows) => this.#centroidTokens(h, rows))
+      : byWidth(width => width === "one" ? h => this.#embeddingTokensOne(h) : (h, rows) => this.#embeddingTokens(h, rows));
+    this.forwardRows = byWidth(width => (lastTokenEmb, targetHidden, donors, position) =>
+      this.#forwardRows(lastTokenEmb, targetHidden, donors, position, select[width]));
   }
 
   static async load(modelDir: string): Promise<GemmaAssistantDrafter> {
@@ -190,51 +204,63 @@ export class GemmaAssistantDrafter implements AssistantDrafterModel {
    * Donors are chronological; position is the target's last position. */
   forward(lastTokenEmb: MlxArray, targetHidden: MlxArray,
     sharedKv: { sliding: [MlxArray, MlxArray]; full: [MlxArray, MlxArray] }, position: number): DrafterStep {
-    const result = this.forwardRows(lastTokenEmb, targetHidden, plainAssistantDonors(sharedKv, position), position);
+    const result = this.forwardRows.one(lastTokenEmb, targetHidden, plainAssistantDonors(sharedKv, position), position);
     try { return { token: ops.itemUint32(result.tokens), nextHidden: result.nextHidden }; }
     catch (error) { result.nextHidden.dispose(); throw error; }
     finally { result.tokens.dispose(); }
   }
 
-  #sampleRows(h: MlxArray, B: number): MlxArray {
-    if (this.useCentroids) {
-      using scores = ops.matmul(h, this.#centroidsT!);
-      using flat = ops.reshape(scores, [B, this.numCentroids]);
-      using neg = ops.neg(flat);
-      using partition = ops.argpartitionAxis(neg, this.topK - 1, -1);
-      using top = partition.slice([0, 0], [B, this.topK]);
-      using topFlat = ops.reshape(top, [B * this.topK]);
-      using candidates = ops.takeAxis(this.#ordering!, topFlat, 0);
-      const count = this.topK * this.vocabPerCentroid;
-      using ids = ops.reshape(candidates, [B, count]);
-      using flatIds = ops.reshape(ids, [B * count]);
-      using embeddings = ops.takeAxis(this.#embed, flatIds, 0);
-      using matrix = ops.reshape(embeddings, [B, count, this.hidden]);
-      using vector = ops.reshape(h, [B, 1, this.hidden]);
-      // The oracle rounds each bf16 product before reduction. Matmul's
-      // accumulation changes candidate rankings on M1, even at identical h.
-      using products = ops.mul(matrix, vector);
-      using candidateScores = ops.sumAxis(products, -1, false);
-      using maximum = ops.maxAxis(candidateScores, -1, true);
-      using winners = ops.equal(candidateScores, maximum);
-      // Sparse full-vocabulary argmax chooses the lowest token ID on a tie.
-      // Apply that rule directly to the candidates without a vocab-size scatter.
-      using sentinel = ops.fromInt32([this.#embed.shape[0]!], []);
-      using eligible = ops.where(winners, ids, sentinel);
-      using selected = ops.minAxis(eligible, -1, false);
-      return selected.astype(Dtype.uint32);
-    }
-    using rows = ops.reshape(h, [B, this.hidden]);
-    using vector = B === 1 ? ops.reshape(h, [this.hidden, 1]) : ops.transposeAxes(rows, [1, 0]);
+  /** The centroid head's token per row: the top centroids' candidate tokens,
+   *  scored against the final hidden [B, 1, H]. */
+  #centroidTokens(h: MlxArray, B: number): MlxArray {
+    using scores = ops.matmul(h, this.#centroidsT!);
+    using flat = ops.reshape(scores, [B, this.numCentroids]);
+    using neg = ops.neg(flat);
+    using partition = ops.argpartitionAxis(neg, this.topK - 1, -1);
+    using top = partition.slice([0, 0], [B, this.topK]);
+    using topFlat = ops.reshape(top, [B * this.topK]);
+    using candidates = ops.takeAxis(this.#ordering!, topFlat, 0);
+    const count = this.topK * this.vocabPerCentroid;
+    using ids = ops.reshape(candidates, [B, count]);
+    using flatIds = ops.reshape(ids, [B * count]);
+    using embeddings = ops.takeAxis(this.#embed, flatIds, 0);
+    using matrix = ops.reshape(embeddings, [B, count, this.hidden]);
+    using vector = ops.reshape(h, [B, 1, this.hidden]);
+    // The oracle rounds each bf16 product before reduction. Matmul's
+    // accumulation changes candidate rankings on M1, even at identical h.
+    using products = ops.mul(matrix, vector);
+    using candidateScores = ops.sumAxis(products, -1, false);
+    using maximum = ops.maxAxis(candidateScores, -1, true);
+    using winners = ops.equal(candidateScores, maximum);
+    // Sparse full-vocabulary argmax chooses the lowest token ID on a tie.
+    // Apply that rule directly to the candidates without a vocab-size scatter.
+    using sentinel = ops.fromInt32([this.#embed.shape[0]!], []);
+    using eligible = ops.where(winners, ids, sentinel);
+    using selected = ops.minAxis(eligible, -1, false);
+    return selected.astype(Dtype.uint32);
+  }
+
+  /** The tied embedding head's argmax for one row: the vocabulary times the hidden column. */
+  #embeddingTokensOne(h: MlxArray): MlxArray {
+    using vector = ops.reshape(h, [this.hidden, 1]);
     using scores = ops.matmul(this.#embed, vector);
-    using flat = B === 1 ? ops.reshape(scores, [1, this.#embed.shape[0]!]) : ops.transposeAxes(scores, [1, 0]);
+    using flat = ops.reshape(scores, [1, this.#embed.shape[0]!]);
+    return ops.argmaxAxis(flat, -1);
+  }
+
+  /** The tied embedding head's argmax for B rows: the vocabulary times the rows' transpose. */
+  #embeddingTokens(h: MlxArray, B: number): MlxArray {
+    using rows = ops.reshape(h, [B, this.hidden]);
+    using vector = ops.transposeAxes(rows, [1, 0]);
+    using scores = ops.matmul(this.#embed, vector);
+    using flat = ops.transposeAxes(scores, [1, 0]);
     return ops.argmaxAxis(flat, -1);
   }
 
   /** Numerical graph only. Callers supply donor validity masks for different
    * row positions; token selection remains on device across the draft chain. */
-  forwardRows(lastTokenEmb: MlxArray, targetHidden: MlxArray,
-    donors: AssistantDonors, position: number | MlxArray): DrafterRowsStep {
+  #forwardRows(lastTokenEmb: MlxArray, targetHidden: MlxArray,
+    donors: AssistantDonors, position: number | MlxArray, select: RowSelect): DrafterRowsStep {
     const B = lastTokenEmb.shape[0]!;
     let h = ops.concatAxis([lastTokenEmb, targetHidden], 2); // (B,1,2*backbone)
     h = disposing(h, ops.matmul(h, this.#prePT));            // (B,1,256)
@@ -284,7 +310,7 @@ export class GemmaAssistantDrafter implements AssistantDrafterModel {
 
     h = disposing(h, this.#rms(h, this.#norm));
 
-    const tokens = this.#sampleRows(h, B);
+    const tokens = select(h, B);
     const nextHidden = ops.matmul(h, this.#postPT);           // (B,1,backbone)
     h.dispose();
     return { tokens, nextHidden };

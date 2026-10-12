@@ -2,7 +2,6 @@ import { AdmissionPool } from "@mlx-bun/inference/execution/admission";
 import { cleanupFailure, disposeResources } from "@mlx-bun/inference/runtime/resources";
 import type { createRowSampling, MlxGatewayBinding, MlxBatchGroup, RowPromptCache } from "@mlx-bun/inference/execution";
 import type { GenerateOptions, GenerateStats } from "@mlx-bun/inference/generation";
-import type { KvScheme } from "@mlx-bun/inference/state/kv-scheme";
 import type { RuntimeConfig } from "@mlx-bun/inference/runtime/config";
 import type { PromptResponseTrace } from "@mlx-bun/inference/runtime/trace";
 import type { CacheCodecProvider } from "@mlx-bun/inference/state";
@@ -80,10 +79,6 @@ export class GenerationGateway implements CompletionEngine {
   #rowsSubmitted = 0;
 
   #exclusiveWaiters = 0;
-  /** The model binding is stable for this gateway; probing allocates native caches. */
-  #cachesBatchable: boolean | null = null;
-  /** Lazy, memoized: can the configured KV scheme convert every named cache? */
-  #kvSchemeBatchable: boolean | null = null;
   constructor(
     binding: MlxGatewayBinding,
     capacity: number,
@@ -91,9 +86,6 @@ export class GenerationGateway implements CompletionEngine {
       kvBudgetBytes?: number;
       checkpoints?: boolean;
       stateCodecs?: CacheCodecProvider;
-    
-      kvScheme?: KvScheme;
-    
       promptCache?: RowPromptCache;
       adapterNamespace?: (adapters: string[]) => string;
       /** Builds the per-row sampler for ordinary rows (binding-owned method and
@@ -107,15 +99,6 @@ export class GenerationGateway implements CompletionEngine {
     if (!Number.isSafeInteger(capacity) || capacity < 1) throw new Error("execution capacity must be a positive integer");
     this.#batch = capacity;
     this.#requests = new AdmissionPool(this.#batch);
-    // Every request carries the server-wide KV scheme, so a requested scheme
-    // this model cannot serve is refused here, at startup (for example
-    // a compressed latent-attention cache, which no KV scheme converts). Main accepted such an
-    // option and silently ignored it. A `config` request without the model's
-    // kv_config.json resolves to bf16 and is not a requested scheme.
-    const kvScheme = this.opts.kvScheme;
-    if (kvScheme && kvScheme.kind !== "bf16" && !this.#kvBatchable())
-      throw new Error(`${binding.config.modelType} cannot serve the requested KV cache scheme ${kvScheme.cacheKey}: ` +
-        "this model's cache layers do not take it; omit --kv-quant or choose a scheme this model supports");
   }
 
   /** Rows currently decoding in the batch (0 if no scheduler / idle). */
@@ -166,19 +149,10 @@ export class GenerationGateway implements CompletionEngine {
     };
   }
 
-  #kvBatchable(): boolean {
-    return this.#kvSchemeBatchable ??= !!this.opts.kvScheme && this.#binding.kvBatchable(this.opts.kvScheme);
-  }
-
   place(shape: RequestShape, options: GenerateOptions = {}): GenerationPlacement {
     if (this.#closed) throw new Error("generation gateway is closed");
     const frozenShape = Object.freeze(shape);
-    const execution = this.#binding.plan(frozenShape, options, {
-      continuous: this.#cachesBatchable ??= this.#binding.cachesBatchable(),
-      // Every request stores the composition's KV scheme.
-      quantizedBatch: this.opts.kvScheme?.quantized === true && this.#kvBatchable(),
-      checkpoints: this.opts.checkpoints === true,
-    });
+    const execution = this.#binding.plan(frozenShape, options, { checkpoints: this.opts.checkpoints === true });
     if (execution.mechanism !== "continuous")
       throw new UnsupportedExecutionError(this.#binding.config.modelType, execution.method, execution.reasons);
     return Object.freeze({ shape: frozenShape, mechanism: "continuous", execution });
@@ -252,10 +226,11 @@ export class GenerationGateway implements CompletionEngine {
       try {
         const adapters = options.adapters?.length
           ? this.opts.adapterNamespace?.(options.adapters) ?? JSON.stringify(options.adapters) : "";
-        const baseNamespace = this.#binding.prefixNamespace?.(placement.execution, options, adapters) ??
-          (placement.execution?.method === "speculative" ? null : adapters);
-        const namespace = baseNamespace !== null && vision?.prefixIdentity
-          ? JSON.stringify(["prepared-prefix-v1", vision.prefixIdentity, baseNamespace]) : baseNamespace;
+        // A prepared media prefix is identified within the request's own namespace, which the
+        // binding places in its method's and its request state's (the rows' cache namespace, below).
+        const base = vision?.prefixIdentity ? JSON.stringify(["prepared-prefix-v1", vision.prefixIdentity, adapters]) : adapters;
+        const namespace = this.#binding.prefixNamespace?.(placement.execution, options, base) ??
+          (placement.execution?.method === "speculative" ? null : base);
         if ((!vision || placement.execution?.promptCache) && namespace !== null) {
           const closePrefetch = this.opts.promptCache?.prefetch ? trace?.begin("cache.prefetch") : undefined;
           try { releasePrefix = await this.opts.promptCache?.prefetch?.(promptIds, namespace, options.cacheSessionId); }
@@ -381,9 +356,6 @@ export class GenerationGateway implements CompletionEngine {
         maxBatch: this.#batch,
         stateCodecs: this.opts.stateCodecs,
         kvBudgetBytes: this.opts.kvBudgetBytes,
-
-        // Preserve the binding-selected cache conversion policy.
-        kvScheme: this.#kvBatchable() ? this.opts.kvScheme : undefined,
         promptCache: this.opts.promptCache,
         lock: { acquire: () => this.#mutex.acquire() },
 

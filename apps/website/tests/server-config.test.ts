@@ -29,8 +29,10 @@ test("serve checks, serve-written keys, and each read site's fallback come from 
   expect(baseline.writes.filter(w => w.flag).map(w => `${w.key} ${w.flag}`))
     .toEqual(["MLX_BUN_FORCE_WIRE force-wire", "MLX_BUN_ALLOW_PRIVATE_MEDIA allow-private-media"]);
   // Different contextual fallbacks at different sites are listed, not an error.
-  expect(rows(baseline, "MLX_BUN_RD_PREFILL_CHUNK").map(row => row.split(" | ").slice(1, 3).join(" | "))).toEqual(["value | computed", "number | `2048`", "number | computed"]);
-  expect(rows(baseline, "MLX_BUN_FLASH_MIN_M")).toEqual(["| `MLX_BUN_FLASH_MIN_M` | value | `1024` | [loss.ts:" + lineOf("packages/training/src/loss.ts", 'runtimeValue("MLX_BUN_FLASH_MIN_M")') + "] |"]);
+  expect(rows(baseline, "MLX_BUN_RD_PREFILL_CHUNK").map(row => row.split(" | ").slice(1, 3).join(" | "))).toEqual(["value | computed", "number | `2048`"]);
+  const contextual = configInventory(extra('import { runtimeConfig } from "./runtime/config";\nconst CHUNK = 512;\nexport const chunk = runtimeConfig().number("MLX_BUN_RD_PREFILL_CHUNK", CHUNK);\n'));
+  expect(rows(contextual, "MLX_BUN_RD_PREFILL_CHUNK").map(row => row.split(" | ").slice(1, 3).join(" | "))).toEqual(["number | computed", "value | computed", "number | `2048`"]);
+  expect(rows(baseline, "MLX_BUN_FLASH_MIN_M")).toEqual(["| `MLX_BUN_FLASH_MIN_M` | value | `1024` | [trainer.ts:" + lineOf("packages/training/src/trainer.ts", 'runtimeValue("MLX_BUN_FLASH_MIN_M")') + "] |"]);
   expect(rows(baseline, "MLX_BUN_SESSION_CACHE")[0]).toContain("| value | unset (only `0` changes it) |");
   expect(rows(baseline, "MLX_BUN_LIBMLXC")[0]).toContain("| process.env | computed | [native.ts:");
   expect(rows(baseline, "MLX_BUN_PAGED_KV")[0]).toContain("[cli/serve.ts:");
@@ -62,8 +64,8 @@ test("each unsupported key form fails with its location; a comment does not", ()
   const serve = "apps/mlx-bun/src/cli/serve.ts", gateway = "packages/inference/src/execution/gateway-binding.ts";
   expect(() => configInventory(mutate(serve, 'runtimeValue("MLX_BUN_RD_CONTEXT_LIMIT")', "runtimeValue(profileKey)")))
     .toThrow(`${serve}:${lineOf(serve, 'runtimeValue("MLX_BUN_RD_CONTEXT_LIMIT")')}: non-literal runtime key \`runtimeValue(profileKey)\``);
-  expect(() => configInventory(mutate(gateway, 'runtime.flag("MLX_BUN_COMPILED_DECODE", true)', "runtime.flag(`MLX_BUN_${name}`, true)")))
-    .toThrow(`${gateway}:${lineOf(gateway, 'runtime.flag("MLX_BUN_COMPILED_DECODE", true)')}: non-literal runtime key`);
+  expect(() => configInventory(mutate(gateway, 'runtime.flag("MLX_BUN_MEDIA_PREFIX_CACHE", true)', "runtime.flag(`MLX_BUN_${name}`, true)")))
+    .toThrow(`${gateway}:${lineOf(gateway, 'runtime.flag("MLX_BUN_MEDIA_PREFIX_CACHE", true)')}: non-literal runtime key`);
   for (const [text, message] of [["process.env[name]", "computed environment read"], ["Bun.env[name]", "computed environment read"],
     ["process.env.MLX_BUN_NEW", "direct environment read"], ["Bun.env.MLX_BUN_NEW", "direct environment read"], ['process.env["MLX_BUN_LIBMLXC"]', "direct environment read"]])
     expect(() => configInventory(extra(`export const read = (name: string) =>\n  ${text};\n`))).toThrow(`packages/inference/src/extra.ts:2: ${message} \`${text}\``);
@@ -124,6 +126,12 @@ test("removing a read site removes it from the output", () => {
   const removed = configInventory(mutate("apps/mlx-bun/src/server/inference-request.ts", 'runtimeValue("MLX_BUN_LANE_DEBUG") === "1"', "false"));
   expect(rows(baseline, "MLX_BUN_LANE_DEBUG")).toHaveLength(1);
   expect(renderServerConfig(removed, revision)).not.toContain("MLX_BUN_LANE_DEBUG");
-  const one = configInventory(mutate("packages/inference/src/generation/speculative/run.ts", 'runtimeConfig().number("MLX_BUN_RD_PREFILL_CHUNK", PREFILL_CHUNK)', "PREFILL_CHUNK"));
-  expect(rows(one, "MLX_BUN_RD_PREFILL_CHUNK")).toEqual(rows(baseline, "MLX_BUN_RD_PREFILL_CHUNK").slice(0, 2));
+  // One of a key's read sites goes; the rest stay listed.
+  const site = "packages/inference/src/generation/bindings/prefill-policy.ts";
+  const one = configInventory(mutate(site, 'runtime.number("MLX_BUN_RD_PREFILL_CHUNK", 2048)', "2048"));
+  const composition = "packages/inference/src/models/composition.ts";
+  const value = 'runtime.value("MLX_BUN_RD_PREFILL_CHUNK")', number = 'runtime.number("MLX_BUN_RD_PREFILL_CHUNK", 2048)';
+  expect(rows(one, "MLX_BUN_RD_PREFILL_CHUNK").map(row => row.split(" | ").slice(1, 4).join(" | "))).toEqual([
+    `value | computed | [generation/bindings/prefill-policy.ts:${lineOf(site, value)}], [models/composition.ts:${lineOf(composition, value)}] |`,
+    `number | \`2048\` | [models/composition.ts:${lineOf(composition, number)}] |`]);
 });

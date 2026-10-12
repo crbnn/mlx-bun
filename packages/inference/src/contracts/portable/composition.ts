@@ -46,6 +46,11 @@ export interface Composition {
   readonly aneBridge: boolean;
   /** The storage and reads of every attention cache the graph's `makeCache` composes. */
   readonly kv: KvStorageScheme;
+  /** Full-attention keys and values held in pages of `blockSize` positions
+   * (`--paged-kv`), or null. Every request's state takes the paged lego in place
+   * of the plain full-attention storage the graph composes; its pages store
+   * what `kv` names. */
+  readonly pagedKv: { readonly blockSize: number } | null;
   readonly draftDepth: DraftDepth;
   /** The prefill chunk size, in prompt tokens, the composition is built for.
    * The prefill planner may hand the graph fewer rows than this as a prompt's
@@ -56,9 +61,6 @@ export interface Composition {
   readonly adapters: boolean;
   /** The most rows one forward carries (`--batch`, mlx-lm's `--batch-size`). */
   readonly maxRows: number;
-  /** Speculative verification over affine-quantized KV: a graph whose verifier
-   * qualifies it declares it (default on). */
-  readonly speculativeAffineKv: boolean;
   /** The groups of a mixed forward share one MLP pass (default on); off, each
    * group runs its own. */
   readonly packedMixedMlp: boolean;
@@ -66,4 +68,40 @@ export interface Composition {
    * argmax over the batch instead of one sampler call per row (default on): the
    * same per-row arithmetic in one graph. Off, every row samples alone. */
   readonly vectorGreedySampling: boolean;
+  /** A lone ordinary row decodes through the graph's compiled step where the
+   * graph builds one (default on). The step is bit-identical to the ordinary
+   * decode forward; off, every row decodes through the forward. Resolved off
+   * for a KV scheme or paging whose storage has no compiled form (TurboQuant, a
+   * delayed start, paged blocks). */
+  readonly compiledDecode: boolean;
+  /** One forward carries a decode group and a prefill group where the graph
+   * declares mixed rows (default off). */
+  readonly mixedPrefill: boolean;
+  /** Prompt tokens one mixed forward carries beside its decode rows (default 256). */
+  readonly mixedTokenBudget: number;
+  /** A prompt's last token prefills alone, as the first one-position step
+   * (mlx-lm's convention, default on); off, the final chunk prefills whole and
+   * token zero samples from it. */
+  readonly prefillTailSplit: boolean;
+  /** Grammar-forced continuations enter the KV without one forward per token
+   * (jump-forward decoding, default off). */
+  readonly grammarJump: boolean;
+  /** Every speculative row drafts by argmax instead of the request sampler's
+   * coupled draw (default off). The draft moves acceptance and draft cost, not
+   * the output distribution (see `generation/speculative/draft-policy`). */
+  readonly greedyDraft: boolean;
 }
+
+/** The value of each composition fact a caller leaves unstated: what
+ * `resolveComposition` resolves, and what a graph built without a record runs. */
+export const COMPOSITION_DEFAULTS = Object.freeze({
+  pagedKv: null,
+  packedMixedMlp: true,
+  vectorGreedySampling: true,
+  compiledDecode: true,
+  mixedPrefill: false,
+  mixedTokenBudget: 256,
+  prefillTailSplit: true,
+  grammarJump: false,
+  greedyDraft: false,
+} satisfies Partial<Composition>);

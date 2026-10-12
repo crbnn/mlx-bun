@@ -141,8 +141,8 @@ const inputs = optIn(Bun.env);
 test.skipIf(!inputs)("rotating rows keep their newest window through late joins and joint preparation", async () => {
   const { window, vocab, custom } = inputs!;
   const ops = await import("@mlx-bun/mlx/ops");
-  const { loadModelConfig, Weights, createModel } = await import("@mlx-bun/inference");
-  const { bindMlxGateway, createRuntimeConfig } = await import("../../src/execution");
+  const { loadModelConfig, Weights, createModel, resolveComposition } = await import("@mlx-bun/inference");
+  const { bindMlxGateway } = await import("../../src/execution");
   const { RotatingKVCache } = await import("../../src/state/rotating-kv");
   const { hash, newest, rowStates } = await rotatingRowReader();
 
@@ -153,6 +153,8 @@ test.skipIf(!inputs)("rotating rows keep their newest window through late joins 
   const originalView = RotatingKVCache.prototype.temporalView;
   try {
     const model = createModel(weights, config);
+    // The same graph composed with the prefill tail split off.
+    const unsplit = createModel(weights, config, resolveComposition(config, { prefillTailSplit: false }));
     if (custom) {
       const args = (model as unknown as { args: { layerTypes: string[]; slidingWindow: number } }).args;
       expect({ layerTypes: args.layerTypes, slidingWindow: args.slidingWindow }).toEqual(custom);
@@ -174,8 +176,9 @@ test.skipIf(!inputs)("rotating rows keep their newest window through late joins 
       const finished = new Set<string>(), tokens: Record<string, number[]> = Object.fromEntries(scenario.rows.map(r => [r, []]));
       const cursor: Record<string, number> = {};
       let current: Forward | null = null, joinedAfter: number | null = null;
-      // The scheduler binds to a view of the graph whose phases report each forward and each head projection.
-      const view = observedPhases(model, {
+      // The scheduler binds to a view of the graph, composed with the scenario's prefill tail split,
+      // whose phases report each forward and each head projection.
+      const view = observedPhases(scenario.tailSplit ? model : unsplit, {
         forward(ids: MlxArray, caches: Cache[]) {
           const [B, L] = ids.shape as [number, number];
           let labels = labelsOf.get(caches[0]!);
@@ -207,8 +210,7 @@ test.skipIf(!inputs)("rotating rows keep their newest window through late joins 
           current = null;
         },
       });
-      const runtime = createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: String(scenario.tailSplit), MLX_BUN_COMPILED_DECODE: "0" });
-      const group = bindMlxGateway(view).createBatchGroup({ maxBatch: scenario.mode === "b1" ? 1 : 2, prefillChunkSize: 2048, runtime });
+      const group = bindMlxGateway(view).createBatchGroup({ maxBatch: scenario.mode === "b1" ? 1 : 2, prefillChunkSize: 2048 });
       const finish: Record<string, string> = {}, pending: Promise<unknown>[] = [];
       const submit = (i: number) => {
         const row = scenario.rows[i]!; admitted.add(row);

@@ -25,7 +25,7 @@ import { QuantizedLinear } from "../../layers/quantized-linear";
 import { QuantizedSwitchLinear } from "../../layers/quantized-switch-linear";
 import { isCompiledTrace } from "../../runtime/compiled-trace";
 import { isExpertTracing, recordRouting } from "../../runtime/expert-trace";
-import { captureRopeOffsets } from "../../state/capabilities";
+import { captureRopeOffsets } from "../../state/attention-read";
 import type { ReadPhase } from "../graph";
 
 /** The phase a Gemma 4 forward runs, named by its caller: one new position per
@@ -330,13 +330,14 @@ export class Router {
   }
 }
 
-/** Port of switch_layers.SwitchGLU (geglu activation), quantized path. */
+/** Port of switch_layers.SwitchGLU (geglu activation), quantized path, with the
+ * activation form its owner chose at construction (`compiled`). */
 export class SwitchGLU {
   readonly gate: QuantizedSwitchLinear;
   readonly up: QuantizedSwitchLinear;
   readonly down: QuantizedSwitchLinear;
 
-  constructor(weights: Weights, config: ModelConfig, prefix: string) {
+  constructor(weights: Weights, config: ModelConfig, prefix: string, readonly compiled: boolean) {
     this.gate = QuantizedSwitchLinear.load(weights, `${prefix}.gate_proj`, config);
     this.up = QuantizedSwitchLinear.load(weights, `${prefix}.up_proj`, config);
     this.down = QuantizedSwitchLinear.load(weights, `${prefix}.down_proj`, config);
@@ -377,7 +378,7 @@ export class SwitchGLU {
     h.dispose();
     // GeGLU activation: gelu_approx(gate) · up. The oracle SwitchGLU uses the SAME
     // @mx.compile'd geglu as the dense MLP (activation=GeGLU(), switch_layers.py).
-    const mid = geglu(xGate, xUp);
+    const mid = geglu(xGate, xUp, this.compiled);
     let y = this.down.forward(mid, idx, doSort);
     mid.dispose();
     if (idx !== indices) idx.dispose();
@@ -403,8 +404,8 @@ export class SwitchGLU {
 export class Experts {
   readonly switchGlu: SwitchGLU;
 
-  constructor(weights: Weights, config: ModelConfig, prefix: string) {
-    this.switchGlu = new SwitchGLU(weights, config, `${prefix}.switch_glu`);
+  constructor(weights: Weights, config: ModelConfig, prefix: string, compiledGeglu: boolean) {
+    this.switchGlu = new SwitchGLU(weights, config, `${prefix}.switch_glu`, compiledGeglu);
   }
 
   forward(x: MlxArray, indices: MlxArray, weights: MlxArray): MlxArray {
@@ -441,12 +442,14 @@ export class DecoderLayer {
   readonly perLayerProjection: QuantizedLinear | null;
   readonly postPerLayerNorm: RMSNorm | null;
 
-  constructor(weights: Weights, config: ModelConfig, prefixBase: string, idx: number, hasKv: boolean) {
+  /** `compiledGeglu` is the graph's construction-time choice of the GeGLU
+   * activation form for the dense MLP and the experts (`layers/geglu.ts`). */
+  constructor(weights: Weights, config: ModelConfig, prefixBase: string, idx: number, hasKv: boolean, compiledGeglu: boolean) {
     const prefix = `${prefixBase}.layers.${idx}`;
     const t = config.text;
     this.layerType = t.layerTypes[idx]!;
     this.attn = new Attention(weights, config, `${prefix}.self_attn`, this.layerType, hasKv);
-    this.mlp = new GegluMLP(weights, config, `${prefix}.mlp`);
+    this.mlp = new GegluMLP(weights, config, `${prefix}.mlp`, compiledGeglu);
     const norm = (n: string) => new RMSNorm(weights.tensor(`${prefix}.${n}.weight`), t.rmsNormEps);
     this.inputNorm = norm("input_layernorm");
     this.postAttnNorm = norm("post_attention_layernorm");
@@ -457,7 +460,7 @@ export class DecoderLayer {
       : null;
     if (t.enableMoeBlock) {
       this.router = new Router(weights, config, `${prefix}.router`);
-      this.experts = new Experts(weights, config, `${prefix}.experts`);
+      this.experts = new Experts(weights, config, `${prefix}.experts`, compiledGeglu);
       this.postFfNorm1 = norm("post_feedforward_layernorm_1");
       this.postFfNorm2 = norm("post_feedforward_layernorm_2");
       this.preFfNorm2 = norm("pre_feedforward_layernorm_2");

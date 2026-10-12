@@ -59,6 +59,7 @@ import { SSMCache } from "../../src/state/ssm";
 import { TrainingSSMCache } from "../../src/state/training-cache";
 import { applyInterleavedRope, buildMropePositions, mropeInvFreq } from "../../src/layers/qwen-mrope";
 import { type MropeRequestState, type MropeForwardState } from "../../src/contracts/mlx/positions";
+import { kvStorage } from "../../src/state/kv-storage";
 
 const PREFIX = "language_model";
 
@@ -479,9 +480,9 @@ export class Qwen3Attention<L extends AttentionLinear = QuantizedLinear> {
 
     lap("attnProj", [q, k, v, gate]);
     let attn: MlxArray;
-    const quantized = cache.quantizedAttention;
-    if (cache.attentionState) {
-      const view = cache.attentionState.appendAndFetch(k, v);
+    const quantized = kvStorage(cache).quantizedAttention!;
+    if (kvStorage(cache).attentionState) {
+      const view = kvStorage(cache).attentionState!.appendAndFetch(k, v);
       k.dispose(); v.dispose();
       try { attn = view.attend(q, this.scale, mask, independentRows); } finally { view.dispose(); }
     } else if (quantized) {
@@ -497,7 +498,7 @@ export class Qwen3Attention<L extends AttentionLinear = QuantizedLinear> {
       disposeTriple(keys);
       disposeTriple(values);
     } else {
-      const [keys, values] = cache.updateAndFetch(k, v);
+      const [keys, values] = kvStorage(cache).updateAndFetch(k, v);
       k.dispose();
       v.dispose();
       attn = ops.sdpa(q, keys, values, this.scale, mask.mode, mask.arr);
@@ -641,8 +642,7 @@ export class Qwen35Model implements MlxDeclaredGraph {
   get graphCapabilities(): GraphCapabilities {
     return declareGraph({
       media: { input: "embeddings+positions", video: true }, hiddenLayerTaps: "hiddenTap" in this,
-      kv: { delayedAffine: "all" }, prefill: { boundedWorkspace: true },
-      speculation: { affineKv: runtimeFlag("MLX_BUN_QWEN_SPEC_KV4", true), immediateAffine4: true },
+      prefill: { boundedWorkspace: true },
     });
   }
   /** E2 changed the media graph contract; the identity tests compare the vision prefill phase directly. */
@@ -777,7 +777,7 @@ export class Qwen35Model implements MlxDeclaredGraph {
     try {
       for (const { ids, cache } of work) {
         const group: typeof groups[number] = { h: this.embed.encode(ids) }; groups.push(group);
-        group.mask = cache[this.faIdx]!.makeMask(ids.shape[1]!, null);
+        group.mask = kvStorage(cache[this.faIdx]!).makeMask(ids.shape[1]!, null);
         group.ssmMask = (cache[0] as SSMCache).prefillPadding?.makeMask(ids.shape[1]!);
       }
       for (const [i, layer] of this.layers.entries()) {
@@ -851,7 +851,7 @@ export class Qwen35Model implements MlxDeclaredGraph {
     const L = h0.shape[1]!;
     // One full-attention mask shared by all full layers (same offset); linear
     // layers see no ssm mask at B=1.
-    const faMask = cache[this.faIdx]!.makeMask(L, null);
+    const faMask = kvStorage(cache[this.faIdx]!).makeMask(L, null);
     using ssmMask = (cache[0] as SSMCache).prefillPadding?.makeMask(L) ?? null;
     // Vision requests: one interleaved-mRoPE cos/sin table per forward,
     // shared by all 12 full-attention layers (positions are layer-invariant).

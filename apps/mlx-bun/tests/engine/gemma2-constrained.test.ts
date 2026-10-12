@@ -29,10 +29,8 @@ const modelDir = process.env.MLX_BUN_APP_TEST_GEMMA2_MODEL;
 type Trace = { calls: string[]; batches: { rows: number; adapters: string }[]; firstLogits?: Float32Array };
 
 async function setup(dir: string) {
-  const { configureRuntime } = await import("@mlx-bun/inference/runtime/config");
-  // Both paths split the prompt tail and skip compiled decode, so they issue
-  // the same forward calls; the scheduler reads this snapshot at bind time.
-  const restoreRuntime = configureRuntime({ MLX_BUN_PREFILL_TAIL_SPLIT: "1", MLX_BUN_COMPILED_DECODE: "0" });
+  // Both paths split the prompt tail (the composition's default) and this graph
+  // builds no compiled step, so they issue the same forward calls.
   const ops = await import("@mlx-bun/mlx/ops");
   const { Dtype } = await import("@mlx-bun/mlx");
   const { loadContext } = await import("../../src/engine/model-host");
@@ -146,7 +144,7 @@ async function setup(dir: string) {
     traced,
     decode: (tokens: number[]) => ctx.tokenizer.decode(tokens),
     async close() {
-      ctx.dispose(); rmSync(adapterDir, { recursive: true, force: true }); restoreRuntime();
+      ctx.dispose(); rmSync(adapterDir, { recursive: true, force: true });
     },
   };
 }

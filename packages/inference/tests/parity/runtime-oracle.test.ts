@@ -43,7 +43,7 @@ describe("runtime report comparison (CPU only)", () => {
   });
   test("rejects mismatched model config and runtime overrides", () => {
     expect(() => compareReports(report(), { ...report(), configSha256: "c".repeat(64) }, plan)).toThrow("configuration");
-    const reference = { ...report(), provenance: { runtimeEnvironment: { MLX_BUN_COMPILED_DECODE: "1" } } };
+    const reference = { ...report(), provenance: { runtimeEnvironment: { MLX_BUN_RD_PREFILL_CHUNK: "512" } } };
     expect(() => compareReports(report(), reference, plan)).toThrow("runtimeEnvironment");
   });
   test("legacy configuration requires explicit acceptance and never bypasses row checks", () => {

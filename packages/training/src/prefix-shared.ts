@@ -87,7 +87,7 @@ export function branchLogpMeanGathered(
   // vjp is eval'd. Push it into the sink (disposed post-eval by the caller) instead of
   // freeing it here, matching responseOnlyLogpMean/fusedLogpMeanFromHidden.
   chunk.sink.push(hResp);
-  const mean = fusedRespLogpMean(model, hResp, new Int32Array(targets), chunkSize, chunk.sink, 0, chunk.flash ?? false);
+  const mean = fusedRespLogpMean(model, hResp, new Int32Array(targets), chunkSize, chunk.sink, 0, chunk.flash ?? null);
   return mean;
 }
 

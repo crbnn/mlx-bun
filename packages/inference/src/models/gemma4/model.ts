@@ -16,9 +16,9 @@
 // caller's phase names (contracts/mlx/cache.ts AttentionCache), so the cache
 // builds the mask (sliding layers compose RotatingKVCache, whose reads own the
 // window) and attends with the kernel it was composed with. The graph never
-// inspects the query count, builds a mask or chooses a kernel; only the
-// training forward (gradient checkpointing, prefix-shared and segmented
-// training) still builds its masks, through `makeTrainingMasks`. The blocks
+// inspects the query count, builds a mask or chooses a kernel, the training
+// forward (gradient checkpointing, prefix-shared and segmented training)
+// included: it reads its stateless training caches the same way. The blocks
 // (attention, feed-forward, per-layer inputs, KV sharing, decoder layer) live in
 // blocks.ts, which the generated graphs (generated/*.ts) compose too.
 
@@ -42,20 +42,18 @@ import type { MediaEncoders, MediaSidecarProbes, MlxPromptInput, Vision } from "
 import { declareGraph } from "../capabilities";
 import { atEveryWidth } from "../graph";
 import { bindGemma4MediaInput, gemma4DraftTarget, gemma4MediaEncoders } from "./media";
-import type { Cache, Mask, SharedKv } from "../../contracts/mlx/cache";
+import type { AttentionCache, AttentionRead, Cache, SharedKv } from "../../contracts/mlx/cache";
 import { isCompiledTrace } from "../../runtime/compiled-trace";
 import { mapPackedTokens } from "../../input/token-groups";
-import { flashAttention, flashSupported, getTrainingAttn } from "../../kernels/attention/flash";
-import { compiledGegluActive } from "../../layers/geglu";
+import { runtimeFlag } from "../../runtime/config";
 import { disposing } from "../../layers/helpers";
 import { activePrefixLayout, ropeBlocks } from "../../layers/prefix-layout";
-import { captureRopeOffsets } from "../../state/capabilities";
 import { RMSNorm } from "../../layers/normalization";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import type { QuantizedLinear } from "../../layers/quantized-linear";
 import { logitSoftcap } from "../../kernels/logits";
 import { compiledLogitSoftcap } from "../../kernels/softcap";
-import { AttentionMasks } from "../../state/attention-read";
+import { AttentionMasks, captureRopeOffsets } from "../../state/attention-read";
 import { composedFullAttentionCache, composedSlidingAttentionCache } from "../../state/bf16-first-kv";
 import type { Composition } from "../../contracts/portable/composition";
 import { deferredTurboQuantKernels } from "../../state/turboquant-attention";
@@ -63,23 +61,25 @@ import {
   DecoderLayer, kvDonors, PerLayerInputs, type Attention, type DonorRead, type Gemma4Phase,
 } from "./blocks";
 
-/** The training forward's donor keys and values: training caches fetch them
- * plain. */
+/** A donor layer's keys and values in the training forward: the keys (RoPE
+ * applied) and values it appended to its training cache, which its sharers read
+ * through that cache and which cross checkpoint and segment boundaries as
+ * tensors. */
 type PlainSharedKv = Extract<SharedKv, { kind: "plain" }>;
 
 /** The training forward's attention (`Gemma4Model.forwardTrainingHidden`,
- *  gradient checkpointing and the segmented backward) over `attn`'s projections:
- *  the plain keys and values a training cache fetches (`updateAndFetch`), roped
- *  block-wise under a prefix-shared layout, attended under `mask` with the stock
- *  fused SDPA or the opt-in flash kernel. Returns the attention output and the
- *  fetched keys and values (a sharer returns `sharedIn`); the caller owns those
- *  of a donor and disposes them after the pass.
- *  @deprecated The segmented backward checkpoints donor keys and values as
- *  tensors, and the prefix-shared caches have no read of their own; B1's
- *  out-of-step items (the training flash path, the segmented backward's donor
- *  checkpoints) give them a contract, and this path goes with them. */
-function attentionMasked(
-  attn: Attention, x: MlxArray, mask: Mask, cache: Cache | null, sharedIn: PlainSharedKv | null,
+ *  gradient checkpointing and the segmented backward) over `attn`'s
+ *  projections, roped block-wise under a prefix-shared layout. `cache` is the
+ *  training cache of this layer, or of its donor for a KV-sharing layer; it
+ *  stores nothing (`TrainingCache`, `PrefixSharedCache`), so its window read
+ *  of the keys and values handed to it owns the mask (causal, windowed, padded
+ *  or block-sparse) and the kernel the run composed, and a sharer reads its
+ *  donor's keys and values (`sharedIn`) by appending them to the donor's cache
+ *  again. Returns the attention output and the donor's keys and values (a
+ *  sharer returns `sharedIn`); the caller owns those of a donor and disposes
+ *  them after the pass. */
+function attentionTraining(
+  attn: Attention, x: MlxArray, cache: AttentionCache, sharedIn: PlainSharedKv | null,
 ): { out: MlxArray; shared: PlainSharedKv } {
   const [B, L] = x.shape as [number, number, number];
 
@@ -88,11 +88,12 @@ function attentionMasked(
   q = disposing(q, attn.qNorm.forward(q));
 
   let shared: PlainSharedKv;
+  let read: AttentionRead;
   if (!attn.hasKv) {
     if (!sharedIn) throw new Error("KV-shared layer received no shared KV");
     shared = sharedIn;
+    read = cache.appendWindow(shared.keys, shared.values);
   } else {
-    if (!cache) throw new Error("donor layer requires a cache");
     let k = attn.kProj!.forward(x);
     k = disposing(k, ops.reshape(k, [B, L, attn.nKvHeads, attn.headDim]));
     let v: MlxArray;
@@ -125,35 +126,20 @@ function attentionMasked(
     if (v !== k) v.dispose();
     k.dispose();
 
-    const [keys, values] = cache.updateAndFetch(kRoped, vT);
-    kRoped.dispose();
-    vT.dispose();
-    shared = { kind: "plain", keys, values, offset, offsetArr };
+    try { read = cache.appendWindow(kRoped, vT); }
+    catch (error) { kRoped.dispose(); vT.dispose(); offsetArr?.dispose(); throw error; }
+    shared = { kind: "plain", keys: kRoped, values: vT, offset, offsetArr };
   }
-
-  q = disposing(q, ops.transposeAxes(q, [0, 2, 1, 3]));
-  const prefixLayoutQ = activePrefixLayout();
-  q = disposing(q, prefixLayoutQ
-    ? ropeBlocks(q, prefixLayoutQ, (block, offset) => attn.rope(block, offset))
-    : attn.rope(q, shared.offsetArr ?? shared.offset));
 
   let out: MlxArray;
-  const ta = getTrainingAttn();
-  if (ta === "flash" && flashSupported(q) && (mask.mode === "causal" || mask.mode === "array")) {
-    // Training, OPT-IN flash path (MLX_BUN_TRAIN_ATTN=flash) for O(L)-memory
-    // long context. NOTE the default (ops.sdpa, below) is the CORRECT and
-    // verified route: its dQ/dK/dV vjps are exact (finite-difference checked;
-    // it's what mlx-lm's tuner differentiates). The two historical bugs were
-    // in THIS flash kernel (spurious dK transpose, divergent dQ barrier),
-    // both fixed and gated by `02d723a:tests/unit/flash-attention.test.ts` vs the ops.sdpa
-    // oracle — see packages/inference/src/kernels/attention/flash.ts's routing comment. Flash also remains
-    // Gemma-guarded in the trainer (e4b >=2K SIGTRAP not yet re-validated).
-    // Full layers → window 0 (pure causal); sliding layers → their window.
-    const window = attn.isSliding ? attn.windowSize : 0;
-    out = flashAttention(q, shared.keys, shared.values, 1.0, true, window);
-  } else {
-    out = ops.sdpa(q, shared.keys, shared.values, 1.0, mask.mode, mask.arr);
-  }
+  try {
+    q = disposing(q, ops.transposeAxes(q, [0, 2, 1, 3]));
+    const prefixLayoutQ = activePrefixLayout();
+    q = disposing(q, prefixLayoutQ
+      ? ropeBlocks(q, prefixLayoutQ, (block, offset) => attn.rope(block, offset))
+      : attn.rope(q, shared.offsetArr ?? shared.offset));
+    out = read.attend(q, 1.0);
+  } finally { read.dispose(); }
   q.dispose();
   const attnT = ops.transposeAxes(out, [0, 2, 1, 3]);
   out.dispose();
@@ -163,14 +149,13 @@ function attentionMasked(
 }
 
 /** The training forward's attention sub-block of `layer` (see
- *  `DecoderLayer.forwardAttn`): inputNorm → `attentionMasked` → postAttnNorm →
- *  residual add.
- *  @deprecated With `attentionMasked`. */
-function layerAttnMasked(
-  layer: DecoderLayer, x: MlxArray, mask: Mask, cache: Cache | null, sharedIn: PlainSharedKv | null,
+ *  `DecoderLayer.forwardAttn`): inputNorm → `attentionTraining` → postAttnNorm →
+ *  residual add. */
+function layerAttnTraining(
+  layer: DecoderLayer, x: MlxArray, cache: AttentionCache, sharedIn: PlainSharedKv | null,
 ): { h: MlxArray; shared: PlainSharedKv } {
   let h = layer.inputNorm.forward(x);
-  const { out, shared } = attentionMasked(layer.attn, h, mask, cache, sharedIn);
+  const { out, shared } = attentionTraining(layer.attn, h, cache, sharedIn);
   h.dispose();
   h = out;
   h = disposing(h, layer.postAttnNorm.forward(h));
@@ -178,15 +163,14 @@ function layerAttnMasked(
   return { h, shared };
 }
 
-/** The training forward's layer (see `attentionMasked`). The split into two
+/** The training forward's layer (see `attentionTraining`). The split into two
  *  sub-blocks lets the checkpoint path rematerialize attention and MLP
- *  separately (peak attn+MLP → max(attn,MLP)+hMid).
- *  @deprecated With `attentionMasked`. */
-function layerMasked(
-  layer: DecoderLayer, x: MlxArray, mask: Mask, cache: Cache | null,
+ *  separately (peak attn+MLP → max(attn,MLP)+hMid). */
+function layerTraining(
+  layer: DecoderLayer, x: MlxArray, cache: AttentionCache,
   sharedIn: PlainSharedKv | null, perLayerInput: MlxArray | null,
 ): { h: MlxArray; shared: PlainSharedKv } {
-  const { h: hMid, shared } = layerAttnMasked(layer, x, mask, cache, sharedIn);
+  const { h: hMid, shared } = layerAttnTraining(layer, x, cache, sharedIn);
   const h = layer.forwardMlp(hMid, perLayerInput);
   hMid.dispose();
   return { h, shared };
@@ -203,15 +187,13 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly loraState = new LoraState();
   /** Layers whose attention reads plain keys and values: none; it attends the storage its caches hold. */
   readonly requiredDenseKvLayers: readonly number[] = Object.freeze([]);
-  /** Paged attention, prepared image/audio embeddings, layer taps for drafts,
-   * and a compiled decode step, except through experts: shapeless replay
-   * retraces their growing windows. Its caches convert delayed affine rows and
-   * every method is qualified over them. */
+  /** Prepared image/audio embeddings, layer taps for drafts, and a compiled
+   * decode step, except through experts: shapeless replay
+   * retraces their growing windows. */
   get graphCapabilities(): GraphCapabilities {
     return declareGraph({
-      media: { input: "embeddings", video: false }, pagedAttention: true, hiddenLayerTaps: true,
+      media: { input: "embeddings", video: false }, hiddenLayerTaps: true,
       compiledDecode: this.config?.modelType?.startsWith("gemma4") === true && !this.config.text.enableMoeBlock,
-      kv: { delayedAffine: "all" },
     });
   }
   #trainable: TrainableGraph | undefined;
@@ -256,12 +238,17 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
   /** The composition's `packedMixedMlp`: the groups of a mixed forward share
    *  one MLP call. */
   readonly #packMixedMlp: boolean;
+  /** The GeGLU activations and the head's softcap run the compiled closures
+   *  (mlx-lm's @mx.compile'd geglu and logit_softcap), unless
+   *  `MLX_BUN_COMPILED_GEGLU=0` asked for the spelled-out ops: read once, here. */
+  readonly #compiledGeglu: boolean;
 
   constructor(weights: Weights, config: ModelConfig, composition: Composition) {
     const t = config.text;
     if (t.hiddenSize === 0 || !config.text.tieWordEmbeddings)
       throw new Error("only tied-embedding text configs are supported");
 
+    this.#compiledGeglu = runtimeFlag("MLX_BUN_COMPILED_GEGLU", true);
     this.config = config;
     this.composition = composition;
     this.weightsBytes = [...weights.shards.files.values()]
@@ -275,7 +262,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
     this.numDonors = t.numHiddenLayers - t.numKvSharedLayers;
     this.layers = Array.from(
       { length: t.numHiddenLayers },
-      (_, i) => new DecoderLayer(weights, config, prefixBase, i, i < this.numDonors),
+      (_, i) => new DecoderLayer(weights, config, prefixBase, i, i < this.numDonors, this.#compiledGeglu),
     );
     // previous_kvs (reference Gemma4TextModel): sharer j uses the LAST
     // donor of its own layer type
@@ -360,7 +347,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    *  checkpoints (`gradCkpt`). */
   sequenceHidden(ids: MlxArray, cache: Cache[], _width: MlxWidthClass): MlxArray {
     const h0 = this.embedTokens(ids);
-    return this.gradCkpt ? this.#forwardMasked(h0, cache, ids) : this.forwardDecoder(h0, cache, "window", ids);
+    return this.gradCkpt ? this.#forwardTraining(h0, cache, ids) : this.forwardDecoder(h0, cache, "window", ids);
   }
 
   /** The scaled token embeddings [B, L, hidden] of `ids` (owned). */
@@ -505,26 +492,29 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
     return this.perLayerInputs!.layer(perLayer, i, B, L);
   }
 
-  /** The training forward over training caches (`TrainingCache`,
-   *  `PrefixSharedCache`, scoring's padded-batch wrapper): ids [1, T] to the
-   *  final-norm hidden [1, T, hidden]. Masks come from the caches (one per layer
-   *  type, `makeTrainingMasks`), donors hand their sharers plain keys and values,
-   *  and a prefix-shared layout ropes block-wise; under `gradCkpt` each layer is
-   *  checkpointed with its donor keys and values as checkpoint tensors.
-   *  @deprecated B1's out-of-step items (the training flash path, the segmented
-   *  backward's donor checkpoints) give these a contract; this path goes then. */
+  /** The training forward over stateless training caches (`TrainingCache`,
+   *  `PrefixSharedCache`), one per donor layer: ids [1, T] to the final-norm
+   *  hidden [1, T, hidden]. Every attention reads through its training cache's
+   *  window read (a KV-sharing layer through its donor's, with the donor's keys
+   *  and values), and a prefix-shared layout ropes block-wise; under `gradCkpt`
+   *  each layer is checkpointed with its donor keys and values as checkpoint
+   *  tensors. */
   forwardTrainingHidden(ids: MlxArray, cache: Cache[]): MlxArray {
-    return this.#forwardMasked(this.embedTokens(ids), cache, ids);
+    return this.#forwardTraining(this.embedTokens(ids), cache, ids);
+  }
+
+  /** The training cache layer `i` reads: its own, or its donor's for a
+   *  KV-sharing layer (`cache` holds the donors' training caches). */
+  #trainingCache(cache: Cache[], i: number): AttentionCache {
+    const ci = this.cacheIndex[i]!;
+    return cache[ci === -1 ? this.cacheIndex[this.previousKvs[i]!]! : ci] as AttentionCache;
   }
 
   /** The training forward's decoder over `h0` (consumed). */
-  #forwardMasked(h0: MlxArray, cache: Cache[], ids: MlxArray | null): MlxArray {
+  #forwardTraining(h0: MlxArray, cache: Cache[], ids: MlxArray | null): MlxArray {
     const B = h0.shape[0]!;
     const L = h0.shape[1]!;
     let h = h0;
-
-    // one mask per layer type, computed from the first cache of that type
-    const masks = this.makeTrainingMasks(cache, L);
 
     // per-layer inputs (e2b/e4b)
     let perLayer: MlxArray | null = null;
@@ -539,24 +529,22 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
       const ci = this.cacheIndex[i]!;
       const sharedIn = ci === -1 ? (intermediates[this.previousKvs[i]!] ?? null) : null;
       const pls = perLayer ? this.#perLayerInput(perLayer, i, B, L) : null;
-      const mask = masks.get(layer.layerType)!;
-      const layerCache = ci === -1 ? null : cache[ci]!;
+      const layerCache = this.#trainingCache(cache, i);
       const { h: next, shared } = this.gradCkpt
-        ? this.runCheckpointedLayer(i, layer, h, mask, layerCache, sharedIn, pls)
-        : layerMasked(layer, h, mask, layerCache, sharedIn, pls);
+        ? this.runCheckpointedLayer(i, layer, h, layerCache, sharedIn, pls)
+        : layerTraining(layer, h, layerCache, sharedIn, pls);
       pls?.dispose();
       h.dispose();
       h = next;
       intermediates[i] = shared;
     }
     perLayer?.dispose();
-    // dispose donor-fetched KV (each donor's shared entry exactly once)
+    // dispose donor KV (each donor's shared entry exactly once)
     for (let i = 0; i < this.numDonors; i++) {
       const s = intermediates[i];
       if (!s) continue;
       Gemma4Model.disposeSharedKv(s);
     }
-    for (const m of masks.values()) m.arr?.dispose();
 
     h = disposing(h, this.finalNorm.forward(h));
     return h;
@@ -633,34 +621,16 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
 
 
   // --- Segmented-backward support (`02d723a:docs/design/orpo-training.md`
-  // §5.3). These run the training forward's layers (`layerMasked`). The
-  // segmented driver builds masks + per-layer inputs ONCE, then drives
-  // runLayerRange per segment, threading the KV-shared donor K/V across segment
-  // boundaries.
+  // §5.3). These run the training forward's layers (`layerTraining`). The
+  // segmented driver builds the training caches + per-layer inputs ONCE, then
+  // drives runLayerRange per segment, threading the KV-shared donor K/V across
+  // segment boundaries.
 
   /** Donor layer indices that KV-sharing sharers reuse (e4b: {22,23} — the last
-   *  donor of each attention type; empty for dense models). Their fetched K/V
-   *  must survive across segment boundaries (saved as detached boundaries). */
+   *  donor of each attention type; empty for dense models). Their K/V must
+   *  survive across segment boundaries (saved as detached boundaries). */
   get reusedDonors(): Set<number> {
     return new Set(this.previousKvs.filter((d, i) => d !== i));
-  }
-
-  /** Per-layer-type training masks (offset-0, full-sequence, no bidir) — built
-   *  once, shared across all segments, and the training forward's masks
-   *  (`forwardTrainingHidden`). Caller owns the returned arrays (dispose each
-   *  mask.arr).
-   *  @deprecated With `attentionMasked`: the training caches' own reads
-   *  will build these. */
-  makeTrainingMasks(cache: Cache[], L: number): Map<string, Mask> {
-    const masks = new Map<string, Mask>();
-    for (let i = 0; i < this.numDonors; i++) {
-      const type = this.layers[i]!.layerType;
-      if (!masks.has(type)) {
-        const window = type === "sliding_attention" ? this.windowSize : null;
-        masks.set(type, cache[i]!.makeMask(L, window));
-      }
-    }
-    return masks;
   }
 
   /** e2b/e4b training entry: the SCALED input embedding (the first segment
@@ -674,7 +644,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
     return { hScaled: h, perLayer };
   }
 
-  /** Dispose a training donor's fetched K/V. */
+  /** Dispose a training donor's K/V. */
   private static disposeSharedKv(s: PlainSharedKv): void {
     s.offsetArr?.dispose();
     s.keys.dispose();
@@ -682,22 +652,21 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
   }
 
   /** Run decoder layers `[aIdx, bIdx)` on hidden `h`, returning the residual
-   *  stream after the last layer in the range (NO finalNorm) plus the fetched
-   *  K/V of any reused-donor layers in the range (`donorKvOut`, for later
-   *  segments). The input `h` is NEVER disposed (the caller / vjp owns the
-   *  boundary leaf); intra-range hidden intermediates and per-layer slices ARE
-   *  disposed. Non-reused donors' K/V are disposed; reused donors' K/V are
-   *  returned (caller threads + disposes). NOT gradient-checkpointed — the
-   *  segmentation IS the memory strategy.
+   *  stream after the last layer in the range (NO finalNorm) plus the K/V of
+   *  any reused-donor layers in the range (`donorKvOut`, for later segments).
+   *  The input `h` is NEVER disposed (the caller / vjp owns the boundary leaf);
+   *  intra-range hidden intermediates and per-layer slices ARE disposed.
+   *  Non-reused donors' K/V are disposed; reused donors' K/V are returned
+   *  (caller threads + disposes). NOT gradient-checkpointed — the segmentation
+   *  IS the memory strategy.
    *
-   *  @param masks     per-layer-type masks (makeTrainingMasks), shared, caller-owned.
+   *  @param cache     the pass's training caches, one per donor layer.
    *  @param perLayer  the [B,L,nLayers,width] tensor (caller-owned) or null.
-   *  @param donorKvIn fetched K/V of reused donors from EARLIER segments, keyed
-   *                   by donor layer index (caller-owned; not disposed here). */
+   *  @param donorKvIn K/V of reused donors from EARLIER segments, keyed by donor
+   *                   layer index (caller-owned; not disposed here). */
   runLayerRange(
     h: MlxArray, aIdx: number, bIdx: number, cache: Cache[],
-    masks: Map<string, Mask>, perLayer: MlxArray | null,
-    donorKvIn: Map<number, SharedKv>,
+    perLayer: MlxArray | null, donorKvIn: Map<number, SharedKv>,
   ): { h: MlxArray; donorKvOut: Map<number, SharedKv> } {
     const donorKvOut = new Map<number, SharedKv>();
     if (aIdx >= bIdx) return { h, donorKvOut };
@@ -712,7 +681,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
       let sharedIn: PlainSharedKv | null = null;
       if (!isDonor) {
         const donor = this.previousKvs[i]!;
-        // The segment donors are training caches, which fetch plain keys and values.
+        // The segment donors hand on the plain keys and values they appended.
         sharedIn = (donorKvOut.get(donor) ?? donorKvIn.get(donor) ?? null) as PlainSharedKv | null;
         if (!sharedIn) throw new Error(`runLayerRange: donor ${donor} K/V not available for sharer ${i}`);
       }
@@ -722,8 +691,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
         pls = ops.reshape(sl, [B, L, this.perLayerWidth]);
         sl.dispose();
       }
-      const mask = masks.get(layer.layerType)!;
-      const { h: next, shared } = layerMasked(layer, cur, mask, isDonor ? cache[ci]! : null, sharedIn, pls);
+      const { h: next, shared } = layerTraining(layer, cur, this.#trainingCache(cache, i), sharedIn, pls);
       pls?.dispose();
       if (i > aIdx) cur.dispose(); // keep the input boundary leaf; drop interiors
       cur = next;
@@ -738,38 +706,36 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
 
   /** Run one layer under gradient checkpointing: its interior activations are
    *  dropped and recomputed in the backward pass. The layer's LoRA params, h,
-   *  the mask array (if any), pls, and a sharer's donor KV are threaded as
-   *  explicit checkpoint inputs (the closure must be pure and self-contained —
-   *  it re-runs during the backward, and captured autograd primals would be
-   *  stale). A donor layer also emits its fetched K/V as checkpoint outputs so
-   *  the (retained, small) tensors reach the sharer layers downstream. */
+   *  pls, and a sharer's donor KV are threaded as explicit checkpoint inputs
+   *  (the closure must be pure and self-contained — it re-runs during the
+   *  backward, and captured autograd primals would be stale); the training
+   *  cache it reads stores nothing, so the recompute reads exactly as the
+   *  forward did. A donor layer also emits its K/V as checkpoint outputs so the
+   *  (retained, small) tensors reach the sharer layers downstream. */
   private runCheckpointedLayer(
-    i: number, layer: DecoderLayer, h: MlxArray, mask: Mask,
-    layerCache: Cache | null, sharedIn: PlainSharedKv | null, pls: MlxArray | null,
+    i: number, layer: DecoderLayer, h: MlxArray,
+    layerCache: AttentionCache, sharedIn: PlainSharedKv | null, pls: MlxArray | null,
   ): { h: MlxArray; shared: PlainSharedKv | null } {
     const ctx = this.gradCkpt!;
     const ll = ctx.byLayer.get(i) ?? { attn: [], mlp: [] };
     return ctx.splitMlp
-      ? this.runSplitCheckpointedLayer(layer, h, mask, layerCache, sharedIn, pls, ll, ctx)
-      : this.runSingleCheckpointedLayer(layer, h, mask, layerCache, sharedIn, pls, ll, ctx);
+      ? this.runSplitCheckpointedLayer(layer, h, layerCache, sharedIn, pls, ll, ctx)
+      : this.runSingleCheckpointedLayer(layer, h, layerCache, sharedIn, pls, ll, ctx);
   }
 
   /** One Checkpoint over the whole layer (the original path). */
   private runSingleCheckpointedLayer(
-    layer: DecoderLayer, h: MlxArray, mask: Mask,
-    layerCache: Cache | null, sharedIn: PlainSharedKv | null, pls: MlxArray | null,
+    layer: DecoderLayer, h: MlxArray,
+    layerCache: AttentionCache, sharedIn: PlainSharedKv | null, pls: MlxArray | null,
     ll: LayerLoras, ctx: GradCheckpointCtx,
   ): { h: MlxArray; shared: PlainSharedKv | null } {
     const lws = [...ll.attn, ...ll.mlp];
-    const isSharer = layerCache === null;
+    const isSharer = !layer.attn.hasKv;
     const sIn = isSharer && sharedIn && sharedIn.kind === "plain" ? sharedIn : null;
-    const hasMaskArr = mask.arr !== null;
     const hasPls = pls !== null;
-    const maskMode = mask.mode;
 
-    // Input order: [h, maskArr?, pls?, sharedInK?, sharedInV?, (lora_a, lora_b)*]
+    // Input order: [h, pls?, sharedInK?, sharedInV?, (lora_a, lora_b)*]
     const inputs: MlxArray[] = [h];
-    if (hasMaskArr) inputs.push(mask.arr!);
     if (hasPls) inputs.push(pls!);
     if (sIn) inputs.push(sIn.keys, sIn.values);
     for (const lw of lws) inputs.push(lw.a, lw.b);
@@ -777,7 +743,6 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
     const ck = new Checkpoint((ins) => {
       let k = 0;
       const hIn = ins[k++]!;
-      const mArr = hasMaskArr ? ins[k++]! : null;
       const plsIn = hasPls ? ins[k++]! : null;
       const sharedInRebuilt: PlainSharedKv | null = sIn
         ? { kind: "plain", keys: ins[k++]!, values: ins[k++]!, offset: 0 }
@@ -785,7 +750,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
       const saved = lws.map((lw) => [lw.a, lw.b] as [MlxArray, MlxArray]);
       for (const lw of lws) { lw.a = ins[k++]!; lw.b = ins[k++]!; }
       try {
-        const out = layerMasked(layer, hIn, { mode: maskMode, arr: mArr }, layerCache, sharedInRebuilt, plsIn);
+        const out = layerTraining(layer, hIn, layerCache, sharedInRebuilt, plsIn);
         if (!isSharer && out.shared && out.shared.kind === "plain")
           return [out.h, out.shared.keys, out.shared.values];
         return [out.h];
@@ -811,35 +776,31 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    *  to `max(attn,MLP)+hMid`. Attn LoRA / pls / donor-KV go to the attn ck; MLP
    *  LoRA to the MLP ck. */
   private runSplitCheckpointedLayer(
-    layer: DecoderLayer, h: MlxArray, mask: Mask,
-    layerCache: Cache | null, sharedIn: PlainSharedKv | null, pls: MlxArray | null,
+    layer: DecoderLayer, h: MlxArray,
+    layerCache: AttentionCache, sharedIn: PlainSharedKv | null, pls: MlxArray | null,
     ll: LayerLoras, ctx: GradCheckpointCtx,
   ): { h: MlxArray; shared: PlainSharedKv | null } {
-    const isSharer = layerCache === null;
+    const isSharer = !layer.attn.hasKv;
     const sIn = isSharer && sharedIn && sharedIn.kind === "plain" ? sharedIn : null;
-    const hasMaskArr = mask.arr !== null;
     const hasPls = pls !== null;
-    const maskMode = mask.mode;
     const attnLws = ll.attn;
     const mlpLws = ll.mlp;
 
-    // --- attn sub-block checkpoint: [h, maskArr?, sharedInK?, sharedInV?, attnLora*]
+    // --- attn sub-block checkpoint: [h, sharedInK?, sharedInV?, attnLora*]
     const attnInputs: MlxArray[] = [h];
-    if (hasMaskArr) attnInputs.push(mask.arr!);
     if (sIn) attnInputs.push(sIn.keys, sIn.values);
     for (const lw of attnLws) attnInputs.push(lw.a, lw.b);
 
     const attnCk = new Checkpoint((ins) => {
       let k = 0;
       const hIn = ins[k++]!;
-      const mArr = hasMaskArr ? ins[k++]! : null;
       const sharedInRebuilt: PlainSharedKv | null = sIn
         ? { kind: "plain", keys: ins[k++]!, values: ins[k++]!, offset: 0 }
         : null;
       const saved = attnLws.map((lw) => [lw.a, lw.b] as [MlxArray, MlxArray]);
       for (const lw of attnLws) { lw.a = ins[k++]!; lw.b = ins[k++]!; }
       try {
-        const out = layerAttnMasked(layer, hIn, { mode: maskMode, arr: mArr }, layerCache, sharedInRebuilt);
+        const out = layerAttnTraining(layer, hIn, layerCache, sharedInRebuilt);
         if (!isSharer && out.shared && out.shared.kind === "plain")
           return [out.h, out.shared.keys, out.shared.values];
         return [out.h];
@@ -884,7 +845,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
     let logits = this.embed.asLinear(h);
     const softcap = this.config.text.finalLogitSoftcapping;
     if (softcap !== null)
-      logits = disposing(logits, compiledGegluActive() && !isCompiledTrace()
+      logits = disposing(logits, this.#compiledGeglu && !isCompiledTrace()
         ? compiledLogitSoftcap(logits, softcap)   // fused, matches @mx.compile logit_softcap
         : logitSoftcap(logits, softcap));
     return logits;

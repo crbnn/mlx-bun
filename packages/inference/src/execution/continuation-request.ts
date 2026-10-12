@@ -12,10 +12,12 @@ export function createOrdinaryContinuationRequest(input: Omit<Parameters<typeof 
   interval: number;
   persistence: import("./continuation-persistence").ContinuationPersistence;
   onToken: Parameters<typeof createRowSampling>[1];
+  /** The request state's prefix namespace over the row's own; absent, the row's. */
+  stateNamespace?: (base: string) => string;
 }) {
   const options: GenerateOptions = snapshotGenerationPolicy(input.options);
   if (!Number.isSafeInteger(input.interval) || input.interval < 1) throw new Error("continuation interval must be positive");
-  if (options.grammar || options.logprobs || options.topLogprobs || options.fill || options.pagedKv ||
+  if (options.grammar || options.logprobs || options.topLogprobs || options.fill ||
       input.execution.method !== "autoregressive")
     throw new Error("ordinary continuation requires replayable ordinary sampling");
   const make = (seed = options.seed, history: readonly number[] = input.prompt) => createRowSampling(makeStepSampler(
@@ -25,7 +27,10 @@ export function createOrdinaryContinuationRequest(input: Omit<Parameters<typeof 
   let policy: ReturnType<typeof bindContinuationPolicy> | undefined;
   const continuation: OrdinaryContinuation = {
     interval: input.interval,
-    restore(namespace) { policy = bindContinuationPolicy({ ...input, options, namespace }); return policy.restore(); },
+    restore(namespace) {
+      policy = bindContinuationPolicy({ ...input, options, namespace: input.stateNamespace?.(namespace) ?? namespace });
+      return policy.restore();
+    },
     resumeSampling(state) {
       const next = make(state.seed, [...state.cacheTokens, state.pendingToken]);
       const previous = sampling; sampling = next; previous.dispose();

@@ -205,25 +205,49 @@ export interface GatedDeltaCache extends Cache {
   recurWindow(qkv: MlxArray, a: MlxArray, b: MlxArray, layer: GatedDeltaParameters): MlxArray;
 }
 
-/** Quantized attention consumes a numerical storage port, independent of the
- * concrete layout used for row positions, retention and persistence.
- * @deprecated Hands packed keys and values to the caller, which then chooses
- * the kernel. Read through {@link AttentionCache}; an affine cache attends with
- * its own kernels. Removed in B1. */
-export interface QuantizedAttentionState {
-  readonly groupSize: number;
-  readonly bits: number;
-  updateAndFetchQuantized(k: MlxArray, v: MlxArray): [ops.QuantizedTensor, ops.QuantizedTensor];
+/** The compressed state of one latent attention layer after an append, as
+ * caller-owned views of every stored position in order (float32). The caller
+ * disposes all three. Rows follow the cache's row layout: right-justified, row
+ * `b`'s positions starting at `leftPad[b]`. */
+export interface LatentAttentionState {
+  /** [B, T, kvLoraRank]: the normalized compressed content state. */
+  readonly latent: MlxArray;
+  /** [B, T, ropeHeadDim]: the decoupled RoPE key, already rotated. */
+  readonly rope: MlxArray;
+  /** [B, T, indexHeadDim]: the sparse-attention (DSA) index keys, on a cache
+   * composed to store them; null otherwise. */
+  readonly indexKeys: MlxArray | null;
 }
 
-/** Values may stay in the codec's rotated domain until after attention.
- * @deprecated Hands rotated values to the caller, which must undo the rotation
- * after attention. Read through {@link AttentionCache}; a TurboQuant cache
- * undoes its rotation inside its read. Removed in B1. */
-export interface RotatedValueAttentionState {
-  /** Capture a fetched value domain independently of later row changes. */
-  captureValueTransform?(): (output: MlxArray) => MlxArray;
-  updateAndFetchDeferredV(k: MlxArray, v: MlxArray): [MlxArray, MlxArray];
+/** State for one multi-head latent attention layer (GLM-5.2's MLA): it stores
+ * the checkpoint-native compressed state per position (the latent and the
+ * decoupled RoPE key, and on a sparse-attention layer the DSA index key), never
+ * per-head keys and values. The attention block projects its queries and that
+ * state, appends the state here and reads back everything stored, from which
+ * it reconstructs or absorbs keys and values itself (the same split as
+ * {@link GatedDeltaCache}: the block keeps its projections, the cache keeps the
+ * state and its row layout). A layer composed with DSA appends an index key
+ * with every position and reads the index keys stored before its append to
+ * select positions.
+ *
+ * Rows: one row for a single sequence; a batch keeps its rows right-justified
+ * along the sequence axis, `rowOffsets[b]` positions in row `b` starting at
+ * `leftPad[b]`. Inputs to an append are borrowed and float32. */
+export interface LatentAttentionCache extends Cache {
+  readonly kvLoraRank: number;
+  readonly ropeHeadDim: number;
+  /** Rows in the layout, or null before the first append. */
+  readonly batchSize: number | null;
+  readonly rowOffsets: readonly number[];
+  readonly leftPad: readonly number[];
+  /** The index keys stored so far, [B, offset, indexHeadDim], owned by the
+   * caller; null when none are stored (a cache without DSA, or an empty one). */
+  storedIndexKeys(): MlxArray | null;
+  /** Appends `L` positions per row (`latent` [B, L, kvLoraRank], `rope`
+   * [B, L, ropeHeadDim], and `indexKeys` [B, L, indexHeadDim] exactly when the
+   * cache stores them), advancing every row by `L`, and returns the state as of
+   * this append. A rejected append leaves the cache unchanged. */
+  appendLatent(latent: MlxArray, rope: MlxArray, indexKeys: MlxArray | null): LatentAttentionState;
 }
 
 /** A captured numerical view supports multiple queries without appending KV
@@ -233,15 +257,6 @@ export interface KvAttentionView {
   /** Qualified committed spans retain the single-position reduction order. */
   attend(q: MlxArray, scale: number, mask: Mask, independentPositions?: boolean): MlxArray;
   dispose(): void;
-}
-
-/** Storage appends once and hands every attention consumer the same view.
- * @deprecated The paged shape {@link AttentionCache} generalizes. Here the view
- * infers the phase from the query, and the caller still supplies the mask and
- * the `independentPositions` flag. Use {@link AttentionCache} and its named
- * reads. Removed in B1. */
-export interface KvAttentionState {
-  appendAndFetch(k: MlxArray, v: MlxArray): KvAttentionView;
 }
 
 /** Owned read-only planes with validity separate from physical padding. */
@@ -262,12 +277,11 @@ export interface KvDonorAttention extends KvAttentionView {
   readonly ends: readonly number[];
 }
 
-/** Dense key/value reads (`updateAndFetch` returning keys and values as
- * arrays) for a graph whose attention reads them that way: plain storage
- * returns them directly, storage that decodes on read returns its dequantized
- * window. Storage that can answer declares it. A cache without it is not
- * certified for a composed dense read (it may still serve `updateAndFetch`
- * directly). */
+/** Dense key/value reads (stored keys and values as arrays) for a read that
+ * attends them that way (`state/softcap-attention.ts`): plain storage returns
+ * them directly, storage that decodes on read returns its dequantized window.
+ * Storage that can answer declares it. A cache without it is not certified for
+ * a composed dense read. */
 export interface DenseKvReads {
   /** Pure: whether `row` can take its next append and still be read dense —
    * its storage reads dense now, and the maintenance that append schedules
@@ -320,31 +334,10 @@ export interface Cache {
     commitPrefill(rows: readonly number[]): void;
     endPrefill(): void;
   };
-  /** Optional representation-owned affine conversion. Logical position can
-   * differ from the physical write head in a padded rotating layout. `kernels`
-   * builds the kernel set the converted storage attends with (state's
-   * `AffineKernelSet`) for its bits, group size and activation dtype.
-   * @deprecated The loader composes the affine, TurboQuant or
-   * delayed-quantization cache, which converts inside its own append and keeps
-   * serving {@link AttentionCache}. Removed in B1. */
-  readonly affineConversion?: { readonly offset: number;
-    toQuantized(groupSize: number, bits: number, kernels: (bits: number, groupSize: number, dtype: Dtype) => unknown): Cache };
-  /** Optional representation-owned TurboQuant conversion.
-   * @deprecated The same replacement as `affineConversion`. Removed in B1. */
-  readonly turboConversion?: { readonly offset: number; toTurboQuantized(kBits: number, vBits: number): Cache };
-  /** @deprecated Use {@link AttentionCache} (see {@link KvAttentionState}).
-   * Removed in B1. */
-  readonly attentionState?: KvAttentionState;
   /** Earliest prefix whose retained representation can resume generation.
    * Irreversible transitions may preserve bytes while invalidating older
    * precision boundaries. Reuse policy must not trim below this offset. */
   minimumReusableOffset?: number;
-  /** @deprecated Use {@link AttentionCache} (see
-   * {@link RotatedValueAttentionState}). Removed in B1. */
-  readonly rotatedValueAttention?: RotatedValueAttentionState;
-  /** @deprecated Use {@link AttentionCache} (see
-   * {@link QuantizedAttentionState}). Removed in B1. */
-  readonly quantizedAttention?: QuantizedAttentionState;
   offset: number;
   /** Stable storage identity for compatibility guards and persistence.
    *  REQUIRED: every capability predicate (isPlainKvCache, isRotating*,
@@ -364,16 +357,6 @@ export interface Cache {
   /** Compiled-decode trace adapters expose the RoPE offset as an int32
    *  array input here; real caches leave it unset (static int path). */
   readonly ropeOffsetArr?: MlxArray;
-  /** @deprecated Hands stored keys and values to the caller. Use
-   * {@link AttentionCache.appendDecode} or {@link AttentionCache.appendWindow},
-   * or a named read that extends them. Recurrent caches implement
-   * {@link GatedDeltaCache}. Removed in B1. */
-  updateAndFetch(k: MlxArray, v: MlxArray): [MlxArray, MlxArray];
-  /** Mask for an N-token step given this cache's state.
-   * @deprecated The named reads of {@link AttentionCache} and
-   * {@link GatedDeltaCache} build their own masks from the offsets, row layout
-   * and window the cache owns. This becomes internal to each cache in B1. */
-  makeMask(N: number, windowSize: number | null): Mask;
   state(): MlxArray[];
   /** Can `trim(n)` drop the last n tokens? (Ring caches lose trimability
    *  once wrapped.) */

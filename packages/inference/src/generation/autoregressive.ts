@@ -38,9 +38,9 @@ readStepExtras,
 stepExtrasArrays,
 type StepExtras
 } from "../sampling/index";
-import { BF16_KV, type KvStorageScheme } from "../contracts/portable/composition";
+import { BF16_KV, COMPOSITION_DEFAULTS, type KvStorageScheme } from "../contracts/portable/composition";
 import { maybePageKv } from "../state/request-policy";
-import { isRotatingPlainCache } from "../state/capabilities";
+import { rollbackVerifyBlock, rollsBackVerifyBlock } from "../state/rollback";
 import {
 fillTraceEnabled,
 fillTracePath,
@@ -51,12 +51,14 @@ type Proposal
 import { Generation } from "./result";
 import { GenerateDiagnostics,GenerateOptions,GenerateStats,GeneratedToken } from "./types";
 
+/** Jump-forward decoding for this request under a composition whose
+ * `grammarJump` is `composed`: grammar requests that return no logprobs. */
 export function shouldUseGrammarJump(
   options: Pick<GenerateOptions, "grammar" | "logprobs" | "topLogprobs">,
-  runtime: RuntimeConfig = runtimeConfig(),
+  composed: boolean = COMPOSITION_DEFAULTS.grammarJump,
 ): boolean {
   return options.grammar !== undefined &&
-    runtime.flag("MLX_BUN_GRAMMAR_JUMP", false) &&
+    composed &&
     !options.logprobs &&
     !(options.topLogprobs && options.topLogprobs > 0);
 }
@@ -194,11 +196,10 @@ async function* generateInner(
       );
     // Replace fresh full-attention caches before any forward. The deepest
     // write is prompt + maxTokens - 1, so capacity covers every decode step.
-    maybePageKv(cache, kv, options, promptTokens.length + maxTokens);
+    maybePageKv(cache, kv, binding.pagedKv ?? null, promptTokens.length + maxTokens);
     // Committed known-token spans, where the graph declares them and the run
-    // mounts no adapter and pages nothing; otherwise known tokens append one
-    // position at a time.
-    appender = options.fill && binding.knownSpans && !options.adapters?.length && !options.pagedKv
+    // mounts no adapter; otherwise known tokens append one position at a time.
+    appender = options.fill && binding.knownSpans && !options.adapters?.length
       ? binding.knownSpans : null;
   } catch (error) {
     if (ownsCache) for (const state of cache) state.dispose();
@@ -221,9 +222,7 @@ async function* generateInner(
   // restore a pre-round snapshot and bit-exactly replay the accepted prefix.
   // A model whose caches can do neither still gets assert-policy fills; verify
   // proposals are dropped and counted (stats.verifyUnsupported).
-  const verifyCapable = fillOn && kv.kind === "bf16" && cache.every(
-    (c) => c.isTrimmable() || isRotatingPlainCache(c) || typeof rewindable(c).specRoundRollback === "function",
-  );
+  const verifyCapable = fillOn && rollsBackVerifyBlock(kv, cache);
   closeBatchSetup?.();
 
   // logits [1,1,V] → sampled token array [1] (+ optional logprob capture,
@@ -402,20 +401,9 @@ async function* generateInner(
         traceProposal(proposal, generatedNow, accepted, [inFlight, ...pred.slice(0, ids.length - 1)]);
       const t1 = performance.now();
       if (accepted < ids.length) {
-        // Trimmable caches drop the rejected tail; recurrent caches restore
-        // their pre-round snapshot and bit-exactly replay the accepted prefix
-        // (Cache.specRoundRollback — the same primitive
-        // packages/inference/src/generation/speculative/run.ts
-        // uses after its accept walk).
-        for (const c of cache) {
-          const rc = rewindable(c);
-          if (rc.specRoundRollback) rc.specRoundRollback(accepted);
-          // A ring stops being trimmable once it wraps, but the verify block
-          // was one concat write that keeps the newest window-1 positions plus
-          // the block in temporal order: dropping its rejected tail leaves at
-          // least the window (accepted >= 1).
-          else rc.trim(ids.length - accepted, isRotatingPlainCache(c));
-        }
+        // The state drops the rejected tail (trim, a ring's rollback trim, or
+        // a recurrence's restore and replay).
+        rollbackVerifyBlock(cache, accepted, ids.length);
         roundOpen = false;
       } else if (roundOpen) {
         for (const c of cache) rewindable(c).specRoundCommit?.();
@@ -508,7 +496,7 @@ async function* generateInner(
       const snapshotAt = options.onPrefillDone && options.snapshotAt !== undefined
         ? Math.min(Math.max(options.snapshotAt, cachedTokens), promptTokens.length)
         : undefined;
-      const tailSplit = runtime.flag("MLX_BUN_PREFILL_TAIL_SPLIT", true);
+      const tailSplit = binding.prefillTailSplit ?? COMPOSITION_DEFAULTS.prefillTailSplit;
 
       while (true) {
         options.signal?.throwIfAborted();
@@ -562,22 +550,21 @@ async function* generateInner(
 
     // ---- decode (pipelined) ----
     // The compiled step is the graph binding's, chosen once for this run's caches; it has no fallback.
-    decoder = options.decodePolicy?.compiledDecode === false ? null : binding.createDecode?.({
-      hasAdapters: !!options.adapters?.length, pagedKv: !!options.pagedKv,
-    }, cache) ?? null;
+    decoder = options.decodePolicy?.compiledDecode === false ? null
+      : binding.createDecode?.({ hasAdapters: !!options.adapters?.length }) ?? null;
     let stop = false;
     /** Token id read eagerly at the top of the loop for grammar (reused for
      *  the yield, avoiding a second readback). -1 when grammar is off — the
      *  pipelined path keeps its deferred itemUint32 below. */
     let grammarTok = -1;
-    // Jump-forward decoding (opt-in, MLX_BUN_GRAMMAR_JUMP=1; serial lane
+    // Jump-forward decoding (opt-in, the composition's grammarJump; serial lane
     // only — the batch lane's #stepGrammar doesn't jump yet): when the
     // grammar forces a unique continuation, emit its retokenized ids without
     // per-token forwards — ONE multi-token forward carries them into the KV
     // (see GrammarController.jumpForward for the contract + the fidelity
     // note on why this is opt-in). Excluded when logprobs are requested
     // (jumped tokens are never sampled, so they'd have no logprobs rows).
-    const grammarJump = options.decodePolicy?.grammarJump ?? shouldUseGrammarJump(options, runtime);
+    const grammarJump = options.decodePolicy?.grammarJump ?? shouldUseGrammarJump(options, binding.grammarJump);
     // Yield token zero before its own decode forward. The captured runtime
     // keeps this scheduling choice stable across consumer awaits.
     const earlyFirstToken = runtime.flag("MLX_BUN_EARLY_FIRST_TOKEN", true) &&

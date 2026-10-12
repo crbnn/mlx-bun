@@ -226,7 +226,7 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
         const namespace = useAdapter ? adapterNamespace : "";
         const activeContexts: string[][] = [];
         observer.forward = ids => { widths.push(ids.shape[0]!); activeContexts.push([...model.loraState!.active]); };
-        const group = binding.createBatchGroup({ maxBatch: batch, kvScheme: kv.scheme, admissionHeld: () => held });
+        const group = binding.createBatchGroup({ maxBatch: batch, admissionHeld: () => held });
         const aborts = Array.from({ length: batch }, () => new AbortController());
         const captured = new Map<string, string>(), restored: number[] = [];
         let idle!: () => void;
@@ -245,7 +245,7 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
           const execution = binding.plan({ hasVision: false, hasAdapters: useAdapter, hasRepetitionPenalty: true,
             userSeed: true,
             hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: useDraft }, options,
-          { continuous: binding.cachesBatchable(), quantizedBatch: binding.kvBatchable(kv.scheme), checkpoints: true });
+          { checkpoints: true });
           expect(execution).toMatchObject({ method: "autoregressive", mechanism: "continuous", checkpoint: true });
           if (useDraft) {
             expect(execution.reasons).toContain("draft-incompatible-with-request");
@@ -416,7 +416,8 @@ test.skipIf(!target || !adapter || !Bun.env.MLX_BUN_TEST_CONTINUATION_KV_START |
   const { AdapterManager } = await import("@mlx-bun/inference/adapters");
   const { bindMlxGateway, createRowSampling } = await import("@mlx-bun/inference/execution");
   const { makeStepSampler } = await import("@mlx-bun/inference/sampling");
-  const { leaseCacheState, isBatchableCache } = await import("@mlx-bun/inference/state");
+  const { leaseCacheState } = await import("@mlx-bun/inference/state");
+  const { isBatchableCache } = await import("../../src/state/capabilities");
   const { observedPhases } = await import("../models/phase-forward");
   const ops = await import("@mlx-bun/mlx/ops");
   const weights = await Weights.open(target!);
@@ -475,7 +476,7 @@ test.skipIf(!target || !adapter || !Bun.env.MLX_BUN_TEST_CONTINUATION_KV_START |
     await adapters.mount("upper", adapter!);
     const scenario = async (batch: number, cancel: boolean, baseOnly = false) => {
       let held = true, leased = false, joined = false, queuedBase = false;
-      const group = binding.createBatchGroup({ maxBatch: batch, kvScheme: kv.scheme, admissionHeld: () => held,
+      const group = binding.createBatchGroup({ maxBatch: batch, admissionHeld: () => held,
         lock: { async acquire() { leased = true; return () => { leased = false; }; } } });
       const drained = async () => {
         const deadline = Date.now() + 10_000;
@@ -506,7 +507,7 @@ test.skipIf(!target || !adapter || !Bun.env.MLX_BUN_TEST_CONTINUATION_KV_START |
           const execution = binding.plan({ hasVision: false, hasAdapters: adapted, hasRepetitionPenalty: false,
             userSeed: false, hasLogitsExtras: false,
             hasGrammar: false, wantsLogprobs: false, hasDraft: false }, options,
-          { continuous: binding.cachesBatchable(), quantizedBatch: binding.kvBatchable(kv.scheme), checkpoints: false });
+          { checkpoints: false });
           expect(execution).toMatchObject({ mechanism: "continuous", method: "autoregressive", fill: false });
           const sampling = createRowSampling(makeStepSampler(options, { tokenRepresentation: "device",
             grammarWait: "external", historyUpdate: "after-sample", initialHistory: ids }), token => {

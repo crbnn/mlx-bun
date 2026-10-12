@@ -46,9 +46,8 @@
 //     its own caches, the prompt and decode groups' MLP rows packed into one call (the composition's packedMixedMlp);
 //   - the scoring forward over a whole sequence (sequenceHidden, prefillTail's operation for its width);
 //   - mounted LoRA adapters: the attention and DeltaNet projections are the generic blocks' QuantizedLinear at
-//     every width, which apply them (the Trellis MLP is no adapter target).
-// The loader refuses, from the declared capabilities and never by routing to another graph: paged KV
-// (paged-kv-batch-unsupported).
+//     every width, which apply them (the Trellis MLP is no adapter target);
+//   - paged KV (the paged legos' own reads in place of the plain full-attention storage).
 
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
@@ -222,9 +221,8 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
   readonly finalNorm: RMSNorm;
   readonly lmHead: QuantizedLinear;
   /** Prepared image and video embeddings with request mRoPE positions, layer
-   *  taps for drafts (verify's capture), delayed affine rows, bounded prefill
-   *  workspace; adapters at every width. Speculation over
-   *  affine KV is the composition's `speculativeAffineKv`. */
+   *  taps for drafts (verify's capture), bounded prefill workspace; adapters at
+   *  every width. */
   readonly graphCapabilities: GraphCapabilities;
 
   readonly prefillChunk: MlxPrefillChunk;
@@ -327,8 +325,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
 
     this.graphCapabilities = declareGraph({
       media: { input: "embeddings+positions", video: true }, hiddenLayerTaps: true,
-      kv: { delayedAffine: "all" }, prefill: { boundedWorkspace: true },
-      speculation: { affineKv: composition.speculativeAffineKv, immediateAffine4: true },
+      prefill: { boundedWorkspace: true },
     });
 
     // The attention cache the composition's KV scheme names: that scheme's own lego, with the dense TurboQuant read

@@ -66,7 +66,7 @@ import { mapPackedTokens } from "../../src/input/token-groups";
 import { type TokenGroup } from "./frozen-token-groups";
 import { flashAttention,flashSupported,getTrainingAttn } from "../../src/kernels/attention/flash";
 import { unrotateValues as tqUnrotateValues } from "../../src/kernels/turboquant/ops";
-import { compiledGegluActive,geglu,GegluMLP } from "../../src/layers/geglu";
+import { compiledGegluActive,geglu,GegluMLP } from "./geglu-reference";
 import { disposing } from "../../src/layers/helpers";
 import { bidirMask } from "../../src/kernels/attention/masks";
 import { RMSNorm } from "../../src/layers/normalization";
@@ -76,10 +76,11 @@ import { QuantizedLinear } from "../../src/layers/quantized-linear";
 import { QuantizedSwitchLinear } from "../../src/layers/quantized-switch-linear";
 import { argmaxLastPosition,logitSoftcap } from "../../src/kernels/logits";
 import { compiledLogitSoftcap } from "../../src/kernels/softcap";
-import { captureRopeOffsets } from "../../src/state/capabilities";
+import { captureRopeOffsets } from "../../src/state/attention-read";
 import { KVCache } from "../../src/state/kv";
 import { deferredTurboQuantKernels } from "../../src/state/turboquant-attention";
 import { RotatingKVCache } from "../../src/state/rotating-kv";
+import { kvStorage } from "../../src/state/kv-storage";
 
 class Attention {
   readonly isSliding: boolean;
@@ -225,12 +226,12 @@ class Attention {
       if (v !== k) v.dispose();
       k.dispose();
 
-      if (cache.attentionState) {
-        const attention = cache.attentionState.appendAndFetch(kRoped, vT);
+      if (kvStorage(cache).attentionState) {
+        const attention = kvStorage(cache).attentionState!.appendAndFetch(kRoped, vT);
         kRoped.dispose(); vT.dispose();
         shared = { kind: "view", attention, offset, offsetArr };
-      } else if (cache.quantizedAttention) {
-        const quantized = cache.quantizedAttention;
+      } else if (kvStorage(cache).quantizedAttention) {
+        const quantized = kvStorage(cache).quantizedAttention!;
         const [kq, vq] = quantized.updateAndFetchQuantized(kRoped, vT);
         kRoped.dispose();
         vT.dispose();
@@ -239,17 +240,17 @@ class Attention {
           groupSize: quantized.groupSize, bits: quantized.bits,
           offsetArr,
         };
-      } else if (cache.rotatedValueAttention) {
+      } else if (kvStorage(cache).rotatedValueAttention) {
         // Deferred-V read: values stay rotated; the attention output is
         // un-rotated below (shared.vRotated) — including by KV-shared
         // consumer layers, which see the flag through sharedIn.
-        const [keys, values] = cache.rotatedValueAttention.updateAndFetchDeferredV(kRoped, vT);
+        const [keys, values] = kvStorage(cache).rotatedValueAttention!.updateAndFetchDeferredV(kRoped, vT);
         kRoped.dispose();
         vT.dispose();
         shared = { kind: "plain", keys, values, offset, offsetArr, vRotated: true,
-          restoreValues: cache.rotatedValueAttention.captureValueTransform?.() };
+          restoreValues: kvStorage(cache).rotatedValueAttention!.captureValueTransform?.() };
       } else {
-        const [keys, values] = cache.updateAndFetch(kRoped, vT);
+        const [keys, values] = kvStorage(cache).updateAndFetch(kRoped, vT);
         kRoped.dispose();
         vT.dispose();
         shared = { kind: "plain", keys, values, offset, offsetArr };
@@ -601,9 +602,8 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    * every method is qualified over them. */
   get graphCapabilities(): GraphCapabilities {
     return declareGraph({
-      media: { input: "embeddings", video: false }, pagedAttention: true, hiddenLayerTaps: "hiddenTap" in this,
+      media: { input: "embeddings", video: false }, hiddenLayerTaps: "hiddenTap" in this,
       compiledDecode: this.config?.modelType?.startsWith("gemma4") === true && !this.config.text.enableMoeBlock,
-      kv: { delayedAffine: "all" },
     });
   }
   #trainable: TrainableGraph | undefined;
@@ -872,7 +872,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
             throw new Error("bidirectional image masks require offset-0 prefill");
           masks.set(type, bidirMask(L, window, bidir));
         } else {
-          masks.set(type, cache[i]!.makeMask(L, window));
+          masks.set(type, kvStorage(cache[i]!).makeMask(L, window));
         }
       }
     }
@@ -946,7 +946,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
         for (let i = 0; i < this.numDonors; i++) {
           const type = this.layers[i]!.layerType;
           if (!group.masks.has(type)) group.masks.set(type,
-            cache[i]!.makeMask(ids.shape[1]!, type === "sliding_attention" ? this.windowSize : null));
+            kvStorage(cache[i]!).makeMask(ids.shape[1]!, type === "sliding_attention" ? this.windowSize : null));
         }
         if (this.perLayerWidth > 0) group.perLayer = this.computePerLayerInputs(ids, group.h);
       }
@@ -1027,7 +1027,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
       const type = this.layers[i]!.layerType;
       if (!masks.has(type)) {
         const window = type === "sliding_attention" ? this.windowSize : null;
-        masks.set(type, cache[i]!.makeMask(L, window));
+        masks.set(type, kvStorage(cache[i]!).makeMask(L, window));
       }
     }
     return masks;

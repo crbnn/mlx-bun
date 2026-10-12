@@ -39,14 +39,16 @@ function syntheticTarget() {
   const table = MlxArray.fromFloat32(Float32Array.from({ length: V * H }, () => (r() - 0.5) * 0.4), [V, H]).eval();
   const head = MlxArray.fromFloat32(Float32Array.from({ length: H * V }, () => (r() - 0.5) * 0.4), [H, V]).eval();
   const scales = MlxArray.fromFloat32(new Float32Array([1]), [1]).astype(Dtype.bfloat16).eval();
+  const logits = (h: MlxArray) => {
+    const f = h.dtype === Dtype.float32 ? h : h.astype(Dtype.float32);
+    const out = ops.matmul(f, head);
+    if (f !== h) f.dispose();
+    return out;
+  };
   const projection = {
     embed: { scales, encode: (ids: MlxArray) => ops.takeAxis(table, ids, 0) },
-    logitsFromHidden: (h: MlxArray) => {
-      const f = h.dtype === Dtype.float32 ? h : h.astype(Dtype.float32);
-      const out = ops.matmul(f, head);
-      if (f !== h) f.dispose();
-      return out;
-    },
+    // The output head per width class (`DraftProjection.logits`): one head at every width.
+    logits: { one: logits, twoToThree: logits, four: logits, fiveToEight: logits, wider: logits },
   };
   const model = {
     graphCapabilities: declareGraph({ hiddenLayerTaps: true }),
@@ -232,30 +234,47 @@ describe.skipIf(!native)("trainDrafter", () => {
   });
 });
 
-describe.skipIf(!native)("calibration provider", () => {
-  test("drafts the full unpruned block even when the checkpoint carries thresholds, and reports each verified round's outcomes", () => {
-    const seen: { thresholds?: number[]; minConf?: number }[] = [];
+describe.skipIf(!native)("calibration rows", () => {
+  test("draft the full unpruned block and report each verified round's outcomes per row", async () => {
+    const seen: object[] = [];
     const conf = [0.9, 0.4, 0.2];
     const fake = {
-      cfg: { ...DEFAULT_DFLASH_CONFIG, gamma: 3, tapLayers: TAPS, sts: { thresholds: [0, 0.8, 0.8], target: 0.5 } },
-      forwardInfer(_model: unknown, _h: unknown, _anchor: number, _gamma: number, opts: { thresholds?: number[]; minConf?: number }) {
-        seen.push({ thresholds: opts.thresholds, minConf: opts.minConf });
-        return { tokens: [5, 6, 7], conf };
+      cfg: { ...DEFAULT_DFLASH_CONFIG, gamma: 3, nLayers: 1, tapLayers: TAPS, sts: { thresholds: [0, 0.8, 0.8], target: 0.5 } },
+      projectContextRows(hidden: MlxArray) {
+        const [B, L] = hidden.shape as [number, number];
+        return [{ k: ops.zeros([B, 1, L, 4], Dtype.float32), v: ops.zeros([B, 1, L, 4], Dtype.float32) }];
+      },
+      forwardRows(_model: unknown, _h: unknown, anchors: readonly number[], gamma: number, opts: object) {
+        seen.push({ ...opts });
+        return { tokens: anchors.map(() => [5, 6, 7].slice(0, gamma)), conf: anchors.map(() => conf.slice(0, gamma)) };
       },
       dispose() {},
     };
     const rounds: { pos: number; conf: number; accepted: boolean }[][] = [];
     const provider = new CalibrationProvider(fake as never, round => rounds.push(round), "fake");
-    const projection = { embed: { encode: () => { throw new Error("unused"); }, scales: { dtype: Dtype.bfloat16 } }, logitsFromHidden: () => { throw new Error("unused"); } };
-    const source = provider.open({ target: { identity: {}, hiddenLayerTaps: { layerCount: 3, projection } } as never });
-    const context = MlxArray.fromFloat32(new Float32Array(1 * 4 * M * H), [1, 4, M * H]);
-    source.prefill([1, 2, 3], context);
-    expect(source.draft([9], 3, 0)).toEqual([5, 6, 7]);
-    expect(seen).toEqual([{ thresholds: [], minConf: undefined }]);
-    const verified = MlxArray.fromFloat32(new Float32Array(1 * 4 * M * H), [1, 4, M * H]);
-    source.commit(3, 1, verified); // one of three accepted
-    expect(rounds).toEqual([[{ pos: 0, conf: 0.9, accepted: true }, { pos: 1, conf: 0.4, accepted: false }, { pos: 2, conf: 0.2, accepted: false }]]);
-    source.dispose();
+    // The target's projection, declared per width class (`DraftProjection.logits`); the fake drafter never reads it.
+    const unused = () => { throw new Error("unused"); };
+    const projection = { embed: { encode: unused, scales: { dtype: Dtype.bfloat16 } },
+      logits: { one: unused, twoToThree: unused, four: unused, fiveToEight: unused, wider: unused } };
+    const target = { identity: {}, hiddenLayerTaps: { layerCount: 3, projection } } as never;
+    // The prompt's tapped context seeds a row, which joins the draft rows as the group joins it.
+    const prefill = provider.grouped.openPrefill({ target, checkpoints: [null] });
+    const tokens = ops.fromInt32([1, 2, 3], [1, 3]);
+    const context = MlxArray.fromFloat32(new Float32Array(3 * M * H), [1, 3, M * H]);
+    await prefill.prefill(tokens, context);
+    const checkpoint = prefill.capture(0);
+    prefill.dispose(); tokens.dispose(); context.dispose();
+    const rows = provider.grouped.open({ target, checkpoints: [checkpoint],
+      sampling: { selection: { kind: "sampled" }, sample() { throw new Error("calibration drafts greedily"); } } });
+    for (const tensor of checkpoint.attachment.tensors) tensor.dispose();
+    try {
+      expect(await rows.draft([9], 3, [0])).toEqual([[5, 6, 7]]);
+      expect(seen).toEqual([{ collectLogits: false, collectConfidence: true }]);
+      const verified = MlxArray.fromFloat32(new Float32Array(4 * M * H), [1, 4, M * H]);
+      await rows.commit([1], verified); // one of three accepted
+      verified.dispose();
+      expect(rounds).toEqual([[{ pos: 0, conf: 0.9, accepted: true }, { pos: 1, conf: 0.4, accepted: false }, { pos: 2, conf: 0.2, accepted: false }]]);
+    } finally { rows.dispose(); }
   });
 });
 

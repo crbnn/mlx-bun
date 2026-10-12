@@ -23,6 +23,7 @@ import { logitSoftcap } from "../kernels/logits";
 import { disposing } from "../layers/helpers";
 import { FINFO_MIN } from "../layers/quantized-attention";
 import { disposeResources } from "../runtime/resources";
+import { kvStorage, type KvStorage } from "./kv-storage";
 
 /** The softcapped reads of one attention layer, each appending `k` and `v`
  * (borrowed; positional encoding applied) to `cache` for the phase it names and
@@ -44,11 +45,12 @@ export interface SoftcapAttentionReads {
  * the cache's own mask for the query count, which is no mask for one unpadded
  * position. */
 export function softcapAttentionReads(softcap: number, window: number | null, arrayMasks: boolean): SoftcapAttentionReads {
-  const mask = (cache: Cache, L: number): Mask => {
+  const mask = (cache: KvStorage, L: number): Mask => {
     const own = cache.makeMask(L, window);
     return arrayMasks && own.mode === "causal" ? { mode: "array", arr: createCausalMask(L, cache.offset, window) } : own;
   };
-  const read = (cache: Cache, k: MlxArray, v: MlxArray): AttentionRead => {
+  const read = (row: Cache, k: MlxArray, v: MlxArray): AttentionRead => {
+    const cache = kvStorage(row);
     const held = mask(cache, k.shape[2]!);
     let keys: MlxArray, values: MlxArray;
     try { [keys, values] = cache.updateAndFetch(k, v); }

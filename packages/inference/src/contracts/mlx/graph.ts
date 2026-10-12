@@ -57,11 +57,10 @@ export type MlxVerifyForward = MlxCapturingForward;
 export type MlxHeadForward = (hidden: MlxArray) => MlxArray;
 
 /** The scoring and training forward, not a serving phase: every position of
- * `ids` [sequences, tokens] as one causal window over the caller's caches
- * (offset-0 training caches, or a padded batch's mask wrapper), on the kernels
- * of `width`, the class of its rows. Returns the post-final-norm hidden the
- * caller owns. The training reads a graph keeps (checkpointing, the training
- * attention) ride it until B1's out-of-step items give them a contract. */
+ * `ids` [sequences, tokens] as one causal window over the caller's caches (the
+ * stateless training caches, which own the mask of an unpadded or right-padded
+ * batch and the training attention kernel), on the kernels of `width`, the
+ * class of its rows. Returns the post-final-norm hidden the caller owns. */
 export type MlxSequenceForward = (ids: MlxArray, state: Cache[], width: MlxWidthClass) => MlxArray;
 
 /** The prompt-chunk operation for each execution unit the composition built.
