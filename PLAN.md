@@ -1247,7 +1247,8 @@ above with an exit; an answered one moves its finding to the owning documentatio
   phase table) and composed the way the program composes, kernels to layers to graphs. Today's
   bit-identity gates are the empirical form; the contracts' JSDoc obligations (ownership, disposal,
   ordering, numerical guarantees) are the statements. Proofs compose over structure and bit-identity
-  under the same kernels, not real-number equality.
+  under the same kernels, not real-number equality. Strata (https://github.com/strata-org/Strata) might be a useful tool to explore (Josh,
+  2026-10-12).
 
 - **SkillOpt skill optimization** (chat, memory, a new optimization domain; [research](https://github.com/joshuarossi/mlx-bun/pull/247)):
   can SkillOpt's gated skill-edit loop (Microsoft, MIT, arXiv:2605.23904) improve the default
