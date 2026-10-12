@@ -679,7 +679,7 @@ Exit: selection is data; `qwen38TrellisM4ProAccepts` and the nested ternary are 
       width. M1 Max paired check, workflow steps, preflight clear: against main, Trellis TQ
       decode 14.1 → 14.0 (0.995 [0.989, 1.002]), prefill 1k 120.5 → 121.8, cold TTFT 6284 →
       6217 ms; e4b decode 63.1 → 63.0, prefill 954 → 961, TTFT 702 → 697 ms; against the
-      previous head within noise everywhere. The workflow's own run on #339 at 832ac8b1 (2026-10-12, preflight clear): no regression outside the band, Trellis TQ decode 0.997 [0.991, 1.003], e4b decode 0.999 [0.998, 1.000], every metric within noise. Found: Trellis decode RSS on the M1 Max is
+      previous head within noise everywhere. The workflow's own run on #339 at 832ac8b1 (2026-10-12, preflight clear): no regression outside the band, Trellis TQ decode 0.997 [0.991, 1.003], e4b decode 0.999 [0.998, 1.000], every metric within noise. At 6fe59e7c (the generated M1 Max graph as the candidate, 2026-10-12): Trellis decode 14.2 → 14.1 (0.997 [0.994, 1.000]) and e4b decode 63.1 → 63.0 (0.998 [0.997, 0.999]) both flagged, e4b on a graph that commit did not touch and both intervals touching 1: the within-session band is narrower than session drift, which the alternating-sessions follow-up fixes; prefill and TTFT within noise. Found: Trellis decode RSS on the M1 Max is
       7614 MB on main and 12050 MB merged (11843 MB already at 918a6afb, so it predates E2
       and B3). Bisected 2026-10-12, no regression: on main, 30412523, d71467c4, 33c7f5be and
       832ac8b1 the worker holds 10.71 GB after warm-up and 11.38 GB after three decodes under
