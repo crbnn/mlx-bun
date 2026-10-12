@@ -3,8 +3,8 @@
 // verification rows), against the same method on the bf16 lego. The planner
 // still refuses these pairs until E2 deletes its cache-format terms, so the
 // methods are bound here, bypassing it.
-// - Teacher-forced verification rounds: two rows of different lengths are
-//   prefilled on each lego, joined into its verification rows
+// - Teacher-forced verification rounds: one row, then two rows of different
+//   lengths, are prefilled on each lego, joined into its verification rows
 //   (`targetCacheLayout`) and run through rounds of fixed verify windows (a
 //   fixed greedy continuation) under the speculative transaction with a fixed
 //   acceptance schedule. Every kept position's logits are compared with the
@@ -126,49 +126,54 @@ test.skipIf(!target)("teacher-forced verification rounds on every lego's verific
     }
     clearCache();
     const accepted = (round: number, row: number) => (round * 7 + row * 3 + 1) % (DEPTH + 1);
-    const logits = new Map<string, Float32Array[]>();
-    for (const lego of LEGOS) {
-      const model = loaded.graph(lego.kv);
-      const maintain = createKvMaintenance(model.composition?.kv ?? { kind: "bf16" });
-      const rows: A[][] = [];
-      for (const prompt of prompts) {
-        const caches = await cachesOf(model, lego.paged);
-        using ids = ops.fromInt32(prompt, [1, prompt.length]);
-        model.forwardHidden(ids, caches).dispose();
-        maintain.prepareBatch?.(caches);
-        rows.push(caches);
-      }
-      const state = new MlxStateRows(rows[0]!.map((cache: A) => targetCacheLayout(cache)));
-      const kept: Float32Array[] = [];
-      try {
-        for (const row of rows) state.append(row);
-        const rollback = bindRowCacheRollback(state.caches, rows.length);
-        const position = rows.map(() => 0);
-        for (let round = 0; round < ROUNDS; round++) {
-          rollback.begin(DEPTH);
-          using ids = ops.fromInt32(position.flatMap((at, row) => continuations[row]!.slice(at, at + DEPTH + 1)), [rows.length, DEPTH + 1]);
-          using hidden = model.forwardHidden(ids, state.caches);
-          using out = model.logitsFromHidden(hidden);
-          const counts = rows.map((_, row) => accepted(round, row));
-          for (const [row, count] of counts.entries()) for (let p = 0; p <= count; p++) {
-            using one = out.slice([row, p, 0], [row + 1, p + 1, out.shape[2]!]);
-            using wide = one.astype(Dtype.float32);
-            kept.push(wide.toFloat32());
-          }
-          rollback.resolve(counts);
-          for (const [row, count] of counts.entries()) position[row]! += count + 1;
-          expect([...state.caches[0]!.rowOffsets]).toEqual(prompts.map((prompt, row) => prompt.length + position[row]!));
+    const report: Record<string, Record<string, unknown>> = {};
+    // One row reads aligned windows (the tiled kernels' own case); two rows of
+    // different lengths read padded ones.
+    for (const cohort of [1, 2]) {
+      const used = prompts.slice(0, cohort);
+      const logits = new Map<string, Float32Array[]>();
+      for (const lego of LEGOS) {
+        const model = loaded.graph(lego.kv);
+        const maintain = createKvMaintenance(model.composition?.kv ?? { kind: "bf16" });
+        const rows: A[][] = [];
+        for (const prompt of used) {
+          const caches = await cachesOf(model, lego.paged);
+          using ids = ops.fromInt32(prompt, [1, prompt.length]);
+          model.forwardHidden(ids, caches).dispose();
+          maintain.prepareBatch?.(caches);
+          rows.push(caches);
         }
-      } finally { state.dispose(); for (const row of rows) for (const cache of row) cache.dispose(); clearCache(); }
-      logits.set(lego.name, kept);
+        const state = new MlxStateRows(rows[0]!.map((cache: A) => targetCacheLayout(cache)));
+        const kept: Float32Array[] = [];
+        try {
+          for (const row of rows) state.append(row);
+          const rollback = bindRowCacheRollback(state.caches, rows.length);
+          const position = rows.map(() => 0);
+          for (let round = 0; round < ROUNDS; round++) {
+            rollback.begin(DEPTH);
+            using ids = ops.fromInt32(position.flatMap((at, row) => continuations[row]!.slice(at, at + DEPTH + 1)), [rows.length, DEPTH + 1]);
+            using hidden = model.forwardHidden(ids, state.caches);
+            using out = model.logitsFromHidden(hidden);
+            const counts = rows.map((_, row) => accepted(round, row));
+            for (const [row, count] of counts.entries()) for (let p = 0; p <= count; p++) {
+              using one = out.slice([row, p, 0], [row + 1, p + 1, out.shape[2]!]);
+              using wide = one.astype(Dtype.float32);
+              kept.push(wide.toFloat32());
+            }
+            rollback.resolve(counts);
+            for (const [row, count] of counts.entries()) position[row]! += count + 1;
+            expect([...state.caches[0]!.rowOffsets]).toEqual(used.map((prompt, row) => prompt.length + position[row]!));
+          }
+        } finally { state.dispose(); for (const row of rows) for (const cache of row) cache.dispose(); clearCache(); }
+        logits.set(lego.name, kept);
+      }
+      const pairs: Record<string, unknown> = report[`B${cohort}`] = {};
+      for (const [a, b] of PAIRS) pairs[`${a} | ${b}`] = compare(logits.get(a)!, logits.get(b)!);
+      // Bf16 pages store what the bf16 lego stores; their verification rows join
+      // the rows the way the decode rows do, which reduces over a padded length.
+      expect((pairs["bf16 | paged bf16"] as ReturnType<typeof compare>).argmaxAgree).toBe(1);
     }
-    const report: Record<string, unknown> = {};
-    for (const [a, b] of PAIRS) report[`${a} | ${b}`] = compare(logits.get(a)!, logits.get(b)!);
     console.log(JSON.stringify({ target, depth: DEPTH, rounds: ROUNDS, report }, null, 1));
-    // Bf16 pages store what the bf16 lego stores; their verification rows join
-    // the rows the way the decode rows do, which reduces over a padded length.
-    const paged = report["bf16 | paged bf16"] as ReturnType<typeof compare>;
-    expect(paged.argmaxAgree).toBe(1);
   } finally { await loaded.release(); }
 }, 1_800_000);
 

@@ -24,8 +24,8 @@ import { PagedKVCache, poolBlocksFor, type PagedQuantization } from "./cache";
  * The same layout serves continuous decoding, prefill cohorts and
  * verification: every row owns its blocks and its offset, so the speculative
  * transaction keeps each row's accepted prefix by trimming that row's blocks
- * back to it, which returns the rejected tail's blocks to the row's pool in the
- * order they were taken. The donor rows are each row's gathered positions,
+ * back to it: the rejected tail's blocks return to the row's pool, and the next
+ * appends take the same blocks again. The donor rows are each row's gathered positions,
  * joined left-padded as the joined read joins them. */
 export class PagedKvRows implements CommittedAttentionCache, SpeculativeRowLayout {
   #rows: PagedKVCache[] = [];
