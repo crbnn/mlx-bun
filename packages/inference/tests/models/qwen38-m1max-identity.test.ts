@@ -138,7 +138,7 @@ const composition = (overrides: Partial<Composition> = {}): Composition => Objec
   device: "applegpu_g13s", aneBridge: false, kv: { kind: "bf16" }, pagedKv: null, draftDepth: { adaptive: true, max: 7 },
   prefillChunkTokens: CHUNK, adapters: false, maxRows: 8, packedMixedMlp: true,
   vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
-  grammarJump: false, greedyDraft: false, ...overrides,
+  grammarJump: false, greedyDraft: false, compiledGeglu: true, ...overrides,
 });
 
 /** The KV schemes the composition serves, as `--kv-quant` composes them (fused SDPA unset). */
@@ -294,7 +294,6 @@ describe("the composition the generated graph declares", () => {
       expect([...currentGraph.verifyRoundCosts]).toEqual(QWEN38_COMPOSITIONS["qwen38-27b-trellis-m1max"]!.verifyRoundCosts!.costs.map(([rows, cost]) => [rows, cost]));
       expect((oldGraph as { verifyRoundCosts?: unknown }).verifyRoundCosts).toBeUndefined();
       expect(currentGraph.prefillChunk.ane).toBeUndefined();
-      expect(currentGraph.requiredDenseKvLayers).toEqual(oldGraph.requiredDenseKvLayers);
       const a = currentGraph.makeCache(), b = oldGraph.makeCache();
       try { expect(a.map(cache => `${cache.constructor.name} ${cache.signature()}`)).toEqual(b.map(cache => `${cache.constructor.name} ${cache.signature()}`)); }
       finally { disposeAll(a, b); }

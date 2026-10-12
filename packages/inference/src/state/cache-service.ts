@@ -11,7 +11,7 @@
 import { join } from "node:path";
 import type { Cache } from "../contracts/mlx/cache";
 import type { CheckpointAttachment } from "../contracts/mlx/checkpoint";
-import { BF16_KV, type KvStorageScheme } from "../contracts/portable/composition";
+import { BF16_KV, type KvStorageScheme, type PagedKvComposition } from "../contracts/portable/composition";
 import type { ObjectCache } from "../contracts/portable/object-cache";
 import type { ModelConfig } from "../artifacts/config";
 import { runtimeConfig, withRuntimeConfig, type RuntimeConfig } from "../runtime/config";
@@ -25,7 +25,7 @@ import { rowAdmission } from "./layout";
 import { cloneKvCaches, composeAtLayer, legacyCacheCodecs } from "./persistence";
 import type { CacheCodecProvider } from "./persistence-types";
 import { PromptCache, type ColdTier } from "./prefix-cache";
-import { maybePageKv, pagedPrefixNamespace, type PagedKv } from "./request-policy";
+import { maybePageKv, pagedPrefixNamespace } from "./request-policy";
 import type { RetentionPolicy } from "./retention-policy";
 import { SsdCacheStore, type SsdIndexEntry, type SsdStoreOptions } from "./ssd-cache";
 import { TieredPromptCache } from "./tiered-prefix-cache";
@@ -33,12 +33,14 @@ import { TieredPromptCache } from "./tiered-prefix-cache";
 export { type ContinuationState } from "./continuation-persistence";
 
 /** The loaded graph the service builds request state for: its fresh caches,
- * the config its KV is projected from, and the composition's KV scheme and
- * paging. */
+ * the config its KV is projected from, the composition's KV scheme and paging,
+ * and the snapshot form of caches it composes beyond the built-in codecs
+ * (GLM-5.2's latent legos), where it declares one. */
 export interface CacheServiceGraph {
   makeCache(): Cache[];
   readonly config: ModelConfig;
-  readonly composition?: { readonly kv: KvStorageScheme; readonly pagedKv: PagedKv | null } | null;
+  readonly composition?: { readonly kv: KvStorageScheme; readonly pagedKv: PagedKvComposition | null } | null;
+  readonly stateCodecs?: CacheCodecProvider;
 }
 
 /** What a replayable generation gives the service to checkpoint it. */
@@ -164,7 +166,8 @@ export interface KvCacheParts {
 export interface KvCacheSettings {
   /** Aggregate projected KV bytes the admitted requests may hold (`--kv-budget`); absent: unlimited. */
   readonly kvBudgetBytes?: number;
-  /** The snapshot form of the composition's caches (default the built-in codecs). */
+  /** The snapshot form of the composition's caches (default the graph's
+   * `stateCodecs`, else the built-in codecs). */
   readonly codecs?: CacheCodecProvider;
   /** Artifact, implementation, state ABI and codec identity captured at load: part of every checkpoint key. */
   readonly identity?: unknown;
@@ -192,8 +195,7 @@ export class KvCacheService implements RequestStateCache {
   readonly codecs: CacheCodecProvider;
   readonly #graph: CacheServiceGraph;
   readonly #kv: KvStorageScheme;
-  readonly #paged: PagedKv | null;
-  readonly #direct: boolean;
+  readonly #paged: PagedKvComposition | null;
   readonly #runtime: RuntimeConfig;
   readonly #prefixes: PromptCache | null;
   readonly #saved: SsdCacheStore | null;
@@ -212,11 +214,10 @@ export class KvCacheService implements RequestStateCache {
     this.#kv = graph.composition?.kv ?? BF16_KV;
     this.#paged = graph.composition?.pagedKv ?? null;
     this.#runtime = settings.runtime ?? runtimeConfig();
-    this.#direct = this.#paged ? this.#runtime.flag("MLX_BUN_PAGED_ATTN", false) : false;
     this.#prefixes = parts.prefixes ?? null;
     this.#saved = parts.saved ?? null;
     this.#continuations = parts.continuations ?? null;
-    this.codecs = settings.codecs ?? legacyCacheCodecs;
+    this.codecs = settings.codecs ?? graph.stateCodecs ?? legacyCacheCodecs;
     this.#identity = settings.identity;
     this.#kvBudget = settings.kvBudgetBytes;
     this.#scheme = kvSchemeOf(this.#kv);
@@ -231,7 +232,7 @@ export class KvCacheService implements RequestStateCache {
 
   /** The state namespace of a request whose own namespace is `namespace`: the composition's paging over it. */
   #namespace(namespace: string): string {
-    return this.#paged ? pagedPrefixNamespace(this.#kv, this.#paged, namespace, this.#direct) : namespace;
+    return this.#paged ? pagedPrefixNamespace(this.#kv, this.#paged, namespace) : namespace;
   }
 
   /** Storage that projects its own rows (a layout such as GLM-5.2's compressed
@@ -517,7 +518,7 @@ const defaultSchedule = (run: () => void, intervalMs: number) => {
  * with generation checkpoints when it names an interval. The caller closes it
  * after every request drained and before disposing the graph. */
 export function createKvCacheService(graph: CacheServiceGraph, options: KvCacheServiceOptions = {}): KvCacheService {
-  const codecs = options.codecs ?? legacyCacheCodecs;
+  const codecs = options.codecs ?? graph.stateCodecs ?? legacyCacheCodecs;
   // A reused prefix comes back as the graph's composed caches, which convert as
   // the caches that stored it would have.
   const clone = (caches: Cache[]): Cache[] => {

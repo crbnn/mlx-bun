@@ -16,6 +16,10 @@ export type CacheKind =
   | "mla-dsa"
   | "mtp-mla";
 
+/** Header kinds of the latent attention legos (`state/latent-legos.ts`), which
+ * their own codecs (`LATENT_LEGO_CODECS`) save and restore. */
+export type LatentLegoKind = "latent-encoded" | "latent-paged";
+
 export interface TensorSlot {
   blocks?: Array<{ hash: string; bytes: number }>;
   off: number;
@@ -28,7 +32,7 @@ export interface TensorSlot {
 export interface CacheHeaderEntry {
   paged?: { capacityTokens: number; blockSize: number; blockTable: number[]; numBlocks: number;
     headDim: number; vHeadDim: number; dtype: Dtype; direct: boolean };
-  kind: CacheKind;
+  kind: CacheKind | LatentLegoKind;
   offset: number;
   minimumReusableOffset?: number;
   /** rotating variants: ring write index */
@@ -52,6 +56,12 @@ export interface CacheHeaderEntry {
   ropeHeadDim?: number;
   dsaHeadDim?: number;
   maxTokens?: number;
+  /** latent-encoded: the conversion start, and whether the saved row still
+   *  reads f32 (its f32 values follow its encoded planes). */
+  quantizedKvStart?: number;
+  latentShadow?: boolean;
+  /** latent-paged: the row's page layout. */
+  latentPages?: { blockSize: number; blockTable: number[]; numBlocks: number };
   /** kv/rotating: [k, v] · qkv/rotating-qkv: [kPacked, kScales, kBiases,
    *  vPacked, vScales, vBiases] · ssm: [conv, recurrent] · turboquant:
    *  [kIdx, kScales, kZeros, vPacked, vScales] */

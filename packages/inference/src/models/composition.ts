@@ -6,9 +6,7 @@ import type { ModelConfig, TurboQuantScheme } from "../artifacts/config";
 import { COMPOSITION_DEFAULTS, type Composition } from "../contracts/portable/composition";
 import { runtimeConfig, type RuntimeConfig } from "../runtime/config";
 import { resolveKvScheme, type KvQuantOverride } from "../state/kv-scheme";
-import { PagedKVCache } from "../state/paged/cache";
-import { pagesStore } from "../state/request-policy";
-import { decodesCompiled } from "../state/layout";
+import { PagedKVCache, pagedDecodeCompiles } from "../state/paged/cache";
 
 /** Rows per forward when the caller states no cap (the app's `--batch` default). */
 export const DEFAULT_MAX_ROWS = 8;
@@ -39,9 +37,10 @@ export interface CompositionRequest {
     readonly fusedSdpa?: boolean;
   };
   /** Paged KV (`--paged-kv`): full-attention storage in pages of `blockSize`
-   * positions (default 256). Absent or null: unpaged. Pages store bf16 or a
-   * uniform 4- or 8-bit affine scheme; another scheme with paging is refused. */
-  readonly pagedKv?: { readonly blockSize?: number } | null;
+   * positions (default 256), read by the direct kernel where `direct` (default
+   * false; see `PagedKvComposition`). Absent or null: unpaged. Pages store what
+   * the KV scheme names for each layer. */
+  readonly pagedKv?: { readonly blockSize?: number; readonly direct?: boolean } | null;
   /** The loaded drafter's tokens per round, and whether the scheduler adapts
    * each round's count up to it. Absent or null: no drafter. */
   readonly draft?: { readonly numDraftTokens: number; readonly adaptive?: boolean } | null;
@@ -54,7 +53,7 @@ export interface CompositionRequest {
   /** One argmax over a decode step whose live rows are all plain greedy. Default true. */
   readonly vectorGreedySampling?: boolean;
   /** A lone ordinary row decodes through the graph's compiled step. Default true;
-   * off whatever is asked for a KV scheme or paging with no compiled form. */
+   * off whatever the request says where the caches have no compiled form (direct pages). */
   readonly compiledDecode?: boolean;
   /** One forward carries a decode group and a prefill group. Default false. */
   readonly mixedPrefill?: boolean;
@@ -66,6 +65,8 @@ export interface CompositionRequest {
   readonly grammarJump?: boolean;
   /** Speculative rows draft by argmax. Default false. */
   readonly greedyDraft?: boolean;
+  /** The GeGLU activations run the compiled closures. Default true. */
+  readonly compiledGeglu?: boolean;
   /** Compose the Neural Engine bridge where a graph builds a Neural Engine
    * operation. Default true: every Apple-silicon Mac has the unit. */
   readonly aneBridge?: boolean;
@@ -95,11 +96,10 @@ function compose(request: Omit<CompositionRequest, "kv">, kv: Composition["kv"])
   const mixedTokenBudget = request.mixedTokenBudget ?? COMPOSITION_DEFAULTS.mixedTokenBudget;
   if (!Number.isSafeInteger(mixedTokenBudget) || mixedTokenBudget < 1)
     throw new Error("composition mixedTokenBudget must be a positive integer");
-  const pagedKv = request.pagedKv ? Object.freeze({ blockSize: request.pagedKv.blockSize ?? PagedKVCache.DEFAULT_BLOCK_SIZE }) : null;
+  const pagedKv = request.pagedKv ? Object.freeze({ blockSize: request.pagedKv.blockSize ?? PagedKVCache.DEFAULT_BLOCK_SIZE,
+    direct: request.pagedKv.direct ?? false }) : null;
   if (pagedKv && (!Number.isSafeInteger(pagedKv.blockSize) || pagedKv.blockSize < 1))
     throw new Error("composition paged KV block size must be a positive integer");
-  if (pagedKv && !pagesStore(kv))
-    throw new Error("paged KV stores bf16 or uniform 4- or 8-bit affine pages; per-layer and TurboQuant pages are not implemented");
   const runtime = runtimeConfig();
   return Object.freeze({
     device: deviceArchitecture(),
@@ -112,24 +112,13 @@ function compose(request: Omit<CompositionRequest, "kv">, kv: Composition["kv"])
     maxRows,
     packedMixedMlp: request.packedMixedMlp ?? COMPOSITION_DEFAULTS.packedMixedMlp,
     vectorGreedySampling: request.vectorGreedySampling ?? COMPOSITION_DEFAULTS.vectorGreedySampling,
-    // A cache lego without a compiled form decodes eagerly: decided here, once.
-    compiledDecode: (request.compiledDecode ?? COMPOSITION_DEFAULTS.compiledDecode) && decodesCompiled(kv, pagedKv !== null),
+    // The caches' declaration: direct pages have no compiled form.
+    compiledDecode: (request.compiledDecode ?? COMPOSITION_DEFAULTS.compiledDecode) && (!pagedKv || pagedDecodeCompiles(pagedKv, kv)),
     mixedPrefill: request.mixedPrefill ?? COMPOSITION_DEFAULTS.mixedPrefill,
     mixedTokenBudget,
     prefillTailSplit: request.prefillTailSplit ?? COMPOSITION_DEFAULTS.prefillTailSplit,
     grammarJump: request.grammarJump ?? COMPOSITION_DEFAULTS.grammarJump,
     greedyDraft: request.greedyDraft ?? COMPOSITION_DEFAULTS.greedyDraft,
+    compiledGeglu: request.compiledGeglu ?? COMPOSITION_DEFAULTS.compiledGeglu,
   });
-}
-
-/** Refuse `composition` for a graph that carries no composition record: such a
- * graph composes its own caches (DiffusionGemma's denoising state, GLM-5.2's
- * compressed MLA), and no lego of a quantized or paged KV scheme exists for
- * them yet, so the record could not be served as named. Serving it as bf16
- * would report an option as implemented when it is not. */
-export function assertComposedCaches(model: object, composition: Composition): void {
-  if ((model as { composition?: Composition }).composition) return;
-  if (composition.kv.kind === "bf16" && !composition.pagedKv) return;
-  const named = composition.pagedKv ? "paged KV" : `${composition.kv.kind} KV`;
-  throw new Error(`this graph composes its own caches, which have no ${named} form yet (--kv-quant, --paged-kv)`);
 }

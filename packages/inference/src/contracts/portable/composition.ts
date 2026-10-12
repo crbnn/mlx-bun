@@ -21,6 +21,21 @@ export type KvStorageScheme =
   /** Full-attention layers TurboQuant-encoded; sliding-window layers stay bf16. */
   | { readonly kind: "turbo"; readonly kBits: number; readonly vBits: number; readonly quantizedKvStart?: number };
 
+/** Full-attention keys and values held in pages (`--paged-kv`). */
+export interface PagedKvComposition {
+  /** Positions per page. */
+  readonly blockSize: number;
+  /** The pages' read of at most eight queries without an array mask (decode,
+   * and prefill and verification windows that short): the direct Metal kernel
+   * over the blocks (Lab numerics) where true, otherwise the gathered blocks
+   * through the fused SDPA (the numerical control). Pages the kernel does not
+   * read (TurboQuant, affine widths that straddle a 32-bit word) read gathered.
+   * Pages the kernel reads have no compiled decode form (the kernel's
+   * partitions follow the context length): their composition resolves
+   * `compiledDecode` off. */
+  readonly direct: boolean;
+}
+
 export interface AffineKvLayer {
   readonly layer: number;
   readonly bits: number;
@@ -50,7 +65,7 @@ export interface Composition {
    * (`--paged-kv`), or null. Every request's state takes the paged lego in place
    * of the plain full-attention storage the graph composes; its pages store
    * what `kv` names. */
-  readonly pagedKv: { readonly blockSize: number } | null;
+  readonly pagedKv: PagedKvComposition | null;
   readonly draftDepth: DraftDepth;
   /** The prefill chunk size, in prompt tokens, the composition is built for.
    * The prefill planner may hand the graph fewer rows than this as a prompt's
@@ -70,9 +85,9 @@ export interface Composition {
   readonly vectorGreedySampling: boolean;
   /** A lone ordinary row decodes through the graph's compiled step where the
    * graph builds one (default on). The step is bit-identical to the ordinary
-   * decode forward; off, every row decodes through the forward. Resolved off
-   * for a KV scheme or paging whose storage has no compiled form (TurboQuant, a
-   * delayed start, paged blocks). */
+   * decode forward over every cache lego that has a compiled form; off, every
+   * row decodes through the forward. Direct pages have none (`pagedKv.direct`),
+   * so their composition resolves it off. */
   readonly compiledDecode: boolean;
   /** One forward carries a decode group and a prefill group where the graph
    * declares mixed rows (default off). */
@@ -90,6 +105,10 @@ export interface Composition {
    * coupled draw (default off). The draft moves acceptance and draft cost, not
    * the output distribution (see `generation/speculative/draft-policy`). */
   readonly greedyDraft: boolean;
+  /** The GeGLU activations (and a Gemma head's logit softcap) run the compiled
+   * closures, the reference's `mx.compile`d geglu and softcap (default on); off,
+   * the spelled-out ops, which compute the same bits. */
+  readonly compiledGeglu: boolean;
 }
 
 /** The value of each composition fact a caller leaves unstated: what
@@ -104,4 +123,5 @@ export const COMPOSITION_DEFAULTS = Object.freeze({
   prefillTailSplit: true,
   grammarJump: false,
   greedyDraft: false,
+  compiledGeglu: true,
 } satisfies Partial<Composition>);

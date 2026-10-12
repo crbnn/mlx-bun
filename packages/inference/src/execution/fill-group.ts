@@ -12,8 +12,6 @@ import { MlxPrefillCohort } from "./prefill-cohort";
 import { MlxStateRows } from "../state/rows";
 import { targetCacheLayout } from "../state/layout";
 import { leaseCacheStates } from "../state/leases";
-import type { KvStorageScheme } from "../contracts/portable/composition";
-import { supportsCommittedAppendCache } from "../generation/bindings/autoregressive";
 import { MlxPhaseDispatch } from "../generation/phase-dispatch";
 import { tokenPhasesOf } from "../models/capabilities";
 import { widthClass, type MlxKnownSpans } from "../contracts/mlx/graph";
@@ -33,14 +31,13 @@ interface RequestState {
 /** Strict continuations share preparation, row layouts and queueing with other
  * methods. Sampled tokens remain pipelined; committed tokens bypass sampling.
  * This binding is qualified independently before serving advertises it. */
-export function bindFillGroupRequests(model: MlxTokenGraph, kv: KvStorageScheme) {
+export function bindFillGroupRequests(model: MlxTokenGraph) {
   return (input: GenerateOptions): MlxGroupMethodRequest => {
     const options = snapshotGenerationPolicy(input);
     return {
-      // The KV scheme is the composition's, shared by every request.
       key: JSON.stringify(["fill"]),
       data: options,
-      open: host => new FillGroup(host, model, kv),
+      open: host => new FillGroup(host, model),
     };
   };
 }
@@ -59,11 +56,11 @@ class FillGroup implements MlxGroupedMethod {
   #real: boolean[] = [];
   #steps = 0;
 
-  constructor(readonly host: MlxGroupMethodHost, readonly model: MlxTokenGraph, kv: KvStorageScheme) {
+  constructor(readonly host: MlxGroupMethodHost, readonly model: MlxTokenGraph) {
     this.#dispatch = new MlxPhaseDispatch(tokenPhasesOf(model));
     this.#verify = bindSpeculativeTargetModel(model);
     const spans = model.knownSpans;
-    this.#spans = spans && !model.loraState?.active.length && supportsCommittedAppendCache(spans, kv) ? spans : null;
+    this.#spans = spans && !model.loraState?.active.length ? spans : null;
   }
 
   /** Positions one known-token call takes: up to the spans' limit for one row, one per row otherwise. */

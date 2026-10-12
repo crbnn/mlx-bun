@@ -652,8 +652,6 @@ export class ${c.className} implements MlxDeclaredGraph, MlxTokenPhases {
   /** Base path for LoRA target keys (weights carry the language_model prefix). */
   readonly prefixBase = PREFIX;
   readonly loraState = new LoraState();
-  /** Layers whose attention reads plain keys and values: none; it attends the storage its caches hold. */
-  readonly requiredDenseKvLayers: readonly number[] = Object.freeze([]);
   /** The full-attention layer whose cache supplies logical positions. */
   readonly faIdx: number;
   readonly embed: QuantizedEmbedding;
@@ -675,7 +673,6 @@ ${c.verifyRoundCosts ? `  /** Verify forward cost by rows relative to one decode
   readonly logits: MlxWidthTable<MlxHeadForward>;
 ${k.knownSpans ? `  /** Committed known-token spans: the append keeps the native affine arithmetic while Trellis shares up to four rows. */
   readonly knownSpans: MlxKnownSpans = Object.freeze({
-    affineKvBits: Object.freeze([4, 8]), turboQuantFormats: Object.freeze([Object.freeze({ kBits: 8, vBits: 3 })]),
     maxChunkSize: (state: readonly Cache[]) => qwenAppendChunkSize(state[0]!.offset),
   });
 ` : ""}

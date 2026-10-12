@@ -238,8 +238,6 @@ export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
   readonly weightsBytes: number;
   readonly prefixBase = "model";
   readonly loraState = new LoraState();
-  /** Layers whose attention reads plain keys and values: none; it attends the storage its caches hold. */
-  readonly requiredDenseKvLayers: readonly number[] = Object.freeze([]);
   /** An ordinary autoregressive graph: every method over every cache lego. */
   get graphCapabilities(): GraphCapabilities { return declareGraph(); }
   readonly embed: QuantizedEmbedding;

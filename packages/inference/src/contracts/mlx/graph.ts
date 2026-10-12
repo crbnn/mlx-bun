@@ -118,13 +118,12 @@ export interface MlxTokenPhases {
 }
 
 /** How a graph whose composition qualifies committed known-token spans takes
- * them (`MlxTokenPhases.appendKnown` over its committed read): which KV
- * formats keep the one-position arithmetic, and how many positions one call
- * takes. A graph without it takes known tokens one position at a time. */
+ * them (`MlxTokenPhases.appendKnown` over its committed read): how many
+ * positions one call takes. Every cache lego's committed read keeps the
+ * one-position arithmetic (the cache contract holds it to the same positions
+ * read one at a time), whatever the composition's KV scheme. A graph without
+ * it takes known tokens one position at a time. */
 export interface MlxKnownSpans {
-  /** Affine formats whose committed append retains one-token arithmetic. */
-  readonly affineKvBits?: readonly number[];
-  readonly turboQuantFormats?: readonly { readonly kBits: number; readonly vBits: number }[];
   /** Positions one sequence's `appendKnown` call takes at the caches' current
    * length. Recheck after each call: native arithmetic can change at a
    * cache-length boundary. */

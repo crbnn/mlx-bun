@@ -136,9 +136,8 @@ describe("padded full-attention rows (plain)", () => {
     for (const cache of [a, b, c, layout, same]) cache.dispose();
   });
 
-  test("it reads dense like the serial cache, borrows its sources and refuses foreign state", () => {
+  test("it borrows its sources and refuses foreign state", () => {
     const layout = new PaddedKVRows(), a = solo(0, 4), b = solo(1, 2);
-    expect(layout.denseKvReads?.appendable(0)).toBe(true);
     layout.mergeRows([a, b]);
     expect(a.offset).toBe(4); expect(b.offset).toBe(2); // sources untouched
     expect(() => layout.mergeRows([a, b])).toThrow("needs an empty batch");
@@ -168,7 +167,6 @@ describe("padded full-attention rows (affine quantized)", () => {
     const layout = ownedCacheLayout(adopted)!;
     expect(layout).toBeInstanceOf(PaddedQuantKVRows);
     expect(layout.signature()).toBe(`kv:padded-rows-quant:${BITS}:${GS}`);
-    expect(layout.denseKvReads).toBeUndefined(); // attends the quantized planes; no plain read
     const joiner = quant(1, lens[1]!);
     layout.mergeRows([adopted, joiner]); adopted.dispose(); joiner.dispose();
     expect(layout.rowOffsets).toEqual([5, 3]); expect(layout.leftPad).toEqual([0, 2]);

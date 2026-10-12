@@ -121,14 +121,14 @@ test("RAM prefixes: a published prefix is reused as the graph's composed caches,
 });
 
 test("paging is the composition's: fresh state pages, and prefixes are kept in the paged namespace", () => {
-  const composition = testComposition(undefined, { pagedKv: { blockSize: 16 } });
+  const composition = testComposition(undefined, { pagedKv: { blockSize: 16, direct: false } });
   const prefixes = new PromptCache(1 << 20);
   const cache = new KvCacheService(graph({ composition }), { prefixes });
   const row = request([1, 2, 3]), acquired = cache.acquire(row, "upper");
   try { expect(acquired.caches.map(layer => layer.signature())).toEqual(["kv:paged"]); }
   finally { disposeResources(acquired.caches); cache.release(row, false); }
   cache.publish(row, "upper", [1, 2, 3], { caches: [state(3)] });
-  expect(prefixes.findExact([1, 2, 3], pagedPrefixNamespace(composition.kv, { blockSize: 16 }, "upper", false))).not.toBeNull();
+  expect(prefixes.findExact([1, 2, 3], pagedPrefixNamespace(composition.kv, { blockSize: 16, direct: false }, "upper"))).not.toBeNull();
   expect(prefixes.findExact([1, 2, 3], "upper")).toBeNull();
   prefixes.clear();
 });

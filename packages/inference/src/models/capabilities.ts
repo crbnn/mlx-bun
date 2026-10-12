@@ -1,6 +1,7 @@
 import type { GraphCapabilities } from "../contracts/portable/graph";
 import type { MlxCompiledDecodeStep, MlxDeclaredGraph, MlxTokenPhases } from "../contracts/mlx/graph";
 import type { Composition } from "../contracts/portable/composition";
+import type { CacheCodecProvider } from "../state/persistence-types";
 
 type Declaration = Partial<Omit<GraphCapabilities, "adapters" | "prefill" | "speculation">> & {
   readonly adapters?: Partial<GraphCapabilities["adapters"]>;
@@ -69,4 +70,11 @@ export function compiledDecodeStepOf(model: object): MlxCompiledDecodeStep | nul
   if (typeof graph.compiledDecodeStep !== "function")
     throw new TypeError("the graph declares a compiled decode step but provides no compiledDecodeStep");
   return graph.compiledDecodeStep();
+}
+
+/** The persistence codecs a graph's caches need beyond the default set (the
+ * graph's `stateCodecs`: GLM-5.2's under a quantized KV scheme or paging, whose
+ * latent legos the default codecs do not save); undefined: the default set. */
+export function stateCodecsOf(model: object): CacheCodecProvider | undefined {
+  return (model as { readonly stateCodecs?: CacheCodecProvider }).stateCodecs;
 }

@@ -6,7 +6,6 @@ import { UniversalDenseModel } from "../../src/models/universal/dense";
 import { universalCacheWindows, type UniversalArgs } from "../../src/models/universal/archs";
 import { KVCache } from "../../src/state/kv";
 import { RotatingKVCache } from "../../src/state/rotating-kv";
-import { SSMCache } from "../../src/state/ssm";
 import { KvScheme } from "../../src/state/kv-scheme";
 import type { GenerateOptions } from "../../src/generation/index";
 import type { ResolvedExecution } from "../../src/contracts/portable/execution";
@@ -67,7 +66,7 @@ const placementPhases = stubPhases(() => { throw new Error("placement never forw
 function gemma4(): Gemma4Model {
   return Object.assign(Object.create(Gemma4Model.prototype), {
     config: { modelType: "gemma4", text: { enableMoeBlock: false }, eosTokenIds: [] },
-    makeCache: () => [new KVCache()], loraState: { active: [] }, ...placementPhases, requiredDenseKvLayers: [],
+    makeCache: () => [new KVCache()], loraState: { active: [] }, ...placementPhases
   });
 }
 
@@ -75,7 +74,7 @@ function softcapUniversal(): UniversalDenseModel {
   return Object.assign(Object.create(UniversalDenseModel.prototype), {
     args: { modelType: "gemma2", maskArray: true, attnLogitSoftcap: 50, layerTypes: null }, encodedKvAttention: false,
     config: { modelType: "gemma2", text: { enableMoeBlock: false }, eosTokenIds: [] },
-    makeCache: () => [new KVCache()], loraState: { active: [] }, ...placementPhases, requiredDenseKvLayers: [0],
+    makeCache: () => [new KVCache()], loraState: { active: [] }, ...placementPhases
   });
 }
 
@@ -94,13 +93,13 @@ const standIn = (prototype: object, modelType: string, extra: object = {}): Runt
 // verifying proposals, and whose verifier qualifies ordinary rounds only.
 const qualifiedFamilies: [string, () => RuntimeModel][] = [
   ["universal dense", () => standIn(UniversalDenseModel.prototype, "llama",
-    { args: { modelType: "llama", maskArray: false, attnLogitSoftcap: null, layerTypes: null }, requiredDenseKvLayers: [] })],
+    { args: { modelType: "llama", maskArray: false, attnLogitSoftcap: null, layerTypes: null } })],
   ["gemma4", gemma4],
-  ["qwen3", () => standIn(Qwen3Model.prototype, "qwen3", { requiredDenseKvLayers: [], encodedKvAttention: true })],
-  ["qwen3-moe", () => standIn(Qwen3MoeModel.prototype, "qwen3_moe", { requiredDenseKvLayers: [], encodedKvAttention: true })],
-  ["qwen3.5", () => standIn(Qwen35Model.prototype, "qwen3_5", { requiredDenseKvLayers: [] })],
-  ["minicpm5", () => standIn(MiniCPM5Model.prototype, "minicpm5", { requiredDenseKvLayers: [] })],
-  ["glm52", () => standIn(Glm52Model.prototype, "glm_moe_dsa", { requiredDenseKvLayers: [] })],
+  ["qwen3", () => standIn(Qwen3Model.prototype, "qwen3", { encodedKvAttention: true })],
+  ["qwen3-moe", () => standIn(Qwen3MoeModel.prototype, "qwen3_moe", { encodedKvAttention: true })],
+  ["qwen3.5", () => standIn(Qwen35Model.prototype, "qwen3_5")],
+  ["minicpm5", () => standIn(MiniCPM5Model.prototype, "minicpm5")],
+  ["glm52", () => standIn(Glm52Model.prototype, "glm_moe_dsa")],
 ];
 const families: [string, () => RuntimeModel][] = [["gemma2 softcap", softcapUniversal], ...qualifiedFamilies];
 
@@ -217,7 +216,7 @@ test.each(families)("%s places grammar with a bound grouped draft exactly as the
 });
 
 describe("DiffusionGemma interleaved denoising binding", () => {
-  const diffusion = () => standIn(DiffusionGemmaModel.prototype, "diffusion_gemma", { requiredDenseKvLayers: [] }) as DiffusionGemmaModel;
+  const diffusion = () => standIn(DiffusionGemmaModel.prototype, "diffusion_gemma") as DiffusionGemmaModel;
   const planWith = (binding: MlxGatewayBinding, request: typeof shape, options: GenerateOptions = {}) =>
     binding.plan(request, options, schedule);
 
@@ -278,7 +277,7 @@ describe("DiffusionGemma interleaved denoising binding", () => {
 function minicpm5(layers = 4): MiniCPM5Model {
   return Object.assign(Object.create(MiniCPM5Model.prototype), {
     config: { modelType: "minicpm5", text: { enableMoeBlock: false, numHiddenLayers: layers, layerTypes: Array(layers).fill("full_attention") }, eosTokenIds: [] },
-    makeCache: () => Array.from({ length: layers }, () => new KVCache()), loraState: { active: [] }, ...placementPhases, requiredDenseKvLayers: [],
+    makeCache: () => Array.from({ length: layers }, () => new KVCache()), loraState: { active: [] }, ...placementPhases
   });
 }
 
@@ -290,7 +289,6 @@ function universal(args: Record<string, unknown> = {}, layers = 4): UniversalDen
     args: descriptor,
     // The bound attention facts a constructed graph derives from this descriptor.
     encodedKvAttention: descriptor.attnLogitSoftcap === null,
-    requiredDenseKvLayers: descriptor.attnLogitSoftcap === null ? [] : Array.from({ length: layers }, (_, layer) => layer),
     makeCache: () => universalCacheWindows(descriptor as unknown as UniversalArgs)
       .map(window => window ? new RotatingKVCache(window) : new KVCache()),
     config: { modelType: descriptor.modelType, text: { enableMoeBlock: false, numHiddenLayers: layers,
@@ -308,7 +306,7 @@ const SLIDING = ["full_attention", "sliding_attention", "full_attention", "slidi
 // over bf16.
 test.each([["MiniCPM5", () => minicpm5()], ["plain universal", () => universal()],
   ["mixed full/sliding universal", () => universal({ modelType: "llama", layerTypes: SLIDING, slidingWindow: 16 })],
-  ["qwen3", () => standIn(Qwen3Model.prototype, "qwen3", { requiredDenseKvLayers: [], encodedKvAttention: true })]] as const)(
+  ["qwen3", () => standIn(Qwen3Model.prototype, "qwen3", { encodedKvAttention: true })]] as const)(
   "%s serves drafts, fill, adapter drafts and grammar proposals over delayed affine KV", (_, make) => {
     for (const kv of [{ kvBits: 4, quantizedKvStart: 8 }, { kvBits: 8 },
       { kvConfig: [{ layerIdx: 0, bits: 4, groupSize: 64 }, { layerIdx: 2, bits: 8, groupSize: 64 }], quantizedKvStart: 8 }]) {
@@ -626,36 +624,17 @@ test("universal graphs batch and bind drafts, whatever their cache layout", () =
   }
 });
 
-test("a graph's plain-read layers are bound once, on the span graph only, and every probe cache is released", () => {
+test("planning never probes a graph's storage, on the span graph as on any other", () => {
   let made = 0;
-  const released: string[] = [];
-  /** A probe cache that records its release and fails on any later use. */
-  const track = <T extends object>(name: string, cache: T): T => {
-    let disposed = false;
-    return new Proxy(cache, { get(target, key, receiver) {
-      if (key === "dispose") return () => { disposed = true; released.push(name); (target as { dispose(): void }).dispose(); };
-      if (disposed) throw new Error(`${name} used after release (${String(key)})`);
-      return Reflect.get(target, key, receiver);
-    } });
-  };
-  // Planning never probes storage: an encoded-read graph binds none at all.
   const encoded = universal({ modelType: "llama", layerTypes: LAYERS, slidingWindow: 16 });
   encoded.makeCache = () => { made++; return []; };
   const binding = bindMlxGateway(encoded, { provider: new NgramProvider(), numDraftTokens: 4 });
   for (let round = 0; round < 3; round++)
     for (const request of [shape, { ...shape, hasDraft: true }, { ...shape, hasGrammar: true }]) place(binding, request);
-  expect(made).toBe(0);
-  // The softcap graph's spans bind its plain-read layers once, against its fresh caches.
+  // The softcap graph's spans read every storage dense: they bind no layers and probe nothing.
   const softcap = universal({ modelType: "gemma2", maskArray: true, attnLogitSoftcap: 50 });
-  const makeCache = softcap.makeCache.bind(softcap);
-  softcap.makeCache = () => { made++; return makeCache().map((cache, layer) => track(`layer ${layer}`, cache)); };
+  softcap.makeCache = () => { made++; return []; };
   const spans = bindMlxGateway(softcap);
   for (let round = 0; round < 3; round++) place(spans, grammar);
-  expect({ made, released: released.length }).toEqual({ made: 1, released: 4 });
-  // A declaration naming storage that does not read dense is refused when bound, its probe released.
-  released.length = 0;
-  const misdeclared = Object.assign(universal({ modelType: "gemma2", maskArray: true, attnLogitSoftcap: 50 }), { requiredDenseKvLayers: [0, 1] });
-  misdeclared.makeCache = () => [track("kept", new KVCache()), track("ssm", new SSMCache())];
-  expect(() => bindMlxGateway(misdeclared)).toThrow("does not read dense: 1");
-  expect(released.sort()).toEqual(["kept", "ssm"]);
+  expect(made).toBe(0);
 });

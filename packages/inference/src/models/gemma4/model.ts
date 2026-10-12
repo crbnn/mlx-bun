@@ -45,7 +45,6 @@ import { bindGemma4MediaInput, gemma4DraftTarget, gemma4MediaEncoders } from "./
 import type { AttentionCache, AttentionRead, Cache, SharedKv } from "../../contracts/mlx/cache";
 import { isCompiledTrace } from "../../runtime/compiled-trace";
 import { mapPackedTokens } from "../../input/token-groups";
-import { runtimeFlag } from "../../runtime/config";
 import { disposing } from "../../layers/helpers";
 import { activePrefixLayout, ropeBlocks } from "../../layers/prefix-layout";
 import { RMSNorm } from "../../layers/normalization";
@@ -185,8 +184,6 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly prefixBase: string;
   /** Active LoRA adapters for the current generation (see LoraState). */
   readonly loraState = new LoraState();
-  /** Layers whose attention reads plain keys and values: none; it attends the storage its caches hold. */
-  readonly requiredDenseKvLayers: readonly number[] = Object.freeze([]);
   /** Prepared image/audio embeddings, layer taps for drafts, and a compiled
    * decode step, except through experts: shapeless replay
    * retraces their growing windows. */
@@ -239,8 +236,8 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    *  one MLP call. */
   readonly #packMixedMlp: boolean;
   /** The GeGLU activations and the head's softcap run the compiled closures
-   *  (mlx-lm's @mx.compile'd geglu and logit_softcap), unless
-   *  `MLX_BUN_COMPILED_GEGLU=0` asked for the spelled-out ops: read once, here. */
+   *  (mlx-lm's @mx.compile'd geglu and logit_softcap), unless the
+   *  composition's `compiledGeglu` is off: the spelled-out ops. */
   readonly #compiledGeglu: boolean;
 
   constructor(weights: Weights, config: ModelConfig, composition: Composition) {
@@ -248,7 +245,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
     if (t.hiddenSize === 0 || !config.text.tieWordEmbeddings)
       throw new Error("only tied-embedding text configs are supported");
 
-    this.#compiledGeglu = runtimeFlag("MLX_BUN_COMPILED_GEGLU", true);
+    this.#compiledGeglu = composition.compiledGeglu;
     this.config = config;
     this.composition = composition;
     this.weightsBytes = [...weights.shards.files.values()]

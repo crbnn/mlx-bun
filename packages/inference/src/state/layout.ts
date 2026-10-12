@@ -15,6 +15,7 @@ import { DelayedQuantizedKVCache } from "./delayed-quantized-kv";
 import { DelayedRotatingQuantizedKVCache } from "./delayed-rotating-quantized-kv";
 import { DelayedTurboQuantKVCache } from "./delayed-turboquant-kv";
 import { MLACache } from "./glm52-cache";
+import { EncodedLatentCache, PagedLatentCache } from "./latent-legos";
 import { KVCache } from "./kv";
 import { PagedKVCache } from "./paged/cache";
 import { PagedKvRows } from "./paged/rows";
@@ -51,7 +52,7 @@ const entry = <C extends Cache>(storage: StorageClass<C>, layouts: RowLayouts<No
 const ownEmptyBatch = <C extends SpeculativeRowLayout>(storage: StorageClass<C>): RowLayoutEntry<C> =>
   entry(storage, { decode: cache => cache.makeEmptyBatch(), prefill: cache => cache.makeEmptyBatch(), verify: cache => cache.makeEmptyBatch() });
 
-const pagedRows = (cache: PagedKVCache) => new PagedKvRows(cache.capacityTokens, cache.blockSize, cache.direct, cache.quantization);
+const pagedRows = (cache: PagedKVCache) => new PagedKvRows(cache.capacityTokens, cache.blockSize, cache.direct, cache.quantization, cache.turbo);
 const rotatingAffineVerify = (cache: { readonly maxSize: number; readonly groupSize: number; readonly bits: number;
   readonly kernels: RotatingAffineLayout["kernels"]; readonly masks: RotatingAffineLayout["masks"] }) =>
   new SpeculativeRotatingAffineLayout(cache.maxSize, cache.groupSize, cache.bits, cache.kernels, cache.masks);
@@ -70,6 +71,8 @@ const ROW_LAYOUTS: readonly RowLayoutEntry<Cache>[] = [
   entry(PagedKVCache, { decode: pagedRows, prefill: pagedRows, verify: pagedRows }),
   ownEmptyBatch(PagedKvRows),
   ownEmptyBatch(MLACache),
+  ownEmptyBatch(EncodedLatentCache),
+  ownEmptyBatch(PagedLatentCache),
   entry(DelayedRotatingQuantizedKVCache, {
     decode: cache => cache.makeEmptyBatch(), prefill: cache => cache.makeEmptyBatch(),
     verify: cache => new DelayedRotatingQuantizedKVCache(cache.maxSize, cache.groupSize, cache.bits, cache.start,
@@ -262,16 +265,6 @@ export function createKvMaintenance(kv: KvStorageScheme): KvMaintenance {
   };
   return Object.freeze(start > 0 ? { preparePrefill, prepareBatch: preparePrefill, maxAppendTokens }
     : { preparePrefill, prepareBatch: routeStorage });
-}
-
-/** Whether every serial cache a decoding row of a composition holds is one the
- * compiled decode step drives (`CompiledDecodeCache`): bf16 storage, and affine
- * storage converting at the first append. TurboQuant storage, the delayed row
- * layouts a later start routes rows into and paged blocks have no compiled form
- * yet. The loader resolves `Composition.compiledDecode` with this, once; nothing
- * at run time asks a cache. */
-export function decodesCompiled(kv: KvStorageScheme, paged: boolean): boolean {
-  return !paged && (kv.kind === "bf16" || (kv.kind !== "turbo" && (kv.quantizedKvStart ?? 0) === 0));
 }
 
 /** A prefilled row joins decode under a scheme that converts after the first

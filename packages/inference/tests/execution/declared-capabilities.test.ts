@@ -26,7 +26,7 @@ const phases = { prefillChunk: { gpu: never }, prefillTail: atEveryWidth(never),
 function replacement(declared: Parameters<typeof declareGraph>[0] = {}, extra: object = {}, modelType = "replacement"): RuntimeModel {
   return {
     config: { modelType, text: { enableMoeBlock: false, numHiddenLayers: 1, layerTypes: ["full_attention"] }, eosTokenIds: [] },
-    makeCache: () => [new KVCache()], loraState: { active: [] }, requiredDenseKvLayers: [], logitsFromHidden() {}, ...phases,
+    makeCache: () => [new KVCache()], loraState: { active: [] }, logitsFromHidden() {}, ...phases,
     graphCapabilities: declareGraph(declared), ...extra,
   } as unknown as RuntimeModel;
 }
@@ -54,7 +54,7 @@ describe("placement follows the graph's declarations", () => {
   test("a paged composition pages every request's state; adapters and compiled decode are placed from their declarations", () => {
     // Paging is the composition's, not the graph's: any graph's plain full-attention storage pages, and
     // requests are planned exactly as without it.
-    const paged = bind(replacement({}, { composition: testComposition(undefined, { pagedKv: { blockSize: 16 } }) }));
+    const paged = bind(replacement({}, { composition: testComposition(undefined, { pagedKv: { blockSize: 16, direct: false } }) }));
     // The cache service builds every request's state from the composition: paged pages, unpaged plain storage.
     const fresh = (binding: MlxGatewayBinding, reusesPrefix: boolean) => {
       const cache = new KvCacheService(binding.graph), row = { promptIds: [1, 2], maxTokens: 62, reusesPrefix };

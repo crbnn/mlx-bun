@@ -4,13 +4,16 @@
 // express the softcap, so this read fetches the window as plain keys and values
 // and attends with the manual composition.
 //
-// It reads storage that certifies dense reads (`Cache.denseKvReads`: plain,
-// rotating and their row layouts, the delayed layouts below their transition,
-// TurboQuant storage, which decodes on read), which the graph declares through
-// `requiredDenseKvLayers` and the gateway binds. The read is the call such a
-// graph made before it read through the cache: the cache's mask for the query
-// count before the append, the append through `updateAndFetch`, then the manual
-// attention under that mask.
+// It reads every KV storage through its dense fetch (`updateAndFetch`): plain
+// and rotating storage and their row layouts hand their keys and values out as
+// stored, TurboQuant storage decoded, affine storage dequantized (the delayed
+// layouts per row, before and after a row's transition), paged storage
+// gathered. Affine storage is dequantized and then read by the same manual
+// attention, so a converted layer keeps the graph's own arithmetic over the
+// values its storage holds. The read is the call such a graph made before it
+// read through the cache: the cache's mask for the query count before the
+// append, the append through `updateAndFetch`, then the manual attention under
+// that mask.
 // TODO(B1): the dense caches own this read as a kernel set chosen at
 // construction, with their own masks, once the deprecated fetches leave the
 // cache contract.

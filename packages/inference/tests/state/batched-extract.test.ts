@@ -437,7 +437,7 @@ const stubModel = phased({
     text: { numHiddenLayers: 1, layerTypes: ["full_attention"] },
   },
   weightsBytes: 0,
-  requiredDenseKvLayers: [0], graphCapabilities: declareGraph(),
+  graphCapabilities: declareGraph(),
   makeCache: (): Cache[] => [new KVCache()],
   forward(ids: MlxArray, caches: Cache[]): MlxArray {
     const [B, L] = ids.shape as [number, number];
@@ -488,7 +488,6 @@ describe("MlxBatchExecutionGroup per-row extraction (stub model)", () => {
       ...stubModel,
       composition: testComposition(scheme.storage),
       makeCache: () => [composedFullAttentionCache(scheme.storage, 0, new AttentionMasks(), denseTurboQuantKernels)],
-      requiredDenseKvLayers: [],
       graphCapabilities: declareGraph(),
       forward(ids: MlxArray, caches: Cache[]): MlxArray {
         const [B, L] = ids.shape as [number, number];
@@ -647,7 +646,7 @@ const ssmUpdate = (ids: MlxArray, c: SSMCache): void => {
 const hybridStub = phased({
   config: { modelType: "stub" },
   weightsBytes: 0,
-  requiredDenseKvLayers: [0], graphCapabilities: declareGraph(),
+  graphCapabilities: declareGraph(),
   makeCache: (): Cache[] => [new KVCache(), new SSMCache()],
   forward(ids: MlxArray, caches: Cache[]): MlxArray {
     const [B, L] = ids.shape as [number, number];

@@ -84,6 +84,7 @@ const { trainDiffusionLora, saveAdapter, detachTraining, disposeLora } = optIn ?
 const { DEFAULT_LORA_KEYS } = optIn ? await import("@mlx-bun/training/diffusion") : {} as typeof import("@mlx-bun/training/diffusion");
 const { AdapterManager } = optIn ? await import("@mlx-bun/inference/adapters") : {} as typeof import("@mlx-bun/inference/adapters");
 const { diffusionGenerate } = optIn ? await import("@mlx-bun/inference/generation/diffusion") : {} as typeof import("@mlx-bun/inference/generation/diffusion");
+const { resolveComposition } = optIn ? await import("@mlx-bun/inference") : {} as typeof import("@mlx-bun/inference");
 const ops = optIn ? await import("@mlx-bun/mlx/ops") : {} as typeof import("@mlx-bun/mlx/ops");
 const { Dtype } = optIn ? await import("@mlx-bun/mlx/ffi") : {} as typeof import("@mlx-bun/mlx/ffi");
 
@@ -117,7 +118,7 @@ describe.skipIf(!optIn)("DiffusionGemma LoRA (denoising objective)", () => {
     let baseGeneration: ReturnType<typeof generate> | undefined, adaptedGeneration: ReturnType<typeof generate> | undefined;
     try {
       const weights = await Weights.open(modelDir);
-      const model = new DiffusionGemmaModel(weights, config);
+      const model = new DiffusionGemmaModel(weights, config, resolveComposition(config));
       try {
         const tok = await loadTokenizer(modelDir);
         const tmpl = await ChatTemplate.load(modelDir);
@@ -194,7 +195,7 @@ describe.skipIf(!optIn)("DiffusionGemma LoRA (denoising objective)", () => {
       // A fresh graph from the checkpoint mounts the saved adapter through the public manager.
       const fresh = await Weights.open(modelDir);
       try {
-        const reloaded = new DiffusionGemmaModel(fresh, config);
+        const reloaded = new DiffusionGemmaModel(fresh, config, resolveComposition(config));
         const manager = new AdapterManager(reloaded);
         const info = await manager.mount(ADAPTER_ID, adapterDir);
         expect(info.mountedLayers).toBe(targets);

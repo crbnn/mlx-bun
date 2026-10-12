@@ -143,8 +143,6 @@ export class MlxBatchExecutionGroup {
   #adoptedRetain: (() => void) | null = null;
   #contextKey: string | undefined;
   #releaseContext: (() => void) | undefined;
-  /** Attention layers a plain-KV graph reads plain, bound once; null otherwise. */
-  readonly #denseKvLayers: readonly number[] | null;
   /** Where a row's composed caches join row layouts under the composition's KV scheme. */
   readonly #maintainKv: KvMaintenance;
   /** The graph's compiled decode step, composed at bind when the graph declares
@@ -185,13 +183,6 @@ export class MlxBatchExecutionGroup {
     const kv = model.composition?.kv ?? BF16_KV;
     this.#maintainKv = createKvMaintenance(kv);
     const proto = withRuntimeConfig(this.#runtime, () => model.makeCache()); // fresh caches hold no buffers
-    // The graph's declared dense-read layers, bound once: a row whose next
-    // append is not certified plain-readable there is rejected before any
-    // shared append, after its pending output publishes.
-    let denseKvLayers: readonly number[];
-    try { denseKvLayers = bindRequiredDenseKvLayers(model.requiredDenseKvLayers, proto); }
-    catch (error) { for (const cache of proto) cache.dispose(); throw error; }
-    this.#denseKvLayers = denseKvLayers.length ? denseKvLayers : null;
     for (const c of proto) c.dispose();
     // The composition decided at load whether its storage has a compiled form.
     this.#compiled = facts.compiledDecode
@@ -436,7 +427,6 @@ export class MlxBatchExecutionGroup {
         const preparation = new MlxPrefillCohort({
           chunkSize: this.#prefillChunkSize, tailSplit: this.#prefillTailSplit,
           cache: this.#cache, maintain: this.#maintainKv,
-          ...(this.#denseKvLayers ? { denseKvReads: this.#denseKvLayers } : {}),
           forward: async (ids, caches, step) => this.#dispatch.prompt(step.phase, step.sequences, step.tokens)(ids, caches, null),
           project: (hidden, caches, completed, step) => this.#projectPrefill(hidden, caches, completed, step),
           complete: (state, logits) => this.#completePrefill(state, logits),
@@ -686,7 +676,6 @@ export class MlxBatchExecutionGroup {
   }
 
   async #step(forward?: MlxForwardWork): Promise<void> {
-    if (this.#denseKvLayers && await this.#rejectUnreadable()) return;
     if (this.#stepTrace) {
       const now = performance.now();
       if (STEP_T.lastEnd) STEP_T.gap += now - STEP_T.lastEnd;
@@ -887,23 +876,6 @@ export class MlxBatchExecutionGroup {
       } catch (error) { row.reject(error); failed.add(index); }
     }
     if (failed.size) this.#applyFilter(this.#running.flatMap((_, index) => failed.has(index) ? [] : [index]), true);
-  }
-
-  /** A graph reading plain KV: when a row's next append is not certified
-   * plain-readable, publish every pending token first (a row may finish on
-   * it), then reject the rows still not certified before any shared append.
-   * True when the batch changed; the next step then starts cold. */
-  async #rejectUnreadable(): Promise<boolean> {
-    const layers = this.#denseKvLayers!;
-    if (!this.#inners || !unreadableRows(this.#inners as Cache[], layers, this.#running.length).length) return false;
-    await this.#flushPipeline();
-    const unreadable = this.#inners ? unreadableRows(this.#inners as Cache[], layers, this.#running.length) : [];
-    if (!unreadable.length) return true;
-    const retiring = unreadable.map(row => this.#running[row]!);
-    this.#applyFilter(this.#running.flatMap((_, row) => unreadable.includes(row) ? [] : [row]), true);
-    // A consumer that cancelled while its last token published keeps its own reason.
-    for (const row of retiring) row.reject(row.req.signal?.aborted ? row.req.signal.reason : new DenseKvReadError());
-    return true;
   }
 
   /** Read out the pipeline register (if any): emit its tokens and evict
@@ -1263,5 +1235,4 @@ export class MlxBatchExecutionGroup {
 }
 
 import { BatchRequest,BatchStats,ExclusiveLock,MlxBatchExecutionGroupOptions,MlxGroupedMethod,MlxGroupPreparation,Row } from "./batch-types";
-import { DenseKvReadError, bindRequiredDenseKvLayers, unreadableRows } from "../state/dense-kv-reads";
 export { type BatchRequest,type BatchRequestFields,type BatchStats,type ExclusiveLock,type MlxBatchExecutionGroupOptions,type MlxGroupedMethod,type MlxGroupMethodHost,type MlxGroupMethodRequest,type MlxGroupPreparation,type Row,type RowSampler } from "./batch-types";

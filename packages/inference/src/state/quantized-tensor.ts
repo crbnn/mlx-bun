@@ -11,3 +11,16 @@ export const disposeTriple = (t: ops.QuantizedTensor): void => {
   t.scales.dispose();
   t.biases.dispose();
 };
+
+/** The dense fetch of affine storage: the keys and values an affine append
+ * fetched (`updateAndFetchQuantized`), each dequantized (to the activation
+ * dtype its scales carry), as a read that attends keys and values as arrays
+ * takes them. Takes ownership of both triples; the caller owns the result. */
+export function dequantizedFetch([keys, values]: [ops.QuantizedTensor, ops.QuantizedTensor],
+  groupSize: number, bits: number): [MlxArray, MlxArray] {
+  try {
+    const dense = (t: ops.QuantizedTensor) => ops.dequantize(t.packed, t.scales, t.biases, { groupSize, bits, mode: "affine" });
+    const k = dense(keys);
+    try { return [k, dense(values)]; } catch (error) { k.dispose(); throw error; }
+  } finally { disposeTriple(keys); disposeTriple(values); }
+}

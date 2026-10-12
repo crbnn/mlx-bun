@@ -45,6 +45,10 @@ const LEGOS: readonly Lego[] = [
   { name: "affine 8 (unfused)", kv: { override: 8, fusedSdpa: false }, paged: false },
   { name: "paged 8", kv: { override: 8 }, paged: true },
   { name: "TurboQuant 8/3", kv: { turboQuant: { kBits: 8, vBits: 3 } }, paged: false },
+  { name: "affine config (tiled-causal)", kv: { override: "config" }, paged: false },
+  // Pages under a per-layer scheme and under TurboQuant (B4): newly served, KL-gated.
+  { name: "paged config", kv: { override: "config" }, paged: true },
+  { name: "paged TurboQuant 8/3", kv: { turboQuant: { kBits: 8, vBits: 3 } }, paged: true },
 ];
 const PAIRS: readonly [string, string][] = [
   ["bf16", "paged bf16"],
@@ -52,6 +56,8 @@ const PAIRS: readonly [string, string][] = [
   ["bf16", "affine 4 (unfused)"], ["bf16", "affine 4 from 32 (unfused)"], ["bf16", "paged 4"],
   ["bf16", "affine 8 (unfused)"], ["bf16", "paged 8"],
   ["bf16", "TurboQuant 8/3"],
+  ["bf16", "affine config (tiled-causal)"], ["bf16", "paged config"], ["affine config (tiled-causal)", "paged config"],
+  ["bf16", "paged TurboQuant 8/3"], ["TurboQuant 8/3", "paged TurboQuant 8/3"],
 ];
 const SHAPE = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
   hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };

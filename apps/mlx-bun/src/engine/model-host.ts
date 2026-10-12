@@ -207,7 +207,7 @@ export async function loadContext(
     return implementation.create({ modelDir, modelId, options }, config, profile);
   }
   const [{ Weights }, { createModel, declaredGraph, openPlannedRuntime, plansMemory, loadModelChatTemplate,
-      sentinelDeclarationFor, mediaTokenDeclarationFor, generationDefaultsFor, resolveComposition, assertComposedCaches },
+      sentinelDeclarationFor, mediaTokenDeclarationFor, generationDefaultsFor, resolveComposition, stateCodecsOf },
     { loadTokenizer, resolveSentinelTokens, resolveVisionTokenIds, resolveAudioTokenIds },
     { AdapterManager }, { bindLegacyDraftTarget }, { defaultDraftProviders }] = await Promise.all([
     import("@mlx-bun/inference/artifacts"), import("@mlx-bun/inference/models"),
@@ -251,6 +251,7 @@ export async function loadContext(
     let runtime: Awaited<ReturnType<typeof openPlannedRuntime>> | null = null;
     if (planned) {
       const nativeDraft = !externalDraft && opts.runtime?.nativeDraft !== false;
+      const plannedCaches = resolveComposition(config, { kv: opts.kv, pagedKv: opts.pagedKv });
       runtime = await openPlannedRuntime(modelDir, profile, {
         ...opts.runtime,
         memoryBudgetBytes: opts.memoryBudgetBytes ?? opts.runtime?.memoryBudgetBytes,
@@ -258,6 +259,8 @@ export async function loadContext(
         batchSize: nativeDraft || externalDraft ? 1 : opts.runtime?.batchSize,
         // An explicit alternate drafter replaces the native head.
         nativeDraft,
+        // Its caches compose the KV scheme and paging the composition resolves below from the same flags.
+        kv: plannedCaches.kv, pagedKv: plannedCaches.pagedKv,
       });
       model = runtime.model;
       owned.add(runtime.model);
@@ -325,8 +328,6 @@ export async function loadContext(
     // planned runtime built its graph from its own memory plan above.
     const composition = resolveComposition(config, { kv: opts.kv, pagedKv: opts.pagedKv, adapters: opts.adapters, maxRows: opts.maxRows, aneBridge: opts.aneBridge,
       draft: draft && { numDraftTokens: draft.numDraftTokens, adaptive: opts.adaptiveDraftDepth } });
-    // A planned runtime built its graph and caches above: the record cannot change them.
-    if (planned) assertComposedCaches(model, composition);
     if (!planned) {
       model = createModel(weights!, config, composition, profile);
       if ("dispose" in model && typeof model.dispose === "function") owned.add(model);
@@ -404,7 +405,9 @@ export async function loadContext(
     // never pay for a tower. The graph knows which its checkpoint ships.
     const encoders = await declaredGraph(model).mediaEncoders?.(modelDir, { shipsAudioTower: sidecarShipsAudioTower })
       ?? { vision: null, audio: null };
+    const stateCodecs = stateCodecsOf(model);
     const context: Omit<ModelContext, "dispose"> = {
+      ...(stateCodecs ? { stateCodecs } : {}),
       draft,
       model,
       profile,

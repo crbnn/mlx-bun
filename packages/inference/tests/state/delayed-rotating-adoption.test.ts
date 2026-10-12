@@ -271,18 +271,16 @@ test("padded rotating prefill reads plain, finalizes its positions and decodes a
   } finally { group.dispose(); twin.dispose(); for (const c of control) c.dispose(); }
 });
 
-test("a rotating plain read appends to no row once any row is converted, before or by the scheduled maintenance", () => {
-  const snapshot = (group: DelayedRotatingQuantizedKVCache) => ({ offsets: [...group.rowOffsets], pads: [...group.leftPad],
-    rows: group.rowOffsets.map((_, row) => { const s = group.extractRow(row); try { return logical(s); } finally { s.dispose(); } }) });
+test("a rotating dense read appends every row once any row is converted, before or by the scheduled maintenance", () => {
   const maintain = (rows: Cache[]) => settle(rows, 4, 6);
   using k = f16(2, 2, 1, 50), v = f16(2, 2, 1, 51);
+  // Every row appends and fetches dense (`tests/state/dense-kv-reads.test.ts` holds the values to their oracle).
   for (const lengths of [[3, 7], [7, 9]]) {
     const source = soloRows(lengths, 40); maintain(source);
     const group = new DelayedRotatingQuantizedKVCache(W, 64, 4, 6, unfusedAffineKernels); group.mergeRows(source);
     try {
-      const before = snapshot(group);
-      expect(() => group.updateAndFetch(k, v)).toThrow("mixed precision rows use their attention state");
-      expect(snapshot(group)).toEqual(before);
+      for (const a of group.updateAndFetch(k, v)) a.dispose();
+      expect(group.rowOffsets).toEqual(lengths.map(length => length + 1));
     } finally { group.dispose(); for (const c of source) c.dispose(); }
   }
   const source = soloRows([3, 5], 60), control = cloneKvCaches(source);
@@ -290,10 +288,10 @@ test("a rotating plain read appends to no row once any row is converted, before 
   try {
     for (const a of group.updateAndFetch(k, v)) a.dispose();
     expect(group.rowOffsets).toEqual([4, 6]);
-    expect(() => group.updateAndFetch(k, v)).toThrow("mixed precision rows use their attention state");
-    expect(group.rowOffsets).toEqual([4, 6]);
+    for (const a of group.updateAndFetch(k, v)) a.dispose();
+    expect(group.rowOffsets).toEqual([5, 7]);
     using k0 = rowOf(k, 0), v0 = rowOf(v, 0);
-    write(control[0]!, k0, v0);
+    write(control[0]!, k0, v0); write(control[0]!, k0, v0);
     const first = group.extractRow(0), second = group.extractRow(1);
     try { expect(logical(first)).toEqual(logical(control[0]!)); expect(second).toBeInstanceOf(RotatingQuantizedKVCache); }
     finally { first.dispose(); second.dispose(); }

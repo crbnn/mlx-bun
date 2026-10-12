@@ -3,13 +3,14 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { RotatingKVCache } from "./rotating-kv";
 import { type AttentionRead, type Cache, type CommittedAttentionCache, type KvAttentionView, type PaddedPrefillCache, type PrefillPadding } from "../contracts/mlx/cache";
-import type { KvAttentionState } from "./kv-storage";
+import { kvStorage, type KvAttentionState } from "./kv-storage";
 import { SpeculativeTransitioningKvRows } from "./transitioning-kv-rows";
 import { AlignedRotatingCache, alignRotatingRows, RotatingAffineLayout, SpeculativeRotatingAffineLayout, RotatingKvPositions } from "./rotating-kv-layout";
 import { BatchedRotatingQuantCache } from "./batched-rotating-quant";
 import { captureKvAttention, combineKvDonorAttention } from "./kv-attention-view";
-import { convertToAffine, transitionDue } from "./bf16-first-kv";
+import { Bf16FirstRotatingQuantizedKVCache, convertToAffine, transitionDue } from "./bf16-first-kv";
 import type { AffineKernelSet } from "./kv";
+import type { DecodeStepPlan } from "../contracts/mlx/cache";
 
 /** The affine transition of `Bf16FirstRotatingQuantizedKVCache` over aligned
  * ring rows: a plain ring converts its physical columns with its own
@@ -44,17 +45,19 @@ export class DelayedRotatingQuantizedKVCache extends SpeculativeTransitioningKvR
     super({ signature: `kv:delayed-rotating-quant:${maxSize}:${bits}:${groupSize}:${start}`, conversionOffset: start,
       ...(compose ? { compose } : {}),
       settle: rows => settleAffineRings(rows, groupSize, bits, start, kernelSet),
-      keepsDenseReads: row => {
-        const source = (row as AlignedRotatingCache).affineConversion;
-        return !source || !transitionDue(source.offset, start);
-      },
       converted: row => row instanceof AlignedRotatingCache && row.inner instanceof BatchedRotatingQuantCache,
       makeLayout: () => { const kernels = kernelSet(bits, groupSize, Dtype.bfloat16);
         return speculative ? new SpeculativeRotatingAffineLayout(maxSize, groupSize, bits, kernels) : new RotatingAffineLayout(maxSize, groupSize, bits, kernels); },
       prepareRows: alignRotatingRows,
+      lone: storage => new Bf16FirstRotatingQuantizedKVCache(maxSize, groupSize, bits, start, kernelSet, undefined, storage),
       packRows: (layout, rows) => layout.adoptAlignedRows(rows as readonly AlignedRotatingCache[]),
       extractRow: row => (row as AlignedRotatingCache).extract(speculative ? maxSize : undefined),
       rollbackRow: (row, before, keep, preserve) => (row as AlignedRotatingCache).rollback(before, keep, preserve) }, row, new RotatingKvPositions(maxSize));
+  }
+  /** A ring's lone row fetches by its ring: concat until the next write lands at
+   * the window, the ring after (`RotatingKVCache.decodePhase`). */
+  protected override decodePhaseOfRows(): DecodeStepPlan["fetch"] {
+    return this.rowOffsets[0]! + 1 < this.maxSize ? "concat" : "ring";
   }
   get attentionState(): KvAttentionState { return this; }
   captureDonorAttention(): import("../contracts/mlx/cache").KvDonorAttention {
@@ -117,14 +120,15 @@ export class DelayedRotatingQuantizedKVCache extends SpeculativeTransitioningKvR
     return new DelayedRotatingQuantizedKVCache(this.maxSize, this.groupSize, this.bits, this.start, this.kernelSet, undefined,
       this.speculative, this.compose);
   }
-  /** Plain keys and values while every row is still plain: each row's own
-   * ring answers (one row keeps its physical columns and phase; several share
-   * one aligned geometry) and rows join along the batch; the caller owns them.
-   * Once a row is converted, or the transition this append runs converts one, reading
-   * plain is an error raised before any row appends. */
+  /** The dense fetch (the softcapped read's): after the transition the append
+   * runs, each row's own ring answers as its storage fetches it dense (a
+   * converted ring dequantized; one row keeps its physical columns and phase;
+   * several share one aligned geometry) and rows join along the batch, or the
+   * packed layout's dense fetch once every row is converted; the caller owns them. */
   updateAndFetch(k: MlxArray, v: MlxArray): [MlxArray, MlxArray] {
-    this.advancePlain();
-    const rows = this.rows as AlignedRotatingCache[];
+    this.advance();
+    if (this.packed) return kvStorage(this.packed).updateAndFetch(k, v);
+    const rows = this.rows.map(kvStorage);
     if (rows.length === 1) {
       const [keys, values] = rows[0]!.updateAndFetch(k, v);
       try { this.syncPositions(true); } catch (error) { keys.dispose(); values.dispose(); throw error; }

@@ -1,6 +1,6 @@
 // geglu is gelu_approx(gate) * up whether its owner composed the compiled
-// closure (the default) or the spelled-out ops (MLX_BUN_COMPILED_GEGLU=0, read
-// by the graph's constructor), and it consumes both inputs.
+// closure (the default) or the spelled-out ops (the composition's `compiledGeglu`
+// off, read by the graph's constructor), and it consumes both inputs.
 import { expect, test } from "bun:test";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";

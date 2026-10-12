@@ -14,6 +14,10 @@ export function decodeStepInputs(temps: MlxArray[]): DecodeStepInputs {
       temps.push(view);
       return view;
     },
+    own(array) {
+      temps.push(array);
+      return array;
+    },
     writePosition(position) {
       let a = writePositions.get(position);
       if (!a) {

@@ -5,7 +5,6 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import { bidirMask, createCausalMask } from "../kernels/attention/masks";
 import { concatDecodeSlot, type AffineKernelSet } from "./kv";
 import { RotatingQuantizedKVCache } from "./rotating-quantized-kv";
-import { plainKvStorage } from "./dense-kv-reads";
 import { AttentionMasks, causalLease, decodeByPosition, encoderWindowMask, rotatingBlockMask, sdpaRead, unmaskedLease, withLease, type MaskLease } from "./attention-read";
 
 
@@ -24,7 +23,6 @@ import { AttentionMasks, causalLease, decodeByPosition, encoderWindowMask, rotat
  *  method picks here, so a one-row window concatenates: the same bits until the
  *  ring wraps, a different key order after. */
 export class RotatingKVCache implements CompiledDecodeCache, CommittedAttentionCache, BidirectionalAttentionCache, EncoderAttentionCache, BlockAttentionCache {
-  readonly denseKvReads = plainKvStorage;
   declare minimumReusableOffset?: number;
   static readonly STEP = 256;
   /** Set only by compiled-decode trace adapters (see Cache). */

@@ -750,6 +750,8 @@ test("paged KV follows main's flag and env mirror, with the block size only alon
   expect(parse("--paged-kv").request).not.toHaveProperty("pagedKv");
   expect(() => parse("--paged-kv-block-size", "512")).toThrow("--paged-kv-block-size requires --paged-kv");
   expect(() => parse("--paged-kv", "--paged-kv-block-size", "0")).toThrow();
+  expect(parse("--paged-kv", "--paged-kv-direct").cache.pagedKv).toEqual({ direct: true });
+  expect(() => parse("--paged-kv-direct")).toThrow("--paged-kv-direct requires --paged-kv");
   const restore = configureRuntime({ MLX_BUN_PAGED_KV: "1" });
   try { expect(parse().cache.pagedKv).toEqual({}); expect(parse("--paged-kv-block-size", "128").cache.pagedKv).toEqual({ blockSize: 128 }); }
   finally { restore(); }

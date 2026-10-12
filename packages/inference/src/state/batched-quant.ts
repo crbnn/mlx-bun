@@ -299,7 +299,7 @@ export class PaddedQuantKVRows implements AttentionCache, BatchableCache {
   #step(): BatchedQuantDecodeMaskCache {
     return this.#view ??= new BatchedQuantDecodeMaskCache(this.#inner, this.#leftPad.length, [...this.#leftPad]);
   }
-  updateAndFetch(): [MlxArray, MlxArray] { return this.#inner.updateAndFetch(); }
+  updateAndFetch(k: MlxArray, v: MlxArray): [MlxArray, MlxArray] { return this.#inner.updateAndFetch(k, v); }
   makeMask(N: number, windowSize: number | null): Mask {
     return this.#padded ? this.#step().makeMask(N, windowSize) : this.#inner.makeMask(N, windowSize);
   }

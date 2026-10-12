@@ -3,7 +3,7 @@
 // requests enter through the public gateway binding (plan, createBatchGroup)
 // with the composition's cache service, as the app composes them. Two readers: the gathered arm (block gather into stock SDPA;
 // for bf16 pages this is main's bit-exact contract against plain KV) and the
-// direct Metal reader (MLX_BUN_PAGED_ATTN=1, Lab numerics). Pages store bf16 or
+// direct Metal reader (the composition's `pagedKv.direct`, Lab numerics). Pages store bf16 or
 // affine KV4/KV8, encoded from their first token; sliding layers follow the
 // server-wide scheme, as `--kv-quant 4|8 --paged-kv` composes them.
 // Checked within this tree:
@@ -11,7 +11,8 @@
 //   tokens, every sampled full-vocabulary vector, and each retired row's valid
 //   K/V in every layer (main's paged-kv-parity contract, extended to KV planes);
 // - direct reads at B3 over bf16, KV4 and KV8 pages: the direct kernel actually
-//   serves decode (the cache's decode read; windows gather), and on
+//   serves decode, and a window of at most eight queries (a six-token prompt's
+//   prefill, run alone), and on
 //   every such call its output equals the gathered reader's over the same query
 //   and pages within DIRECT_TOLERANCE of the output's scale (the two differ only
 //   in reduction order and where dequantized values round); every sampled
@@ -149,51 +150,57 @@ test.skipIf(!inputs)("Gemma4 paged KV: gathered bf16 equals plain KV; direct rea
     const schemeFor = (encoding: Encoding) => encoding === "bf16" ? undefined : resolveKvScheme({ override: encoding, fusedSdpa: true });
     // One graph per encoding and paging (block size, or null unpaged): the composition pages every request.
     const models = new Map<string, A>();
-    const modelFor = (encoding: Encoding, blockSize: number | null = null): A => {
-      const key = `${encoding}:${blockSize}`;
+    const modelFor = (encoding: Encoding, blockSize: number | null = null, reader: Reader = "gathered"): A => {
+      const key = `${encoding}:${blockSize}:${reader}`;
       let built = models.get(key);
       if (!built) {
         const scheme = schemeFor(encoding);
         built = createModel(weights, config, resolveComposition(config, { ...(scheme ? { kv: { override: encoding as 4 | 8, fusedSdpa: true } } : {}),
-          ...(blockSize === null ? {} : { pagedKv: { blockSize } }) }));
+          ...(blockSize === null ? {} : { pagedKv: { blockSize, direct: reader === "direct" } }) }));
         models.set(key, built);
       }
       return built;
     };
     const model = modelFor("bf16");
     const layers = (() => { const probe: Cache[] = model.makeCache(); try { return probe.length; } finally { releaseAll(probe.map(c => () => c.dispose())); } })();
-    const runtimeFor = (reader: Reader) => createRuntimeConfig({ MLX_BUN_PAGED_ATTN: reader === "direct" ? "1" : "0" });
+    const runtime = createRuntimeConfig({});
     // Direct dispatch accounting: the direct kernel serves the decode read
-    // (`appendDecode`, one query, no mask; a window always gathers), and every
-    // such call is checked against the gathered reader over the same query and pages.
-    let directCalls = 0, worstRelative = 0;
-    const appendDecode = PagedKVCache.prototype.appendDecode;
-    PagedKVCache.prototype.appendDecode = function (this: A, k: MlxArray, v: MlxArray) {
-      const read = appendDecode.call(this, k, v);
-      if (!this.direct) return read;
-      const gathered = pagedAttentionView(this.pool!, [...this.blockTable], this.offset, false);
-      return { attend(q: MlxArray, scale: number) {
-        const out = read.attend(q, scale);
-        directCalls++;
-        using expected = gathered.attend(q, scale, { mode: "", arr: null });
-        const [x, y] = [out.toFloat32(), expected.toFloat32()];
-        let difference = 0, magnitude = 0;
-        for (let i = 0; i < y.length; i++) {
-          difference = Math.max(difference, Math.abs(x[i]! - y[i]!)); magnitude = Math.max(magnitude, Math.abs(y[i]!));
-        }
-        worstRelative = Math.max(worstRelative, difference / magnitude);
-        if (!(difference <= DIRECT_TOLERANCE * magnitude))
-          throw new Error(`direct paged attention differs from the gathered reader by ${difference} (output scale ${magnitude}, q ${q.shape})`);
-        return out;
-      }, dispose() { read.dispose(); gathered.dispose(); } };
+    // (`appendDecode`, one query, no mask) and windows of at most eight queries
+    // (`appendWindow`, the causal mask), and every such call is checked against
+    // the gathered reader over the same query and pages.
+    let directCalls = 0, directWindows = 0, worstRelative = 0;
+    const checked = (method: "appendDecode" | "appendWindow", mask: { mode: "" | "causal"; arr: null }) => {
+      const original = PagedKVCache.prototype[method];
+      PagedKVCache.prototype[method] = function (this: A, k: MlxArray, v: MlxArray) {
+        const read = original.call(this, k, v);
+        if (!this.direct || k.shape[2]! > 8) return read;
+        const gathered = pagedAttentionView(this.pool!, [...this.blockTable], this.offset, false);
+        return { attend(q: MlxArray, scale: number) {
+          const out = read.attend(q, scale);
+          directCalls++;
+          if (method === "appendWindow") directWindows++;
+          using expected = gathered.attend(q, scale, mask);
+          const [x, y] = [out.toFloat32(), expected.toFloat32()];
+          let difference = 0, magnitude = 0;
+          for (let i = 0; i < y.length; i++) {
+            difference = Math.max(difference, Math.abs(x[i]! - y[i]!)); magnitude = Math.max(magnitude, Math.abs(y[i]!));
+          }
+          worstRelative = Math.max(worstRelative, difference / magnitude);
+          if (!(difference <= DIRECT_TOLERANCE * magnitude))
+            throw new Error(`direct paged attention differs from the gathered reader by ${difference} (output scale ${magnitude}, q ${q.shape})`);
+          return out;
+        }, dispose() { read.dispose(); gathered.dispose(); } };
+      };
+      releases.push(() => { PagedKVCache.prototype[method] = original; });
     };
-    releases.push(() => { PagedKVCache.prototype.appendDecode = appendDecode; });
+    checked("appendDecode", { mode: "", arr: null });
+    checked("appendWindow", { mode: "causal", arr: null });
 
-    /** One execution group per call, bound under the reader's runtime. Rows
-     * submit while admission is held, then release together (a real cohort). */
+    /** One execution group per call, over the graph composed with the setup's
+     * paging and reader. Rows submit while admission is held, then release
+     * together (a real cohort). */
     const runGroup = async (setup: Setup, rows: RowSpec[], opts: RunOptions = {}) => {
-      const runtime = runtimeFor(setup.reader);
-      const binding = withRuntimeConfig(runtime, () => bindMlxGateway(modelFor(setup.encoding, setup.paged ? setup.blockSize : null)));
+      const binding = withRuntimeConfig(runtime, () => bindMlxGateway(modelFor(setup.encoding, setup.paged ? setup.blockSize : null, setup.reader)));
       const scheme = schemeFor(setup.encoding);
       const options: A = {};
       const plan = binding.plan({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
@@ -297,13 +304,17 @@ test.skipIf(!inputs)("Gemma4 paged KV: gathered bf16 equals plain KV; direct rea
       const gatheredSetup: Setup = { encoding, reader: "gathered", paged: true, blockSize: 16 };
       const directSetup: Setup = { ...gatheredSetup, reader: "direct" };
       const gathered = await runGroup(gatheredSetup, rows.map(prompt => ({ prompt })));
-      const before = directCalls;
+      const before = directCalls, windowsBefore = directWindows;
       worstRelative = 0;
       const direct = await runGroup(directSetup, rows.map(prompt => ({ prompt })));
       completed(gatheredSetup, gathered.outcomes); completed(directSetup, direct.outcomes);
       expect(directCalls - before).toBeGreaterThan(0);
+      // A prompt whose prefill window is at most eight queries reads it directly.
+      const short = await runGroup(directSetup, [{ prompt: rows[0]!.slice(0, 6) }]);
+      completed(directSetup, short.outcomes);
+      expect(directWindows - windowsBefore).toBeGreaterThan(0);
       const equalRows = direct.outcomes.map((o, row) => Bun.deepEquals(o.tokens, gathered.outcomes[row]!.tokens));
-      console.log(`[paged] direct ${encoding}: ${directCalls - before} direct attention calls within ${worstRelative.toExponential(2)} ` +
+      console.log(`[paged] direct ${encoding}: ${directCalls - before} direct attention calls (${directWindows - windowsBefore} windows) within ${worstRelative.toExponential(2)} ` +
         `of the gathered reader (relative); greedy tokens equal the gathered arm per row: ${JSON.stringify(equalRows)}`);
 
       for (const reader of READERS) {

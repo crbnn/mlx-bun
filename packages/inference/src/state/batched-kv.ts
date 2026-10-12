@@ -6,7 +6,6 @@ import { KVCache } from "./kv";
 import { isPlainKvCache } from "./capabilities";
 import { type AttentionRead, type BatchableCache, type Cache, type CommittedAttentionCache, type Mask, type PaddedPrefillCache, type PrefillPadding } from "../contracts/mlx/cache";
 import { FullPrefillPadding } from "./full-prefill-padding";
-import { plainKvStorage } from "./dense-kv-reads";
 import { AttentionMasks, causalLease, sdpaRead, unmaskedLease, withLease, type MaskLease } from "./attention-read";
 
 /** Full-attention storage with independently advancing row positions.
@@ -20,7 +19,6 @@ import { AttentionMasks, causalLease, sdpaRead, unmaskedLease, withLease, type M
  * each row's left padding) for their query count, built once per forward
  * through `masks`. */
 export class BatchedKVCache implements BatchableCache, PaddedPrefillCache, CommittedAttentionCache {
-  readonly denseKvReads = plainKvStorage;
   keys: MlxArray | null = null;
   values: MlxArray | null = null;
   rowOffsets: number[] = [];
@@ -43,9 +41,7 @@ export class BatchedKVCache implements BatchableCache, PaddedPrefillCache, Commi
   }
 
   /** Fill spans run on this layout (the target layout of a full-attention
-   * layer). The graph qualifies bf16 committed spans as the window read
-   * (`supportsCommittedAppendCache` admits storage without `kvBits`), so a
-   * committed span reads exactly as a window does. */
+   * layer). A bf16 committed span reads exactly as a window does. */
   appendCommitted(k: MlxArray, v: MlxArray): AttentionRead {
     return this.appendWindow(k, v);
   }

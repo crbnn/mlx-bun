@@ -119,7 +119,14 @@ export interface NativeMtpHead {
   readonly hiddenSize: number;
   /** Geometry of the compressed cache the head appends to. */
   readonly cache: { readonly kvLoraRank: number; readonly ropeHeadDim: number; readonly maxTokens: number };
-  forward(ids: MlxArray, hidden: MlxArray, cache: Cache): Promise<MlxArray>;
+  /** One draft step: `ids` [B, 1] (one token per sequence) over each row's anchor
+   * `hidden` [B, 1, hidden], appended to `cache`; the caller owns the output
+   * [B, 1, hidden]. */
+  decode(ids: MlxArray, hidden: MlxArray, cache: Cache): Promise<MlxArray>;
+  /** A window of two or more tokens per sequence, `ids` [B, L] over `hidden`
+   * [B, L, hidden], appended to `cache`; the caller owns the output. The caller
+   * names the phase from the window it built: one token per sequence is `decode`. */
+  window(ids: MlxArray, hidden: MlxArray, cache: Cache): Promise<MlxArray>;
   /** Logits [B, positions, V] of the head's output. */
   project(hidden: MlxArray): MlxArray;
 }

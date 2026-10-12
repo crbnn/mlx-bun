@@ -178,7 +178,6 @@ export class Bf16FirstQuantizedKVCache implements CommittedAttentionCache, Bidir
   get offset(): number { return this.#storage.offset; }
   get minimumReusableOffset(): number | undefined { return (this.#storage as Cache).minimumReusableOffset; }
   set minimumReusableOffset(value: number | undefined) { (this.#storage as Cache).minimumReusableOffset = value; }
-  get denseKvReads() { return (this.#storage as Cache).denseKvReads; }
   /** The donor reads of the storage held now: a drafter borrowing this layer's
    * keys and values reads them as the storage hands them out. */
   get captureDonorRows() { const storage = this.#storage as Cache; return storage.captureDonorRows?.bind(storage); }
@@ -235,8 +234,11 @@ export class Bf16FirstQuantizedKVCache implements CommittedAttentionCache, Bidir
   decodeInputs(plan: DecodeStepPlan, step: DecodeStepInputs): MlxArray[] { return this.#storage.decodeInputs(plan, step); }
   commitDecodeStep(slot: DecodeSlot, outputs: MlxArray[]): MlxArray[] {
     const evalWith = this.#storage.commitDecodeStep(slot, outputs);
-    if (this.#plain) this.#convertIfDue();
-    return evalWith;
+    if (!this.#plain || !transitionDue(this.#plain.offset, this.start)) return evalWith;
+    // The conversion consumes the arrays the step wrote and evaluates the
+    // converted storage before it returns: nothing is left to evaluate here.
+    this.#convertIfDue();
+    return [];
   }
 
   /** After a bf16 append: convert once the stored length reaches the start.
@@ -261,11 +263,11 @@ export class Bf16FirstQuantizedKVCache implements CommittedAttentionCache, Bidir
   trim(n: number): void { this.#storage.trim(n); }
   /** @deprecated The reads build their own masks. */
   makeMask(N: number, windowSize: number | null): Mask { return this.#storage.makeMask(N, windowSize); }
-  /** @deprecated Read through `appendDecode` or `appendWindow`. The plain
+  /** @deprecated Read through `appendDecode` or `appendWindow`. The dense
    * fetch of the storage (the softcapped read's): bf16 storage fetches and then
-   * converts as an append does; affine storage has no plain fetch. */
+   * converts as an append does; affine storage fetches its window dequantized. */
   updateAndFetch(k: MlxArray, v: MlxArray): [MlxArray, MlxArray] {
-    if (this.#quantized) return this.#quantized.updateAndFetch();
+    if (this.#quantized) return this.#quantized.updateAndFetch(k, v);
     return fetchThenSettle(this.#plain!.updateAndFetch(k, v), () => this.#convertIfDue());
   }
 
@@ -323,7 +325,6 @@ export class Bf16FirstRotatingQuantizedKVCache implements CommittedAttentionCach
   get offset(): number { return this.#storage.offset; }
   get minimumReusableOffset(): number | undefined { return (this.#storage as Cache).minimumReusableOffset; }
   set minimumReusableOffset(value: number | undefined) { (this.#storage as Cache).minimumReusableOffset = value; }
-  get denseKvReads() { return (this.#storage as Cache).denseKvReads; }
   /** The donor reads of the storage held now: a drafter borrowing this layer's
    * keys and values reads them as the storage hands them out. */
   get captureDonorRows() { const storage = this.#storage as Cache; return storage.captureDonorRows?.bind(storage); }
@@ -381,8 +382,11 @@ export class Bf16FirstRotatingQuantizedKVCache implements CommittedAttentionCach
   decodeInputs(plan: DecodeStepPlan, step: DecodeStepInputs): MlxArray[] { return this.#storage.decodeInputs(plan, step); }
   commitDecodeStep(slot: DecodeSlot, outputs: MlxArray[]): MlxArray[] {
     const evalWith = this.#storage.commitDecodeStep(slot, outputs);
-    if (this.#plain) this.#convertIfDue();
-    return evalWith;
+    if (!this.#plain || !transitionDue(this.#plain.offset, this.start)) return evalWith;
+    // The conversion consumes the arrays the step wrote and evaluates the
+    // converted storage before it returns: nothing is left to evaluate here.
+    this.#convertIfDue();
+    return [];
   }
 
   #settle(read: AttentionRead): AttentionRead {
@@ -405,11 +409,11 @@ export class Bf16FirstRotatingQuantizedKVCache implements CommittedAttentionCach
   trim(n: number, bypass?: boolean): void { this.#storage.trim(n, bypass); }
   /** @deprecated The reads build their own masks. */
   makeMask(N: number, windowSize: number | null): Mask { return this.#storage.makeMask(N, windowSize); }
-  /** @deprecated Read through `appendDecode` or `appendWindow`. The plain
+  /** @deprecated Read through `appendDecode` or `appendWindow`. The dense
    * fetch of the storage (the softcapped read's): a bf16 ring fetches and then
-   * converts as an append does; an affine ring has no plain fetch. */
+   * converts as an append does; an affine ring fetches its ring dequantized. */
   updateAndFetch(k: MlxArray, v: MlxArray): [MlxArray, MlxArray] {
-    if (this.#quantized) return this.#quantized.updateAndFetch();
+    if (this.#quantized) return this.#quantized.updateAndFetch(k, v);
     return fetchThenSettle(this.#plain!.updateAndFetch(k, v), () => this.#convertIfDue());
   }
 
@@ -445,7 +449,7 @@ export class Bf16FirstRotatingQuantizedKVCache implements CommittedAttentionCach
  * resolved by whoever builds the cache; nothing here reads the runtime
  * configuration.
  */
-export class Bf16FirstTurboQuantKVCache implements CommittedAttentionCache, BidirectionalAttentionCache, EncoderAttentionCache, BlockAttentionCache {
+export class Bf16FirstTurboQuantKVCache implements CommittedAttentionCache, BidirectionalAttentionCache, EncoderAttentionCache, BlockAttentionCache, CompiledDecodeCache {
   #plain: KVCache | null;
   #encoded: TurboQuantKVCache | null = null;
 
@@ -474,7 +478,6 @@ export class Bf16FirstTurboQuantKVCache implements CommittedAttentionCache, Bidi
   get offset(): number { return this.#storage.offset; }
   get minimumReusableOffset(): number | undefined { return (this.#storage as Cache).minimumReusableOffset; }
   set minimumReusableOffset(value: number | undefined) { (this.#storage as Cache).minimumReusableOffset = value; }
-  get denseKvReads() { return (this.#storage as Cache).denseKvReads; }
   /** The donor reads of the storage held now: a drafter borrowing this layer's
    * keys and values reads them as the storage hands them out. */
   get captureDonorRows() { const storage = this.#storage as Cache; return storage.captureDonorRows?.bind(storage); }
@@ -523,6 +526,21 @@ export class Bf16FirstTurboQuantKVCache implements CommittedAttentionCache, Bidi
 
   maxAppendTokens(): number {
     return this.#plain && this.#plain.offset < this.start ? this.start - this.#plain.offset : Infinity;
+  }
+
+  // The compiled decode step drives the storage held now; a committed step
+  // owes the transition an append owes.
+  prepareDecodeStep(): DecodeStepPlan { return this.#storage.prepareDecodeStep(); }
+  decodePhase(): DecodeStepPlan["fetch"] { return this.#storage.decodePhase(); }
+  decodeSlot(plan: DecodeStepPlan): DecodeSlot { return this.#storage.decodeSlot(plan); }
+  decodeInputs(plan: DecodeStepPlan, step: DecodeStepInputs): MlxArray[] { return this.#storage.decodeInputs(plan, step); }
+  commitDecodeStep(slot: DecodeSlot, outputs: MlxArray[]): MlxArray[] {
+    const evalWith = this.#storage.commitDecodeStep(slot, outputs);
+    if (!this.#plain || !transitionDue(this.#plain.offset, this.start)) return evalWith;
+    // The conversion consumes the arrays the step wrote and evaluates the
+    // converted storage before it returns: nothing is left to evaluate here.
+    this.#convertIfDue();
+    return [];
   }
 
   #settle(read: AttentionRead): AttentionRead {

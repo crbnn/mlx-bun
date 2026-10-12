@@ -7,7 +7,6 @@ import { type AttentionRead, type BatchableCache, type Cache, type CommittedAtte
 import type { RotatedValueAttentionState } from "./kv-storage";
 import * as tq from "../kernels/turboquant/ops";
 import { TurboQuantCodec, turboQuantFusedDecode, disposeTurboQuant, type TurboQuantTensor } from "./turboquant-codec";
-import { decodedKvStorage } from "./dense-kv-reads";
 import { AttentionMasks, causalLease, unmaskedLease, type MaskLease } from "./attention-read";
 import type { TurboQuantKernels } from "./turboquant-attention";
 
@@ -28,7 +27,6 @@ function encoded(planes: readonly MlxArray[]): TurboQuantTensor {
  * through `masks`. Those are the masks the graphs build with `makeMask` before
  * the append. A committed span is the window read. */
 export class BatchedTurboQuantKVCache implements CommittedAttentionCache, BatchableCache, PaddedPrefillCache {
-  readonly denseKvReads = decodedKvStorage;
   readonly #storage = new KvTensorRows();
   readonly #codec: TurboQuantCodec;
   #reuseOffsets: number[] = [];

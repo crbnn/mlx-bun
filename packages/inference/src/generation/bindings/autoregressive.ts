@@ -7,7 +7,7 @@ import { runtimeConfig, type RuntimeConfig } from "../../runtime/config";
 import type { MlxTokenGraph } from "../../models/graph";
 import type { PrefillPolicy } from "../../contracts/portable/prefill";
 import { resolveMlxPrefillPolicy } from "./prefill-policy";
-import { COMPOSITION_DEFAULTS, type KvStorageScheme } from "../../contracts/portable/composition";
+import { COMPOSITION_DEFAULTS, type KvStorageScheme, type PagedKvComposition } from "../../contracts/portable/composition";
 import { MlxPhaseDispatch } from "../phase-dispatch";
 
 export type { MlxModelMemory };
@@ -19,20 +19,6 @@ export interface MlxDecodeStep {
   /** Release per-run workspaces after pending outputs are dropped and before
    * cache disposal. Wait for native work if releasing requires completion. */
   close(): void | Promise<void>;
-}
-
-/** The model declares which codecs retain its committed-span arithmetic; `kv`
- * is the composition's KV scheme, which its caches store. */
-export function supportsCommittedAppendCache(
-  spans: Pick<MlxKnownSpans, "affineKvBits" | "turboQuantFormats"> | null | undefined,
-  kv: KvStorageScheme,
-): boolean {
-  switch (kv.kind) {
-    case "bf16": return true;
-    case "turbo": return !!spans?.turboQuantFormats?.some(format => format.kBits === kv.kBits && format.vBits === kv.vBits);
-    case "affine-layers": return kv.layers.every(layer => spans?.affineKvBits?.includes(layer.bits));
-    case "affine": return !!spans?.affineKvBits?.includes(kv.bits);
-  }
 }
 
 /** One replaceable binding owns all graph-specific operations used by the AR
@@ -52,7 +38,7 @@ export interface MlxAutoregressiveBinding {
   /** The composition's KV scheme, which `makeCache` composes; absent: bf16. */
   readonly kv?: KvStorageScheme;
   /** The composition's paging (`pagedKv`); absent: none. */
-  readonly pagedKv?: { readonly blockSize: number } | null;
+  readonly pagedKv?: PagedKvComposition | null;
   /** The composition's `prefillTailSplit`; absent: the default. */
   readonly prefillTailSplit?: boolean;
   /** The composition's `grammarJump`; absent: the default. */

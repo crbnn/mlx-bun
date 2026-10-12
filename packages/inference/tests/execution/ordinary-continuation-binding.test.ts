@@ -22,7 +22,7 @@ test(`ordinary shared continuation binds ${name} through its loaded backend`, ()
   const make = (kv: KvOptions = {}) => Object.assign(Object.create(prototype), {
     config: { modelType: name, text: { enableMoeBlock: false }, eosTokenIds: [] },
     makeCache: () => [new KVCache()], composition: testComposition(kvOf(kv)),
-    loraState: { active: [] }, requiredDenseKvLayers: [],
+    loraState: { active: [] },
   }) as Gemma4Model;
   const model = make();
   const binding = bindMlxGateway(model);
@@ -57,7 +57,7 @@ test("Gemma2 softcap plans shared continuation for plain, affine and TurboQuant 
   const make = (kv: KvOptions = {}) => Object.assign(Object.create(UniversalDenseModel.prototype), { encodedKvAttention: false,
     args: { modelType: "gemma2", maskArray: true, attnLogitSoftcap: 50, layerTypes: null },
     config: { modelType: "gemma2", text: { enableMoeBlock: false }, eosTokenIds: [] },
-    makeCache: () => [new KVCache()], loraState: { active: [] }, requiredDenseKvLayers: [0],
+    makeCache: () => [new KVCache()], loraState: { active: [] },
     composition: testComposition(kvOf(kv)),
   }) as UniversalDenseModel;
   const model = make();
@@ -100,15 +100,15 @@ test("Gemma2 softcap plans shared continuation for plain, affine and TurboQuant 
 });
 
 test("a paged composition pages plain, adapter and media requests alike and keys their checkpoints in its namespace", () => {
-  const graph = <M extends object>(prototype: M, modelType: string, pagedKv: { blockSize: number } | null) => Object.assign(Object.create(prototype), {
+  const graph = <M extends object>(prototype: M, modelType: string, pagedKv: { blockSize: number; direct: boolean } | null) => Object.assign(Object.create(prototype), {
     config: { modelType, text: { enableMoeBlock: false }, eosTokenIds: [] },
-    makeCache: () => [new KVCache()], loraState: { active: [] }, requiredDenseKvLayers: [],
+    makeCache: () => [new KVCache()], loraState: { active: [] },
     composition: testComposition(undefined, { pagedKv }),
   }) as M;
   const lookups: unknown[][] = [];
   const store = { findGenerationCheckpoint: (...args: unknown[]) => { lookups.push(args); return null; } } as unknown as ContinuationStore;
   const continuations = { store, persistence: new ContinuationPersistence(store, { maxBytes: 1024 }), everyTokens: 4 };
-  const pagedGraph = graph(Gemma4Model.prototype, "gemma4", { blockSize: 16 }), unpagedGraph = graph(Gemma4Model.prototype, "gemma4", null);
+  const pagedGraph = graph(Gemma4Model.prototype, "gemma4", { blockSize: 16, direct: false }), unpagedGraph = graph(Gemma4Model.prototype, "gemma4", null);
   const binding = bindMlxGateway(pagedGraph);
   const unpaged = bindMlxGateway(unpagedGraph);
   // The cache service owns the request state: the composition's paging over the graph's caches.
@@ -118,16 +118,15 @@ test("a paged composition pages plain, adapter and media requests alike and keys
   const prompt = [2, 651, 9];
   const fill = { fill: new FillSession({ rows: [], eos: [], echo: null }, prompt) };
   // Paging is the composition's state, never a planner input: every request is
-  // planned exactly as on the unpaged composition, checkpoints included. Only
-  // compiled decode differs, which the loader resolves off for paged blocks.
-  const placed = ({ compiledDecode: _compiled, ...plan }: ResolvedExecution) =>
-    ({ ...plan, reasons: plan.reasons.filter(reason => reason !== "compiled-decode-unavailable-for-request") });
+  // planned exactly as on the unpaged composition, checkpoints and compiled
+  // decode included.
+  const placed = (plan: ResolvedExecution) => plan;
   for (const [request, options] of [[shape, {}], [adapterShape, adapters], [{ ...shape, hasVision: true }, {}],
     [{ ...adapterShape, hasGrammar: true }, adapters], [adapterShape, { ...adapters, ...fill }],
     [{ ...adapterShape, wantsLogprobs: true }, adapters]] as const)
     expect({ request, plan: placed(binding.plan(request, options, schedule)) })
       .toEqual({ request, plan: placed(unpaged.plan(request, options, schedule)) });
-  expect(binding.plan(shape, {}, schedule).compiledDecode).toBe(false);
+  expect(binding.plan(shape, {}, schedule).compiledDecode).toBe(true);
   expect(unpaged.plan(shape, {}, schedule).compiledDecode).toBe(true);
   // The adapter row pages; its prefixes and checkpoints live in the paged namespace over its own.
   const plan = binding.plan(adapterShape, adapters, schedule);
@@ -135,7 +134,7 @@ test("a paged composition pages plain, adapter and media requests alike and keys
   // The method's namespace is the composition's alike; the cache service adds its paging.
   expect(binding.prefixNamespace!(plan, adapters, "upper@a")).toBe("upper@a");
   expect(unpaged.prefixNamespace!(plan, adapters, "upper@a")).toBe("upper@a");
-  const namespace = pagedPrefixNamespace(pagedGraph.composition!.kv, { blockSize: 16 }, "upper@a", false);
+  const namespace = pagedPrefixNamespace(pagedGraph.composition!.kv, { blockSize: 16, direct: false }, "upper@a");
   expect(JSON.parse(namespace)[0]).toBe("paged-v1");
   expect(binding.reusesPrefix(plan)).toBe(true);
   const requests = [binding.continuationRequest!(plan, adapters, prompt, () => {}, 4)!,
@@ -160,7 +159,7 @@ test("a paged composition pages plain, adapter and media requests alike and keys
   try { expect({ reused: fresh.reusedTokens, caches: fresh.caches.map(state => state.signature()) }).toEqual({ reused: 0, caches: ["kv:paged"] }); }
   finally { for (const state of fresh.caches) state.dispose(); pagedCache.release(prepared, false); }
   // Any graph pages: the composition pages Qwen 3.5's plain full-attention storage the same way.
-  const qwen = bindMlxGateway(graph(Qwen35Model.prototype, "qwen3_5", { blockSize: 16 }));
+  const qwen = bindMlxGateway(graph(Qwen35Model.prototype, "qwen3_5", { blockSize: 16, direct: false }));
   const qwenCache = new KvCacheService(qwen.graph);
   for (const request of [shape, adapterShape]) {
     const placed = qwen.plan(request, adapters, schedule);

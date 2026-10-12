@@ -6,7 +6,7 @@ import type { QuantizedAttentionState } from "./kv-storage";
 import { createCausalMask } from "../kernels/attention/masks";
 
 import { activeQuantViews,quantConcatDecodeSlot } from "./quantized-kv";
-import { disposeTriple,mapTriple } from "./quantized-tensor";
+import { dequantizedFetch,disposeTriple,mapTriple } from "./quantized-tensor";
 import { AttentionMasks, decodeByPosition, rotatingBlockMask, unmaskedLease, withLease, type MaskLease } from "./attention-read";
 import { affineCausalLease, affineRead, unfusedAffineKernels, viewAffineKernel, type AffineKernel, type AffineKernels, type AffineKernelSet } from "./affine-attention";
 
@@ -166,8 +166,10 @@ export class RotatingQuantizedKVCache implements CompiledDecodeCache, CommittedA
     return tensors.reduce((bytes, array) => bytes + array.nbytes, 0) / steps;
   }
 
-  updateAndFetch(): [MlxArray, MlxArray] {
-    throw new Error("RotatingQuantizedKVCache: use updateAndFetchQuantized");
+  /** The dense fetch: appends, then the stored ring (as the affine fetch
+   * hands it out) dequantized. */
+  updateAndFetch(k: MlxArray, v: MlxArray): [MlxArray, MlxArray] {
+    return dequantizedFetch(this.updateAndFetchQuantized(k, v), this.groupSize, this.bits);
   }
 
   #seqLen(): number {

@@ -78,7 +78,7 @@ export class Glm52MtpRows {
     this.#cache.specRoundBegin();
     try {
       for (let position = 0; position < depth; position++) {
-        const hidden = await this.graph.forward(ids!, chained ?? this.#hidden!, this.#cache);
+        const hidden = await this.graph.decode(ids!, chained ?? this.#hidden!, this.#cache);
         chained?.dispose(); chained = hidden;
         using logits = this.graph.project(hidden);
         using flat = ops.reshape(logits, [B, logits.shape.at(-1)!]);
@@ -101,7 +101,8 @@ export class Glm52MtpRows {
       using ids = ops.fromInt32(this.#drafts.flatMap(tokens => Array.from({ length: width }, (_, i) => tokens[i] ?? 0)), [B, width]);
       using hidden = context.slice([0, 0, 0], [B, width, context.shape[2]!]);
       this.#cache.specRoundBegin();
-      using output = await this.graph.forward(ids, hidden, this.#cache);
+      // The window it replays names the phase: one accepted token per row is a decode step.
+      using output = await (width === 1 ? this.graph.decode(ids, hidden, this.#cache) : this.graph.window(ids, hidden, this.#cache));
       output.eval(); this.#cache.specRoundRollback(accepted);
     }
     using positions = ops.fromInt32([...accepted], [B, 1, 1]);

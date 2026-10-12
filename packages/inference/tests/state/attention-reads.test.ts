@@ -272,10 +272,8 @@ for (const config of pagedConfigs) {
     const pair = twice(() => new PagedKVCache(1024, 16, config.direct, config.quantization));
     try {
       expectAllZero(compareSteps(`PagedKVCache ${config.name}`, pair, 1, steps, oldPagedRead));
-      const short = compareSteps(`PagedKVCache ${config.name}${config.direct ? " [divergent: old used the direct kernel]" : ""}`,
-        pair, 1, shortWindows, oldPagedRead);
-      if (config.direct) expect(Math.max(...short)).toBeLessThan(0.05);
-      else expectAllZero(short);
+      // Windows of at most eight queries: the direct kernel under a direct cache, as before.
+      expectAllZero(compareSteps(`PagedKVCache ${config.name} short windows`, pair, 1, shortWindows, oldPagedRead));
     } finally { disposeResources(pair); }
   });
 }
@@ -290,11 +288,7 @@ for (const config of pagedConfigs) for (const lengths of [[29], [29, 41], [29, 4
       // Without an attention state the rows join left-padded for one SDPA, as
       // the old path did (B1f); with one, each row reads alone, as it did.
       const label = `PagedKvRows ${config.name}[${lengths}]`;
-      const long = compareSteps(label, pair, B, ["D", 37, "D"], oldPagedRead);
-      const short = compareSteps(`${label}${config.direct ? " [divergent: old used the direct kernel]" : ""}`,
-        pair, B, [3], oldPagedRead);
-      expectAllZero(long);
-      if (config.direct) expect(short[0]!).toBeLessThan(0.05); else expectAllZero(short);
+      expectAllZero(compareSteps(label, pair, B, ["D", 37, "D", 3], oldPagedRead));
     } finally { disposeResources([...pair, ...a, ...b]); }
   });
 }

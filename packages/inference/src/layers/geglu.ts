@@ -41,7 +41,7 @@ export function compiledGeglu(gate: MlxArray, up: MlxArray): MlxArray {
 /** gelu_approx(gate) * up, consuming both inputs. `compiled` is the owner's
  *  construction-time choice: the compiled closure (the oracle's @mx.compile'd
  *  geglu, one kernel set; the default the Gemma graphs compose), or the
- *  spelled-out composition (the `MLX_BUN_COMPILED_GEGLU=0` opt-out, same L1
+ *  spelled-out composition (the composition's `compiledGeglu` off, same L1
  *  parity, slower). Inside a compiled-decode trace the closure records the
  *  spelled-out ops. */
 export function geglu(gate: MlxArray, up: MlxArray, compiled: boolean): MlxArray {

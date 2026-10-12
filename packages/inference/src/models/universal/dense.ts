@@ -4,7 +4,7 @@
 // descriptor (archs.ts). Monolith path only: no compiled
 // decode. Each attention block reads its cache for the phase its caller names
 // (`ReadPhase`) with the read the descriptor composes at construction: the
-// cache's own read, or the score-softcapped read over plain KV
+// cache's own read, or the score-softcapped read over dense KV
 // (`state/softcap-attention.ts`). The bar is L1 bit-exactness
 // vs mlx-lm on this machine's GPU (`02d723a:tests/parity/universal-parity.test.ts`).
 //
@@ -95,8 +95,9 @@ class UniversalAttention {
   readonly qNorm: RMSNorm | null;
   readonly kNorm: RMSNorm | null;
   /** Bound at construction: the score softcap composes the manual attention
-   * over plain K/V arrays as this block's read; without it, the block reads
-   * through the cache's own read, which also attends encoded KV. */
+   * over dense K/V arrays (any storage, fetched dense) as this block's read;
+   * without it, the block reads through the cache's own read, which also
+   * attends encoded KV. */
   readonly softcap: number | null;
   /** The projections adapters mount on (affine-quantized), read at load. */
   readonly adapters: { readonly q: QuantizedLinear | null; readonly k: QuantizedLinear | null;
@@ -455,11 +456,9 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
   readonly ropes: UniversalRope[];
   /** Whether every attention layer, as bound, reads encoded (affine) KV views. */
   readonly encodedKvAttention: boolean;
-  /** Layers whose bound attention reads plain keys and values: the manual softcap layers. */
-  readonly requiredDenseKvLayers: readonly number[];
 
   /** A graph whose attention softcaps its scores verifies ordinary rounds only
-   * (its layers read plain K/V through the softcapped read, `requiredDenseKvLayers`). */
+   * (its layers read dense K/V through the softcapped read). */
   get graphCapabilities(): GraphCapabilities {
     return declareGraph(this.encodedKvAttention === false ? { speculation: ORDINARY_VERIFICATION } : {});
   }
@@ -504,7 +503,6 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
       (_, i) => new UniversalLayer(weights, config, `model.layers.${i}`, a, this.ropes[i]!, audit, reads(i)),
     );
     this.encodedKvAttention = this.layers.every(layer => layer.attn.softcap === null);
-    this.requiredDenseKvLayers = Object.freeze(this.layers.flatMap((layer, index) => layer.attn.softcap === null ? [] : [index]));
     this.finalNorm = a.norm === "layernorm"
       ? loadLayerNorm(weights, "model.norm", a.normEps, audit)
       : loadRmsNorm(weights, "model.norm", a.normEps, a.norm === "rmsnorm_plus_one", audit);

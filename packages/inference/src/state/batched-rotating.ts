@@ -27,7 +27,6 @@ import { type AttentionCache, type AttentionRead, type BatchableCache, type Cach
 import { AttentionMasks, sdpaRead, withLease, type MaskLease } from "./attention-read";
 import { isRotatingPlainCache } from "./capabilities";
 import { BatchedRotatingState, type RotatingPositionSnapshot } from "./batched-rotating-state";
-import { plainKvStorage } from "./dense-kv-reads";
 import {
   appendRotatingStorage,
   mergeStorageRows,
@@ -100,7 +99,6 @@ export function buildBatchedRotatingMask(
  * place there and concatenates here: the same bits until the ring wraps, a
  * different key order after. */
 export class BatchedRotatingCache implements AttentionCache, BatchableCache, PaddedPrefillCache {
-  readonly denseKvReads = plainKvStorage;
   keys: MlxArray | null = null;
   values: MlxArray | null = null;
   #rows: BatchedRotatingState;
