@@ -1140,10 +1140,11 @@ unchanged.
       active 16795 → 17768 MB; e4b default decode 64.4 → 64.3 (0.998 [0.997, 1.000], flagged;
       sessions 64.4 → 64.4 and 64.4 → 64.2), prefill 1k 988.8 → 993.7, cold TTFT 678 → 675 ms,
       peak MLX active 7759 → 7871 MB. The e4b flag is a 0.2% difference with an interval whose
-      upper edge touches 1.000: the band still lacks a calibrated floor. Owed: an A/A run
-      (main against main, same host, two sessions) on a quiet M1 Max to measure the null
-      spread per metric, recorded as the decision's floor so sub-percent noise stops flagging;
-      until then a flag inside about 1% with sessions disagreeing on the sign is read by hand.
+      upper edge touches 1.000. Josh, 2026-10-12: this run is what no change looks like (the
+      branch is performance-neutral by every other measure), so its per-metric spread is the
+      null and becomes the decision's floor, recorded in `perf-check.ts` with this run as its
+      provenance (decode about ±0.6% on Trellis and ±0.2% on e4b, prefill and TTFT about ±3%);
+      a metric is flagged only beyond that floor. No A/A run.
 - [x] ARCHITECTURE.md: the cache owns the read; phases are named; a graph extends
       nothing; the exemplar sentence points at the regenerated graphs; the loader-level generic
       fallback is stated and the in-graph one forbidden; the one-way-per-pattern list above.
