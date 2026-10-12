@@ -958,7 +958,9 @@ family's generic Qwen 3.5 graph for any other composition of that artifact.
 Each builds, at construction, one operation per phase and width class from the
 composition and its device's one-kernel layers. On the M4 Pro: factored Trellis row
 kernels at one to four rows (the matrix-unit down at four) and the matrix-unit set
-at five to eight, for decode, verify and the head; and, when the composition has the
+at five to eight for decode and verify, with the affine projections and the head on
+the affine row kernels at two to four rows and the matrix-unit ones at five to eight;
+and, when the composition has the
 Neural Engine bridge (`aneBridge`, on by default; a bridge that does not load fails
 the load with `AneBridgeError`) and mounts no adapters, a prompt-chunk operation of
 exactly the composition's chunk size that splits each layer between the Neural
