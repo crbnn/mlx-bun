@@ -8,7 +8,8 @@
 //     --candidate-root DIR --candidate-command '["bun","DIR/apps/mlx-bun/bin/mlx-bun.mjs","serve"]'
 //     --native /abs/libmlxc.dylib --model ID=PATH[=LABEL] ...
 //     [--reference 'LABEL={"command":[...],"registerCommand":[...],"version":"..."}' ...]
-//     [--configurations default,serial,mixed,mtp2,mtp3] [--draft ID=/abs/mtp-companion] [--skip-context]
+//     [--configurations default,serial,mixed,mtp2,mtp3,dflash2] [--draft ID=/abs/mtp-companion]
+//     [--dflash2-draft ID=/abs/drafter[=/abs/target-basis.json]] [--sessions N] [--skip-context]
 //   bun scripts/bench-serve.ts run --plan /abs/plan.json --out /abs/empty-dir
 //   bun scripts/bench-serve.ts compare /abs/run/run.json
 //
@@ -21,8 +22,8 @@ import { hostname, release } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { runCell, stopAll, type Workload } from "./bench/measure";
-import { artifactFiles, cellArgs, checkOutputDirectory, CONFIGURATIONS, describeModel, nativeFiles, outsideTrees, pinProblems, planCells,
-  sourceSnapshot, validatePlan, WORKLOAD, type Configuration, type Plan, type ReferenceSpec, type Tree } from "./bench/plan";
+import { artifactFiles, cellArgs, cellExtraEnvironment, checkOutputDirectory, CONFIGURATIONS, describeModel, fileSha, nativeFiles, outsideTrees,
+  pinProblems, planCells, sourceSnapshot, validatePlan, WORKLOAD, type Configuration, type Plan, type ReferenceSpec, type Tree } from "./bench/plan";
 import { markdown, qualification, type CellRecord, type RunRecord } from "./bench/report";
 
 const TOOL_ROOT = resolve(import.meta.dir, "..");
@@ -33,13 +34,18 @@ const USAGE = `Paired serve benchmark: baseline tree versus candidate tree over 
       --candidate-root DIR --candidate-command '["bun","DIR/apps/mlx-bun/bin/mlx-bun.mjs","serve"]'
       --native /abs/libmlxc.dylib --model ID=/abs/snapshot[=LABEL] ...
       [--reference 'LABEL={"command":["PY","-m","mlx_lm.server"],"registerCommand":[...],"version":"..."}' ...]
-      [--configurations default,serial,mixed,mtp2,mtp3] [--draft ID=/abs/mtp-companion] [--skip-context]
+      [--configurations default,serial,mixed,mtp2,mtp3,dflash2] [--draft ID=/abs/mtp-companion]
+      [--dflash2-draft ID=/abs/drafter[=/abs/target-basis.json]] [--sessions N] [--skip-context]
   bun scripts/bench-serve.ts run --plan /abs/plan.json --out /abs/empty-dir [--ready-timeout-ms N]
   bun scripts/bench-serve.ts compare /abs/run-dir/run.json
 
 Profile all must be main's full matrix (cpm5, e4b, 12B, qwen27b × default, serial, mixed, plus the
-mlx-lm reference), optionally followed by mtp2,mtp3 for models given a --draft companion; anything
-narrower is scoped and never full qualification. Outputs must lie outside
+mlx-lm reference), optionally followed by mtp2,mtp3 for models given a --draft MTP companion and dflash2
+for models given a --dflash2-draft drafter (--kv-quant 4 --num-draft-tokens adaptive; the optional basis
+file goes to both servers as MLX_BUN_DFLASH2_TARGET_BASIS, which main reads and the refactor ignores);
+anything narrower is scoped and never full qualification. --sessions N (default 1) runs every tree N
+times per model and configuration, alternating trees (A B A B), each session a fresh server; the report
+pairs each session with its counterpart. Outputs must lie outside
 every tree. run exits 0 only when every applicable cell measured every required phase with stable
 decode, verified library provenance and matching probes; performance acceptance stays unreviewed.`;
 
@@ -108,7 +114,8 @@ export async function run(planPath: string, outDir: string, options: { readyTime
     const entry: CellRecord = { key: cell.key, model: cell.model, kind: cell.kind, order: cell.order, command: null,
       intendedLibrary: cell.kind === "tree" ? plan.native.library : null,
       ...(cell.tree ? { tree: cell.tree } : {}), ...(cell.configuration ? { configuration: cell.configuration } : {}),
-      ...(cell.reference ? { reference: cell.reference } : {}), ...(cell.skipped ? { skipped: cell.skipped } : {}) };
+      ...(cell.reference ? { reference: cell.reference } : {}), ...(cell.session ? { session: cell.session } : {}),
+      ...(cell.skipped ? { skipped: cell.skipped } : {}) };
     record.cells.push(entry);
     if (cell.skipped) { save(); continue; }
     const safe = cell.key.replaceAll("/", "-"), ssd = mkdtempSync(join(out, `ssd-${safe}-`));
@@ -117,7 +124,8 @@ export async function run(planPath: string, outDir: string, options: { readyTime
       entry.command = cellArgs(plan, cell, port, ssd);
       console.log(`=== ${cell.key} ===`);
       entry.result = await runCell({ key: cell.key, model: plan.models.find(m => m.id === cell.model)!, command: entry.command,
-        env: cellEnvironment(join(out, "sandboxes", safe), entry.intendedLibrary), cwd: join(out, "sandboxes", safe), port,
+        env: { ...cellEnvironment(join(out, "sandboxes", safe), entry.intendedLibrary), ...cellExtraEnvironment(plan, cell) },
+        cwd: join(out, "sandboxes", safe), port,
         ...(cell.kind === "reference" && plan.references.find(r => r.label === cell.reference)?.apiKey
           ? { apiKey: plan.references.find(r => r.label === cell.reference)!.apiKey } : {}),
         flushBeforeRestart: cell.kind === "tree", logPath: join(out, "logs", `${safe}.stderr.log`),
@@ -158,7 +166,7 @@ export function makePlan(args: string[]): Plan {
     "baseline-root": { type: "string" }, "baseline-command": { type: "string" },
     "candidate-root": { type: "string" }, "candidate-command": { type: "string" },
     native: { type: "string" }, model: { type: "string", multiple: true }, draft: { type: "string", multiple: true },
-    reference: { type: "string", multiple: true },
+    "dflash2-draft": { type: "string", multiple: true }, sessions: { type: "string", default: "1" }, reference: { type: "string", multiple: true },
     configurations: { type: "string", default: "default,serial,mixed" }, "skip-context": { type: "boolean", default: false },
   } });
   const trees = Object.fromEntries((["baseline", "candidate"] as Tree[]).map(tree => {
@@ -185,9 +193,22 @@ export function makePlan(args: string[]): Plan {
     const resolved = realpathSync(path);
     model.draft = { path: resolved, files: artifactFiles(resolved) };
   }
+  for (const spec of values["dflash2-draft"] ?? []) {
+    const [id, path, basis] = spec.split("=");
+    const model = models.find(m => m.id === id);
+    if (!model || !path || !isAbsolute(path) || (basis !== undefined && !isAbsolute(basis)))
+      throw new Error(`--dflash2-draft ${spec} must be ID=/abs/drafter[=/abs/target-basis.json] for a planned model`);
+    const resolved = realpathSync(path);
+    model.dflash2 = { path: resolved, files: artifactFiles(resolved), ...(basis !== undefined ? { basis: (() => {
+      const real = realpathSync(basis);
+      return { name: real.slice(real.lastIndexOf("/") + 1), path: real, bytes: Bun.file(real).size, sha256: fileSha(real) };
+    })() } : {}) };
+  }
+  const sessions = Number(values.sessions);
+  if (!Number.isSafeInteger(sessions) || sessions < 1) throw new Error(`--sessions ${values.sessions} must be a positive integer`);
   const partial = { schema: 1 as const, profile: values.profile as Plan["profile"], seed: values.seed!,
     workload: { ...WORKLOAD, withContext: !values["skip-context"] }, trees, references,
-    configurations: values.configurations!.split(",") as Configuration[], models,
+    configurations: values.configurations!.split(",") as Configuration[], ...(sessions > 1 ? { sessions } : {}), models,
     native: { library: resolve(values.native), files: nativeFiles(values.native) }, cells: [] };
   for (const name of partial.configurations) if (!(name in CONFIGURATIONS)) throw new Error(`unknown configuration ${name}`);
   const plan = { ...partial, cells: planCells(partial as Plan) };
