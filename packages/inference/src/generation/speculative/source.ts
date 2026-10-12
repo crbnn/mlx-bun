@@ -52,16 +52,13 @@ export interface DraftSource {
    *  sources leave the final prompt token pending; native Colibri MTP starts
    *  from a full-prompt target forward. */
   readonly prefillMode?: "tail-split" | "full";
-  /** Request one fixed target kernel family across the speculative verify
-   * batch. Native GLM MTP uses the direct-Colibri SPEC_PIN contract. */
-  readonly pinTargetKernelFamily?: boolean;
   /** This source can vary its requested draft depth between rounds without
    * changing sampling semantics. Used by Qwen MTP for context-aware depth. */
   readonly adaptiveDraftDepth?: boolean;
 
   /** Multi-layer target tap the source needs captured on the target's prefill
    *  AND every verify forward (DSpark's H_ctx; e4b {20,31,41,42}). When set,
-   *  the serve loop sets model.hiddenTap around those forwards and passes the
+   *  the target binding captures them in those forwards and passes the
    *  captured context [1,L,m*H] into prefill()/commit(). Undefined for sources
    *  that don't tap (two-model, assistant). */
   readonly tapLayers?: number[];

@@ -1,5 +1,6 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
+import type { MlxVerifyWindow } from "../phase-dispatch";
 import type { Cancellation, GenerationOutput, TokenLogprobs } from "../../contracts/portable/generation";
 import type { DisposableResource } from "../../contracts/portable/resources";
 import { cleanupFailure, disposeResources } from "../../runtime/resources";
@@ -37,7 +38,8 @@ export interface MlxDraftRows<Context = MlxArray> {
  * allocations on failure. State retention is a separate injected interface. */
 export interface MlxRowVerification<Context extends DisposableResource = MlxArray> {
   readonly transaction: SpeculativeTransaction<readonly number[]>;
-  forward(ids: MlxArray): Promise<{ logits: MlxArray; context: Context }>;
+  /** The verify forward over `ids` [sequences, positions], the window the round built. */
+  forward(ids: MlxArray, window: MlxVerifyWindow): Promise<{ logits: MlxArray; context: Context }>;
   /** Diagnostic barrier for retained target state after verification/rollback. */
   materialize?(): void;
 }
@@ -155,7 +157,7 @@ export async function prepareSpeculativeRows<Context extends DisposableResource 
   if (layers) profiled.__deltaProf = layers;
   if (inventory) counting.__opCount = {};
   let verification: Awaited<ReturnType<typeof target.forward>>;
-  try { verification = await target.forward(ids); }
+  try { verification = await target.forward(ids, { sequences: B, positions: verifyDepth + 1 }); }
   finally {
     if (layers) profiled.__deltaProf = undefined;
     if (inventory && phaseMs) { phaseMs.verifyOps = counting.__opCount as Record<string, number>; counting.__opCount = undefined; }
@@ -204,7 +206,7 @@ async function prepareDeviceRound<Context extends DisposableResource>(
     using pending = pendingIds.astype(lazy.tokens.dtype);
     using ids = ops.concatAxis([pending, lazy.tokens], 1);
     target.transaction.begin(depth);
-    verification = await target.forward(ids);
+    verification = await target.forward(ids, { sequences: B, positions: depth + 1 });
     const sampled = sampleWindowOnDevice(rows, verification.logits);
     if (!sampled) throw new Error("device round requires stateless window sampling");
     let read: number[];

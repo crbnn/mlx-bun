@@ -37,6 +37,7 @@
 // false halts the generation mid-burst.
 
 import { MlxArray } from "@mlx-bun/mlx/array";
+import { prefillPhase } from "../../contracts/portable/prefill";
 import { sampleSpeculativeRows } from "./round";
 import * as ops from "@mlx-bun/mlx/ops";
 import { clearCache } from "@mlx-bun/mlx/ffi";
@@ -195,10 +196,13 @@ async function specRunInner(
   const samplePos = async (logits1V: MlxArray, step: number): Promise<number> =>
     (await stepSampler.sample(logits1V, step)).token;
 
-  const forwardTokens = async (tokens: number[], taps?: number[]) => {
+  /** One prompt step of `tokens` in the phase its plan named (`whole`: a full chunk). */
+  const prefillTokens = async (tokens: number[], whole: boolean, taps?: readonly number[]) => {
     const ids = ops.fromInt32(tokens, [1, tokens.length]);
-    try { return await binding.forward(ids, caches, taps); }
-    finally { ids.dispose(); }
+    try {
+      return await binding.prefill(ids, caches, { phase: prefillPhase(0, tokens.length, whole), sequences: 1,
+        tokens: tokens.length }, taps);
+    } finally { ids.dispose(); }
   };
   let failure: { error: unknown } | undefined;
 
@@ -301,9 +305,9 @@ async function specRunInner(
       const end = promptIds.length - 1; // last prompt token NEVER prefilled
       while (pos < end) {
         options.signal?.throwIfAborted();
-        const n = Math.min(prefillChunk, end - pos);
+        const whole = prefillChunk <= end - pos, n = whole ? prefillChunk : end - pos;
         const chunk = promptIds.slice(pos, pos + n);
-        const { hidden: h, ctxML } = await forwardTokens(chunk, tapLayers);
+        const { hidden: h, ctxML } = await prefillTokens(chunk, whole, tapLayers);
         if (ctxML) ctxParts.push(ctxML);
         try {
           if (pos + n >= end) {
@@ -321,16 +325,16 @@ async function specRunInner(
       // sampled from the last position below.
       for (let off = cached; off < promptIds.length;) {
         options.signal?.throwIfAborted();
-        const end = Math.min(off + prefillChunk, promptIds.length,
-          snapshotAt > off ? snapshotAt : Infinity);
+        const limit = Math.min(promptIds.length, snapshotAt > off ? snapshotAt : Infinity);
+        const whole = off + prefillChunk <= limit, end = whole ? off + prefillChunk : limit;
         const chunk = promptIds.slice(off, end);
-        const { hidden: h, ctxML } = await forwardTokens(chunk, tapLayers);
+        const { hidden: h, ctxML } = await prefillTokens(chunk, whole, tapLayers);
         if (ctxML) ctxParts.push(ctxML);
         try { if (end >= promptIds.length) {
           const L = h.shape[1]!;
           const H = h.shape[2]!;
           anchorHidden = h.slice([0, L - 1, 0], [1, L, H]); // [1,1,H], retained
-          const lg = binding.projectLogits(anchorHidden);
+          const lg = binding.projectLogits(anchorHidden, 1);
           try {
             const V = lg.shape[lg.shape.length - 1]!;
             lastLogits = ops.reshape(lg, [1, V]);
@@ -397,9 +401,12 @@ async function specRunInner(
       options.signal?.throwIfAborted();
       if (!speculating) {
         // plain single-token continuation (post-ring-wrap fallback)
-        const { hidden: h } = await forwardTokens([pending], undefined);
+        const h = await (async () => {
+          using ids = ops.fromInt32([pending], [1, 1]);
+          return binding.decode(ids, caches, 1);
+        })();
         try {
-          const lg = binding.projectLogits(h);
+          const lg = binding.projectLogits(h, 1);
           try {
             const V = lg.shape[lg.shape.length - 1]!;
             roundRow = ops.reshape(lg, [1, V]);
@@ -484,18 +491,15 @@ async function specRunInner(
       // trimmable caches, which roll back via trim() below).
       rollback.begin(d);
       const vIds = ops.fromInt32([pending, ...drafts], [1, d + 1]);
-      let pin: { close(): void } | undefined;
       try {
-        pin = src.pinTargetKernelFamily ? binding.pinVerify?.() : undefined;
-        const ft = await binding.forward(vIds, caches, tapLayers);
+        const ft = await binding.verify(vIds, caches, { sequences: 1, positions: d + 1 }, tapLayers);
         // Assign these before the lm-head call so the outer cleanup owns them
         // even if logits construction throws.
         vHidden = ft.hidden;
         vCtxML = ft.ctxML;
-        vLogits = binding.projectLogits(vHidden);
+        vLogits = binding.projectLogits(vHidden, d + 1);
       } finally {
         vIds.dispose();
-        pin?.close();
       }
       extras.targetCalls++;
       // The lm-head remains one logical batched operation. Native GLM MTP's

@@ -24,6 +24,7 @@ import { type CheckpointAttachment } from "../contracts/mlx/checkpoint";
 import { advanceSpeculativeOutputs } from "../generation/speculative/round";
 import { AdaptiveDraftGate } from "../generation/speculative/adaptive-draft-gate";
 import { MlxPrefillRows, type MlxPrefillState } from "./prefill-rows";
+import { prefillPhase } from "../contracts/portable/prefill";
 import type { MlxForwardWork } from "../contracts/mlx/forward-work";
 import type { MlxGroupMethodHost, MlxGroupMethodRequest, MlxGroupPreparation, MlxGroupedMethod, Row } from "./batch-types";
 
@@ -198,13 +199,16 @@ class SpeculativeGroup implements MlxGroupedMethod {
         }
       },
       plan(state) {
-        const end = Math.min(state.pos + state.chunkSize, state.end, state.boundary > state.pos ? state.boundary : Infinity);
+        const limit = Math.min(state.end, state.boundary > state.pos ? state.boundary : Infinity);
+        const whole = state.pos + state.chunkSize <= limit;
+        const end = whole ? state.pos + state.chunkSize : limit;
         return { start: state.pos, end, kind: end === state.end ? "final" : "drain",
-          snapshot: end === state.boundary && end > state.row.cachedTokens, batchYield: true, maintain: true };
+          snapshot: end === state.boundary && end > state.row.cachedTokens, batchYield: true, maintain: true,
+          phase: prefillPhase(state.pos, end, whole) };
       },
-      async forward(ids, caches, _states, work) {
+      async forward(ids, caches, _states, step, work) {
         const taps = prefix!.tapLayers;
-        const output = await method.binding.forward(ids, caches, taps.length ? [...taps] : undefined, work);
+        const output = await method.binding.prefill(ids, caches, step, taps.length ? taps : undefined, work);
         context = output.ctxML;
         return output.hidden;
       },
@@ -218,10 +222,10 @@ class SpeculativeGroup implements MlxGroupedMethod {
         } catch (error) { captured?.dispose(); throw error; }
         captured?.dispose();
       },
-      project(hidden, _caches, completed) {
+      project(hidden, _caches, completed, step) {
         if (completed.every(state => state.pendingPrompt)) return null;
         using last = hidden.slice([0, hidden.shape[1]! - 1, 0], [hidden.shape[0]!, hidden.shape[1]!, hidden.shape[2]!]);
-        return method.binding.projectLogits(last);
+        return method.binding.projectLogits(last, step.sequences);
       },
       checkpoint: capture,
       async complete(state, logits, index) {
@@ -362,7 +366,6 @@ class SpeculativeGroup implements MlxGroupedMethod {
       return proposals[index]!.length ? [request.fill!] : [];
     }) : [];
     const halted = new Set<Row>();
-    const pin = this.binding.pinVerify?.();
     try {
       const completed = await advanceSpeculativeOutputs(rows.map(row => ({ pending: row.current,
         step: row.sampled, remaining: row.req.maxTokens - row.generated, eosTokenIds: row.req.eosTokenIds,
@@ -393,13 +396,12 @@ class SpeculativeGroup implements MlxGroupedMethod {
             for (const fill of fills) fill.stats.checkpointMs += elapsed;
           },
         },
-        forward: async ids => {
+        forward: async (ids, window) => {
           if (echoDepth) externalTokens = ops.copyOf(ids);
           const taps = this.#draft!.tapLayers;
-          const result = await this.binding.forward(ids, this.#target!.caches, taps.length ? [...taps] : undefined,
-            work ? (tokens, caches, options) => work(tokens, caches, { ...options, preserveTokenGeometry: true }) : undefined);
+          const result = await this.binding.verify(ids, this.#target!.caches, window, taps.length ? taps : undefined, work);
           const context = result.ctxML ?? result.hidden;
-          try { return { logits: this.binding.projectLogits(result.hidden), context }; }
+          try { return { logits: this.binding.projectLogits(result.hidden, window.sequences * window.positions), context }; }
           catch (error) { context.dispose(); throw error; }
           finally { if (result.ctxML) result.hidden.dispose(); }
         },
@@ -470,7 +472,7 @@ class SpeculativeGroup implements MlxGroupedMethod {
       }
       if (keep.length !== rows.length) this.host.filterRows(keep);
       if (++this.#steps % 256 === 0) clearCache();
-    } finally { externalTokens?.dispose(); pin?.close(); }
+    } finally { externalTokens?.dispose(); }
   }
 
   #proposeEcho(row: Row, request: RequestState): void {

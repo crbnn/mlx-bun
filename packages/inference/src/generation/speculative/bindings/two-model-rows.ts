@@ -23,7 +23,7 @@ export function openStandaloneDraftRows(binding: MlxAutoregressiveBinding, names
     try { for (const cache of empty) layouts.push(prefillCacheLayout(cache) as MlxDraftLayout); }
     catch (error) { disposeResources(layouts); throw error; }
     finally { disposeResources(empty); }
-    const state = new MlxStateRows(layouts), rows = new MlxAutoregressiveDraftRows(binding.graph, state, sampling);
+    const state = new MlxStateRows(layouts), rows = new MlxAutoregressiveDraftRows(binding.phases, state, sampling);
     const prepareAppend = (checkpoints: readonly (DraftRowCheckpoint | null)[]): PreparedStateChange => {
       const restored: Cache[][] = [], pending: Array<number | null> = [];
       try {

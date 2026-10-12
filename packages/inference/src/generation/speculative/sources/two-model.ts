@@ -89,14 +89,16 @@ export class TwoModelProvider implements DraftProvider {
 class TwoModelSource implements DraftSource {
   readonly weightsBytes = 0;
   private readonly rows: ReturnType<typeof openStandaloneDraftRows>;
+  /** The prefill tail split (`MLX_BUN_PREFILL_TAIL_SPLIT`), read once when the source opens. */
+  private readonly tailSplit: boolean;
   private processed = 0;
   constructor(model: RuntimeModel, sampler: (lp: MlxArray, step: number) => MlxArray, namespace: string) {
     this.rows = openStandaloneDraftRows(bindMlxAutoregressiveGraph(model), namespace,
       { sample: (logprobs, steps) => sampler(logprobs, steps[0]!) }, [null]);
+    this.tailSplit = runtimeFlag("MLX_BUN_PREFILL_TAIL_SPLIT", true);
   }
   async prefill(promptIds: number[]): Promise<void> {
-    const tailSplit = runtimeFlag("MLX_BUN_PREFILL_TAIL_SPLIT", true);
-    const upTo = tailSplit && promptIds.length > 1 ? promptIds.length - 1 : promptIds.length;
+    const upTo = this.tailSplit && promptIds.length > 1 ? promptIds.length - 1 : promptIds.length;
     for (let at = this.processed; at < upTo; at += PREFILL_CHUNK) {
       const end = Math.min(at + PREFILL_CHUNK, upTo);
       using ids = ops.fromInt32(promptIds.slice(at, end), [1, end - at]);
