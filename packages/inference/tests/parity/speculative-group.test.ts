@@ -26,9 +26,8 @@
 //   with the draft ignored; the adapter changes the B1 control's logprobs; each
 //   row equals its B1 control without a draft (greedy tokens), seeded B4 cohorts
 //   repeat, groups never mix adapter contexts, a failing row leaves its peers intact, and prefix reuse stays
-//   isolated by adapter. Drafted base rows join these checks where placement
-//   serves them; delayed affine KV on MiniCPM5 and encoded Universal graphs
-//   refuses them by design (genuine delayed speculation is excluded).
+//   isolated by adapter. Drafted base rows join these checks: placement
+//   speculates over every KV scheme, delayed affine included.
 // The first two tests require a combination placement serves; run only the
 // adapter test with --test-name-pattern "adapter rows" for such a KV setting.
 // Not covered: equality with main or an external oracle, HTTP, speed.

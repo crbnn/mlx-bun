@@ -1,26 +1,26 @@
-// Opt-in, real weights: methods bound directly onto cache legos that did not
-// serve them before PLAN B3 (paged KV under speculation, and every lego's
-// verification rows), against the same method on the bf16 lego. The planner
-// still refuses these pairs until E2 deletes its cache-format terms, so the
-// methods are bound here, bypassing it.
+// Opt-in, real weights: methods on cache legos that did not serve them before
+// PLAN B3 (speculation over paged KV, TurboQuant and delayed affine KV), against
+// the same method on the bf16 lego. Each lego is a composition the loader
+// resolves (`resolveComposition`: its KV scheme and paging); the gateway binding
+// plans every request and gives each row its request state, as the app does.
 // - Teacher-forced verification rounds: one row, then two rows of different
-//   lengths, are prefilled on each lego (a prompt tail), joined into its
-//   verification rows (`targetCacheLayout`) and run through rounds of fixed
-//   windows on the graph's verify phase (a fixed greedy continuation) under
-//   the speculative transaction with a fixed
+//   lengths, are prefilled on each lego's request state (a prompt tail), joined
+//   into its verification rows (`targetCacheLayout`) and run through rounds of
+//   fixed windows on the graph's verify phase (a fixed greedy continuation)
+//   under the speculative transaction with a fixed
 //   acceptance schedule. Every kept position's logits are compared with the
 //   bf16 lego's: max |Δlogit|, argmax agreement, mean and max KL. The KL of the
 //   served affine lego of the same width, and of the tiled affine kernels
 //   against the unfused ones (the accepted tiled null), are printed beside the
-//   paged quantized legos' for calibration.
-// - The speculative group with the assistant drafter over paged bf16 KV (the
-//   request policy's pages in place of the graph's full-attention caches): one
-//   row and a four-row cohort, tokens and acceptance against the same group
-//   over the bf16 lego.
+//   newly served legos' for calibration.
+// - The speculative group with the assistant drafter on every lego, placed by
+//   the binding's plan and submitted with its request state: one row and a
+//   four-row cohort, tokens and acceptance against the same group over the
+//   bf16 lego.
 // Opt in with MLX_BUN_TEST_LEGO_TARGET=/gemma4/snapshot and
 // MLX_BUN_TEST_LEGO_DRAFT=/assistant/snapshot (a Gemma 4 target and its
 // assistant drafter). No downloads.
-import { expect, spyOn, test } from "bun:test";
+import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
@@ -32,14 +32,15 @@ if ((target === undefined) !== (draft === undefined)) throw new Error("MLX_BUN_T
 
 const BLOCK = 256, CAPACITY = 1024, DEPTH = 3, ROUNDS = 6;
 
-/** A lego: the composition's KV request, and whether the request policy pages
- * its full-attention layers. */
+/** A lego: the composition's KV request, and whether it pages. */
 interface Lego { readonly name: string; readonly kv?: A; readonly paged: boolean }
 const LEGOS: readonly Lego[] = [
   { name: "bf16", paged: false },
   { name: "paged bf16", paged: true },
   { name: "affine 4 (unfused)", kv: { override: 4, fusedSdpa: false }, paged: false },
   { name: "affine 4 (tiled-causal)", kv: { override: 4, fusedSdpa: true }, paged: false },
+  // Converts inside the rounds: the prompts hold 15 to 30 tokens, the rounds add 24.
+  { name: "affine 4 from 32 (unfused)", kv: { override: 4, fusedSdpa: false, quantizedKvStart: 32 }, paged: false },
   { name: "paged 4", kv: { override: 4 }, paged: true },
   { name: "affine 8 (unfused)", kv: { override: 8, fusedSdpa: false }, paged: false },
   { name: "paged 8", kv: { override: 8 }, paged: true },
@@ -48,10 +49,12 @@ const LEGOS: readonly Lego[] = [
 const PAIRS: readonly [string, string][] = [
   ["bf16", "paged bf16"],
   ["affine 4 (unfused)", "affine 4 (tiled-causal)"],
-  ["bf16", "affine 4 (unfused)"], ["bf16", "paged 4"],
+  ["bf16", "affine 4 (unfused)"], ["bf16", "affine 4 from 32 (unfused)"], ["bf16", "paged 4"],
   ["bf16", "affine 8 (unfused)"], ["bf16", "paged 8"],
   ["bf16", "TurboQuant 8/3"],
 ];
+const SHAPE = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
+  hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
 
 /** Log-softmax of one logit row, f64 on the host. */
 function logSoftmax(row: Float32Array): Float64Array {
@@ -87,7 +90,9 @@ async function loadTarget() {
   const config = await loadModelConfig(target!);
   const weights = await Weights.open(target!);
   const tokenizer = await loadTokenizer(target!);
-  const graph = (kv?: A) => createModel(weights, config, resolveComposition(config, kv ? { kv } : {})) as A;
+  /** The graph the loader builds for `lego`'s composition (bf16 when none is named). */
+  const graph = (lego?: Lego) => createModel(weights, config, resolveComposition(config, {
+    ...(lego?.kv ? { kv: lego.kv } : {}), ...(lego?.paged ? { pagedKv: { blockSize: BLOCK } } : {}) })) as A;
   const release = async () => {
     const { clearCache } = await import("@mlx-bun/mlx/ffi");
     try { weights.dispose(); } finally { for (const file of weights.shards.files.values()) file.mmap.unmap(); clearCache(); }
@@ -95,20 +100,18 @@ async function loadTarget() {
   return { config, tokenizer, graph, generate, release };
 }
 
-/** `model`'s caches, with the request policy's pages in place of the
- * full-attention storage when `paged` (`maybePageKv`, as `--paged-kv` pages a
- * request). */
-async function cachesOf(model: A, paged: boolean) {
-  const { maybePageKv } = await import("../../src/state/request-policy");
-  const caches = model.makeCache();
-  if (paged) maybePageKv(caches, model.composition?.kv ?? { kind: "bf16" }, { blockSize: BLOCK }, CAPACITY);
-  return caches;
+/** One request's state as the gateway gives it to a row: the binding's request
+ * state policy for the planned execution (the composition's paging), else the
+ * graph's caches. */
+function requestState(binding: A, model: A, execution: A): A[] {
+  return binding.statePolicy?.(execution, {}, CAPACITY)?.create() ?? model.makeCache();
 }
 
 test.skipIf(!target)("teacher-forced verification rounds on every lego's verification rows", async () => {
   const ops = await import("@mlx-bun/mlx/ops");
   const { clearCache, Dtype } = await import("@mlx-bun/mlx/ffi");
   const { createKvMaintenance } = await import("../../src/state/kv-maintenance");
+  const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
   const { targetCacheLayout } = await import("../../src/state/layout");
   const { MlxStateRows } = await import("../../src/state/rows");
   const { bindRowCacheRollback } = await import("../../src/state/rollback");
@@ -136,11 +139,16 @@ test.skipIf(!target)("teacher-forced verification rounds on every lego's verific
       const used = prompts.slice(0, cohort);
       const logits = new Map<string, Float32Array[]>();
       for (const lego of LEGOS) {
-        const model = loaded.graph(lego.kv);
+        const model = loaded.graph(lego);
+        const binding = bindMlxGateway(model);
+        // The planner places the row whatever the lego; its request state is the composition's.
+        const execution = binding.plan(SHAPE, {}, { checkpoints: false });
+        expect(execution.mechanism, lego.name).toBe("continuous");
         const maintain = createKvMaintenance(model.composition?.kv ?? { kind: "bf16" });
         const rows: A[][] = [];
         for (const prompt of used) {
-          const caches = await cachesOf(model, lego.paged);
+          const caches = requestState(binding, model, execution);
+          if (lego.paged) expect(caches.some((cache: A) => cache.signature() === "kv:paged"), lego.name).toBe(true);
           using ids = ops.fromInt32(prompt, [1, prompt.length]);
           phaseHidden(model, ids, caches).dispose();
           maintain.prepareBatch?.(caches);
@@ -182,11 +190,10 @@ test.skipIf(!target)("teacher-forced verification rounds on every lego's verific
   } finally { await loaded.release(); }
 }, 1_800_000);
 
-test.skipIf(!target)("the speculative group with the assistant drafter over paged bf16 KV", async () => {
+test.skipIf(!target)("the speculative group with the assistant drafter on every lego, placed by the planner", async () => {
   const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
   const speculative = await import("@mlx-bun/inference/generation/speculative");
   const { clearCache } = await import("@mlx-bun/mlx/ffi");
-  const { maybePageKv } = await import("../../src/state/request-policy");
   const loaded = await loadTarget();
   try {
     const provider = (await speculative.defaultDraftProviders().load("assistant", { dir: draft,
@@ -195,40 +202,41 @@ test.skipIf(!target)("the speculative group with the assistant drafter over page
       "What is the boiling point of water at high altitude, and why?", "Tell a two-sentence story about a clockmaker."]
       .map(text => loaded.tokenizer.encode(text, true));
     const options: A = { temperature: 0, maxTokens: 32, eosTokenIds: [] };
-    const run = async (paged: boolean, count: number) => {
-      const model = loaded.graph();
-      // The paged lego in place of the graph's caches, before anything binds.
-      if (paged) {
-        const make = model.makeCache.bind(model);
-        spyOn(model, "makeCache").mockImplementation(() => {
-          const caches = make();
-          maybePageKv(caches, model.composition?.kv ?? { kind: "bf16" }, { blockSize: BLOCK }, CAPACITY);
-          return caches;
-        });
-      }
+    /** `count` rows on `lego` as the app runs them: the binding plans each
+     * request and submits it with its method and request state. */
+    const run = async (lego: Lego, count: number) => {
+      const model = loaded.graph(lego);
       const binding = bindMlxGateway(model, { provider, numDraftTokens: 2 });
-      const plan = binding.plan({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
-        hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true }, options,
-        { checkpoints: false });
-      expect(plan.method).toBe("speculative");
+      const plan = binding.plan({ ...SHAPE, hasDraft: true }, options, { checkpoints: false });
+      expect({ lego: lego.name, method: plan.method, mechanism: plan.mechanism })
+        .toEqual({ lego: lego.name, method: "speculative", mechanism: "continuous" });
       let held = true;
       const group = binding.createBatchGroup({ maxBatch: 4, admissionHeld: () => held });
       const tokens = Array.from({ length: count }, () => [] as number[]);
       try {
         const pending = tokens.map((output, row) => group.submit({ method: binding.methodRequest!(plan, options)!,
+          statePolicy: binding.statePolicy?.(plan, options, prompts[row]!.length + options.maxTokens),
+          compiledDecode: plan.compiledDecode,
           promptIds: prompts[row]!, maxTokens: options.maxTokens, eosTokenIds: [], onToken(token: number) { output.push(token); } }));
         held = false; group.kick();
         const stats = await Promise.all(pending);
         return { tokens, spec: stats.map((stat: A) => ({ drafted: stat.spec?.drafted, accepted: stat.spec?.accepted, rounds: stat.spec?.rounds })) };
       } finally { await group.close(); clearCache(); }
     };
-    const report: Record<string, unknown> = {};
+    const report: Record<string, Record<string, unknown>> = {};
+    const legos = LEGOS.filter(lego => lego.name !== "affine 4 (tiled-causal)");
     for (const count of [1, 4]) {
-      const plain = await run(false, count), paged = await run(true, count);
-      report[`B${count}`] = { tokensEqual: JSON.stringify(plain.tokens) === JSON.stringify(paged.tokens),
-        bf16: plain.spec, paged: paged.spec,
-        firstDifference: plain.tokens.map((row, index) => row.findIndex((token, at) => paged.tokens[index]![at] !== token)) };
-      for (const stats of paged.spec) expect(stats.rounds).toBeGreaterThan(0);
+      const cohort: Record<string, unknown> = report[`B${count}`] = {};
+      const reference = await run(legos[0]!, count);
+      cohort.bf16 = { spec: reference.spec };
+      for (const lego of legos.slice(1)) {
+        const served = await run(lego, count);
+        cohort[lego.name] = { tokensEqual: JSON.stringify(reference.tokens) === JSON.stringify(served.tokens),
+          spec: served.spec, firstDifference: reference.tokens.map((row, index) => row.findIndex((token, at) => served.tokens[index]![at] !== token)) };
+        for (const stats of served.spec) expect(stats.rounds, lego.name).toBeGreaterThan(0);
+        // Bf16 pages store what the bf16 lego stores: one row reads them alike.
+        if (lego.name === "paged bf16" && count === 1) expect(served.tokens).toEqual(reference.tokens);
+      }
     }
     console.log(JSON.stringify({ target, draft, report }, null, 1));
   } finally { await loaded.release(); }

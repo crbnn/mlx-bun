@@ -286,7 +286,7 @@ export function createRequestPrep(input: {
    *
    *  Refusals owned here (body-level); the ones only ChatStage can see —
    *  a compiled grammar, media prompts and a mounted draft model — are applied
-   *  there. The execution binding owns cache-format and method support. Strict
+   *  there. The execution binding owns method support (every cache serves it). Strict
    *  shared execution keeps the sampler's absolute token positions, including
    *  known tokens; an explicit seed therefore remains replayable.
    *
