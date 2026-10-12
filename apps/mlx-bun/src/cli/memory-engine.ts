@@ -1,8 +1,8 @@
 // The `memory` verb's in-process task model: main's `memory synthesize` (and the
 // nightly job) loaded its own Gemma-4 e4b on first use instead of needing a
 // serving mlx-bun. Nothing loads until a stage actually asks for a completion,
-// and every call runs through the app engine's continuous gateway — there is
-// no serial lane and no second server. Policy stays here and in memory/model:
+// and every call runs through the app engine's continuous gateway, where one
+// call is a batch of one; there is no second server. Policy stays here and in memory/model:
 // the task model, the chunk adapter only for the chunk stage, greedy argmax
 // with the model's EOS and no stop strings, full-precision KV, and the raw
 // decoded text main returned.

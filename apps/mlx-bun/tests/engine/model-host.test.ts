@@ -192,7 +192,7 @@ test("compiled runner retirement is idempotent and never allocates an absent run
     CompiledDecode.release(model);
     assert.equal(materializations, 0); assert.equal(allocations, 0);
     const runner = CompiledDecode.for(model);
-    // A cache that declares the compiled-decode capability; the fake closure never traces its stand-in.
+    // A cache with a compiled decode form (the CompiledDecodeCache protocol); the fake closure never traces its stand-in.
     const keys = new ArrayValue(), values = new ArrayValue();
     const slot = { key: "fake", fetch: "concat", inputs: 2, outputs: 2, trace() { throw new Error("never traced"); } };
     const cache = { offset: 1, prepareDecodeStep: () => ({ fetch: "concat", activeLen: 1 }),

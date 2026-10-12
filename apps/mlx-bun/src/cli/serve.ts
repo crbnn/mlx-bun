@@ -151,7 +151,7 @@ export function parseServeOptions(args: CommandArgs): ServeOptions {
   return {
     query: value("model") ?? args.positionals[0] ?? value("query") ?? null,
     hostname: host, port: number("port", 0, 65535, true) ?? 8080,
-    // Main's --decode-concurrency is an alias of --batch: the same continuous capacity, never a serial lane.
+    // Main's --decode-concurrency is an alias of --batch: the same cap on the continuous scheduler's rows.
     capacity: number("batch", 1, Number.MAX_SAFE_INTEGER, true) ?? number("decode-concurrency", 1, Number.MAX_SAFE_INTEGER, true) ?? 8,
     contextLimit: profileLimit,
     defaultGeneratedTokens: maxTokens === undefined ? undefined : Math.floor(maxTokens),

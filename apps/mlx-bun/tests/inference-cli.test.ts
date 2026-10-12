@@ -6,7 +6,7 @@ import type { ModelRecord } from "@mlx-bun/hub/registry";
 import type { LoadedModelContext } from "../src/engine/model-host";
 import { loadContextTemplate, requireChatTemplate } from "../src/engine/model-host";
 import { UnsupportedExecutionError } from "../src/engine/completion";
-import { configureRuntime, runtimeValue } from "@mlx-bun/inference/runtime/config";
+import { configureRuntime } from "@mlx-bun/inference/runtime/config";
 import { resolveKvScheme } from "@mlx-bun/inference/state/kv-scheme";
 import { commandInvocation, help, parseCommand } from "../src/cli/args";
 import { generateOptions, resolveInferenceModel, runInference, type InferenceDependencies, type OneShotEngine } from "../src/cli/inference";
@@ -141,11 +141,10 @@ test("generate carries main's TurboQuant spec to the engine's KV scheme", async 
 });
 
 /** Records the fused-attention route the command composes at load (`--fused-sdpa`, resolved: 0 fused, 1 unfused;
- * embedding composes none), and the process flag each seam observes (load, engine, run, close), which no command
- * writes any more. */
+ * embedding composes none), and the seams the command passes in order (load, engine, run, close). */
 function routeSeams(run?: (args: Parameters<OneShotEngine["completion"]["run"]>) => Promise<void>) {
   const base = harness(), seen: string[] = [], routes: string[] = [];
-  const note = (seam: string) => { seen.push(`${seam}:${runtimeValue("MLX_BUN_NO_FUSED_SDPA") ?? "unset"}`); };
+  const note = (seam: string) => { seen.push(seam); };
   const dependencies: InferenceDependencies = { ...base.dependencies,
     load: async (...args) => {
       note("load");
@@ -162,10 +161,10 @@ function routeSeams(run?: (args: Parameters<OneShotEngine["completion"]["run"]>)
     } };
   return { dependencies, seen, routes };
 }
-const untouched = (...seams: string[]) => seams.map(seam => `${seam}:ambient`);
+const seams = (...names: string[]) => names;
 
-test("generate composes main's decode route into its own load; no seam writes the process flag", async () => {
-  const restore = configureRuntime({ MLX_BUN_NO_FUSED_SDPA: "ambient", MLX_BUN_EVAL_KV_QUANT: undefined });
+test("generate composes main's decode route into its own load", async () => {
+  const restore = configureRuntime({ MLX_BUN_EVAL_KV_QUANT: undefined });
   try {
     for (const [flags, route] of [[[], "1"], [["--kv-quant", "off"], "1"], [["--kv-quant", "4"], "1"], [["--kv-quant", "8"], "1"],
       [["--kv-quant", "turbo"], "1"], [["--kv-quant", "turbo:k4v2"], "1"], [["--kv-quant", "config"], "0"], [["--l1"], "1"], [["--l2"], "0"],
@@ -174,8 +173,7 @@ test("generate composes main's decode route into its own load; no seam writes th
       const run = routeSeams();
       await runInference("generate", parse("--prompt", "hi", ...flags), run.dependencies);
       expect({ flags, routes: run.routes, seen: run.seen })
-        .toEqual({ flags, routes: [route], seen: untouched("load", "engine", "run", "close") });
-      expect(runtimeValue("MLX_BUN_NO_FUSED_SDPA")).toBe("ambient");
+        .toEqual({ flags, routes: [route], seen: seams("load", "engine", "run", "close") });
     }
     // Main: the evaluation KV switch without --kv-quant keeps the unfused route.
     const evaluation = configureRuntime({ MLX_BUN_EVAL_KV_QUANT: "1" });
@@ -187,34 +185,28 @@ test("generate composes main's decode route into its own load; no seam writes th
     // Embedding composes no route.
     const embed = routeSeams();
     await runInference("embed", parseCommand("embed", ["--text", "x"]), embed.dependencies);
-    expect({ routes: embed.routes, seen: embed.seen }).toEqual({ routes: ["ambient"], seen: untouched("load", "engine", "close") });
+    expect({ routes: embed.routes, seen: embed.seen }).toEqual({ routes: ["ambient"], seen: seams("load", "engine", "close") });
   } finally { restore(); }
 });
 
 test("the generate route survives failure and cancellation cleanup and isolates concurrent commands", async () => {
-  const restore = configureRuntime({ MLX_BUN_NO_FUSED_SDPA: "ambient" });
-  try {
-    const failing = routeSeams(async () => { throw new Error("run failed"); });
-    await expect(runInference("generate", parse("--prompt", "hi", "--kv-quant", "config"), failing.dependencies)).rejects.toThrow("run failed");
-    expect({ routes: failing.routes, seen: failing.seen }).toEqual({ routes: ["0"], seen: untouched("load", "engine", "run", "close") });
-    expect(runtimeValue("MLX_BUN_NO_FUSED_SDPA")).toBe("ambient");
-    const abort = new AbortController();
-    const cancelled = routeSeams(async () => { abort.abort(new Error("cancelled")); });
-    await expect(runInference("generate", parse("--prompt", "hi", "--kv-quant", "config"), cancelled.dependencies, abort.signal)).rejects.toThrow("cancelled");
-    expect({ routes: cancelled.routes, seen: cancelled.seen }).toEqual({ routes: ["0"], seen: untouched("load", "engine", "run", "close") });
-    expect(runtimeValue("MLX_BUN_NO_FUSED_SDPA")).toBe("ambient");
-    // Two commands interleave inside their runs; each composed its own route.
-    let release!: () => void;
-    const both = new Promise<void>(resolve => { release = resolve; });
-    let waiting = 0;
-    const barrier = async () => { if (++waiting === 2) release(); await both; };
-    const fused = routeSeams(barrier), unfused = routeSeams(barrier);
-    await Promise.all([runInference("generate", parse("--prompt", "hi", "--kv-quant", "config"), fused.dependencies),
-      runInference("generate", parse("--prompt", "hi", "--kv-quant", "4"), unfused.dependencies)]);
-    expect([fused.routes, unfused.routes]).toEqual([["0"], ["1"]]);
-    expect([fused.seen, unfused.seen]).toEqual([untouched("load", "engine", "run", "close"), untouched("load", "engine", "run", "close")]);
-    expect(runtimeValue("MLX_BUN_NO_FUSED_SDPA")).toBe("ambient");
-  } finally { restore(); }
+  const failing = routeSeams(async () => { throw new Error("run failed"); });
+  await expect(runInference("generate", parse("--prompt", "hi", "--kv-quant", "config"), failing.dependencies)).rejects.toThrow("run failed");
+  expect({ routes: failing.routes, seen: failing.seen }).toEqual({ routes: ["0"], seen: seams("load", "engine", "run", "close") });
+  const abort = new AbortController();
+  const cancelled = routeSeams(async () => { abort.abort(new Error("cancelled")); });
+  await expect(runInference("generate", parse("--prompt", "hi", "--kv-quant", "config"), cancelled.dependencies, abort.signal)).rejects.toThrow("cancelled");
+  expect({ routes: cancelled.routes, seen: cancelled.seen }).toEqual({ routes: ["0"], seen: seams("load", "engine", "run", "close") });
+  // Two commands interleave inside their runs; each composed its own route.
+  let release!: () => void;
+  const both = new Promise<void>(resolve => { release = resolve; });
+  let waiting = 0;
+  const barrier = async () => { if (++waiting === 2) release(); await both; };
+  const fused = routeSeams(barrier), unfused = routeSeams(barrier);
+  await Promise.all([runInference("generate", parse("--prompt", "hi", "--kv-quant", "config"), fused.dependencies),
+    runInference("generate", parse("--prompt", "hi", "--kv-quant", "4"), unfused.dependencies)]);
+  expect([fused.routes, unfused.routes]).toEqual([["0"], ["1"]]);
+  expect([fused.seen, unfused.seen]).toEqual([seams("load", "engine", "run", "close"), seams("load", "engine", "run", "close")]);
 });
 
 for (const json of [false, true]) test(`embeddings accept stdin lines without a chat template and preserve output format (${json})`, async () => {

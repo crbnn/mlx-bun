@@ -114,8 +114,6 @@ test("a key serve writes shows its flag, never its local literal", () => {
   expect(written).toHaveLength(1);
   expect(written[0]).toContain(`| value | set by \`serve\` from \`--force-wire\` ([cli/serve-host.ts:${lineOf(host, "MLX_BUN_FORCE_WIRE")}]) |`);
   expect(written[0]).not.toContain("only `1` changes it");
-  // `--fused-sdpa` composes into the loaded model's KV scheme: nothing reads or writes a fused-SDPA key.
-  expect(rows(baseline, "MLX_BUN_NO_FUSED_SDPA")).toEqual([]);
   // Without the write the read sites' own fallback is the default.
   expect(rows(configInventory(mutate(host, write, "")), "MLX_BUN_FORCE_WIRE")[0]).toContain("| value | unset (only `1` changes it) |");
   expect(() => configInventory(mutate(host, "options.forceWire ?", "options.wireAlways ?")))

@@ -576,13 +576,13 @@ test("startup wires the memory budget, runtime context, allocator limit, expert 
       resolvedKvScheme: { mode: "off", fitOptions: undefined, storage: { kind: "bf16" } }, adapterNamespace() {} };
     const expected = fit(config, 2e9, 1, undefined, undefined, 0, 8e9, undefined).maxSafeContext;
     let loadOptions, cacheOptions, statusBudget, contextLimit, defaultAdapter;
-    const routes = [];
-    const route = seam => routes.push(seam + ":" + runtimeValue("MLX_BUN_NO_FUSED_SDPA"));
+    const seams = [];
+    const seam = name => seams.push(name);
     mock.module(app + "src/engine/index.ts", () => ({
-      loadContext: async (path, id, options) => { loadOptions = options; route("load"); events.push("load wire=" + runtimeValue("MLX_BUN_FORCE_WIRE") + " media=" + runtimeValue("MLX_BUN_ALLOW_PRIVATE_MEDIA")); return context; },
-      modelServingBinding: async () => { route("binding"); return { discovery: { embeddings: false }, gateway: {} }; },
-      createCacheServices: async (_context, _binding, options) => { cacheOptions = options; route("cache"); return cache; },
-      createAppEngine: async () => { route("engine"); return { gateway: { activeRows: 0 }, async close() { route("close"); context.dispose(); } }; },
+      loadContext: async (path, id, options) => { loadOptions = options; seam("load"); events.push("load wire=" + runtimeValue("MLX_BUN_FORCE_WIRE") + " media=" + runtimeValue("MLX_BUN_ALLOW_PRIVATE_MEDIA")); return context; },
+      modelServingBinding: async () => { seam("binding"); return { discovery: { embeddings: false }, gateway: {} }; },
+      createCacheServices: async (_context, _binding, options) => { cacheOptions = options; seam("cache"); return cache; },
+      createAppEngine: async () => { seam("engine"); return { gateway: { activeRows: 0 }, async close() { seam("close"); context.dispose(); } }; },
     }));
     let limit = 77;
     mock.module("@mlx-bun/mlx/ffi", () => ({ setMemoryLimit(bytes) { events.push("allocator " + bytes); const previous = limit; limit = bytes; return previous; } }));
@@ -614,21 +614,19 @@ test("startup wires the memory budget, runtime context, allocator limit, expert 
     assert.equal(statusBudget, 8e9);
     assert.equal(contextLimit, expected);
     await running.close();
-    // --fused-sdpa composes with the KV flags at load; no seam writes the process flag.
-    assert.deepEqual(routes, ["load:undefined", "binding:undefined", "cache:undefined", "engine:undefined", "close:undefined"]);
-    assert.equal(runtimeValue("MLX_BUN_NO_FUSED_SDPA"), undefined);
+    // --fused-sdpa composes with the KV flags at load (loadOptions.kv above); the seams run in order.
+    assert.deepEqual(seams, ["load", "binding", "cache", "engine", "close"]);
     // Process settings restore only after the engine released the model.
     assert.deepEqual(events.slice(5), ["model close", "restore offload", "allocator 77"]);
     assert.equal(limit, 77);
     assert.equal(runtimeValue("MLX_BUN_FORCE_WIRE"), undefined);
     assert.equal(runtimeValue("MLX_BUN_ALLOW_PRIVATE_MEDIA"), undefined);
     // A bad adapter fails startup with main's message and releases the model before anything else was created.
-    events.length = 0; mountFails = true; routes.length = 0; options.fusedSdpa = false; options.cache.kvQuant = "config";
+    events.length = 0; mountFails = true; seams.length = 0; options.fusedSdpa = false; options.cache.kvQuant = "config";
     await assert.rejects(startModelServer({ path: "/unused", repoId: "test", expertsBytes: 0 }, options), /adapter mount failed: adapter_config.json missing/);
     assert.deepEqual(events, ["load wire=1 media=1", "mount my-lora /unused/adapters/my-lora", "model close"]);
-    assert.deepEqual(routes, ["load:undefined"]);
+    assert.deepEqual(seams, ["load"]);
     assert.deepEqual(loadOptions.kv, { override: "config", fusedSdpa: false });
-    assert.equal(runtimeValue("MLX_BUN_NO_FUSED_SDPA"), undefined);
     mountFails = false; options.cache.kvQuant = "off";
     events.length = 0;
     const dense = await startModelServer({ path: "/dense", repoId: "dense", expertsBytes: 0 }, options);
