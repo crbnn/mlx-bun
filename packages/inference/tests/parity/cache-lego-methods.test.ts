@@ -4,9 +4,10 @@
 // still refuses these pairs until E2 deletes its cache-format terms, so the
 // methods are bound here, bypassing it.
 // - Teacher-forced verification rounds: one row, then two rows of different
-//   lengths, are prefilled on each lego, joined into its verification rows
-//   (`targetCacheLayout`) and run through rounds of fixed verify windows (a
-//   fixed greedy continuation) under the speculative transaction with a fixed
+//   lengths, are prefilled on each lego (a prompt tail), joined into its
+//   verification rows (`targetCacheLayout`) and run through rounds of fixed
+//   windows on the graph's verify phase (a fixed greedy continuation) under
+//   the speculative transaction with a fixed
 //   acceptance schedule. Every kept position's logits are compared with the
 //   bf16 lego's: max |Δlogit|, argmax agreement, mean and max KL. The KL of the
 //   served affine lego of the same width, and of the tiled affine kernels
@@ -111,6 +112,8 @@ test.skipIf(!target)("teacher-forced verification rounds on every lego's verific
   const { targetCacheLayout } = await import("../../src/state/layout");
   const { MlxStateRows } = await import("../../src/state/rows");
   const { bindRowCacheRollback } = await import("../../src/state/rollback");
+  const { phaseHidden } = await import("../models/phase-forward");
+  const { widthClass } = await import("../../src/contracts/mlx/graph");
   const loaded = await loadTarget();
   try {
     const prompts = ["Write a short paragraph about lighthouses and the people who kept them.",
@@ -139,7 +142,7 @@ test.skipIf(!target)("teacher-forced verification rounds on every lego's verific
         for (const prompt of used) {
           const caches = await cachesOf(model, lego.paged);
           using ids = ops.fromInt32(prompt, [1, prompt.length]);
-          model.forwardHidden(ids, caches).dispose();
+          phaseHidden(model, ids, caches).dispose();
           maintain.prepareBatch?.(caches);
           rows.push(caches);
         }
@@ -152,8 +155,10 @@ test.skipIf(!target)("teacher-forced verification rounds on every lego's verific
           for (let round = 0; round < ROUNDS; round++) {
             rollback.begin(DEPTH);
             using ids = ops.fromInt32(position.flatMap((at, row) => continuations[row]!.slice(at, at + DEPTH + 1)), [rows.length, DEPTH + 1]);
-            using hidden = model.forwardHidden(ids, state.caches);
-            using out = model.logitsFromHidden(hidden);
+            // The verify phase at the class of the window's rows (rows times depth + 1), as the speculative group calls it.
+            const width = widthClass(rows.length * (DEPTH + 1));
+            using hidden = model.verify[width](ids, state.caches, null);
+            using out = model.logits[width](hidden);
             const counts = rows.map((_, row) => accepted(round, row));
             for (const [row, count] of counts.entries()) for (let p = 0; p <= count; p++) {
               using one = out.slice([row, p, 0], [row + 1, p + 1, out.shape[2]!]);
