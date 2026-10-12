@@ -430,6 +430,42 @@ below is a missing lego; the refusals disappear because the legos exist, not the
       by `MlxKnownSpans.affineKvBits / turboQuantFormats`; that capability goes.
 - [ ] Order: after the merge of E5, the B3 planner side and the ratchet item, which own the
       contract and the legos these build on.
+- [x] Built (`refactor/composition-b4-legos`, 3e235467, fourteen commits on e436ccf5; merging
+      forward onto `refactor/composition`). Compiled decode on the TurboQuant, delayed-start
+      and paged legos (shapeless replay per lego; on e4b eight lego cells ran 19 compiled
+      steps with tokens equal to eager), `compiledDecode` a plain field, `decodesCompiled`
+      deleted. Pages under per-layer affine and TurboQuant (262 page cells; KL vs bf16 at one
+      row: paged config 0.025/0.28, paged TurboQuant 0.038/0.38, against the tiled null
+      0.102/1.31). DiffusionGemma's `makeCache` composes the scheme and paging (paged bf16 at
+      maxDiff 0; canvas KL vs bf16: affine 4 0.266, affine 8 0.0087, per-layer 0.0045,
+      TurboQuant 0.054). GLM-5.2 latent legos, affine, TurboQuant and paged (bf16 and paged f32
+      at maxDiff 0 against the frozen oracle, 404 + 36 tensors; logits KL vs f32 with DSA on:
+      affine 4 5.1e-3, affine 8 6.9e-5, TurboQuant 7.3e-5; the latent uses the key encoding,
+      the value encoding cost 0.0117); the gateway's refusal gone. Gemma 2's softcap read over
+      affine storage by dequantize-and-read (keeps Gemma 2's arithmetic); `DenseKvReadError`,
+      the 501, `Cache.denseKvReads` and `requiredDenseKvLayers` gone from every graph and
+      generator; synthetic frozen oracle at maxDiff 0 on every phase for seven schemes; 72 pass
+      / 6 skip (need Gemma 2 weights, none on either machine). `appendKnown` over every lego;
+      `affineKvBits` / `turboQuantFormats` / `supportsCommittedAppendCache` gone; fill's span
+      tests over 13 legos (221 pass); direct generation no longer silently turns fill off under
+      a quantized scheme. GLM's absorbed or reconstructed read named by phase (404 tensors at
+      maxDiff 0). `compiledGeglu` (default on) and `pagedKv.direct` (`--paged-kv-direct`,
+      default off) are composition fields; `MLX_BUN_COMPILED_GEGLU` and `MLX_BUN_PAGED_ATTN`
+      read nowhere. The direct paged read: windows of up to eight queries read with the direct
+      kernel again; the paged lego declares whether it has a compiled decode form
+      (`pagedDecodeCompiles`: none for pages the direct kernel reads), and `resolveComposition`
+      resolves `compiledDecode` off for such a composition, so decode runs the direct kernel
+      eagerly as main did; against main 9593d881 with `MLX_BUN_PAGED_ATTN=1` on e4b and 12B,
+      72 of 72 rows identical in tokens and every logits vector; `/stats` shows
+      `compiled_decode: false` there. Gates against e436ccf5: typecheck; root test exit 0
+      (inference 2646 pass); architecture and drift; identity suites at maxDiff 0; 88 of 88
+      digest cells identical; the parity suites at the base's lines. Left: `--kv-quant turbo`
+      is still refused at startup for a head dimension outside {64, 128, 256, 512}, because the
+      ported TurboQuant codec tabulates its rotation for those four sizes only (no cached
+      artifact hits it; Josh's decision whether to generate the missing sizes from the same
+      construction, KL-gated, or to declare the codec's sizes as a fact of the lego); two
+      unreachable guards remain by inspection (`training/segmented.ts`'s quantized donor KV,
+      the latent width checks).
 
 Exit: every lego the composition can name serves every model and method, so nothing in the tree
 has a reason to name a cache together with a model, method or row kind; the conformance suite
