@@ -36,7 +36,10 @@ import { join } from "node:path";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
-import type { AttentionCache, AttentionRead, BatchableCache, Cache, CommittedAttentionCache, GatedDeltaCache, GatedDeltaParameters } from "../../src/contracts/mlx/cache";
+import type {
+  AttentionCache, AttentionRead, BatchableCache, BidirectionalAttentionCache, BlockAttentionCache, Cache, CommittedAttentionCache,
+  EncoderAttentionCache, GatedDeltaCache, GatedDeltaParameters,
+} from "../../src/contracts/mlx/cache";
 import { BF16_KV, type KvStorageScheme } from "../../src/contracts/portable/composition";
 import { composedAffineKernels } from "../../src/state/affine-attention";
 import { AttentionMasks } from "../../src/state/attention-read";
@@ -140,6 +143,9 @@ interface Lego {
   make(masks?: AttentionMasks): Cache;
   /** Every read equals the bf16 lego's bit for bit (bf16 storage). */
   readonly exact: boolean;
+  /** A first window is stored bf16 (every bf16-first lego), so the first-window
+   * reads equal the bf16 lego's bit for bit. */
+  readonly firstWindowBf16: boolean;
   /** Bound on a read's difference from the bf16 lego's (quantized storage). */
   readonly tolerance: number;
 }
@@ -151,15 +157,16 @@ const perLayer = (bits: number): KvStorageScheme =>
 const turbo = (start = 0): KvStorageScheme => ({ kind: "turbo", kBits: 8, vBits: 3, ...(start ? { quantizedKvStart: start } : {}) });
 
 const full = (name: string, scheme: KvStorageScheme, kernels = denseTurboQuantKernels, tolerance = 0.2): Lego => ({
-  name, g: FULL, scheme, exact: scheme.kind === "bf16", tolerance,
+  name, g: FULL, scheme, exact: scheme.kind === "bf16", firstWindowBf16: true, tolerance,
   make: masks => composedFullAttentionCache(scheme, 0, masks ?? new AttentionMasks(), kernels),
 });
 const sliding = (name: string, scheme: KvStorageScheme, tolerance = 0.2): Lego => ({
-  name, g: SLIDING, scheme, exact: scheme.kind === "bf16" || scheme.kind === "turbo", tolerance,
+  name, g: SLIDING, scheme, exact: scheme.kind === "bf16" || scheme.kind === "turbo", firstWindowBf16: true, tolerance,
   make: masks => composedSlidingAttentionCache(scheme, 0, SLIDING.window!, masks ?? new AttentionMasks()),
 });
 const paged = (name: string, quantization?: PagedQuantization, direct = false): Lego => ({
   name, g: FULL, scheme: quantization ? affine(quantization.bits) : BF16_KV, exact: !quantization && !direct,
+  firstWindowBf16: !quantization,
   tolerance: quantization ? 0.2 : 0.07,
   make: () => new PagedKVCache(256, 16, direct, quantization),
 });
@@ -177,7 +184,7 @@ const LEGOS: readonly Lego[] = [
   full("TurboQuant deferred full, bf16 first", turbo(), deferredTurboQuantKernels, 0.5),
   full("TurboQuant dense full, bf16 for 6 positions", turbo(6), denseTurboQuantKernels, 0.5),
   sliding("TurboQuant sliding (bf16)", turbo()),
-  { name: "KV4 head-256 (M4 Pro composition), bf16 first", g: HEAD256, scheme: affine(4), exact: false, tolerance: 0.2,
+  { name: "KV4 head-256 (M4 Pro composition), bf16 first", g: HEAD256, scheme: affine(4), exact: false, firstWindowBf16: true, tolerance: 0.2,
     make: masks => new Bf16FirstKv4Head256Cache(0, composedAffineKernels("unfused"), masks ?? new AttentionMasks()) },
   paged("paged bf16"),
   paged("paged bf16, direct read (Lab)", undefined, true),
@@ -289,6 +296,69 @@ for (const lego of LEGOS) describe(lego.name, () => {
         if (lego.exact) expect(diff, `${phase} ${L} at ${position}`).toBe(0);
         else expect(diff, `${phase} ${L} at ${position}: ${diff}`).toBeLessThanOrEqual(lego.tolerance);
       }
+    } finally { dispose(cache, bf16Cache); }
+  });
+
+  /** A first window's flags: positions 2..4 attend each other both ways. */
+  const flags = (L: number) => {
+    using ints = ops.fromInt32(Array.from({ length: L }, (_, i) => Number(i >= 2 && i <= 4)), [L]);
+    return ints.astype(Dtype.bool);
+  };
+  const expectRead = (label: string, out: MlxArray, want: MlxArray, exact: boolean) => {
+    const diff = maxDiff(out, want);
+    if (exact) expect(diff, label).toBe(0);
+    else expect(diff, `${label}: ${diff}`).toBeLessThanOrEqual(lego.tolerance);
+  };
+
+  test("vision prefill: the bidirectional first window", () => {
+    const cache = lego.make(), bf16Cache = reference(lego);
+    const L = 7;
+    try {
+      using bidirectional = flags(L);
+      const [k, v] = rowKv(g, L, 81);
+      using q = rowQ(g, L, 81);
+      try {
+        using out = readOnce((cache as BidirectionalAttentionCache).appendBidirectional(k, v, bidirectional), q, g);
+        using want = readOnce((bf16Cache as BidirectionalAttentionCache).appendBidirectional(k, v, bidirectional), q, g);
+        expectRead("bidirectional", out, want, lego.firstWindowBf16);
+      } finally { k.dispose(); v.dispose(); }
+      expect(cache.offset).toBe(L);
+      using a = step(cache, g, "decode", 1, [82]);
+      using b = step(bf16Cache, g, "decode", 1, [82]);
+      expectRead("decode after", a, b, lego.exact);
+    } finally { dispose(cache, bf16Cache); }
+  });
+
+  test("encoder: the first window, which the sliding window does not limit", () => {
+    const cache = lego.make(), bf16Cache = reference(lego);
+    const L = 12;
+    try {
+      using bidirectional = flags(L);
+      const [k, v] = rowKv(g, L, 83);
+      using q = rowQ(g, L, 83);
+      try {
+        using out = readOnce((cache as EncoderAttentionCache).appendEncoderWindow(k, v, bidirectional), q, g);
+        using want = readOnce((bf16Cache as EncoderAttentionCache).appendEncoderWindow(k, v, bidirectional), q, g);
+        expectRead("encoder window", out, want, lego.firstWindowBf16);
+      } finally { k.dispose(); v.dispose(); }
+      expect(cache.offset).toBe(L);
+    } finally { dispose(cache, bf16Cache); }
+  });
+
+  test("block read: the stored positions and the block, nothing appended", () => {
+    const cache = makeRow(lego, 11, 84), bf16Cache = reference(lego);
+    try {
+      fill(bf16Cache, g, 9, 84); step(bf16Cache, g, "window", 2, [184]).dispose();
+      const [k, v] = rowKv(g, 4, 85);
+      using q = rowQ(g, 4, 85);
+      try {
+        using out = readOnce((cache as BlockAttentionCache).readBlock(k, v), q, g);
+        using again = readOnce((cache as BlockAttentionCache).readBlock(k, v), q, g);
+        using want = readOnce((bf16Cache as BlockAttentionCache).readBlock(k, v), q, g);
+        expect(cache.offset).toBe(11);
+        expect(maxDiff(out, again)).toBe(0);
+        expectRead("block", out, want, lego.exact);
+      } finally { k.dispose(); v.dispose(); }
     } finally { dispose(cache, bf16Cache); }
   });
 
