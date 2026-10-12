@@ -173,24 +173,30 @@ export function decide({ before, after, run }: DecideInput): Decision {
   const q = qualification(run);
   if (!q.complete) return none("run incomplete, no numbers", q.problems);
   const notes = [after ? after.ok ? "" : `machine not clear after the run: ${after.problems.join("; ")}` : "no preflight after the run"].filter(Boolean);
+  // What qualification reported, not required, about a context configuration's cells and pairs.
+  const contexts = run.plan.configurations.filter(isContext);
+  notes.push(...q.notes.filter(note => !note.includes(": not applicable") && !note.includes("not observed mapped") &&
+    contexts.some(name => note.includes(`/${name}/`) || note.includes(`/${name} `))).map(note => `context: ${note}`));
   const reasons: string[] = [], compositions: Composition[] = [];
   for (const model of run.plan.models) for (const configuration of run.plan.configurations) {
     const cells = run.cells.filter(cell => cell.kind === "tree" && cell.model === model.id && cell.configuration === configuration);
     if (cells.length && cells.every(cell => cell.skipped)) continue; // not applicable, as the plan predeclared
-    const comparison = pooledComparison(run, model.id, configuration);
-    if (!comparison) { reasons.push(`${model.id}/${configuration}: no paired measurement`); continue; }
-    // The trees ran different settings: every metric is shown beside the gate, none in it.
+    // The trees ran different settings: every metric is shown beside the gate, none in it, and a missing
+    // measurement is a note.
     const context = isContext(configuration);
+    const missing = context ? notes : reasons;
+    const comparison = pooledComparison(run, model.id, configuration);
+    if (!comparison) { missing.push(`${model.id}/${configuration}: no paired measurement`); continue; }
     const deltas = [...GATED, ...CONTEXT].flatMap(name => {
       const metric = comparison.pooled.find(c => c.metric === name);
-      if (!metric) { reasons.push(`${model.id}/${configuration}: no ${name} comparison`); return []; }
+      if (!metric) { missing.push(`${model.id}/${configuration}: no ${name} comparison`); return []; }
       try {
         return [{ ...pairedDelta(metric, !context && (GATED as readonly string[]).includes(name)),
           sessions: comparison.sessions.map(({ session, metrics }) => {
             const own = metrics.find(c => c.metric === name);
             return { session, baselineMedian: own?.baselineMedian ?? null, candidateMedian: own?.candidateMedian ?? null };
           }) }];
-      } catch (error) { reasons.push(`${model.id}/${configuration}: ${(error as Error).message}`); return []; }
+      } catch (error) { missing.push(`${model.id}/${configuration}: ${(error as Error).message}`); return []; }
     });
     compositions.push({ model: model.id, configuration, label: model.label, deltas });
   }

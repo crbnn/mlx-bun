@@ -177,11 +177,12 @@ test("every applicable configuration gets its table; a configuration a model has
   expect(text).toContain("dflash2 (--kv-quant 4 --num-draft-tokens adaptive --draft-model <DFlash 2 drafter>)");
 });
 
-test("dflash2-d7-baseline is context: shown with each tree's depth, never gated, its differing probes a note", () => {
+test("dflash2-d7-baseline is context: shown with each tree's depth, never gated, its differing probes and unstable decode notes", () => {
   const p = plan({ configurations: ["default", "dflash2-d7-baseline"] });
   const models = [{ ...p.models[0]!, dflash2: { path: "/drafters/dflash2", files: [{ name: "model.safetensors", bytes: 1, sha256: "e".repeat(64) }] } }, p.models[1]!];
-  // A candidate 20% slower everywhere: a regression in a gated configuration.
-  const slow = { decode: SAME.decode.map(x => x * 0.8), ttft: SAME.ttft.map(x => x * 1.2) };
+  // A candidate about 23% slower, with a decode spread (1.16) over the stability guard: in a gated configuration a
+  // regression, and a run with no numbers.
+  const slow = { decode: [24, 23.2, 22.8, 22.2, 25.8], ttft: SAME.ttft.map(x => x * 1.2) };
   const run = runRecord({}, { configurations: ["default", "dflash2-d7-baseline"], models });
   const cell = (tree: Tree) => run.cells.find(c => c.key === `qwen27b/dflash2-d7-baseline/${tree}`)!;
   // The candidate's adaptive widths change the last bits of one probe's greedy text, and its decode is slower.
@@ -192,6 +193,7 @@ test("dflash2-d7-baseline is context: shown with each tree's depth, never gated,
   const q = qualification(run);
   expect(q.problems).toEqual([]);
   expect(q.notes.some(note => note.startsWith("qwen27b/dflash2-d7-baseline chat probe: **parity ✗**"))).toBe(true);
+  expect(q.notes).toContain("qwen27b/dflash2-d7-baseline/candidate: unstable decode spread 1.16 exceeds the 1.15 stability guard");
   const d = decide(input(run));
   expect(d.outcome).toBe("pass");
   const context = d.compositions.find(c => c.configuration === "dflash2-d7-baseline")!;
@@ -200,12 +202,18 @@ test("dflash2-d7-baseline is context: shown with each tree's depth, never gated,
   const text = summary(d, input(run));
   expect(text).toContain("dflash2-d7-baseline (--kv-quant 4 --draft-model <DFlash 2 drafter>; baseline --num-draft-tokens 7, candidate --num-draft-tokens adaptive)");
   expect(text).toContain("Context, not gated: the trees ran different settings (baseline --num-draft-tokens 7, candidate --num-draft-tokens adaptive)");
-  expect(text).toMatch(/\| decode \| tok\/s ↑ \| 30\.1 \| 24\.1 \| 0\.800 \| .* \| context, not gated \|/);
-  // The same differing probe in a gated configuration voids the check.
+  expect(text).toMatch(/\| decode \| tok\/s ↑ \| 30\.1 \| 23\.2 \| .* \| context, not gated \|/);
+  expect(text).toContain("- note: context: qwen27b/dflash2-d7-baseline/candidate: unstable decode spread 1.16");
+  expect(text).toContain("- note: context: qwen27b/dflash2-d7-baseline chat probe: **parity ✗**");
+  // The same differing probe and spread in a gated configuration void the check.
   const gated = runRecord({}, { configurations: ["default", "dflash2"], models });
   const own = gated.cells.find(c => c.key === "qwen27b/dflash2/candidate")!;
-  own.result = { ...own.result!, parity: { ...own.result!.parity!, chat: { ...own.result!.parity!.chat, text: "2, 3, 5, 7, 11, 13, 17, 23" } } };
-  expect(qualification(gated).problems.some(problem => problem.startsWith("qwen27b/dflash2 chat probe"))).toBe(true);
+  own.result = { ...own.result!, decodeTps: slow.decode,
+    parity: { ...own.result!.parity!, chat: { ...own.result!.parity!.chat, text: "2, 3, 5, 7, 11, 13, 17, 23" } } };
+  const problems = qualification(gated).problems;
+  expect(problems.some(problem => problem.startsWith("qwen27b/dflash2 chat probe"))).toBe(true);
+  expect(problems).toContain("qwen27b/dflash2/candidate: unstable decode spread 1.16 exceeds the 1.15 stability guard");
+  expect(decide(input(gated)).outcome).toBe("no measurement");
 });
 
 test("two alternating sessions: the pairs pool across sessions, the interval widens with session drift, per-session medians are shown", () => {
