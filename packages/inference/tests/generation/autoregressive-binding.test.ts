@@ -257,11 +257,10 @@ test("a replacement binding supplies its own fused decoder to the same loop, cho
   let setup = 0;
   const replacement: MlxAutoregressiveBinding = {
     ...binding,
-    createDecode(policy, state) {
+    createDecode(policy) {
       setup++;
       expect(seen.forwards).toBe(2); // only after prefill
-      expect(policy).toEqual({ hasAdapters: false, pagedKv: false });
-      expect(state[0]!.offset).toBe(2); // the run's own caches, after the prompt
+      expect(policy).toEqual({ hasAdapters: false });
       return { close() {}, step: stepping() };
     },
   };

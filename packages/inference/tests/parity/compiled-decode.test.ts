@@ -4,7 +4,6 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test
 import type { MlxArray } from "@mlx-bun/mlx";
 import type { Cache } from "@mlx-bun/inference/contracts/mlx";
 import type { KvOptions } from "../models/test-composition";
-import { configureRuntime } from "@mlx-bun/inference/runtime/config";
 
 const timeout = 240_000;
 const forcedTokens = [911, 604, 607, 610];
@@ -112,14 +111,12 @@ for (const [family, checkpoint] of [
       finally { input.dispose(); }
     }
     async function trajectory(prompt: number[], compiled: boolean, kv: KvOptions): Promise<number[]> {
-      const restore = configureRuntime({ MLX_BUN_COMPILED_DECODE: compiled ? "1" : "0" });
-      try {
-        const out: number[] = [];
-        for await (const token of generate(modelFor(kv), prompt, {
-          maxTokens: family === "12B" ? 32 : 24, temperature: 0,
-        })) out.push(token.token);
-        return out;
-      } finally { restore(); }
+      // The composition turns the compiled step on; a run that declines replay decodes through the forward.
+      const out: number[] = [];
+      for await (const token of generate(modelFor(kv), prompt, {
+        maxTokens: family === "12B" ? 32 : 24, temperature: 0, ...(compiled ? {} : { decodePolicy: { compiledDecode: false, grammarJump: false } }),
+      })) out.push(token.token);
+      return out;
     }
 
     const trajectoryCases = family === "12B"
@@ -147,7 +144,6 @@ for (const [family, checkpoint] of [
       // The graph composed with the scheme: its caches convert inside their own appends.
       const graph = modelFor(kvOptions(mixed));
       const cache = graph.makeCache();
-      const restore = configureRuntime({ MLX_BUN_COMPILED_DECODE: compiled ? "1" : "0" });
       try {
         const prefix = promptOf(context);
         for (let position = 0; position < prefix.length; position += 128) {
@@ -198,7 +194,6 @@ for (const [family, checkpoint] of [
         return collected;
       } finally {
         for (const row of cache) row.dispose();
-        restore();
       }
     }
 

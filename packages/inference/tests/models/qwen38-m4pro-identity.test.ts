@@ -138,9 +138,10 @@ function artifact(): { weights: Weights; config: ModelConfig } {
 }
 
 const composition = (overrides: Partial<Composition> = {}): Composition => Object.freeze<Composition>({
-  device: "applegpu_g16s", aneBridge: false, kv: { kind: "bf16" }, draftDepth: { adaptive: true, max: 7 },
-  prefillChunkTokens: CHUNK, adapters: false, maxRows: 8, speculativeAffineKv: true, packedMixedMlp: true,
-  vectorGreedySampling: true, ...overrides,
+  device: "applegpu_g16s", aneBridge: false, kv: { kind: "bf16" }, pagedKv: null, draftDepth: { adaptive: true, max: 7 },
+  prefillChunkTokens: CHUNK, adapters: false, maxRows: 8, packedMixedMlp: true,
+  vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
+  grammarJump: false, greedyDraft: false, ...overrides,
 });
 /** The M4 Pro composition's KV scheme (`--kv-quant 4`, fused SDPA unset). */
 const KV4: KvStorageScheme = Object.freeze({ kind: "affine", bits: 4, groupSize: 64, kernels: "unfused" });

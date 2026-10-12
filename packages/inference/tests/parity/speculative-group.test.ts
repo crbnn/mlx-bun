@@ -26,9 +26,8 @@
 //   with the draft ignored; the adapter changes the B1 control's logprobs; each
 //   row equals its B1 control without a draft (greedy tokens), seeded B4 cohorts
 //   repeat, groups never mix adapter contexts, a failing row leaves its peers intact, and prefix reuse stays
-//   isolated by adapter. Drafted base rows join these checks where placement
-//   serves them; delayed affine KV on MiniCPM5 and encoded Universal graphs
-//   refuses them by design (genuine delayed speculation is excluded).
+//   isolated by adapter. Drafted base rows join these checks: placement
+//   speculates over every KV scheme, delayed affine included.
 // The first two tests require a combination placement serves; run only the
 // adapter test with --test-name-pattern "adapter rows" for such a KV setting.
 // Not covered: equality with main or an external oracle, HTTP, speed.
@@ -101,11 +100,9 @@ export function optIn(env: Record<string, string | undefined>) {
   if (kind === "glm-mtp") {
     const raw = JSON.parse(readFileSync(join(target, "config.json"), "utf8"));
     assert.equal(raw.model_type, "glm_moe_dsa", `${PREFIX}KIND=glm-mtp needs a GLM-5.2 (glm_moe_dsa) target, not ${raw.model_type}`);
-    // GLM's attention stores a compressed MLA latent cache, not plain or rotating
-    // KV: no layer has an affine or TurboQuant conversion, so the gateway's
-    // kvBatchable refuses every quantized scheme and the drafted placement these
-    // tests require is refused. The KV matrix does not apply to this cache;
-    // plain KV is its only layout.
+    // GLM's attention stores a compressed MLA latent cache: no quantized or paged
+    // form of it exists yet, so the loader refuses those compositions (owed). The
+    // KV matrix does not apply to this cache; plain KV is its only layout.
     if (kv !== "bf16") throw new Error(`${PREFIX}KIND=glm-mtp takes plain KV only: GLM's MLA latent cache has no affine or TurboQuant conversion`);
   }
   if (window !== undefined) {
@@ -196,9 +193,8 @@ type Loaded = Awaited<ReturnType<typeof load>>;
 async function bindFor(loaded: Loaded, provider: A, depth: number) {
   const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
   const binding = bindMlxGateway(loaded.view, provider ? { provider, numDraftTokens: depth } : undefined);
-  const quantizedBatch = loaded.kv.scheme ? binding.kvBatchable(loaded.kv.scheme) : false;
   const place = (options: A, extra: Record<string, boolean> = {}) => binding.plan(loaded.requirements({ ...extra, hasDraft: !!provider }),
-    options, { continuous: true, quantizedBatch, checkpoints: false });
+    options, { checkpoints: false });
   /** A speculative method request; any other placement fails with its reasons. */
   const method = (options: A) => {
     const plan = place(options);
@@ -211,7 +207,6 @@ async function bindFor(loaded: Loaded, provider: A, depth: number) {
   const group = (options: { maxBatch?: number; promptCache?: A; held?: boolean } = {}) => {
     let held = options.held ?? false;
     const created: A = binding.createBatchGroup({ maxBatch: options.maxBatch ?? 4, admissionHeld: () => held,
-      ...(loaded.kv.scheme && quantizedBatch ? { kvScheme: loaded.kv.scheme } : {}),
       ...(options.promptCache ? { promptCache: options.promptCache } : {}) });
     return Object.assign(created, { release() { held = false; created.kick(); } });
   };
@@ -292,6 +287,10 @@ test.skipIf(!inputs)("grouped speculation: placement, the serial producer at B1,
       expect(stats.spec!.drafted).toBeGreaterThanOrEqual(inputs!.kind === "ngram" ? 0 : stats.spec!.rounds!);
     }
     console.log(JSON.stringify({ kind: inputs!.kind, kv: inputs!.kv, start: inputs!.start, single: single.stats, batch: batch.stats }));
+    // The trajectories' digest and draft counts, for comparing trees.
+    console.log(`[spec-digest] ${JSON.stringify({ kv: inputs!.kv, start: inputs!.start, single: Bun.hash(JSON.stringify(single.tokens)).toString(16),
+      batch: Bun.hash(JSON.stringify(batch.tokens)).toString(16),
+      spec: [...single.stats, ...batch.stats].map(stat => stat.spec && [stat.spec.drafted, stat.spec.accepted, stat.spec.rounds]) })}`);
 
     // Retirement: stop, consumer failure and abort inside a four-row cohort.
     const retiring = groupOf({ held: true });
@@ -570,10 +569,9 @@ test.skipIf(!inputs?.adapter)("adapter rows with a configured draft: placement, 
       .toEqual({ mechanism: "continuous", reasons: [] });
     if (provider.grouped?.supportsTargetAdapters !== true) expect(adapterPlan.method).toBe("autoregressive");
     const adapterSpeculates = adapterPlan.method === "speculative";
-    // Drafted base rows: served, or refused where genuine delayed speculation is excluded.
+    // Drafted base rows are served over every cache lego.
     const basePlan = probeBinding.place(optionsFor(base, prompt), { wantsLogprobs: true });
-    const baseServed = basePlan.mechanism === "continuous";
-    if (!baseServed) expect(basePlan.reasons).toContain("continuous-unavailable");
+    expect(basePlan.mechanism).toBe("continuous");
     const expectedMethod = (adapters: string[]) => adapters.length ? adapterPlan.method : basePlan.method;
     const run = async (batch: number, requests: Request[], promptIds = prompt, cached = false, seeded = false) => {
       frames.length = 0;
@@ -639,7 +637,7 @@ test.skipIf(!inputs?.adapter)("adapter rows with a configured draft: placement, 
     expect(four.frames.some(frame => frame.batch === 4)).toBe(true);
     expect((await run(4, [upper, upper, upper, upper], prompt, false, true)).results.map(({ output, metadata }) => ({ output, metadata })))
       .toEqual(four.results.map(({ output, metadata }) => ({ output, metadata })));
-    const baseAlone = baseServed ? await run(4, [base]) : undefined;
+    const baseAlone = await run(4, [base]);
     if (baseAlone) {
       expect(baseAlone.results[0]!.output).toEqual(baseSerial.results[0]!.output);
       const mixed = await run(4, [upper, upper, base, upper]);
@@ -677,7 +675,7 @@ test.skipIf(!inputs?.adapter)("adapter rows with a configured draft: placement, 
       expect(warmBase.results[0]!.output).toEqual(coldBase.results[0]!.output);
     }
     console.log(`[speculative-group] adapter rows ${adapterSpeculates ? "speculate" : "decode ordinarily, draft ignored"}; ` +
-      `drafted base rows ${baseServed ? basePlan.method : "refused"}: B1 controls, grouped contexts, failure cleanup and isolated prefix reuse pass`);
+      `drafted base rows ${basePlan.method}: B1 controls, grouped contexts, failure cleanup and isolated prefix reuse pass`);
   } finally {
     stopProbe(); publication.mockRestore(); cache.clear();
     try { manager.unmount("upper"); provider?.dispose(); } finally { await loaded.release(); clearCache(); }

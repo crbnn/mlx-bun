@@ -9,7 +9,6 @@ import type { DraftKind } from "../engine/model-host";
 import type { DownloadOwner } from "../hub/downloads";
 import type { KvQuantOverride } from "@mlx-bun/inference/state/kv-scheme";
 import type { TurboQuantScheme } from "@mlx-bun/inference/artifacts/config";
-import type { KvStorageScheme } from "@mlx-bun/inference/contracts/portable";
 import type { AppStoragePaths, ChatPaths } from "./serve-state";
 
 export interface ServeOptions {
@@ -96,20 +95,8 @@ export interface ServeKvFlags {
   kvQuant?: KvQuantOverride;
   turboQuant?: TurboQuantScheme;
   quantizedKvStart?: number;
-}
-
-/** Validate resolved startup policy before handing resources to the engine.
- * Paging must not silently replace a selected KV codec or draft provider. */
-export function validatePagedServingOptions(
-  pagedKv: RequestPrepOptions["pagedKv"],
-  kv: KvStorageScheme,
-  hasDraft: boolean,
-): void {
-  if (!pagedKv) return;
-  if (kv.kind === "affine-layers" || kv.kind === "turbo")
-    throw new Error("--paged-kv supports bf16 and uniform affine KV4/KV8; per-layer and TurboQuant pages are not implemented.");
-  if (hasDraft)
-    throw new Error("--paged-kv cannot combine with --draft-model in v1.");
+  /** `--paged-kv` and `--paged-kv-block-size`: the composition's paging. */
+  pagedKv?: { blockSize?: number };
 }
 
 /** Main's MLX_BUN_SHUTDOWN_TIMEOUT_MS: any finite value > 0, else 120 s. How long a close may take to drain work and flush saved state. */

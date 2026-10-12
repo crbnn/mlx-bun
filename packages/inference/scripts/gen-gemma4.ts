@@ -400,8 +400,8 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
   readonly loraState = new LoraState();
   /** Layers whose attention reads plain keys and values: none; it attends the storage its caches hold. */
   readonly requiredDenseKvLayers: readonly number[] = Object.freeze([]);
-  /** Prepared image and audio embeddings, paged attention, layer taps for drafts${compiledDecode ? ", a compiled decode step" : ""};
-   *  its caches convert delayed affine rows. No training operations. */
+  /** Prepared image and audio embeddings, layer taps for drafts${compiledDecode ? ", a compiled decode step" : ""}.
+   *  No training operations. */
   readonly graphCapabilities: GraphCapabilities;
   readonly embed: QuantizedEmbedding;
   readonly layers: readonly DecoderLayer[];
@@ -450,8 +450,7 @@ ${perLayer ? `    this.#perLayerInputs = new PerLayerInputs(weights, config, PRE
 ${softcapHead}
     this.#packMixedMlp = composition.packedMixedMlp;
     this.graphCapabilities = declareGraph({
-      media: { input: "embeddings", video: false }, pagedAttention: true, hiddenLayerTaps: true, compiledDecode: ${compiledDecode},
-      kv: { delayedAffine: "all" },
+      media: { input: "embeddings", video: false }, hiddenLayerTaps: true, compiledDecode: ${compiledDecode},
     });
 
     const head = this.#head;

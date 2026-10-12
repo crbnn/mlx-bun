@@ -9,7 +9,7 @@ describe("generationCheckpointKey", () => {
       hasVision: false, hasAdapters: false, hasRepetitionPenalty: false,
       userSeed: false, hasLogitsExtras: false,
       hasGrammar: false, wantsLogprobs: false, hasDraft: false,
-    }, { method: "autoregressive", continuous: false, quantizedBatch: false,
+    }, { method: "autoregressive",
       grammarBatch: false, checkpoints: true });
     const key = generationCheckpointKey([1], {}, "", execution);
     expect(key).not.toBe(generationCheckpointKey([1], {}, "", { ...execution, compiledDecode: true }));

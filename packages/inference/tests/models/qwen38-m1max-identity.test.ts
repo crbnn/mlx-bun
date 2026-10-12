@@ -133,9 +133,10 @@ function artifact(): { weights: Weights; config: ModelConfig } {
 }
 
 const composition = (overrides: Partial<Composition> = {}): Composition => Object.freeze<Composition>({
-  device: "applegpu_g13s", aneBridge: false, kv: { kind: "bf16" }, draftDepth: { adaptive: true, max: 7 },
-  prefillChunkTokens: CHUNK, adapters: false, maxRows: 8, speculativeAffineKv: true, packedMixedMlp: true,
-  vectorGreedySampling: true, ...overrides,
+  device: "applegpu_g13s", aneBridge: false, kv: { kind: "bf16" }, pagedKv: null, draftDepth: { adaptive: true, max: 7 },
+  prefillChunkTokens: CHUNK, adapters: false, maxRows: 8, packedMixedMlp: true,
+  vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
+  grammarJump: false, greedyDraft: false, ...overrides,
 });
 
 /** The KV schemes the composition serves, as `--kv-quant` composes them (fused SDPA unset). */
@@ -295,8 +296,6 @@ describe("the composition the generated graph declares", () => {
       try { expect(a.map(cache => `${cache.constructor.name} ${cache.signature()}`)).toEqual(b.map(cache => `${cache.constructor.name} ${cache.signature()}`)); }
       finally { disposeAll(a, b); }
     }
-    const off = pair("bf16", { speculativeAffineKv: false });
-    expect(off.currentGraph.graphCapabilities).toEqual(off.oldGraph.graphCapabilities);
     const adapted = pair("bf16", { adapters: true });
     expect(adapted.currentGraph.graphCapabilities).toEqual(adapted.oldGraph.graphCapabilities);
   });

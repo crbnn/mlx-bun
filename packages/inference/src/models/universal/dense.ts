@@ -28,7 +28,7 @@ import type { GraphCapabilities } from "../../contracts/portable/graph";
 import type {
   MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward, MlxWidthClass,
 } from "../../contracts/mlx/graph";
-import { PLAIN_KV_VERIFICATION, declareGraph } from "../capabilities";
+import { ORDINARY_VERIFICATION, declareGraph } from "../capabilities";
 import { atEveryWidth, type ReadPhase } from "../graph";
 import type { QuantizedLinear } from "../../layers/quantized-linear";
 import { TrellisLinear } from "../../layers/trellis-linear";
@@ -458,17 +458,10 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
   /** Layers whose bound attention reads plain keys and values: the manual softcap layers. */
   readonly requiredDenseKvLayers: readonly number[];
 
-  /** Softcapped attention reads plain K/V in every layer it softcaps, so encoded
-   * storage decodes on read and verification qualifies plain-KV rounds only.
-   * Otherwise attention attends the storage its caches hold: delayed affine rows
-   * convert per layer and serve ordinary decoding only. Before the attention
-   * facts are bound, neither is declared. */
+  /** A graph whose attention softcaps its scores verifies ordinary rounds only
+   * (its layers read plain K/V through the softcapped read, `requiredDenseKvLayers`). */
   get graphCapabilities(): GraphCapabilities {
-    const denseReads = this.encodedKvAttention === false;
-    return declareGraph({
-      kv: { denseReads, delayedAffine: this.encodedKvAttention === true ? "ordinary" : "none" },
-      ...(denseReads ? { speculation: PLAIN_KV_VERIFICATION } : {}),
-    });
+    return declareGraph(this.encodedKvAttention === false ? { speculation: ORDINARY_VERIFICATION } : {});
   }
   // Cache layout and each layer's read come from the same descriptor facts,
   // bound at construction; later edits to `args` cannot make them disagree.

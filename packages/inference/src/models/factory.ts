@@ -35,7 +35,7 @@ import { UniversalDenseModel } from "./universal/dense";
 import { WhisperModel } from "./whisper/model";
 import { genericArgsFor } from "./universal/archs";
 import { familyForGraph } from "./families";
-import { resolveComposition } from "./composition";
+import { assertComposedCaches, resolveComposition } from "./composition";
 import type { Composition } from "../contracts/portable/composition";
 import {
   GraphTable,
@@ -224,7 +224,7 @@ export async function openModel<Model>(
   const implementation = (options.implementations ?? MLX_MODEL_IMPLEMENTATIONS).select(config, profile);
   const composition = options.composition ?? resolveComposition(config);
   const weights = await Weights.open(modelDir);
-  try { return implementation.create(weights, config, profile, composition); }
+  try { return composed(implementation.create(weights, config, profile, composition), composition); }
   catch (error) { weights.dispose(); throw error; }
 }
 
@@ -254,5 +254,13 @@ export function createModel<Model>(
       `${resolved.profile.id} uses the direct Colibri container; construct it with ` +
       "openModel(modelDir) or Glm52Model.open(modelDir)",
     );
-  return implementations.select(config, resolved).create(weights, config, resolved, composition);
+  return composed(implementations.select(config, resolved).create(weights, config, resolved, composition), composition);
+}
+
+/** `model`, once its caches can serve `composition` (`assertComposedCaches`);
+ * a refused model is released. */
+function composed<Model>(model: Model, composition: Composition): Model {
+  try { assertComposedCaches(model as object, composition); }
+  catch (error) { (model as { dispose?(): void }).dispose?.(); throw error; }
+  return model;
 }

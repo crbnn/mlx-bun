@@ -10,7 +10,7 @@ import { startServer } from "../../src/server/start";
 import { createLoopbackMemoryClient } from "@mlx-bun/module-memory/completion-client";
 import { ResponseStore } from "../../src/server/responses";
 
-const execution = { method: "autoregressive", mechanism: "continuous" as const, pagedKv: false, promptCache: true, checkpoint: true, fill: false, compiledDecode: false, grammarJump: false, reasons: [] };
+const execution = { method: "autoregressive", mechanism: "continuous" as const, promptCache: true, checkpoint: true, fill: false, compiledDecode: false, grammarJump: false, reasons: [] };
 type RouteEngine = Parameters<typeof createCompletionRoutes>[0];
 function harness(run?: CompletionEngine["run"], overrides: {
   responseHistory?: ResponseStore;

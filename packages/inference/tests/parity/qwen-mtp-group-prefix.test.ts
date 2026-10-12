@@ -561,7 +561,7 @@ async function record(inputs: { target: string; draft: string }, directory: stri
       const options = { ...sampling, maxTokens };
       const plan = binding.plan({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: "seed" in sampling,
         hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true }, options,
-      { continuous: true, quantizedBatch: false, checkpoints: false });
+      { checkpoints: false });
       assert.equal(plan.method, "speculative"); assert.equal(plan.mechanism, "continuous");
       const method = binding.methodRequest!(plan, options);
       assert(method, "the MTP method must bind");

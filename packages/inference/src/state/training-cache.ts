@@ -7,6 +7,7 @@ import { gatedDeltaUpdate } from "../kernels/delta/gated";
 import type { AttentionCache, AttentionRead, Cache, GatedDeltaCache, GatedDeltaParameters, Mask } from "../contracts/mlx/cache";
 import { AttentionMasks, causalLease, unmaskedLease, withLease, type MaskLease } from "./attention-read";
 import type { PrefixLayout } from "../contracts/mlx/trainable";
+import { isRecurrentCache } from "./capabilities";
 
 /** The kernel a training cache's reads attend with, fixed when the cache is
  *  built. `sdpa` is the stock fused SDPA, the kernel mlx-lm's tuner
@@ -311,4 +312,15 @@ export function prefixSharedCaches(layout: PrefixLayout, windows: readonly (numb
   attention: TrainingAttention = "sdpa"): Cache[] {
   const memo: { mask: MlxArray | null } = { mask: null }, masks = new AttentionMasks();
   return windows.map(window => new PrefixSharedCache(layout, memo, window, masks, attention));
+}
+
+/** The stateless stand-in a training or scoring forward runs in place of one
+ * of the graph's fresh caches: recurrent state takes `TrainingSSMCache` (fixed
+ * size and causal, so right padding never reaches a real position and needs no
+ * mask); an attention cache takes `attention(window)`, the caller's stand-in
+ * over that cache's sliding window (its ring size; null for full attention). */
+export function trainingStandIn(cache: Cache, attention: (window: number | null) => Cache): Cache {
+  if (isRecurrentCache(cache)) return new TrainingSSMCache();
+  const maxSize = (cache as { maxSize?: number }).maxSize;
+  return attention(typeof maxSize === "number" ? maxSize : null);
 }

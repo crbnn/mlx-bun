@@ -265,30 +265,6 @@ export class KvScheme {
     const { kvConfig, turboQuant: _turbo, ...scalar } = this.options;
     return { ...scalar, ...(kvConfig ? { kvConfig: kvConfig.map((entry) => ({ ...entry })) } : {}) };
   }
-
-  /** Affine layouts convert during solo prefill. TQ also has a transitional
-   * row layout that preserves each request's delayed conversion boundary. */
-  batchable(config: ModelConfig, canConvert?: (layerIdx: number) => boolean,
-    cacheLayerCount = config.text.numHiddenLayers, capabilities: { delayedAffine?: boolean } = {}): boolean {
-    if (this.kind === "bf16") return true;
-    if (this.kind !== "affine-config" && this.kind !== "affine-uniform" && this.kind !== "turbo") return false;
-    if (!canConvert) return false;
-    const start = conversionStart(this.kind, this.options);
-    if (start > 0 && this.kind !== "turbo" && !capabilities.delayedAffine) return false;
-    if (this.kind === "affine-uniform" || this.kind === "turbo") {
-      // Some models share the donor prefix's KV in later layers. Probe the
-      // actual cache list, just as uniform conversion does.
-      for (let layer = 0; layer < cacheLayerCount; layer++) {
-        if (cacheLayerKind(config, layer) === "recurrent") continue;
-        if (!canConvert(layer)) return false;
-      }
-      return true;
-    }
-    return this.options.kvConfig!.every((entry) => {
-      if (entry.layerIdx < 0 || entry.layerIdx >= config.text.numHiddenLayers) return false;
-      return cacheLayerKind(config, entry.layerIdx) !== "recurrent" && canConvert(entry.layerIdx);
-    });
-  }
 }
 
 /** Resolve the KV flags (`--kv-quant`, its TurboQuant spelling,

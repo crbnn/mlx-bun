@@ -351,7 +351,7 @@ export class GrammarController {
   }
 
   /** Jump-forward decoding (SGLang's technique via xgrammar's
-   *  findJumpForwardString; opt-in — MLX_BUN_GRAMMAR_JUMP=1): when the grammar
+   *  findJumpForwardString; opt-in — the composition's grammarJump): when the grammar
    *  admits exactly one continuation string (JSON keys/punctuation, enum
    *  bodies — longest with `any_whitespace:false` compact schemas), return its
    *  token ids so the decode loop can carry them into the KV with ONE
@@ -624,7 +624,7 @@ function resolveGrammarRequest(req: GrammarRequest):
 
 /** Kill switch: MLX_BUN_GRAMMAR=0 disables grammar compilation entirely
  *  (requests degrade to prompt injection). Matches the project's envelope-gated
- *  kill-switch discipline (MLX_BUN_COMPILED_DECODE, …). */
+ *  kill-switch discipline. */
 export function grammarEnabled(): boolean {
   return runtimeValue("MLX_BUN_GRAMMAR") !== "0";
 }

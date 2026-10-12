@@ -85,16 +85,6 @@ export interface GenerateOptions extends SamplerOptions, LogitsProcessorOptions 
    *  When unset, zeroing falls back to imageMask (the legacy vision shape).
    *  Caller keeps ownership. */
   multimodalMask?: MlxArray;
-  /** OPTIONAL paged KV storage (`02d723a:docs/design/kv-cache.md`): fresh
-   *  full-attention caches are replaced with PagedKVCache (block pool +
-   *  gather-to-contiguous) before prefill, quantized as a uniform 4- or 8-bit
-   *  composition's KV scheme names. Scope: B1/B>1 Gemma4-family — refused
-   *  with a per-layer or TurboQuant scheme, drafts and compiled decode
-   *  (callers refuse the combos; the cache swap itself only ever touches
-   *  empty full-attention entries). Values are gated bit-exact vs the plain
-   *  path (tests/paged-kv*). The KV scheme itself is the composition's
-   *  (`Composition.kv`), composed by the graph's `makeCache` at load. */
-  pagedKv?: { blockSize?: number };
   /** Mounted LoRA adapter ids to apply (resolved/validated by
    *  AdapterManager.resolveSpec). Residuals sum in order. Set on the
    *  model's LoraState for exactly the duration of this generation —

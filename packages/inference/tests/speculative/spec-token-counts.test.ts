@@ -25,7 +25,7 @@ function fixture(drafts: "accepted" | "rejected" | "none", fallback = false) {
   };
   const binding: MlxSpeculativeBinding = {
     descriptor: { id: "eos-count", backend: "mlx", graphAbi: "mlx-hidden-bsh-v1", stateAbi: "legacy-cache-array-v1", artifact: "synthetic" },
-    eosTokenIds: [7], prefillTailSplit: true,
+    eosTokenIds: [7], prefillTailSplit: true, greedyDraft: false,
     makeCache: () => [new KVCache()],
     bindRollback(caches) {
       const transaction = bindCacheRollback(caches);

@@ -36,7 +36,7 @@ import type { GraphCapabilities } from "../../src/contracts/portable/graph";
 import type {
   MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward,
 } from "../../src/contracts/mlx/graph";
-import { PLAIN_KV_VERIFICATION, declareGraph } from "../../src/models/capabilities";
+import { ORDINARY_VERIFICATION, declareGraph } from "../../src/models/capabilities";
 import { atEveryWidth } from "../../src/models/graph";
 import { QuantizedLinear } from "../../src/layers/quantized-linear";
 import { RMSNorm } from "../../src/layers/normalization";
@@ -485,11 +485,7 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
    * convert per layer and serve ordinary decoding only. Before the attention
    * facts are bound, neither is declared. */
   get graphCapabilities(): GraphCapabilities {
-    const denseReads = this.encodedKvAttention === false;
-    return declareGraph({
-      kv: { denseReads, delayedAffine: this.encodedKvAttention === true ? "ordinary" : "none" },
-      ...(denseReads ? { speculation: PLAIN_KV_VERIFICATION } : {}),
-    });
+    return declareGraph(this.encodedKvAttention === false ? { speculation: ORDINARY_VERIFICATION } : {});
   }
   readonly #cacheWindows: readonly (number | null)[];
 

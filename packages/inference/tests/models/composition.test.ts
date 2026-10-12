@@ -28,9 +28,10 @@ afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 test("the default record: this machine, bf16, no drafter, the 2048-token chunk, no adapters, eight rows", () => {
   const composition = resolveComposition(config);
-  expect(composition).toEqual({ device: deviceArchitecture(), aneBridge: true, kv: { kind: "bf16" },
-    draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 8, speculativeAffineKv: true, packedMixedMlp: true,
-    vectorGreedySampling: true });
+  expect(composition).toEqual({ device: deviceArchitecture(), aneBridge: true, kv: { kind: "bf16" }, pagedKv: null,
+    draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 8, packedMixedMlp: true,
+    vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
+    grammarJump: false, greedyDraft: false });
   // The Neural Engine bridge is composed unless the caller turns it off; nothing probes the machine.
   expect(resolveComposition(config, { aneBridge: false }).aneBridge).toBe(false);
   expect(Object.isFrozen(composition)).toBe(true);
@@ -80,17 +81,45 @@ test("--fused-sdpa picks the affine read kernels: on tiled-causal, off unfused, 
   expect(resolveComposition(config, { kv: { fusedSdpa: true } }).kv).toEqual({ kind: "bf16" });
 });
 
-test("the two graph switches are composition fields, on by default; the runtime configuration does not reach them", () => {
-  const switches = (request: Parameters<typeof resolveComposition>[1] = {}, values: Record<string, string> = {}) =>
+test("the graph switch is a composition field, on by default; the runtime configuration does not reach it", () => {
+  const packed = (request: Parameters<typeof resolveComposition>[1] = {}, values: Record<string, string> = {}) =>
+    withRuntimeConfig(createRuntimeConfig(values), () => resolveComposition(config, request).packedMixedMlp);
+  expect(packed()).toBe(true);
+  expect(packed({ packedMixedMlp: false })).toBe(false);
+  expect(packed({}, { MLX_BUN_MIXED_PACKED_MLP: "0" })).toBe(true);
+  // Speculation over a KV scheme is no composition fact: every cache lego holds the transaction.
+  expect(resolveComposition(config)).not.toHaveProperty("speculativeAffineKv");
+});
+
+test("the scheduler switches are composition fields at their defaults; the runtime configuration does not reach them", () => {
+  const facts = (request: Parameters<typeof resolveComposition>[1] = {}, values: Record<string, string> = {}) =>
     withRuntimeConfig(createRuntimeConfig(values), () => {
-      const { speculativeAffineKv, packedMixedMlp } = resolveComposition(config, request);
-      return { speculativeAffineKv, packedMixedMlp };
+      const { compiledDecode, mixedPrefill, mixedTokenBudget, prefillTailSplit, grammarJump, greedyDraft } = resolveComposition(config, request);
+      return { compiledDecode, mixedPrefill, mixedTokenBudget, prefillTailSplit, grammarJump, greedyDraft };
     });
-  expect(switches()).toEqual({ speculativeAffineKv: true, packedMixedMlp: true });
-  expect(switches({ speculativeAffineKv: false })).toEqual({ speculativeAffineKv: false, packedMixedMlp: true });
-  expect(switches({ packedMixedMlp: false })).toEqual({ speculativeAffineKv: true, packedMixedMlp: false });
-  expect(switches({}, { MLX_BUN_QWEN_SPEC_KV4: "0", MLX_BUN_MIXED_PACKED_MLP: "0" }))
-    .toEqual({ speculativeAffineKv: true, packedMixedMlp: true });
+  const defaults = { compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true, grammarJump: false,
+    greedyDraft: false };
+  expect(facts()).toEqual(defaults);
+  const flipped = { compiledDecode: false, mixedPrefill: true, mixedTokenBudget: 9, prefillTailSplit: false, grammarJump: true,
+    greedyDraft: true };
+  expect(facts(flipped)).toEqual(flipped);
+  // The environment keys these fields replaced change nothing.
+  expect(facts({}, { MLX_BUN_COMPILED_DECODE: "0", MLX_BUN_MIXED_PREFILL: "1", MLX_BUN_MIXED_TOKEN_BUDGET: "9",
+    MLX_BUN_PREFILL_TAIL_SPLIT: "0", MLX_BUN_GRAMMAR_JUMP: "1", MLX_BUN_SPEC_GREEDY_DRAFT: "1" })).toEqual(defaults);
+  for (const mixedTokenBudget of [0, 1.5, -2])
+    expect(() => resolveComposition(config, { mixedTokenBudget })).toThrow("composition mixedTokenBudget must be a positive integer");
+});
+
+test("compiled decode is resolved at load from the storage's compiled form: bf16 and affine converting at the first append keep it", () => {
+  const compiled = (request: Parameters<typeof resolveComposition>[1]) => resolveComposition(config, request).compiledDecode;
+  expect(compiled({})).toBe(true);
+  expect(compiled({ kv: { override: 4, quantizedKvStart: 0 } })).toBe(true);
+  expect(compiled({ kv: { override: 8 } })).toBe(true);
+  // TurboQuant storage, a delayed start and paged blocks have no compiled form, whatever is asked.
+  for (const request of [{ kv: { turboQuant: { kBits: 8, vBits: 3 } } }, { kv: { override: 4 as const, quantizedKvStart: 40 } },
+    { pagedKv: {} }, { pagedKv: {}, compiledDecode: true }])
+    expect(compiled(request), JSON.stringify(request)).toBe(false);
+  expect(compiled({ compiledDecode: false })).toBe(false);
 });
 
 test("the loaded drafter fixes the depth, or caps it when the scheduler adapts; rows and adapters are recorded as given", () => {
@@ -128,4 +157,32 @@ test("openModel, the convenience load, takes the same record and the same defaul
   try { expect(given.composition).toBe(chosen); } finally { given.weights.dispose(); }
   const defaulted = await openModel(dir, { implementations: registry });
   try { expect(defaulted.composition).toEqual(resolveComposition(config)); } finally { defaulted.weights.dispose(); }
+});
+
+test("paging is a composition fact: bf16 and uniform 4- or 8-bit pages, the block size given or 256", () => {
+  expect(resolveComposition(config).pagedKv).toBeNull();
+  expect(resolveComposition(config, { pagedKv: {} }).pagedKv).toEqual({ blockSize: 256 });
+  expect(resolveComposition(config, { pagedKv: { blockSize: 16 }, kv: { override: 8 } })).toMatchObject({
+    pagedKv: { blockSize: 16 }, kv: { kind: "affine", bits: 8 } });
+  expect(() => resolveComposition(config, { pagedKv: { blockSize: 0 } })).toThrow("composition paged KV block size must be a positive integer");
+  // The paged lego has no per-layer, other-width or TurboQuant pages yet: such a composition cannot be built as named.
+  const listed = { ...config, kvQuant: [{ layerIdx: 0, bits: 4, groupSize: 64 }] };
+  for (const kv of [{ override: "config" as const }, { turboQuant: { kBits: 8, vBits: 3 } }, { override: 3 }]) {
+    expect(resolveComposition(listed, { kv }).kv.kind).not.toBe("bf16");
+    expect(() => resolveComposition(listed, { kv, pagedKv: {} })).toThrow("per-layer and TurboQuant pages are not implemented");
+  }
+});
+
+test("a graph that carries no composition record composes its own caches: a KV scheme or paging for it is refused", () => {
+  let released = 0;
+  const registry = new ModelImplementationRegistry<Weights, { weights: Weights; dispose(): void }>([{
+    id: "qwen3", graph: "qwen3", loader: "safetensors", loop: "autoregressive",
+    create: weights => ({ weights, dispose() { released++; } }),
+  }]);
+  const profile = resolveModelProfile(config);
+  expect(() => createModel({} as Weights, config, resolveComposition(config), profile, registry)).not.toThrow();
+  for (const request of [{ kv: { override: 4 as const } }, { pagedKv: {} }])
+    expect(() => createModel({} as Weights, config, resolveComposition(config, request), profile, registry))
+      .toThrow("this graph composes its own caches");
+  expect(released).toBe(2);
 });

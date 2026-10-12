@@ -124,7 +124,7 @@ export interface DraftRowSampling {
     readonly ids: readonly number[];
     sample(logits: MlxArray, head: import("./draft-vocab").DraftVocabularyHead, steps: readonly number[]): MlxArray | null;
   };
-  /** Every row drafts by argmax (`MLX_BUN_SPEC_GREEDY_DRAFT=1`). Rows may then
+  /** Every row drafts by argmax (the composition's `greedyDraft`). Rows may then
    *  skip logprob normalization and select with the fused normalized argmax
    *  instead of calling sample(); the selected IDs are identical. */
   readonly greedy?: boolean;

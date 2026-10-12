@@ -10,8 +10,10 @@ import type { MlxTokenGraph } from "../../src/models/graph";
 import { createRuntimeConfig } from "../../src/runtime/config";
 import { KVCache } from "../../src/state/kv";
 import type { Cache } from "../../src/contracts/mlx/cache";
+import type { KvStorageScheme } from "../../src/contracts/portable/composition";
 import { stubPhases } from "../models/phase-forward";
 import { kvStorage } from "../../src/state/kv-storage";
+import { testComposition } from "../models/test-composition";
 
 // A graph that is none of the model classes and declares its own compiled step:
 // the scheduler and the autoregressive binding reach it only through that
@@ -49,9 +51,9 @@ function countingStep(model: { append: (caches: Cache[], width: number) => void 
   return { step, calls };
 }
 
-async function decode(model: MlxTokenGraph, options: { compiledDecode?: boolean; env?: Record<string, string> } = {},
+async function decode(model: MlxTokenGraph, options: { compiledDecode?: boolean } = {},
   tokens: number[] = []) {
-  const group = new MlxBatchExecutionGroup(model, { maxBatch: 2, runtime: createRuntimeConfig(options.env ?? {}) });
+  const group = new MlxBatchExecutionGroup(model, { maxBatch: 2, runtime: createRuntimeConfig({}) });
   try {
     await group.submit({ promptIds: [1, 2, 3], maxTokens: 6, eosTokenIds: [], sample: logits => ops.argmaxAxis(logits, -1),
       ...(options.compiledDecode === undefined ? {} : { compiledDecode: options.compiledDecode }),
@@ -60,8 +62,8 @@ async function decode(model: MlxTokenGraph, options: { compiledDecode?: boolean;
   return tokens;
 }
 
-/** A cache the compiled step cannot drive: it declares no decode slots. */
-const unreplayable = () => [Object.assign(new KVCache(), { prepareDecodeStep: undefined }) as unknown as Cache];
+const TURBO: KvStorageScheme = { kind: "turbo", kBits: 8, vBits: 3 };
+const DELAYED_AFFINE: KvStorageScheme = { kind: "affine", bits: 4, groupSize: 64, quantizedKvStart: 40, kernels: "unfused" };
 
 test("a lone row decodes through the step its graph declares, and other graphs never get one", async () => {
   const fixture = graph({ compiledDecode: true });
@@ -81,13 +83,16 @@ test("a lone row decodes through the step its graph declares, and other graphs n
   expect(undeclared.forwards.length).toBeGreaterThan(1);
 });
 
-test("the request, the kill switch and caches the step cannot drive keep decoding on the decode operation", async () => {
-  for (const [name, options, makeCache] of [
-    ["request opt-out", { compiledDecode: false }, undefined],
-    ["kill switch", { env: { MLX_BUN_COMPILED_DECODE: "0" } }, undefined],
-    ["caches without decode slots", {}, unreplayable],
+test("the request and the composition keep decoding on the decode operation", async () => {
+  for (const [name, options, extra] of [
+    ["request opt-out", { compiledDecode: false }, {}],
+    ["composition off", {}, { composition: testComposition(undefined, { compiledDecode: false }) }],
+    // The loader resolves compiled decode off for storage with no compiled form.
+    ["TurboQuant storage", {}, { composition: testComposition(TURBO) }],
+    ["delayed affine storage", {}, { composition: testComposition(DELAYED_AFFINE) }],
+    ["paged storage", {}, { composition: testComposition(undefined, { pagedKv: { blockSize: 16 } }) }],
   ] as const) {
-    const fixture = graph({ compiledDecode: true }, makeCache ? { makeCache } : {});
+    const fixture = graph({ compiledDecode: true }, extra);
     const declared = countingStep(fixture);
     expect(await decode({ ...fixture.model, compiledDecodeStep: () => declared.step }, options), name).toEqual(Array(6).fill(0));
     expect(declared.calls.steps, name).toBe(0);
@@ -112,16 +117,17 @@ test("a graph that promises a compiled step and provides none is refused where i
   expect(compiledDecodeStepOf(graph({}).model)).toBeNull();
 });
 
-test("the autoregressive binding offers the declared step for a run whose caches it drives, unless adapters or paging rule replay out", () => {
+test("the autoregressive binding offers the declared step where the composition keeps it, unless adapters rule replay out", () => {
   const fixture = graph({ compiledDecode: true });
   const declared = countingStep(fixture);
   const binding = bindMlxAutoregressiveGraph({ ...fixture.model, compiledDecodeStep: () => declared.step });
   const caches = fixture.model.makeCache();
   try {
-    expect(binding.createDecode!({ hasAdapters: true, pagedKv: false }, caches)).toBeNull();
-    expect(binding.createDecode!({ hasAdapters: false, pagedKv: true }, caches)).toBeNull();
-    expect(binding.createDecode!({ hasAdapters: false, pagedKv: false }, unreplayable())).toBeNull();
-    const decoder = binding.createDecode!({ hasAdapters: false, pagedKv: false }, caches)!;
+    expect(binding.createDecode!({ hasAdapters: true })).toBeNull();
+    for (const composition of [testComposition(TURBO), testComposition(DELAYED_AFFINE)])
+      expect(bindMlxAutoregressiveGraph({ ...fixture.model, composition, compiledDecodeStep: () => declared.step })
+        .createDecode!({ hasAdapters: false })).toBeNull();
+    const decoder = binding.createDecode!({ hasAdapters: false })!;
     try {
       using token = MlxArray.fromFloat32(new Float32Array([0]), [1]);
       const result = decoder.step(token, caches);
@@ -133,5 +139,5 @@ test("the autoregressive binding offers the declared step for a run whose caches
   } finally { for (const cache of caches) cache.dispose(); }
   // A graph declaring nothing has no decoder, whatever methods it carries.
   expect(bindMlxAutoregressiveGraph({ ...graph({}).model, compiledDecodeStep: () => declared.step })
-    .createDecode!({ hasAdapters: false, pagedKv: false }, caches)).toBeNull();
+    .createDecode!({ hasAdapters: false })).toBeNull();
 });

@@ -217,8 +217,8 @@ async function specRunInner(
       throw new Error("speculative KV requires uniform KV4/KV8 or TurboQuant start=0");
     caches = binding.makeCache();
     // Draft policy (see packages/inference/src/generation/speculative/draft-policy.ts): the target's stepSampler
-    // above is untouched; only the drafter's selection changes under the flag.
-    const draftOptions = draftSamplerOptions(options);
+    // above is untouched; only the drafter's selection changes under the composition's greedyDraft.
+    const draftOptions = draftSamplerOptions(options, binding.greedyDraft);
     const src = binding.openDraft(draftOptions === options ? sampler : makeSampler(draftOptions), caches);
     source = src;
     tapLayers = src.tapLayers;
@@ -257,7 +257,7 @@ async function specRunInner(
     };
     const snapshotAt = prefixCache
       ? Math.min(options.snapshotAt ?? promptIds.length, promptIds.length - 1) : -1;
-    const seedSource = async (end: number) => {
+    const seedSource = async (end: number, processed: number) => {
       if (ctxParts.length === 1) prefillCtx = ctxParts[0]!;
       else if (ctxParts.length > 1) {
         prefillCtx = ops.concatAxis(ctxParts, 1);
@@ -266,7 +266,7 @@ async function specRunInner(
       ctxParts.length = 0;
       const context = prefillCtx;
       prefillCtx = null; // source.prefill owns context on both success and failure
-      await src.prefill(promptIds.slice(0, end), context ?? undefined);
+      await src.prefill(promptIds.slice(0, end), context ?? undefined, processed);
     };
     // ---- prefill (target, chunked; optionally tapped for DSpark), then seed
     // the source. Order: the source's prefill needs the tapped context that the
@@ -285,7 +285,7 @@ async function specRunInner(
     // flips near-ties. So under the flag: drain to len-1, pending = the last
     // prompt token, straight into the rounds. Gated live: 4/4 token-for-token
     // vs the oracle venv (γ∈{2,3} × 2 prompts, incl. the knife-edge cell).
-    // MLX_BUN_PREFILL_TAIL_SPLIT=0 reverts to the legacy full-chunk + sampled
+    // The composition's prefillTailSplit off reverts to the legacy full-chunk + sampled
     // token0 shape (kill switch; also the 1-token-prompt degenerate path).
     //
     // Seam interaction: the tapped seed covers rows 0..len-2 only — the last
@@ -341,7 +341,7 @@ async function specRunInner(
           } finally { lg.dispose(); }
         } } finally { h.dispose(); }
         if (end === snapshotAt && snapshotAt > cached) {
-          await seedSource(end);
+          await seedSource(end, end);
           capture(promptIds.slice(0, end));
         }
         clearCache();
@@ -355,7 +355,7 @@ async function specRunInner(
     // Seed the source: two-model prefills its own draft cache; DSpark seeds
     // H_ctx from the tapped prompt context (ownership transfers to prefill);
     // the assistant is a no-op.
-    await seedSource(promptIds.length);
+    await seedSource(promptIds.length, oracleShape ? promptIds.length - 1 : promptIds.length);
     // Conversion replaces plain cache objects. Bind only after prefill has
     // converted every attention layer; rollback must own the active objects.
     const rollback = binding.bindRollback(caches);

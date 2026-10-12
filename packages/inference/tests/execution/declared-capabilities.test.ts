@@ -1,11 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { bindMlxGateway } from "../../src/execution/gateway-binding";
-import { declareGraph, PLAIN_KV_VERIFICATION } from "../../src/models/capabilities";
+import { declareGraph, ORDINARY_VERIFICATION } from "../../src/models/capabilities";
 import type { RuntimeModel } from "../../src/models/factory";
 import { createRuntimeConfig, withRuntimeConfig } from "../../src/runtime/config";
 import { KVCache } from "../../src/state/kv";
 import { atEveryWidth } from "../../src/models/graph";
-import { resolveKvScheme } from "../../src/state/kv-scheme";
 import { NgramProvider } from "../../src/generation/speculative/sources/ngram-source";
 import type { GenerateOptions } from "../../src/generation/index";
 import type { GraphCapabilities } from "../../src/contracts/portable/graph";
@@ -17,7 +16,7 @@ const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: fals
   hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
 /** The graph's composition naming the KV scheme every request stores. */
 const composed = (kv: KvOptions) => ({ composition: testComposition(kvOf(kv)) });
-const schedule = { continuous: true, quantizedBatch: true, checkpoints: false };
+const schedule = { checkpoints: false };
 
 /** Placement never forwards: every phase a stand-in declares throws. */
 const never = () => { throw new Error("placement never forwards"); };
@@ -32,33 +31,46 @@ function replacement(declared: Parameters<typeof declareGraph>[0] = {}, extra: o
 }
 const bind = (model: RuntimeModel, draft = false) => bindMlxGateway(model,
   draft ? { provider: new NgramProvider(), numDraftTokens: 3 } : undefined);
-const refusals = (plan: { reasons: readonly string[] }) => plan.reasons.filter(reason => reason.endsWith("-unsupported") || reason === "continuous-unavailable");
+const refusals = (plan: { reasons: readonly string[] }) => plan.reasons.filter(reason => reason.endsWith("-unsupported"));
+/** A plan without its compiled-decode note: the loader, not the planner, resolves
+ * compiled decode off for storage with no compiled form (paged, TurboQuant, delayed). */
+const placement = (plan: { reasons: readonly string[] }) =>
+  ({ ...plan, reasons: plan.reasons.filter(reason => reason !== "compiled-decode-unavailable-for-request") });
 
 describe("placement follows the graph's declarations", () => {
   test("the binding reports what the graph declared, once", () => {
-    const declared = declareGraph({ pagedAttention: true });
-    expect(bind(replacement({ pagedAttention: true })).capabilities).toEqual(declared);
+    const declared = declareGraph({ hiddenLayerTaps: true });
+    expect(bind(replacement({ hiddenLayerTaps: true })).capabilities).toEqual(declared);
   });
 
   test("a model type or class name declares nothing", () => {
     // Named like the graphs whose declarations grant these capabilities, this graph declares none.
     const binding = bind(replacement({}, {}, "gemma4"));
     expect(refusals(binding.plan({ ...shape, hasVision: true }, {}, schedule))).toEqual(["media-batch-unsupported"]);
-    expect(refusals(binding.plan(shape, { pagedKv: {} }, schedule))).toEqual(["paged-kv-batch-unsupported"]);
     expect(binding.plan(shape, {}, schedule).compiledDecode).toBe(false);
-    expect(binding.kvBatchable(resolveKvScheme({ override: 4, quantizedKvStart: 64 }))).toBe(false);
   });
 
-  test("paged attention, adapters and compiled decode are placed from their declarations", () => {
-    const paged = bind(replacement({ pagedAttention: true }));
-    expect(paged.plan(shape, { pagedKv: {} }, schedule)).toMatchObject({ mechanism: "continuous", pagedKv: true });
+  test("a paged composition pages every request's state; adapters and compiled decode are placed from their declarations", () => {
+    // Paging is the composition's, not the graph's: any graph's plain full-attention storage pages, and
+    // requests are planned exactly as without it.
+    const paged = bind(replacement({}, { composition: testComposition(undefined, { pagedKv: { blockSize: 16 } }) }));
+    for (const request of [shape, { ...shape, hasAdapters: true }, { ...shape, hasGrammar: true }]) {
+      const plan = paged.plan(request, {}, schedule);
+      expect(placement(plan)).toEqual(placement(bind(replacement()).plan(request, {}, schedule)));
+      const state = paged.statePolicy!(plan, {}, 64)!;
+      const caches = state.create();
+      try { expect(caches.map(cache => cache.signature())).toEqual(["kv:paged"]); }
+      finally { for (const cache of caches) cache.dispose(); }
+    }
+    expect(bind(replacement()).statePolicy!(bind(replacement()).plan(shape, {}, schedule), {}, 64)).toBeUndefined();
     const unadapted = bind(replacement({ adapters: { batched: false } }));
     expect(refusals(unadapted.plan({ ...shape, hasAdapters: true }, {}, schedule))).toEqual(["adapter-batch-unsupported"]);
     expect(unadapted.bindAdapterContext).toBeUndefined();
     expect(bind(replacement({ adapters: { batched: true } })).plan({ ...shape, hasAdapters: true }, {}, schedule).mechanism).toBe("continuous");
     const compiled = bind(replacement({ compiledDecode: true }));
     expect(compiled.plan(shape, {}, schedule).compiledDecode).toBe(true);
-    expect(withRuntimeConfig(createRuntimeConfig({ MLX_BUN_COMPILED_DECODE: "0" }), () => bind(replacement({ compiledDecode: true })))
+    // A composition that turns the compiled step off is planned without it.
+    expect(bind(replacement({ compiledDecode: true }, { composition: testComposition(undefined, { compiledDecode: false }) }))
       .plan(shape, {}, schedule).compiledDecode).toBe(false);
   });
 
@@ -72,24 +84,17 @@ describe("placement follows the graph's declarations", () => {
     expect(() => bind({ config: {}, makeCache: () => [] } as unknown as RuntimeModel)).toThrow("must declare its capabilities");
   });
 
-  test("delayed affine KV batches per the declared level", () => {
-    const delayed = resolveKvScheme({ override: 4, quantizedKvStart: 64 }), immediate = resolveKvScheme({ override: 4, quantizedKvStart: 0 });
-    for (const [level, batches] of [["none", false], ["ordinary", true], ["all", true]] as const)
-      expect(bind(replacement({ kv: { delayedAffine: level } })).kvBatchable(delayed), level).toBe(batches);
-    expect(bind(replacement()).kvBatchable(immediate)).toBe(true);
-    // Ordinary-only graphs serve delayed rows ordinarily and refuse to speculate over them; `all` graphs speculate.
-    const request = { ...shape, hasDraft: true }, kv = composed({ kvBits: 4, quantizedKvStart: 64 });
-    const ordinary = bind(replacement({ kv: { delayedAffine: "ordinary" } }, kv), true).plan(request, {}, schedule);
-    expect(ordinary).toMatchObject({ mechanism: "unsupported" });
-    expect(ordinary.reasons).toContain("continuous-unavailable");
-    expect(bind(replacement({ kv: { delayedAffine: "all" } }, kv), true).plan(request, {}, schedule))
-      .toMatchObject({ method: "speculative", mechanism: "continuous" });
+  test("every cache lego is planned alike: a drafted request speculates over delayed affine and TurboQuant KV", () => {
+    const request = { ...shape, hasDraft: true };
+    const reference = bind(replacement({}, composed({})), true).plan(request, {}, schedule);
+    expect(reference).toMatchObject({ method: "speculative", mechanism: "continuous" });
+    for (const kv of [{ kvBits: 4, quantizedKvStart: 64 }, { kvBits: 8 }, { turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: 0 }])
+      expect(placement(bind(replacement({}, composed(kv)), true).plan(request, {}, schedule)), JSON.stringify(kv)).toEqual(placement(reference));
   });
 
   test("a verifier that does not qualify a request shape leaves it ordinary", () => {
     const specs: [keyof GraphCapabilities["speculation"], Record<string, unknown>, KvOptions][] = [
       ["logprobs", { wantsLogprobs: true }, {}],
-      ["turboKv", {}, { turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: 0 }],
     ];
     for (const [flag, extra, kv] of specs) {
       const request = { ...shape, hasDraft: true, ...extra }, options: GenerateOptions = {};
@@ -99,7 +104,7 @@ describe("placement follows the graph's declarations", () => {
       expect(unqualified.reasons).toContain("draft-incompatible-with-request");
     }
     // Plain-KV verification qualifies none of them at once.
-    const plain = bind(replacement({ speculation: PLAIN_KV_VERIFICATION }), true);
+    const plain = bind(replacement({ speculation: ORDINARY_VERIFICATION }), true);
     expect(plain.plan({ ...shape, hasDraft: true }, {}, schedule)).toMatchObject({ method: "speculative", mechanism: "continuous" });
     expect(plain.plan({ ...shape, hasDraft: true, wantsLogprobs: true }, {}, schedule)).toMatchObject({ method: "autoregressive" });
   });

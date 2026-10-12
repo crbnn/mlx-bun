@@ -35,7 +35,7 @@ describe.skipIf(!native)("memory task model on the continuous gateway", () => {
     restoreRuntime = configureRuntime({ MLX_BUN_MEMORY_BATCH: "3" });
     memory = createInProcessMemoryClient({
       ...defaults,
-      engine: async (context, scheme, capacity) => (engine = await defaults.engine(context, scheme, capacity)),
+      engine: async (context, capacity) => (engine = await defaults.engine(context, capacity)),
       adapterDir: stage => stage === "chunk" ? adapter : undefined,
     });
     const policy = "Meta policy (synthetic): record durable facts about the user's projects and preferences.";

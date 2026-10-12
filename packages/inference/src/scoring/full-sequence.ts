@@ -19,8 +19,7 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import { type Cache } from "../contracts/mlx/cache";
 import { AttentionMasks } from "../state/attention-read";
-import { isRecurrentCache } from "../state/capabilities";
-import { selectedTrainingAttention, TrainingCache, TrainingSSMCache } from "../state/training-cache";
+import { selectedTrainingAttention, TrainingCache, TrainingSSMCache, trainingStandIn } from "../state/training-cache";
 import type { RuntimeModel } from "../models/factory";
 import { widthClass } from "../contracts/mlx/width";
 
@@ -54,7 +53,7 @@ export function trainForwardHidden(
   const probe = model.makeCache();
   const masks = new AttentionMasks(), attention = selectedTrainingAttention();
   const cache: Cache[] = probe.map((c) =>
-    isRecurrentCache(c) ? new TrainingSSMCache() : new TrainingCache(cacheWindow(c), masks, attention, rowLengths));
+    trainingStandIn(c, window => new TrainingCache(window, masks, attention, rowLengths)));
   for (const c of probe) c.dispose();
   try {
     return model.sequenceHidden(ids, cache, width); // [B, L, hidden]
@@ -77,13 +76,4 @@ export function trainForward(
   const logits = model.logitsFromHidden(h);
   h.dispose();
   return logits;
-}
-
-/** The sliding-window size a cache enforces, or null for full attention.
- *  RotatingKVCache stores its window as `maxSize`; KVCache has none. Mirrors
- *  gemma4 forwardLayers, where sliding layers use windowSize == the rotating
- *  cache's maxSize. (Quantized KV caches are not used on the training path.) */
-function cacheWindow(c: Cache): number | null {
-  const maxSize = (c as { maxSize?: number }).maxSize;
-  return typeof maxSize === "number" ? maxSize : null;
 }

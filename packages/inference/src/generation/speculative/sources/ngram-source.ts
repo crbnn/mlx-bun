@@ -40,7 +40,7 @@
 // speculation is structurally never worse than plain decode by more than the
 // host lookup and verification overhead.
 
-import { runtimeFlag } from "../../../runtime/config";
+import { COMPOSITION_DEFAULTS } from "../../../contracts/portable/composition";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { CheckpointAttachment } from "../../../contracts/mlx/checkpoint";
@@ -176,7 +176,6 @@ class NgramSource implements DraftSource {
   readonly weightsBytes = 0;
   #hist: number[] = [];
   #lastDrafts: number[] = [];
-  readonly #tailSplit = runtimeFlag("MLX_BUN_PREFILL_TAIL_SPLIT", true);
   readonly checkpoint: NonNullable<DraftSource["checkpoint"]>;
 
   constructor(
@@ -198,11 +197,12 @@ class NgramSource implements DraftSource {
   }
 
   prefill(promptIds: number[], _context?: Parameters<DraftSource["prefill"]>[1], processedTokens?: number): void {
-    // Mirror the serve loop's prefill shape (two-model.ts does the same): under
-    // the oracle tail split the last prompt token is never prefilled — it IS
-    // the first feed. Legacy shape (kill switch / 1-token prompt): full prompt,
-    // and the sampled token0 arrives as the first feed.
-    const upTo = processedTokens ?? (this.#tailSplit && promptIds.length > 1 ? promptIds.length - 1 : promptIds.length);
+    // The serve loop's processed prefix (two-model.ts does the same): under the
+    // target's tail split the last prompt token is never prefilled — it IS the
+    // first feed. Without it (or for a 1-token prompt): the full prompt, and the
+    // sampled token0 arrives as the first feed. Absent, the default composition's.
+    const upTo = processedTokens ??
+      (COMPOSITION_DEFAULTS.prefillTailSplit && promptIds.length > 1 ? promptIds.length - 1 : promptIds.length);
     this.#hist = promptIds.slice(0, upTo);
   }
 

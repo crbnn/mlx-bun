@@ -17,7 +17,7 @@
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import { clearCache } from "@mlx-bun/mlx/ffi";
-import { runtimeFlag } from "../../../runtime/config";
+import { COMPOSITION_DEFAULTS } from "../../../contracts/portable/composition";
 import { loadModelConfig } from "../../../artifacts/config";
 import { Weights } from "../../../artifacts/weights";
 import { createModel, type RuntimeModel } from "../../../models/factory";
@@ -89,16 +89,16 @@ export class TwoModelProvider implements DraftProvider {
 class TwoModelSource implements DraftSource {
   readonly weightsBytes = 0;
   private readonly rows: ReturnType<typeof openStandaloneDraftRows>;
-  /** The prefill tail split (`MLX_BUN_PREFILL_TAIL_SPLIT`), read once when the source opens. */
-  private readonly tailSplit: boolean;
   private processed = 0;
   constructor(model: RuntimeModel, sampler: (lp: MlxArray, step: number) => MlxArray, namespace: string) {
     this.rows = openStandaloneDraftRows(bindMlxAutoregressiveGraph(model), namespace,
       { sample: (logprobs, steps) => sampler(logprobs, steps[0]!) }, [null]);
-    this.tailSplit = runtimeFlag("MLX_BUN_PREFILL_TAIL_SPLIT", true);
   }
-  async prefill(promptIds: number[]): Promise<void> {
-    const upTo = this.tailSplit && promptIds.length > 1 ? promptIds.length - 1 : promptIds.length;
+  /** Prefills the draft cache through `processedTokens`, the target's own boundary (its
+   * prefill tail split); absent, the default composition's. */
+  async prefill(promptIds: number[], _context?: MlxArray, processedTokens?: number): Promise<void> {
+    const upTo = processedTokens ??
+      (COMPOSITION_DEFAULTS.prefillTailSplit && promptIds.length > 1 ? promptIds.length - 1 : promptIds.length);
     for (let at = this.processed; at < upTo; at += PREFILL_CHUNK) {
       const end = Math.min(at + PREFILL_CHUNK, upTo);
       using ids = ops.fromInt32(promptIds.slice(at, end), [1, end - at]);

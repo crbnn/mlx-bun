@@ -77,7 +77,7 @@ async function worker(plan: MtpPlan, variantIndex: number, mode: MtpSample["mode
     const options = { ...(plan.sampling ?? { temperature: 0 }), maxTokens };
     const execution = binding.plan({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: !!plan.sampling,
       hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true },
-      options, { continuous: true, quantizedBatch: false, checkpoints: false });
+      options, { checkpoints: false });
     assert(execution.method === "speculative", "requested MTP did not bind");
     const request = binding.methodRequest!(execution, options)!;
     const tokens: number[] = [], steps: MtpSample["steps"] = [];

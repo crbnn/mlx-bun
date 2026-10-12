@@ -22,7 +22,7 @@ import type { AppState, RouteGroup } from "./serve-state";
 import { createServingUnit, type ContextHost, type ContextHostOptions, type ServingUnit, type UnitShared } from "./serving-unit";
 
 export type { ContextHost, ContextHostOptions } from "./serving-unit";
-export { resolveServingLimits, validatePagedServingOptions } from "./serve-options";
+export { resolveServingLimits } from "./serve-options";
 
 export interface ModelHostHooks {
   /** Runs inside the listener's drain step, after cache demotion stops and
@@ -118,6 +118,7 @@ export async function startModelHost(state: AppState, model: ModelRecord, option
         ...(options.memoryBudgetBytes !== undefined ? { memoryBudgetBytes: options.memoryBudgetBytes } : {}),
         // The composition's facts: the KV flags, the startup adapter and the batch cap.
         kv: kvFlags(options), adapters: startup && options.adapterDir !== undefined, maxRows: options.capacity,
+        ...(options.cache.pagedKv ? { pagedKv: options.cache.pagedKv } : {}),
         // Resource plan inputs for runtimes that plan memory up front; other models ignore this block.
         runtime: { batchSize: options.capacity, maxGenerationTokens: options.defaultGeneratedTokens ?? 128,
           ...(options.memoryBudgetBytes !== undefined ? { memoryBudgetBytes: options.memoryBudgetBytes } : {}),

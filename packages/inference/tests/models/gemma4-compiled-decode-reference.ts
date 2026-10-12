@@ -5,7 +5,8 @@
 // closures on a runtime flag and builds masks for the layers it runs. Delete it
 // with gemma4-reference.ts.
 //
-// Changes from b3db6b09: import paths only.
+// Changes from b3db6b09: import paths, and `isCompiledDecodeCache` inlined below
+// (B3 deleted it from state/capabilities: the composition decides at load).
 
 // Compiled decode step (Phase A of `02d723a:docs/archive/investigations/optimization_plan.md`).
 //
@@ -48,7 +49,7 @@ import { MlxArray } from "@mlx-bun/mlx/array";
 import { CompiledFunction } from "@mlx-bun/mlx/compile";
 import * as ops from "@mlx-bun/mlx/ops";
 import { runtimeValue } from "../../src/runtime/config";
-import { isCompiledDecodeCache, isRowBatchCache } from "../../src/state/capabilities";
+import { isRowBatchCache } from "../../src/state/capabilities";
 import { decodeStepInputs } from "../../src/state/decode-step-inputs";
 import { setCompiledTrace } from "../../src/runtime/compiled-trace";
 import type {
@@ -56,6 +57,16 @@ import type {
 } from "../../src/contracts/mlx/cache";
 import type { MlxCompiledDecodeStep } from "../../src/contracts/mlx/graph";
 import { kvStorage } from "../../src/state/kv-storage";
+
+/** The predicate b3db6b09 imported from state/capabilities, verbatim. */
+function isCompiledDecodeCache(cache: Cache): cache is CompiledDecodeCache {
+  const candidate = cache as Partial<CompiledDecodeCache>;
+  return typeof candidate.prepareDecodeStep === "function" &&
+    typeof candidate.decodePhase === "function" &&
+    typeof candidate.decodeSlot === "function" &&
+    typeof candidate.decodeInputs === "function" &&
+    typeof candidate.commitDecodeStep === "function";
+}
 
 /** What the runner reads of the Gemma graph it compiles (the graph passes
  * itself; a structural type keeps the graph file and this one acyclic). */

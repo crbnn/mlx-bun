@@ -21,7 +21,7 @@ import { chatCompletionJson, chatCompletionStream } from "../../src/server/opena
 class ScriptedEngine implements CompletionEngine {
   readonly seenOptions: GenerateOptions[] = [];
   place(shape: Parameters<CompletionEngine["place"]>[0]) {
-    return Object.freeze({ shape, mechanism: "continuous" as const, execution: { method: "autoregressive", mechanism: "continuous" as const, pagedKv: false, promptCache: true, checkpoint: true, fill: false, compiledDecode: false, grammarJump: false, reasons: [] } });
+    return Object.freeze({ shape, mechanism: "continuous" as const, execution: { method: "autoregressive", mechanism: "continuous" as const, promptCache: true, checkpoint: true, fill: false, compiledDecode: false, grammarJump: false, reasons: [] } });
   }
   async run(
     _promptIds: number[],

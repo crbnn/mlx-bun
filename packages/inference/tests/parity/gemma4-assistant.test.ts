@@ -387,10 +387,10 @@ test.skipIf(!inputs)("Gemma4 assistant: shared generation accepts, rejects and c
     });
     cleanup.push(() => opened.mockRestore());
     const binding = bindMlxGateway(view, { provider, numDraftTokens: depth });
-    assert(binding.runtime.flag("MLX_BUN_PREFILL_TAIL_SPLIT", true), "this consumer requires default tail-split prefill");
+    assert((view as { composition?: { prefillTailSplit: boolean } }).composition?.prefillTailSplit ?? true, "this consumer requires default tail-split prefill");
     const plan = binding.plan({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
       hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true }, options,
-    { continuous: true, quantizedBatch: false, checkpoints: false });
+    { checkpoints: false });
     assert.equal(plan.mechanism, "continuous"); assert.equal(plan.method, "speculative");
     const method = binding.methodRequest!(plan, options);
     assert(method, "real assistant method must be bound");

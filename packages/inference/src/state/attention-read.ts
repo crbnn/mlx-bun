@@ -184,3 +184,11 @@ export function withLease(mask: MaskLease, read: (mask: MaskLease) => AttentionR
   try { return read(mask); }
   catch (error) { mask.release(); throw error; }
 }
+
+/** Retain an independent array handle for positions used across cache writes.
+ * The contiguous view preserves the integer values and shares their storage;
+ * callers release it with the fetched attention state. */
+export function captureRopeOffsets(cache: { readonly ropeOffsetArr?: MlxArray }): MlxArray | undefined {
+  const offsets = cache.ropeOffsetArr;
+  return offsets ? ops.contiguous(offsets) : undefined;
+}
