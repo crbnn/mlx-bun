@@ -970,11 +970,19 @@ on main and the refactor is only useful when investigating a behavior difference
 One line per idea: the question and the domains it touches. Picking one up makes it an item
 above with an exit; an answered one moves its finding to the owning documentation and is deleted.
 
-- **Width tables as a LUT keyed by exact row count** (graphs, scheduler; Josh, 2026-10-11): the
-  graph binds each width to the operation its kernels were measured best at, several widths
-  aliasing one bound operation; the scheduler describes the work as N rows wide and indexes,
-  choosing nothing. New kernels change the bindings a generator emits, never the contract.
-  Replaces the five named classes when a measurement first needs a boundary they cannot express.
+- **Width tables as a LUT keyed by exact row count** (graphs, scheduler; Josh, 2026-10-11). Row
+  count is a property of the work; the class boundaries (`one`, `twoToThree`, `four`,
+  `fiveToEight`, `wider`) are properties of one composition: that model, those kernels, that
+  hardware, measured once (D1, including the separate four-row path that preserved the bits).
+  Exposing them in the shared contract makes every implementation adopt vocabulary derived from
+  that experiment: local optimization results promoted into shared API structure. The durable
+  contract is "perform this named phase for work of this width"; the composition supplies the
+  prepared mapping, binding each width to the operation its kernels were measured best at, with
+  several widths aliasing one bound operation. The scheduler describes the work as N rows wide
+  and indexes, choosing nothing; new kernels change the bindings a generator emits, never what
+  the scheduler understands. The general rule behind it: a measured boundary belongs to the
+  composition, never to a contract. Pick up when a measurement first needs a boundary the named
+  classes cannot express, or when the generated graphs are the only width tables left.
 
 - **SkillOpt skill optimization** (chat, memory, a new optimization domain; [research](https://github.com/joshuarossi/mlx-bun/pull/247)):
   can SkillOpt's gated skill-edit loop (Microsoft, MIT, arXiv:2605.23904) improve the default
