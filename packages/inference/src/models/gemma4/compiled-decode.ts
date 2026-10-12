@@ -14,7 +14,7 @@
 //   closure is compiled shapeless=true: dim sizes may vary per step,
 //   ndim/dtype may not.
 //
-// The trace runs the UNMODIFIED Gemma4Model.forwardHidden against the stand-in
+// The trace runs the graph's own one-row decode operation (decode.one) against the stand-in
 // each cache supplies for its slot (CompiledDecodeCache in
 // packages/inference/src/contracts/mlx/cache.ts; the stand-ins live beside their
 // cache classes in packages/inference/src/state/) — so the compiled graph
@@ -30,10 +30,10 @@
 //   ring — bit-exact with the rotating steady state, where a concat
 //   would permute KV positions and change reduction order.
 //
-// Anything this module can't express falls back to the uncompiled path
-// (generate.ts catches and disables for the generation): active LoRA
-// adapters (their weights would bake into the trace as constants),
-// caches without the compiled-decode capability, diverged cache offsets.
+// The scheduler chooses this step once, for a row it can express, and never falls
+// back: it refuses active LoRA
+// adapters (their weights would bake into the trace as constants) and
+// caches without the compiled-decode capability; a step this module cannot take throws.
 
 import { disposeResources } from "../../runtime/resources";
 import { MlxArray } from "@mlx-bun/mlx/array";
@@ -60,7 +60,8 @@ export interface CompiledGemmaTarget {
       perLayerInput: null): { h: MlxArray; donor: { dispose(): void } | null };
   }[];
   materializeGraphConstants(): void;
-  forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray;
+  /** The one-row decode operation the trace records. */
+  readonly decode: { readonly one: (ids: MlxArray, cache: Cache[], capture: null) => MlxArray };
   logitsFromHidden(hidden: MlxArray): MlxArray;
 }
 
@@ -90,7 +91,7 @@ function makeTraceFn(model: CompiledGemmaTarget, slots: DecodeSlot[]) {
     setCompiledTrace(true);
     try {
       const ids = ops.reshape(inputs[0]!, [1, 1]);
-      const h = model.forwardHidden(ids, adapters);
+      const h = model.decode.one(ids, adapters, null);
       ids.dispose();
       const logits = model.logitsFromHidden(h);
       h.dispose();
@@ -181,7 +182,7 @@ export class CompiledDecode implements MlxCompiledDecodeStep {
   #segClosures = new Map<string, (CompiledFunction | null)[]>();
   /** Closure keys whose apply failed (e.g. a primitive without
    *  output_shapes under shapeless replay): never re-trace these — the
-   *  caller falls back to uncompiled without paying a trace per
+   *  step throws at once instead of paying a trace per
    *  generation. */
   #broken = new Set<string>();
   /** Dense models (no KV sharing, per-layer inputs, or MoE) use the
@@ -221,22 +222,22 @@ export class CompiledDecode implements MlxCompiledDecodeStep {
    *  declare the compiled-decode capability, and not a batched layout: even one that
    *  inherits it (a filtered-to-one rotating quantized ring) carries per-row state
    *  the trace does not express. */
-  accepts(caches: readonly Cache[]): boolean {
+  #replayable(caches: readonly Cache[]): boolean {
     return caches.every((c) => !isRowBatchCache(c) && isCompiledDecodeCache(c));
   }
 
   /** One decode step: consumes the pending token array (uint32 [1],
    *  unevaluated is fine), advances every cache by one position, returns
    *  the logits node plus the cache-update nodes that must ride the same
-   *  async_eval. Throws on unsupported state — caller falls back to the
-   *  uncompiled path (any growth already done is benign). */
+   *  async_eval. Throws on unsupported state, leaving
+   *  the caches as they were (any growth already done is benign). */
   step(cur: MlxArray, caches: Cache[]): { logits: MlxArray; evalWith: MlxArray[] } {
     if (this.#disposed) throw new Error("compiled decode runner is disposed");
     const offset0 = caches[0]!.offset;
     for (const c of caches)
       if (c.offset !== offset0)
         throw new Error("compiled decode: cache offsets diverged");
-    if (!this.accepts(caches)) throw new Error("compiled decode: a cache does not declare the compiled-decode capability");
+    if (!this.#replayable(caches)) throw new Error("compiled decode: a cache does not declare the compiled-decode capability");
     const decodable = caches as CompiledDecodeCache[];
     return this.#segmented
       ? this.#stepSegmented(cur, decodable, offset0)

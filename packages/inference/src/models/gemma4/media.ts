@@ -3,6 +3,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import type { Cache } from "../../contracts/mlx/cache";
 import type { TargetView } from "../../contracts/mlx/draft-target";
 import type { MediaEncoders, MediaSidecarProbes, MlxPromptInput, Vision } from "../../contracts/mlx/media";
+import type { MlxHeadForward, MlxLayerCapture, MlxWidthTable } from "../../contracts/mlx/graph";
 import { bindEmbeddingsInput } from "../media-input";
 import { readAssistantDonors } from "./assistant-target";
 import type { ModelConfig } from "../../artifacts/config";
@@ -15,16 +16,22 @@ export interface Gemma4MediaGraph {
   readonly embedScale: number;
   readonly numDonors: number;
   readonly layers: readonly { readonly layerType: string }[];
-  forwardHidden(ids: MlxArray, caches: Cache[]): MlxArray;
-  forwardEmbeddings(embeddings: MlxArray, caches: Cache[], imageMask: MlxArray | null,
+  /** The vision prefill phase: a prompt's prepared embeddings (borrowed), image tokens attending each other both
+   *  ways where `imageMask` marks them; `ids` feed the per-layer inputs. */
+  prefillEmbeddings(embeddings: MlxArray, caches: Cache[], imageMask: MlxArray | null,
     ids: MlxArray, multimodalMask: MlxArray | null): MlxArray;
-  logitsFromHidden(hidden: MlxArray): MlxArray;
+  /** A prompt's token ids after a reused prefix: the window read, or one position the decode read. */
+  readonly prefillTail: MlxWidthTable<(ids: MlxArray, caches: Cache[], capture: MlxLayerCapture | null) => MlxArray>;
+  readonly decode: MlxWidthTable<(ids: MlxArray, caches: Cache[], capture: MlxLayerCapture | null) => MlxArray>;
+  readonly logits: MlxWidthTable<MlxHeadForward>;
 }
 
-/** Prepared embeddings enter the ordinary forward; decode continues from token ids. */
+/** Prepared embeddings enter the vision prefill phase; a prompt continuing after a reused prefix and decode
+ *  continue from token ids, in the phase the scheduler names. */
 export function bindGemma4MediaInput(model: Gemma4MediaGraph, input: Vision): MlxPromptInput {
-  return bindEmbeddingsInput((ids, caches, start) => start > 0 ? model.forwardHidden(ids, caches)
-    : model.forwardEmbeddings(input.embeddings, caches, input.imageMask ?? null, ids, input.multimodalMask ?? null));
+  return bindEmbeddingsInput((ids, caches, start, phase, width) => start === 0
+    ? model.prefillEmbeddings(input.embeddings, caches, input.imageMask ?? null, ids, input.multimodalMask ?? null)
+    : (phase === "decode" ? model.decode : model.prefillTail)[width](ids, caches, null));
 }
 
 /** The graph's ports for draft sources over its live caches: donor KV for the
@@ -41,7 +48,7 @@ export function gemma4DraftTarget(model: Gemma4MediaGraph, caches: Cache[]): Tar
     readDonors: () => readAssistantDonors(caches[sliding]!, caches[full]!),
   } : undefined, hiddenLayerTaps: Object.freeze({
     layerCount: model.layers.length,
-    projection: Object.freeze({ embed: model.embed, logitsFromHidden: model.logitsFromHidden.bind(model) }),
+    projection: Object.freeze({ embed: model.embed, logits: model.logits }),
   }) });
 }
 

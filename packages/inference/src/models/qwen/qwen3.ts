@@ -16,7 +16,6 @@ import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
-import { argmaxLastPosition } from "../../kernels/logits";
 import { disposing } from "../../layers/helpers";
 import { composedFullAttentionCache } from "../../state/bf16-first-kv";
 import type { Composition } from "../../contracts/portable/composition";
@@ -25,10 +24,10 @@ import { denseTurboQuantKernels } from "../../state/turboquant-attention";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import type {
-  MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward,
+  MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward, MlxWidthClass,
 } from "../../contracts/mlx/graph";
 import { declareGraph } from "../capabilities";
-import { atEveryWidth, deprecatedPhase, type ReadPhase } from "../graph";
+import { atEveryWidth, type ReadPhase } from "../graph";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import { QuantizedLinear } from "../../layers/quantized-linear";
 import { RMSNorm } from "../../layers/normalization";
@@ -226,9 +225,9 @@ export class Qwen3Model implements MlxDeclaredGraph, MlxTokenPhases {
     return this.layers.map((_, layer) => composedFullAttentionCache(this.composition.kv, layer, masks, denseTurboQuantKernels));
   }
 
-  /** @deprecated E2 calls the named phases. */
-  forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray {
-    return this.forwardLayers(this.embed.encode(ids), cache, deprecatedPhase(ids));
+  /** The scoring forward (`MlxSequenceForward`): the window read at every width. */
+  sequenceHidden(ids: MlxArray, cache: Cache[], _width: MlxWidthClass): MlxArray {
+    return this.forwardLayers(this.embed.encode(ids), cache, "window");
   }
 
   /** One whole chunk of a prompt; rows are sequences times the chunk size. The GPU is this graph's one unit. */
@@ -256,10 +255,6 @@ export class Qwen3Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly verify = atEveryWidth<MlxVerifyForward>((ids, cache) =>
     this.forwardLayers(this.embed.encode(ids), cache, "window"));
 
-  forwardEmbeddings(_embeds: MlxArray, _cache: Cache[], _bidir: MlxArray | null): MlxArray {
-    throw new Error("qwen3 input-embedding path is not supported");
-  }
-
   /** The decoder over `h0` (consumed), every block reading its cache for `phase`. */
   protected forwardLayers(h0: MlxArray, cache: Cache[], phase: ReadPhase): MlxArray {
     let cur = h0;
@@ -277,7 +272,7 @@ export class Qwen3Model implements MlxDeclaredGraph, MlxTokenPhases {
   embedPooled(ids: MlxArray): MlxArray {
     const cache = this.makeCache();
     try {
-      const h = this.forwardHidden(ids, cache); // [1, L, hidden]
+      const h = this.forwardLayers(this.embed.encode(ids), cache, "window"); // [1, L, hidden]
       const [B, L, H] = h.shape as [number, number, number];
       const last = h.slice([0, L - 1, 0], [B, L, H]); // [1, 1, hidden]
       h.dispose();
@@ -297,35 +292,5 @@ export class Qwen3Model implements MlxDeclaredGraph, MlxTokenPhases {
 
   logitsFromHidden(h: MlxArray): MlxArray {
     return this.lmHead ? this.lmHead.forward(h) : this.embed.asLinear(h);
-  }
-
-  forward(tokens: number[] | MlxArray, cache: Cache[]): MlxArray {
-    const ids = Array.isArray(tokens)
-      ? ops.fromInt32(tokens, [1, tokens.length])
-      : tokens;
-    const h = this.forwardHidden(ids, cache);
-    if (Array.isArray(tokens)) ids.dispose();
-    const logits = this.logitsFromHidden(h);
-    h.dispose();
-    return logits;
-  }
-
-  generate(promptTokens: number[], maxTokens: number, eosIds: number[] = []): number[] {
-    const cache = this.makeCache();
-    const out: number[] = [];
-    try {
-      let tokens = promptTokens;
-      for (let step = 0; step < maxTokens; step++) {
-        const logits = this.forward(tokens, cache);
-        const next = argmaxLastPosition(logits);
-        logits.dispose();
-        if (eosIds.includes(next)) break;
-        out.push(next);
-        tokens = [next];
-      }
-    } finally {
-      for (const c of cache) c.dispose();
-    }
-    return out;
   }
 }

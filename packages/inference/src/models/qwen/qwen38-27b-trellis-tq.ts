@@ -227,7 +227,6 @@ export class Qwen38TrellisTQ extends Qwen35Model {
           try { ops.evalAll([h, ...state]); }
           finally { if (cache[i]!.stateNeedsDispose) for (const a of state) a.dispose(); }
         }
-        this.captureLayer(i, h);
         capture?.(i, h);
       }
       const out = this.finalNorm.forward(h);

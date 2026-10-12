@@ -22,12 +22,13 @@
 //   - decode, one position per sequence, and speculative verify windows with the
 //     drafter's layer capture, at every width (decode, verify, logits);
 //   - prepared image and audio embeddings, image tokens attending each other both
-//     ways (bindMediaInput, through forwardEmbeddings);
+//     ways (bindMediaInput, through prefillEmbeddings);
 //   - the compiled decode step (compiledDecodeStep);
 //   - the assistant drafter's donor reads and the hidden-layer taps (draftTarget);
 //   - mounted LoRA adapters (loraTargets: the blocks' QuantizedLinear projections apply them);
 //   - paged KV (the paged caches' own reads), and mixed groups of rows in one
-//     forward (forwardHiddenMixed).
+//     forward (mixed);
+//   - the scoring forward over a whole sequence (sequenceHidden, the window read).
 // Its caches are the composition's (makeCache): under the scheme it serves, every
 // cache the kv_config lists is the bf16-first affine lego, read bf16 through its
 // first append and through its quantized storage after, with the read kernels the
@@ -47,16 +48,14 @@ import type { Weights } from "../../../artifacts/weights";
 import type { Cache } from "../../../contracts/mlx/cache";
 import type { TargetView } from "../../../contracts/mlx/draft-target";
 import type {
-  MlxCapturingForward, MlxCompiledDecodeStep, MlxDeclaredGraph, MlxHeadForward, MlxLayerCapture, MlxPhaseForward, MlxPrefillChunk,
-  MlxTokenPhases,
-  MlxVerifyForward, MlxWidthTable,
+  MlxCompiledDecodeStep, MlxDeclaredGraph, MlxHeadForward, MlxLayerCapture, MlxMixedForward, MlxPhaseForward,
+  MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward, MlxWidthClass, MlxWidthTable,
 } from "../../../contracts/mlx/graph";
 import type { MediaEncoders, MediaSidecarProbes, MlxPromptInput, Vision } from "../../../contracts/mlx/media";
-import type { TokenGroup } from "../../../contracts/mlx/token-work";
 import type { Composition } from "../../../contracts/portable/composition";
 import type { GraphCapabilities } from "../../../contracts/portable/graph";
 import { mapPackedTokens } from "../../../input/token-groups";
-import { argmaxLastPosition, logitSoftcap } from "../../../kernels/logits";
+import { logitSoftcap } from "../../../kernels/logits";
 import { compiledLogitSoftcap } from "../../../kernels/softcap";
 import { compiledGegluActive } from "../../../layers/geglu";
 import { disposing } from "../../../layers/helpers";
@@ -70,7 +69,7 @@ import { AttentionMasks } from "../../../state/attention-read";
 import { composedFullAttentionCache, composedSlidingAttentionCache } from "../../../state/bf16-first-kv";
 import { deferredTurboQuantKernels } from "../../../state/turboquant-attention";
 import { declareGraph } from "../../capabilities";
-import { atEveryWidth, deprecatedPhase } from "../../graph";
+import { atEveryWidth } from "../../graph";
 import type { ServedComposition } from "../../implementation";
 import { DecoderLayer, type Gemma4Phase } from "../blocks";
 import { CompiledDecode } from "../compiled-decode";
@@ -178,14 +177,6 @@ const ownCache = (layer: DecoderLayer, i: number): Attend => (x, caches, phase) 
 const feedforwardOf = (layer: DecoderLayer): Feedforward => hMid =>
   layer.scaled(layer.denseFeedforward(hMid));
 
-/** @deprecated E2: the phase of a forward reaching a deprecated entry point, from
- *  its input's shape (`deprecatedPhase`); a window over an image mask (`bidir`) is
- *  the bidirectional read. */
-function deprecatedRead(h0: MlxArray, bidir: MlxArray | null): Gemma4Phase {
-  const read = deprecatedPhase(h0);
-  return bidir && read === "window" ? { bidirectional: bidir } : read;
-}
-
 export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
   /** The served configuration this graph was built for: its KV scheme is what `makeCache` composes. */
@@ -212,17 +203,12 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
   readonly perLayerWidth: number;
 
   readonly prefillChunk: MlxPrefillChunk;
-  readonly prefillTail: MlxWidthTable<MlxCapturingForward>;
-  readonly decode: MlxWidthTable<MlxPhaseForward>;
+  readonly prefillTail: MlxWidthTable<(ids: MlxArray, caches: Cache[], capture: MlxLayerCapture | null) => MlxArray>;
+  readonly decode: MlxWidthTable<(ids: MlxArray, caches: Cache[], capture: MlxLayerCapture | null) => MlxArray>;
   readonly verify: MlxWidthTable<MlxVerifyForward>;
   /** Known tokens: this graph declares no committed spans, so they read as a window. */
   readonly appendKnown: MlxWidthTable<MlxPhaseForward>;
   readonly logits: MlxWidthTable<MlxHeadForward>;
-
-  /** @deprecated E2 deletes it with `legacyForwardWithTaps`: the layer tap the
-   *  speculative binding sets around a deprecated forward. Only the deprecated
-   *  entry points read it, turning it into the forward's capture. */
-  hiddenTap: { layers: Set<number>; pos?: number; captured: Map<number, MlxArray> } | null = null;
 
   readonly #attend: readonly Attend[];
   readonly #feedforward: readonly Feedforward[];
@@ -259,11 +245,11 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
     });
 
     const head = this.#head;
-    const window: MlxCapturingForward = (ids, caches, capture) =>
+    const window = (ids: MlxArray, caches: Cache[], capture: MlxLayerCapture | null): MlxArray =>
       this.#run(this.#embedTokens(ids), caches, "window", capture);
     this.prefillChunk = Object.freeze({ gpu: window });
     this.prefillTail = atEveryWidth(window);
-    this.decode = atEveryWidth<MlxPhaseForward>((ids, caches) => this.#run(this.#embedTokens(ids), caches, "decode", null));
+    this.decode = atEveryWidth((ids: MlxArray, caches: Cache[], capture: MlxLayerCapture | null) => this.#run(this.#embedTokens(ids), caches, "decode", capture));
     this.verify = atEveryWidth(window);
     this.appendKnown = atEveryWidth<MlxPhaseForward>((ids, caches) => window(ids, caches, null));
     this.logits = atEveryWidth<MlxHeadForward>(hidden => head(hidden));
@@ -360,56 +346,31 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
     }
   }
 
-  // ── Deprecated entry points: E2 moves every caller onto the phases above and
-  // deletes these. They reach the same layers through #run, reading the phase
-  // from the input's shape (deprecatedRead) and the speculative binding's tap.
-
-  /** @deprecated E2: the speculative binding's layer tap (`hiddenTap`) as the
-   *  forward's capture, then `capture`: each tapped layer's output and the final
-   *  hidden copied as bf16, one position when `pos` is set. */
-  #tapCapture(capture: MlxLayerCapture | null): MlxLayerCapture | null {
-    const tap = this.hiddenTap;
-    if (!tap) return capture;
-    const dtype = this.embed.scales.dtype;
-    return (layer, h) => {
-      if (tap.layers.has(layer)) {
-        const H = h.shape[2]!;
-        const src = tap.pos !== undefined ? h.slice([0, tap.pos, 0], [1, tap.pos + 1, H]) : h;
-        const copy = src.astype(dtype);
-        if (src !== h) src.dispose();
-        tap.captured.set(layer, copy);
-      }
-      capture?.(layer, h);
-    };
+  /** The scoring forward (`MlxSequenceForward`): the window read at every width. */
+  sequenceHidden(ids: MlxArray, cache: Cache[], _width: MlxWidthClass): MlxArray {
+    return this.#run(this.#embedTokens(ids), cache, "window", null);
   }
 
-  /** @deprecated E2. ids [B, L] to the final-norm hidden [B, L, hidden]. */
-  forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray {
-    const h = this.#embedTokens(ids);
-    return this.#run(h, cache, deprecatedRead(h, null), this.#tapCapture(null));
-  }
-
-  /** @deprecated E2. Pre-merged (unscaled) input embeddings (borrowed) to hidden states: `bidir` (bool [L]) marks
+  /** The vision prefill phase: pre-merged (unscaled) input embeddings (borrowed) to hidden states: `bidir` (bool [L]) marks
    *  image tokens, which attend each other both ways in a prompt's first window. */
-  forwardEmbeddings(embeds: MlxArray, cache: Cache[], bidir: MlxArray | null, _ids: MlxArray,
+  prefillEmbeddings(embeds: MlxArray, cache: Cache[], bidir: MlxArray | null, _ids: MlxArray,
     _multimodal: MlxArray | null = null): MlxArray {
     const h = ops.mulScalar(embeds, this.embedScale);
-    return this.#run(h, cache, deprecatedRead(h, bidir), this.#tapCapture(null));
+    return this.#run(h, cache, bidir ? { bidirectional: bidir } : "window", null);
   }
 
-  /** @deprecated E2 decides mixed rows. Each group's attention reads its own
-   *  caches; the feed-forward runs once over the groups' real tokens packed
-   *  together (unless a group keeps its token geometry or the composition's
-   *  `packedMixedMlp` is off). A single group without a capture is `forwardHidden`. */
-  forwardHiddenMixed(work: readonly TokenGroup[]): MlxArray[] {
-    if (work.length === 1 && !work[0]!.captureLayer) return [this.forwardHidden(work[0]!.ids, work[0]!.cache)];
+  /** Mixed rows in one forward: each group's attention reads its own caches in its
+   *  own phase (a verify group reads a window); the feed-forward runs once over the
+   *  groups' real tokens packed together, unless a group is a verify window or the
+   *  composition's `packedMixedMlp` is off. */
+  readonly mixed: MlxMixedForward = work => {
     const groups: Array<{ ids: MlxArray; cache: Cache[]; h: MlxArray; phase: Gemma4Phase }> = [];
     const results: MlxArray[] = [];
-    const packedMlp = this.#packMixedMlp && !work.some(group => group.preserveTokenGeometry);
+    const packedMlp = this.#packMixedMlp && !work.some(group => group.phase === "verify");
     try {
-      for (const { ids, cache } of work) {
+      for (const { ids, state, phase } of work) {
         const h = this.#embedTokens(ids);
-        const group = { ids, cache, h, phase: deprecatedRead(h, null) };
+        const group = { ids, cache: state, h, phase: (phase === "decode" ? "decode" : "window") as Gemma4Phase };
         groups.push(group);
       }
       for (let i = 0; i < LAYERS.length; i++) {
@@ -425,7 +386,7 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
             else for (const mid of mids) outputs.push(feedforward(mid));
           } catch (error) { for (const output of outputs) output.dispose(); throw error; }
           for (const [index, group] of groups.entries()) { group.h.dispose(); group.h = outputs[index]!; }
-          for (const [index, group] of groups.entries()) work[index]!.captureLayer?.(i, group.h);
+          for (const [index, group] of groups.entries()) work[index]!.capture?.(i, group.h);
         } finally {
           for (const mid of mids) mid.dispose();
         }
@@ -433,7 +394,7 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
       for (const [index, group] of groups.entries()) {
         const hidden = this.finalNorm.forward(group.h);
         results.push(hidden);
-        work[index]!.captureLayer?.(LAYERS.length, hidden);
+        work[index]!.capture?.(LAYERS.length, hidden);
       }
       return results;
     } catch (error) { for (const result of results) result.dispose(); throw error; }
@@ -442,36 +403,8 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
         group.h.dispose();
       }
     }
-  }
+  };
 
-  /** @deprecated E2 indexes `logits` by the rows it projects; one head serves every width. */
+  /** The one head: the scoring forward's and the compiled decode step's; the phases index `logits`. */
   logitsFromHidden(h: MlxArray): MlxArray { return this.#head(h); }
-
-  /** @deprecated E2. Logits for `tokens` appended to `cache`. */
-  forward(tokens: number[] | MlxArray, cache: Cache[]): MlxArray {
-    const ids = Array.isArray(tokens) ? ops.fromInt32(tokens, [1, tokens.length]) : tokens;
-    const h = this.forwardHidden(ids, cache);
-    if (Array.isArray(tokens)) ids.dispose();
-    const logits = this.logitsFromHidden(h);
-    h.dispose();
-    return logits;
-  }
-
-  /** Greedy generation on fresh caches (diagnostics and scripts). */
-  generate(promptTokens: number[], maxTokens: number, eosIds: number[] = []): number[] {
-    const cache = this.makeCache();
-    const out: number[] = [];
-    try {
-      let tokens = promptTokens;
-      for (let step = 0; step < maxTokens; step++) {
-        const logits = this.forward(tokens, cache);
-        const next = argmaxLastPosition(logits);
-        logits.dispose();
-        if (eosIds.includes(next)) break;
-        out.push(next);
-        tokens = [next];
-      }
-    } finally { for (const c of cache) c.dispose(); }
-    return out;
-  }
 }

@@ -66,7 +66,7 @@ export function miniCpmTrainable(model: MiniCpmTraining): TrainableGraph {
     prefixShared: {
       /** The training forward over the whole concat: the prefix-shared caches
        *  have no attention read of their own, so it runs `runLayerRange`. */
-      forwardHidden(ids: MlxArray, layout: PrefixLayout): MlxArray {
+      prefixSharedHidden(ids: MlxArray, layout: PrefixLayout): MlxArray {
         const caches = prefixSharedCaches(model.layers.length, layout);
         setActivePrefixLayout(layout);
         try {
