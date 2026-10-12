@@ -1107,6 +1107,12 @@ unchanged.
       PATTERN TO FOLLOW" are deleted with their identity tests' oracle halves (the generator
       drift tests and the real-weight digests remain the gates); the drafter port's unused
       `forwardInfer`, `draftBlock` and `projectContextKV`; the `sliding-grammar-fill` Llama 3B
+      case bisected to its first failing commit. From Codex's review of #339, still true on the
+      head: `TwoModelProvider.dispose()` releases only its `Weights`, so a specialized graph used
+      as a two-model draft (one that owns MLX constants or Neural Engine programs in `#owned`)
+      leaks them on unload; the fix is the graph contract requiring `dispose()` on every graph
+      (generic graphs release nothing), called by every provider and by the host, not an
+      optional-method probe; done here because B4 is editing the graph files now.
       case bisected to its first failing commit. Exit: the sweep returns nothing but
       diagnostics and history; every document names only what the tree contains; the
       architecture gate's documentation generators run clean.
