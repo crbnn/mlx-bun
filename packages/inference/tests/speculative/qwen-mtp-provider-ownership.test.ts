@@ -156,7 +156,7 @@ test("group membership borrows committed checkpoints and survives reorder, drain
     metadata: state.attachment.metadata,
     tensors: state.attachment.tensors.map(array => [...array.toFloat32()]) });
   const expected = donors.map(values);
-  const group = provider.grouped.open({ target, sampling: { sample: unused }, checkpoints: [] });
+  const group = provider.grouped.open({ target, sampling: { selection: { kind: "sampled" }, sample: unused }, checkpoints: [] });
   const source = provider.open({ target, sampler: unused });
   try {
     expect(group.rowCount).toBe(0);
@@ -203,7 +203,7 @@ test("target and draft admission publish together after every state owner prepar
   const unused = () => { throw new Error("admission must not execute the model"); };
   const draft = provider.grouped.open({ target: { identity: {}, recurrentMtp: {
     hiddenSize: 8, layerCount: 1, embed: unused, logits: atEveryWidth(unused),
-  } }, sampling: { sample: unused }, checkpoints: [] });
+  } }, sampling: { selection: { kind: "sampled" }, sample: unused }, checkpoints: [] });
   const target = new MlxStateRows([new BatchedKVCache()]);
   const pending = MlxArray.fromFloat32(new Float32Array(8).fill(17), [1, 1, 8]);
   const checkpoint: DraftRowCheckpoint = { processedTokens: 1,
@@ -262,7 +262,7 @@ test("prefill membership borrows the same checkpoints without constructing a sam
     expect(prefill.rowCount).toBe(2);
     prefill.filterRows([1]);
     const restored = prefill.capture(0);
-    const decode = provider.grouped.open({ target, sampling: { sample: unused }, checkpoints: [restored] });
+    const decode = provider.grouped.open({ target, sampling: { selection: { kind: "sampled" }, sample: unused }, checkpoints: [restored] });
     try {
       expect(decode.namespace).toBe(prefill.namespace);
       const captured = decode.capture(0);
@@ -280,7 +280,7 @@ test("Qwen MTP declares the target tap its grouped rows consume, resolved from t
     const target = { identity: {}, recurrentMtp: { hiddenSize: 8, layerCount: 3, embed: unused, logits: atEveryWidth(unused) } };
     const declared = provider.grouped.targetTapLayers!(target);
     expect(declared).toEqual([2]);
-    for (const open of [() => provider.grouped.open({ target, sampling: { sample: unused }, checkpoints: [] }),
+    for (const open of [() => provider.grouped.open({ target, sampling: { selection: { kind: "sampled" }, sample: unused }, checkpoints: [] }),
       () => provider.grouped.openPrefill({ target, checkpoints: [] })]) {
       const rows = open();
       try { expect(rows.tapLayers).toEqual(declared); } finally { rows.dispose(); }

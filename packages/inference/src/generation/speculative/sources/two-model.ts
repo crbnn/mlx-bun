@@ -94,7 +94,7 @@ class TwoModelSource implements DraftSource {
   private processed = 0;
   constructor(model: RuntimeModel, sampler: (lp: MlxArray, step: number) => MlxArray, namespace: string) {
     this.rows = openStandaloneDraftRows(bindMlxAutoregressiveGraph(model), namespace,
-      { sample: (logprobs, steps) => sampler(logprobs, steps[0]!) }, [null]);
+      { selection: { kind: "sampled" }, sample: (logprobs, steps) => sampler(logprobs, steps[0]!) }, [null]);
     this.tailSplit = runtimeFlag("MLX_BUN_PREFILL_TAIL_SPLIT", true);
   }
   async prefill(promptIds: number[]): Promise<void> {

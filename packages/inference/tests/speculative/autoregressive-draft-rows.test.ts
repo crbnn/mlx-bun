@@ -37,7 +37,7 @@ test("batched draft graph retains independent attention and recurrent boundaries
       const tokens = Array.from({ length: B }, (_, row) => values[row * N + N - 1]!);
       return MlxArray.fromFloat32(Float32Array.from(tokens.flatMap(token => Array.from({ length: 32 }, (_, id) => id === token + 1 ? 10 : 0))), [tokens.length, 1, 32]);
     },
-  )), state, { sample(logprobs, steps) { sampled.push([...steps]); return ops.argmaxAxis(logprobs, -1); } });
+  )), state, { selection: { kind: "sampled" }, sample(logprobs, steps) { sampled.push([...steps]); return ops.argmaxAxis(logprobs, -1); } });
   const inspect = (row: number) => {
     const caches = state.extractRow(row);
     try {

@@ -113,22 +113,32 @@ export interface DraftSource {
   dispose(): void;
 }
 
+/** How a draft group's rows choose their tokens: each row's draw, and the
+ *  selection the group resolved when it bound its requests. A drafter that
+ *  selects over its target's head binds one selection operation from
+ *  `selection` when its rows open; its draft loop calls that operation. */
 export interface DraftRowSampling {
-  /** Borrow [B,V] log-probabilities; return owned [B] IDs on device. */
+  /** Borrow [B,V] log-probabilities; return owned [B] IDs on device: each row's
+   *  own draw (argmax under the greedy draft policy). */
   sample(logprobs: MlxArray, steps: readonly number[]): MlxArray;
-  /** Frequency-ranked draft vocabulary (`MLX_BUN_SPEC_DRAFT_VOCAB`): ascending
-   *  token ids the draft may propose, and each row's coupled draw over logits
-   *  [B, N] restricted to them. Returns FULL-vocabulary ids [B]. Null when a
-   *  current row's sampler cannot be reproduced on a subset. */
-  readonly vocabulary?: {
-    readonly ids: readonly number[];
-    sample(logits: MlxArray, head: import("./draft-vocab").DraftVocabularyHead, steps: readonly number[]): MlxArray | null;
-  };
-  /** Every row drafts by argmax (`MLX_BUN_SPEC_GREEDY_DRAFT=1`). Rows may then
-   *  skip logprob normalization and select with the fused normalized argmax
-   *  instead of calling sample(); the selected IDs are identical. */
-  readonly greedy?: boolean;
+  readonly selection: DraftSelection;
 }
+
+/** The selection every row of one draft group shares, resolved once per request
+ *  from its sampling and the vocabulary its drafter declares.
+ *  - `sampled`: each row's `sample` over the full head's log-probabilities.
+ *  - `greedy`: every row drafts by argmax (`MLX_BUN_SPEC_GREEDY_DRAFT=1`), so a
+ *    drafter may select with the fused normalized argmax over the full head's
+ *    logits instead of calling `sample`; the selected IDs are identical.
+ *  - `listed`: the frequency-ranked draft vocabulary its drafter declared
+ *    (ascending token ids) and each row's coupled draw over logits [B, N]
+ *    restricted to them, returning full-vocabulary ids [B]. Bound only for
+ *    requests whose draft sampler reproduces on the subset. */
+export type DraftSelection =
+  | { readonly kind: "sampled" }
+  | { readonly kind: "greedy" }
+  | { readonly kind: "listed"; readonly ids: readonly number[];
+      sample(logits: MlxArray, head: import("./draft-vocab").DraftVocabularyHead, steps: readonly number[]): MlxArray };
 
 /** Request-owned constraints can propose known continuations without changing
  * their committed state. The target verifier still decides every output. */
@@ -178,9 +188,11 @@ export interface DraftPrefillGroup {
 
 export interface GroupedDraftProvider {
   readonly supportsExternalTokens?: boolean;
-  /** Directory of the loaded draft artifact; optional files shipped beside its
-   *  weights (the frequency-ranked draft vocabulary) are discovered there. */
-  readonly artifactDir?: string;
+  /** The frequency-ranked draft vocabulary (ascending token ids) this provider's
+   *  rows can select over for this target, or null. The binding resolves it once
+   *  for the bound target; a request whose draft sampler reproduces on it drafts
+   *  over it (`DraftSelection` `listed`). Absent: none. */
+  draftVocabulary?(target: TargetView): readonly number[] | null;
   /** Resolve persistence identity without allocating a draft row. */
   checkpointNamespace?(): string;
   /** Draft state remains valid when target forwards run under a mounted

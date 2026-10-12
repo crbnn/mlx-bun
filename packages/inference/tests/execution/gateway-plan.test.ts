@@ -587,6 +587,36 @@ function delegatingNgram(): DraftProvider {
       open: options => grouped.open(options), openPrefill: options => grouped.openPrefill(options) } };
 }
 
+test("each request binds one draft selection, resolved when the binding binds it and keyed into its group", () => {
+  /** The n-gram provider's operations declaring a listed draft vocabulary; counts each declaration asked. */
+  const listing = (asked: { count: number }): DraftProvider => {
+    const inner = delegatingNgram();
+    return { ...inner, grouped: { ...inner.grouped!, draftVocabulary: () => { asked.count++; return [1, 2, 3]; } } };
+  };
+  const selectionOf = (binding: MlxGatewayBinding, options: GenerateOptions) => {
+    const plan = binding.plan({ ...shape, hasDraft: true }, options, { ...schedule, continuous: binding.cachesBatchable() });
+    expect(plan).toMatchObject({ method: "speculative", mechanism: "continuous" });
+    return JSON.parse(binding.methodRequest!(plan, options)!.key).at(-1);
+  };
+  const asked = { count: 0 };
+  const binding = bindMlxGateway(softcapUniversal(), { provider: listing(asked), numDraftTokens: 3 });
+  // The vocabulary is the composition's: declared once, for the bound target.
+  expect(asked.count).toBe(1);
+  // A draft sampler that reproduces on the listed rows drafts over them; XTC does
+  // not, so that request draws over the full head in a group of its own.
+  expect(selectionOf(binding, {})).toBe("listed");
+  expect(selectionOf(binding, { temperature: 0.7, topP: 0.9, seed: 3 })).toBe("listed");
+  expect(selectionOf(binding, { temperature: 0.7, xtcProbability: 0.5, xtcThreshold: 0.1 })).toBe("sampled");
+  expect(asked.count).toBe(1);
+  // Without a declared vocabulary every request draws over the full head.
+  expect(selectionOf(bindMlxGateway(softcapUniversal(), { provider: new NgramProvider(), numDraftTokens: 3 }), {})).toBe("sampled");
+  // Argmax drafts (MLX_BUN_SPEC_GREEDY_DRAFT=1) never consult the vocabulary.
+  const greedyAsked = { count: 0 };
+  const greedy = withRuntimeConfig(createRuntimeConfig({ MLX_BUN_SPEC_GREEDY_DRAFT: "1" }),
+    () => bindMlxGateway(softcapUniversal(), { provider: listing(greedyAsked), numDraftTokens: 3 }));
+  expect([selectionOf(greedy, {}), greedyAsked.count]).toEqual(["greedy", 0]);
+});
+
 test.each([["two-model", twoModelDraft, "gemma2-draft"], ["n-gram", () => new NgramProvider(), "ngram"],
   ["delegating n-gram", delegatingNgram, "ngram-delegate"]] as const)(
   "Gemma2 softcap speculates with the %s provider over plain KV", (_, provider, id) => {

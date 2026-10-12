@@ -38,6 +38,7 @@ import type { DraftProvider, DraftSource, DraftRowGroup, DraftPrefillGroup, Draf
 import { targetLacks } from "../source";
 import type { DraftRowCheckpoint } from "../../../contracts/mlx/draft-checkpoint";
 import { QwenMtpRows } from "../bindings/qwen-mtp-rows";
+import { configuredDraftVocabulary } from "../draft-vocab";
 import { type MtpRowState } from "../../../state/speculative/qwen-mtp-state";
 import { captureQwenMtpState, restoreQwenMtpState } from "../../../state/speculative/qwen-mtp-state";
 import type { Cache } from "../../../contracts/mlx/cache";
@@ -57,7 +58,12 @@ export class QwenMtpProvider implements DraftProvider {
   readonly grouped: GroupedDraftProvider = {
     supportsExternalTokens: true,
     targetTapLayers: view => mtpTapLayers(this.#target(view)),
-    artifactDir: undefined as string | undefined,
+    // A list shipped beside the companion (or named by MLX_BUN_SPEC_DRAFT_VOCAB),
+    // for a target whose quantized head the rows can project a row subset of.
+    draftVocabulary: view => {
+      const head = this.#target(view).vocabularyHead;
+      return head ? configuredDraftVocabulary(head.vocabSize, this.#dir) : null;
+    },
     checkpointNamespace: () => this.#checkpointNamespace,
     open: options => this.#openRows(options.target, options.sampling, options.checkpoints),
     openPrefill: options => this.#openRows(options.target, null, options.checkpoints),
@@ -68,9 +74,12 @@ export class QwenMtpProvider implements DraftProvider {
   readonly #config: ModelConfig;
   readonly #resources: DisposableStack;
   readonly #checkpointNamespace: string;
+  /** The companion's directory, where its optional draft vocabulary ships. */
+  readonly #dir: string;
 
-  private constructor(id: string, config: ModelConfig, weightsBytes: number, module: RecurrentMtpModule, resources: DisposableStack, checkpointNamespace: string) {
+  private constructor(id: string, dir: string, config: ModelConfig, weightsBytes: number, module: RecurrentMtpModule, resources: DisposableStack, checkpointNamespace: string) {
     this.id = id;
+    this.#dir = dir;
     this.#config = config;
     this.#module = module;
     this.weightsBytes = weightsBytes;
@@ -90,12 +99,10 @@ export class QwenMtpProvider implements DraftProvider {
     // companions. Hash once at provider load, outside inference execution.
     const identity = await artifactIdentity(configFingerprint(config),
       [...weights.shards.files].map(([name, shard]) => ({ name, path: shard.path })));
-    const provider = new QwenMtpProvider(
-      dir.split("/").filter(Boolean).at(-1) ?? "qwen-mtp",
+    return new QwenMtpProvider(
+      dir.split("/").filter(Boolean).at(-1) ?? "qwen-mtp", dir,
       config, weightsBytes, module, resources.move(), `${DRAFT_CHECKPOINT_SCHEMA.qwenMtp}:${identity}`,
     );
-    (provider.grouped as { artifactDir?: string }).artifactDir = dir;
-    return provider;
   }
 
   open(opts: Parameters<DraftProvider["open"]>[0]): DraftSource {
