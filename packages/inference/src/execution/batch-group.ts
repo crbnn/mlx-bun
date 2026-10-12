@@ -6,6 +6,8 @@ import type { MlxRequestStatePolicy } from "../state/request-policy";
 import { AdmissionRejected } from "./admission";
 import { runMixedTokenIteration } from "./mixed-iteration";
 import { MlxPrefillCohort,type PrefillState } from "./prefill-cohort";
+import type { MlxPrefillForward } from "./prefill-rows";
+import { MlxPhaseDispatch } from "../generation/phase-dispatch";
 import { driveExecutionGroup } from "./scheduler";
 // Continuous-batching scheduler for `--batch N` serving (the engine loop).
 // Owns ONE running batch and drives it forward one decode step at a
@@ -62,14 +64,14 @@ import { activeMemory,cacheMemory,clearCache,Dtype,peakMemory } from "@mlx-bun/m
 import * as ops from "@mlx-bun/mlx/ops";
 import { type Cache } from "../contracts/mlx/cache";
 import type { PrefillPolicy } from "../contracts/portable/prefill";
-import type { MlxCompiledDecodeStep } from "../contracts/mlx/graph";
+import { widthClass, type MlxCompiledDecodeStep, type MlxMixedForward } from "../contracts/mlx/graph";
 import { resolveMlxPrefillPolicy } from "../generation/bindings/prefill-policy";
 import { acquireModelWiredLimit } from "../generation/index";
-import { compiledDecodeStepOf } from "../models/capabilities";
+import { compiledDecodeStepOf, tokenPhasesOf } from "../models/capabilities";
 import type { MlxTokenGraph } from "../models/graph";
 import { runtimeConfig,withRuntimeConfig,type RuntimeConfig } from "../runtime/config";
 import { independentGreedySampling } from "../sampling/index";
-import { composedStorageOf,isBatchableCache,isPlainKvCache,isRotatingPlainCache } from "../state/capabilities";
+import { composedStorageOf,isBatchableCache,isCompiledDecodeCache,isPlainKvCache,isRotatingPlainCache,isRowBatchCache } from "../state/capabilities";
 import { createKvMaintenance,type KvMaintenance } from "../state/kv-maintenance";
 import type { KvScheme } from "../state/kv-scheme";
 import { ownedCacheLayout } from "../state/layout";
@@ -154,12 +156,23 @@ export class MlxBatchExecutionGroup {
   readonly #batchCacheMaxTokens: number | null;
   readonly #kvScheme: KvScheme | undefined;
   readonly #maintainKv: KvMaintenance | null;
-  /** The graph's declared compiled decode step, for the B=1 case whose state
-   *  layout it accepts (kill switch MLX_BUN_COMPILED_DECODE; adapter requests
-   *  disable replay in their plan). Set to null permanently on a failed step
-   *  (a direct generation disables per generation; the scheduler is one
-   *  long-lived "generation"). */
-  #compiled: MlxCompiledDecodeStep | null;
+  /** The graph's compiled decode step, composed at bind when the graph declares
+   *  one, its caches can be driven by it and MLX_BUN_COMPILED_DECODE leaves it on.
+   *  It runs a lone row whose caches are the graph's own (`#compiledRow`), never
+   *  falling back to the ordinary forward: a failed step fails the batch. */
+  readonly #compiled: MlxCompiledDecodeStep | null;
+  /** Whether the lone running row decodes through `#compiled`: decided when the
+   *  row is adopted (its request allows replay and every cache it holds is one
+   *  the step drives), cleared when a second row merges. */
+  #compiledRow = false;
+  /** The graph's phase operations, indexed by the phase and rows of each forward. */
+  readonly #dispatch: MlxPhaseDispatch;
+  /** The composition's vectorized greedy sampling: one argmax over the batch when every live row is plain greedy. */
+  readonly #vectorGreedy: boolean;
+  /** The mixed iteration (MLX_BUN_MIXED_PREFILL, default off): the composition's mixed-rows forward when it
+   *  declares one and the flag is on, bound once; null otherwise. */
+  readonly #mixed: MlxMixedForward | null;
+  readonly #mixedTokenBudget: number;
 
   constructor(private readonly model: MlxTokenGraph, opts: MlxBatchExecutionGroupOptions) {
     this.#runtime = opts.runtime ?? runtimeConfig();
@@ -204,10 +217,15 @@ export class MlxBatchExecutionGroup {
     this.#maintainKv = this.#kvScheme?.quantized
       ? createKvMaintenance(this.#kvScheme.storage)
       : null;
+    const replayable = proto.every(cache => isCompiledDecodeCache(cache) && !isRowBatchCache(cache));
     for (const c of proto) c.dispose();
-    this.#compiled = this.#runtime.flag("MLX_BUN_COMPILED_DECODE", true)
+    this.#compiled = replayable && this.#runtime.flag("MLX_BUN_COMPILED_DECODE", true)
       ? withRuntimeConfig(this.#runtime, () => compiledDecodeStepOf(model))
       : null;
+    this.#dispatch = new MlxPhaseDispatch(tokenPhasesOf(model));
+    this.#vectorGreedy = model.composition?.vectorGreedySampling ?? true;
+    this.#mixed = this.#runtime.flag("MLX_BUN_MIXED_PREFILL", false) && model.mixed ? model.mixed : null;
+    this.#mixedTokenBudget = this.#runtime.number("MLX_BUN_MIXED_TOKEN_BUDGET", 256);
   }
 
   get activeRows(): number {
@@ -232,12 +250,6 @@ export class MlxBatchExecutionGroup {
           row.req.maxTokens,
           this.#kvScheme,
         );
-  }
-
-  async #forwardHidden(ids: MlxArray, cache: Cache[]): Promise<MlxArray> {
-    return typeof this.model.forwardHiddenAsync === "function"
-      ? await this.model.forwardHiddenAsync(ids, cache)
-      : this.model.forwardHidden(ids, cache);
   }
 
   /** Projected aggregate KV of everything admitted (running + mid-prefill). */
@@ -379,30 +391,27 @@ export class MlxBatchExecutionGroup {
         (this.#kvBudgetBytes === undefined ||
           this.projectedKvBytes + this.#rowKvBytes(this.#pending[0]!) <= this.#kvBudgetBytes),
       get mixedPreparation() {
-        return scheduler.#decodeStateKey === undefined && scheduler.#prefill?.supportsMixedWork !== false && scheduler.#runtime.flag("MLX_BUN_MIXED_PREFILL", false) &&
-          (!scheduler.#method || scheduler.#method.runningTokens !== undefined) &&
-          typeof scheduler.model.forwardHiddenMixed === "function"
+        return scheduler.#mixed && scheduler.#decodeStateKey === undefined && scheduler.#prefill?.supportsMixedWork !== false &&
+          (!scheduler.#method || scheduler.#method.runningTokens !== undefined)
           ? { runningTokens: scheduler.#method?.runningTokens ?? scheduler.#running.length,
             minimumPreparationTokens: scheduler.#prefill?.rows.length ?? 0 }
           : undefined;
       },
-      get maxIterationTokens() { return scheduler.#runtime.number("MLX_BUN_MIXED_TOKEN_BUDGET", 256); },
+      get maxIterationTokens() { return scheduler.#mixedTokenBudget; },
       advanceMixed: async tokenBudget => {
         this.#promptCache?.reclaim?.();
+        const mixed = this.#mixed!;
         const advanced = await runMixedTokenIteration({
           prepare: forward => this.#advancePreparation({ forward,
             maxTokens: tokenBudget - (this.#method?.runningTokens ?? this.#running.length) }),
           decode: forward => this.#method ? this.#method.advance(forward) : this.#step(forward),
-          forward: async (ids, cache, options) => options?.captureLayer
-            ? this.model.forwardHiddenMixed!([{ ids, cache, ...options }])[0]!
-            : this.#forwardHidden(ids, cache),
-          mixed: groups => {
+          mixed: (groups, rows) => {
             const workId = `mixed:${++nextMixedWorkId}`;
             const tokens = groups.map(group => group.ids.shape[0]! * group.ids.shape[1]!);
             const closes = [...this.#running, ...(this.#prefill?.rows ?? [])].map(row =>
               row.req.trace?.begin("engine.mixed_forward", { workId,
                 decodeTokens: tokens[0]!, prefillTokens: tokens[1]!, packedTokens: tokens[0]! + tokens[1]! }));
-            try { return this.model.forwardHiddenMixed!(groups); }
+            try { return mixed(groups, widthClass(rows)); }
             finally { for (const close of closes) close?.(); }
           },
         });
@@ -498,8 +507,8 @@ export class MlxBatchExecutionGroup {
           model: this.model, chunkSize: this.#prefillChunkSize, tailSplit: this.#prefillTailSplit,
           promptCache: this.#promptCache, stateCodecs: this.#stateCodecs, maintain: this.#maintainKv ?? undefined,
           ...(this.#denseKvLayers ? { denseKvReads: this.#denseKvLayers } : {}),
-          forward: (ids, caches) => this.#forwardHidden(ids, caches),
-          project: (hidden, caches, completed) => this.#projectPrefill(hidden, caches, completed),
+          forward: async (ids, caches, step) => this.#dispatch.prompt(step.phase, step.sequences, step.tokens)(ids, caches, null),
+          project: (hidden, caches, completed, step) => this.#projectPrefill(hidden, caches, completed, step),
           complete: (state, logits) => this.#completePrefill(state, logits),
           resume: state => this.#completePrefill(state, null),
           reject: (failed, error) => this.#rejectPreparingRows([failed], error),
@@ -546,7 +555,7 @@ export class MlxBatchExecutionGroup {
       .filter((resource): resource is DisposableResource => resource != null);
     this.#pending = []; this.#running = []; this.#prefill = null;
     this.#method = undefined; this.#methodKey = undefined;
-    this.#inners = null; this.#pendingToks = null; this.#pendingReal = null;
+    this.#inners = null; this.#pendingToks = null; this.#pendingReal = null; this.#compiledRow = false;
     this.#adoptedRetain = null;
     for (const row of rows) row.reject(error);
     disposeResources(resources);
@@ -554,7 +563,7 @@ export class MlxBatchExecutionGroup {
 
 
   /** The target owns projection geometry; samplers receive individual rows. */
-  #projectPrefill(hidden: MlxArray, caches: Cache[], completed: readonly PrefillState[]): MlxArray {
+  #projectPrefill(hidden: MlxArray, caches: Cache[], completed: readonly PrefillState[], step: MlxPrefillForward): MlxArray {
     for (const p of completed) {
       p.closePrefill?.(); p.closePrefill = undefined;
       p.row.closeTokenZero = p.row.req.trace?.begin("token_zero.total", { mechanism: "continuous" });
@@ -571,7 +580,7 @@ export class MlxBatchExecutionGroup {
     }
     // Project before selecting rows: M4 quantized projection can use different
     // arithmetic at M=1. Tail-split preparation reaches this with N=1.
-    const logits = this.model.logitsFromHidden(hidden);
+    const logits = this.#dispatch.logits(step.sequences * step.tokens)(hidden);
     try {
       if (attributed.length) {
         const closes = begin("token_zero.head");
@@ -689,11 +698,18 @@ export class MlxBatchExecutionGroup {
     // decode and prompt-cache take/put become possible for it. Each layout's
     // mergeRows takes such an adopted row as its first row.
     if (!this.#inners) {
+      // The adopted row decodes through the compiled step when its request
+      // allows replay and every cache it holds is one the step drives (a
+      // stored prefix comes back as the graph's composed caches, a cohort row
+      // as its layout's serial form).
+      this.#compiledRow = this.#compiled !== null && p.row.req.compiledDecode !== false &&
+        p.solo.every(cache => isCompiledDecodeCache(cache) && !isRowBatchCache(cache));
       this.#inners = p.solo; p.solo = [];
       this.#adoptedRetain = p.retain ?? null; p.retain = undefined;
       this.#running.push(p.row);
       return;
     }
+    this.#compiledRow = false;
 
     const prev = this.#inners;
     const merged: Cache[] = [];
@@ -731,6 +747,15 @@ export class MlxBatchExecutionGroup {
    *  Rows that finish get one extra harmless KV write from the already-built
    *  step; filter drops the row (mlx-lm behaves identically). Length-finished
    *  rows are known in advance and are NOT sampled (placeholder slot). */
+  /** One decode forward of the `B` running rows: the media rows' positioned decode or the graph's decode for
+   *  their width, through the mixed iteration's hook when it runs one. */
+  #decodeForward(ids: MlxArray, caches: Cache[], B: number, work?: MlxForwardWork): Promise<MlxArray> {
+    const width = widthClass(B), decodeState = this.#running[0]?.req.promptInput?.decodeState;
+    const states = decodeState ? this.#running.map(row => row.req.promptInput!.decodeState!) : null;
+    const own = async () => decodeState ? decodeState.decode(ids, caches, states!, width) : this.#dispatch.decode(B)(ids, caches, null);
+    return work ? work(ids, caches, { phase: "decode", rows: B, width, capture: null, own }) : own();
+  }
+
   async #step(forward?: MlxForwardWork): Promise<void> {
     if (this.#denseKvLayers && await this.#rejectUnreadable()) return;
     if (this.#stepTrace) {
@@ -742,10 +767,6 @@ export class MlxBatchExecutionGroup {
     const B = rows.length;
     const inners = this.#inners!;
     const decodeState = rows[0]?.req.promptInput?.decodeState;
-    if (decodeState) {
-      const states = rows.map(row => row.req.promptInput!.decodeState!);
-      forward = async (ids, caches) => decodeState.forward(ids, caches, states);
-    }
 
     // A row is live if it still needs tokens sampled; a row whose pending
     // unread token is its last (sampled == maxTokens) only awaits emission.
@@ -785,18 +806,15 @@ export class MlxBatchExecutionGroup {
       // Compiled decode at B=1: after adopt-don't-copy, a lone row's caches
       // are the caches the graph itself made, so a graph that declares a
       // compiled step replays its recorded graph here — closing the batch
-      // lane's last B=1 host-tax gap (e4b's ~7%). Guards: a declared step
-      // (constructor), state the step accepts (a merged batch's layouts do
-      // not), and a uint32 pipeline register (the trace signature;
-      // per-row int32 samplers take the graph path).
-      // Grammar batches use #stepGrammar and stay on the graph path.
+      // lane's last B=1 host-tax gap (e4b's ~7%). The step was composed at
+      // bind and the row chosen for it when it was adopted (`#compiledRow`);
+      // a per-row int32 sampler register keeps the decode operation (the
+      // trace signature is uint32). A failed step fails the batch: there is
+      // no second path to fall back to.
+      // Grammar batches use #stepGrammar and stay on the decode operation.
       let lg: MlxArray | null = null;
       let evalWith: MlxArray[] = [];
-      if (
-        !forward && this.#compiled && B === 1 && this.#running[0]!.req.compiledDecode !== false &&
-        (!this.#pendingToks || this.#pendingToks.dtype === Dtype.uint32) &&
-        this.#compiled.accepts(inners as Cache[])
-      ) {
+      if (!forward && !decodeState && this.#compiledRow && (!this.#pendingToks || this.#pendingToks.dtype === Dtype.uint32)) {
         let cur = this.#pendingToks;
         let owned = false;
         if (!cur) {
@@ -806,14 +824,9 @@ export class MlxBatchExecutionGroup {
           owned = true;
         }
         try {
-          const r = this.#compiled.step(cur, inners as Cache[]);
+          const r = this.#compiled!.step(cur, inners as Cache[]);
           lg = r.logits; // [1,1,V]
           evalWith = r.evalWith;
-        } catch (e) {
-          // A failed step is transactional (see generate.ts) — safe to
-          // re-forward the same token on the graph path below.
-          this.#compiled = null;
-          console.warn(`batch lane: compiled decode disabled: ${e}`);
         } finally {
           if (owned) cur.dispose();
         }
@@ -825,9 +838,9 @@ export class MlxBatchExecutionGroup {
           const ids = this.#pendingToks
             ? ops.reshape(this.#pendingToks, [B, 1]) // feed the unread tokens
             : ops.fromInt32(rows.map((r) => r.current), [B, 1]); // pipeline cold
-          const h = await (forward ? forward(ids, fwd) : this.#forwardHidden(ids, fwd));
+          const h = await this.#decodeForward(ids, fwd, B, forward);
           ids.dispose();
-          lg = this.model.logitsFromHidden(h); // [B,1,V]
+          lg = this.#dispatch.logits(B)(h); // [B,1,V]
           h.dispose();
         }
         const V = lg.shape[2]!;
@@ -840,7 +853,7 @@ export class MlxBatchExecutionGroup {
         // harmless (the slot is filtered before it is ever emitted; its only
         // use is one KV write on the row's own, about-to-evict row).
         const vecOk =
-          this.#runtime.value("MLX_BUN_BATCH_VEC_SAMPLE") !== "0" &&
+          this.#vectorGreedy &&
           rows.every((r) => r.sampled >= r.req.maxTokens || r.req.plainGreedy);
         // Doomed slots hold placeholders (vec path: a real argmax value,
         // equally not part of the row's stream) — flag them so the fed
@@ -1036,9 +1049,9 @@ export class MlxBatchExecutionGroup {
         const ids = prev
           ? ops.reshape(prev, [B, 1]) // feed the unread tokens (device array)
           : ops.fromInt32(rows.map((r) => r.current), [B, 1]); // pipeline cold
-        const h = await (forward ? forward(ids, fwd) : this.#forwardHidden(ids, fwd));
+        const h = await this.#decodeForward(ids, fwd, B, forward);
         ids.dispose();
-        const lg = this.model.logitsFromHidden(h); // [B,1,V]
+        const lg = this.#dispatch.logits(B)(h); // [B,1,V]
         h.dispose();
         const V = lg.shape[2]!;
 
@@ -1293,7 +1306,7 @@ export class MlxBatchExecutionGroup {
         this.#adoptedRetain?.();
       }
       this.#adoptedRetain = null;
-      this.#inners = null;
+      this.#inners = null; this.#compiledRow = false;
       this.#running = [];
       this.#pendingToks?.dispose();
       this.#pendingToks = null;

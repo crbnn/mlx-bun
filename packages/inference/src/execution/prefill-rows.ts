@@ -3,6 +3,7 @@ import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import { clearCache } from "@mlx-bun/mlx/ffi";
 import type { PrefillStep } from "../contracts/portable/prefill";
+import type { MlxPromptStep } from "../generation/phase-dispatch";
 import { cloneKvCaches } from "../state/persistence";
 import { type CacheCodecProvider } from "../state/persistence-types";
 import { disposeResources, cleanupFailure } from "../runtime/resources";
@@ -40,6 +41,9 @@ export interface MlxPrefillState {
   planned?: MlxPrefillStep;
 }
 
+/** One cohort forward: the rows' common phase and their positions per row. */
+export type MlxPrefillForward = MlxPromptStep;
+
 /** The method owns initialization, planning, companion state, snapshots and
  * completion. This driver owns common target batching and work boundaries.
  * Checkpoint factories return owned cache state; close/dispose are idempotent. */
@@ -50,8 +54,11 @@ export interface MlxPrefillRowsHost<State extends MlxPrefillState> {
   plan(state: State): MlxPrefillStep;
   /** Already prepared state can complete without any target forward. */
   ready?(state: State): boolean;
-  forward(ids: MlxArray, caches: Cache[], states: readonly State[], work?: MlxForwardWork): Promise<MlxArray>;
-  project(hidden: MlxArray, caches: Cache[], completed: readonly State[]): MlxArray | null;
+  /** Run one cohort forward of `ids` [sequences, tokens] in `step.phase`. */
+  forward(ids: MlxArray, caches: Cache[], states: readonly State[], step: MlxPrefillForward,
+    work?: MlxForwardWork): Promise<MlxArray>;
+  /** Project the cohort forward `step` produced (its rows: sequences times tokens). */
+  project(hidden: MlxArray, caches: Cache[], completed: readonly State[], step: MlxPrefillForward): MlxArray | null;
   /** Consume method context after target maintenance, before snapshots. */
   afterForward?(ids: MlxArray, caches: Cache[], states: readonly State[], hidden: MlxArray): void | Promise<void>;
   checkpoint(state: State, capture: () => Cache[], row: number): void;
@@ -171,6 +178,16 @@ export class MlxPrefillRows<State extends MlxPrefillState> implements MlxGroupPr
       const count = Math.min(this.#states.some(state => state.planned!.atomic) ? Infinity
         : Math.max(1, Math.floor(remaining / this.#states.length)),
         ...this.#states.map(state => state.planned!.end - state.pos));
+      // A planned step stays the unit of maintenance: a row whose step is longer
+      // than this forward (a sibling's step is shorter, or the budget is) runs
+      // `count` of its positions now and is maintained at the step's planned end,
+      // so its caches convert where its own plan put the boundary, whatever rows
+      // it shares the forward with. Only every row's whole planned chunk is a
+      // chunk forward; any other piece of more than one position is a tail.
+      const whole = this.#states.every(state => state.planned!.phase === "chunk" &&
+        state.pos === state.planned!.start && state.pos + count === state.planned!.end);
+      const step: MlxPrefillForward = { sequences: this.#states.length, tokens: count,
+        phase: count === 1 ? "decode" : whole ? "chunk" : "tail" };
       const work = { workId: ++nextWorkId, batchSize: this.#states.length, tokensPerRow: count };
       const closes = this.#states.map(state => state.row.req.trace?.begin("prefill.chunk", {
         mechanism: "continuous", startToken: state.pos, ...work,
@@ -182,7 +199,7 @@ export class MlxPrefillRows<State extends MlxPrefillState> implements MlxGroupPr
         let forwarded: MlxArray | null;
         {
           using span = traceRows(this.#states, "prefill.forward", work);
-          forwarded = ids ? await this.operations.forward(ids, caches, this.#states, workLimit?.forward) : null;
+          forwarded = ids ? await this.operations.forward(ids, caches, this.#states, step, workLimit?.forward) : null;
         }
         using hidden = forwarded;
         const drains: number[] = [], finals: number[] = [];
@@ -226,7 +243,7 @@ export class MlxPrefillRows<State extends MlxPrefillState> implements MlxGroupPr
         let projected: MlxArray | null = null;
         if (hidden && finals.length) {
           using span = traceRows(this.#states, "prefill.project", work);
-          projected = this.operations.project(hidden, caches, finals.map(row => this.#states[row]!));
+          projected = this.operations.project(hidden, caches, finals.map(row => this.#states[row]!), step);
         }
         using logits = projected;
         for (const row of finals) {
