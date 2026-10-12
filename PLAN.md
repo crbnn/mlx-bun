@@ -17,8 +17,10 @@ Decisions that govern all work:
 
 ## Composition refactor
 
-Status: draft, 2026-10-10; Josh approved this plan. One PR per numbered item, targeting `main`,
-not merged without Josh's instruction. Delete a block when its exit criteria are met.
+Status: in progress since 2026-10-10; Josh approved this plan. Every item lands as a sub-branch merged
+into `refactor/composition` after its gates match the base; the one PR to `main` is #323 (Josh,
+2026-10-12: one branch, one PR; the integration branch is folded in and the per-item PRs closed).
+Delete a block when its exit criteria are met.
 
 ### Target
 
