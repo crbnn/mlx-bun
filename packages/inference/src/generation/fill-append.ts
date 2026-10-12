@@ -11,7 +11,7 @@ import { leaseCacheStates } from "../state/leases";
  * boundaries, preserving the cache-covered prefix on a consumer break.
  */
 export async function appendFillHidden(
-  forward: (ids: MlxArray, cache: Cache[]) => MlxArray | Promise<MlxArray>,
+  forward: (ids: MlxArray, cache: Cache[], positions: number) => MlxArray | Promise<MlxArray>,
   cache: Cache[],
   ids: number[],
   chunkSize: (cache: readonly Cache[]) => number,
@@ -25,7 +25,7 @@ export async function appendFillHidden(
  * the returned hidden rows belong to the caller. Model policy receives B so
  * a larger cohort cannot silently cross its qualified projection geometry. */
 export async function appendHiddenRows(
-  forward: (ids: MlxArray, cache: Cache[]) => MlxArray | Promise<MlxArray>,
+  forward: (ids: MlxArray, cache: Cache[], positions: number) => MlxArray | Promise<MlxArray>,
   cache: Cache[],
   input: MlxArray,
   chunkSize: (cache: readonly Cache[], rows: number) => number,
@@ -38,10 +38,10 @@ export async function appendHiddenRows(
       if (!Number.isSafeInteger(limit) || limit < 1)
         throw new Error("Model append chunk limit must be a positive integer");
       const end = Math.min(length, start + limit);
-      if (start === 0 && end === length) return await forward(input, cache);
+      if (start === 0 && end === length) return await forward(input, cache, length);
       const part = input.slice([0, start], [rows, end]);
       try {
-        const h = await forward(part, cache);
+        const h = await forward(part, cache, end - start);
         hidden.push(h);
         // Bound transient graphs while retaining all positions for an optional
         // diagnostic trace. Normal generation projects only the last position.

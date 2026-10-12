@@ -184,6 +184,7 @@ async function runEntry(entry: "createModel" | "Gemma4Model", steps: number) {
   checkRuntime(manifest, { mlxVersion: ffi.MLX_VERSION, architecture: ffi.deviceArchitecture() });
   const { loadModelConfig, Weights, createModel, resolveComposition } = await import("@mlx-bun/inference");
   const { Gemma4Model } = await import("@mlx-bun/inference/models/gemma4");
+  const { phaseLogits } = await import("../models/phase-forward");
   const { argmaxLastPosition, lastPositionLogits } = await import("@mlx-bun/inference/scoring");
   const { KVCache } = await import("../../src/state/kv");
   const { RotatingKVCache } = await import("../../src/state/rotating-kv");
@@ -203,7 +204,7 @@ async function runEntry(entry: "createModel" | "Gemma4Model", steps: number) {
     checkPlainCaches(layers, config.text.layerTypes, { KVCache, RotatingKVCache });
     let tokens = manifest.prompt_ids;
     for (let step = 0; step < steps; step++) {
-      const logits = model.forward(tokens, layers);
+      const logits = phaseLogits(model, tokens, layers);
       let next: number;
       try {
         const actual = lastPositionLogits(logits);

@@ -167,7 +167,7 @@ export function gemma4Trainable(model: Gemma4Training): TrainableGraph {
       begin: (ids, prefix) => new Gemma4SegmentedPass(model, ids, prefix),
     },
     prefixShared: {
-      forwardHidden(ids: MlxArray, layout: PrefixLayout): MlxArray {
+      prefixSharedHidden(ids: MlxArray, layout: PrefixLayout): MlxArray {
         // One prefix cache per DONOR layer (sharers consume donors' fetched K/V
         // inside the training forward); the caches build the block-sparse masks.
         const caches: Cache[] = Array.from({ length: model.numDonors }, () => new PrefixSharedCache(layout));

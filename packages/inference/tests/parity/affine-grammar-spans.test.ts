@@ -39,6 +39,7 @@ test.skipIf(!target)("real-weight committed spans over delayed affine KV equal d
   const { bindMlxGateway, createRuntimeConfig, withRuntimeConfig } = await import("../../src/execution");
   const { bindMlxAutoregressiveGraph } = await import("../../src/generation/bindings/autoregressive");
   const { resolveKvScheme } = await import("../../src/state/kv-scheme");
+  const { observedPhases } = await import("../models/phase-forward");
   const weights = await Weights.open(target!);
   try {
     const config = await loadModelConfig(target!);
@@ -54,17 +55,14 @@ test.skipIf(!target)("real-weight committed spans over delayed affine KV equal d
       const start = scheme.options.quantizedKvStart ?? 0;
       const existing = graphs.get(start);
       if (existing) return existing;
-      const model = createModel(weights, config, resolveComposition(config, { kv: { override: 4, quantizedKvStart: start, fusedSdpa: true } }));
-      const project = model.logitsFromHidden.bind(model), forward = model.forwardHidden.bind(model);
-      model.logitsFromHidden = (hidden: MlxArray) => {
-        const logits = project(hidden);
-        lane?.push({ shape: [...logits.shape], dtype: logits.dtypeName, sha256: createHash("sha256").update(logits.rawBytes()).digest("hex") });
-        return logits;
-      };
-      (model as { forwardHidden: typeof forward }).forwardHidden = (ids, caches) => {
-        kinds.push(caches.map(cache => (cache.composed?.storage() ?? cache).constructor.name));
-        return forward(ids, caches as never);
-      };
+      // The scheduler binds to a view whose phases report each forward's cache storage and each head's logits.
+      const model = observedPhases(createModel(weights, config, resolveComposition(config,
+        { kv: { override: 4, quantizedKvStart: start, fusedSdpa: true } })), {
+        forward(_ids, caches) { kinds.push(caches.map(cache => (cache.composed?.storage() ?? cache).constructor.name)); },
+        head(_hidden, logits) {
+          lane?.push({ shape: [...logits.shape], dtype: logits.dtypeName, sha256: createHash("sha256").update(logits.rawBytes()).digest("hex") });
+        },
+      });
       const graph = { model, binding: withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }), () => bindMlxGateway(model)) };
       graphs.set(start, graph);
       return graph;

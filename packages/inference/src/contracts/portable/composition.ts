@@ -41,7 +41,8 @@ export type DraftDepth = number | { readonly adaptive: true; readonly max: numbe
 export interface Composition {
   /** The GPU's architecture identifier as MLX reports it (for example `applegpu_g16s`). */
   readonly device: string;
-  /** The Neural Engine bridge loaded and compiles programs on this machine. */
+  /** The Neural Engine bridge is composed: a graph that builds a Neural Engine
+   * operation builds it at load, and a bridge that fails there fails the load. */
   readonly aneBridge: boolean;
   /** The storage and reads of every attention cache the graph's `makeCache` composes. */
   readonly kv: KvStorageScheme;
@@ -61,4 +62,8 @@ export interface Composition {
   /** The groups of a mixed forward share one MLP pass (default on); off, each
    * group runs its own. */
   readonly packedMixedMlp: boolean;
+  /** A decode step whose live rows are all plain greedy samples them with one
+   * argmax over the batch instead of one sampler call per row (default on): the
+   * same per-row arithmetic in one graph. Off, every row samples alone. */
+  readonly vectorGreedySampling: boolean;
 }

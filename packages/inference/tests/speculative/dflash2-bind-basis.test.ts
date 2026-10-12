@@ -25,6 +25,7 @@ import { testComposition } from "../models/test-composition";
 import { QWEN38_TRELLIS_TQ_GRAPH, Qwen38TrellisTQ } from "../../src/models/qwen/qwen38-27b-trellis-tq";
 import { Affine4MmaLinear } from "../../src/layers/affine-verify-linear";
 import type { DraftProjection } from "../../src/contracts/mlx/draft-projection";
+import { atEveryWidth } from "../../src/models/graph";
 import type { ResidualBasis, TargetView } from "../../src/contracts/mlx/draft-target";
 import { projectedDraftGroups } from "../../src/generation/speculative/bindings/projected-draft-rows";
 import type { DraftPrefillGroup, GroupedDraftProvider } from "../../src/generation/speculative/source";
@@ -108,11 +109,12 @@ beforeAll(() => {
   resident.push(table, head, headT);
   projection = {
     embed: { encode: ids => ops.takeAxis(table, ids, 0), scales: { dtype: Dtype.bfloat16 } },
-    logitsFromHidden(hidden) {
+    // One head at every width.
+    logits: atEveryWidth((hidden: MlxArray) => {
       const logits = ops.matmul(hidden, headT);
       captured.push(logits.toFloat32());
       return logits;
-    },
+    }),
   };
   const gain = new Float32Array(H);
   for (let i = 0; i < H; i++) gain[i] = 0.5 + Math.abs(draw());

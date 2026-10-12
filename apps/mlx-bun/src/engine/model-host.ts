@@ -118,6 +118,8 @@ export interface LoadContextOptions<Model extends ServedModelInfo = RuntimeModel
   adapters?: boolean;
   /** Most rows one forward carries (`--batch`). Default 8. */
   maxRows?: number;
+  /** Compose the Neural Engine bridge where the graph builds a Neural Engine operation. Default true. */
+  aneBridge?: boolean;
   /** Resource overrides for runtimes that plan memory up front; models
    * without one ignore them. */
   runtime?: RuntimeOpenOptions;
@@ -319,7 +321,7 @@ export async function loadContext(
     if (!draft && planned) draft = await declaredDraftHead();
     // Resolved once, before the resident graph is built, which receives it. A
     // planned runtime built its graph from its own memory plan above.
-    const composition = resolveComposition(config, { kv: opts.kv, adapters: opts.adapters, maxRows: opts.maxRows,
+    const composition = resolveComposition(config, { kv: opts.kv, adapters: opts.adapters, maxRows: opts.maxRows, aneBridge: opts.aneBridge,
       draft: draft && { numDraftTokens: draft.numDraftTokens, adaptive: opts.adaptiveDraftDepth } });
     if (!planned) {
       model = createModel(weights!, config, composition, profile);

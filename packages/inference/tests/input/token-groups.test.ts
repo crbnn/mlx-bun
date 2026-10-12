@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { mapPackedTokens, mapTokenGroups } from "../../src/input/token-groups";
+import { widthClass } from "../../src/contracts/mlx/graph";
 import * as ops from "@mlx-bun/mlx/ops";
 
 test("tokenwise packing preserves unequal lengths and B>1 without padding", () => {
@@ -32,12 +33,17 @@ test("verification keeps its row geometry while other token groups share a packe
   using verify = ops.fromInt32([1, 2, 3, 4], [2, 2, 1]);
   using first = ops.fromInt32([5, 6], [1, 2, 1]);
   using second = ops.fromInt32([7], [1, 1, 1]);
-  const shapes: number[][] = [];
+  const shapes: number[][] = [], widths: string[] = [];
   const inputs = [verify, first, second];
-  const result = mapTokenGroups(inputs.map((ids, row) => ({ ids, cache: [], preserveTokenGeometry: row === 0 })),
-    inputs, hidden => { shapes.push([...hidden.shape]); return ops.copyOf(hidden); });
+  const groups = inputs.map((ids, row) => ({ phase: row === 0 ? "verify" as const : "window" as const,
+    width: widthClass(ids.size), ids, state: [], capture: null }));
+  // The packed call runs at the class the caller names for the packed rows; the verify group at its own.
+  const result = mapTokenGroups(groups, inputs, (hidden, width) => {
+    shapes.push([...hidden.shape]); widths.push(width); return ops.copyOf(hidden);
+  }, "twoToThree");
   try {
     expect(shapes).toEqual([[1, 3, 1], [2, 2, 1]]);
+    expect(widths).toEqual(["twoToThree", "four"]);
     expect(result.map(hidden => hidden.toIntTokens())).toEqual([[1, 2, 3, 4], [5, 6], [7]]);
   } finally { for (const hidden of result) hidden.dispose(); }
 });

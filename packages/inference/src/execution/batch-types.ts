@@ -110,7 +110,7 @@ export interface BatchRequestFields {
    *  log-softmax+argmax over [B,V] instead of B slice/sample/concat graphs)
    *  when EVERY live row qualifies. Numerically identical per row
    *  (row-independent ops, same per-row shapes); the per-row closure path
-   *  is the fallback and the MLX_BUN_BATCH_VEC_SAMPLE=0 kill switch. */
+   *  is the fallback and the composition's `vectorGreedySampling: false`. */
   plainGreedy?: boolean;
   /** Grammar controller for this row (B1: per-row matchers). When set, the
    *  scheduler drives it: `accept()` after each emitted token (fires the async

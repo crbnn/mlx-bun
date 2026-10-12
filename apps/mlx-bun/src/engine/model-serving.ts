@@ -15,13 +15,13 @@ function compositionWire(composition: Composition): unknown {
  * supply a binding explicitly and need no forward/makeCache methods. */
 export async function modelServingBinding(context: LoadedModelContext, supplied?: ModelBinding): Promise<ModelBinding> {
   if (supplied) return supplied;
-  const [{ declaredGraph, embeddingDeclarationFor }, { embedMany, embeddingTerminatorId, isEmbeddingModel }, { bindMlxGateway }, { MLX_VERSION, deviceArchitecture }] = await Promise.all([
+  const [{ declaredGraph, embeddingDeclarationFor }, { embedMany, embeddingTerminatorId, isEmbeddingModel }, { bindMlxGateway }, { MLX_VERSION, deviceArchitecture }, ops, { widthClass }] = await Promise.all([
     import("@mlx-bun/inference/models"), import("@mlx-bun/inference/embeddings"),
-    import("@mlx-bun/inference/execution"), import("@mlx-bun/mlx/ffi"),
+    import("@mlx-bun/inference/execution"), import("@mlx-bun/mlx/ffi"), import("@mlx-bun/mlx/ops"), import("@mlx-bun/inference/contracts/mlx"),
   ]);
   const ctx = context as ModelContext;
   const model = ctx.model;
-  if (typeof model.makeCache !== "function" || typeof model.forward !== "function")
+  if (typeof model.makeCache !== "function" || typeof model.sequenceHidden !== "function")
     throw new Error("model implementation must supply its serving binding");
   declaredGraph(model);
   const gateway = bindMlxGateway(model, ctx.draft ?? undefined);
@@ -38,7 +38,12 @@ export async function modelServingBinding(context: LoadedModelContext, supplied?
     async signal(ids, count, minimum) {
       const caches = model.makeCache();
       try {
-        const logits = model.forward(ids, caches);
+        // The whole prompt as one window (the scoring forward), the head over every position.
+        const input = ops.fromInt32(ids, [1, ids.length]);
+        let hidden;
+        try { hidden = model.sequenceHidden(input, caches, widthClass(ids.length)); } finally { input.dispose(); }
+        let logits;
+        try { logits = model.logitsFromHidden(hidden); } finally { hidden.dispose(); }
         let f: Float32Array;
         let vocab: number;
         try {

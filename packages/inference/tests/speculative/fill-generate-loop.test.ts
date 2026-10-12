@@ -18,7 +18,8 @@ import { KVCache } from "../../src/state/kv";
 import { type Cache } from "../../src/contracts/mlx/cache";
 import type { KvStorageScheme } from "../../src/contracts/portable/composition";
 import type { RuntimeModel } from "../../src/models/factory";
-import type { MlxTokenAppend } from "../../src/generation/bindings/autoregressive";
+import type { MlxKnownSpans } from "../../src/contracts/mlx/graph";
+import { stubPhases } from "../models/phase-forward";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { configureRuntime, runtimeConfig } from "../../src/runtime/config";
 import { cloneKvCaches } from "../../src/state/persistence";
@@ -65,9 +66,18 @@ class StubModel {
     return this.makeCacheImpl();
   }
 
-  createAppend(): MlxTokenAppend | null {
-    // This stub's rows are independent and have no shape-dependent rounding.
-    return { maxChunkSize: () => 32, forwardHidden: this.forwardHidden.bind(this) };
+  /** Every phase runs the stub's one forward (late-bound, so a subclass's override serves them all) and its head. */
+  readonly #phases = stubPhases((ids, cache) => this.forwardHidden(ids, cache), hidden => this.logitsFromHidden(hidden));
+  readonly prefillChunk = this.#phases.prefillChunk;
+  readonly prefillTail = this.#phases.prefillTail;
+  readonly decode = this.#phases.decode;
+  readonly verify = this.#phases.verify;
+  readonly appendKnown = this.#phases.appendKnown;
+  readonly logits = this.#phases.logits;
+
+  /** Committed known-token spans: this stub's rows are independent and have no shape-dependent rounding. */
+  get knownSpans(): MlxKnownSpans | undefined {
+    return { maxChunkSize: () => 32 };
   }
 
   forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray {
@@ -217,7 +227,7 @@ describe("generate(): cancellation", () => {
 describe("generate(): the fill append", () => {
   test("an unqualified graph appends M1 without intermediate heads or verification", async () => {
     class UnqualifiedModel extends StubModel {
-      override createAppend(): null { return null; }
+      override get knownSpans(): undefined { return undefined; }
     }
     const fill = session([row([TRIGGER], SPAN)], 32, 4);
     const { model, tokens, stats } = await withFill({ MLX_BUN_FILL: "strict" },
@@ -232,8 +242,8 @@ describe("generate(): the fill append", () => {
 
   test("the graph's chunk limit caps a caller's larger requested chunks", async () => {
     class TwoRowModel extends StubModel {
-      override createAppend(): MlxTokenAppend {
-        return { maxChunkSize: () => 2, forwardHidden: this.forwardHidden.bind(this) };
+      override get knownSpans(): MlxKnownSpans {
+        return { maxChunkSize: () => 2 };
       }
     }
     const fill = session([row([TRIGGER], SPAN)], 32, 8);
@@ -247,11 +257,8 @@ describe("generate(): the fill append", () => {
   test("the graph rechecks its limit after each committed chunk", async () => {
     const offsets: number[] = [];
     class BoundaryModel extends StubModel {
-      override createAppend(): MlxTokenAppend {
-        return {
-          maxChunkSize(state) { offsets.push(state[0]!.offset); return state[0]!.offset === 4 ? 1 : 2; },
-          forwardHidden: this.forwardHidden.bind(this),
-        };
+      override get knownSpans(): MlxKnownSpans {
+        return { maxChunkSize(state) { offsets.push(state[0]!.offset); return state[0]!.offset === 4 ? 1 : 2; } };
       }
     }
     const fill = session([row([TRIGGER], SPAN)], 32, 4);

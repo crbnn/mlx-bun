@@ -4,7 +4,7 @@
 // for the D3 Gemma 4 PR in gemma4-blocks-identity.test.ts. Delete it with
 // gemma4-reference.ts.
 //
-// Changes from b3db6b09: import paths only.
+// Changes from b3db6b09: import paths only, and the prefix-shared forward's E2 name (prefixSharedHidden).
 
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { Checkpoint } from "@mlx-bun/mlx/checkpoint";
@@ -173,7 +173,7 @@ export function gemma4Trainable(model: Gemma4Training): TrainableGraph {
       begin: (ids, prefix) => new Gemma4SegmentedPass(model, ids, prefix),
     },
     prefixShared: {
-      forwardHidden(ids: MlxArray, layout: PrefixLayout): MlxArray {
+      prefixSharedHidden(ids: MlxArray, layout: PrefixLayout): MlxArray {
         // One prefix cache per DONOR layer (sharers consume donors' fetched K/V inside forwardLayers).
         const caches: Cache[] = Array.from({ length: model.numDonors }, () => new PrefixSharedCache(layout));
         setActivePrefixLayout(layout);

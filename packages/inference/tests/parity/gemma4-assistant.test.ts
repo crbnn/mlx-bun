@@ -72,6 +72,7 @@ test.skipIf(!inputs)("Gemma4 assistant: donor attention and draft chains equal i
   const { captureKvDonorAttention } = await import("../../src/state/kv-attention-view");
   const { cloneKvCaches } = await import("../../src/state/persistence");
   const { readAssistantDonors } = await import("../../src/models/gemma4/assistant-target");
+  const { phaseHidden } = await import("../models/phase-forward");
   const assistant = await import("../../src/models/gemma4/assistant");
   const { quantizedSdpa } = await import("../models/quantized-sdpa-reference");
   const { unfusedAffineKernels } = await import("../../src/state/affine-attention");
@@ -103,7 +104,7 @@ test.skipIf(!inputs)("Gemma4 assistant: donor attention and draft chains equal i
     assert(caches[slidingAt] instanceof RotatingKVCache && caches[fullAt] instanceof KVCacheClass, "unexpected donor cache kinds");
     const embed = (token: number) => { using ids = ops.fromInt32([token], [1, 1]); using e = model.embed.encode(ids); return ops.mulScalar(e, model.embedScale); };
     const greedy = (h: MlxArray) => { using logits = model.logitsFromHidden(h); using arg = ops.argmaxAxis(logits, -1); return arg.toIntTokens()[0]!; };
-    const forward = (ids: number[]) => { using x = ops.fromInt32(ids, [1, ids.length]); return model.forwardHidden(x, caches); };
+    const forward = (ids: number[]) => { using x = ops.fromInt32(ids, [1, ids.length]); return phaseHidden(model as never, x, caches); };
     const at = (h: MlxArray, i: number) => h.slice([0, i, 0], [1, i + 1, h.shape[2]!]);
     /** Donor rows chosen independently of temporalView, each registered as it is made. */
     const select = (c: Cache, sliding: boolean, quantized: boolean, own: (x: Rows) => void): [Rows, Rows] => {
@@ -249,6 +250,7 @@ test.skipIf(!inputs)("Gemma4 assistant: shared generation accepts, rejects and c
   const { loadModelConfig, Weights, createModel, generate } = await import("@mlx-bun/inference");
   const { loadTokenizer, ChatTemplate } = await import("@mlx-bun/inference/input");
   const { AssistantProvider } = await import("@mlx-bun/inference/generation/speculative");
+  const { observedPhases, phaseHidden } = await import("../models/phase-forward");
   const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
   const ops = await import("@mlx-bun/mlx/ops");
   const { clearCache } = await import("@mlx-bun/mlx/ffi");
@@ -324,19 +326,22 @@ test.skipIf(!inputs)("Gemma4 assistant: shared generation accepts, rejects and c
       }
       return hashes;
     };
-    const originalForward = model.forwardHidden.bind(model);
-    const forward = spyOn(model, "forwardHidden").mockImplementation((ids, caches) => {
-      assert.deepEqual(ids.shape, [1, ids.shape[1]], "B1 inputs");
-      const values = ids.toIntTokens();
-      if (!active) {
-        assert.equal(forwards.length, 0, "one unchunked assistant prefill");
-        assert.equal(values.length, prefillTokens, "actual tail-split prefill extent");
-      }
-      assert.deepEqual(values, active ? [active.pending, ...active.proposals] : prompt.slice(processed.length, processed.length + values.length), "exact prompt/verify inputs");
-      state(caches, processed.length);
-      const hidden = originalForward(ids, caches);
-      try {
-        using reference = replay.forwardHidden(ids, replayCaches);
+    // The scheduler binds to a view whose phases check each target forward's input and prior state, then
+    // replay it on a separate graph and compare logits and state after it appends.
+    const view = observedPhases(model, {
+      forward(ids, caches) {
+        assert.deepEqual(ids.shape, [1, ids.shape[1]], "B1 inputs");
+        const values = ids.toIntTokens();
+        if (!active) {
+          assert.equal(forwards.length, 0, "one unchunked assistant prefill");
+          assert.equal(values.length, prefillTokens, "actual tail-split prefill extent");
+        }
+        assert.deepEqual(values, active ? [active.pending, ...active.proposals] : prompt.slice(processed.length, processed.length + values.length), "exact prompt/verify inputs");
+        state(caches, processed.length);
+      },
+      forwarded(ids, caches, hidden) {
+        const values = ids.toIntTokens();
+        using reference = phaseHidden(replay as never, ids, replayCaches);
         using actualLogits = model.logitsFromHidden(hidden), wantedLogits = replay.logitsFromHidden(reference);
         const logits = same(actualLogits, wantedLogits, [1, values.length, vocab], "full target logits");
         processed.push(...values);
@@ -347,10 +352,8 @@ test.skipIf(!inputs)("Gemma4 assistant: shared generation accepts, rejects and c
           using greedy = ops.argmaxAxis(actualLogits, -1);
           active.predictions = greedy.toIntTokens();
         }
-        return hidden;
-      } catch (error) { hidden.dispose(); throw error; }
+      },
     });
-    cleanup.push(() => forward.mockRestore());
     const originalOpen = provider.grouped.open.bind(provider.grouped);
     const opened = spyOn(provider.grouped, "open").mockImplementation(args => {
       opens++;
@@ -383,7 +386,7 @@ test.skipIf(!inputs)("Gemma4 assistant: shared generation accepts, rejects and c
       return row;
     });
     cleanup.push(() => opened.mockRestore());
-    const binding = bindMlxGateway(model, { provider, numDraftTokens: depth });
+    const binding = bindMlxGateway(view, { provider, numDraftTokens: depth });
     assert(binding.runtime.flag("MLX_BUN_PREFILL_TAIL_SPLIT", true), "this consumer requires default tail-split prefill");
     const plan = binding.plan({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
       hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true }, options,

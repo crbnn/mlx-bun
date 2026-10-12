@@ -34,7 +34,7 @@ import { disposing } from "../../layers/helpers";
 import { KVCache } from "../../state/kv";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
-import type { MlxDeclaredGraph, MlxDenoisingOperations } from "../../contracts/mlx/graph";
+import type { MlxDeclaredGraph, MlxDenoisingOperations, MlxWidthClass } from "../../contracts/mlx/graph";
 import type { TrainableGraph } from "../../contracts/mlx/trainable";
 import { declareGraph } from "../capabilities";
 import type { PixelInput } from "../../contracts/mlx/media";
@@ -846,21 +846,12 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
     }
   }
 
-  // ---- AR-only RuntimeModel surface (never called on a diffusion model) ----
-  // DiffusionGemma is non-autoregressive: generate() detects it and routes to
-  // the denoising engine (packages/inference/src/generation/diffusion.ts). These exist so
-  // the model fits the shared RuntimeModel union; calling them is a bug.
-  forwardHidden(_ids: MlxArray, _cache: Cache[]): MlxArray {
-    throw new Error("DiffusionGemma is non-autoregressive — use the diffusion engine, not forwardHidden");
-  }
-  forward(_tokens: number[] | MlxArray, _cache: Cache[]): MlxArray {
-    throw new Error("DiffusionGemma is non-autoregressive — use the diffusion engine, not forward");
-  }
-  generate(_promptTokens: number[], _maxTokens: number, _eosIds?: number[]): number[] {
-    throw new Error("DiffusionGemma is non-autoregressive — use diffusionGenerate, not generate");
-  }
-  forwardEmbeddings(_embeds: MlxArray, _cache: Cache[], _bidir: MlxArray | null): MlxArray {
-    throw new Error("DiffusionGemma vision runs through its own encoder merge, not forwardEmbeddings");
+  // ---- The scoring surface (never called on a diffusion model) ----
+  // DiffusionGemma is non-autoregressive: generation routes it to the denoising
+  // engine (packages/inference/src/generation/diffusion.ts). This exists so the
+  // model fits the RuntimeModel union scoring takes; calling it is a bug.
+  sequenceHidden(_ids: MlxArray, _cache: Cache[], _width: MlxWidthClass): MlxArray {
+    throw new Error("DiffusionGemma is non-autoregressive — use the diffusion engine, not the scoring forward");
   }
 
   readonly prefixBase = "model.decoder";

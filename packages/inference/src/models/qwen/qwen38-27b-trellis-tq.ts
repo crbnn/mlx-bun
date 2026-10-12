@@ -38,6 +38,7 @@ import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target
 import { compiledSwiglu } from "../../layers/swiglu";
 import { Qwen35Model } from "./qwen3_5";
 import type { ReadPhase } from "../graph";
+import type { MlxWidthClass } from "../../contracts/mlx/graph";
 import type { ServedComposition } from "../implementation";
 import type { Qwen3Layer } from "./blocks";
 import { qwenDraftTarget, qwenResidualBasis } from "./media-input";
@@ -169,7 +170,9 @@ export class Qwen38TrellisTQ extends Qwen35Model {
    *  inputs (prefill) keep the generic block, which owns tiling and expansion. */
   #mlpStep(layer: Qwen3Layer, options: { mixedGateUp: MixedGateUpTail | "off" }, counts: Record<string, number>): MlpStep {
     const mlp = layer.mlp;
-    const generic: MlpStep = (hidden, phase) => mlp.forward(hidden, phase);
+    // Reached above four rows (the packed steps below take fewer), where the
+    // Trellis MLP runs its split projections at either wide class.
+    const generic: MlpStep = (hidden, phase) => mlp.forward(hidden, phase, "wider");
     if (mlp.kind !== "trellis") {
       counts.split!++;
       return generic;
@@ -207,11 +210,10 @@ export class Qwen38TrellisTQ extends Qwen35Model {
    *  vision mRoPE state and the diagnostic profiler keep the generic loop,
    *  which owns those concerns. Consumes h0, like the generic implementation. */
   protected override forwardLayers(h0: MlxArray, cache: Cache[], phase: ReadPhase,
-    positions?: MlxArray, capture: ((layer: number, hidden: MlxArray) => void) | null = null): MlxArray {
+    positions: MlxArray | undefined, capture: ((layer: number, hidden: MlxArray) => void) | null,
+    width: MlxWidthClass, bounded: boolean): MlxArray {
     if (positions || this.mrope || (globalThis as Record<string, unknown>).__deltaProf)
-      return super.forwardLayers(h0, cache, phase, positions, capture);
-    const L = h0.shape[1]!;
-    const bounded = L > TRELLIS_MATVEC_MAX_M;
+      return super.forwardLayers(h0, cache, phase, positions, capture, width, bounded);
     let h: MlxArray | null = h0;
     try {
       for (let i = 0; i < this.#steps.length; i++) {
@@ -225,7 +227,6 @@ export class Qwen38TrellisTQ extends Qwen35Model {
           try { ops.evalAll([h, ...state]); }
           finally { if (cache[i]!.stateNeedsDispose) for (const a of state) a.dispose(); }
         }
-        this.captureLayer(i, h);
         capture?.(i, h);
       }
       const out = this.finalNorm.forward(h);

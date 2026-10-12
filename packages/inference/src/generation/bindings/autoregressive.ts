@@ -1,21 +1,22 @@
-import type { AutoregressiveGraph } from "../../contracts/portable/graph";
+import type { GraphDescriptor } from "../../contracts/portable/graph";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { Cache } from "../../contracts/mlx/cache";
-import type { MlxCompiledDecodeStep, MlxModelMemory, MlxTokenAppend } from "../../contracts/mlx/graph";
-import { compiledDecodeStepOf } from "../../models/capabilities";
+import type { MlxCompiledDecodeStep, MlxKnownSpans, MlxModelMemory, MlxWidthClass } from "../../contracts/mlx/graph";
+import { compiledDecodeStepOf, tokenPhasesOf } from "../../models/capabilities";
 import { runtimeConfig, type RuntimeConfig } from "../../runtime/config";
-import { bindMlxGraph, type MlxTokenGraph } from "../../models/graph";
+import type { MlxTokenGraph } from "../../models/graph";
 import type { PrefillPolicy } from "../../contracts/portable/prefill";
 import { resolveMlxPrefillPolicy } from "./prefill-policy";
 import type { KvStorageScheme } from "../../contracts/portable/composition";
+import { isCompiledDecodeCache, isRowBatchCache } from "../../state/capabilities";
+import { MlxPhaseDispatch } from "../phase-dispatch";
 
-export type { MlxModelMemory, MlxTokenAppend };
+export type { MlxModelMemory };
 
 export interface MlxDecodeStep {
   /** Consume one pending token and advance state once. Returned arrays belong
-   * to the caller. null permits ordinary graph execution and MUST leave state
-   * unchanged. Errors propagate unless this implementation can roll back. */
-  tryStep(token: MlxArray, state: Cache[]): { logits: MlxArray; evalWith: MlxArray[] } | null;
+   * to the caller. A step that throws fails the generation. */
+  step(token: MlxArray, state: Cache[]): { logits: MlxArray; evalWith: MlxArray[] };
   /** Release per-run workspaces after pending outputs are dropped and before
    * cache disposal. Wait for native work if releasing requires completion. */
   close(): void | Promise<void>;
@@ -24,88 +25,83 @@ export interface MlxDecodeStep {
 /** The model declares which codecs retain its committed-span arithmetic; `kv`
  * is the composition's KV scheme, which its caches store. */
 export function supportsCommittedAppendCache(
-  append: Pick<MlxTokenAppend, "affineKvBits" | "turboQuantFormats"> | null | undefined,
+  spans: Pick<MlxKnownSpans, "affineKvBits" | "turboQuantFormats"> | null | undefined,
   kv: KvStorageScheme,
 ): boolean {
   switch (kv.kind) {
     case "bf16": return true;
-    case "turbo": return !!append?.turboQuantFormats?.some(format => format.kBits === kv.kBits && format.vBits === kv.vBits);
-    case "affine-layers": return kv.layers.every(layer => append?.affineKvBits?.includes(layer.bits));
-    case "affine": return !!append?.affineKvBits?.includes(kv.bits);
+    case "turbo": return !!spans?.turboQuantFormats?.some(format => format.kBits === kv.kBits && format.vBits === kv.vBits);
+    case "affine-layers": return kv.layers.every(layer => spans?.affineKvBits?.includes(layer.bits));
+    case "affine": return !!spans?.affineKvBits?.includes(kv.bits);
   }
 }
 
 /** One replaceable binding owns all graph-specific operations used by the AR
- * loop. The current method requires MLX tensors and the legacy Cache[] ABI.
- * Weights are borrowed for the binding's lifetime; generated caches are owned
- * by the run. Caller-provided caches and media remain borrowed. */
+ * loop: the graph's named phases and the facts the loop reads once. The
+ * current method requires MLX tensors and the legacy Cache[] ABI. Weights are
+ * borrowed for the binding's lifetime; generated caches are owned by the run.
+ * Caller-provided caches and media remain borrowed. */
 export interface MlxAutoregressiveBinding {
   readonly runtime?: RuntimeConfig;
   readonly prefillPolicy?: PrefillPolicy;
-  readonly graph: AutoregressiveGraph<MlxArray, Cache[], MlxArray>;
+  readonly descriptor: GraphDescriptor;
+  /** The graph's phase operations. */
+  readonly phases: MlxPhaseDispatch;
   readonly eosTokenIds: readonly number[];
   readonly memory: MlxModelMemory;
   readonly adapters?: { active: string[] };
   /** The composition's KV scheme, which `makeCache` composes; absent: bf16. */
   readonly kv?: KvStorageScheme;
+  /** The graph's committed known-token spans, when it declares them. */
+  readonly knownSpans?: MlxKnownSpans;
   makeCache(): Cache[];
-  forwardEmbeddings?(
+  /** The vision prefill phase over prepared embeddings (borrowed). */
+  prefillEmbeddings?(
     embeddings: MlxArray, state: Cache[], imageMask: MlxArray | null,
-    ids: MlxArray, multimodalMask: MlxArray | null,
+    ids: MlxArray, multimodalMask: MlxArray | null, width: MlxWidthClass,
   ): MlxArray;
-  /** Called once after prefill. A compiled/fused decoder belongs to THIS graph,
-   * never to a model inferred from a name or inherited by a replacement. */
-  createDecode?(policy: { hasAdapters: boolean; pagedKv: boolean }): MlxDecodeStep | null;
-  createAppend?(policy: { hasAdapters: boolean; pagedKv: boolean }): MlxTokenAppend | null;
+  /** The graph's compiled decode step for this run's `state`, chosen once after
+   * prefill: present when the graph declares one, the run allows replay and
+   * every cache is one the step drives. A compiled/fused decoder belongs to
+   * THIS graph, never to a model inferred from a name or inherited by a
+   * replacement. */
+  createDecode?(policy: { hasAdapters: boolean; pagedKv: boolean }, state: readonly Cache[]): MlxDecodeStep | null;
 }
 
-/** Bind a resident graph to the autoregressive method: its forward, caches and
+/** Bind a resident graph to the autoregressive method: its phases, caches and
  * memory, and the compiled decode step it declares. Nothing here reads which
  * model the graph is. */
 export function bindMlxAutoregressiveGraph(model: MlxTokenGraph): MlxAutoregressiveBinding {
   const runtime = runtimeConfig();
+  const compiledOn = runtime.flag("MLX_BUN_COMPILED_DECODE", true);
   return {
     runtime,
     prefillPolicy: resolveMlxPrefillPolicy(model, runtime),
-    graph: bindMlxGraph<Cache[]>(model, {
-      id: `legacy:${model.config.modelType}`, artifact: "legacy-resident-model",
-      stateAbi: "legacy-cache-array-v1", // not a persistence identity
-    }),
+    descriptor: Object.freeze({ id: `legacy:${model.config.modelType}`, artifact: "legacy-resident-model",
+      stateAbi: "legacy-cache-array-v1", backend: "mlx", graphAbi: "mlx-hidden-bsh-v1" }),
+    phases: new MlxPhaseDispatch(tokenPhasesOf(model)),
     eosTokenIds: model.config.eosTokenIds,
     memory: model,
     adapters: model.loraState,
     ...(model.composition ? { kv: model.composition.kv } : {}),
+    ...(model.knownSpans ? { knownSpans: model.knownSpans } : {}),
     makeCache: model.makeCache.bind(model),
-    forwardEmbeddings: model.forwardEmbeddings?.bind(model),
-    createAppend: model.createAppend?.bind(model),
-    createDecode(policy) {
+    prefillEmbeddings: model.prefillEmbeddings?.bind(model),
+    createDecode(policy, state) {
       // Only a graph that declares a compiled step has one. Adapters would bake
       // residuals into the tape.
-      if (!runtime.flag("MLX_BUN_COMPILED_DECODE", true) || policy.hasAdapters || policy.pagedKv) return null;
-      let compiled: MlxCompiledDecodeStep | null = compiledDecodeStepOf(model);
+      if (!compiledOn || policy.hasAdapters || policy.pagedKv ||
+          !state.every(cache => isCompiledDecodeCache(cache) && !isRowBatchCache(cache))) return null;
+      const compiled: MlxCompiledDecodeStep | null = compiledDecodeStepOf(model);
       if (!compiled) return null;
-      return {
-        tryStep(token, state) {
-          if (!compiled || !compiled.accepts(state)) return null;
-          try { return compiled.step(token, state); }
-          catch (error) {
-            // A compiled step restores committed writes on failure, so retrying
-            // this token through the ordinary graph is safe. Other decoders
-            // must establish that guarantee themselves before returning null.
-            compiled = null;
-            console.warn(`compiled decode disabled for this generation: ${error}`);
-            return null;
-          }
-        },
-        // The graph owns the compiled closures; its unload releases them.
-        close() { compiled = null; },
-      };
+      // The graph owns the compiled closures; its unload releases them.
+      return { step: (token, caches) => compiled.step(token, caches), close() {} };
     },
   };
 }
 
 export function assertMlxAutoregressiveBinding(binding: MlxAutoregressiveBinding): void {
-  const descriptor = binding.graph.descriptor;
+  const descriptor = binding.descriptor;
   if (descriptor.backend !== "mlx" || descriptor.graphAbi !== "mlx-hidden-bsh-v1" ||
       descriptor.stateAbi !== "legacy-cache-array-v1")
     throw new Error(`AR binding ${descriptor.id} has an incompatible backend, graph, or state ABI`);

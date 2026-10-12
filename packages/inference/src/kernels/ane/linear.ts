@@ -1,5 +1,4 @@
 import { dlopen, FFIType, ptr, toArrayBuffer, type Pointer } from "bun:ffi";
-import { existsSync } from "node:fs";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
@@ -8,12 +7,19 @@ import { ANE_LIBRARY as LIBRARY } from "../../runtime/native";
 // Apple Neural Engine sidecar (native/ane-bridge.m): programs
 // compiled from MIL text through the private AppleNeuralEngine.framework, with
 // IOSurface inputs/outputs the host or the GPU (zero-copy MLX wraps) fill.
-// Private Apple API; callers treat any failure as "no ANE" and stay on the GPU.
+// A graph whose composition names the bridge (`Composition.aneBridge`) builds
+// its programs when it is constructed; a bridge that does not load, or a
+// program that does not compile, fails that load with `AneBridgeError`.
+
+/** The Neural Engine bridge did not load, or a program did not compile: the
+ *  load of a graph whose composition names the bridge fails with it. */
+export class AneBridgeError extends Error {
+  override readonly name = "AneBridgeError";
+}
 
 type Lib = ReturnType<typeof open>;
 function open() {
   return dlopen(LIBRARY, {
-    mbane_available: { args: [], returns: FFIType.i32 },
     mbane_program_create: { args: [FFIType.ptr, FFIType.i32, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.i32, FFIType.ptr,
       FFIType.u64, FFIType.ptr, FFIType.ptr, FFIType.i32], returns: FFIType.ptr },
     mbane_input: { args: [FFIType.ptr, FFIType.i32], returns: FFIType.ptr },
@@ -23,15 +29,14 @@ function open() {
     mbane_free: { args: [FFIType.ptr], returns: FFIType.void },
   }).symbols;
 }
-let lib: Lib | null | undefined;
-function native(): Lib | null {
-  if (lib !== undefined) return lib;
-  try { lib = existsSync(LIBRARY) ? open() : null; } catch { lib = null; }
-  if (lib && !lib.mbane_available()) lib = null;
+let lib: Lib | undefined;
+/** The bridge, loaded on first use. */
+function native(): Lib {
+  if (lib) return lib;
+  try { lib = open(); }
+  catch (error) { throw new AneBridgeError(`the Neural Engine bridge did not load (${LIBRARY})`, { cause: error }); }
   return lib;
 }
-
-export function aneAvailable(): boolean { return native() !== null; }
 
 const errorBuffer = new Uint8Array(512);
 const errorText = () => new TextDecoder().decode(errorBuffer.subarray(0, errorBuffer.indexOf(0)));
@@ -54,11 +59,11 @@ export class AneProgram implements Disposable {
    *  `share`: a program that never runs at the same time as this one. With the
    *  same MIL and weights the result holds that same loaded program; otherwise
    *  a new program loads on its buffers (each at least as large). Either way
-   *  the shared resources live until every holder is disposed. */
+   *  the shared resources live until every holder is disposed. Throws
+   *  `AneBridgeError` when the bridge does not load or the program does not compile. */
   static create(mil: string, inputBytes: readonly number[], outputBytes: number,
     options: { weights?: Record<string, Uint8Array>; share?: AneProgram } = {}): AneProgram {
     const l = native();
-    if (!l) throw new Error("ANE bridge unavailable");
     const entries = Object.entries(options.weights ?? {});
     const names = entries.map(([name]) => cstring(name));
     const namePtrs = BigUint64Array.from(names.map(n => BigInt(ptr(n))));
@@ -70,7 +75,7 @@ export class AneProgram implements Disposable {
     const handle = l.mbane_program_create(ptr(text), entries.length, entries.length ? ptr(namePtrs) : null,
       entries.length ? ptr(dataPtrs) : null, entries.length ? ptr(dataLens) : null, inputBytes.length, ptr(sizes),
       outputBytes, options.share ? options.share.#handle : null, ptr(errorBuffer), errorBuffer.length);
-    if (!handle) throw new Error(errorText() || "ANE program creation failed");
+    if (!handle) throw new AneBridgeError(errorText() || "ANE program creation failed");
     return new AneProgram(l, handle, inputBytes, outputBytes);
   }
 

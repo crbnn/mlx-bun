@@ -7,6 +7,7 @@ import { type MropeRequestState } from "../../contracts/mlx/positions";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { Cache } from "../../contracts/mlx/cache";
 import type { MediaEncoders, MlxDecodeState, MlxPromptInput, VisionEncoder } from "../../contracts/mlx/media";
+import type { MlxHeadForward, MlxWidthClass, MlxWidthTable } from "../../contracts/mlx/graph";
 import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
@@ -21,16 +22,20 @@ export interface QwenMediaGraph {
   readonly lmHead: QuantizedLinear | null;
   /** The full-attention layer whose cache supplies logical positions. */
   readonly faIdx: number;
-  forwardHiddenAtPositions(ids: MlxArray, caches: Cache[], positions: MlxArray): MlxArray;
-  forwardEmbeddingsAtPositions(embeddings: MlxArray, caches: Cache[], positions: MlxArray): MlxArray;
-  logitsFromHidden(hidden: MlxArray): MlxArray;
+  /** The vision prefill phase: a prompt's prepared embeddings (borrowed) at request positions. */
+  prefillEmbeddingsAtPositions(embeddings: MlxArray, caches: Cache[], positions: MlxArray, width: MlxWidthClass): MlxArray;
+  /** A prompt's token ids after a reused prefix, at request positions. */
+  prefillAtPositions(ids: MlxArray, caches: Cache[], positions: MlxArray, width: MlxWidthClass): MlxArray;
+  /** One new token per row at request positions. */
+  decodeAtPositions(ids: MlxArray, caches: Cache[], positions: MlxArray, width: MlxWidthClass): MlxArray;
+  readonly logits: MlxWidthTable<MlxHeadForward>;
 }
 
 class QwenMediaDecodeState implements MlxDecodeState {
   readonly key = "qwen-interleaved-mrope";
   constructor(readonly model: QwenMediaGraph, readonly delta: number) {}
 
-  forward(ids: MlxArray, caches: Cache[], rows: readonly MlxDecodeState[]): MlxArray {
+  decode(ids: MlxArray, caches: Cache[], rows: readonly MlxDecodeState[], width: MlxWidthClass): MlxArray {
     const B = rows.length, L = ids.shape[1]!;
     const cache = caches[this.model.faIdx]!;
     // The cache supplies logical positions, including left padding, on device.
@@ -44,17 +49,18 @@ class QwenMediaDecodeState implements MlxDecodeState {
     using positions = ops.add(startRows, indices);
     using axis = ops.reshape(positions, [1, B, L]);
     using grid = ops.concatAxis([axis, axis, axis], 0);
-    return this.model.forwardHiddenAtPositions(ids, caches, grid);
+    return this.model.decodeAtPositions(ids, caches, grid, width);
   }
 }
 
 /** The prompt owns its grid; only its continuation delta survives into decode. */
 export function bindQwenMediaInput(model: QwenMediaGraph, embeddings: MlxArray,
   state: MropeRequestState): MlxPromptInput {
-  const input = bindEmbeddingsInput((ids, caches, start) => {
+  const input = bindEmbeddingsInput((ids, caches, start, phase, width) => {
     using positions = mropePositionIds(state, start, ids.shape[1]!);
-    return start > 0 ? model.forwardHiddenAtPositions(ids, caches, positions)
-      : model.forwardEmbeddingsAtPositions(embeddings, caches, positions);
+    if (start === 0) return model.prefillEmbeddingsAtPositions(embeddings, caches, positions, width);
+    return phase === "decode" ? model.decodeAtPositions(ids, caches, positions, width)
+      : model.prefillAtPositions(ids, caches, positions, width);
   });
   return { ...input, decodeState: new QwenMediaDecodeState(model, state.delta) };
 }
@@ -91,10 +97,10 @@ export function qwenResidualBasis(graph: string, modelDir: string): ResidualBasi
 export function qwenDraftTarget(model: QwenMediaGraph, residualBasis?: ResidualBasis): TargetView {
   return Object.freeze({ identity: model, ...(residualBasis ? { residualBasis } : {}), hiddenLayerTaps: Object.freeze({
     layerCount: model.config.text.numHiddenLayers,
-    projection: Object.freeze({ embed: model.embed, logitsFromHidden: model.logitsFromHidden.bind(model) }),
+    projection: Object.freeze({ embed: model.embed, logits: model.logits }),
   }), recurrentMtp: Object.freeze({
     hiddenSize: model.config.text.hiddenSize, layerCount: model.config.text.numHiddenLayers,
-    embed: model.embed.encode.bind(model.embed), logitsFromHidden: model.logitsFromHidden.bind(model),
+    embed: model.embed.encode.bind(model.embed), logits: model.logits,
     vocabularyHead: model.lmHead ? Object.freeze({ w: model.lmHead.w, scales: model.lmHead.scales,
       biases: model.lmHead.biases, spec: model.lmHead.spec, vocabSize: model.config.text.vocabSize }) : undefined,
   }) });

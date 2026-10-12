@@ -4,7 +4,6 @@
 import { deviceArchitecture } from "@mlx-bun/mlx/ffi";
 import type { ModelConfig, TurboQuantScheme } from "../artifacts/config";
 import type { Composition } from "../contracts/portable/composition";
-import { aneAvailable } from "../kernels/ane/linear";
 import { runtimeConfig, type RuntimeConfig } from "../runtime/config";
 import { resolveKvScheme, type KvQuantOverride } from "../state/kv-scheme";
 
@@ -48,12 +47,16 @@ export interface CompositionRequest {
   readonly speculativeAffineKv?: boolean;
   /** The groups of a mixed forward share one MLP pass. Default true. */
   readonly packedMixedMlp?: boolean;
+  /** One argmax over a decode step whose live rows are all plain greedy. Default true. */
+  readonly vectorGreedySampling?: boolean;
+  /** Compose the Neural Engine bridge where a graph builds a Neural Engine
+   * operation. Default true: every Apple-silicon Mac has the unit. */
+  readonly aneBridge?: boolean;
 }
 
-/** Resolve the record for `config` on this machine. Reads the GPU architecture,
- * asks the Neural Engine bridge whether it compiles programs (the first call in
- * a process compiles one small program) and reads the prefill chunk override
- * from the current runtime configuration. The result is frozen. */
+/** Resolve the record for `config` on this machine. Reads the GPU architecture
+ * and the prefill chunk override from the current runtime configuration. The
+ * result is frozen. */
 export function resolveComposition(config: ModelConfig, request: CompositionRequest = {}): Composition {
   const maxRows = request.maxRows ?? DEFAULT_MAX_ROWS;
   if (!Number.isSafeInteger(maxRows) || maxRows < 1) throw new Error("composition maxRows must be a positive integer");
@@ -63,7 +66,7 @@ export function resolveComposition(config: ModelConfig, request: CompositionRequ
   const runtime = runtimeConfig();
   return Object.freeze({
     device: deviceArchitecture(),
-    aneBridge: aneAvailable(),
+    aneBridge: request.aneBridge ?? true,
     kv: resolveKvScheme({ ...request.kv, config: config.kvQuant }).storage,
     draftDepth: !draft ? 0 : draft.adaptive ? Object.freeze({ adaptive: true as const, max: draft.numDraftTokens }) : draft.numDraftTokens,
     prefillChunkTokens: resolveChunkTokens(runtime),
@@ -71,5 +74,6 @@ export function resolveComposition(config: ModelConfig, request: CompositionRequ
     maxRows,
     speculativeAffineKv: request.speculativeAffineKv ?? true,
     packedMixedMlp: request.packedMixedMlp ?? true,
+    vectorGreedySampling: request.vectorGreedySampling ?? true,
   });
 }

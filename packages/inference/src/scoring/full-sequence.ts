@@ -1,6 +1,6 @@
 // Training forward pass: full-sequence logits with no KV reuse.
 //
-// B=1 (no padding): trainForward runs the model's stock forwardHidden over a
+// B=1 (no padding): trainForward runs the graph's scoring forward (sequenceHidden) over a
 // fresh cache exactly as before — bit-identical to the single-example trainer.
 //
 // B>1 (padded batch): every row in the batch is padded to a common length L,
@@ -25,6 +25,7 @@ import { AttentionMasks, sdpaRead } from "../state/attention-read";
 import { isRecurrentCache } from "../state/capabilities";
 import { TrainingCache, TrainingSSMCache } from "../state/training-cache";
 import type { RuntimeModel } from "../models/factory";
+import { widthClass } from "../contracts/mlx/width";
 
 export { TrainingCache, TrainingSSMCache };
 
@@ -42,6 +43,7 @@ export function trainForwardHidden(
   validLengths?: number[],
 ): MlxArray {
   const [B, L] = ids.shape as [number, number];
+  const width = widthClass(B * L);
   const needsPadMask =
     validLengths !== undefined && validLengths.some((v) => v < L);
 
@@ -51,7 +53,7 @@ export function trainForwardHidden(
     const realCache = model.makeCache();
     const cache = wrapWithBatchedMask(realCache, B, L, validLengths!);
     try {
-      return model.forwardHidden(ids, cache);
+      return model.sequenceHidden(ids, cache, width);
     } finally {
       for (const c of realCache) c.dispose();
       for (const c of cache) if (c instanceof BatchedMaskCache) c.disposeOwnMask();
@@ -67,7 +69,7 @@ export function trainForwardHidden(
     isRecurrentCache(c) ? new TrainingSSMCache() : new TrainingCache(cacheWindow(c), masks));
   for (const c of probe) c.dispose();
   try {
-    return model.forwardHidden(ids, cache); // [B, L, hidden]
+    return model.sequenceHidden(ids, cache, width); // [B, L, hidden]
   } finally {
     for (const c of cache) c.dispose();
   }

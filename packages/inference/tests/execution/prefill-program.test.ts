@@ -15,7 +15,7 @@ function steps(input: PrefillPosition): PrefillStep[] {
 test("cold and warm prefill preserve the oracle's separate last-token forward", () => {
   for (const position of [0, 3, 7, 8]) {
     const program = steps({ length: 9, position, chunkSize: 3, tailSplit: true });
-    expect(program.at(-1)).toEqual({ start: 8, end: 9, kind: "final", snapshot: false, batchYield: false });
+    expect(program.at(-1)).toEqual({ start: 8, end: 9, kind: "final", snapshot: false, batchYield: false, phase: "decode" });
     expect(program.flatMap((step) => Array.from({ length: step.end - step.start }, (_, i) => step.start + i)))
       .toEqual(Array.from({ length: 9 - position }, (_, i) => position + i));
     expect(program.filter((step) => step.kind === "drain").every((step) => step.end - step.start <= 3)).toBe(true);

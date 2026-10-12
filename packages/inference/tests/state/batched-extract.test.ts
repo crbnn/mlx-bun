@@ -35,6 +35,7 @@ import { KvScheme, resolveKvScheme } from "../../src/state/kv-scheme";
 import { MlxBatchExecutionGroup, type RowPromptCache } from "../../src/execution/batch-group";
 import type { RuntimeModel } from "../../src/models/factory";
 import { declareGraph } from "../../src/models/capabilities";
+import { stubPhases } from "../models/phase-forward";
 
 /** Contiguous raw bytes of a (possibly strided) view, as a plain array. */
 const bytes = (a: MlxArray): number[] => {
@@ -413,7 +414,14 @@ const kvFromIds = (ids: MlxArray): MlxArray => {
   return k;
 };
 
-const stubModel = {
+/** A stub whose one forward and head serve every phase, bound to the stub itself. */
+function phased<T extends object>(stub: T): T {
+  type Stub = { forward(ids: MlxArray, caches: Cache[]): MlxArray; logitsFromHidden(h: MlxArray): MlxArray };
+  const out = { ...stub } as T & Stub;
+  return Object.assign(out, stubPhases((ids, caches) => out.forward(ids, caches), h => out.logitsFromHidden(h)));
+}
+
+const stubModel = phased({
   config: {
     modelType: "stub",
     text: { numHiddenLayers: 1, layerTypes: ["full_attention"] },
@@ -421,7 +429,7 @@ const stubModel = {
   weightsBytes: 0,
   requiredDenseKvLayers: [0], graphCapabilities: declareGraph({ kv: { denseReads: true } }),
   makeCache: (): Cache[] => [new KVCache()],
-  forwardHidden(ids: MlxArray, caches: Cache[]): MlxArray {
+  forward(ids: MlxArray, caches: Cache[]): MlxArray {
     const [B, L] = ids.shape as [number, number];
     const k = kvFromIds(ids);
     for (const c of caches) {
@@ -435,7 +443,7 @@ const stubModel = {
     const [B, N] = h.shape as [number, number, number];
     return ops.zeros([B, N, V], Dtype.float32); // argmax → token 0 every step
   },
-} as unknown as RuntimeModel;
+}) as unknown as RuntimeModel;
 
 const soloReplay = (tokens: number[]): KVCache => {
   const c = new KVCache();
@@ -475,12 +483,12 @@ describe("MlxBatchExecutionGroup per-row extraction (stub model)", () => {
     });
     // This graph composes the scheme's lego and reads through its window read,
     // so it declares no plain-KV reads: the scheduler may convert its rows.
-    const quantModel = {
+    const quantModel = phased({
       ...stubModel,
       makeCache: () => [composedFullAttentionCache(scheme.storage, 0, new AttentionMasks(), denseTurboQuantKernels)],
       requiredDenseKvLayers: [],
       graphCapabilities: declareGraph({ kv: { denseReads: false } }),
-      forwardHidden(ids: MlxArray, caches: Cache[]): MlxArray {
+      forward(ids: MlxArray, caches: Cache[]): MlxArray {
         const [B, L] = ids.shape as [number, number];
         const f = ids.astype(Dtype.float32);
         const col = ops.reshape(f, [B, 1, L, 1]);
@@ -493,7 +501,7 @@ describe("MlxBatchExecutionGroup per-row extraction (stub model)", () => {
         k.dispose();
         return ops.zeros([B, L, HD], Dtype.float32);
       },
-    } as unknown as RuntimeModel;
+    }) as unknown as RuntimeModel;
     const puts: Cache[][] = [];
     const pc: RowPromptCache = {
       take: () => null,
@@ -635,12 +643,12 @@ const ssmUpdate = (ids: MlxArray, c: SSMCache): void => {
   c.advance(L);
 };
 
-const hybridStub = {
+const hybridStub = phased({
   config: { modelType: "stub" },
   weightsBytes: 0,
   requiredDenseKvLayers: [0], graphCapabilities: declareGraph({ kv: { denseReads: true } }),
   makeCache: (): Cache[] => [new KVCache(), new SSMCache()],
-  forwardHidden(ids: MlxArray, caches: Cache[]): MlxArray {
+  forward(ids: MlxArray, caches: Cache[]): MlxArray {
     const [B, L] = ids.shape as [number, number];
     for (const c of caches) {
       if (c instanceof SSMCache) {
@@ -657,7 +665,7 @@ const hybridStub = {
     const [B, N] = h.shape as [number, number, number];
     return ops.zeros([B, N, V], Dtype.float32); // argmax → token 0 every step
   },
-} as unknown as RuntimeModel;
+}) as unknown as RuntimeModel;
 
 describe("MlxBatchExecutionGroup per-row extraction (hybrid stub: KV + SSM)", () => {
   test("finished rows put() exact serial caches for BOTH layer kinds", async () => {

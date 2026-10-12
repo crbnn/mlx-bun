@@ -16,6 +16,7 @@ for (const [family, checkpoint] of [
 ] as const) {
   describe.skipIf(!checkpoint)(`compiled decode parity (${family})`, () => {
     let mlx: typeof import("@mlx-bun/mlx");
+    let phaseHidden: typeof import("../models/phase-forward").phaseHidden;
     let state: typeof import("@mlx-bun/inference/state");
     let CompiledDecode: typeof import("@mlx-bun/inference/models/gemma4/compiled-decode").CompiledDecode;
     let generate: typeof import("@mlx-bun/inference/generation").generate;
@@ -33,6 +34,7 @@ for (const [family, checkpoint] of [
       // A supplied but invalid checkpoint fails instead of silently skipping.
       expect(await Bun.file(`${checkpoint}/config.json`).exists()).toBe(true);
       mlx = await import("@mlx-bun/mlx");
+      ({ phaseHidden } = await import("../models/phase-forward"));
       state = await import("@mlx-bun/inference/state");
       ({ CompiledDecode } = await import("@mlx-bun/inference/models/gemma4/compiled-decode"));
       ({ generate } = await import("@mlx-bun/inference/generation"));
@@ -106,7 +108,7 @@ for (const [family, checkpoint] of [
     }
     function forward(graph: typeof model, ids: number[], cache: Cache[]): MlxArray {
       const input = mlx.ops.fromInt32(ids, [1, ids.length]);
-      try { return graph.forwardHidden(input, cache); }
+      try { return phaseHidden(graph, input, cache); }
       finally { input.dispose(); }
     }
     async function trajectory(prompt: number[], compiled: boolean, kv: KvOptions): Promise<number[]> {
@@ -179,7 +181,7 @@ for (const [family, checkpoint] of [
             } else {
               const ids = mlx.ops.reshape(cur, [1, 1]);
               let hidden: MlxArray;
-              try { hidden = graph.forwardHidden(ids, cache); }
+              try { hidden = graph.decode.one(ids, cache, null); }
               finally { ids.dispose(); }
               try { logits = graph.logitsFromHidden(hidden); }
               finally { hidden.dispose(); }
@@ -219,7 +221,7 @@ for (const [family, checkpoint] of [
     }
 
     if (family === "12B") {
-      test("mid-step segment failure rolls back writes before ordinary decode retries", async () => {
+      test("a mid-step segment failure fails its generation: the compiled step has no fallback", async () => {
         const extra = { kvBits: 8, kvGroupSize: 64, quantizedKvStart: 0 };
         const prompt = wrappedPrompt;
         const origApply = mlx.CompiledFunction.prototype.apply;
@@ -235,13 +237,11 @@ for (const [family, checkpoint] of [
           }
           return origApply.call(this, inputs);
         };
+        // The scheduler chose the compiled step at load; a step that fails ends the request with its error
+        // instead of replaying the token on the decode operation.
         try {
-          const recovered = await trajectory(prompt, true, extra);
+          await expect(trajectory(prompt, true, extra)).rejects.toThrow("forced mid-step trace failure (test)");
           expect(forcedThrows).toBe(1);
-          mlx.CompiledFunction.prototype.apply = origApply;
-          const clean = await trajectory(prompt, false, extra);
-          expect(recovered.length).toBeGreaterThan(4);
-          expect(recovered).toEqual(clean);
         } finally { mlx.CompiledFunction.prototype.apply = origApply; }
       }, timeout);
     }

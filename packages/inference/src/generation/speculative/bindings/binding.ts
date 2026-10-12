@@ -1,8 +1,9 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { Cache } from "../../../contracts/mlx/cache";
+import type { MlxLayerCapture } from "../../../contracts/mlx/graph";
 import type { MlxTokenGraph } from "../../../models/graph";
-import { declaredGraph } from "../../../models/capabilities";
+import { declaredGraph, tokenPhasesOf } from "../../../models/capabilities";
 import type { Sampler } from "../../../sampling/index";
 import type { DraftProvider, DraftSource } from "../source";
 import { runtimeConfig, type RuntimeConfig } from "../../../runtime/config";
@@ -15,10 +16,21 @@ import type { MlxForwardWork } from "../../../contracts/mlx/forward-work";
 import type { PrefillPolicy } from "../../../contracts/portable/prefill";
 import type { KvStorageScheme } from "../../../contracts/portable/composition";
 import { resolveMlxPrefillPolicy } from "../../bindings/prefill-policy";
+import { MlxPhaseDispatch, promptWorkStep, verifyWorkStep, type MlxPromptStep, type MlxVerifyWindow } from "../../phase-dispatch";
+
+/** A target forward's post-final-norm hidden and, when the drafter taps layers,
+ *  the tapped layers concatenated on the feature axis [B, L, m*H] (null
+ *  otherwise). Both belong to the caller. */
+export interface MlxTargetForward {
+  readonly hidden: MlxArray;
+  readonly ctxML: MlxArray | null;
+}
 
 /** Bound target operations and draft construction for one speculative run.
  * A replacement graph supplies this entire port, including any hidden taps.
- * The verifier never needs a MlxTokenGraph or an artifact-family check. */
+ * The verifier never needs a MlxTokenGraph or an artifact-family check. Each
+ * forward names its phase; `work`, when given, is the mixed iteration's hook
+ * and runs the same rows inside a shared forward. */
 export interface MlxSpeculativeBinding {
   readonly runtime?: RuntimeConfig;
   readonly prefillPolicy?: PrefillPolicy;
@@ -31,20 +43,28 @@ export interface MlxSpeculativeBinding {
   makeCache(): Cache[];
   openDraft(sampler: Sampler, caches: Cache[]): DraftSource;
   bindRollback(caches: Cache[]): SpeculativeTransaction;
-  forward(ids: MlxArray, caches: Cache[], tapLayers?: number[], work?: MlxForwardWork):
-    Promise<{ hidden: MlxArray; ctxML: MlxArray | null }>;
-  /** Whether `forward` can capture these hidden layers (a provider's declared taps). */
+  /** One prompt step in the phase its planner named, capturing `tapLayers`. */
+  prefill(ids: MlxArray, caches: Cache[], step: MlxPromptStep, tapLayers?: readonly number[],
+    work?: MlxForwardWork): Promise<MlxTargetForward>;
+  /** A verify window, capturing `tapLayers`. */
+  verify(ids: MlxArray, caches: Cache[], window: MlxVerifyWindow, tapLayers?: readonly number[],
+    work?: MlxForwardWork): Promise<MlxTargetForward>;
+  /** One new token per sequence, outside a speculative round. */
+  decode(ids: MlxArray, caches: Cache[], sequences: number): Promise<MlxArray>;
+  /** Whether the forwards can capture these hidden layers (a provider's declared taps). */
   supportsTapLayers(layers: readonly number[]): boolean;
-  projectLogits(hidden: MlxArray): MlxArray;
-  /** Establish the implementation's verify kernel context; restore on close. */
-  pinVerify?(): { close(): void };
+  /** The head over a hidden of `rows` rows (sequences times positions). */
+  projectLogits(hidden: MlxArray, rows: number): MlxArray;
 }
 
 export type MlxSpeculativeTargetBinding = Omit<MlxSpeculativeBinding, "openDraft">;
 
-/** Legacy mutable tap/kernel fields require the gateway's exclusive lease. */
+/** The target graph's phase operations for speculation, bound once. */
 export function bindSpeculativeTargetModel(model: MlxTokenGraph): MlxSpeculativeTargetBinding {
   const runtime = runtimeConfig();
+  const dispatch = new MlxPhaseDispatch(tokenPhasesOf(model));
+  /** The decoder's layer count, the post-final-norm capture's index; read where a tap needs it. */
+  const layerCount = () => model.config.text.numHiddenLayers;
   return {
     runtime,
     prefillPolicy: resolveMlxPrefillPolicy(model, runtime),
@@ -56,18 +76,19 @@ export function bindSpeculativeTargetModel(model: MlxTokenGraph): MlxSpeculative
     ...(model.composition ? { kv: model.composition.kv } : {}),
     makeCache: model.makeCache.bind(model),
     bindRollback: bindCacheRollback,
-    forward: (ids, caches, tapLayers, work) => legacyForwardWithTaps(model, ids, caches, tapLayers, work),
-    // legacyForwardWithTaps captures layers 0..nLayers-1 through the model's
-    // hidden tap and the post-final-norm sentinel nLayers from the forward output.
+    prefill: (ids, caches, step, tapLayers, work) => withCapture(tapLayers, layerCount, capture => {
+      const own = async () => dispatch.prompt(step.phase, step.sequences, step.tokens)(ids, caches, capture);
+      return work ? work(ids, caches, promptWorkStep(step, capture, own)) : own();
+    }),
+    verify: (ids, caches, window, tapLayers, work) => withCapture(tapLayers, layerCount, capture => {
+      const own = async () => dispatch.verify(window.sequences, window.positions)(ids, caches, capture);
+      return work ? work(ids, caches, verifyWorkStep(window, capture, own)) : own();
+    }),
+    decode: async (ids, caches, sequences) => dispatch.decode(sequences)(ids, caches, null),
+    // The capture sees layers 0..nLayers-1 and then the post-final-norm output as index nLayers.
     supportsTapLayers: layers => !layers.length || (declaredGraph(model).graphCapabilities.hiddenLayerTaps && layers.every(layer =>
-      Number.isInteger(layer) && layer >= 0 && layer <= model.config.text.numHiddenLayers)),
-    projectLogits: model.logitsFromHidden.bind(model),
-    ...(model.setSpecKernelPinned ? {
-      pinVerify() {
-        model.setSpecKernelPinned!(true);
-        return { close() { model.setSpecKernelPinned!(false); } };
-      },
-    } : {}),
+      Number.isInteger(layer) && layer >= 0 && layer <= layerCount())),
+    projectLogits: (hidden, rows) => dispatch.logits(rows)(hidden),
   };
 }
 
@@ -84,65 +105,36 @@ export function assertMlxSpeculativeBinding(binding: MlxSpeculativeBinding): voi
     throw new Error(`speculative binding ${descriptor.id} has an incompatible backend, graph, or state ABI`);
 }
 
-/** Run one target forward, and when `tapLayers` is set (⟹ a Gemma4 target — a
- *  DSpark-style source), also return the captured multi-layer context
- *  [1,L,m*H] (tapLayers concatenated on the feature axis; index nLayers is the
- *  post-finalNorm sentinel). Non-tapping sources get ctxML=null and never
- *  touch model.hiddenTap. */
-async function legacyForwardWithTaps(
-  model: MlxTokenGraph,
-  ids: MlxArray,
-  caches: Cache[],
-  tapLayers: number[] | undefined,
-  work?: MlxForwardWork,
-): Promise<{ hidden: MlxArray; ctxML: MlxArray | null }> {
-  if (!tapLayers) {
-    if (work) return { hidden: await work(ids, caches), ctxML: null };
-    const asyncModel = model as MlxTokenGraph & {
-      forwardHiddenAsync?: (
-        ids: MlxArray,
-        caches: Cache[],
-      ) => Promise<MlxArray>;
-    };
-    const hidden = typeof asyncModel.forwardHiddenAsync === "function"
-      ? await asyncModel.forwardHiddenAsync(ids, caches)
-      : model.forwardHidden(ids, caches);
-    return { hidden, ctxML: null };
-  }
-  if (!declaredGraph(model).graphCapabilities.hiddenLayerTaps) throw new Error("target graph does not support hidden taps");
-  const m = model;
-  const previousTap = m.hiddenTap;
+/** Run `forward` with a capture of `tapLayers` (none without taps) and return
+ *  its hidden and the tapped layers [B, L, m*H], concatenated in `tapLayers`
+ *  order on the feature axis. The capture copies each tapped layer as the
+ *  graph hands it over (index `layerCount` is the post-final-norm output), so
+ *  every graph and the mixed iteration capture the same way. */
+async function withCapture(tapLayers: readonly number[] | undefined, layerCount: () => number,
+  forward: (capture: MlxLayerCapture | null) => MlxArray | Promise<MlxArray>): Promise<MlxTargetForward> {
+  if (!tapLayers?.length) return { hidden: await forward(null), ctxML: null };
   const cap = new Map<number, MlxArray>();
   const layers = new Set(tapLayers);
-  if (!work) m.hiddenTap = { layers, captured: cap };
   let hidden: MlxArray | null = null;
   try {
-    hidden = work ? await work(ids, caches, { captureLayer(layer, h) {
-      if (layers.has(layer)) cap.set(layer, ops.contiguous(h));
-    } }) : model.forwardHidden(ids, caches);
-    // The post-final-norm sentinel is this forward's own output. A graph whose
-    // tap stops at its last layer still supplies it: an owned copy, released
-    // with the other captures.
-    const sentinel = model.config.text.numHiddenLayers;
-    if (layers.has(sentinel) && !cap.has(sentinel)) cap.set(sentinel, ops.contiguous(hidden));
-    const perLayer = tapLayers.map((li) => {
-      const a = cap.get(li);
-      if (!a) throw new Error(`spec tap: layer ${li} not captured`);
-      return a;
+    hidden = await forward((layer, h) => { if (layers.has(layer)) cap.set(layer, ops.contiguous(h)); });
+    const final = layerCount();
+    if (layers.has(final) && !cap.has(final)) cap.set(final, ops.contiguous(hidden));
+    const perLayer = tapLayers.map(layer => {
+      const captured = cap.get(layer);
+      if (!captured) throw new Error(`spec tap: layer ${layer} not captured`);
+      return captured;
     });
-    const ctxML = ops.concatAxis(perLayer, 2); // [1,L,m*H]
+    const ctxML = ops.concatAxis(perLayer, 2);
     for (const [, a] of cap) a.dispose();
-    cap.clear(); // consumed — the finally must not double-dispose
+    cap.clear();
     const out = { hidden, ctxML };
     hidden = null; // ownership returned to the caller
     return out;
   } finally {
-    // On any throw (forward mid-capture, missing layer, concat), free the
-    // partially-captured tap tensors and the orphaned hidden. On success both
-    // are already gone (cap cleared, hidden nulled).
+    // On any throw, free the partial captures and the orphaned hidden.
     hidden?.dispose();
     for (const [, a] of cap) a.dispose();
-    if (!work) m.hiddenTap = previousTap;
   }
 }
 

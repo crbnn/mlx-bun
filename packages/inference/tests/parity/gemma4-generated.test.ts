@@ -81,6 +81,7 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
   const { CompiledDecode } = await import("@mlx-bun/inference/models/gemma4/compiled-decode");
   const { generate } = await import("@mlx-bun/inference/generation");
   const { loadTokenizer } = await import("@mlx-bun/inference/input");
+  const { phaseHidden, phaseLogits } = await import("../models/phase-forward");
   // The kernel set `--kv-quant config` composes (tiled-causal), which the caches converted
   // before the first forward read with in both graphs.
   const { composedAffineKernels } = await import("@mlx-bun/inference/state");
@@ -145,7 +146,7 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
           const vectors: Buffer[] = [];
           let tokens = prompt;
           for (let step = 0; step < STEPS; step++) {
-            const logits = model.forward(tokens, caches);
+            const logits = phaseLogits(model, tokens, caches);
             try { const { bytes, next } = lastVector(logits); vectors.push(bytes); tokens = [next]; }
             finally { logits.dispose(); }
           }
@@ -216,7 +217,7 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
     const plain = (model: A) => {
       const caches: A[] = mono.makeCache();
       try {
-        const logits = model.forward(prompt.slice(0, 64), caches);
+        const logits = phaseLogits(model, prompt.slice(0, 64), caches);
         try { return lastVector(logits).bytes; } finally { logits.dispose(); }
       } finally { releaseAll(caches.map(cache => () => cache.dispose())); }
     };
@@ -231,7 +232,7 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config
       try {
         const ids = ops.fromInt32([...prompt.slice(0, ROW_TOKENS), ...prompt.slice(-ROW_TOKENS)], [2, ROW_TOKENS]);
         try {
-          const hidden = model.forwardHidden(ids, caches);
+          const hidden = phaseHidden(model, ids, caches);
           try { using exact = ops.contiguous(hidden); return Buffer.from(exact.rawBytes()); } finally { hidden.dispose(); }
         } finally { ids.dispose(); }
       } finally { releaseAll(caches.map(cache => () => cache.dispose())); ffi.clearCache(); }

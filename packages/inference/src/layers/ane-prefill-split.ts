@@ -7,9 +7,6 @@ import type { TrellisGeometry } from "../kernels/trellis/geometry";
 import { QuantizedLinear } from "./quantized-linear";
 import { TrellisLinear, trellisRows, trellisStoredRows } from "./trellis-linear";
 
-/** Whether the Apple Neural Engine bridge loaded (graphs build ANE layers only then). */
-export { aneAvailable } from "../kernels/ane/linear";
-
 // Prompt-chunk channel splits between the Apple Neural Engine and the GPU.
 // The ANE computes the first n output channels from streamed fp16 weights the
 // GPU writes into its program's buffers (zero-copy IOSurface wraps), the GPU

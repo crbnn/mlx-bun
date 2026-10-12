@@ -10,7 +10,7 @@ import { KvScheme } from "../../src/state/kv-scheme";
 export function testComposition(kv: KvStorageScheme = { kind: "bf16" }, fields: Partial<Composition> = {}): Composition {
   return Object.freeze({
     device: deviceArchitecture(), aneBridge: false, kv, draftDepth: 0, prefillChunkTokens: PREFILL_CHUNK_TOKENS,
-    adapters: false, maxRows: 8, speculativeAffineKv: true, packedMixedMlp: true, ...fields,
+    adapters: false, maxRows: 8, speculativeAffineKv: true, packedMixedMlp: true, vectorGreedySampling: true, ...fields,
   });
 }
 

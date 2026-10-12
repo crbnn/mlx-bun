@@ -5,6 +5,8 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { QwenMtpRows } from "../../src/generation/speculative/bindings/qwen-mtp-rows";
 import type { MtpModule } from "../../src/models/qwen/mtp";
 import type { Cache } from "../../src/contracts/mlx/cache";
+import { atEveryWidth } from "../../src/models/graph";
+import { mtpModule } from "../models/phase-forward";
 import { toLogprobs } from "../../src/sampling/index";
 import { createRuntimeConfig, withRuntimeConfig } from "../../src/runtime/config";
 import { greedyDraftPolicy } from "../../src/generation/speculative/draft-policy";
@@ -18,7 +20,7 @@ function fixture(sampling: ConstructorParameters<typeof QwenMtpRows>[2]) {
       using floats = ids.astype(Dtype.float32);
       return ops.reshape(floats, [...ids.shape, 1]);
     },
-    logitsFromHidden(hidden: MlxArray): MlxArray {
+    logits: atEveryWidth((hidden: MlxArray): MlxArray => {
       const B = hidden.shape[0]!;
       const values = Float32Array.from({ length: B * V }, (_, i) => {
         const row = Math.floor(i / V), token = i % V;
@@ -26,15 +28,15 @@ function fixture(sampling: ConstructorParameters<typeof QwenMtpRows>[2]) {
       });
       step++;
       return MlxArray.fromFloat32(values, [B, 1, V]);
-    },
+    }),
   };
-  const module = { forward(embeds: MlxArray, hidden: MlxArray, cache: Cache) {
+  const module = mtpModule((embeds: MlxArray, hidden: MlxArray, cache: Cache) => {
     const [B, N] = embeds.shape;
     using k = ops.reshape(embeds, [B!, 1, N!, 1]);
     using v = ops.reshape(hidden, [B!, 1, N!, 1]);
     for (const view of cache.updateAndFetch(k, v)) view.dispose();
     return ops.copyOf(hidden);
-  } } as MtpModule;
+  }) as unknown as MtpModule;
   const rows = new QwenMtpRows(target, module, sampling, []);
   rows.append([null, null]);
   using ids = ops.fromInt32([1, 2, 3, 11, 12, 13], [2, 3]);

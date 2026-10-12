@@ -55,7 +55,7 @@ export interface SegmentedTraining {
 export interface PrefixSharedTraining {
   /** Post-final-norm hidden [1, T, hidden] of the concat `ids` under `layout`.
    *  Borrows `ids`; the caller owns the result. */
-  forwardHidden(ids: MlxArray, layout: PrefixLayout): MlxArray;
+  prefixSharedHidden(ids: MlxArray, layout: PrefixLayout): MlxArray;
 }
 
 /** A gradient-checkpointed run of one training loop. */

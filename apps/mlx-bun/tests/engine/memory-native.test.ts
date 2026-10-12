@@ -56,14 +56,18 @@ describe.skipIf(!native)("memory task model on the continuous gateway", () => {
   }, 300_000);
   afterAll(async () => { await memory?.close(); restoreRuntime?.(); });
 
-  /** Main's greedyDecodeBitExact, op for op, on the engine's own model while the gateway is held. */
+  /** Main's greedyDecodeBitExact, op for op, on the engine's own model while the gateway is held: each prompt
+   *  chunk through the phase a scheduler names for it, then one token at a time through the decode phase. */
   const reference = (request: MemoryCompletionRequest, adapters: string[]) => engine!.gateway.runExclusive(async () => {
     const context = engine!.context;
+    type Forward = (ids: MlxArray, cache: unknown[], capture: null) => MlxArray;
+    type Table<T> = Record<"one" | "twoToThree" | "four" | "fiveToEight" | "wider", T>;
     const model = context.model as unknown as {
       loraState: { active: string[] }; makeCache(): { dispose(): void }[];
-      forwardHidden(ids: MlxArray, cache: unknown[]): MlxArray; forward(tokens: number[], cache: unknown[]): MlxArray;
+      prefillTail: Table<Forward>; decode: Table<Forward>; logits: Table<(hidden: MlxArray) => MlxArray>;
       config: { eosTokenIds: number[] };
     };
+    const width = (rows: number) => rows === 1 ? "one" : rows <= 3 ? "twoToThree" : rows === 4 ? "four" : rows <= 8 ? "fiveToEight" : "wider";
     const ids = promptIds(request);
     model.loraState.active = adapters;
     const cache = model.makeCache();
@@ -72,14 +76,18 @@ describe.skipIf(!native)("memory task model on the continuous gateway", () => {
       for (let start = 0; start < prompt.length; start += 2048) {
         const chunk = prompt.slice(start, start + 2048);
         const input = ops.fromInt32(chunk, [1, chunk.length]);
-        model.forwardHidden(input, cache).dispose();
+        (chunk.length === 1 ? model.decode.one : model.prefillTail[width(chunk.length)])(input, cache, null).dispose();
         input.dispose();
       }
       const eos = new Set(model.config.eosTokenIds);
       const out: number[] = [];
       let last = ids.at(-1)!;
       for (let i = 0; i < request.maxTokens; i++) {
-        const logits = model.forward([last], cache);
+        const input = ops.fromInt32([last], [1, 1]);
+        const hidden = model.decode.one(input, cache, null);
+        input.dispose();
+        const logits = model.logits.one(hidden);
+        hidden.dispose();
         const best = ops.argmaxAxis(logits, -1);
         logits.dispose();
         const token = ops.itemUint32(best);
@@ -111,16 +119,19 @@ describe.skipIf(!native)("memory task model on the continuous gateway", () => {
   }, 300_000);
 
   test("a same-stage batch at width 3 decodes as one group, in input order, reproducibly", async () => {
-    const model = engine!.context.model as unknown as { forwardHidden(ids: MlxArray, cache: unknown[]): MlxArray };
-    const forwardHidden = model.forwardHidden;
+    // The scheduler indexes the graph's decode table at each call: observe it there.
+    type Forward = (ids: MlxArray, cache: unknown[], capture: unknown) => MlxArray;
+    const model = engine!.context.model as unknown as { decode: Record<string, Forward> };
+    const decode = model.decode;
     let widest = 0;
-    model.forwardHidden = function (ids, cache) { widest = Math.max(widest, ids.shape[0]!); return forwardHidden.call(this, ids, cache); };
+    model.decode = Object.freeze(Object.fromEntries(Object.entries(decode).map(([width, run]) =>
+      [width, (ids: MlxArray, cache: unknown[], capture: unknown) => { widest = Math.max(widest, ids.shape[0]!); return run(ids, cache, capture); }])));
     try {
       const first = await memory.client.completeBatch(entityRows);
       expect(widest).toBe(3);
       expect(first).toHaveLength(3);
       expect(await memory.client.completeBatch(entityRows)).toEqual(first);
-    } finally { model.forwardHidden = forwardHidden; }
+    } finally { model.decode = decode; }
   }, 300_000);
 
   test("a closed client refuses work", async () => {

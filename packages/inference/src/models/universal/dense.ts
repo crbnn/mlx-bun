@@ -16,7 +16,7 @@ import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
-import { argmaxLastPosition, logitSoftcap } from "../../kernels/logits";
+import { logitSoftcap } from "../../kernels/logits";
 import { disposing } from "../../layers/helpers";
 import { composedFullAttentionCache, composedSlidingAttentionCache } from "../../state/bf16-first-kv";
 import type { Composition } from "../../contracts/portable/composition";
@@ -26,10 +26,10 @@ import { denseTurboQuantKernels } from "../../state/turboquant-attention";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import type {
-  MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward,
+  MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward, MlxWidthClass,
 } from "../../contracts/mlx/graph";
 import { PLAIN_KV_VERIFICATION, declareGraph } from "../capabilities";
-import { atEveryWidth, deprecatedPhase, type ReadPhase } from "../graph";
+import { atEveryWidth, type ReadPhase } from "../graph";
 import type { QuantizedLinear } from "../../layers/quantized-linear";
 import { TrellisLinear } from "../../layers/trellis-linear";
 import { RMSNorm } from "../../layers/normalization";
@@ -44,7 +44,7 @@ import { cacheRead, type AttentionReadStrategy } from "../qwen/blocks";
 
 /** The score-softcapped read as a block's read strategy: decode reads
  * `appendDecode`, a window `appendWindow`; this graph has no committed append
- * (no `createAppend`), so a committed span reads as a window. */
+ * (its `appendKnown` is the window read), so a committed span reads as a window. */
 function softcapRead(softcap: number, window: number | null, arrayMasks: boolean): AttentionReadStrategy {
   const reads = softcapAttentionReads(softcap, window, arrayMasks);
   const byPhase: Readonly<Record<ReadPhase, typeof reads.appendDecode>> = {
@@ -559,9 +559,9 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
       : composedFullAttentionCache(kv, layer, masks, denseTurboQuantKernels));
   }
 
-  /** @deprecated E2 calls the named phases. */
-  forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray {
-    return this.forwardLayers(this.#embed(ids), cache, deprecatedPhase(ids));
+  /** The scoring forward (`MlxSequenceForward`): the window read at every width. */
+  sequenceHidden(ids: MlxArray, cache: Cache[], _width: MlxWidthClass): MlxArray {
+    return this.forwardLayers(this.#embed(ids), cache, "window");
   }
 
   /** One whole chunk of a prompt; rows are sequences times the chunk size. The GPU is this graph's one unit. */
@@ -569,11 +569,13 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
     gpu: (ids, cache) => this.forwardLayers(this.#embed(ids), cache, "window"),
   };
 
-  /** The positions left after a prompt's whole chunks: the same semantics as
-   * `prefillChunk`, named apart because a composition may run it elsewhere. */
-  prefillTail(ids: MlxArray, cache: Cache[]): MlxArray {
-    return this.forwardLayers(this.#embed(ids), cache, "window");
-  }
+  /** A prompt's positions that are not a whole chunk: the window read at every width. */
+  readonly prefillTail = atEveryWidth<MlxCapturingForward>((ids, cache) =>
+    this.forwardLayers(this.#embed(ids), cache, "window"));
+
+  /** Known tokens: this graph declares no committed spans, so they read as a window. */
+  readonly appendKnown = atEveryWidth<MlxPhaseForward>((ids, cache) =>
+    this.forwardLayers(this.#embed(ids), cache, "window"));
 
   /** The one output head at every width. */
   readonly logits = atEveryWidth<MlxHeadForward>(hidden => this.logitsFromHidden(hidden));
@@ -586,10 +588,6 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
    * declares no hidden-layer taps, so `capture` is always null. */
   readonly verify = atEveryWidth<MlxVerifyForward>((ids, cache) =>
     this.forwardLayers(this.#embed(ids), cache, "window"));
-
-  forwardEmbeddings(_embeds: MlxArray, _cache: Cache[], _bidir: MlxArray | null): MlxArray {
-    throw new Error("universal-dense input-embedding path is not supported");
-  }
 
   /** Token embeddings, scaled where the descriptor scales them (owned). */
   #embed(ids: MlxArray): MlxArray {
@@ -631,35 +629,5 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
       d.dispose();
     }
     return logits;
-  }
-
-  forward(tokens: number[] | MlxArray, cache: Cache[]): MlxArray {
-    const ids = Array.isArray(tokens)
-      ? ops.fromInt32(tokens, [1, tokens.length])
-      : tokens;
-    const h = this.forwardHidden(ids, cache);
-    if (Array.isArray(tokens)) ids.dispose();
-    const logits = this.logitsFromHidden(h);
-    h.dispose();
-    return logits;
-  }
-
-  generate(promptTokens: number[], maxTokens: number, eosIds: number[] = []): number[] {
-    const cache = this.makeCache();
-    const out: number[] = [];
-    try {
-      let tokens = promptTokens;
-      for (let step = 0; step < maxTokens; step++) {
-        const logits = this.forward(tokens, cache);
-        const next = argmaxLastPosition(logits);
-        logits.dispose();
-        if (eosIds.includes(next)) break;
-        out.push(next);
-        tokens = [next];
-      }
-    } finally {
-      for (const c of cache) c.dispose();
-    }
-    return out;
   }
 }

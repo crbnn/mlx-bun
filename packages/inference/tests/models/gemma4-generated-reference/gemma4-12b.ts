@@ -3,8 +3,9 @@
 // 30412523), frozen as the oracle of tests/models/gemma4-generated-identity.test.ts:
 // a class that extends Gemma4Model, checks its caches' signatures against the
 // per-layer KV literals it folded, reaches into the caches' quantized storage
-// and falls back to the generic forward on a miss. Only the import paths
-// changed. The generator now emits an entire graph that extends nothing; this
+// and falls back to the generic forward on a miss. Only the import paths and
+// its base changed (deprecated-base.ts restores the deprecated entry points E2
+// deleted from Gemma4Model). The generator now emits an entire graph that extends nothing; this
 // file goes with the identity test once D2 merges.
 
 import { MlxArray } from "@mlx-bun/mlx/array";
@@ -18,7 +19,7 @@ import { QuantizedKVCache } from "../../../src/state/quantized-kv";
 import { RotatingKVCache } from "../../../src/state/rotating-kv";
 import { RotatingQuantizedKVCache } from "../../../src/state/rotating-quantized-kv";
 import { type Cache, type Mask, type SharedKv } from "../../../src/contracts/mlx/cache";
-import { Gemma4Model } from "../../../src/models/gemma4/model";
+import { DeprecatedGemma4Base } from "./deprecated-base";
 import type { DecoderLayer } from "../../../src/models/gemma4/blocks";
 
 import { GENERATED_GEMMA_FINGERPRINTS } from "../../../src/models/gemma4/family";
@@ -200,7 +201,7 @@ function donorFullQuantG64B4KeqVScal(layer: DecoderLayer, x: MlxArray, mask: Mas
   return h;
 }
 
-export class GeneratedGemma4 extends Gemma4Model {
+export class GeneratedGemma4 extends DeprecatedGemma4Base {
   /** Per-layer cache signatures must match what this file was generated for. */
   #matches(cache: Cache[]): boolean {
     return (

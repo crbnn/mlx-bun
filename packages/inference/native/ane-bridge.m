@@ -57,7 +57,7 @@ static void put_error(char *dst, int len, NSString *prefix, NSError *error) {
   strlcpy(dst, text.UTF8String ?: "ane error", (size_t)len);
 }
 
-int mbane_available(void) {
+static int framework_loaded(void) {
   static int available = -1;
   if (available < 0) {
     available = dlopen("/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine", RTLD_NOW) &&
@@ -87,7 +87,7 @@ void *mbane_program_create(const char *mil, int weightCount, const char *const *
                            const uint64_t *weightBytes, int inputCount, const uint64_t *inputBytes, uint64_t outputBytes,
                            void *share, char *err, int errlen) {
   @autoreleasepool {
-    if (!mbane_available()) { put_error(err, errlen, @"AppleNeuralEngine.framework unavailable", nil); return NULL; }
+    if (!framework_loaded()) { put_error(err, errlen, @"AppleNeuralEngine.framework unavailable", nil); return NULL; }
     if (inputCount < 1 || inputCount > MBANE_MAX_INPUTS) { put_error(err, errlen, @"unsupported input count", nil); return NULL; }
     mbane_program *other = share;
     if (other) {

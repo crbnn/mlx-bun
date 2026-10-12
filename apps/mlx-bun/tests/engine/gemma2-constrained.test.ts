@@ -63,7 +63,10 @@ async function setup(dir: string) {
   // Every graph step records the KV after it; every logits projection (both
   // paths project through logitsFromHidden) records the complete logits.
   let trace: Trace | null = null;
-  const forward = model.forward.bind(model), hidden = model.forwardHidden.bind(model);
+  // Both paths name phases on the same graph tables, whose forwards all run its layer loop.
+  type Layers = (h0: MlxArray, caches: Cache[], phase: string) => MlxArray;
+  const graph = model as unknown as { forwardLayers: Layers };
+  const layers = graph.forwardLayers.bind(model);
   const project = model.logitsFromHidden.bind(model);
   const step = (kind: string, input: unknown, out: MlxArray, caches: Cache[]) => {
     if (!trace) return;
@@ -71,8 +74,7 @@ async function setup(dir: string) {
     trace.batches.push({ rows, adapters: model.loraState.active.join("+") });
     trace.calls.push(`${kind} ${out.shape.join("x")} kv ${kv(caches)}`);
   };
-  model.forward = (tokens, caches) => { const out = forward(tokens, caches); step("forward", tokens, out, caches); return out; };
-  model.forwardHidden = (ids, caches) => { const out = hidden(ids, caches); step("hidden", ids, out, caches); return out; };
+  graph.forwardLayers = (h0, caches, phase) => { const out = layers(h0, caches, phase); step("hidden", h0, out, caches); return out; };
   model.logitsFromHidden = (h) => {
     const out = project(h);
     if (trace) {

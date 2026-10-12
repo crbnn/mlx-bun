@@ -7,7 +7,7 @@
 // which this codebase allows any more. Delete this file and the identity test
 // once the D3 PR has merged.
 //
-// Changes from b3db6b09: import paths only.
+// Changes from b3db6b09: import paths only, and E2's scoring-forward name (sequenceHidden).
 
 // Concrete model graph for plain Qwen3 (Qwen3ForCausalLM).
 // Port target: mlx_lm.models.qwen3. A standard dense decoder — GQA softmax
@@ -218,13 +218,17 @@ export class Qwen3Model implements MlxDeclaredGraph, MlxTokenPhases {
     return this.layers.map(() => new KVCache());
   }
 
+  /** E2's name for the scoring forward (`MlxSequenceForward`), so scoring reaches the frozen forward itself. */
+  sequenceHidden(ids: MlxArray, cache: Cache[], _width: unknown): MlxArray { return this.forwardHidden(ids, cache); }
+
   forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray {
     const h = this.embed.encode(ids);
     return this.forwardLayers(h, cache);
   }
 
   readonly prefillChunk: MlxPrefillChunk = { gpu: (ids, cache) => this.forwardHidden(ids, cache) };
-  prefillTail(ids: MlxArray, cache: Cache[]): MlxArray { return this.forwardHidden(ids, cache); }
+  readonly prefillTail = atEveryWidth<MlxVerifyForward>((ids, cache) => this.forwardHidden(ids, cache));
+  readonly appendKnown = atEveryWidth<MlxPhaseForward>((ids, cache) => this.forwardHidden(ids, cache));
   readonly logits = atEveryWidth<MlxHeadForward>(hidden => this.logitsFromHidden(hidden));
   readonly decode = atEveryWidth<MlxPhaseForward>((ids, cache) => this.forwardHidden(ids, cache));
   readonly verify = atEveryWidth<MlxVerifyForward>((ids, cache) => this.forwardHidden(ids, cache));

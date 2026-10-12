@@ -94,7 +94,7 @@ export interface CommittedAttentionCache extends AttentionCache {
   /** Committed span: `L` decided positions per row, causal within the span.
    * Each query attends its own causal prefix with the arithmetic of a
    * one-position read, so the span keeps the single-position reduction order
-   * the graph qualifies per KV format (`MlxTokenAppend`). This replaces the
+   * the graph qualifies per KV format (`MlxKnownSpans`, read by `appendKnown`). This replaces the
    * `independentPositions` flag. The only caller today runs one row with up to
    * four positions. */
   appendCommitted(k: MlxArray, v: MlxArray): AttentionRead;

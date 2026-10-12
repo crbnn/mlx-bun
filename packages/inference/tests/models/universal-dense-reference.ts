@@ -7,7 +7,7 @@
 // test the layer class, none of which this codebase allows any more. Delete
 // this file and the identity test once the D3 PR has merged.
 //
-// Changes from b3db6b09: import paths only.
+// Changes from b3db6b09: import paths only, and E2's scoring-forward name (sequenceHidden).
 
 import { referenceKvAttention as captureKvAttention } from "./quantized-sdpa-reference";
 // UniversalDense — the Tier-0 config-driven dense llama-family module
@@ -557,6 +557,9 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
     return this.#cacheWindows.map(window => window ? new RotatingKVCache(window) : new KVCache());
   }
 
+  /** E2's name for the scoring forward (`MlxSequenceForward`), so scoring reaches the frozen forward itself. */
+  sequenceHidden(ids: MlxArray, cache: Cache[], _width: unknown): MlxArray { return this.forwardHidden(ids, cache); }
+
   forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray {
     let h = this.embed.encode(ids);
     if (this.args.embedMultiplier !== null)
@@ -565,7 +568,8 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
   }
 
   readonly prefillChunk: MlxPrefillChunk = { gpu: (ids, cache) => this.forwardHidden(ids, cache) };
-  prefillTail(ids: MlxArray, cache: Cache[]): MlxArray { return this.forwardHidden(ids, cache); }
+  readonly prefillTail = atEveryWidth<MlxVerifyForward>((ids, cache) => this.forwardHidden(ids, cache));
+  readonly appendKnown = atEveryWidth<MlxPhaseForward>((ids, cache) => this.forwardHidden(ids, cache));
   readonly logits = atEveryWidth<MlxHeadForward>(hidden => this.logitsFromHidden(hidden));
   readonly decode = atEveryWidth<MlxPhaseForward>((ids, cache) => this.forwardHidden(ids, cache));
   readonly verify = atEveryWidth<MlxVerifyForward>((ids, cache) => this.forwardHidden(ids, cache));

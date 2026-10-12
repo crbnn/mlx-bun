@@ -86,7 +86,6 @@ export class Glm52NativeMtpProvider implements DraftProvider {
 
 export class Glm52NativeMtpSource implements DraftSource {
   readonly prefillMode = "full" as const;
-  readonly pinTargetKernelFamily = true;
   readonly weightsBytes = 0;
   #cache: MLACache;
   readonly #head: NativeMtpHead;

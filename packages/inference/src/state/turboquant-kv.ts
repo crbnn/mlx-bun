@@ -79,9 +79,8 @@ export class TurboQuantKVCache implements CommittedAttentionCache, BlockAttentio
     return this.turboQuantKernels.read(this.#fetches(k, v), causalLease);
   }
 
-  /** The window read. Qwen 3.5's committed append (`createAppend`) read this
-   * storage through `updateAndFetch` and the fused SDPA under its causal mask,
-   * the same call as its window. */
+  /** The window read: a committed span on this storage (Qwen 3.5's
+   * `appendKnown`) attends with the same call as a window. */
   appendCommitted(k: MlxArray, v: MlxArray): AttentionRead {
     return this.appendWindow(k, v);
   }

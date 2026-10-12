@@ -31,8 +31,8 @@ import { Checkpoint } from "@mlx-bun/mlx/checkpoint";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import type {
-  MlxCompiledDecodeStep, MlxDeclaredGraph, MlxHeadForward, MlxLayerCapture, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases,
-  MlxVerifyForward,
+  MlxCompiledDecodeStep, MlxDeclaredGraph, MlxHeadForward, MlxLayerCapture, MlxMixedForward, MlxPhaseForward,
+  MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward, MlxWidthClass,
 } from "../../contracts/mlx/graph";
 import { CompiledDecode } from "./compiled-decode";
 import type { TargetView } from "../../contracts/mlx/draft-target";
@@ -40,12 +40,11 @@ import type { TrainableGraph } from "../../contracts/mlx/trainable";
 import { gemma4Trainable, type GradCheckpointCtx, type LayerLoras } from "./trainable";
 import type { MediaEncoders, MediaSidecarProbes, MlxPromptInput, Vision } from "../../contracts/mlx/media";
 import { declareGraph } from "../capabilities";
-import { atEveryWidth, deprecatedPhase } from "../graph";
+import { atEveryWidth } from "../graph";
 import { bindGemma4MediaInput, gemma4DraftTarget, gemma4MediaEncoders } from "./media";
 import type { Cache, Mask, SharedKv } from "../../contracts/mlx/cache";
 import { isCompiledTrace } from "../../runtime/compiled-trace";
 import { mapPackedTokens } from "../../input/token-groups";
-import { type TokenGroup } from "../../contracts/mlx/token-work";
 import { flashAttention, flashSupported, getTrainingAttn } from "../../kernels/attention/flash";
 import { compiledGegluActive } from "../../layers/geglu";
 import { disposing } from "../../layers/helpers";
@@ -54,7 +53,7 @@ import { captureRopeOffsets } from "../../state/capabilities";
 import { RMSNorm } from "../../layers/normalization";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import type { QuantizedLinear } from "../../layers/quantized-linear";
-import { argmaxLastPosition,logitSoftcap } from "../../kernels/logits";
+import { logitSoftcap } from "../../kernels/logits";
 import { compiledLogitSoftcap } from "../../kernels/softcap";
 import { AttentionMasks } from "../../state/attention-read";
 import { composedFullAttentionCache, composedSlidingAttentionCache } from "../../state/bf16-first-kv";
@@ -210,7 +209,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    * every method is qualified over them. */
   get graphCapabilities(): GraphCapabilities {
     return declareGraph({
-      media: { input: "embeddings", video: false }, pagedAttention: true, hiddenLayerTaps: "hiddenTap" in this,
+      media: { input: "embeddings", video: false }, pagedAttention: true, hiddenLayerTaps: true,
       compiledDecode: this.config?.modelType?.startsWith("gemma4") === true && !this.config.text.enableMoeBlock,
       kv: { delayedAffine: "all" },
     });
@@ -241,17 +240,10 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
   /** layer idx → cache index (donors only; -1 for sharers). */
   readonly cacheIndex: number[];
   /** Set by the trainer around its training forwards to checkpoint each layer
-   *  (null = off). While set, the deprecated entry points run the training
-   *  forward (`forwardTrainingHidden`'s), whose donors hand their sharers keys
-   *  and values as checkpoint tensors. */
+   *  (null = off). While set, the scoring and training forward
+   *  (`sequenceHidden`) runs the training forward (`forwardTrainingHidden`'s),
+   *  whose donors hand their sharers keys and values as checkpoint tensors. */
   gradCkpt: GradCheckpointCtx | null = null;
-  /** Optional per-forward hidden-state tap for DSpark's DFlash H_ctx (paper
-   *  Eq 2). null = off → byte-identical forward. `layers`: residual-output
-   *  indices to capture (0..nLayers-1 = post-layer residual; nLayers =
-   *  post-finalNorm). `pos`: if set, capture only [1,1,H] at that seq position
-   *  (live decode); else the full [1,L,H] (offline regen). The caller owns and
-   *  disposes the captured arrays. Additive/read-only → parity untouched. */
-  hiddenTap: { layers: Set<number>; pos?: number; captured: Map<number, MlxArray> } | null = null;
   // e2b/e4b per-layer input machinery (the block and its parts)
   readonly perLayerInputs: PerLayerInputs | null;
   readonly perLayerEmbed: QuantizedEmbedding | null;
@@ -363,9 +355,12 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
     if (constants.length) ops.evalAll(constants);
   }
 
-  /** ids [B, L] → final-norm hidden states [B, L, hidden]. */
-  forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray {
-    return this.forwardLayers(this.embedTokens(ids), cache, null, ids);
+  /** The scoring and training forward (`MlxSequenceForward`): the window read
+   *  at every width, or the checkpointed training forward while the trainer
+   *  checkpoints (`gradCkpt`). */
+  sequenceHidden(ids: MlxArray, cache: Cache[], _width: MlxWidthClass): MlxArray {
+    const h0 = this.embedTokens(ids);
+    return this.gradCkpt ? this.#forwardMasked(h0, cache, ids) : this.forwardDecoder(h0, cache, "window", ids);
   }
 
   /** The scaled token embeddings [B, L, hidden] of `ids` (owned). */
@@ -378,24 +373,31 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    * prefill chunk size; rows are sequences times that size. Token ids only: a
    * prompt with prepared media enters through the `MlxPromptInput` that
    * `bindMediaInput` returns. The GPU is this graph's one unit. */
-  readonly prefillChunk: MlxPrefillChunk = {
-    gpu: (ids, cache) => this.forwardDecoder(this.embedTokens(ids), cache, "window", ids),
-  };
+  readonly prefillChunk: MlxPrefillChunk = { gpu: (ids, cache, capture) => this.#window(ids, cache, capture) };
 
-  /** The positions left at the end of a prompt after its whole chunks, fewer
-   * than the chunk size per sequence; rows are sequences times those tokens.
-   * The same semantics as `prefillChunk`, named apart because a composition
-   * may run it on different hardware. */
-  prefillTail(ids: MlxArray, cache: Cache[]): MlxArray {
-    return this.forwardDecoder(this.embedTokens(ids), cache, "window", ids);
+  /** A prompt's positions that are not a whole chunk: the window read at every width. */
+  readonly prefillTail = atEveryWidth<(ids: MlxArray, cache: Cache[], capture: MlxLayerCapture | null) => MlxArray>(
+    (ids, cache, capture) => this.#window(ids, cache, capture));
+
+  /** Known tokens: this graph declares no committed spans, so they read as a window. */
+  readonly appendKnown = atEveryWidth<MlxPhaseForward>((ids, cache) => this.#window(ids, cache, null));
+
+  /** A causal window of token ids over every layer, `capture` seeing every layer and then the final hidden. */
+  #window(ids: MlxArray, cache: Cache[], capture: MlxLayerCapture | null): MlxArray {
+    const hidden = this.forwardDecoder(this.embedTokens(ids), cache, "window", ids, capture);
+    capture?.(this.layers.length, hidden);
+    return hidden;
   }
 
   /** The one output head at every width. */
   readonly logits = atEveryWidth<MlxHeadForward>(hidden => this.logitsFromHidden(hidden));
 
   /** One new token per sequence: `ids` [sequences, 1], so rows are sequences. */
-  readonly decode = atEveryWidth<MlxPhaseForward>((ids, cache) =>
-    this.forwardDecoder(this.embedTokens(ids), cache, "decode", ids));
+  readonly decode = atEveryWidth<(ids: MlxArray, cache: Cache[], capture: MlxLayerCapture | null) => MlxArray>((ids, cache, capture) => {
+    const hidden = this.forwardDecoder(this.embedTokens(ids), cache, "decode", ids, capture);
+    capture?.(this.layers.length, hidden);
+    return hidden;
+  });
 
   /** A speculative window: each sequence's last accepted token and its drafted
    * tokens, right-padded by the caller to the round's depth, `ids`
@@ -414,7 +416,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
     return this.perLayerInputs!.compute(ids, hScaled);
   }
 
-  /** Pre-merged (unscaled) input embeddings → hidden states. Used by the
+  /** The vision prefill phase: pre-merged (unscaled) input embeddings → hidden states. Used by the
    *  multimodal (vision/audio) path; `bidir` (bool [L]) marks image tokens,
    *  which attend bidirectionally among themselves (use_bidirectional_attention:
    *  "vision" — text stays causal; audio prompts pass NO bidir mask, and a
@@ -431,12 +433,13 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    *  positions must still be zeroed. When null (the legacy vision call
    *  shape), the zeroing mask falls back to `bidir` — vision passes the same
    *  image mask for both roles, so that path is unchanged. */
-  forwardEmbeddings(
+  prefillEmbeddings(
     embeds: MlxArray, cache: Cache[], bidir: MlxArray | null,
     ids: MlxArray | null = null, multimodal: MlxArray | null = null,
   ): MlxArray {
     const h = ops.mulScalar(embeds, this.embedScale);
-    if (this.perLayerWidth === 0) return this.forwardLayers(h, cache, bidir, null);
+    const phase: Gemma4Phase = bidir ? { bidirectional: bidir } : "window";
+    if (this.perLayerWidth === 0) return this.forwardDecoder(h, cache, phase, null);
 
     if (!ids)
       throw new Error("per-layer-input multimodal models require token ids");
@@ -449,47 +452,16 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
       cond.dispose();
       zero.dispose();
     }
-    const out = this.forwardLayers(h, cache, bidir, plIds);
+    const out = this.forwardDecoder(h, cache, phase, plIds);
     if (plIds !== ids) plIds.dispose();
     return out;
-  }
-
-  /** Store layer `i`'s residual stream `h` ([1,L,H]) if the hidden tap requests
-   *  it. Copies (astype bf16, optional slice) so the loop's `h.dispose()` can't
-   *  free the capture. No-op and no graph ops when the tap is null → the forward
-   *  is byte-identical to an untapped run. (DSpark DFlash H_ctx.) */
-  protected captureLayer(i: number, h: MlxArray): void {
-    const tap = this.hiddenTap;
-    if (!tap || !tap.layers.has(i)) return;
-    const H = h.shape[2]!;
-    const src = tap.pos !== undefined ? h.slice([0, tap.pos, 0], [1, tap.pos + 1, H]) : h;
-    const copy = src.astype(this.embed.scales.dtype); // bf16, matches regen dump dtype
-    if (src !== h) src.dispose();
-    tap.captured.set(i, copy);
-  }
-
-  /** The decoder over `h0` [B, L, hidden] (consumed) for a forward reaching a
-   *  deprecated entry point (`forwardHidden`, `forwardEmbeddings`,
-   *  `forwardHiddenMixed`'s single group): the shared adapter derives the phase,
-   *  and a window over an image mask (`bidir`, bool [L]) is the bidirectional
-   *  read. While the trainer checkpoints (`gradCkpt`), the training forward.
-   *  @deprecated E2 deletes the adapter, and this hook goes with it. Since D2
-   *  the generated graphs (generated/*.ts) are entire graphs and no longer
-   *  override it. */
-  protected forwardLayers(
-    h0: MlxArray, cache: Cache[], bidir: MlxArray | null, ids: MlxArray | null,
-  ): MlxArray {
-    if (this.gradCkpt) return this.#forwardMasked(h0, cache, ids);
-    const read = deprecatedPhase(h0);
-    return this.forwardDecoder(h0, cache, bidir && read === "window" ? { bidirectional: bidir } : read, ids);
   }
 
   /** The decoder over `h0` [B, L, hidden] (consumed), every donor layer's
    *  attention reading its cache for `phase` and every KV-sharing layer
    *  attending its donor's read. `ids` [B, L] feed the per-layer inputs
    *  (e2b/e4b). `capture` receives each layer's residual output after the layer
-   *  runs (see `MlxLayerCapture`); the caller hands it the final hidden. The
-   *  hidden tap (`hiddenTap`) captures the same layers and the final hidden. */
+   *  runs (see `MlxLayerCapture`); the caller hands it the final hidden. */
   protected forwardDecoder(
     h0: MlxArray, cache: Cache[], phase: Gemma4Phase, ids: MlxArray | null,
     capture: MlxLayerCapture | null = null,
@@ -513,13 +485,11 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
         h.dispose();
         h = next.h;
         if (ci !== -1) donors[ci] = next.donor;
-        this.captureLayer(i, h); // DFlash H_ctx tap (no-op unless hiddenTap set)
         capture?.(i, h);
       }
       const out = this.finalNorm.forward(h);
       h.dispose();
       h = null;
-      this.captureLayer(this.layers.length, out); // post-finalNorm sentinel (index = nLayers)
       return out;
     } finally {
       h?.dispose();
@@ -577,7 +547,6 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
       pls?.dispose();
       h.dispose();
       h = next;
-      this.captureLayer(i, h); // DFlash H_ctx tap (no-op unless hiddenTap set)
       intermediates[i] = shared;
     }
     perLayer?.dispose();
@@ -590,39 +559,39 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
     for (const m of masks.values()) m.arr?.dispose();
 
     h = disposing(h, this.finalNorm.forward(h));
-    this.captureLayer(this.layers.length, h); // post-finalNorm sentinel (index = nLayers)
     return h;
   }
 
-  /** Mixed token execution: attention retains each group's cache, positions and
-   * SDPA shape; feed-forward work packs only real tokens. Kernel selection for
-   * packed matmuls can differ from a solo GEMV, so this is an explicit Lab port
-   * until its matching packed oracle and serving comparison are accepted. */
-  forwardHiddenMixed(work: readonly TokenGroup[]): MlxArray[] {
-    if (work.length === 1 && !work[0]!.captureLayer) return [this.forwardHidden(work[0]!.ids, work[0]!.cache)];
-    const groups: Array<{ ids: MlxArray; cache: Cache[]; h: MlxArray; phase: Gemma4Phase;
-      perLayer: MlxArray | null; donors: (DonorRead | null)[] }> = [];
+  /** Mixed rows in one forward: each group's attention reads its own caches,
+   * positions and SDPA shape in its own phase (a verify group reads a window);
+   * feed-forward work packs only real tokens, when the composition packs mixed
+   * MLP and no group is a verify window. Kernel selection for packed matmuls
+   * can differ from a solo GEMV, so this is an explicit Lab port until its
+   * matching packed oracle and serving comparison are accepted. */
+  readonly mixed: MlxMixedForward = groups => {
+    const runs: Array<{ h: MlxArray; perLayer: MlxArray | null; donors: (DonorRead | null)[] }> = [];
     const results: MlxArray[] = [];
-    const packedMlp = this.#packMixedMlp && !work.some(group => group.preserveTokenGeometry);
+    const packedMlp = this.#packMixedMlp && !groups.some(group => group.phase === "verify");
     try {
-      for (const { ids, cache } of work) {
-        const group = { ids, cache, h: this.embedTokens(ids), phase: deprecatedPhase(ids),
-          perLayer: null as MlxArray | null, donors: Array<DonorRead | null>(this.numDonors).fill(null) };
-        groups.push(group);
-        if (this.perLayerWidth > 0) group.perLayer = this.computePerLayerInputs(ids, group.h);
+      for (const group of groups) {
+        const run = { h: this.embedTokens(group.ids), perLayer: null as MlxArray | null,
+          donors: Array<DonorRead | null>(this.numDonors).fill(null) };
+        runs.push(run);
+        if (this.perLayerWidth > 0) run.perLayer = this.computePerLayerInputs(group.ids, run.h);
       }
       for (let i = 0; i < this.layers.length; i++) {
         const layer = this.layers[i]!, ci = this.cacheIndex[i]!;
         const mids: MlxArray[] = [], inputs: MlxArray[] = [];
         try {
-          for (const group of groups) {
-            const { h, donor } = layer.forwardAttn(group.h, ci === -1 ? null : group.cache[ci]!, group.phase,
-              ci === -1 ? group.donors[this.previousKvs[i]!]! : null);
+          for (const [row, group] of groups.entries()) {
+            const run = runs[row]!;
+            const { h, donor } = layer.forwardAttn(run.h, ci === -1 ? null : group.state[ci]!,
+              group.phase === "decode" ? "decode" : "window", ci === -1 ? run.donors[this.previousKvs[i]!]! : null);
             mids.push(h);
-            if (ci !== -1) group.donors[ci] = donor;
-            if (group.perLayer) {
+            if (ci !== -1) run.donors[ci] = donor;
+            if (run.perLayer) {
               const [B, L] = group.ids.shape;
-              using part = group.perLayer.slice([0, 0, i, 0], [B!, L!, i + 1, this.perLayerWidth]);
+              using part = run.perLayer.slice([0, 0, i, 0], [B!, L!, i + 1, this.perLayerWidth]);
               inputs.push(ops.reshape(part, [B!, L!, this.perLayerWidth]));
             }
           }
@@ -639,28 +608,28 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
             if (packedMlp) outputs.push(...mapPackedTokens(mids, packed => layer.forwardMlp(packed, pli)));
             else for (const [row, mid] of mids.entries()) outputs.push(layer.forwardMlp(mid, inputs[row] ?? null));
           } catch (error) { for (const output of outputs) output.dispose(); throw error; }
-          for (const [index, group] of groups.entries()) {
-            group.h.dispose(); group.h = outputs[index]!;
+          for (const [row, run] of runs.entries()) {
+            run.h.dispose(); run.h = outputs[row]!;
           }
-          for (const [index, group] of groups.entries()) work[index]!.captureLayer?.(i, group.h);
+          for (const [row, group] of groups.entries()) group.capture?.(i, runs[row]!.h);
         } finally {
           for (const mid of mids) mid.dispose();
           for (const input of inputs) input.dispose();
         }
       }
-      for (const [index, group] of groups.entries()) {
-        const hidden = this.finalNorm.forward(group.h); results.push(hidden);
-        work[index]!.captureLayer?.(this.layers.length, hidden);
+      for (const [row, group] of groups.entries()) {
+        const hidden = this.finalNorm.forward(runs[row]!.h); results.push(hidden);
+        group.capture?.(this.layers.length, hidden);
       }
       return results;
     } catch (error) { for (const result of results) result.dispose(); throw error; }
     finally {
-      for (const group of groups) {
-        group.h.dispose(); group.perLayer?.dispose();
-        for (const donor of group.donors) donor?.dispose();
+      for (const run of runs) {
+        run.h.dispose(); run.perLayer?.dispose();
+        for (const donor of run.donors) donor?.dispose();
       }
     }
-  }
+  };
 
 
   // --- Segmented-backward support (`02d723a:docs/design/orpo-training.md`
@@ -919,37 +888,5 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
         ? compiledLogitSoftcap(logits, softcap)   // fused, matches @mx.compile logit_softcap
         : logitSoftcap(logits, softcap));
     return logits;
-  }
-
-  /** tokens → logits [1, L, vocab] (compat path used by parity tests). */
-  forward(tokens: number[] | MlxArray, cache: Cache[]): MlxArray {
-    const ids = Array.isArray(tokens)
-      ? ops.fromInt32(tokens, [1, tokens.length])
-      : tokens;
-    const h = this.forwardHidden(ids, cache);
-    if (Array.isArray(tokens)) ids.dispose();
-    const logits = this.logitsFromHidden(h);
-    h.dispose();
-    return logits;
-  }
-
-  /** Greedy generation (parity harness); returns generated token ids. */
-  generate(promptTokens: number[], maxTokens: number, eosIds: number[] = []): number[] {
-    const cache = this.makeCache();
-    const out: number[] = [];
-    try {
-      let tokens = promptTokens;
-      for (let step = 0; step < maxTokens; step++) {
-        const logits = this.forward(tokens, cache);
-        const next = argmaxLastPosition(logits);
-        logits.dispose();
-        if (eosIds.includes(next)) break;
-        out.push(next);
-        tokens = [next];
-      }
-    } finally {
-      for (const c of cache) c.dispose();
-    }
-    return out;
   }
 }

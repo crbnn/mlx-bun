@@ -73,7 +73,7 @@ export class DelayedRotatingQuantizedKVCache extends SpeculativeTransitioningKvR
 
   appendDecode(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v, false); }
   appendWindow(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v, false); }
-  /** The graph's committed read today (Qwen 3.5's `createAppend`): the same
+  /** The graph's committed read today (Qwen 3.5's `appendKnown` under `knownSpans`): the same
    * mask and attention view, attended with independent positions, which the
    * packed layout's view honours and the per-row views ignore, as they do in
    * that call.

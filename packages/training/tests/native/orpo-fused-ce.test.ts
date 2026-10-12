@@ -212,7 +212,7 @@ describe.skipIf(!enabled)("ORPO fused linear-CE head parity (MiniCPM5-1B)", () =
     const idData = Array.from({ length: M }, (_, i) => (i * 2659 + 13) % V);
     const ids = ops.fromInt32(idData, [1, M]);
     const cache = model.makeCache();
-    const h3 = model.forwardHidden(ids, cache);
+    const h3 = model.sequenceHidden(ids, cache, "wider");
     const hResp = ops.reshape(h3, [M, H]);
     ops.evalAll([hResp]);
     const targets = idData.map((_, i) => idData[(i + 1) % M]!);

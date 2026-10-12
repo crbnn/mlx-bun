@@ -23,6 +23,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { declareGraph } from "../../src/models/capabilities";
+import { stubPhases } from "../models/phase-forward";
 
 /** Owned target state as stored: class, coverage, reuse floor and exact planes. */
 function encoded(caches: readonly Cache[]) {
@@ -55,8 +56,9 @@ function fixture(provider: Pick<DraftProvider, "id" | "grouped"> & { dispose(): 
       return ops.reshape(ids, [ids.shape[0]!, ids.shape[1]!, 1]);
     },
     logitsFromHidden(hidden: MlxArray) { return ops.copyOf(hidden); },
+    ...stubPhases((ids, caches) => model.forwardHidden(ids, caches), hidden => model.logitsFromHidden(hidden)),
     ...graph,
-  } as unknown as RuntimeModel;
+  } as unknown as RuntimeModel & { forwardHidden(ids: MlxArray, caches: Cache[]): MlxArray };
   const cache = new PromptCache(1024 ** 2);
   const host: MlxGroupMethodHost = { rows: joined, runtime: runtimeConfig(), prefillChunkSize: 3,
     kvMaintenance: scheme.kind === "bf16" ? undefined : createKvMaintenance(scheme),
@@ -95,9 +97,9 @@ test("budgeted method prefill retains companion history through an injected mode
   const preparation = f.method.prepare(row);
   let calls = 0;
   try {
-    while (!await preparation.advance({ maxTokens: 2, forward: async (ids, caches) => {
+    while (!await preparation.advance({ maxTokens: 2, forward: async (ids, _caches, step) => {
       expect(ids.shape[0]! * ids.shape[1]!).toBeLessThanOrEqual(2); calls++;
-      return f.model.forwardHidden(ids, caches);
+      return step.own();
     } })) { /* each bounded chunk returns to the scheduler */ }
     expect(calls).toBe(4);
     expect(f.joined).toEqual([row]);

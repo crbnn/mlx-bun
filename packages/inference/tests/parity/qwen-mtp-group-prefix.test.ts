@@ -400,6 +400,7 @@ async function record(inputs: { target: string; draft: string }, directory: stri
   const { loadModelConfig, Weights, createModel, loadTokenizer, ChatTemplate } = await import("@mlx-bun/inference");
   const { QwenMtpProvider } = await import("@mlx-bun/inference/generation/speculative");
   const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
+  const { observedPhases } = await import("../models/phase-forward");
   const { PromptCache, SsdCacheStore, TieredPromptCache, cloneKvCaches, leaseCacheStates, disposeAttachments } = await import("@mlx-bun/inference/state");
   const { disposeResources } = await import("@mlx-bun/inference/execution");
   const ops = await import("@mlx-bun/mlx/ops");
@@ -461,33 +462,33 @@ async function record(inputs: { target: string; draft: string }, directory: stri
       return rows.every((row, r) => row.length === width && row[0] === arm.pending[r] &&
         (!arm.proposals || row.slice(1).every((t, i) => t === (i < arm.proposals![r]!.length ? arm.proposals![r]![i] : arm.pending[r]))));
     };
-    // Observers, installed before the gateway binds projectLogits.
-    const forwardHidden = model.forwardHidden.bind(model), logitsFromHidden = model.logitsFromHidden.bind(model);
-    const forwardSpy = spyOn(model, "forwardHidden").mockImplementation((input: A, caches: A[], ...rest: A[]) => {
-      const flat = input.toIntTokens() as number[], [B, L] = input.shape;
-      const event: A = { event: "forward", ids: Array.from({ length: B }, (_, r) => flat.slice(r * L, (r + 1) * L)) };
-      if (isVerify(event.ids)) {
-        event.verify = true; context!.arm = null;
-        if (context!.layouts === null) context!.layouts = caches;
-        event.sameLayouts = context!.layouts === caches;
-        if (context!.joined) { note({ event: "state", at: "entry", members: [...context!.members], rows: rowStates(caches, context!.members) }); context!.joined = false; }
-        context!.targetCaches = caches;
-      }
-      const hidden = forwardHidden(input, caches, ...rest);
-      try { event.hidden = tensor(hidden); note(event); } catch (error) { hidden.dispose(); throw error; }
-      return hidden;
-    });
-    releases.push(() => forwardSpy.mockRestore());
-    const logitsSpy = spyOn(model, "logitsFromHidden").mockImplementation((hidden: A, ...rest: A[]) => {
-      const logits = logitsFromHidden(hidden, ...rest);
-      try {
+    // Observers on the phases the gateway calls (every target forward and head projection); the gateway binds the view.
+    let entered: A = null;
+    const view = observedPhases(model, {
+      forward(input: A, caches: A[]) {
+        const flat = input.toIntTokens() as number[], [B, L] = input.shape;
+        const event: A = { event: "forward", ids: Array.from({ length: B }, (_, r) => flat.slice(r * L, (r + 1) * L)) };
+        if (isVerify(event.ids)) {
+          event.verify = true; context!.arm = null;
+          if (context!.layouts === null) context!.layouts = caches;
+          event.sameLayouts = context!.layouts === caches;
+          if (context!.joined) { note({ event: "state", at: "entry", members: [...context!.members], rows: rowStates(caches, context!.members) }); context!.joined = false; }
+          context!.targetCaches = caches;
+        }
+        entered = event;
+      },
+      forwarded(_input: A, _caches: A[], hidden: A) {
+        const event = entered;
+        entered = null;
+        event.hidden = tensor(hidden);
+        note(event);
+      },
+      head(_hidden: A, logits: A) {
         using arg = ops.argmaxAxis(logits, -1);
         const [B, P] = logits.shape, flat = arg.toIntTokens() as number[];
         note({ event: "project", logits: tensor(logits, true), argmax: Array.from({ length: B }, (_, r) => flat.slice(r * P, (r + 1) * P)) });
-      } catch (error) { logits.dispose(); throw error; }
-      return logits;
+      },
     });
-    releases.push(() => logitsSpy.mockRestore());
     const observeRows = (rows: A, kind: "decode" | "prefill") => {
       const draft = rows.draft.bind(rows), commit = rows.commit.bind(rows), capture = rows.capture.bind(rows);
       rows.draft = async (pending: number[], depth: number, steps: number[]) => {
@@ -555,7 +556,7 @@ async function record(inputs: { target: string; draft: string }, directory: stri
     const openSpy = spyOn(provider.grouped, "open").mockImplementation((options: A) => observeRows(open(options), "decode"));
     const prefillSpy = spyOn(provider.grouped, "openPrefill").mockImplementation((options: A) => observeRows(openPrefill(options), "prefill"));
     releases.push(() => openSpy.mockRestore(), () => prefillSpy.mockRestore());
-    const binding = bindMlxGateway(model, { provider, numDraftTokens: DEPTH });
+    const binding = bindMlxGateway(view, { provider, numDraftTokens: DEPTH });
     const methodFor = (sampling: A, maxTokens: number) => {
       const options = { ...sampling, maxTokens };
       const plan = binding.plan({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: "seed" in sampling,

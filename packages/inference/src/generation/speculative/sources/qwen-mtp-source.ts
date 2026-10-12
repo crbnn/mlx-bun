@@ -245,7 +245,7 @@ export class QwenMtpSource implements DraftSource {
         const embeds = this.#target.embed(ids);
         ids.dispose();
         const hiddens = ctxML.slice([0, pos - start, 0], [1, pos + n - start, H]);
-        const out = this.#module.forward(embeds, hiddens, this.#cache);
+        const out = (n === 1 ? this.#module.decode.one : this.#module.window)(embeds, hiddens, this.#cache);
         embeds.dispose();
         hiddens.dispose();
         out.dispose(); // prefill outputs are not seeds; only KV matters here
@@ -350,7 +350,7 @@ export class QwenMtpSource implements DraftSource {
         const embeds = this.#target.embed(ids);
         ids.dispose();
         const hidden = vCtxML.slice([0, d - 1, 0], [1, d, H]);
-        const out = this.#module.forward(embeds, hidden, this.#cache);
+        const out = this.#module.decode.one(embeds, hidden, this.#cache);
         embeds.dispose();
         hidden.dispose();
         out.dispose();
@@ -381,14 +381,14 @@ export class QwenMtpSource implements DraftSource {
   /** One module forward for (borrowed [1,1] token ids, hidden). */
   #stepIds(ids: MlxArray, hidden: MlxArray): MlxArray {
     using embed = this.#target.embed(ids);
-    return this.#module.forward(embed, hidden, this.#cache);
+    return this.#module.decode.one(embed, hidden, this.#cache);
   }
 
   /** Sample a draft token from the module output via the TARGET's lm head
    *  and the request sampler (per-step RNG stream discipline). Returns the
    *  owned device token ([1]); the round reads all drafts back together. */
   #sample(moduleOut: MlxArray, step: number): MlxArray {
-    using logits = this.#target.logitsFromHidden(moduleOut);
+    using logits = this.#target.logits.one(moduleOut);
     // Sampler contract is [1, V] (the main decode loop's shape). moduleOut
     // is [1, 1, H] → logits [1, 1, V]; without this reshape any sampler
     // that slices 2-D (top-k) throws "[slice] Invalid number of indices…

@@ -4,6 +4,7 @@ import { declareGraph, PLAIN_KV_VERIFICATION } from "../../src/models/capabiliti
 import type { RuntimeModel } from "../../src/models/factory";
 import { createRuntimeConfig, withRuntimeConfig } from "../../src/runtime/config";
 import { KVCache } from "../../src/state/kv";
+import { atEveryWidth } from "../../src/models/graph";
 import { resolveKvScheme } from "../../src/state/kv-scheme";
 import { NgramProvider } from "../../src/generation/speculative/sources/ngram-source";
 import type { GenerateOptions } from "../../src/generation/index";
@@ -18,10 +19,14 @@ const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: fals
 const composed = (kv: KvOptions) => ({ composition: testComposition(kvOf(kv)) });
 const schedule = { continuous: true, quantizedBatch: true, checkpoints: false };
 
+/** Placement never forwards: every phase a stand-in declares throws. */
+const never = () => { throw new Error("placement never forwards"); };
+const phases = { prefillChunk: { gpu: never }, prefillTail: atEveryWidth(never), decode: atEveryWidth(never),
+  verify: atEveryWidth(never), appendKnown: atEveryWidth(never), logits: atEveryWidth(never) };
 function replacement(declared: Parameters<typeof declareGraph>[0] = {}, extra: object = {}, modelType = "replacement"): RuntimeModel {
   return {
     config: { modelType, text: { enableMoeBlock: false, numHiddenLayers: 1, layerTypes: ["full_attention"] }, eosTokenIds: [] },
-    makeCache: () => [new KVCache()], loraState: { active: [] }, requiredDenseKvLayers: [], logitsFromHidden() {},
+    makeCache: () => [new KVCache()], loraState: { active: [] }, requiredDenseKvLayers: [], logitsFromHidden() {}, ...phases,
     graphCapabilities: declareGraph(declared), ...extra,
   } as unknown as RuntimeModel;
 }
@@ -59,9 +64,9 @@ describe("placement follows the graph's declarations", () => {
 
   test("prepared media enters through the graph's own operation, declared and provided together", () => {
     const forward = () => { throw new Error("placement never forwards"); };
-    const media = bind(replacement({ media: { input: "embeddings", video: false } }, { bindMediaInput: () => ({ forward }) }));
+    const media = bind(replacement({ media: { input: "embeddings", video: false } }, { bindMediaInput: () => ({ prefill: forward }) }));
     expect(media.plan({ ...shape, hasVision: true }, {}, schedule)).toMatchObject({ mechanism: "continuous" });
-    expect(media.mediaInput!({ embeddings: {} as never }).forward).toBe(forward);
+    expect(media.mediaInput!({ embeddings: {} as never }).prefill).toBe(forward);
     // Denoising pixels are that method's own input, not the shared media path.
     expect(() => bind(replacement({ media: { input: "embeddings", video: false } }))).toThrow("provides no bindMediaInput");
     expect(() => bind({ config: {}, makeCache: () => [] } as unknown as RuntimeModel)).toThrow("must declare its capabilities");

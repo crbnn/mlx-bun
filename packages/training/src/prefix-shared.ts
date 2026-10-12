@@ -136,7 +136,7 @@ function prefixHidden(
   concat.set(rejectedResp, P + Rc);
   const ids = MlxArray.fromInt32(concat, [1, T]);
   try {
-    return shared.forwardHidden(ids, { P, Rc, Rr });
+    return shared.prefixSharedHidden(ids, { P, Rc, Rr });
   } finally {
     ids.dispose();
   }

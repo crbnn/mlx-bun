@@ -6,7 +6,6 @@ import { deviceArchitecture } from "@mlx-bun/mlx/ffi";
 import { loadModelConfig, type ModelConfig } from "../../src/artifacts/config";
 import type { Weights } from "../../src/artifacts/weights";
 import type { Composition } from "../../src/contracts/portable/composition";
-import { aneAvailable } from "../../src/kernels/ane/linear";
 import { resolveComposition } from "../../src/models/composition";
 import { createModel, openModel } from "../../src/models/factory";
 import { ModelImplementationRegistry } from "../../src/models/implementation";
@@ -29,8 +28,11 @@ afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 test("the default record: this machine, bf16, no drafter, the 2048-token chunk, no adapters, eight rows", () => {
   const composition = resolveComposition(config);
-  expect(composition).toEqual({ device: deviceArchitecture(), aneBridge: aneAvailable(), kv: { kind: "bf16" },
-    draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 8, speculativeAffineKv: true, packedMixedMlp: true });
+  expect(composition).toEqual({ device: deviceArchitecture(), aneBridge: true, kv: { kind: "bf16" },
+    draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 8, speculativeAffineKv: true, packedMixedMlp: true,
+    vectorGreedySampling: true });
+  // The Neural Engine bridge is composed unless the caller turns it off; nothing probes the machine.
+  expect(resolveComposition(config, { aneBridge: false }).aneBridge).toBe(false);
   expect(Object.isFrozen(composition)).toBe(true);
   expect(Object.isFrozen(composition.kv)).toBe(true);
 });

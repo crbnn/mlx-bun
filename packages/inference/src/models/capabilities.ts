@@ -1,5 +1,6 @@
 import type { GraphCapabilities } from "../contracts/portable/graph";
-import type { MlxCompiledDecodeStep, MlxDeclaredGraph } from "../contracts/mlx/graph";
+import type { MlxCompiledDecodeStep, MlxDeclaredGraph, MlxTokenPhases } from "../contracts/mlx/graph";
+import type { Composition } from "../contracts/portable/composition";
 
 type Declaration = Partial<Omit<GraphCapabilities, "adapters" | "kv" | "prefill" | "speculation">> & {
   readonly adapters?: Partial<GraphCapabilities["adapters"]>;
@@ -46,6 +47,18 @@ export function declaredGraph(model: object): MlxDeclaredGraph & { readonly grap
   if (media?.input === "pixels" && typeof graph.pixelInput !== "function")
     throw new TypeError("the graph declares pixel media input but provides no pixelInput");
   return graph as MlxDeclaredGraph;
+}
+
+/** The named token phases of a graph whose method is autoregressive, checked
+ * once where composition binds it; null for a denoising graph, whose canvas
+ * method runs none. An autoregressive graph without them is refused. */
+export function tokenPhasesOf(model: object): MlxTokenPhases & { readonly composition?: Composition } | null {
+  const graph = declaredGraph(model);
+  if (graph.graphCapabilities.method !== "autoregressive") return null;
+  const phases = model as Partial<MlxTokenPhases>;
+  for (const name of ["prefillChunk", "prefillTail", "decode", "verify", "appendKnown", "logits"] as const)
+    if (!phases[name]) throw new TypeError(`the graph declares the autoregressive method but provides no ${name} phase`);
+  return model as MlxTokenPhases & { readonly composition?: Composition };
 }
 
 /** The compiled decode step of a graph that declares one, created on first use

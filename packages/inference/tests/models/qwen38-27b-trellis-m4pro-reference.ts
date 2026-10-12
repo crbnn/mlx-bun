@@ -4,7 +4,9 @@
 // Changes from the source file: import paths; the constructor's third argument
 // `ane`, which replaces the aneAvailable() probe so a test builds the Neural
 // Engine plan only when it opts in (MLX_BUN_TEST_ANE=1); and quantizedCoreRead,
-// moved here verbatim from blocks.ts.
+// moved here verbatim from blocks.ts; since E2, the deprecated entry points it
+// inherited come from qwen35-deprecated-base.ts, and the ANE plan follows `ane`
+// alone (the probe it also asked went with E2).
 //
 // Qwen3.8-27B Trellis 3.2bpw (mlx-bun/Qwen3.8-27B-Trellis-3.2bpw) on the
 // M4 Pro GPU (applegpu_g16s) — the graph for this exact artifact on this exact
@@ -42,8 +44,9 @@ import * as ops from "@mlx-bun/mlx/ops";
 import type { Weights } from "../../src/artifacts/weights";
 import type { ModelConfig } from "../../src/artifacts/config";
 import type { Cache, GatedDeltaCache } from "../../src/contracts/mlx/cache";
-import type { TokenGroup } from "../../src/contracts/mlx/token-work";
+import type { TokenGroup } from "./frozen-token-groups";
 import { QuantizedLinear } from "../../src/layers/quantized-linear";
+import { qwenAppendChunkSize } from "../../src/layers/qwen-append";
 import type { TrellisLinear } from "../../src/layers/trellis-linear";
 import { compiledSwiglu } from "../../src/layers/swiglu";
 import { FactoredGateUpRow, FactoredGateUpRows, FactoredMixedGateUp, MmaGateUp } from "../../src/layers/trellis-gate-up";
@@ -51,10 +54,11 @@ import { FactoredDownK3iRow, FactoredDownK3iRows, FactoredDownRow, FactoredDownR
 import { Affine3MmaLinear, Affine3RowsLinear, Affine4MmaLinear, Affine4RowsLinear } from "../../src/layers/affine-verify-linear";
 import { kv4DecodeAttention } from "../../src/layers/kv4-decode-attention";
 import { foldedQuantizedSdpa } from "../../src/layers/quantized-attention";
-import { AneAffineSplit, AneTrellisMlpSplit, AneTrellisMlpSplitK3i, aneAvailable, type AneMlpSplit }
+import { AneAffineSplit, AneTrellisMlpSplit, AneTrellisMlpSplitK3i, type AneMlpSplit }
   from "../../src/layers/ane-prefill-split";
-import { deprecatedPhase, type ReadPhase } from "../../src/models/graph";
-import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
+import type { ReadPhase } from "../../src/models/graph";
+import { widthClass, type MlxWidthClass } from "../../src/contracts/mlx/graph";
+import { DeprecatedQwen35Base, deprecatedPhase } from "./qwen35-deprecated-base";
 import {
   GatedDeltaNet, Qwen3Attention, cacheRead, type AttentionLinear, type AttentionLinearLoader, type AttentionReadStrategy, type Qwen3Layer,
 } from "../../src/models/qwen/blocks";
@@ -123,7 +127,7 @@ const decodeCore: QuantizedAttentionCore = (q, keys, values, scale, groupSize, b
 const foldedCore: QuantizedAttentionCore = (q, keys, values, scale, groupSize, bits) =>
   foldedQuantizedSdpa(q, keys, values, scale, groupSize, bits);
 
-export class Qwen38TrellisM4Pro extends Qwen35Model {
+export class Qwen38TrellisM4Pro extends DeprecatedQwen35Base {
   readonly graph = QWEN38_TRELLIS_M4PRO_GRAPH;
   /** Verify forward cost by rows relative to one decode step (M4 Pro 24 GB). */
   readonly verifyRoundCosts: ReadonlyMap<number, number> = new Map([
@@ -206,7 +210,7 @@ export class Qwen38TrellisM4Pro extends Qwen35Model {
    *  program for the ANE chunk here; the system ANE cache keeps the compiled
    *  programs across processes. Projections of one shape share buffers. */
   #buildAnePlan(weights: Weights, config: ModelConfig): Step[] | null {
-    if (!this.#ane || !aneAvailable()) return null;
+    if (!this.#ane) return null;
     const started = performance.now();
     try {
       const affineShares = new Map<string, AneAffineSplit>();
@@ -234,7 +238,7 @@ export class Qwen38TrellisM4Pro extends Qwen35Model {
       throw new Error(`${QWEN38_TRELLIS_M4PRO_GRAPH}: expected Trellis gate/up/down in every MLP`);
     const { gate, up, down } = mlp;
     if (kind === "prefill") return (hidden, residual, phase) => {
-      using out = mlp.forward(hidden, phase);
+      using out = mlp.forward(hidden, phase, "wider"); // the prefill plan: more than eight rows
       return ops.add(residual, out);
     };
     const k3i = down.geometry.blockInterleave === 2;
@@ -269,11 +273,45 @@ export class Qwen38TrellisM4Pro extends Qwen35Model {
   /** One tapped group (speculative verify, draft-tapped prefill) runs a plan,
    *  forwarding each layer output and the final hidden to its capture callback.
    *  Several groups keep the generic token packing. */
+  /** Qwen35Model's committed append as the pre-D1 graph inherited it (frozen here since E2 moved the base's
+   *  qualification to construction): the 27B geometry and the M4 Pro device read when it is asked. */
+  createAppend(policy: { hasAdapters: boolean; pagedKv: boolean }) {
+    const t = this.config.text;
+    if (policy.hasAdapters || policy.pagedKv || this.loraState.active.length || this.mrope ||
+        t.hiddenSize !== 5120 || t.intermediateSize !== 17408 || this.layers.length !== 64 ||
+        t.headDim !== 256 || t.numAttentionHeads !== 24 || t.numKeyValueHeads !== 4)
+      return null;
+    if (deviceArchitecture() !== "applegpu_g16s") return null;
+    const qualified = (linear: QuantizedLinear) => {
+      const { mode, bits, groupSize } = linear.spec;
+      return mode === "affine" && [2, 3, 4, 6, 8].includes(bits) && [32, 64, 128].includes(groupSize);
+    };
+    for (const layer of this.layers) {
+      const a = layer.linearAttn, s = layer.selfAttn;
+      const attention = a ? [a.inProjQkv, a.inProjZ, a.inProjB, a.inProjA, a.outProj]
+        : [s!.qProj, s!.kProj, s!.vProj, s!.oProj];
+      const mlp = layer.mlp.kind === "affine" ? [layer.mlp.gate, layer.mlp.up, layer.mlp.down] : [];
+      if (!attention.every(qualified) || !mlp.every(qualified)) return null;
+    }
+    return {
+      affineKvBits: [4, 8],
+      turboQuantFormats: [{ kBits: 8, vBits: 3 }],
+      maxChunkSize: (state: readonly Cache[], rows = 1) => rows === 1 ? qwenAppendChunkSize(state[0]!.offset) : 1,
+      forwardHidden: (ids: MlxArray, cache: Cache[]): MlxArray => {
+        const [rows, tokens] = ids.shape as [number, number];
+        if (ids.shape.length !== 2 || !(rows === 1 ? tokens <= 4 : rows > 1 && tokens === 1))
+          throw new Error("Qwen committed-token append supports one position per shared row or up to four positions at B=1");
+        return this.forwardLayers(this.embed.encode(ids), cache, deprecatedPhase(ids, true), undefined, null,
+          widthClass(rows * tokens), tokens > 4);
+      },
+    };
+  }
+
   override forwardHiddenMixed(work: readonly TokenGroup[]): MlxArray[] {
     const only = work.length === 1 ? work[0]! : null;
     if (!only?.captureLayer) return super.forwardHiddenMixed(work);
     const out = this.forwardLayers(this.embed.encode(only.ids), only.cache, deprecatedPhase(only.ids), undefined,
-      only.captureLayer);
+      only.captureLayer, widthClass(only.ids.shape[0]! * only.ids.shape[1]!), only.ids.shape[1]! > 4);
     only.captureLayer(this.layers.length, out);
     return [out];
   }
@@ -287,17 +325,17 @@ export class Qwen38TrellisM4Pro extends Qwen35Model {
   }
 
   /** Text forward over the plan the row count matches. Consumes h0. */
-  protected override forwardLayers(h0: MlxArray, cache: Cache[], phase: ReadPhase, positions?: MlxArray,
-    capture: ((layer: number, hidden: MlxArray) => void) | null = null): MlxArray {
+  protected override forwardLayers(h0: MlxArray, cache: Cache[], phase: ReadPhase, positions: MlxArray | undefined,
+    capture: ((layer: number, hidden: MlxArray) => void) | null, width: MlxWidthClass, boundedGeneric: boolean): MlxArray {
     const kv = cache[this.faIdx]!.quantizedAttention;
     if (positions || this.mrope || phase === "committed" || h0.shape[0] !== 1 || this.loraState.active.length ||
         (kv && (kv.bits !== 4 || kv.groupSize !== 64)) || (globalThis as Record<string, unknown>).__deltaProf)
-      return super.forwardLayers(h0, cache, phase, positions, capture);
+      return super.forwardLayers(h0, cache, phase, positions, capture, width, boundedGeneric);
     const L = h0.shape[1]!;
     const faMask = cache[this.faIdx]!.makeMask(L, null);
     if (faMask.arr) {
       faMask.arr.dispose();
-      return super.forwardLayers(h0, cache, phase, positions, capture);
+      return super.forwardLayers(h0, cache, phase, positions, capture, width, boundedGeneric);
     }
     const steps = this.#planFor(L), bounded = L > 8;
     let h: MlxArray | null = h0;

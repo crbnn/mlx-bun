@@ -17,6 +17,7 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { Gemma4Model } from "../gemma4/model";
 import type { DraftProjection } from "../../contracts/mlx/draft-projection";
+import { widthClass } from "../../contracts/mlx/graph";
 import type { DsparkContextAttention, DsparkDrafterModel } from "../../contracts/mlx/drafter";
 import { loadAdapterTensors } from "../../adapters/manager";
 import { writeShardedSafetensors, type NamedTensor } from "../../artifacts/safetensors-writer";
@@ -333,10 +334,10 @@ export class DflashDrafter implements DsparkDrafterModel {
     return pairs;
   }
 
-  #baseLogits(model: DraftProjection, block: MlxArray): MlxArray {
+  #baseLogits(model: DraftProjection, block: MlxArray, anchors: number): MlxArray {
     const hOut = ops.matmul(block, this.get("out_proj")); // [A,γ,H]
     const hBf = hOut.astype(model.embed.scales.dtype); hOut.dispose();
-    const logits = model.logitsFromHidden(hBf); hBf.dispose();
+    const logits = model.logits[widthClass(anchors * this.cfg.gamma)](hBf); hBf.dispose();
     return logits;
   }
   #markov(prevToks: MlxArray): { B: MlxArray; emb1: MlxArray } {
@@ -417,7 +418,7 @@ export class DflashDrafter implements DsparkDrafterModel {
     let B: MlxArray | null = null, emb1: MlxArray | null = null;
     try {
       block = this.#backbone(hCtx, anchorEmb, ctxMask, A);
-      const U = this.#baseLogits(model, block);
+      const U = this.#baseLogits(model, block, A);
       Uf = U.astype(CDT); U.dispose();
       ({ B, emb1 } = this.#seqHead(prevToks));
       const draftLogits = ops.add(Uf, B);
@@ -449,7 +450,7 @@ export class DflashDrafter implements DsparkDrafterModel {
     using embeddings = model.embed.encode(ids);
     using anchorEmb = ops.reshape(embeddings, [B, this.dims.hiddenSize]);
     using block = this.#backbone(hCtx, anchorEmb, null, B, context);
-    using raw = this.#baseLogits(model, block);
+    using raw = this.#baseLogits(model, block, B);
     using base = raw.astype(CDT);
     const isRnn = this.cfg.seqHead === "rnn";
     let state: MlxArray | null = isRnn ? zerosArray([B, r]) : null;
