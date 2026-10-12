@@ -21,7 +21,8 @@ import type { Weights } from "../../src/artifacts/weights";
 import type { BatchableCache, Cache } from "../../src/contracts/mlx/cache";
 import { widthClass, type MlxLayerCapture, type MlxWidthTable } from "../../src/contracts/mlx/graph";
 import type { Composition, KvStorageScheme } from "../../src/contracts/portable/composition";
-import { LAYERS, Qwen38TrellisM4Pro } from "../../src/models/qwen/qwen38-27b-trellis-m4pro";
+import { AneProgram } from "../../src/kernels/ane/linear";
+import { LAYERS, Qwen38TrellisM4Pro, anePrograms, type AneWidths } from "../../src/models/qwen/qwen38-27b-trellis-m4pro";
 import { unfusedAffineKernels } from "../../src/state/affine-attention";
 import { AttentionMasks } from "../../src/state/attention-read";
 import { Bf16FirstKv4Head256Cache, Bf16FirstQuantizedKVCache, Bf16FirstTurboQuantKVCache, convertToAffine } from "../../src/state/bf16-first-kv";
@@ -235,6 +236,12 @@ const disposeAll = (...sets: Cache[][]) => { for (const set of sets) for (const 
 
 type Scheme = "bf16" | "kv4";
 const SCHEMES: Scheme[] = ["bf16", "kv4"];
+
+/** The install step for a graph's Neural Engine programs at `widths` (the artifact's by default): construction only
+ *  loads them. The synthetic artifact's: in_proj_z and out_proj VALUE_DIM wide, o_proj HEADS × HEAD_DIM. */
+const SYNTHETIC_ANE_WIDTHS: AneWidths = { hidden: HIDDEN, intermediate: INTER,
+  projections: [[HIDDEN, VALUE_DIM], [VALUE_DIM, HIDDEN], [HEADS * HEAD_DIM, HIDDEN]] };
+const compileAne = (record: Composition, widths?: AneWidths) => { for (const spec of anePrograms(record, widths)) AneProgram.compile(spec); };
 
 let synthetic: { weights: Weights; config: ModelConfig } | null = null;
 const source = () => synthetic ??= artifact();
@@ -531,7 +538,9 @@ describe("Qwen3.8 M4 Pro graph on the real artifact", () => {
     const weights = await Weights.open(ARTIFACT!);
     try {
       // The new graph installs the checkpoint view; the old graphs read through it and must not install it again.
-      const current = new Qwen38TrellisM4Pro(weights, config, composition({ aneBridge: ANE, prefillChunkTokens: 2048 }));
+      const record = composition({ aneBridge: ANE, prefillChunkTokens: 2048 });
+      compileAne(record);
+      const current = new Qwen38TrellisM4Pro(weights, config, record);
       const shared = {
         tensor: (name: string) => weights.tensor(name), has: (name: string) => weights.has(name), info: (name: string) => weights.info(name),
         get tensorNames() { return weights.tensorNames; }, shards: weights.shards, setView: () => {},
@@ -652,9 +661,11 @@ describe("Qwen3.8 M4 Pro graph on the real artifact", () => {
 describe("Qwen3.8 M4 Pro graph, Neural Engine chunk operation (MLX_BUN_TEST_ANE=1)", () => {
   for (const scheme of SCHEMES) test.skipIf(!ANE)(`${scheme}: prefillChunk.ane against the old ANE plan, prefillChunk.gpu against the old prefill plan, at 2048 rows`, () => {
     const { weights, config } = source();
+    const record = composition({ aneBridge: true, prefillChunkTokens: 2048 });
+    compileAne(record, SYNTHETIC_ANE_WIDTHS);
     const oldAne = new FrozenM4Pro(weights, config, true);
     const { old } = graphs();
-    const current = new Qwen38TrellisM4Pro(weights, config, composition({ aneBridge: true, prefillChunkTokens: 2048 }));
+    const current = new Qwen38TrellisM4Pro(weights, config, record);
     expect(current.prefillChunk.ane).toBeDefined();
     const make = () => scheme === "kv4" ? kv4Caches() : current.makeCache();
     const sets = [make(), make(), make(), make()];

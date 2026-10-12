@@ -1,4 +1,5 @@
 export * from "./composition";
+export * from "./ane-install";
 export * from "./factory";
 export * from "./runtime";
 export * from "./memory-plan";

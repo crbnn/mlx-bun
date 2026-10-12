@@ -1,5 +1,6 @@
 import type { ModelConfig } from "../artifacts/config";
 import type { AffineKvLayer, Composition, DraftDepth } from "../contracts/portable/composition";
+import type { AneProgramSpec } from "../kernels/ane/linear";
 import {
   assertResolvedModelProfile,
   type GenerationLoop,
@@ -115,6 +116,9 @@ export interface GraphEntry<Source, Model> {
   readonly id: string;
   readonly serves: ServedComposition;
   create(source: Source, config: ModelConfig, composition: Composition): Model;
+  /** The Neural Engine programs `create` loads for `composition`, a function of the composition alone (no
+   * weights, no artifact files): what the install step compiles (`compileAnePrograms`). Absent: none. */
+  anePrograms?(composition: Composition): readonly AneProgramSpec[];
 }
 
 const kvKey = (scheme: ServedKv): string => {

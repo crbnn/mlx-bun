@@ -14,6 +14,7 @@ import {
 } from "./qwen/qwen38-27b-trellis-tq";
 import {
   COMPOSITION as QWEN38_TRELLIS_M4PRO_COMPOSITION, QWEN38_TRELLIS_M4PRO_GRAPH, Qwen38TrellisM4Pro,
+  anePrograms as qwen38TrellisM4ProAnePrograms,
 } from "./qwen/qwen38-27b-trellis-m4pro";
 import { GENERATED_GRAPHS, type GeneratedGemma4Graph } from "./gemma4/generated/index";
 import { MiniCPM5Model } from "./minicpm5/model";
@@ -71,7 +72,8 @@ export const MLX_GRAPH_TABLES: Readonly<Record<ModelGraph, GraphTable<Weights, R
   // (architecture plus the complete quantization table).
   "qwen3.5": new GraphTable([
     { id: QWEN38_TRELLIS_M4PRO_GRAPH, serves: QWEN38_TRELLIS_M4PRO_COMPOSITION,
-      create: (weights, config, composition) => new Qwen38TrellisM4Pro(weights, config, composition) },
+      create: (weights, config, composition) => new Qwen38TrellisM4Pro(weights, config, composition),
+      anePrograms: composition => qwen38TrellisM4ProAnePrograms(composition) },
     { id: QWEN38_TRELLIS_TQ_GRAPH, serves: QWEN38_TRELLIS_TQ_COMPOSITION,
       create: (weights, config, composition) => new Qwen38TrellisTQ(weights, config, composition) },
     generic("qwen3.5", (weights, config, composition) => new Qwen35Model(weights, config, composition)),

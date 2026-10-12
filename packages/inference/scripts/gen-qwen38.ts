@@ -77,10 +77,21 @@ export interface Qwen38LayerSpec {
   readonly downLayout: "rowMajor" | "k3Interleaved";
 }
 
+/** The widths a layer's Neural Engine programs are built at: the MLP's hidden and
+ * intermediate widths (config) and each projection's input and output width by
+ * name (its stored weight and quantization width). Every layer of a kind has the
+ * same widths. */
+export interface Qwen38Widths {
+  readonly hidden: number;
+  readonly intermediate: number;
+  readonly projections: Readonly<Record<string, readonly [number, number]>>;
+}
+
 export interface Qwen38Description {
   /** Where the description was read: repo@revision. */
   readonly source: string;
   readonly fingerprint: string;
+  readonly widths: Qwen38Widths;
   readonly layers: readonly Qwen38LayerSpec[];
 }
 
@@ -166,15 +177,29 @@ export async function describeArtifact(dir: string): Promise<Qwen38Description> 
   const t = config.text;
   const downNames = Array.from({ length: t.numHiddenLayers }, (_, i) => [
     `language_model.model.layers.${i}.mlp.down_proj.weight`, `model.language_model.layers.${i}.mlp.down_proj.weight`]).flat();
-  const shapes = await storedShapes(dir, downNames);
+  // The first DeltaNet and the first attention layer: every layer of a kind has their projection widths.
+  const firstOf = { deltanet: 0, attention: t.fullAttentionInterval - 1 };
+  const projectionPaths = [
+    ...DELTANET_PROJECTIONS.map(name => [name, `layers.${firstOf.deltanet}.linear_attn.${name}`] as const),
+    ...ATTENTION_PROJECTIONS.map(name => [name, `layers.${firstOf.attention}.self_attn.${name}`] as const),
+  ];
+  const projectionNames = projectionPaths.flatMap(([, path]) => [`language_model.model.${path}.weight`, `model.language_model.${path}.weight`]);
+  const shapes = await storedShapes(dir, [...downNames, ...projectionNames]);
+  const bits = (path: string) => {
+    const spec = quantFor(config.quantization, path);
+    if (!spec) throw new Error(`${path}: no quantization entry`);
+    return spec.bits;
+  };
+  const projections = Object.fromEntries(projectionPaths.map(([name, path], j): [string, [number, number]] => {
+    // A packed affine weight is [outputs, inputs · bits / 32] words.
+    const shape = shapes.get(projectionNames[2 * j]!) ?? shapes.get(projectionNames[2 * j + 1]!);
+    if (!shape || shape.length !== 2) throw new Error(`${path}: no stored 2-D weight`);
+    return [name, [shape[1]! * 32 / bits(`language_model.model.${path}`), shape[0]!]];
+  }));
+  const widths: Qwen38Widths = { hidden: t.hiddenSize, intermediate: t.intermediateSize, projections };
   const layers = Array.from({ length: t.numHiddenLayers }, (_, i): Qwen38LayerSpec => {
     const prefix = `language_model.model.layers.${i}`;
     const kind = (i + 1) % t.fullAttentionInterval !== 0 ? "deltanet" : "attention";
-    const bits = (path: string) => {
-      const spec = quantFor(config.quantization, path);
-      if (!spec) throw new Error(`${path}: no quantization entry`);
-      return spec.bits;
-    };
     const projections = kind === "deltanet"
       ? DELTANET_PROJECTIONS.map(name => bits(`${prefix}.linear_attn.${name}`))
       : ATTENTION_PROJECTIONS.map(name => bits(`${prefix}.self_attn.${name}`));
@@ -183,7 +208,7 @@ export async function describeArtifact(dir: string): Promise<Qwen38Description> 
     return { kind, projections, gate: bits(`${prefix}.mlp.gate_proj`), up: bits(`${prefix}.mlp.up_proj`),
       down: bits(`${prefix}.mlp.down_proj`), downLayout: shape.length === 3 ? "k3Interleaved" : "rowMajor" };
   });
-  return { source: sourceOf(dir), fingerprint: qwen38TrellisTqFingerprint(config), layers };
+  return { source: sourceOf(dir), fingerprint: qwen38TrellisTqFingerprint(config), widths, layers };
 }
 
 export async function readDescription(source: string): Promise<Qwen38Description> {
@@ -215,6 +240,14 @@ export function emitQwen38Graph(description: Qwen38Description, stem: string): s
   const affineLayers = [...new Set([...Object.values(k.projections).flatMap(p => p ? [p[3], p[4]] : []), ...Object.values(k.head)])];
   const one = k.mlp.one;
   const aneProjections = k.ane.projections;
+  /** Each distinct [inputs, outputs] shape of the split projections, with the projections that have it. */
+  const aneShapes = [...aneProjections.reduce((shapes, name) => {
+    const shape = description.widths.projections[name];
+    if (!shape) throw new Error(`${stem}: the description has no widths for ${name}`);
+    const key = shape.join("→");
+    shapes.set(key, [shape, [...(shapes.get(key)?.[1] ?? []), name]]);
+    return shapes;
+  }, new Map<string, [readonly [number, number], string[]]>()).values()];
   /** Blocks are built once per projection layer pair and shared by the classes that name it. */
   const blocksName = (p: { 3: string; 4: string }) => `${p[4][0]!.toLowerCase()}${p[4].slice(1).replace(/Linear$/, "")}Blocks`;
   const projectionSets = [...new Map(NARROW.flatMap(cls => k.projections[cls] ? [[blocksName(k.projections[cls]!), k.projections[cls]!] as const] : [])).entries()];
@@ -310,8 +343,11 @@ import type { MediaEncoders, MlxPromptInput, Vision } from "../../contracts/mlx/
 import type { MropeForwardState } from "../../contracts/mlx/positions";
 import type { Composition } from "../../contracts/portable/composition";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
+import type { AneProgramSpec } from "../../kernels/ane/linear";
 import { ${affineLayers.sort().join(", ")} } from "../../layers/affine-verify-linear";
-import { ${[k.ane.affine, k.ane.rowMajorMlp, k.ane.k3InterleavedMlp].sort().join(", ")}, type AneMlpSplit } from "../../layers/ane-prefill-split";
+import {
+  ${[k.ane.affine, k.ane.rowMajorMlp, k.ane.k3InterleavedMlp].sort().join(", ")}, aneAffineSplitProgram, aneMlpSplitProgram, type AneMlpSplit,
+} from "../../layers/ane-prefill-split";
 import { disposing } from "../../layers/helpers";
 import { LoraState } from "../../layers/lora";
 import { RMSNorm } from "../../layers/normalization";
@@ -372,6 +408,33 @@ const ANE_PROJECTIONS: ReadonlySet<string> = new Set(${list(aneProjections)});
 const ASYNC_EVERY = ${k.asyncEvery};
 /** The Neural Engine's channel fraction in each split. */
 const ANE_FRACTION = ${k.ane.fraction};
+
+/** The widths a graph's Neural Engine programs are built at: the MLP's hidden and intermediate widths, and the input
+ *  and output widths of each distinct split projection shape. */
+export interface AneWidths {
+  readonly hidden: number;
+  readonly intermediate: number;
+  readonly projections: readonly (readonly [number, number])[];
+}
+
+/** The artifact's widths, from its description: ${aneShapes.map(([shape, names]) => `${names.join(", ")} ${shape[0]}→${shape[1]}`).join("; ")}. */
+export const ANE_WIDTHS: AneWidths = Object.freeze({
+  hidden: ${description.widths.hidden}, intermediate: ${description.widths.intermediate},
+  projections: Object.freeze([${aneShapes.map(([shape]) => `[${shape[0]}, ${shape[1]}]`).join(", ")}] as const),
+});
+
+/** The distinct Neural Engine programs this graph loads for \`composition\`, at the artifact's widths unless
+ *  \`widths\` names others (a synthetic artifact laid out like it): none without the bridge or with adapters mounted,
+ *  otherwise the whole-MLP slice every layer shares and one program per split projection shape, each for exactly the
+ *  composition's chunk size. The install step compiles them into the system cache (\`compileAnePrograms\`,
+ *  models/ane-install); the constructor only loads them, so one missing there fails construction with
+ *  \`AneBridgeError\`. */
+export function anePrograms(composition: Composition, widths: AneWidths = ANE_WIDTHS): AneProgramSpec[] {
+  if (!composition.aneBridge || composition.adapters) return [];
+  const chunk = composition.prefillChunkTokens;
+  return [aneMlpSplitProgram(widths.hidden, widths.intermediate, ANE_FRACTION, chunk),
+    ...widths.projections.map(([inputs, outputs]) => aneAffineSplitProgram(inputs, outputs, ANE_FRACTION, chunk))];
+}
 
 /** One layer: input norm, mixer, residual, post-attention norm, MLP, residual. Consumes nothing; returns an owned output.
  *  \`width\` is the class of \`x\`'s rows the calling operation names (the generic blocks' MLP reads it). */
@@ -509,7 +572,8 @@ ${narrowSets}
     // The Neural Engine chunk operation, for exactly the composition's chunk
     // size. Layers run one at a time, so each MLP split shares the previous
     // layer's program and projections of one shape share theirs: one loaded
-    // program per shape.
+    // program per shape, the programs \`anePrograms\` lists, loaded from the
+    // compile cache the install step filled (nothing compiles here).
     let ane: Step[] | null = null;
     if (composition.aneBridge && !composition.adapters) {
       const started = performance.now(), chunk = composition.prefillChunkTokens;
@@ -763,8 +827,9 @@ Compositions: ${Object.values(QWEN38_COMPOSITIONS).map(c => `${c.stem} (${c.arti
   if (values.help) { console.log(usage); process.exit(0); }
   if (values.describe) {
     if (positionals.length !== 1) { console.error(usage); process.exit(1); }
-    const { source, fingerprint, layers } = await describeArtifact(positionals[0]!);
-    console.log(`{\n "source": ${JSON.stringify(source)},\n "fingerprint": ${JSON.stringify(fingerprint)},\n "layers": [\n` +
+    const { source, fingerprint, widths, layers } = await describeArtifact(positionals[0]!);
+    console.log(`{\n "source": ${JSON.stringify(source)},\n "fingerprint": ${JSON.stringify(fingerprint)},\n` +
+      ` "widths": ${JSON.stringify(widths)},\n "layers": [\n` +
       layers.map(layer => `  ${JSON.stringify(layer)}`).join(",\n") + "\n ]\n}");
     process.exit(0);
   }

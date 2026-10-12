@@ -67,8 +67,11 @@ import type { MediaEncoders, MlxPromptInput, Vision } from "../../contracts/mlx/
 import type { MropeForwardState } from "../../contracts/mlx/positions";
 import type { Composition } from "../../contracts/portable/composition";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
+import type { AneProgramSpec } from "../../kernels/ane/linear";
 import { Affine3MmaLinear, Affine3RowsLinear, Affine4MmaLinear, Affine4RowsLinear } from "../../layers/affine-verify-linear";
-import { AneAffineSplit, AneTrellisMlpSplit, AneTrellisMlpSplitK3i, type AneMlpSplit } from "../../layers/ane-prefill-split";
+import {
+  AneAffineSplit, AneTrellisMlpSplit, AneTrellisMlpSplitK3i, aneAffineSplitProgram, aneMlpSplitProgram, type AneMlpSplit,
+} from "../../layers/ane-prefill-split";
 import { disposing } from "../../layers/helpers";
 import { LoraState } from "../../layers/lora";
 import { RMSNorm } from "../../layers/normalization";
@@ -192,6 +195,33 @@ const ANE_PROJECTIONS: ReadonlySet<string> = new Set(["in_proj_z", "out_proj", "
 const ASYNC_EVERY = 4;
 /** The Neural Engine's channel fraction in each split. */
 const ANE_FRACTION = 0.55;
+
+/** The widths a graph's Neural Engine programs are built at: the MLP's hidden and intermediate widths, and the input
+ *  and output widths of each distinct split projection shape. */
+export interface AneWidths {
+  readonly hidden: number;
+  readonly intermediate: number;
+  readonly projections: readonly (readonly [number, number])[];
+}
+
+/** The artifact's widths, from its description: in_proj_z 5120→6144; out_proj, o_proj 6144→5120. */
+export const ANE_WIDTHS: AneWidths = Object.freeze({
+  hidden: 5120, intermediate: 17408,
+  projections: Object.freeze([[5120, 6144], [6144, 5120]] as const),
+});
+
+/** The distinct Neural Engine programs this graph loads for `composition`, at the artifact's widths unless
+ *  `widths` names others (a synthetic artifact laid out like it): none without the bridge or with adapters mounted,
+ *  otherwise the whole-MLP slice every layer shares and one program per split projection shape, each for exactly the
+ *  composition's chunk size. The install step compiles them into the system cache (`compileAnePrograms`,
+ *  models/ane-install); the constructor only loads them, so one missing there fails construction with
+ *  `AneBridgeError`. */
+export function anePrograms(composition: Composition, widths: AneWidths = ANE_WIDTHS): AneProgramSpec[] {
+  if (!composition.aneBridge || composition.adapters) return [];
+  const chunk = composition.prefillChunkTokens;
+  return [aneMlpSplitProgram(widths.hidden, widths.intermediate, ANE_FRACTION, chunk),
+    ...widths.projections.map(([inputs, outputs]) => aneAffineSplitProgram(inputs, outputs, ANE_FRACTION, chunk))];
+}
 
 /** One layer: input norm, mixer, residual, post-attention norm, MLP, residual. Consumes nothing; returns an owned output.
  *  `width` is the class of `x`'s rows the calling operation names (the generic blocks' MLP reads it). */
@@ -365,7 +395,8 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph, MlxTokenPhases {
     // The Neural Engine chunk operation, for exactly the composition's chunk
     // size. Layers run one at a time, so each MLP split shares the previous
     // layer's program and projections of one shape share theirs: one loaded
-    // program per shape.
+    // program per shape, the programs `anePrograms` lists, loaded from the
+    // compile cache the install step filled (nothing compiles here).
     let ane: Step[] | null = null;
     if (composition.aneBridge && !composition.adapters) {
       const started = performance.now(), chunk = composition.prefillChunkTokens;

@@ -58,6 +58,18 @@ export interface CompositionRequest {
  * and the prefill chunk override from the current runtime configuration. The
  * result is frozen. */
 export function resolveComposition(config: ModelConfig, request: CompositionRequest = {}): Composition {
+  return compose(request, resolveKvScheme({ ...request.kv, config: config.kvQuant }).storage);
+}
+
+/** The record a load resolves on this machine without an artifact's config:
+ * `resolveComposition` with bf16 KV, which is what a load with no KV flag
+ * resolves. The install step compiles the Neural Engine programs of this record
+ * (`compileAnePrograms`), so it needs no downloaded model. Frozen. */
+export function machineComposition(request: Omit<CompositionRequest, "kv"> = {}): Composition {
+  return compose(request, resolveKvScheme({}).storage);
+}
+
+function compose(request: Omit<CompositionRequest, "kv">, kv: Composition["kv"]): Composition {
   const maxRows = request.maxRows ?? DEFAULT_MAX_ROWS;
   if (!Number.isSafeInteger(maxRows) || maxRows < 1) throw new Error("composition maxRows must be a positive integer");
   const draft = request.draft;
@@ -67,7 +79,7 @@ export function resolveComposition(config: ModelConfig, request: CompositionRequ
   return Object.freeze({
     device: deviceArchitecture(),
     aneBridge: request.aneBridge ?? true,
-    kv: resolveKvScheme({ ...request.kv, config: config.kvQuant }).storage,
+    kv,
     draftDepth: !draft ? 0 : draft.adaptive ? Object.freeze({ adaptive: true as const, max: draft.numDraftTokens }) : draft.numDraftTokens,
     prefillChunkTokens: resolveChunkTokens(runtime),
     adapters: request.adapters ?? false,
