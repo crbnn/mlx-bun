@@ -620,6 +620,29 @@ Exit: selection is data; `qwen38TrellisM4ProAccepts` and the nested ternary are 
       request at four rows against the same request at one row on the M4 Pro composition, the
       number the bit-stability decision promised to record; the paired benchmark, which E2
       could not run on a busy machine, runs on the merge.
+- [x] Merged with B3 onto the integration branch (832ac8b1): no textual conflict; B3 had kept
+      the layout function names over its table, so E2's callers bound unchanged; one fix,
+      B3's `cache-lego-methods` test still called the deleted `forwardHidden` /
+      `logitsFromHidden` (typed `any`) and now drives the phases, with its KL numbers
+      unchanged. Both generators produce no diff. Ratchet: both parents' deletions, nothing
+      new (left: geglu 1, glm52 2, flash-cce 9, the TQ graph's `graph-extends` 2, four
+      `cache-escape`). Gates: typecheck clean; architecture 21; drift 7; `cache-contract`
+      190/190; root test exit 0 (inference 2347 pass / 85 skip); every real-weight suite at
+      E2's counts and lines; the 100-cell digest matrix (five artifacts × five schemes × two
+      chunk sizes × one and four rows, 250 row digests) identical to E2; `qwen-trellis-parity`
+      on the M1 Max 4/4 bit-exact. Inventories at 1 / 2 / 4 / 8 rows: factored row kernels,
+      the matrix-unit down at four, the matrix-unit set at five to eight, generic 0 at every
+      width. M1 Max paired check, workflow steps, preflight clear: against main, Trellis TQ
+      decode 14.1 → 14.0 (0.995 [0.989, 1.002]), prefill 1k 120.5 → 121.8, cold TTFT 6284 →
+      6217 ms; e4b decode 63.1 → 63.0, prefill 954 → 961, TTFT 702 → 697 ms; against the
+      previous head within noise everywhere. Found: Trellis decode RSS on the M1 Max is
+      7614 MB on main and 12050 MB merged (11843 MB already at 918a6afb, so it predates E2
+      and B3): owed, a bisection across the landed steps and the reason, before the merge to
+      main; memory is one of the three axes. Not run: both M4 Pro benchmarks (its preflight
+      failed 90 times on 4.5 GB of swap; the machine needs a reboot) and the DFlash 2
+      comparison anywhere (the M1 Max's artifact snapshot lacked `final_gain` until
+      2026-10-12, now copied in). Owed on a rebooted M4 Pro: the default and the DFlash 2
+      adaptive paired runs, main against the integration head.
 
 Exit: one request and four concurrent requests on the M4 Pro composition both dispatch the
 Trellis row kernels for their width, shown by the op inventory diagnostic, with no generic path
