@@ -8,7 +8,7 @@ import type { ResolvedExecution } from "../../src/contracts/portable/execution";
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
 import { KVCache } from "../../src/state/kv";
 import type { ContinuationServices, ContinuationStore } from "../../src/execution/continuation";
-import { ContinuationPersistence } from "../../src/execution/continuation-persistence";
+import { ContinuationPersistence } from "../../src/state/continuation-persistence";
 import { kvOf, testComposition, type KvOptions } from "../models/test-composition";
 
 const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,

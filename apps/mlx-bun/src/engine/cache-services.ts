@@ -2,9 +2,9 @@ import { readFileSync } from "node:fs";
 import { modelIdentity } from "@mlx-bun/hub/registry";
 import { kvSchemeOf, supportsTurboQuantHeadDim, TURBOQUANT_HEAD_DIMS } from "@mlx-bun/inference/state/kv-scheme";
 import type { Cache } from "@mlx-bun/inference/contracts/mlx";
-import type { PromptCache, TieredPromptCache, SsdCacheStore, SsdIndexEntry,
+import type { PromptCache, TieredPromptCache, SsdCacheStore, SsdIndexEntry, ContinuationPersistence,
   CacheCodecProvider, ColdTier, DurabilitySnapshotStats, DurabilityFlushResult } from "@mlx-bun/inference/state";
-import type { ContinuationPersistence, MlxGatewayBinding } from "@mlx-bun/inference/execution";
+import type { MlxGatewayBinding } from "@mlx-bun/inference/execution";
 import type { LoadedModelContext } from "./model-host";
 import type { ModelBinding } from "./model-binding";
 import { createKvBudget, type KvBudget } from "./kv-budget";
@@ -46,16 +46,15 @@ export interface CacheServiceDependencies {
 }
 
 async function defaultDependencies(): Promise<CacheServiceDependencies> {
-  const [state, execution, artifacts, memory] = await Promise.all([
-    import("@mlx-bun/inference/state"), import("@mlx-bun/inference/execution"),
-    import("@mlx-bun/inference/artifacts"), import("@mlx-bun/mlx/ffi"),
+  const [state, artifacts, memory] = await Promise.all([
+    import("@mlx-bun/inference/state"), import("@mlx-bun/inference/artifacts"), import("@mlx-bun/mlx/ffi"),
   ]);
   return {
     defaultStateCodecs: state.legacyCacheCodecs, cloneState: state.cloneKvCaches,
     createPromptCache: (...args) => new state.PromptCache(...args),
     createTieredPromptCache: (...args) => new state.TieredPromptCache(...args),
     createStore: options => new state.SsdCacheStore(options),
-    createContinuationPersistence: (...args) => new execution.ContinuationPersistence(...args),
+    createContinuationPersistence: (...args) => new state.ContinuationPersistence(...args),
     costSizeRetention: () => new state.CostSizeRetention(), configFingerprint: artifacts.configFingerprint,
     modelIdentity,
     activeMemory: memory.activeMemory, maxWorkingSet: memory.maxRecommendedWorkingSetSize,

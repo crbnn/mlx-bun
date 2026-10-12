@@ -1,5 +1,5 @@
 import type { ModelConfig } from "../artifacts/config";
-import { kvBytesAt, KvScheme } from "../state/kv-scheme";
+import { kvBytesAt, KvScheme } from "./kv-scheme";
 
 /** Project one batch row's worst-case KV bytes using the same per-layer
  * scheme that the server-wide admission ceiling uses. */

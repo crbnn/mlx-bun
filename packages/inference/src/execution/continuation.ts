@@ -4,7 +4,7 @@ import { generationCheckpointKey } from "../generation/checkpoint-identity";
 import type { GenerateOptions } from "../generation/index";
 import { disposeResources } from "../runtime/resources";
 import type { MlxPrefixCache } from "../state/checkpoint";
-import type { ContinuationPersistence } from "./continuation-persistence";
+import type { ContinuationPersistence } from "../state/continuation-persistence";
 
 /** Cache and checkpoint services the application binds once per loaded model;
  * the gateway binding reads them for paged state and qualified continuation. */

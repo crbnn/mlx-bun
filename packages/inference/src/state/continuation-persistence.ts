@@ -1,11 +1,29 @@
-import { SpillQueue } from "../state/persistence";
-import { type SpillItem } from "../state/persistence-types";
-import { cacheBytes } from "../state/prefix-cache";
+import { SpillQueue } from "./persistence";
+import { type SpillItem } from "./persistence-types";
+import { cacheBytes } from "./prefix-cache";
 import { disposeResources } from "../runtime/resources";
-import type { ContinuationStore, OrdinaryContinuationState } from "./continuation-types";
+import type { Cache } from "../contracts/mlx/cache";
+import type { SsdCacheStore } from "./ssd-cache";
+
+/** The saved-state operations generation checkpoints use. */
+export type ContinuationStore = Pick<SsdCacheStore, "findGenerationCheckpoint" | "restore" |
+  "storeGenerationCheckpoint" | "removeGenerationCheckpoints">;
+
+/** A replayable generation's state: caches covering the prompt and the
+ * generated tokens, the token sampled from them but not yet emitted, and the
+ * seed its sampler continues from. */
+export interface ContinuationState {
+  caches: Cache[];
+  cacheTokens: number[];
+  generatedTokens: number;
+  pendingToken: number;
+  seed: number;
+}
 
 type Metadata = Parameters<ContinuationStore["storeGenerationCheckpoint"]>[2];
-interface Attempt { key: string; completed: boolean; pending: number; failed: boolean; version: number; retired: boolean }
+/** One request's checkpoint writes under its key. */
+export interface ContinuationAttempt { key: string; completed: boolean; pending: number; failed: boolean; version: number; retired: boolean }
+type Attempt = ContinuationAttempt;
 interface Job { attempt: Attempt; metadata?: Metadata; cleanup?: number }
 
 /** One coordinator per checkpoint store. Queue owns snapshots through disk
@@ -48,7 +66,7 @@ export class ContinuationPersistence {
     return attempt;
   }
   /** Takes ownership even when a completed/superseded attempt declines it. */
-  enqueue(attempt: Attempt, state: Omit<OrdinaryContinuationState, "seed">, metadata: Metadata): void {
+  enqueue(attempt: Attempt, state: Omit<ContinuationState, "seed">, metadata: Metadata): void {
     if (attempt.completed || this.#attempts.get(attempt.key) !== attempt) {
       disposeResources(state.caches); return;
     }

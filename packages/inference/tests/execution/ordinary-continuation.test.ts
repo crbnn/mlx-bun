@@ -42,7 +42,7 @@ test("inconsistent restored coverage releases owned state before rejecting", () 
 
 test("restoring an implicit seed recovers the original sampler", async () => {
   const { createOrdinaryContinuationRequest } = await import("../../src/execution/continuation-request");
-  const { ContinuationPersistence } = await import("../../src/execution/continuation-persistence");
+  const { ContinuationPersistence } = await import("../../src/state/continuation-persistence");
   const { makeStepSampler } = await import("../../src/sampling/index");
   const { MlxArray } = await import("@mlx-bun/mlx/array");
   const first = { temperature: 0.7, seed: 123, seedWasExplicit: false };

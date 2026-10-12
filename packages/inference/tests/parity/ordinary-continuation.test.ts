@@ -61,7 +61,7 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
   const { createModel } = await import("@mlx-bun/inference/models");
   const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
   const { createOrdinaryContinuationRequest } = await import("@mlx-bun/inference/execution");
-  const { ContinuationPersistence } = await import("@mlx-bun/inference/execution");
+  const { ContinuationPersistence } = await import("@mlx-bun/inference/state");
   const { SsdCacheStore } = await import("@mlx-bun/inference/state");
   const { TwoModelProvider } = await import("../../src/generation/speculative/sources/two-model");
   const ops = await import("@mlx-bun/mlx/ops");

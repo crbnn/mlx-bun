@@ -77,7 +77,7 @@ import { extractSoleRow,filterLayoutRows,ownedCacheLayout,publishRow,rowAdmissio
 import { leaseCacheStates } from "../state/leases";
 import { cloneSingleRowState } from "../state/views";
 import { CancellationSource,GenerationCancelled } from "./cancellation";
-import { batchRowKvBytes } from "./kv-budget";
+import { batchRowKvBytes } from "../state/kv-budget";
 import { ExecutionTasks } from "./tasks";
 
 /** Per-step phase timing (MLX_BUN_BATCH_STEP_TRACE=1, debug-only): where a

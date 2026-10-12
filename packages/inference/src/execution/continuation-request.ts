@@ -10,7 +10,7 @@ import { type OrdinaryContinuation } from "./continuation-types";
  * KV layout and delayed conversion remain owned by cache maintenance and persistence. */
 export function createOrdinaryContinuationRequest(input: Omit<Parameters<typeof bindContinuationPolicy>[0], "namespace"> & {
   interval: number;
-  persistence: import("./continuation-persistence").ContinuationPersistence;
+  persistence: import("../state/continuation-persistence").ContinuationPersistence;
   onToken: Parameters<typeof createRowSampling>[1];
   /** The request state's prefix namespace over the row's own; absent, the row's. */
   stateNamespace?: (base: string) => string;

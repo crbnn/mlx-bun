@@ -1824,10 +1824,10 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
   });
 
   test("a checkpoint before the transition restores exactly in a fresh group: alone it repeats the control byte for byte; beside a sibling it equals plain KV resumed the same way", async () => {
-    const { bindMlxGateway, createRuntimeConfig, createOrdinaryContinuationRequest, ContinuationPersistence, createRowSampling } =
+    const { bindMlxGateway, createRuntimeConfig, createOrdinaryContinuationRequest, createRowSampling } =
       await import("../../../src/execution");
     const { makeStepSampler } = await import("../../../src/sampling");
-    const { SsdCacheStore, PromptCache, cloneKvCaches, leaseCacheState } = await import("../../../src/state");
+    const { SsdCacheStore, ContinuationPersistence, PromptCache, cloneKvCaches, leaseCacheState } = await import("../../../src/state");
     const plain = await setup(null);
     const soloA = await plain.submit(A, 8);
     await plain.close();
@@ -2016,9 +2016,9 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
     });
 
     test("a TurboQuant checkpoint restores exactly in a fresh group and repeats the control", async () => {
-      const { bindMlxGateway, createRuntimeConfig, createOrdinaryContinuationRequest, ContinuationPersistence } =
+      const { bindMlxGateway, createRuntimeConfig, createOrdinaryContinuationRequest } =
         await import("../../../src/execution");
-      const { SsdCacheStore, PromptCache, cloneKvCaches, leaseCacheState } = await import("../../../src/state");
+      const { SsdCacheStore, ContinuationPersistence, PromptCache, cloneKvCaches, leaseCacheState } = await import("../../../src/state");
       const directory = await mkdtemp(join(tmpdir(), "turbo-continuation-"));
       const scheme = resolveKvScheme({ turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: 0 });
       const run = async (name: string, interruptAt?: number) => {

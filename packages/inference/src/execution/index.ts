@@ -14,6 +14,5 @@ export * from "./prefill-cohort";
 export * from "./prefill-rows";
 export * from "./continuation";
 export * from "./continuation-request";
-export * from "./continuation-persistence";
 export * from "../runtime/resources";
 export * from "../runtime/config";
