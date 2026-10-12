@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { resolve } from "node:path";
-import type { CellResult, RawRequest, ReqResult } from "./measure";
+import type { CellResult, MemoryReading, RawRequest, ReqResult } from "./measure";
 import { decide, EXIT, foreignProcesses, machineProblems, pairedDelta, summary, t975, type DecideInput, type MachineReadings,
   type PreflightRecord } from "./perf-check";
 import { planCells, REQUIRED_PHASES, WORKLOAD, type Plan, type Tree } from "./plan";
@@ -13,19 +13,20 @@ const REQUESTS = { warmup: 1, parity: 1, decode: WORKLOAD.decodeRuns, ttft1k: WO
 type Samples = { decode: number[]; ttft: number[] };
 const SAME: Samples = { decode: [30, 30.4, 29.8, 30.1, 30.2], ttft: [400, 404, 398] };
 
-function plan(): Plan {
+function plan(patch: Partial<Plan> = {}): Plan {
   const model = (id: string) => ({ id, label: `${id} artifact, candidate graph ${id}-graph`, path: `/models/${id}`, modelType: "fake",
     kvConfig: false, packedTrellis: false, files: [{ name: "model.safetensors", bytes: 1, sha256: "d".repeat(64) }] });
   const tree = (root: string, commit: string) => ({ root, commit: commit.repeat(40), command: ["bun", `${root}/apps/mlx-bun/bin/mlx-bun.mjs`, "serve"] });
   const p: Plan = { schema: 1, profile: "scoped", seed: "s", workload: { ...WORKLOAD, withContext: true },
     trees: { baseline: tree("/base", "b"), candidate: tree("/head", "c") }, references: [], configurations: ["default"],
-    models: [model("qwen27b"), model("e4b")], native: { library: LIB.path, files: [LIB] }, cells: [] };
+    models: [model("qwen27b"), model("e4b")], native: { library: LIB.path, files: [LIB] }, cells: [], ...patch };
   return { ...p, cells: planCells(p) };
 }
+const reading = (mb: number): MemoryReading => ({ mlxActiveMB: mb, mlxCacheMB: 64, mlxPeakMB: mb + 500, footprintMB: mb + 100, footprintPeakMB: mb + 700, pid: 4321 });
 
 function cellResult(key: string, samples: Samples): CellResult {
   const probe = { text: "2, 3, 5, 7, 11, 13, 17, 19", promptTokens: 12, completionTokens: 24, finishReason: "length" };
-  return { key, readyMs: 900, idleRssMB: 4000, parity: { completion: probe, chat: probe }, peakRssMB: 9000, rssByLeg: [], coldStartMs: 1200,
+  return { key, readyMs: 900, parity: { completion: probe, chat: probe }, memory: { idle: reading(10_500), byLeg: [["agg", reading(11_200)]] }, coldStartMs: 1200,
     restart: { readyMs: 900, ctxTtftMs: 300, cachedTokens: 16000, durability: null },
     decodeTps: samples.decode, decodeSpread: 1, decodeStable: true,
     ttft: { coldMs: samples.ttft, prefill1kTps: samples.ttft.map(ms => 1100_000 / ms), warmMs: 40, warmCachedTokens: 1090 },
@@ -45,16 +46,21 @@ function requests(cell: string, samples: Samples): RawRequest[] {
   }));
 }
 
-/** A complete run; `candidate` overrides the candidate's samples for one model. */
-function runRecord(candidate: Partial<Record<string, Samples>> = {}): RunRecord {
-  const p = plan(), samplesFor = (model: string, tree: Tree) => tree === "candidate" ? candidate[model] ?? SAME : SAME;
+/** A complete run; `candidate` overrides the candidate's samples for one model (per session when `sessions` is given). */
+function runRecord(candidate: Partial<Record<string, Samples | Samples[]>> = {}, patch: Partial<Plan> = {}): RunRecord {
+  const p = plan(patch);
+  const samplesFor = (model: string, tree: Tree, session = 1) => {
+    const own = tree === "candidate" ? candidate[model] : undefined;
+    return own === undefined ? SAME : Array.isArray(own) ? own[session - 1]! : own;
+  };
   const cells: CellRecord[] = p.cells.map(c => ({ key: c.key, model: c.model, kind: "tree", tree: c.tree!, configuration: c.configuration!,
-    order: c.order, command: [], intendedLibrary: LIB.path, result: cellResult(c.key, samplesFor(c.model, c.tree!)) }));
+    ...(c.session ? { session: c.session } : {}), order: c.order, command: [], intendedLibrary: LIB.path,
+    ...(c.skipped ? { skipped: c.skipped } : { result: cellResult(c.key, samplesFor(c.model, c.tree!, c.session)) }) }));
   const pin = { root: "/head", head: "c".repeat(40), clean: true, sha256: "t".repeat(64) };
   return { schema: 1, tool: { start: pin, end: pin }, plan: p,
     machine: { chip: "Apple M1 Max", memoryBytes: 32 * 2 ** 30, loadAverage: "{ 1.0 1.0 1.0 }", host: "m1max", os: "27.0.1", bun: "1.4.2" },
     startedAt: "2026-10-11T10:00:00.000Z", finishedAt: "2026-10-11T10:40:00.000Z", pins: { start: [], end: [] }, cells,
-    requests: cells.flatMap(c => requests(c.key, samplesFor(c.model, c.tree!))) };
+    requests: cells.filter(c => !c.skipped).flatMap(c => requests(c.key, samplesFor(c.model, c.tree!, c.session))) };
 }
 
 const readings: MachineReadings = { swapUsedMB: 0, freePercent: 60, cpuSpeedLimit: -1, gpuWiredLimitMB: 0, loadAvg1m: 1.2, bigProcesses: [] };
@@ -63,7 +69,7 @@ function preflight(problems: string[] = []): PreflightRecord {
     machine: { chip: "Apple M1 Max", memoryBytes: 32 * 2 ** 30, host: "m1max", os: "27.0.1" } };
 }
 const input = (run: RunRecord | null, before: PreflightRecord | null = preflight(), after: PreflightRecord | null = preflight()): DecideInput =>
-  ({ before, after, run, configuration: "default" });
+  ({ before, after, run });
 
 test("the synthetic run is complete by bench-serve's own qualification", () => {
   expect(qualification(runRecord()).problems).toEqual([]);
@@ -111,12 +117,19 @@ test("a complete run within noise passes and the summary quotes every gated delt
   expect(qwen.label).toBe("qwen27b artifact, candidate graph qwen27b-graph");
   expect(qwen.deltas.filter(x => x.gated).map(x => [x.metric, x.pairs])).toEqual([["decode", 5], ["prefill (nominal 1k prompt)", 3],
     ["TTFT cold (nominal 1k prompt)", 3]]);
+  expect(qwen.configuration).toBe("default");
+  expect(qwen.deltas.filter(x => !x.gated).map(x => x.metric)).toEqual(["prefill @ctx", "TTFT @ctx", "aggregate ×4", "peak MLX active", "peak physical footprint"]);
   expect(qwen.deltas.filter(x => !x.gated).every(x => x.pairs === 1 && x.interval === null)).toBe(true);
   const text = summary(d, input(run));
   expect(text).toContain("## Performance check: no regression outside the paired noise band");
-  expect(text).toContain("### qwen27b · qwen27b artifact, candidate graph qwen27b-graph");
-  expect(text).toMatch(/\| decode \| tok\/s ↑ \| 30\.1 \| 30\.0 \| 0\.99\d \| \[0\.9\d\d, 1\.0\d\d\] \| 5 \| within noise \|/);
-  expect(text).toContain("| prefill @ctx | tok/s ↑ | 400.0 | 400.0 | 1.000 | — | 1 | context, not gated |");
+  expect(text).toContain("### qwen27b · default · qwen27b artifact, candidate graph qwen27b-graph");
+  expect(text).toContain("with one session per tree it covers request-to-request noise, not drift between sessions");
+  expect(text).toMatch(/\| decode \| tok\/s ↑ \| 30\.1 \| 30\.0 \| 0\.99\d \| \[0\.9\d\d, 1\.0\d\d\] \| 5 \| s1 30\.1 → 30\.0 \| within noise \|/);
+  expect(text).toContain("| prefill @ctx | tok/s ↑ | 400.0 | 400.0 | 1.000 | — | 1 | s1 400.0 → 400.0 | context, not gated |");
+  // Memory is the worker's MLX allocator and the footprint, as context; RSS is gone.
+  expect(text).toContain("| peak MLX active | MB ↓ | 11700 | 11700 | 1.000 | — | 1 | s1 11700 → 11700 | context, not gated |");
+  expect(text).toContain("| peak physical footprint | MB ↓ | 11900 | 11900 | 1.000 | — | 1 | s1 11900 → 11900 | context, not gated |");
+  expect(text).not.toContain("RSS |");
   expect(text).toContain(`baseline: ${"b".repeat(40)} · candidate: ${"c".repeat(40)}`);
 });
 
@@ -125,7 +138,7 @@ test("a consistent slowdown on one composition fails with the regressed metrics 
   const d = decide(input(runRecord({ e4b: slower })));
   expect(d.outcome).toBe("regression");
   expect(EXIT[d.outcome]).toBe(1);
-  expect(d.headline).toBe("regression outside the paired noise band: e4b decode, e4b prefill (nominal 1k prompt), e4b TTFT cold (nominal 1k prompt)");
+  expect(d.headline).toBe("regression outside the paired noise band: e4b/default decode, e4b/default prefill (nominal 1k prompt), e4b/default TTFT cold (nominal 1k prompt)");
   expect(summary(d, input(runRecord({ e4b: slower })))).toContain("| **regression** |");
 });
 
@@ -146,6 +159,47 @@ test("a failed preflight, a missing or incomplete run quote no numbers", () => {
   expect(d.headline).toBe("run incomplete, no numbers");
   expect(d.reasons.join("\n")).toContain("e4b/default/candidate: decode has 4 successful");
   expect(summary(d, input(incomplete))).not.toContain("| decode |");
+});
+
+test("every applicable configuration gets its table; a configuration a model has no drafter for is skipped, not a reason", () => {
+  const p = plan({ configurations: ["default", "dflash2"] });
+  // Only qwen27b has a DFlash 2 drafter in this plan.
+  const withDrafter = { ...p, models: [{ ...p.models[0]!, dflash2: { path: "/drafters/dflash2", files: [{ name: "model.safetensors", bytes: 1, sha256: "e".repeat(64) }] } }, p.models[1]!] };
+  const run = runRecord({}, { configurations: ["default", "dflash2"], models: withDrafter.models });
+  expect(run.cells.filter(c => c.skipped).map(c => c.key)).toEqual(["e4b/dflash2/baseline", "e4b/dflash2/candidate"]);
+  expect(qualification(run).problems).toEqual([]);
+  const d = decide(input(run));
+  expect(d.outcome).toBe("pass");
+  expect(d.compositions.map(c => `${c.model}/${c.configuration}`)).toEqual(["qwen27b/default", "qwen27b/dflash2", "e4b/default"]);
+  const text = summary(d, input(run));
+  for (const heading of ["### qwen27b · default ·", "### qwen27b · dflash2 ·", "### e4b · default ·"]) expect(text).toContain(heading);
+  expect(text).not.toContain("### e4b · dflash2");
+  expect(text).toContain("dflash2 (--kv-quant 4 --num-draft-tokens adaptive --draft-model <DFlash 2 drafter>)");
+});
+
+test("two alternating sessions: the pairs pool across sessions, the interval widens with session drift, per-session medians are shown", () => {
+  // The candidate is 0.2% slower in session 1 and 0.2% faster in session 2: each session alone is a tight band
+  // on one side of 1, the pooled interval straddles it.
+  const slow = { decode: SAME.decode.map(x => x * 0.998), ttft: SAME.ttft }, fast = { decode: SAME.decode.map(x => x * 1.002), ttft: SAME.ttft };
+  const run = runRecord({ qwen27b: [slow, fast] }, { sessions: 2 });
+  expect(qualification(run).problems).toEqual([]);
+  const d = decide(input(run));
+  expect(d.outcome).toBe("pass");
+  const decode = d.compositions.find(c => c.model === "qwen27b")!.deltas.find(x => x.metric === "decode")!;
+  expect(decode.pairs).toBe(10);
+  expect(decode.verdict).toBe("within noise");
+  expect(decode.sessions!.map(s => s.session)).toEqual([1, 2]);
+  expect(decode.sessions![0]!.candidateMedian).toBeCloseTo(30.1 * 0.998, 9);
+  expect(decode.sessions![1]!.candidateMedian).toBeCloseTo(30.1 * 1.002, 9);
+  // The same 0.2% slowdown in both sessions is a regression.
+  const both = decide(input(runRecord({ qwen27b: [slow, slow] }, { sessions: 2 })));
+  expect(both.headline).toBe("regression outside the paired noise band: qwen27b/default decode");
+  const text = summary(d, input(run));
+  expect(text).toContain("2 server sessions per tree, alternating trees");
+  expect(text).toContain("the sessions alternate trees, so it covers session-to-session drift");
+  expect(text).toMatch(/\| decode \| tok\/s ↑ \| 30\.1 \| 30\.1 \| 1\.000 \| \[0\.99\d, 1\.00\d\] \| 10 \| s1 30\.1 → 30\.0; s2 30\.1 → 30\.2 \| within noise \|/);
+  // Context metrics now have one pair per session, still never gated.
+  expect(d.compositions[0]!.deltas.find(x => x.metric === "peak MLX active")).toMatchObject({ pairs: 2, gated: false });
 });
 
 test("the preflight after the run is shown, and as on main the one before gates", () => {
@@ -186,6 +240,7 @@ test("a resident model server or a training run is foreign, bun or Python; the c
 test("--help documents every subcommand and exits 0", () => {
   const help = Bun.spawnSync([process.execPath, resolve(import.meta.dir, "perf-check.ts"), "--help"]);
   expect(help.exitCode).toBe(0);
-  for (const part of ["preflight --out", "graph --model", "decide --preflight-before", "95% Student-t", "TTFT cold (nominal 1k prompt)"])
+  for (const part of ["preflight --out", "graph --model", "decide --preflight-before", "95% Student-t", "TTFT cold (nominal 1k prompt)",
+    "--sessions N alternates trees", "not ps RSS"])
     expect(help.stdout.toString()).toContain(part);
 });

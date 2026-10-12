@@ -7,8 +7,8 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { hostname, release } from "node:os";
 import { parseArgs } from "node:util";
-import type { Configuration } from "./plan";
-import { comparePair, qualification, type MetricComparison, type RunRecord } from "./report";
+import { CONFIGURATIONS, type Configuration } from "./plan";
+import { pooledComparison, qualification, type MetricComparison, type RunRecord } from "./report";
 
 // ---- preflight (main's src/preflight.ts, checkMachine) ------------------------------
 export const PREFLIGHT_LIMITS = { maxSwapUsedMB: 512, minFreePercent: 35, bigRssMB: 2048, busyCpuPercent: 50, maxLoad1m: 8 } as const;
@@ -115,8 +115,9 @@ async function graphLabel(modelDir: string): Promise<string> {
 // ---- the decision -----------------------------------------------------------------------
 /** The report's paired request metrics that gate (PLAN: prefill, decode, TTFT). */
 export const GATED = ["decode", "prefill (nominal 1k prompt)", "TTFT cold (nominal 1k prompt)"] as const;
-/** Shown beside them; one pair each, so no interval and no gate. */
-export const CONTEXT = ["prefill @ctx", "TTFT @ctx", "aggregate ×4"] as const;
+/** Shown beside them, never gated: one pair per session. Memory is the worker's MLX allocator and the
+ * physical footprint, never `ps` RSS (measure.ts `MemoryReading` says why). */
+export const CONTEXT = ["prefill @ctx", "TTFT @ctx", "aggregate ×4", "peak MLX active", "peak physical footprint"] as const;
 
 /** Two-sided 95% Student-t quantiles for 1..30 degrees of freedom; above 30 the df-30 value (wider, never narrower). */
 const T975 = [12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.160, 2.145, 2.131,
@@ -132,6 +133,8 @@ export interface PairedDelta {
   /** 95% Student-t interval of that ratio, computed on the log ratios; null below two pairs. */
   interval: [number, number] | null;
   verdict: Verdict | null;
+  /** Each session's own medians over its pairs (one entry when the plan runs one session). */
+  sessions?: Array<{ session: number; baselineMedian: number | null; candidateMedian: number | null }>;
 }
 
 /** The paired delta of one report metric. Throws on a non-positive sample: a complete run has none. */
@@ -150,78 +153,95 @@ export function pairedDelta(c: MetricComparison, gated: boolean): PairedDelta {
   return { ...base, ratio: Math.exp(mean), interval, verdict: worse ? "regression" : better ? "improvement" : "within noise" };
 }
 
+export interface Composition { model: string; configuration: Configuration; label: string; deltas: PairedDelta[] }
 export interface Decision {
   outcome: "pass" | "regression" | "no measurement";
   headline: string;
   /** Why there are no numbers (preflight problems or the run's qualification problems). */
   reasons: string[];
   notes: string[];
-  compositions: Array<{ model: string; label: string; deltas: PairedDelta[] }>;
+  /** Every applicable model and configuration of the plan, in plan order. */
+  compositions: Composition[];
 }
-export interface DecideInput {
-  before: PreflightRecord | null; after: PreflightRecord | null; run: RunRecord | null; configuration: Configuration;
-}
+export interface DecideInput { before: PreflightRecord | null; after: PreflightRecord | null; run: RunRecord | null }
 
-export function decide({ before, after, run, configuration }: DecideInput): Decision {
+export function decide({ before, after, run }: DecideInput): Decision {
   const none = (headline: string, reasons: string[]): Decision => ({ outcome: "no measurement", headline, reasons, notes: [], compositions: [] });
   if (!before) return none("no preflight record, no numbers", ["the job stopped before the preflight ran"]);
   if (!before.ok) return none("preflight failed, no numbers", before.problems);
   if (!run) return none("no run record, no numbers", ["the preflight was clear, but bench-serve saved no run record"]);
   const q = qualification(run);
   if (!q.complete) return none("run incomplete, no numbers", q.problems);
-  if (!run.plan.configurations.includes(configuration)) return none("run incomplete, no numbers", [`the plan has no ${configuration} configuration`]);
   const notes = [after ? after.ok ? "" : `machine not clear after the run: ${after.problems.join("; ")}` : "no preflight after the run"].filter(Boolean);
-  const reasons: string[] = [];
-  const compositions = run.plan.models.map(model => {
-    const comparison = comparePair(run, model.id, configuration) ?? [];
+  const reasons: string[] = [], compositions: Composition[] = [];
+  for (const model of run.plan.models) for (const configuration of run.plan.configurations) {
+    const cells = run.cells.filter(cell => cell.kind === "tree" && cell.model === model.id && cell.configuration === configuration);
+    if (cells.length && cells.every(cell => cell.skipped)) continue; // not applicable, as the plan predeclared
+    const comparison = pooledComparison(run, model.id, configuration);
+    if (!comparison) { reasons.push(`${model.id}/${configuration}: no paired measurement`); continue; }
     const deltas = [...GATED, ...CONTEXT].flatMap(name => {
-      const metric = comparison.find(c => c.metric === name);
-      if (!metric) { reasons.push(`${model.id}: no ${name} comparison`); return []; }
-      try { return [pairedDelta(metric, (GATED as readonly string[]).includes(name))]; }
-      catch (error) { reasons.push(`${model.id}: ${(error as Error).message}`); return []; }
+      const metric = comparison.pooled.find(c => c.metric === name);
+      if (!metric) { reasons.push(`${model.id}/${configuration}: no ${name} comparison`); return []; }
+      try {
+        return [{ ...pairedDelta(metric, (GATED as readonly string[]).includes(name)),
+          sessions: comparison.sessions.map(({ session, metrics }) => {
+            const own = metrics.find(c => c.metric === name);
+            return { session, baselineMedian: own?.baselineMedian ?? null, candidateMedian: own?.candidateMedian ?? null };
+          }) }];
+      } catch (error) { reasons.push(`${model.id}/${configuration}: ${(error as Error).message}`); return []; }
     });
-    return { model: model.id, label: model.label, deltas };
-  });
+    compositions.push({ model: model.id, configuration, label: model.label, deltas });
+  }
   if (reasons.length) return none("run incomplete, no numbers", reasons);
-  const regressions = compositions.flatMap(c => c.deltas.filter(d => d.gated && d.verdict === "regression").map(d => `${c.model} ${d.metric}`));
+  const regressions = compositions.flatMap(c => c.deltas.filter(d => d.gated && d.verdict === "regression")
+    .map(d => `${c.model}/${c.configuration} ${d.metric}`));
   return regressions.length
     ? { outcome: "regression", headline: `regression outside the paired noise band: ${regressions.join(", ")}`, reasons, notes, compositions }
     : { outcome: "pass", headline: "no regression outside the paired noise band", reasons, notes, compositions };
 }
 
 const num = (x: number | null, digits: number) => x === null ? "—" : x.toFixed(digits);
-const digitsFor = (unit: string) => unit === "ms" ? 0 : 1;
+const digitsFor = (unit: string) => unit === "ms" || unit === "MB" ? 0 : 1;
 const machineLine = (m: { chip: string; memoryBytes: number; host: string }) => `${m.chip} · ${(m.memoryBytes / 2 ** 30).toFixed(0)} GB · ${m.host}`;
 const preflightLine = (label: string, p: PreflightRecord | null) => !p ? `- preflight ${label}: not run` :
   `- preflight ${label}: ${p.ok ? "clear" : "NOT CLEAR"} at ${p.at} (${p.attempts} check${p.attempts === 1 ? "" : "s"} over ` +
   `${Math.round(p.waitedMs / 60_000)} min); swap ${p.swapUsedMB.toFixed(0)} MB, free ${p.freePercent}%, load ${p.loadAvg1m.toFixed(1)}`;
+const configurationLine = (name: Configuration) => `${name} (${[...CONFIGURATIONS[name].args, ...("dflash2" in CONFIGURATIONS[name] ? ["--draft-model <DFlash 2 drafter>"] : []),
+  ...("draftDepth" in CONFIGURATIONS[name] ? [`--draft-kind mtp --num-draft-tokens ${CONFIGURATIONS[name].draftDepth}`] : [])].join(" ") || "CLI defaults"})`;
 
-/** The job summary: headline, provenance, and per composition the paired deltas with their intervals. */
+/** The job summary: headline, provenance, and per model and configuration the paired deltas with their intervals. */
 export function summary(d: Decision, input: DecideInput): string {
   const { before, after, run } = input, lines = [`## Performance check: ${d.headline}`, ""];
   const machine = run?.machine ?? before?.machine;
+  const sessions = run?.plan.sessions ?? 1;
   if (machine) lines.push(`machine: ${machineLine(machine)}`);
   if (run) lines.push(`baseline: ${run.plan.trees.baseline.commit} · candidate: ${run.plan.trees.candidate.commit}`,
-    `run: ${run.startedAt} to ${run.finishedAt ?? "unfinished"}; configuration ${input.configuration}; ` +
-    `${run.plan.workload.decodeRuns} decode samples of ${run.plan.workload.decodeTokens} tokens, ${run.plan.workload.ttftRuns} cold TTFT samples (nominal 1k prompt)`);
+    `run: ${run.startedAt} to ${run.finishedAt ?? "unfinished"}; configurations ${run.plan.configurations.map(configurationLine).join(", ")}; ` +
+    `${sessions} server session${sessions === 1 ? "" : "s"} per tree, alternating trees; per session ${run.plan.workload.decodeRuns} decode samples of ` +
+    `${run.plan.workload.decodeTokens} tokens, ${run.plan.workload.ttftRuns} cold TTFT samples (nominal 1k prompt)`);
   lines.push("", preflightLine("before", before), preflightLine("after", after), "");
   if (d.outcome === "no measurement") {
     lines.push("No numbers are quoted:", ...d.reasons.map(reason => `- ${reason}`), "");
     return lines.join("\n");
   }
-  lines.push("Paired delta: geometric mean of the per-request candidate/baseline ratios. Interval: 95% Student-t, on the log ratios; " +
-    "it covers request-to-request noise within one server session per tree, not drift between sessions. A gated metric fails " +
-    "when its whole interval is on the worse side of 1.", "");
+  lines.push("Paired delta: geometric mean of the per-request candidate/baseline ratios, each session paired with its counterpart and " +
+    "the pairs pooled across sessions. Interval: 95% Student-t, on the log ratios; " + (sessions > 1
+      ? "the sessions alternate trees, so it covers session-to-session drift as well as request noise. "
+      : "with one session per tree it covers request-to-request noise, not drift between sessions. ") +
+    "A gated metric fails when its whole interval is on the worse side of 1. Memory: the worker's MLX allocator from /stats and the " +
+    "physical footprint, never ps RSS.", "");
   for (const note of d.notes) lines.push(`- note: ${note}`);
   if (d.notes.length) lines.push("");
   for (const c of d.compositions) {
-    lines.push(`### ${c.model} · ${c.label}`, "", "| metric | unit | baseline median | candidate median | candidate/baseline | 95% interval | pairs | verdict |",
-      "|---|---|---|---|---|---|---|---|");
+    lines.push(`### ${c.model} · ${c.configuration} · ${c.label}`, "",
+      "| metric | unit | baseline median | candidate median | candidate/baseline | 95% interval | pairs | per-session medians | verdict |",
+      "|---|---|---|---|---|---|---|---|---|");
     for (const x of c.deltas) {
       const digits = digitsFor(x.unit), arrow = x.direction === "higher-is-better" ? "↑" : "↓";
       const verdict = !x.gated ? "context, not gated" : x.verdict === "regression" ? "**regression**" : x.verdict ?? "—";
+      const perSession = (x.sessions ?? []).map(s => `s${s.session} ${num(s.baselineMedian, digits)} → ${num(s.candidateMedian, digits)}`).join("; ") || "—";
       lines.push(`| ${x.metric} | ${x.unit} ${arrow} | ${num(x.baselineMedian, digits)} | ${num(x.candidateMedian, digits)} | ${num(x.ratio, 3)} | ` +
-        `${x.interval ? `[${x.interval[0].toFixed(3)}, ${x.interval[1].toFixed(3)}]` : "—"} | ${x.pairs} | ${verdict} |`);
+        `${x.interval ? `[${x.interval[0].toFixed(3)}, ${x.interval[1].toFixed(3)}]` : "—"} | ${x.pairs} | ${perSession} | ${verdict} |`);
     }
     lines.push("");
   }
@@ -241,19 +261,22 @@ const USAGE = `Performance-regression check around the paired serve benchmark (s
       Prints the graph this tree's table selects for the artifact on this machine under the default
       serve composition (bf16 KV, no drafter, 8 rows). Needs MLX_BUN_LIBMLXC or staged native files.
   bun scripts/bench/perf-check.ts decide --preflight-before FILE [--preflight-after FILE] [--run FILE]
-      [--configuration default]
-      Prints the markdown summary for a saved bench-serve run and exits 0 (no regression), 1 (a
-      regression outside the paired noise band) or 2 (no qualified measurement: preflight failed,
-      or the run is missing or incomplete; no numbers are quoted).
+      Prints the markdown summary for a saved bench-serve run, one table per applicable model and
+      configuration, and exits 0 (no regression), 1 (a regression outside the paired noise band) or 2
+      (no qualified measurement: preflight failed, or the run is missing or incomplete; no numbers
+      are quoted).
 
 Decision: numbers count only when the preflight before the run was clear and bench-serve's own
 qualification says the run is complete (every phase paired, decode stable, provenance verified,
-probes equal). For each composition, ${GATED.map(name => `"${name}"`).join(", ")} gate.
-The paired delta is the geometric mean of the per-request candidate/baseline ratios; its interval
-is the 95% Student-t interval of the mean log ratio. A metric regresses when the whole interval is
-on the worse side of 1. The interval covers request-to-request noise within one server session per
-tree, not drift between sessions. Single-pair metrics (${CONTEXT.join(", ")}) are shown, never gated.
-The preflight after the run is recorded and shown; as on main, the one before the run gates.`;
+probes equal). For each model and configuration, ${GATED.map(name => `"${name}"`).join(", ")} gate.
+Each session pairs with its counterpart (bench-serve --sessions N alternates trees, A B A B) and the
+pairs pool across sessions; the paired delta is the geometric mean of the per-request
+candidate/baseline ratios and its interval the 95% Student-t interval of the mean log ratio, so with
+several sessions it covers session-to-session drift. A metric regresses when the whole interval is
+on the worse side of 1. Per-session medians are shown beside the pooled ones. One-pair-per-session
+metrics (${CONTEXT.join(", ")}) are shown, never gated; memory is the worker's MLX allocator from
+/stats and the physical footprint, not ps RSS. The preflight after the run is recorded and shown; as
+on main, the one before the run gates.`;
 
 const readJson = <T>(path: string | undefined): T | null => path && existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) as T : null;
 
@@ -273,9 +296,8 @@ async function main(argv: string[]): Promise<number> {
   }
   if (command === "decide") {
     const { values } = parseArgs({ args: rest, options: { "preflight-before": { type: "string" }, "preflight-after": { type: "string" },
-      run: { type: "string" }, configuration: { type: "string", default: "default" } } });
-    const input: DecideInput = { before: readJson(values["preflight-before"]), after: readJson(values["preflight-after"]),
-      run: readJson(values.run), configuration: values.configuration as Configuration };
+      run: { type: "string" } } });
+    const input: DecideInput = { before: readJson(values["preflight-before"]), after: readJson(values["preflight-after"]), run: readJson(values.run) };
     const decision = decide(input);
     console.log(summary(decision, input));
     return EXIT[decision.outcome];
