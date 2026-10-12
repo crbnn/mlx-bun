@@ -824,13 +824,17 @@ const encodedCodec: CacheCodec = {
   matches: cache => cache instanceof EncodedLatentCache,
   snapshot(cache, context) {
     const c = cache as EncodedLatentCache;
-    if (c.batchSize !== 1) throw new Error("only one-row encoded latent state is saved");
+    if (c.batchSize !== 1) throw new Error(`persistence takes serial state; extract each of the ${c.batchSize} rows first`);
     const state = c.rowState(0);
     for (const array of [...state.planes.flat(), ...(state.shadow ?? [])]) context.push(array, true);
     return { kind: ENCODED, offset: state.offset, tensors: context.slots, ...geometryHeader(c.geometry), ...formatHeader(c.format),
       quantizedKvStart: c.start, latentShadow: state.shadow !== null };
   },
-  clone(cache) { return (cache as EncodedLatentCache).extractRow(0); },
+  clone(cache) {
+    const c = cache as EncodedLatentCache;
+    if (c.batchSize !== 1) throw new Error(`persistence takes serial state; extract each of the ${c.batchSize} rows first`);
+    return c.extractRow(0);
+  },
   load(entry, context) {
     const cache = new EncodedLatentCache(geometryOf(entry), formatOf(entry)!, entry.quantizedKvStart ?? 0);
     const arrays = entry.tensors.map(context.arr);
@@ -848,13 +852,17 @@ const pagedCodec: CacheCodec = {
   matches: cache => cache instanceof PagedLatentCache,
   snapshot(cache, context) {
     const c = cache as PagedLatentCache;
-    if (c.batchSize !== 1) throw new Error("only one-row paged latent state is saved");
+    if (c.batchSize !== 1) throw new Error(`persistence takes serial state; extract each of the ${c.batchSize} rows first`);
     const pages = c.pages[0]!;
     for (const pool of pages.pools) context.push(pool, false);
     return { kind: PAGED, offset: pages.offset, tensors: context.slots, ...geometryHeader(c.geometry), ...formatHeader(c.format),
       latentPages: { blockSize: c.blockSize, blockTable: [...pages.blockTable], numBlocks: pages.numBlocks } };
   },
-  clone(cache) { return (cache as PagedLatentCache).extractRow(0); },
+  clone(cache) {
+    const c = cache as PagedLatentCache;
+    if (c.batchSize !== 1) throw new Error(`persistence takes serial state; extract each of the ${c.batchSize} rows first`);
+    return c.extractRow(0);
+  },
   load(entry, context) {
     const layout = entry.latentPages!;
     const cache = new PagedLatentCache(geometryOf(entry), formatOf(entry), layout.blockSize);
