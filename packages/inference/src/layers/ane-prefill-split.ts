@@ -13,20 +13,22 @@ export { aneAvailable } from "../kernels/ane/linear";
 // Prompt-chunk channel splits between the Apple Neural Engine and the GPU.
 // The ANE computes the first n output channels from streamed fp16 weights the
 // GPU writes into its program's buffers (zero-copy IOSurface wraps), the GPU
-// computes the rest at the same time, and the results combine. Each layer owns
+// computes the rest at the same time, and the results combine. Each layer holds
 // one program, built for exactly the chunk size the layer is constructed with,
-// and serves inputs of exactly that many rows; dispose frees the program.
-// Layers that never run at once may share buffers, named at construction
-// (`share`): the new program reuses the other's IOSurfaces, which live until
-// every program holding them is freed. Not bit-identical to the GPU path (fp16
-// weights and activations on the ANE); gate by KL.
+// and serves inputs of exactly that many rows; dispose releases it. Layers that
+// never run at once may share, named at construction (`share`): a layer whose
+// program is identical to the other's holds that same loaded program, otherwise
+// its program loads on the other's buffers; either lives until every layer
+// holding it is disposed. Loaded programs are a machine-wide resource
+// (AneProgram), so a graph's layers of one shape share one. Not bit-identical
+// to the GPU path (fp16 weights and activations on the ANE); gate by KL.
 
 /** Channels the ANE takes of R rows at `fraction` (64-aligned, at least 64 left on each side). */
 export function aneChannels(R: number, fraction: number): number {
   return Math.min(R - 64, Math.max(64, Math.round((fraction * R) / 64) * 64));
 }
 
-/** Whole-MLP slice program [D, n] over `rows` rows, on `share`'s buffers when given. */
+/** Whole-MLP slice program [D, n] over `rows` rows: `share` itself when identical, else on its buffers. */
 function mlpProgram(D: number, n: number, rows: number, share: AneProgram | undefined): AneProgram {
   return AneProgram.create(mlpSliceMil(D, n, rows), [n * D * 2, n * D * 2, n * D * 2, rows * D * 2], rows * D * 2, { share });
 }
@@ -88,7 +90,7 @@ function checkMlp(name: string, gate: TrellisLinear, up: TrellisLinear, down: Tr
 function disposeLinear(lin: TrellisLinear): void { lin.codes.dispose(); lin.scales.dispose(); }
 
 /** Either whole-MLP split; both build the same slice program (only the GPU
- *  fill differs), so either can lend its buffers to the other. */
+ *  fill differs), so either can share the other's program. */
 export type AneMlpSplit = AneTrellisMlpSplit | AneTrellisMlpSplitK3i;
 
 /** Whole-MLP split for a down projection with row-major codes. */
@@ -97,8 +99,9 @@ export class AneTrellisMlpSplit implements Disposable {
     readonly up: TrellisLinear, readonly down: TrellisLinear, readonly rest: Rest) {}
 
   /** Builds the program for chunks of exactly `rows` rows now. `share`: a
-   *  split that never runs at the same time as this one, whose buffers this
-   *  program reuses (each at least as large). */
+   *  split that never runs at the same time as this one; this split holds its
+   *  program when the two are identical, otherwise loads one on its buffers
+   *  (each at least as large). */
   static build(gate: TrellisLinear, up: TrellisLinear, down: TrellisLinear, fraction: number, rows: number,
     share?: AneMlpSplit): AneTrellisMlpSplit {
     checkMlp("AneTrellisMlpSplit", gate, up, down, false);
@@ -112,7 +115,7 @@ export class AneTrellisMlpSplit implements Disposable {
     return mlpSplit(this.program, this.rows, this.channels, this.gate, this.up, this.down, this.rest, trellisFillHalf, hidden, swiglu);
   }
   [Symbol.dispose](): void { this.dispose(); }
-  /** Frees this layer's program and its GPU rows; shared buffers outlive it while another program holds them. */
+  /** Releases this layer's program and frees its GPU rows; a shared program or buffers outlive it while another layer holds them. */
   dispose(): void { this.program.dispose(); for (const lin of Object.values(this.rest)) disposeLinear(lin); }
 }
 
@@ -148,9 +151,8 @@ export class AneAffineSplit implements Disposable {
   private constructor(readonly program: AneStreamedMatmul, readonly head: { w: MlxArray; scales: MlxArray; biases: MlxArray },
     readonly rest: QuantizedLinear, readonly spec: ops.QuantSpec) {}
 
-  /** Builds the program for chunks of exactly `rows` rows now. `share`: a
-   *  split that never runs at the same time as this one, whose buffers this
-   *  program reuses (each at least as large). */
+  /** Builds the program for chunks of exactly `rows` rows now. `share`: as
+   *  AneTrellisMlpSplit.build. */
   static build(lin: QuantizedLinear, fraction: number, rows: number, share?: AneAffineSplit): AneAffineSplit {
     const N = lin.outFeatures, K = lin.inFeatures;
     if (!lin.biases || lin.bias || lin.w.ndim !== 2 || lin.spec.mode !== "affine") throw new Error("AneAffineSplit: unsupported projection");
@@ -193,7 +195,7 @@ export class AneAffineSplit implements Disposable {
   }
 
   [Symbol.dispose](): void { this.dispose(); }
-  /** Frees this layer's program and its weight rows; shared buffers outlive it while another program holds them. */
+  /** Releases this layer's program and frees its weight rows; a shared program or buffers outlive it while another layer holds them. */
   dispose(): void {
     this.program.dispose();
     for (const a of [this.head.w, this.head.scales, this.head.biases, this.rest.w, this.rest.scales, this.rest.biases!]) a.dispose();

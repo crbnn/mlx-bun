@@ -356,8 +356,9 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph, MlxTokenPhases {
     }
 
     // The Neural Engine chunk operation, for exactly the composition's chunk
-    // size. Each MLP split shares the previous layer's buffers and projections
-    // of one shape share theirs: layers run one at a time.
+    // size. Layers run one at a time, so each MLP split shares the previous
+    // layer's program and projections of one shape share theirs: one loaded
+    // program per shape.
     let ane: Step[] | null = null;
     if (composition.aneBridge && !composition.adapters) {
       const started = performance.now(), chunk = composition.prefillChunkTokens;
