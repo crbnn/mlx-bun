@@ -9,7 +9,6 @@ import { MiniCPM5Model } from "../../src/models/minicpm5/model";
 import { Qwen3Model } from "../../src/models/qwen/qwen3";
 import { Qwen3MoeModel } from "../../src/models/qwen/qwen3-moe";
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
-import { Qwen38TrellisTQ } from "../../src/models/qwen/qwen38-27b-trellis-tq";
 
 // Declarations are read from graphs built without weights: what a graph declares
 // follows from its own construction facts, so prototype stand-ins with those facts suffice.
@@ -27,16 +26,15 @@ describe("every graph declares its capabilities", () => {
     expect(graph(Gemma4Model.prototype, text(false, "gemma3n")).graphCapabilities.compiledDecode).toBe(false);
   });
 
-  test("Qwen3.5 and its Trellis specialization: prepared embeddings with positions, video, speculation over affine KV as its own option", () => {
-    // Speculation over affine KV is the composition's field (`MLX_BUN_QWEN_SPEC_KV4`, read when it resolves).
-    for (const prototype of [Qwen35Model.prototype, Qwen38TrellisTQ.prototype]) {
-      const declared = graph(prototype, { composition: testComposition() }).graphCapabilities;
-      expect(declared).toEqual(declareGraph({ media: { input: "embeddings+positions", video: true }, hiddenLayerTaps: true,
-        kv: { delayedAffine: "all" }, prefill: { boundedWorkspace: true }, speculation: { immediateAffine4: true } }));
-      const off = graph(prototype, { composition: testComposition(undefined, { speculativeAffineKv: false }) })
-        .graphCapabilities;
-      expect(off.speculation).toEqual({ ...declared.speculation, affineKv: false });
-    }
+  test("Qwen3.5: prepared embeddings with positions, video, speculation over affine KV as its own option", () => {
+    // Speculation over affine KV is the composition's field (`MLX_BUN_QWEN_SPEC_KV4`, read when it resolves). The
+    // generated M1 Max Trellis graph declares the same (tests/models/qwen38-m1max-identity.test.ts).
+    const declared = graph(Qwen35Model.prototype, { composition: testComposition() }).graphCapabilities;
+    expect(declared).toEqual(declareGraph({ media: { input: "embeddings+positions", video: true }, hiddenLayerTaps: true,
+      kv: { delayedAffine: "all" }, prefill: { boundedWorkspace: true }, speculation: { immediateAffine4: true } }));
+    const off = graph(Qwen35Model.prototype, { composition: testComposition(undefined, { speculativeAffineKv: false }) })
+      .graphCapabilities;
+    expect(off.speculation).toEqual({ ...declared.speculation, affineKv: false });
   });
 
   test("dense-attention graphs delay affine rows for ordinary decoding only", () => {

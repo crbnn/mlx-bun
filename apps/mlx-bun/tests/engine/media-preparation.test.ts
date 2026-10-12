@@ -54,7 +54,6 @@ describe.skipIf(nativeMissing)("media preparation routes", () => {
   test("the binder selects each family's route once, from the concrete model", async () => {
     const { DiffusionGemmaModel } = await import("@mlx-bun/inference/models/diffusion-gemma");
     const { Qwen35Model } = await import("@mlx-bun/inference/models/qwen3_5");
-    const { Qwen38TrellisTQ } = await import("@mlx-bun/inference/models/qwen38-27b-trellis-tq");
     const { Gemma4Model } = await import("@mlx-bun/inference/models/gemma4");
     const { Qwen3Model } = await import("@mlx-bun/inference/models/qwen3");
     // Stand-ins built without weights carry the composition facts a graph declares from.
@@ -67,13 +66,12 @@ describe.skipIf(nativeMissing)("media preparation routes", () => {
     // The tower check precedes extraction: a URL that would fail to fetch is never read.
     expect(await diffusion.prepare(request(unreachable))).toEqual({ rejected: "vision-tower-absent" });
 
-    for (const prototype of [Qwen35Model.prototype, Qwen38TrellisTQ.prototype]) {
-      const qwen = await bind(prototype);
-      expect(qwen.video).toBe(true);
-      const call = request(user(image()));
-      expect(await qwen.prepare(call)).toEqual({ rejected: "vision-sidecar-unavailable" });
-      expect(call.optionsRead()).toBe(0);
-    }
+    // The generated Trellis graphs declare Qwen 3.5's media (tests/models/qwen38-m1max-identity.test.ts in the library).
+    const qwen = await bind(Qwen35Model.prototype);
+    expect(qwen.video).toBe(true);
+    const call = request(user(image()));
+    expect(await qwen.prepare(call)).toEqual({ rejected: "vision-sidecar-unavailable" });
+    expect(call.optionsRead()).toBe(0);
 
     // A graph without declared media takes the tower route, which refuses every media part.
     for (const prototype of [Gemma4Model.prototype, Qwen3Model.prototype]) {

@@ -7,11 +7,10 @@ import { QuantizedLinear } from "./quantized-linear";
 import { wordsPerBlock } from "../kernels/trellis/codebook";
 import {
   TRELLIS_MATVEC_MAX_M as MATVEC_MAX_M, type TrellisGeometry,
-  expandTrellis, trellisReduce, trellisScatter,
-  fusedGateUpSwiglu as gateUpKernel, fusedGateUpSwigluMixed as mixedGateUpKernel,
+  expandTrellis, trellisReduce, trellisScatter, fusedGateUpSwiglu as gateUpKernel,
   tiledTrellisPrefill, tiledTrellisPrefillEligible,
   splitKTrellisPrefill, splitKTrellisPrefillEligible,
-  wideTrellisPrefill, wideTrellisPrefillEligible, type MixedGateUpTail,
+  wideTrellisPrefill, wideTrellisPrefillEligible,
   qualifiedRepresentations, type TrellisRepresentations,
 } from "../kernels/trellis/index";
 export { TRELLIS_MATVEC_MAX_M, type TrellisGeometry, type MixedGateUpTail } from "../kernels/trellis/index";
@@ -54,21 +53,9 @@ export function fusedGateUpEligible(gate: TrellisLinear, up: TrellisLinear): boo
     a.k === b.k && a.rows === b.rows && a.cols === b.cols && a.T === b.T && a.L === b.L;
 }
 
-/** Gate and up share their axis-1 geometry but NOT their bit width: the case a
- *  per-tensor bit allocation creates and the same-k fused kernel refuses.
- *  Geometry only; whether to use it is the owning graph's decision. */
-export function mixedGateUpEligible(gate: TrellisLinear, up: TrellisLinear): boolean {
-  const a = gate.geometry, b = up.geometry;
-  return a.axis === 1 && b.axis === 1 && a.k !== b.k &&
-    a.rows === b.rows && a.cols === b.cols && a.T === b.T && a.L === b.L;
-}
-
 /** Borrow the layers' weights; the gate's stored representations choose the decode. */
 export function fusedGateUpSwiglu(x: MlxArray, gate: TrellisLinear, up: TrellisLinear): MlxArray {
   return gateUpKernel(x, gate, up, VARIANT, gate.representations.gateUpCodebook);
-}
-export function fusedGateUpSwigluMixed(x: MlxArray, gate: TrellisLinear, up: TrellisLinear, tail: MixedGateUpTail = "fused"): MlxArray {
-  return mixedGateUpKernel(x, gate, up, VARIANT, tail, gate.representations.mixedExactBits);
 }
 
 /** Output rows [start, stop) of an axis-1 (row-coded) Trellis projection as an

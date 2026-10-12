@@ -7,7 +7,9 @@ import { expect, test } from "bun:test";
 import { Dtype, MlxArray, ops } from "@mlx-bun/mlx";
 import type { QuantSpec } from "../../src/artifacts/config";
 import { createRuntimeConfig, withRuntimeConfig } from "../../src/runtime/config";
-import { ExpandedTrellisLinear, TrellisLinear, fusedGateUpSwiglu, fusedGateUpSwigluMixed } from "../../src/layers/trellis-linear";
+import { ExpandedTrellisLinear, TrellisLinear, fusedGateUpSwiglu } from "../../src/layers/trellis-linear";
+import { ReduceGateUpRow, ReduceGateUpRows, ReduceMixedGateUp } from "../../src/layers/trellis-reduce-gate-up";
+import { ScatterDownK3iRow, ScatterDownK3iRows, ScatterDownRow, ScatterDownRows } from "../../src/layers/trellis-scatter-down";
 import * as reference from "./trellis-linear-reference";
 
 const defaults = createRuntimeConfig({});
@@ -95,7 +97,8 @@ test("fused gate/up wrappers are bit-identical to the committed layer's", () => 
           diffs.push(`k${gi + 2}=${diff}`);
         }
         for (const [gi, ui] of [[0, 1], [1, 2], [2, 0], [1, 0]] as const) for (const tail of ["fused", "split"] as const) {
-          using actual = fusedGateUpSwigluMixed(x, layer(gates[gi]!), layer(ups[ui]!), tail);
+          // The mixed-width wrapper's one caller was the TQ graph; D2 made it the ReduceMixedGateUp layer.
+          using actual = new ReduceMixedGateUp(layer(gates[gi]!), layer(ups[ui]!), tail).forward(x);
           using expected = reference.fusedGateUpSwigluMixed(x, committed(gates[gi]!), committed(ups[ui]!), tail);
           const diff = maxDiff(actual, expected);
           expect(diff, `mixed k${gi + 2}/${ui + 2} ${tail} M=${m}`).toBe(0);
@@ -106,6 +109,43 @@ test("fused gate/up wrappers are bit-identical to the committed layer's", () => 
     } finally { for (const w of [...gates, ...ups]) w[Symbol.dispose](); }
   });
 }, 120_000);
+
+test("the reduce gate/up and scatter down layers are bit-identical to the committed layer's paths at their rows", () => {
+  withRuntimeConfig(defaults, () => {
+    const gates = [2, 3, 4].map((k) => packed(1, k, 307 + k)), ups = [2, 3, 4].map((k) => packed(1, k, 401 + k));
+    const downs: [string, Packed, boolean][] = [["k2", packed(0, 2, 503), false], ["k4", packed(0, 4, 509), false],
+      ["k3 interleaved", packed(0, 3, 521, true), true]];
+    try {
+      const layer = (w: Packed, shared = false) => new TrellisLinear(w.codes, w.scales, w.spec, shared);
+      const committed = (w: Packed, shared = false) => new reference.TrellisLinear(w.codes, w.scales, w.spec, undefined, shared);
+      for (const m of [1, 2, 3, 4]) {
+        using x = input(m, IN);
+        const diffs: string[] = [];
+        for (const i of [0, 1, 2]) {
+          const gate = layer(gates[i]!), up = layer(ups[i]!);
+          using actual = (m === 1 ? new ReduceGateUpRow(gate, up) : new ReduceGateUpRows(gate, up)).forward(x);
+          using expected = reference.fusedGateUpSwiglu(x, committed(gates[i]!), committed(ups[i]!));
+          const diff = maxDiff(actual, expected);
+          expect(diff, `same-width k${i + 2} M=${m}`).toBe(0);
+          diffs.push(`k${i + 2}=${diff}`);
+        }
+        // The 27B graph builds its down projections with the shared scatter codebook.
+        using d = input(m, OUT);
+        for (const [name, w, interleaved] of downs) {
+          const down = layer(w, true);
+          const project = interleaved ? m === 1 ? new ScatterDownK3iRow(down) : new ScatterDownK3iRows(down)
+            : m === 1 ? new ScatterDownRow(down) : new ScatterDownRows(down);
+          using actual = project.forward(d);
+          using expected = committed(w, true).forward(d);
+          const diff = maxDiff(actual, expected);
+          expect(diff, `down ${name} M=${m}`).toBe(0);
+          diffs.push(`down-${name}=${diff}`);
+        }
+        console.log(`[trellis-identity] reduce/scatter layers M=${m}: maxDiff ${diffs.join(" ")}`);
+      }
+    } finally { for (const w of [...gates, ...ups, ...downs.map(([, packedDown]) => packedDown)]) w[Symbol.dispose](); }
+  });
+}, 300_000);
 
 test("ExpandedTrellisLinear is bit-identical to the committed layer's expand mode", () => {
   withRuntimeConfig(defaults, () => {

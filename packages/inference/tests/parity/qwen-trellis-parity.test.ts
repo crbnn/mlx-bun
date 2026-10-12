@@ -103,7 +103,7 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis: logits, greedy tokens and MTP spec
   const { QwenMtpProvider } = await import("@mlx-bun/inference/generation/speculative");
   const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
   const { argmaxLastPosition, lastPositionLogits } = await import("@mlx-bun/inference/scoring");
-  const { Qwen38TrellisTQ } = await import("@mlx-bun/inference/models/qwen38-27b-trellis-tq");
+  const { Qwen38TrellisM1Max } = await import("@mlx-bun/inference/models/qwen38-27b-trellis-m1max");
   const { clearCache } = await import("@mlx-bun/mlx/ffi");
   const { observedPhases, phaseLogits } = await import("../models/phase-forward");
 
@@ -119,8 +119,9 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis: logits, greedy tokens and MTP spec
   const report: Record<string, unknown> = {};
   try {
     const model = createModel(weights, config) as A;
-    // The purpose-built graph main selected must be the one this tree selects too.
-    expect(model).toBeInstanceOf(Qwen38TrellisTQ);
+    // Main selected its purpose-built TQ graph for this artifact on the M1 Max; this tree selects the graph generated
+    // for that composition (the reference runtime's GPU family is checked above).
+    expect(model).toBeInstanceOf(Qwen38TrellisM1Max);
     report.graph = model.constructor.name;
 
     // Greedy trajectories, full logits by hash.
