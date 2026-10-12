@@ -56,13 +56,13 @@ export function bindSpeculativeGroupRequests(model: MlxTokenGraph, provider: Pic
   const target = () => view ??= bindLegacyDraftTarget(model, []);
   // Resolved once for this target into a snapshot the binding owns: the checked
   // list cannot change afterwards, and prefill and decode rows must tap exactly it.
-  const taps = Object.freeze([...(provider.grouped?.targetTapLayers?.(target()) ?? [])]);
+  const taps = Object.freeze([...(provider.grouped.targetTapLayers?.(target()) ?? [])]);
   if (!binding.supportsTapLayers(taps)) return undefined;
   // The selection's composition facts, resolved once for this target: argmax
   // drafts (`MLX_BUN_SPEC_GREEDY_DRAFT`), else the vocabulary the provider
   // declares for it.
   const greedy = greedyDraftPolicy();
-  const listed = greedy ? null : provider.grouped?.draftVocabulary?.(target()) ?? null;
+  const listed = greedy ? null : provider.grouped.draftVocabulary?.(target()) ?? null;
   return (input: GenerateOptions): MlxGroupMethodRequest => {
     const options = captureSpeculativeOptions(input);
     // The request's selection, resolved once here: the listed vocabulary only
@@ -170,7 +170,7 @@ class SpeculativeGroup implements MlxGroupedMethod {
         const sampler = makeSampler(draftSamplerOptions(options));
         const request: RequestState = { draftSampling: sampler, draftSubset: makeSubsetDraftSampler(draftSamplerOptions(options)),
           namespace: "", prefixLength: 0,
-          fill: method.provider.grouped?.supportsExternalTokens ? options.fill : undefined,
+          fill: method.provider.grouped.supportsExternalTokens ? options.fill : undefined,
           processed: method.host.promptCache ? [] : undefined,
           sampling: makeStepSampler(options, { tokenRepresentation: "number", grammarWait: "before-sample",
             historyUpdate: "after-sample", initialHistory: row.req.promptIds, acceptGrammar: true,
@@ -183,7 +183,7 @@ class SpeculativeGroup implements MlxGroupedMethod {
         try {
           caches = method.binding.makeCache();
           prefix ??= declaredTaps(method.provider, method.taps,
-            method.provider.grouped!.openPrefill({ target: bindLegacyDraftTarget(method.model, caches), checkpoints: [] }));
+            method.provider.grouped.openPrefill({ target: bindLegacyDraftTarget(method.model, caches), checkpoints: [] }));
           const prompt = row.req.promptIds;
           const pendingPrompt = prefix.prefillMode !== "full" && method.binding.prefillTailSplit && prompt.length > 1;
           request.prefixLength = prompt.length - Number(pendingPrompt);
@@ -301,7 +301,7 @@ class SpeculativeGroup implements MlxGroupedMethod {
               }
               maintain?.prepareBatch?.(state.caches);
               this.#target ??= new MlxStateRows(state.caches.map(targetCacheLayout));
-              this.#draft ??= declaredTaps(this.provider, this.taps, this.provider.grouped!.open({ target: bindLegacyDraftTarget(this.model, this.#target.caches),
+              this.#draft ??= declaredTaps(this.provider, this.taps, this.provider.grouped.open({ target: bindLegacyDraftTarget(this.model, this.#target.caches),
                 checkpoints: [], sampling: { sample: (lp, steps) => this.#sampleDraftRows(lp, steps), selection: this.#draftSelection() },
                 constraints: { propose: async (row, maxTokens) => this.host.rows[row]!.req.grammar?.proposeTokens(maxTokens) ?? [] } }));
               applyStateChanges([() => this.#target!.prepareAppend(state.caches),
