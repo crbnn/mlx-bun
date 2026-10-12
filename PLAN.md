@@ -983,6 +983,14 @@ above with an exit; an answered one moves its finding to the owning documentatio
   the scheduler understands. The general rule behind it: a measured boundary belongs to the
   composition, never to a contract. Pick up when a measurement first needs a boundary the named
   classes cannot express, or when the generated graphs are the only width tables left.
+- **Formal proofs composed along the contracts** (kernels, layers, graphs, cache, scheduler; Josh,
+  2026-10-11): because every piece implements a contract defined between layers and nothing crosses
+  one any other way, correctness can be proven per lego (a kernel against its reference op over the
+  composition's fixed shapes, a cache lego against the conformance obligations, a graph against its
+  phase table) and composed the way the program composes, kernels to layers to graphs. Today's
+  bit-identity gates are the empirical form; the contracts' JSDoc obligations (ownership, disposal,
+  ordering, numerical guarantees) are the statements. Proofs compose over structure and bit-identity
+  under the same kernels, not real-number equality.
 
 - **SkillOpt skill optimization** (chat, memory, a new optimization domain; [research](https://github.com/joshuarossi/mlx-bun/pull/247)):
   can SkillOpt's gated skill-edit loop (Microsoft, MIT, arXiv:2605.23904) improve the default
