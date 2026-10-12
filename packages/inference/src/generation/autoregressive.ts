@@ -22,7 +22,6 @@ import { widthClass, type MlxKnownSpans } from "../contracts/mlx/graph";
 import { nextPrefillStep } from "../contracts/portable/prefill";
 import {
 assertMlxAutoregressiveBinding,
-supportsCommittedAppendCache,
 type MlxAutoregressiveBinding,
 type MlxDecodeStep
 } from "./bindings/autoregressive";
@@ -66,28 +65,24 @@ export function shouldUseGrammarJump(
 /** Composition gate for token fast-forwarding, enforced inside the engine
  *  The serving planner owns request-level eligibility, including explicit
  *  seeds in serial execution and mounted draft models. Shared strict fill
- *  has its own grouped method and uses the same append-format declaration.
+ *  has its own grouped method. The composition's KV scheme is no gate: every
+ *  cache lego takes known tokens, one position at a time or through the
+ *  graph's committed spans.
  *   - grammar: forced-token production is the grammar's job; two producers in
  *     one iteration is forbidden (asserted in the loop).
  *   - logprobs/top_logprobs: injected tokens are never sampled, so they have
  *     no distribution row (same rule as shouldUseGrammarJump).
- *   - promptEmbeddings: vision/audio prompts (and mRoPE) — untested shape.
- *   - quantized KV: the model's append binding declares the formats of the
- *     composition's scheme `kv` it supports. Verify-policy quantized appends
- *     remain a separate gate. */
+ *   - promptEmbeddings: vision/audio prompts (and mRoPE) — untested shape. */
 export function shouldUseFill(
   options: Pick<GenerateOptions, "fill" | "grammar" | "logprobs" | "topLogprobs" | "promptEmbeddings">,
   runtime: RuntimeConfig = runtimeConfig(),
-  append?: Pick<MlxKnownSpans, "affineKvBits" | "turboQuantFormats"> | null,
-  kv: KvStorageScheme = BF16_KV,
 ): boolean {
   if (!options.fill) return false;
   if (resolveFillMode(runtime.value("MLX_BUN_FILL") ?? "off") === "off") return false;
   return options.grammar === undefined &&
     !options.logprobs &&
     !(options.topLogprobs && options.topLogprobs > 0) &&
-    options.promptEmbeddings === undefined &&
-    supportsCommittedAppendCache(append, kv);
+    options.promptEmbeddings === undefined;
 }
 
 /** The rewind surface a verify-policy fill needs. `Cache` declares the
@@ -213,7 +208,7 @@ async function* generateInner(
   // Token fast-forwarding gate (see shouldUseFill). Sliding-window layers take
   // part: a multi-token append is one concat write, and a rejected verify tail
   // leaves the ring by the bypass trim that write allows (see rewind below).
-  const fillOn = shouldUseFill(options, runtime, appender, kv);
+  const fillOn = shouldUseFill(options, runtime);
   const fillTrace = fillOn && fillTraceEnabled();
   const fillTraceFile = fillOn ? fillTracePath() : null;
   // Verify-policy proposals (echo tier) need the rejected tail rewound. That

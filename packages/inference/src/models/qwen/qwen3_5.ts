@@ -109,7 +109,6 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
     this.faIdx = config.text.fullAttentionInterval - 1;
     this.#packMixedMlp = composition.packedMixedMlp;
     this.knownSpans = this.#qualifiesKnownSpans() ? Object.freeze({
-      affineKvBits: Object.freeze([4, 8]), turboQuantFormats: Object.freeze([Object.freeze({ kBits: 8, vBits: 3 })]),
       maxChunkSize: (state: readonly Cache[]) => qwenAppendChunkSize(state[0]!.offset),
     }) : undefined;
     const known: ReadPhase = this.knownSpans ? "committed" : "window";

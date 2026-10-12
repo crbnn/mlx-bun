@@ -662,7 +662,6 @@ ${k.verifyRoundCosts ? `  /** Verify forward cost by rows relative to one decode
   readonly logits: MlxWidthTable<MlxHeadForward>;
 ${k.knownSpans ? `  /** Committed known-token spans: the append keeps the native affine arithmetic while Trellis shares up to four rows. */
   readonly knownSpans: MlxKnownSpans = Object.freeze({
-    affineKvBits: Object.freeze([4, 8]), turboQuantFormats: Object.freeze([Object.freeze({ kBits: 8, vBits: 3 })]),
     maxChunkSize: (state: readonly Cache[]) => qwenAppendChunkSize(state[0]!.offset),
   });
 ` : ""}

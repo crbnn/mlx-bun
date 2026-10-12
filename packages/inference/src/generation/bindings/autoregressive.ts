@@ -21,20 +21,6 @@ export interface MlxDecodeStep {
   close(): void | Promise<void>;
 }
 
-/** The model declares which codecs retain its committed-span arithmetic; `kv`
- * is the composition's KV scheme, which its caches store. */
-export function supportsCommittedAppendCache(
-  spans: Pick<MlxKnownSpans, "affineKvBits" | "turboQuantFormats"> | null | undefined,
-  kv: KvStorageScheme,
-): boolean {
-  switch (kv.kind) {
-    case "bf16": return true;
-    case "turbo": return !!spans?.turboQuantFormats?.some(format => format.kBits === kv.kBits && format.vBits === kv.vBits);
-    case "affine-layers": return kv.layers.every(layer => spans?.affineKvBits?.includes(layer.bits));
-    case "affine": return !!spans?.affineKvBits?.includes(kv.bits);
-  }
-}
-
 /** One replaceable binding owns all graph-specific operations used by the AR
  * loop: the graph's named phases and the facts the loop reads once. The
  * current method requires MLX tensors and the legacy Cache[] ABI. Weights are

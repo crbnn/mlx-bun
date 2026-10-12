@@ -54,9 +54,7 @@ export class KVCache implements CompiledDecodeCache, CommittedAttentionCache, Bi
     return sdpaRead(keys, values, causalLease);
   }
 
-  /** The graph qualifies bf16 committed spans as the window read
-   * (`supportsCommittedAppendCache` admits storage without `kvBits`), so a
-   * committed span reads exactly as a window does. */
+  /** A bf16 committed span reads exactly as a window does. */
   appendCommitted(k: MlxArray, v: MlxArray): AttentionRead {
     return this.appendWindow(k, v);
   }

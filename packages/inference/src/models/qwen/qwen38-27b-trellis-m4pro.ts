@@ -284,7 +284,6 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph, MlxTokenPhases {
   readonly logits: MlxWidthTable<MlxHeadForward>;
   /** Committed known-token spans: the append keeps the native affine arithmetic while Trellis shares up to four rows. */
   readonly knownSpans: MlxKnownSpans = Object.freeze({
-    affineKvBits: Object.freeze([4, 8]), turboQuantFormats: Object.freeze([Object.freeze({ kBits: 8, vBits: 3 })]),
     maxChunkSize: (state: readonly Cache[]) => qwenAppendChunkSize(state[0]!.offset),
   });
 

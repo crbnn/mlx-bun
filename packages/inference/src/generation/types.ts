@@ -121,7 +121,7 @@ export interface GenerateOptions extends SamplerOptions, LogitsProcessorOptions 
    *  or rolled back, and no comparison is made against what the model would
    *  have produced. Injection bypasses the sampler, which is a documented
    *  behavior-policy deviation at temperature > 0 — hence opt-in
-   *  (MLX_BUN_FILL=strict) and the composition refusals in shouldUseFill.
+   *  (MLX_BUN_FILL=strict) and the request refusals in shouldUseFill.
    *  Serial lane only: the batch scheduler and the spec loop never read it. */
   fill?: FillSession;
 }

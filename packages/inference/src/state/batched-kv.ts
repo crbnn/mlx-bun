@@ -41,9 +41,7 @@ export class BatchedKVCache implements BatchableCache, PaddedPrefillCache, Commi
   }
 
   /** Fill spans run on this layout (the target layout of a full-attention
-   * layer). The graph qualifies bf16 committed spans as the window read
-   * (`supportsCommittedAppendCache` admits storage without `kvBits`), so a
-   * committed span reads exactly as a window does. */
+   * layer). A bf16 committed span reads exactly as a window does. */
   appendCommitted(k: MlxArray, v: MlxArray): AttentionRead {
     return this.appendWindow(k, v);
   }

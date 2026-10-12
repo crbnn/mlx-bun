@@ -96,7 +96,7 @@ export function bindMlxGateway(model: MlxTokenGraph,
   const grammarSpans = caps.method === "autoregressive" && !verification.grammarProposals
     ? bindGrammarGroupRequests(model) : undefined;
   const adapterState = caps.adapters.batched ? model.loraState : undefined;
-  const fillRequests = !denoising ? bindFillGroupRequests(model, kv) : undefined;
+  const fillRequests = !denoising ? bindFillGroupRequests(model) : undefined;
   const mediaInput = caps.media && caps.media.input !== "pixels"
     ? (input: Vision): MlxPromptInput => graph.bindMediaInput!(input) : undefined;
   return {
