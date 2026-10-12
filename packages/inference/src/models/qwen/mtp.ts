@@ -8,11 +8,12 @@ import { disposing } from "../../layers/helpers";
 import { QuantizedLinear } from "../../layers/quantized-linear";
 import { RMSNorm } from "../../layers/normalization";
 import { type Cache } from "../../contracts/mlx/cache";
-import type { RecurrentMtpModule } from "../../contracts/mlx/drafter";
+import type { RecurrentMtpForward, RecurrentMtpModule } from "../../contracts/mlx/drafter";
+import type { MlxWidthTable } from "../../contracts/mlx/graph";
 import { DenseLinear } from "../../layers/dense-linear";
 import { compiledSwiglu } from "../../layers/swiglu";
 import { Qwen3Attention } from "./blocks";
-import { deprecatedPhase } from "../graph";
+import { atEveryWidth } from "../graph";
 
 type MtpLinear = DenseLinear | QuantizedLinear;
 
@@ -56,12 +57,19 @@ export class MtpModule implements RecurrentMtpModule {
     this.finalNorm = new RMSNorm(weights.tensor("norm.weight"), eps);
   }
 
+  /** One position per row; the module has one draft kernel set, at every width. */
+  readonly decode: MlxWidthTable<RecurrentMtpForward> = atEveryWidth<RecurrentMtpForward>(
+    (tokenEmbeds, hiddens, cache) => this.#block(tokenEmbeds, hiddens, cache, "decode"));
+  /** Several positions per row. */
+  readonly window: RecurrentMtpForward = (tokenEmbeds, hiddens, cache) => this.#block(tokenEmbeds, hiddens, cache, "window");
+
   /** One block forward over [B,S,·]: token embeddings ([B,S,H], target
    *  embed_tokens output) paired with hiddens ([B,S,H], target pre-final-norm
-   *  or the module's own chained output). Appends S rows to `cache`; returns
-   *  the module output [B,S,H] (post final norm — what the target lm_head
-   *  consumes AND what chains into the next step's `hidden`). */
-  forward(tokenEmbeds: MlxArray, hiddens: MlxArray, cache: Cache): MlxArray {
+   *  or the module's own chained output), the attention reading its cache for
+   *  `phase`. Appends S rows to `cache`; returns the module output [B,S,H]
+   *  (post final norm — what the target lm_head consumes AND what chains into
+   *  the next step's `hidden`). */
+  #block(tokenEmbeds: MlxArray, hiddens: MlxArray, cache: Cache, phase: "decode" | "window"): MlxArray {
     const embNorm = this.preFcNormEmbedding.forward(tokenEmbeds);
     const hidNorm = this.preFcNormHidden.forward(hiddens);
     const joined = ops.concatAxis([embNorm, hidNorm], 2);
@@ -72,7 +80,7 @@ export class MtpModule implements RecurrentMtpModule {
 
     // Decoder layer (Qwen3Layer.forward shape).
     const xn = this.inputNorm.forward(x);
-    const r = this.attn.forward(xn, cache, deprecatedPhase(x));
+    const r = this.attn.forward(xn, cache, phase);
     xn.dispose();
     const h = ops.add(x, r);
     x.dispose();

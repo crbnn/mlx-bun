@@ -4,6 +4,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import type { PreparedStateChange } from "../../../contracts/portable/resources";
 import { normalizedArgmax } from "../../../kernels/sampling/normalized-argmax";
 import type { RecurrentMtpModule } from "../../../contracts/mlx/drafter";
+import { widthClass } from "../../../contracts/mlx/graph";
 import { applyStateChanges,cleanupFailure,disposeResources } from "../../../runtime/resources";
 import { toLogprobs } from "../../../sampling/index";
 import { BatchedKVCache } from "../../../state/batched-kv";
@@ -107,7 +108,7 @@ export class QwenMtpRows {
       using embeds = this.target.embed(first);
       const mixed = this.#prefilled.some(value => !value);
       if (mixed) this.#cache.specRoundBegin();
-      this.module.forward(embeds, this.#hidden!, this.#cache).dispose();
+      this.module.decode[widthClass(B)](embeds, this.#hidden!, this.#cache).dispose();
       if (mixed) this.#cache.specRoundRollback(this.#prefilled.map(Number));
     }
     for (let pos = 0; pos + 1 < length; pos += 2048) {
@@ -115,7 +116,8 @@ export class QwenMtpRows {
       using ids = tokens.slice([0, pos + 1], [B, end + 1]);
       using embeds = this.target.embed(ids);
       using hidden = context.slice([0, pos, 0], [B, end, H]);
-      this.module.forward(embeds, hidden, this.#cache).dispose();
+      // A single position per row appends through the one-position read.
+      (end - pos === 1 ? this.module.decode[widthClass(B)] : this.module.window)(embeds, hidden, this.#cache).dispose();
       ops.evalAll(this.#cache.state());
     }
     using tail = context.slice([0, length - 1, 0], [B, length, H]);
@@ -181,7 +183,7 @@ export class QwenMtpRows {
       // its companion KV aligned so a later round can resume speculation.
       if (depth === 0) {
         using embeds = this.target.embed(ids!);
-        this.module.forward(embeds, this.#hidden!, this.#cache).dispose();
+        this.module.decode[widthClass(B)](embeds, this.#hidden!, this.#cache).dispose();
         this.#drafts = Array.from({ length: B }, () => []);
         this.#depth = 0;
         this.#hidden!.dispose(); this.#hidden = null;
@@ -189,7 +191,7 @@ export class QwenMtpRows {
       }
       for (let position = 0; position < depth; position++) {
         using embeds = this.target.embed(ids!);
-        const output = this.module.forward(embeds, chained ?? this.#hidden!, this.#cache);
+        const output = this.module.decode[widthClass(B)](embeds, chained ?? this.#hidden!, this.#cache);
         chained?.dispose(); chained = output;
         // Frequency-ranked draft vocabulary: project onto the listed rows only.
         // The target still verifies over the full vocabulary.
@@ -205,7 +207,7 @@ export class QwenMtpRows {
             continue;
           }
         }
-        using logits = this.target.logitsFromHidden(output);
+        using logits = this.target.logits[widthClass(B)](output);
         using flat = ops.reshape(logits, [B, logits.shape.at(-1)!]);
         let token: MlxArray;
         if (this.sampling!.greedy) {
@@ -247,7 +249,7 @@ export class QwenMtpRows {
       using embeds = this.target.embed(ids);
       using hidden = context.slice([0, depth - 1, 0], [B, depth, context.shape[2]!]);
       this.#cache.specRoundBegin();
-      this.module.forward(embeds, hidden, this.#cache).dispose();
+      this.module.decode[widthClass(B)](embeds, hidden, this.#cache).dispose();
       this.#cache.specRoundRollback(extra);
     }
     using positions = ops.fromInt32([...accepted], [B, 1, 1]);

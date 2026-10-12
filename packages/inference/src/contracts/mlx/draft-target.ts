@@ -1,6 +1,7 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { AssistantDonors } from "./attention";
 import type { DraftProjection } from "./draft-projection";
+import type { MlxWidthTable } from "./width";
 
 /** Read-only target state and embedding, independent of draft scheduling. */
 export interface AssistantRowsTarget {
@@ -19,7 +20,8 @@ export interface RecurrentMtpTarget {
   readonly hiddenSize: number;
   readonly layerCount: number;
   embed(ids: MlxArray): MlxArray;
-  logitsFromHidden(hidden: MlxArray): MlxArray;
+  /** The output head per width class, indexed by the rows the drafter projects. */
+  readonly logits: MlxWidthTable<(hidden: MlxArray) => MlxArray>;
   /** The untied quantized vocabulary projection, when the drafter may project
    *  onto a row subset of it (frequency-ranked draft vocabulary). Borrowed. */
   readonly vocabularyHead?: {

@@ -31,9 +31,9 @@
 // Kernels: each 4-bit projection is built at load on both kernels it runs.
 // Context projection (prefill taps, a commit's accepted rows: any count) runs
 // MLX's quantized matmul. A draft block of B anchors × G columns runs the
-// simdgroup matrix unit when its B·G rows fit one block of 8 (5..8 rows) and
-// MLX's quantized matmul at every other count; the block takes its kernel once,
-// from its own width, and every projection in it runs that kernel.
+// simdgroup matrix unit when its B·G rows fit one block of 8 (5..8 rows, the
+// fiveToEight class of its draft table) and MLX's quantized matmul at every other
+// width; the scheduler indexes the table by the rows it drafts for.
 
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
@@ -41,7 +41,9 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { Weights } from "../../artifacts/weights";
 import type { DraftProjection } from "../../contracts/mlx/draft-projection";
 import type { ResidualBasis } from "../../contracts/mlx/draft-target";
-import type { Dflash2ContextAttention, Dflash2DrafterModel } from "../../contracts/mlx/drafter";
+import type { Dflash2ContextAttention, Dflash2DraftBlock, Dflash2DrafterModel } from "../../contracts/mlx/drafter";
+import { widthClass, type MlxWidthTable } from "../../contracts/mlx/graph";
+import { byWidth } from "../graph";
 import { isDflash2Architecture } from "./dflash2-artifact";
 import { QuantizedLinear } from "../../layers/quantized-linear";
 import { Affine4MmaLinear } from "../../layers/affine-verify-linear";
@@ -80,8 +82,6 @@ type BlockKernel = "anyRows" | "blockOf8";
  *  `anyRows` kernel otherwise. */
 interface Weight extends Readonly<Record<BlockKernel, Projection>> { dispose(): void }
 
-/** The kernel a draft block of `rows` rows runs on. */
-function blockKernel(rows: number): BlockKernel { return rows >= 5 && rows <= 8 ? "blockOf8" : "anyRows"; }
 
 function bf16Weight(projection: Bf16Projection): Weight {
   return { anyRows: projection, blockOf8: projection, dispose: () => projection.t.dispose() };
@@ -367,22 +367,20 @@ export class Dflash2Drafter implements Dflash2DrafterModel {
     });
   }
 
-  /** One block per anchor: up to `depth` (≤ gamma) greedy tokens per row. */
-  draftRows(context: Dflash2ContextAttention, projection: DraftProjection, anchors: readonly number[],
-    position: number | MlxArray, depth: number): number[][] {
-    const steps = Math.min(this.cfg.blockSize, Math.max(1, depth) + 1) - 1;
-    if (!steps) return anchors.map(() => []);
-    using tokens = this.draftRowsDevice(context, projection, anchors, position, depth);
-    const flat = tokens.toIntTokens();
-    return anchors.map((_, row) => flat.slice(row * steps, (row + 1) * steps));
-  }
+  /** The columns of a block drafting `depth` tokens: the anchor and up to `depth` (≤ gamma) mask positions. */
+  blockColumns(depth: number): number { return Math.min(this.cfg.blockSize, Math.max(1, depth) + 1); }
 
-  /** The same proposals left on the device: [B, steps] uint32, row-major. */
-  draftRowsDevice(context: Dflash2ContextAttention, projection: DraftProjection, anchors: readonly number[],
-    position: number | MlxArray, depth: number): MlxArray {
-    const B = anchors.length, G = Math.min(this.cfg.blockSize, Math.max(1, depth) + 1);
+  /** The draft block per width class of its rows (anchors × columns): the simdgroup matrix unit for five to
+   *  eight rows, MLX's quantized matmul at every other width. */
+  readonly draft: MlxWidthTable<Dflash2DraftBlock> = byWidth(width => (context, projection, anchors, position, columns) =>
+    this.#block(context, projection, anchors, position, columns, width === "fiveToEight" ? "blockOf8" : "anyRows"));
+
+  /** One block per anchor over `columns` positions, every projection on `kernel`: the proposals left on the
+   *  device, [B, columns - 1] uint32, row-major. */
+  #block(context: Dflash2ContextAttention, projection: DraftProjection, anchors: readonly number[],
+    position: number | MlxArray, columns: number, kernel: BlockKernel): MlxArray {
+    const B = anchors.length, G = columns;
     const { hidden: H, heads, kvHeads, headDim } = this.cfg;
-    const kernel = blockKernel(B * G);
     using ids = ops.fromInt32(anchors.flatMap(anchor => [anchor, ...Array(G - 1).fill(this.cfg.maskTokenId)]), [B, G]);
     using embedded = projection.embed.encode(ids);
     let x = this.#fromTarget(embedded);
@@ -436,7 +434,7 @@ export class Dflash2Drafter implements Dflash2DrafterModel {
       using rows = x.slice([0, 1, 0], [B, G, H]);
       using h = this.#rms(rows, this.#norm);
       using headInput = this.#toTargetHead(h);
-      using logits = projection.logitsFromHidden(headInput);
+      using logits = projection.logits[widthClass(B * (G - 1))](headInput);
       using z = this.#selProj.forward(h);
       using columns = this.#select(logits, z, anchors, G - 1); // [steps, B]
       using rowsMajor = ops.transposeAxes(columns, [1, 0]);

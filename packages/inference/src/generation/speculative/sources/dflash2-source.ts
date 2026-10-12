@@ -11,7 +11,8 @@
 // (`residualBasis`); binding a draft group applies it before the first draft.
 
 import { artifactIdentity } from "../../../artifacts/identity";
-import { projectedDraftGroups } from "../bindings/projected-draft-rows";
+import { projectedDraftGroups, type ProjectedDraftMethod } from "../bindings/projected-draft-rows";
+import { widthClass } from "../../../contracts/mlx/graph";
 import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { DraftProvider, DraftSource, GroupedDraftProvider } from "../source";
@@ -37,14 +38,25 @@ export class Dflash2Provider implements DraftProvider {
         `${target.hiddenLayerTaps.layerCount} layers — wrong (target, drafter) pairing`);
       drafter.bindResidualBasis(target.residualBasis ?? null);
       const projection = target.hiddenLayerTaps.projection;
+      // The block for the rows drafted this round: anchors × columns rows index the drafter's draft table.
+      const draftDevice: NonNullable<ProjectedDraftMethod["draftDevice"]> = (context, pending, positions, depth) => {
+        const columns = drafter.blockColumns(depth);
+        return drafter.draft[widthClass(pending.length * columns)](context, projection, pending, positions, columns);
+      };
       return {
         namespace, schema: "dflash2-context-v1", layers: drafter.cfg.layers,
         project(hidden, positions) {
           using context = drafter.projectContext(hidden);
           return drafter.projectContextKVRows(context, positions);
         },
-        draft: (context, pending, positions, depth) => drafter.draftRows(context, projection, pending, positions, depth),
-        draftDevice: (context, pending, positions, depth) => drafter.draftRowsDevice(context, projection, pending, positions, depth),
+        draft(context, pending, positions, depth) {
+          const steps = drafter.blockColumns(depth) - 1;
+          if (!steps) return pending.map(() => []);
+          using tokens = draftDevice(context, pending, positions, depth);
+          const flat = tokens.toIntTokens();
+          return pending.map((_, row) => flat.slice(row * steps, (row + 1) * steps));
+        },
+        draftDevice,
       };
     });
   }
