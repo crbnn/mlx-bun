@@ -119,6 +119,8 @@ const { unfusedAffineKernels } = await import("../../../src/state/affine-attenti
 const { softcapAttention } = await import("../../../src/state/softcap-attention");
 const { testComposition } = await import("../test-composition");
 const { observedPhases, phaseHidden, phaseLogits } = await import("../phase-forward");
+const { syntheticDigests } = await import("../synthetic-digest");
+const digests = syntheticDigests("gemma2");
 const { widthClass } = await import("../../../src/contracts/mlx/graph");
 /** The storage class a cache holds: a composed lego's storage, else the cache itself. */
 const storageKind = (cache: Cache) => (cache.composed?.storage() ?? cache).constructor.name;
@@ -146,7 +148,7 @@ function fixture() {
   const weights = { shards: { files: new Map() }, tensorNames: [...arrays.keys()],
     has: (name: string) => arrays.has(name), tensor: (name: string) => arrays.get(name)! } as unknown as Weights;
   const models: UniversalDenseModel[] = [];
-  return { make(legacy = false) { const model = legacy ? new LegacyMaskModel(weights, config, testComposition())
+  return { make(causalReference = false) { const model = causalReference ? new OffsetCausalMaskModel(weights, config, testComposition())
     : new UniversalDenseModel(weights, config, testComposition());
     models.push(model); return model; },
     dispose() {
@@ -192,8 +194,9 @@ function maskedRead(mask: Mask, softcap: number | null) {
   } };
 }
 
-// Main's original explicit-mask path: one causal matrix at cache 0's offset.
-class LegacyMaskModel extends SelectedMaskModel {
+// The explicit causal mask by definition for this one-layer full-attention
+// fixture: one causal matrix at the cache's offset (main's explicit-mask path).
+class OffsetCausalMaskModel extends SelectedMaskModel {
   protected selectMasks(caches: Cache[], length: number): Mask[] {
     const mask: Mask = length === 1 ? { mode: "", arr: null }
       : { mode: "array", arr: createCausalMask(length, caches[0]!.offset, null) };
@@ -253,11 +256,11 @@ test.skipIf(!native)("a fill group's last row leaving with a pipelined token dra
 
 describe.skipIf(!native)("Gemma2 manual attention native masks", () => {
   test("ordinary B1 prefill, continuation chunks and decode preserve main's complete logits", () => {
-    const f = fixture(), actual = f.make(), legacy = f.make(true);
-    const current = actual.makeCache(), reference = legacy.makeCache();
+    const f = fixture(), actual = f.make(), causal = f.make(true);
+    const current = actual.makeCache(), reference = causal.makeCache();
     try {
       for (const tokens of [[2, 4, 7], [8, 3], [6], [5, 9]]) {
-        using a = phaseLogits(actual, tokens, current), b = phaseLogits(legacy, tokens, reference);
+        using a = phaseLogits(actual, tokens, current), b = phaseLogits(causal, tokens, reference);
         expect(a.rawBytes()).toEqual(b.rawBytes());
       }
     } finally { dispose(current); dispose(reference); f.dispose(); }
@@ -373,29 +376,6 @@ class PositionMaskModel extends SelectedMaskModel {
   }
 }
 
-/** The selection an earlier change replaced, verbatim: with explicit masks
- * every layer took cache 0's full mask; otherwise one mask per group. */
-class PreviousSelectionModel extends SelectedMaskModel {
-  protected selectMasks(cache: Cache[], L: number): Mask[] {
-    const a = this.args;
-    let faMask: Mask;
-    let swaMask: Mask | null = null;
-    if (a.maskArray) {
-      faMask = kvStorage(cache[0]!).makeMask(L, null);
-      if (faMask.mode === "causal")
-        faMask = { mode: "array", arr: createCausalMask(L, cache[0]!.offset, null) };
-    } else if (a.layerTypes && a.layerTypes.includes("sliding_attention")) {
-      const faIdx = a.layerTypes.indexOf("full_attention");
-      const swaIdx = a.layerTypes.indexOf("sliding_attention");
-      faMask = kvStorage(cache[faIdx === -1 ? 0 : faIdx]!).makeMask(L, null);
-      swaMask = kvStorage(cache[swaIdx]!).makeMask(L, a.slidingWindow);
-    } else {
-      faMask = kvStorage(cache[0]!).makeMask(L, null);
-    }
-    return this.layers.map((_, i) => a.layerTypes?.[i] === "sliding_attention" && swaMask ? swaMask : faMask);
-  }
-}
-
 // Offsets 0→3 (W-1) →4 (W) →5 (W+1) →8 (a chunk past the window) →9 →11 →12.
 const CHUNKS = [[2, 4, 7], [8], [3], [6, 5, 9], [10], [11, 12], [13]];
 const ORDERS: [string, string[]][] = [["full first", [F, S, F, S]], ["sliding first", [S, F, S, F]]];
@@ -403,35 +383,33 @@ const ORDERS: [string, string[]][] = [["full first", [F, S, F, S]], ["sliding fi
 describe.skipIf(!native)("Universal mixed full/sliding masks", () => {
   for (const [order, types] of ORDERS) {
     test(`explicit masks, ${order}: each group masks through its own cache at W-1, W, W+1 and across chunks`, () => {
-      const f = mixedFixture(types, true), actual = f.make(), reference = f.make(PositionMaskModel), previous = f.make(PreviousSelectionModel);
-      const caches = [actual.makeCache(), reference.makeCache(), previous.makeCache()];
-      let previousFailed = false;
+      const f = mixedFixture(types, true), actual = f.make(), reference = f.make(PositionMaskModel);
+      const caches = [actual.makeCache(), reference.makeCache()];
       try {
         expect(caches[0]!.map(cache => cache instanceof RotatingKVCache)).toEqual(types.map(type => type === S));
         for (const tokens of CHUNKS) {
           using a = phaseLogits(actual, tokens, caches[0]!), b = phaseLogits(reference, tokens, caches[1]!);
           expect(a.shape).toEqual([1, tokens.length, 96]);
           expect(a.rawBytes()).toEqual(b.rawBytes());
-          // The replaced selection gives sliding layers a full-width mask; past the window it cannot run.
-          if (!previousFailed) {
-            try { using c = phaseLogits(previous, tokens, caches[2]!); c.eval(); if (c.rawBytes().join() !== a.rawBytes().join()) previousFailed = true; }
-            catch { previousFailed = true; }
-          }
         }
         expect(caches[0]![types.indexOf(S)]!.offset).toBe(12);
-        expect(previousFailed).toBe(true);
       } finally { caches.forEach(dispose); f.dispose(); }
     });
 
-    test(`ordinary masks, ${order}: the recipe reproduces the previous per-group selection exactly`, () => {
-      const f = mixedFixture(types, false), actual = f.make(), previous = f.make(PreviousSelectionModel);
-      const caches = [actual.makeCache(), previous.makeCache()];
+    // Ordinary masks have no definitional reference here (a causal-mode read
+    // and an explicit array differ in the last bits): the recorded digest holds
+    // them, recorded from the tree whose per-group selection equalled the
+    // previous one byte for byte on these chunks.
+    digests.test(`ordinary masks, ${order}: every chunk's logits and caches at W-1, W, W+1 and across chunks`, digest => {
+      const f = mixedFixture(types, false), actual = f.make();
+      const caches = actual.makeCache();
       try {
-        for (const tokens of CHUNKS) {
-          using a = phaseLogits(actual, tokens, caches[0]!), b = phaseLogits(previous, tokens, caches[1]!);
-          expect(a.rawBytes()).toEqual(b.rawBytes());
+        for (const [index, tokens] of CHUNKS.entries()) {
+          using logits = phaseLogits(actual, tokens, caches);
+          digest.tensors(`chunk ${index} logits`, logits);
+          digest.caches(`chunk ${index} caches`, caches);
         }
-      } finally { caches.forEach(dispose); f.dispose(); }
+      } finally { dispose(caches); f.dispose(); }
     });
 
     for (const lengths of [[W + 2, 2], [W - 1, W + 1]]) test(`explicit masks, ${order}: B2 rows of lengths ${lengths} ignore poisoned padding in both groups`, () => {
@@ -1429,7 +1407,7 @@ test.skipIf(!native || !artifact)("a structurally equivalent delegating provider
 // storage's dense fetch, the bf16 window through the append that reaches the
 // start and the window dequantized after it (dequantize-and-read, so a
 // converted layer keeps the graph's own arithmetic over the values its storage
-// holds). The frozen-oracle case holds every phase to that definition at
+// holds). The requantizing-oracle case holds every phase to that definition at
 // maxDiff 0; the served rows of every kind are held to the direct B1 order.
 describe.skipIf(!native)("dense-read graphs with delayed affine KV", () => {
   beforeAll(loadStateValues);
@@ -1740,7 +1718,7 @@ describe.skipIf(!native)("dense-read graphs with delayed affine KV", () => {
     } finally { await plain.close(); await delayed.close(); }
   });
 
-  // The frozen oracle (no artifact holds Gemma 2 numbers past the transition:
+  // The requantizing oracle (no artifact holds Gemma 2 numbers past the transition:
   // main's serial path threw at the first forward that read a converted
   // layer). The graph and its manual attention are the production graph's; the
   // storage is the oracle's: the plain storage the graph composes without a
@@ -1782,7 +1760,7 @@ describe.skipIf(!native)("dense-read graphs with delayed affine KV", () => {
     { name: "layer 2 at 4 bits from 9", start: 9, bits: types.map((_, layer) => layer === 2 ? 4 : null),
       scheme: resolveKvScheme({ override: "config", config: [{ layerIdx: 2, bits: 4, groupSize: HEAD_DIM }], quantizedKvStart: 9 }) },
   ];
-  for (const { name, scheme, bits, start } of oracleSchemes) test(`frozen oracle, ${name}: every phase's logits through the composed legos equal the oracle storage's at maxDiff 0`, () => {
+  for (const { name, scheme, bits, start } of oracleSchemes) test(`requantizing oracle, ${name}: every phase's logits through the composed legos equal the oracle storage's at maxDiff 0`, () => {
     const f = mixedFixture(types, true, HEAD_DIM), model = f.make(undefined, testComposition(scheme.storage));
     const composed = model.makeCache();
     const oracle = types.map((type, layer) => new OracleKv(type === S ? W : null, bits[layer]!, start)) as unknown as Cache[];

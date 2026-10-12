@@ -10,12 +10,12 @@ import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 
 const PACKAGE = resolve(import.meta.dir, "..");
-/** Each suite and the test file that holds its cases. */
-export const SUITES: Readonly<Record<string, string>> = {
-  glm52: "tests/models/glm52/glm52-digest.test.ts",
-  "diffusion-gemma": "tests/models/diffusion-gemma-digest.test.ts",
-  "dense-family": "tests/models/dense-family-digest.test.ts",
-  gemma2: "tests/models/universal/gemma2-batching.test.ts",
+/** Each suite: the test file that holds its cases and the opt-in that file needs to run them. */
+export const SUITES: Readonly<Record<string, { readonly file: string; readonly env?: Readonly<Record<string, string>> }>> = {
+  glm52: { file: "tests/models/glm52/glm52-digest.test.ts" },
+  "diffusion-gemma": { file: "tests/models/diffusion-gemma-digest.test.ts" },
+  "dense-family": { file: "tests/models/dense-family-digest.test.ts" },
+  gemma2: { file: "tests/models/universal/gemma2-batching.test.ts", env: { MLX_BUN_GEMMA2_NATIVE: "1" } },
 };
 const RECORD_ENV = "MLX_BUN_RECORD_SYNTHETIC_DIGESTS";
 
@@ -46,10 +46,11 @@ if (unknown.length) {
 const suites = named.length ? named : Object.keys(SUITES);
 let failed = false;
 for (const suite of suites) {
-  const env = { ...process.env, [RECORD_ENV]: command === "record" ? "1" : undefined };
+  const { file, env: optIn } = SUITES[suite]!;
+  const env = { ...process.env, ...optIn, [RECORD_ENV]: command === "record" ? "1" : undefined };
   // Only the digest cases (their names end in "(digest)") run when recording.
   const filter = command === "record" ? ["--test-name-pattern", "\\(digest\\)$"] : [];
-  const child = Bun.spawn([process.execPath, "test", SUITES[suite]!, ...filter], { cwd: PACKAGE, env, stdout: "inherit", stderr: "inherit" });
+  const child = Bun.spawn([process.execPath, "test", file, ...filter], { cwd: PACKAGE, env, stdout: "inherit", stderr: "inherit" });
   const code = await child.exited;
   console.log(`synthetic-digests ${command} ${suite}: exit ${code}`);
   failed ||= code !== 0;
