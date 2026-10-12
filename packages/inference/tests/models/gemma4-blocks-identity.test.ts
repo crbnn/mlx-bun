@@ -341,7 +341,7 @@ for (const kind of ["dense", "shared"] as const) {
         try {
           const prefill = prompt(37, 1);
           both(`${tag} prefill37`, p, oldCaches, newCaches, forwardHidden([prefill]));
-          phased(`${tag} prefillChunk37`, [prefill], (input, caches) => p.current.prefillChunk.gpu(input, caches) as MlxArray);
+          phased(`${tag} prefillChunk37`, [prefill], (input, caches) => p.current.prefillChunk.gpu(input, caches, null) as MlxArray);
           convert(scheme, oldCaches, newCaches, refCaches, phaseCaches);
           stateDiff(`${tag} converted`, newCaches, oldCaches);
           stateDiff(`${tag} converted (phase operation)`, phaseCaches, refCaches);
@@ -354,7 +354,7 @@ for (const kind of ["dense", "shared"] as const) {
           }
 
           both(`${tag} window5`, p, oldCaches, newCaches, forwardHidden([prompt(5, 2)]));
-          phased(`${tag} prefillTail5`, [prompt(5, 2)], (input, caches) => p.current.prefillTail(input, caches));
+          phased(`${tag} prefillTail5`, [prompt(5, 2)], (input, caches) => p.current.prefillTail.fiveToEight(input, caches, null) as MlxArray);
 
           {
             const rows = [prompt(4, 3)];

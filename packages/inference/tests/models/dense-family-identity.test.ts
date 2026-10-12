@@ -140,7 +140,7 @@ interface Graph {
 /** The current graph's named phases. */
 interface PhasedGraph extends Graph {
   readonly prefillChunk: MlxPrefillChunk;
-  prefillTail(ids: MlxArray, cache: Cache[]): MlxArray | Promise<MlxArray>;
+  readonly prefillTail: MlxWidthTable<MlxVerifyForward>;
   readonly decode: MlxWidthTable<MlxPhaseForward>;
   readonly verify: MlxWidthTable<MlxVerifyForward>;
 }
@@ -383,7 +383,7 @@ for (const family of FAMILIES) {
         try {
           const prefill = prompt(37, 1);
           both(`${tag} prefill37`, p, oldCaches, newCaches, [prefill]);
-          phased(`${tag} prefillChunk37`, p, refCaches, phaseCaches, [prefill], (input, caches) => p.current.prefillChunk.gpu(input, caches));
+          phased(`${tag} prefillChunk37`, p, refCaches, phaseCaches, [prefill], (input, caches) => p.current.prefillChunk.gpu(input, caches, null));
           convert(scheme, oldCaches, newCaches, refCaches, phaseCaches);
           stateDiff(`${tag} converted`, newCaches, oldCaches);
           stateDiff(`${tag} converted (phase operation)`, phaseCaches, refCaches);
@@ -393,7 +393,7 @@ for (const family of FAMILIES) {
             phased(`${tag} decode`, p, refCaches, phaseCaches, [[200 + step]], (input, caches) => p.current.decode.one(input, caches));
           }
           both(`${tag} window5`, p, oldCaches, newCaches, [prompt(5, 2)]);
-          phased(`${tag} prefillTail5`, p, refCaches, phaseCaches, [prompt(5, 2)], (input, caches) => p.current.prefillTail(input, caches));
+          phased(`${tag} prefillTail5`, p, refCaches, phaseCaches, [prompt(5, 2)], (input, caches) => p.current.prefillTail.fiveToEight(input, caches, null) as MlxArray);
           both(`${tag} verify4`, p, oldCaches, newCaches, [prompt(4, 3)]);
           phased(`${tag} verify4`, p, refCaches, phaseCaches, [prompt(4, 3)], (input, caches) => p.current.verify.four(input, caches, null));
 

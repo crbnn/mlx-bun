@@ -21,7 +21,7 @@ import { argmaxLastPosition } from "../../kernels/logits";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import type {
-  MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward,
+  MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward,
 } from "../../contracts/mlx/graph";
 import { declareGraph } from "../capabilities";
 import { atEveryWidth } from "../graph";
@@ -971,10 +971,20 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
   }
 
   readonly prefillChunk: MlxPrefillChunk = { gpu: (ids, cache) => this.forwardHiddenAsync(ids, cache) };
-  prefillTail(ids: MlxArray, cache: Cache[]): Promise<MlxArray> { return this.forwardHiddenAsync(ids, cache); }
+  readonly prefillTail = atEveryWidth<MlxCapturingForward>((ids, cache) => this.forwardHiddenAsync(ids, cache));
+  readonly appendKnown = atEveryWidth<MlxPhaseForward>((ids, cache) => this.forwardHiddenAsync(ids, cache));
   readonly logits = atEveryWidth<MlxHeadForward>(hidden => this.logitsFromHidden(hidden));
   readonly decode = atEveryWidth<MlxPhaseForward>((ids, cache) => this.forwardHiddenAsync(ids, cache));
-  readonly verify = atEveryWidth<MlxVerifyForward>((ids, cache) => this.forwardHiddenAsync(ids, cache));
+  /** A verify window on the row-independent M=1 streamed-expert kernel family
+   *  (`setFixedKernelFamily`), so a token's experts take the same kernels
+   *  whatever rows verify beside it. Composed into the operation: the scheduler
+   *  never pins or unpins it. */
+  readonly verify = atEveryWidth<MlxVerifyForward>(async (ids, cache) => {
+    const executor = this.expertRuntime?.executor;
+    executor?.setFixedKernelFamily(true);
+    try { return await this.forwardHiddenAsync(ids, cache); }
+    finally { executor?.setFixedKernelFamily(false); }
+  });
 
   forwardEmbeddings(
     embeddings: MlxArray,

@@ -48,7 +48,8 @@ import type { Weights } from "../../../artifacts/weights";
 import type { Cache } from "../../../contracts/mlx/cache";
 import type { TargetView } from "../../../contracts/mlx/draft-target";
 import type {
-  MlxCompiledDecodeStep, MlxDeclaredGraph, MlxHeadForward, MlxLayerCapture, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases,
+  MlxCapturingForward, MlxCompiledDecodeStep, MlxDeclaredGraph, MlxHeadForward, MlxLayerCapture, MlxPhaseForward, MlxPrefillChunk,
+  MlxTokenPhases,
   MlxVerifyForward, MlxWidthTable,
 } from "../../../contracts/mlx/graph";
 import type { MediaEncoders, MediaSidecarProbes, MlxPromptInput, Vision } from "../../../contracts/mlx/media";
@@ -217,8 +218,11 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
   readonly perLayerWidth: number;
 
   readonly prefillChunk: MlxPrefillChunk;
+  readonly prefillTail: MlxWidthTable<MlxCapturingForward>;
   readonly decode: MlxWidthTable<MlxPhaseForward>;
   readonly verify: MlxWidthTable<MlxVerifyForward>;
+  /** Known tokens: this graph declares no committed spans, so they read as a window. */
+  readonly appendKnown: MlxWidthTable<MlxPhaseForward>;
   readonly logits: MlxWidthTable<MlxHeadForward>;
 
   /** @deprecated E2 deletes it with `legacyForwardWithTaps`: the layer tap the
@@ -264,18 +268,14 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
     });
 
     const head = this.#head;
-    this.prefillChunk = Object.freeze({
-      gpu: (ids: MlxArray, caches: Cache[]) => this.#run(this.#embedTokens(ids), caches, "window", ids, null),
-    });
+    const window: MlxCapturingForward = (ids, caches, capture) =>
+      this.#run(this.#embedTokens(ids), caches, "window", ids, capture);
+    this.prefillChunk = Object.freeze({ gpu: window });
+    this.prefillTail = atEveryWidth(window);
     this.decode = atEveryWidth<MlxPhaseForward>((ids, caches) => this.#run(this.#embedTokens(ids), caches, "decode", ids, null));
-    this.verify = atEveryWidth<MlxVerifyForward>((ids, caches, capture) =>
-      this.#run(this.#embedTokens(ids), caches, "window", ids, capture));
+    this.verify = atEveryWidth(window);
+    this.appendKnown = atEveryWidth<MlxPhaseForward>((ids, caches) => window(ids, caches, null));
     this.logits = atEveryWidth<MlxHeadForward>(hidden => head(hidden));
-  }
-
-  /** The positions left at the end of a prompt after its whole chunks; the same operation as `prefillChunk.gpu`. */
-  prefillTail(ids: MlxArray, caches: Cache[]): MlxArray {
-    return this.#run(this.#embedTokens(ids), caches, "window", ids, null);
   }
 
   /** One cache per layer that owns one, all sharing one mask memo, so each

@@ -26,7 +26,7 @@ import { denseTurboQuantKernels } from "../../state/turboquant-attention";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import type {
-  MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward,
+  MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward,
 } from "../../contracts/mlx/graph";
 import { PLAIN_KV_VERIFICATION, declareGraph } from "../capabilities";
 import { atEveryWidth, deprecatedPhase, type ReadPhase } from "../graph";
@@ -569,11 +569,13 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
     gpu: (ids, cache) => this.forwardLayers(this.#embed(ids), cache, "window"),
   };
 
-  /** The positions left after a prompt's whole chunks: the same semantics as
-   * `prefillChunk`, named apart because a composition may run it elsewhere. */
-  prefillTail(ids: MlxArray, cache: Cache[]): MlxArray {
-    return this.forwardLayers(this.#embed(ids), cache, "window");
-  }
+  /** A prompt's positions that are not a whole chunk: the window read at every width. */
+  readonly prefillTail = atEveryWidth<MlxCapturingForward>((ids, cache) =>
+    this.forwardLayers(this.#embed(ids), cache, "window"));
+
+  /** Known tokens: this graph declares no committed spans, so they read as a window. */
+  readonly appendKnown = atEveryWidth<MlxPhaseForward>((ids, cache) =>
+    this.forwardLayers(this.#embed(ids), cache, "window"));
 
   /** The one output head at every width. */
   readonly logits = atEveryWidth<MlxHeadForward>(hidden => this.logitsFromHidden(hidden));

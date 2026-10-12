@@ -315,14 +315,14 @@ for (const scheme of SCHEMES) {
         {
           using input = ids([prompt(CHUNK, 1)]);
           const expected = old.forwardHidden(input, set.old);
-          outputDiff(`${scheme} prefillChunk.gpu ${CHUNK}`, current.prefillChunk.gpu(input, set.current) as MlxArray, expected,
+          outputDiff(`${scheme} prefillChunk.gpu ${CHUNK}`, current.prefillChunk.gpu(input, set.current, null) as MlxArray, expected,
             current.logits.wider, oldHead);
           stateDiff(`${scheme} prefillChunk.gpu ${CHUNK}`, set.current, set.old);
         }
         {
           using input = ids([prompt(13, 2)]);
           const expected = old.forwardHidden(input, set.old);
-          outputDiff(`${scheme} prefillTail 13`, current.prefillTail(input, set.current), expected, current.logits.wider, oldHead);
+          outputDiff(`${scheme} prefillTail 13`, (current.prefillTail.wider(input, set.current, null) as MlxArray), expected, current.logits.wider, oldHead);
           stateDiff(`${scheme} prefillTail 13`, set.current, set.old);
         }
         for (let step = 0; step < 3; step++) {
@@ -492,7 +492,7 @@ describe("Qwen3.8 M4 Pro graph, adapters composition", () => {
     };
     try {
       const steps: [string, number[][], (input: MlxArray) => MlxArray][] = [
-        ["prefillChunk.gpu", [prompt(CHUNK, 90)], input => adapted.prefillChunk.gpu(input, newCaches) as MlxArray],
+        ["prefillChunk.gpu", [prompt(CHUNK, 90)], input => adapted.prefillChunk.gpu(input, newCaches, null) as MlxArray],
         ["decode.one", [[7]], input => adapted.decode.one(input, newCaches) as MlxArray],
         ["verify.twoToThree 3", [prompt(3, 91)], input => adapted.verify.twoToThree(input, newCaches, null) as MlxArray],
         ["verify.four 4", [prompt(4, 93)], input => adapted.verify.four(input, newCaches, null) as MlxArray],
@@ -537,14 +537,14 @@ describe("Qwen3.8 M4 Pro graph on the real artifact", () => {
         {
           using input = ids([real(2048, 1)]);
           const expected = old.forwardHidden(input, oldCaches);
-          outputDiff("real prefillChunk.gpu 2048", current.prefillChunk.gpu(input, newCaches) as MlxArray, expected,
+          outputDiff("real prefillChunk.gpu 2048", current.prefillChunk.gpu(input, newCaches, null) as MlxArray, expected,
             lastLogits(current.logits.one), lastLogits(head));
           stateDiff("real prefillChunk.gpu 2048", newCaches, oldCaches);
         }
         {
           using input = ids([real(37, 2)]);
           const expected = old.forwardHidden(input, oldCaches);
-          outputDiff("real prefillTail 37", current.prefillTail(input, newCaches), expected, lastLogits(current.logits.one), lastLogits(head));
+          outputDiff("real prefillTail 37", (current.prefillTail.wider(input, newCaches, null) as MlxArray), expected, lastLogits(current.logits.one), lastLogits(head));
           stateDiff("real prefillTail 37", newCaches, oldCaches);
         }
         for (let step = 0; step < 8; step++) {
@@ -570,7 +570,7 @@ describe("Qwen3.8 M4 Pro graph on the real artifact", () => {
         try {
           using input = ids([real(2048, 40)]);
           const expected = oldAne.forwardHidden(input, oldSet);
-          outputDiff("real prefillChunk.ane 2048", current.prefillChunk.ane!(input, newSet) as MlxArray, expected,
+          outputDiff("real prefillChunk.ane 2048", current.prefillChunk.ane!(input, newSet, null) as MlxArray, expected,
             lastLogits(current.logits.one), lastLogits(head));
           stateDiff("real prefillChunk.ane 2048", newSet, oldSet);
         } finally { disposeAll(oldSet, newSet); }
@@ -606,7 +606,7 @@ describe("Qwen3.8 M4 Pro graph on the real artifact", () => {
         {
           using input = ids([real(2048, 1)]);
           const expected = old.forwardHidden(input, oldCaches);
-          outputDiff("composed kv4 prefillChunk.gpu 2048", current.prefillChunk.gpu(input, newCaches) as MlxArray, expected,
+          outputDiff("composed kv4 prefillChunk.gpu 2048", current.prefillChunk.gpu(input, newCaches, null) as MlxArray, expected,
             lastLogits(current.logits.one), lastLogits(head));
           // The conversion point: the old path's conversion after the first forward (quantized_kv_start 0).
           for (const [layer, cache] of oldCaches.entries())
@@ -617,7 +617,7 @@ describe("Qwen3.8 M4 Pro graph on the real artifact", () => {
         {
           using input = ids([real(37, 2)]);
           const expected = old.forwardHidden(input, oldCaches);
-          outputDiff("composed kv4 prefillTail 37", current.prefillTail(input, newCaches), expected, lastLogits(current.logits.one), lastLogits(head));
+          outputDiff("composed kv4 prefillTail 37", (current.prefillTail.wider(input, newCaches, null) as MlxArray), expected, lastLogits(current.logits.one), lastLogits(head));
           stateDiff("composed kv4 prefillTail 37", storage(newCaches), oldCaches);
         }
         for (let step = 0; step < 4; step++) {
@@ -652,10 +652,10 @@ describe("Qwen3.8 M4 Pro graph, Neural Engine chunk operation (MLX_BUN_TEST_ANE=
     try {
       using input = ids([prompt(2048, 100)]);
       const ane = oldAne.forwardHidden(input, sets[0]!);
-      outputDiff(`${scheme} prefillChunk.ane 2048`, current.prefillChunk.ane!(input, sets[1]!) as MlxArray, ane, current.logits.wider, oldHead);
+      outputDiff(`${scheme} prefillChunk.ane 2048`, current.prefillChunk.ane!(input, sets[1]!, null) as MlxArray, ane, current.logits.wider, oldHead);
       stateDiff(`${scheme} prefillChunk.ane 2048`, sets[1]!, sets[0]!);
       const gpu = old.forwardHidden(input, sets[2]!);
-      outputDiff(`${scheme} prefillChunk.gpu 2048`, current.prefillChunk.gpu(input, sets[3]!) as MlxArray, gpu, current.logits.wider, oldHead);
+      outputDiff(`${scheme} prefillChunk.gpu 2048`, current.prefillChunk.gpu(input, sets[3]!, null) as MlxArray, gpu, current.logits.wider, oldHead);
       stateDiff(`${scheme} prefillChunk.gpu 2048`, sets[3]!, sets[2]!);
       // Decode after the Neural Engine chunk, as after the old one.
       using next = ids([[5]]);

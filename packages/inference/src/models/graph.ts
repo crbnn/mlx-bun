@@ -2,7 +2,7 @@ import type { AutoregressiveGraph, GraphDescriptor, LogitSelection } from "../co
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { ModelConfig } from "../artifacts/config";
 import type { Cache } from "../contracts/mlx/cache";
-import type { MlxDeclaredGraph, MlxModelMemory, MlxTokenAppend, MlxWidthTable } from "../contracts/mlx/graph";
+import type { MlxDeclaredGraph, MlxModelMemory, MlxTokenAppend, MlxWidthClass, MlxWidthTable } from "../contracts/mlx/graph";
 import type { MixedTokenModel } from "../contracts/mlx/token-work";
 import type { Composition } from "../contracts/portable/composition";
 
@@ -44,6 +44,12 @@ export interface MlxTokenGraph extends MlxGraphOperations<Cache[]>, MlxDeclaredG
 /** The width table of a graph whose one operation serves every width class. */
 export function atEveryWidth<Operation>(operation: Operation): MlxWidthTable<Operation> {
   return Object.freeze({ one: operation, twoToThree: operation, four: operation, fiveToEight: operation, wider: operation });
+}
+
+/** A width table whose entry for each class `build` makes once, at construction. */
+export function byWidth<Operation>(build: (width: MlxWidthClass) => Operation): MlxWidthTable<Operation> {
+  return Object.freeze({ one: build("one"), twoToThree: build("twoToThree"), four: build("four"),
+    fiveToEight: build("fiveToEight"), wider: build("wider") });
 }
 
 /** The phase a forward runs, named by its caller: one new position per row

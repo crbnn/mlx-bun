@@ -57,7 +57,8 @@ import type { Weights } from "../../artifacts/weights";
 import type { Cache, GatedDeltaCache } from "../../contracts/mlx/cache";
 import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
 import type {
-  MlxDeclaredGraph, MlxHeadForward, MlxLayerCapture, MlxPhaseForward, MlxPrefillChunk, MlxTokenAppend, MlxTokenPhases,
+  MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxKnownSpans, MlxLayerCapture, MlxPhaseForward, MlxPrefillChunk,
+  MlxTokenAppend, MlxTokenPhases, MlxWidthClass,
   MlxVerifyForward, MlxWidthTable,
 } from "../../contracts/mlx/graph";
 import type { MediaEncoders, MlxPromptInput, Vision } from "../../contracts/mlx/media";
@@ -85,7 +86,8 @@ import { Bf16FirstKv4Head256Cache, composedFullAttentionCache } from "../../stat
 import { SSMCache } from "../../state/ssm";
 import { denseTurboQuantKernels } from "../../state/turboquant-attention";
 import { declareGraph } from "../capabilities";
-import { atEveryWidth, deprecatedPhase, type ReadPhase } from "../graph";
+import { widthClass } from "../../contracts/mlx/graph";
+import { atEveryWidth, byWidth, deprecatedPhase, type ReadPhase } from "../graph";
 import type { ServedComposition } from "../implementation";
 import {
   GatedDeltaNet, Qwen3Attention, Qwen3Layer, type AttentionLinear, type AttentionLinearLoader, type TrellisMlp,
@@ -193,8 +195,9 @@ const ASYNC_EVERY = 4;
 /** The Neural Engine's channel fraction in each split. */
 const ANE_FRACTION = 0.55;
 
-/** One layer: input norm, mixer, residual, post-attention norm, MLP, residual. Consumes nothing; returns an owned output. */
-type Step = (x: MlxArray, cache: Cache, phase: ReadPhase, mrope: MropeForwardState | null) => MlxArray;
+/** One layer: input norm, mixer, residual, post-attention norm, MLP, residual. Consumes nothing; returns an owned output.
+ *  `width` is the class of `x`'s rows the calling operation names (the generic blocks' MLP reads it). */
+type Step = (x: MlxArray, cache: Cache, phase: ReadPhase, mrope: MropeForwardState | null, width: MlxWidthClass) => MlxArray;
 type Mixer = (normed: MlxArray, cache: Cache, phase: ReadPhase) => MlxArray;
 
 /** A layer of one width class: `mixer` then `mlp` (post-attention-normed hidden to the MLP output, owned). */
@@ -246,9 +249,16 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph, MlxTokenPhases {
   ]);
 
   readonly prefillChunk: MlxPrefillChunk;
+  readonly prefillTail: MlxWidthTable<MlxCapturingForward>;
   readonly decode: MlxWidthTable<MlxPhaseForward>;
   readonly verify: MlxWidthTable<MlxVerifyForward>;
+  readonly appendKnown: MlxWidthTable<MlxPhaseForward>;
   readonly logits: MlxWidthTable<MlxHeadForward>;
+  /** Committed known-token spans: the append keeps the native affine arithmetic while Trellis shares up to four rows. */
+  readonly knownSpans: MlxKnownSpans = Object.freeze({
+    affineKvBits: Object.freeze([4, 8]), turboQuantFormats: Object.freeze([Object.freeze({ kBits: 8, vBits: 3 })]),
+    maxChunkSize: (state: readonly Cache[]) => qwenAppendChunkSize(state[0]!.offset),
+  });
 
   /** @deprecated E2 deletes it with `legacyForwardWithTaps`: the layer tap the
    *  speculative binding sets around a deprecated forward. Only the deprecated
@@ -307,7 +317,7 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph, MlxTokenPhases {
       return delta;
     };
     const mlpOf = (i: number) => generic[i]!.mlp as TrellisMlp;
-    const genericStep = (layer: Qwen3Layer): Step => (x, cache, phase, mrope) => layer.forward(x, cache, phase, mrope);
+    const genericStep = (layer: Qwen3Layer): Step => (x, cache, phase, mrope, width) => layer.forward(x, cache, phase, mrope, width);
     this.#generic = generic.map(genericStep);
 
     if (composition.adapters) {
@@ -407,28 +417,45 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph, MlxTokenPhases {
 
     const one = this.#one, twoToThree = this.#twoToThree, four = this.#four, fiveToEight = this.#fiveToEight, wide = this.#generic;
     const embed = this.embed, split = ane;
-    const gpu: MlxPhaseForward = (ids, state) => this.#bounded(wide, embed.encode(ids), state, "window", null, null);
+    const gpu: MlxCapturingForward = (ids, state, capture) =>
+      this.#bounded(wide, embed.encode(ids), state, "window", capture, null, "wider");
     this.prefillChunk = Object.freeze(split
-      ? { gpu, ane: (ids: MlxArray, state: Cache[]) => this.#bounded(split, embed.encode(ids), state, "window", null, null) }
+      ? { gpu, ane: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
+        this.#bounded(split, embed.encode(ids), state, "window", capture, null, "wider") }
       : { gpu });
+    this.prefillTail = Object.freeze({
+      one: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
+        this.#submitted(one, embed.encode(ids), state, "window", capture, "one"),
+      twoToThree: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
+        this.#submitted(twoToThree, embed.encode(ids), state, "window", capture, "twoToThree"),
+      four: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
+        this.#submitted(four, embed.encode(ids), state, "window", capture, "four"),
+      fiveToEight: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
+        this.#submitted(fiveToEight, embed.encode(ids), state, "window", capture, "fiveToEight"),
+      wider: gpu,
+    });
     this.decode = Object.freeze({
-      one: (ids: MlxArray, state: Cache[]) => this.#submitted(one, embed.encode(ids), state, "decode", null),
-      twoToThree: (ids: MlxArray, state: Cache[]) => this.#submitted(twoToThree, embed.encode(ids), state, "decode", null),
-      four: (ids: MlxArray, state: Cache[]) => this.#submitted(four, embed.encode(ids), state, "decode", null),
-      fiveToEight: (ids: MlxArray, state: Cache[]) => this.#submitted(fiveToEight, embed.encode(ids), state, "decode", null),
-      wider: (ids: MlxArray, state: Cache[]) => this.#lazy(wide, embed.encode(ids), state, "decode", null, null),
+      one: (ids: MlxArray, state: Cache[]) => this.#submitted(one, embed.encode(ids), state, "decode", null, "one"),
+      twoToThree: (ids: MlxArray, state: Cache[]) => this.#submitted(twoToThree, embed.encode(ids), state, "decode", null, "twoToThree"),
+      four: (ids: MlxArray, state: Cache[]) => this.#submitted(four, embed.encode(ids), state, "decode", null, "four"),
+      fiveToEight: (ids: MlxArray, state: Cache[]) => this.#submitted(fiveToEight, embed.encode(ids), state, "decode", null, "fiveToEight"),
+      wider: (ids: MlxArray, state: Cache[]) => this.#lazy(wide, embed.encode(ids), state, "decode", null, null, "wider"),
     });
     this.verify = Object.freeze({
       one: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
-        this.#submitted(one, embed.encode(ids), state, "window", capture),
+        this.#submitted(one, embed.encode(ids), state, "window", capture, "one"),
       twoToThree: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
-        this.#submitted(twoToThree, embed.encode(ids), state, "window", capture),
+        this.#submitted(twoToThree, embed.encode(ids), state, "window", capture, "twoToThree"),
       four: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
-        this.#submitted(four, embed.encode(ids), state, "window", capture),
+        this.#submitted(four, embed.encode(ids), state, "window", capture, "four"),
       fiveToEight: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
-        this.#submitted(fiveToEight, embed.encode(ids), state, "window", capture),
-      wider: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) => this.#bounded(wide, embed.encode(ids), state, "window", capture, null),
+        this.#submitted(fiveToEight, embed.encode(ids), state, "window", capture, "fiveToEight"),
+      wider: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) => this.#bounded(wide, embed.encode(ids), state, "window", capture, null, "wider"),
     });
+    // Known tokens read committed on the generic blocks, evaluated per layer above four rows.
+    this.appendKnown = byWidth<MlxPhaseForward>(width => width === "fiveToEight" || width === "wider"
+      ? (ids, state) => this.#bounded(wide, embed.encode(ids), state, "committed", null, null, width)
+      : (ids, state) => this.#lazy(wide, embed.encode(ids), state, "committed", null, null, width));
     const head = this.lmHead, plain: MlxHeadForward = hidden => head.forward(hidden);
     if (composition.adapters) this.logits = atEveryWidth(plain);
     else {
@@ -465,20 +492,16 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph, MlxTokenPhases {
    *  (R1 seed, final-norm gain) the artifact's fold record declares. */
   draftTarget(_caches: Cache[]): TargetView { return qwenDraftTarget(this, this.#residualBasis); }
 
-  /** The positions left at the end of a prompt after its whole chunks, on the GPU. */
-  prefillTail(ids: MlxArray, state: Cache[]): MlxArray {
-    return this.#bounded(this.#generic, this.embed.encode(ids), state, "window", null, null);
-  }
-
   // ── The layer loops. Each consumes h0 and returns the post-final-norm hidden,
   // owned by the caller; `capture` sees every layer's output, then the final hidden.
 
   /** Every layer, the graph submitted every ASYNC_EVERY layers. */
-  #submitted(steps: Step[], h0: MlxArray, cache: Cache[], phase: ReadPhase, capture: MlxLayerCapture | null): MlxArray {
+  #submitted(steps: Step[], h0: MlxArray, cache: Cache[], phase: ReadPhase, capture: MlxLayerCapture | null,
+    width: MlxWidthClass): MlxArray {
     let h: MlxArray | null = h0;
     try {
       for (let i = 0; i < steps.length; i++) {
-        const next = steps[i]!(h, cache[i]!, phase, null);
+        const next = steps[i]!(h, cache[i]!, phase, null, width);
         h.dispose();
         h = next;
         if (i % ASYNC_EVERY === ASYNC_EVERY - 1 && i + 1 < steps.length) ops.asyncEvalAll([h]);
@@ -494,11 +517,11 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph, MlxTokenPhases {
 
   /** Every layer, each layer's output and recurrent state evaluated before the next. */
   #bounded(steps: Step[], h0: MlxArray, cache: Cache[], phase: ReadPhase, capture: MlxLayerCapture | null,
-    mrope: MropeForwardState | null): MlxArray {
+    mrope: MropeForwardState | null, width: MlxWidthClass): MlxArray {
     let h: MlxArray | null = h0;
     try {
       for (let i = 0; i < steps.length; i++) {
-        const next = steps[i]!(h, cache[i]!, phase, mrope);
+        const next = steps[i]!(h, cache[i]!, phase, mrope, width);
         h.dispose();
         h = next;
         const state = cache[i]!.state();
@@ -515,11 +538,11 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph, MlxTokenPhases {
 
   /** Every layer, nothing evaluated. */
   #lazy(steps: Step[], h0: MlxArray, cache: Cache[], phase: ReadPhase, capture: MlxLayerCapture | null,
-    mrope: MropeForwardState | null): MlxArray {
+    mrope: MropeForwardState | null, width: MlxWidthClass): MlxArray {
     let h: MlxArray | null = h0;
     try {
       for (let i = 0; i < steps.length; i++) {
-        const next = steps[i]!(h, cache[i]!, phase, mrope);
+        const next = steps[i]!(h, cache[i]!, phase, mrope, width);
         h.dispose();
         h = next;
         capture?.(i, h);
@@ -542,16 +565,17 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph, MlxTokenPhases {
    *  not entered here. */
   #deprecated(h0: MlxArray, cache: Cache[], phase: ReadPhase, positions: MlxArray | null, capture: MlxLayerCapture | null): MlxArray {
     const [rows, tokens] = h0.shape as [number, number];
+    const width = widthClass(rows * tokens);
     if (positions || phase === "committed" || rows !== 1) {
       const mrope = positions ? { posIds: positions, ...this.#mrope } : null;
-      return tokens > TRELLIS_MATVEC_MAX_M ? this.#bounded(this.#generic, h0, cache, phase, capture, mrope)
-        : this.#lazy(this.#generic, h0, cache, phase, capture, mrope);
+      return tokens > TRELLIS_MATVEC_MAX_M ? this.#bounded(this.#generic, h0, cache, phase, capture, mrope, width)
+        : this.#lazy(this.#generic, h0, cache, phase, capture, mrope, width);
     }
-    if (tokens === 1) return this.#submitted(this.#one, h0, cache, phase, capture);
-    if (tokens <= 3) return this.#submitted(this.#twoToThree, h0, cache, phase, capture);
-    if (tokens === 4) return this.#submitted(this.#four, h0, cache, phase, capture);
-    if (tokens <= 8) return this.#submitted(this.#fiveToEight, h0, cache, phase, capture);
-    return this.#bounded(this.#generic, h0, cache, phase, capture, null);
+    if (tokens === 1) return this.#submitted(this.#one, h0, cache, phase, capture, width);
+    if (tokens <= 3) return this.#submitted(this.#twoToThree, h0, cache, phase, capture, width);
+    if (tokens === 4) return this.#submitted(this.#four, h0, cache, phase, capture, width);
+    if (tokens <= 8) return this.#submitted(this.#fiveToEight, h0, cache, phase, capture, width);
+    return this.#bounded(this.#generic, h0, cache, phase, capture, null, width);
   }
 
   /** @deprecated E2: the speculative binding's layer tap, as the operations' capture, then `capture`. */

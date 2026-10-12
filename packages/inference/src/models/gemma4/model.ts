@@ -31,7 +31,7 @@ import { Checkpoint } from "@mlx-bun/mlx/checkpoint";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import type {
-  MlxCompiledDecodeStep, MlxDeclaredGraph, MlxHeadForward, MlxLayerCapture, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases,
+  MlxCapturingForward, MlxCompiledDecodeStep, MlxDeclaredGraph, MlxHeadForward, MlxLayerCapture, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases,
   MlxVerifyForward,
 } from "../../contracts/mlx/graph";
 import { CompiledDecode } from "./compiled-decode";
@@ -378,16 +378,19 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    * prefill chunk size; rows are sequences times that size. Token ids only: a
    * prompt with prepared media enters through the `MlxPromptInput` that
    * `bindMediaInput` returns. The GPU is this graph's one unit. */
-  readonly prefillChunk: MlxPrefillChunk = {
-    gpu: (ids, cache) => this.forwardDecoder(this.embedTokens(ids), cache, "window", ids),
-  };
+  readonly prefillChunk: MlxPrefillChunk = { gpu: (ids, cache, capture) => this.#window(ids, cache, capture) };
 
-  /** The positions left at the end of a prompt after its whole chunks, fewer
-   * than the chunk size per sequence; rows are sequences times those tokens.
-   * The same semantics as `prefillChunk`, named apart because a composition
-   * may run it on different hardware. */
-  prefillTail(ids: MlxArray, cache: Cache[]): MlxArray {
-    return this.forwardDecoder(this.embedTokens(ids), cache, "window", ids);
+  /** A prompt's positions that are not a whole chunk: the window read at every width. */
+  readonly prefillTail = atEveryWidth<MlxCapturingForward>((ids, cache, capture) => this.#window(ids, cache, capture));
+
+  /** Known tokens: this graph declares no committed spans, so they read as a window. */
+  readonly appendKnown = atEveryWidth<MlxPhaseForward>((ids, cache) => this.#window(ids, cache, null));
+
+  /** A causal window of token ids over every layer, `capture` seeing every layer and then the final hidden. */
+  #window(ids: MlxArray, cache: Cache[], capture: MlxLayerCapture | null): MlxArray {
+    const hidden = this.forwardDecoder(this.embedTokens(ids), cache, "window", ids, capture);
+    capture?.(this.layers.length, hidden);
+    return hidden;
   }
 
   /** The one output head at every width. */

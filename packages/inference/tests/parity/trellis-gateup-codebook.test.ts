@@ -8,6 +8,7 @@ import { TRELLIS_MATVEC_MAX_M, fusedGateUpSwiglu, fusedGateUpSwigluMixed, trelli
 import { gateUpCodebookEligible } from "../../src/kernels/trellis/gate-up";
 import { scatterBitsEligible, scatterFloatCodebookEligible } from "../../src/kernels/trellis/scatter";
 import type { ReadPhase } from "../../src/models/graph";
+import type { MlxWidthClass } from "../../src/contracts/mlx/graph";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import { createRuntimeConfig, runtimeConfig, withRuntimeConfig } from "../../src/runtime/config";
 import { deviceArchitecture, clearCache } from "@mlx-bun/mlx/ffi";
@@ -29,13 +30,13 @@ const representation = (mode: Mode): Representation => {
  *  (same-width gate/up fuse, different widths take the mixed kernel's split
  *  tail, down runs the packed matvec) with each single-row representation
  *  explicit; wider inputs run the loaded MLP. */
-function representedMlp(mlp: { gate: unknown; up: unknown; down: unknown; forward(x: MlxArray, phase: ReadPhase): MlxArray },
+function representedMlp(mlp: { gate: unknown; up: unknown; down: unknown; forward(x: MlxArray, phase: ReadPhase, width: MlxWidthClass): MlxArray },
   r: Representation) {
   const gate = mlp.gate as TrellisLinear, up = mlp.up as TrellisLinear, down = mlp.down as TrellisLinear;
   return {
-    forward(x: MlxArray, phase: ReadPhase): MlxArray {
+    forward(x: MlxArray, phase: ReadPhase, width: MlxWidthClass): MlxArray {
       const lead = x.shape.slice(0, -1), M = lead.reduce((a, b) => a * b, 1);
-      if (M > TRELLIS_MATVEC_MAX_M) return mlp.forward(x, phase);
+      if (M > TRELLIS_MATVEC_MAX_M) return mlp.forward(x, phase, width);
       using mid = gate.geometry.k === up.geometry.k ? fusedGateUpSwiglu(x, gate, up, 13, r.codebook)
         : fusedGateUpSwigluMixed(x, gate, up, 13, "split", r.mixedBits);
       using rows = ops.reshape(mid, [M, down.geometry.inFeatures]);

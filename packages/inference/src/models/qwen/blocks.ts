@@ -12,7 +12,7 @@ import type { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { CompiledFunction } from "@mlx-bun/mlx/compile";
-import { TrellisLinear, fusedGateUpEligible, fusedGateUpSwiglu, TRELLIS_MATVEC_MAX_M } from "../../layers/trellis-linear";
+import { TrellisLinear, fusedGateUpEligible, fusedGateUpSwiglu } from "../../layers/trellis-linear";
 import { disposing } from "../../layers/helpers";
 import { compiledSwiglu } from "../../layers/swiglu";
 import { QuantizedLinear } from "../../layers/quantized-linear";
@@ -21,6 +21,7 @@ import type { AttentionRead, Cache, CommittedAttentionCache, GatedDeltaCache, Ga
 import { applyInterleavedRope } from "../../layers/qwen-mrope";
 import type { MropeForwardState } from "../../contracts/mlx/positions";
 import type { ReadPhase } from "../graph";
+import type { MlxWidthClass } from "../../contracts/mlx/graph";
 
 const PREFIX = "language_model";
 
@@ -363,8 +364,8 @@ export class Qwen3Attention<L extends AttentionLinear = QuantizedLinear> {
   }
 }
 
-/** Rows of a [.., features] input. */
-const inputRows = (x: MlxArray) => x.shape.slice(0, -1).reduce((a, b) => a * b, 1);
+/** The width classes whose rows the fused Trellis gate/up kernel takes (up to `TRELLIS_MATVEC_MAX_M` rows). */
+const FUSED_GATE_UP_WIDTHS: ReadonlySet<MlxWidthClass> = new Set<MlxWidthClass>(["one", "twoToThree", "four"]);
 
 /** The MLP over Trellis-coded projections (a packed-Trellis artifact's
  *  `mode: "trellis"` entries). Its input is the post-attention norm's output,
@@ -381,12 +382,14 @@ export class TrellisMlp {
   }
 
   /** `x` [.., hidden] (borrowed, row-contiguous) to an owned [.., hidden].
-   *  Every phase computes the same rows. */
-  forward(x: MlxArray, _phase: ReadPhase): MlxArray {
-    // Packed-trellis decode (M ≤ 4): gate, up and the swiglu in ONE kernel —
-    // x read once, no gate/up vectors materialized. This Lab path retains
-    // the packed activation arithmetic documented in `02d723a:docs/design/turboquant.md`.
-    if (this.#fusedGateUp && inputRows(x) <= TRELLIS_MATVEC_MAX_M) {
+   *  Every phase computes the same rows; `width` is the class of `x`'s rows,
+   *  named by the caller. */
+  forward(x: MlxArray, _phase: ReadPhase, width: MlxWidthClass): MlxArray {
+    // Packed-trellis decode (up to four rows): gate, up and the swiglu in ONE
+    // kernel — x read once, no gate/up vectors materialized. This Lab path
+    // retains the packed activation arithmetic documented in
+    // `02d723a:docs/design/turboquant.md`.
+    if (this.#fusedGateUp && FUSED_GATE_UP_WIDTHS.has(width)) {
       const hidden = fusedGateUpSwiglu(x, this.gate, this.up);
       const out = this.down.forward(hidden);
       hidden.dispose();
@@ -412,8 +415,8 @@ export class AffineMlp {
   constructor(readonly gate: QuantizedLinear, readonly up: QuantizedLinear, readonly down: QuantizedLinear) {}
 
   /** `x` [.., hidden] (borrowed) to an owned [.., hidden], with the projection
-   *  arithmetic `phase` names. */
-  forward(x: MlxArray, phase: ReadPhase): MlxArray {
+   *  arithmetic `phase` names; every width class takes the same kernels. */
+  forward(x: MlxArray, phase: ReadPhase, _width: MlxWidthClass): MlxArray {
     const rowsApart = projectRowsApart[phase];
     const g = this.gate.forward(x, rowsApart);
     const u = this.up.forward(x, rowsApart);
@@ -468,9 +471,11 @@ export class Qwen3Layer {
     this.postAttnNorm = new RMSNorm(weights.tensor(`${prefix}.post_attention_layernorm.weight`), config.text.rmsNormEps);
   }
 
-  forward(x: MlxArray, cache: Cache, phase: ReadPhase, mrope: MropeForwardState | null = null): MlxArray {
+  /** One layer over `x` [.., hidden] (borrowed) for `phase`; `width` is the class of `x`'s rows, which picks the
+   *  MLP's kernels. */
+  forward(x: MlxArray, cache: Cache, phase: ReadPhase, mrope: MropeForwardState | null, width: MlxWidthClass): MlxArray {
     using h = this.forwardAttn(x, cache, phase, mrope);
-    return this.forwardMlp(h, phase);
+    return this.forwardMlp(h, phase, width);
   }
 
   forwardAttn(x: MlxArray, cache: Cache, phase: ReadPhase, mrope: MropeForwardState | null = null): MlxArray {
@@ -481,7 +486,7 @@ export class Qwen3Layer {
     return ops.add(x, r);
   }
 
-  forwardMlp(h: MlxArray, phase: ReadPhase): MlxArray {
+  forwardMlp(h: MlxArray, phase: ReadPhase, width: MlxWidthClass): MlxArray {
     using hn = this.postAttnNorm.forward(h);
     // Diagnostic (same switch as the attention/DeltaNet sub-phases): settle the
     // pending attention block first so the MLP is timed alone.
@@ -490,7 +495,7 @@ export class Qwen3Layer {
     if (prof) { ops.evalAll([hn]); t0 = performance.now(); }
     // RMSNorm allocates an aligned row-contiguous output, the layout the
     // Trellis MLP takes as given.
-    using m = this.mlp.forward(hn, phase);
+    using m = this.mlp.forward(hn, phase, width);
     if (prof) { ops.evalAll([m]); prof.mlp = (prof.mlp ?? 0) + performance.now() - t0; }
     return ops.add(h, m);
   }

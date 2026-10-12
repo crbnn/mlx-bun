@@ -26,6 +26,7 @@ import type { Weights } from "../../src/artifacts/weights";
 import type { BatchableCache, Cache, PaddedPrefillCache } from "../../src/contracts/mlx/cache";
 import type { KvStorageScheme } from "../../src/contracts/portable/composition";
 import type { TokenGroup } from "../../src/contracts/mlx/token-work";
+import { widthClass, type MlxWidthClass } from "../../src/contracts/mlx/graph";
 import type { RuntimeModel } from "../../src/models/factory";
 import { createRuntimeConfig, runtimeConfig, withRuntimeConfig } from "../../src/runtime/config";
 import { trainForward } from "../../src/scoring/full-sequence";
@@ -327,13 +328,24 @@ function tapsDiff(label: string, actual: MlxArray[], expected: MlxArray[]): void
   } finally { for (const array of [...actual, ...expected]) array.dispose(); }
 }
 
-/** One committed append through the graph's createAppend (B=1, 1 to 4
- *  positions, or one position per row). */
+/** One committed append (B=1, 1 to 4 positions, or one position per row): the
+ *  frozen graph's createAppend, which `as27b` makes eligible at call time, and
+ *  the current graph's committed read, which `appendKnown` runs for a
+ *  composition that qualifies committed spans. Qualification is read at
+ *  construction from the 27B geometry these synthetic weights cannot carry, so
+ *  the current side reaches the committed read through the decoder directly;
+ *  one position per row is `decode`, as the scheduler appends it. */
 function fill(model: Qwen35Model | FrozenQwen35Model, caches: Cache[], rows: number[][]): MlxArray {
-  const append = model.createAppend({ hasAdapters: false, pagedKv: false });
-  expect(append).not.toBeNull();
   using input = ids(rows);
-  return append!.forwardHidden(input, caches);
+  if (model instanceof FrozenQwen35Model) {
+    const append = model.createAppend({ hasAdapters: false, pagedKv: false });
+    expect(append).not.toBeNull();
+    return append!.forwardHidden(input, caches);
+  }
+  if (rows.length > 1) return model.decode[widthClass(rows.length)](input, caches) as MlxArray;
+  const decoder = model as unknown as { forwardLayers(h0: MlxArray, cache: Cache[], phase: "committed",
+    positions: undefined, capture: null, width: MlxWidthClass, bounded: boolean): MlxArray };
+  return decoder.forwardLayers(model.embed.encode(input), caches, "committed", undefined, null, widthClass(rows[0]!.length), false);
 }
 
 /** Target row layouts holding `sources` (one serial cache list per row), the
@@ -370,7 +382,7 @@ for (const kind of ["trellis", "affine"] as const) {
         try {
           const prefill = prompt(37, 1);
           both(`${tag} prefill37`, p, oldCaches, newCaches, forwardHidden([prefill]));
-          phased(`${tag} prefillChunk37`, [prefill], (input, caches) => p.current.prefillChunk.gpu(input, caches) as MlxArray);
+          phased(`${tag} prefillChunk37`, [prefill], (input, caches) => p.current.prefillChunk.gpu(input, caches, null) as MlxArray);
           convert(scheme, oldCaches, newCaches, refCaches, phaseCaches);
           stateDiff(`${tag} converted`, newCaches, oldCaches);
           stateDiff(`${tag} converted (phase operation)`, phaseCaches, refCaches);
@@ -382,7 +394,7 @@ for (const kind of ["trellis", "affine"] as const) {
           }
 
           both(`${tag} window5`, p, oldCaches, newCaches, forwardHidden([prompt(5, 2)]));
-          phased(`${tag} prefillTail5`, [prompt(5, 2)], (input, caches) => p.current.prefillTail(input, caches));
+          phased(`${tag} prefillTail5`, [prompt(5, 2)], (input, caches) => p.current.prefillTail.fiveToEight(input, caches, null) as MlxArray);
 
           {
             const rows = [prompt(4, 3)];

@@ -409,7 +409,7 @@ for (const c of COMPOSITIONS) {
           try {
             const prefill = prompt(37, 1);
             both(`${tag} prefill37`, p, oldCaches, newCaches, forwardHidden([prefill]));
-            phased(`${tag} prefillChunk37`, [prefill], (input, caches) => p.current.prefillChunk.gpu(input, caches) as MlxArray);
+            phased(`${tag} prefillChunk37`, [prefill], (input, caches) => p.current.prefillChunk.gpu(input, caches, null) as MlxArray);
             convert(p, scheme, oldCaches, newCaches, refCaches, phaseCaches);
             stateDiff(`${tag} converted`, newCaches, oldCaches);
             stateDiff(`${tag} converted (phase operation)`, phaseCaches, refCaches);
@@ -419,7 +419,7 @@ for (const c of COMPOSITIONS) {
               phased(`${tag} decode`, token, (input, caches) => p.current.decode.one(input, caches) as MlxArray);
             }
             both(`${tag} window5`, p, oldCaches, newCaches, forwardHidden([prompt(5, 2)]));
-            phased(`${tag} prefillTail5`, [prompt(5, 2)], (input, caches) => p.current.prefillTail(input, caches));
+            phased(`${tag} prefillTail5`, [prompt(5, 2)], (input, caches) => p.current.prefillTail.fiveToEight(input, caches, null) as MlxArray);
             donorReadDiff(tag, p, oldCaches, newCaches);
             {
               // The verify phase with its capture against the oracle's verify (its inherited generic forward).
