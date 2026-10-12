@@ -46,7 +46,7 @@
 <text x="1012" y="193" font-size="12.5" font-style="italic" fill="#333">machine, then builds everything the scheduler runs.</text>
 <text x="1012" y="218" font-size="12.5" fill="#222">• Composition: device, ANE bridge, KV scheme</text>
 <text x="1023" y="235" font-size="12.5" fill="#222">(--kv-quant), draft depth (--num-draft-tokens),</text>
-<text x="1023" y="252" font-size="12.5" fill="#222">prefill chunk, adapters, max rows (--batch-size)</text>
+<text x="1023" y="252" font-size="12.5" fill="#222">prefill chunk, adapters, max rows (--batch)</text>
 <text x="1012" y="269" font-size="12.5" fill="#222">• Graph table: the most-constrained graph wins;</text>
 <text x="1023" y="286" font-size="12.5" fill="#222">exactly one generic graph per family</text>
 <text x="1012" y="303" font-size="12.5" fill="#222">• Artifacts: config dialects, safetensors (mmap),</text>
@@ -59,7 +59,7 @@
 <text x="1012" y="422" font-size="12.5" fill="#222">• LoRA adapters mounted onto named targets</text>
 <text x="1023" y="439" font-size="12.5" fill="#222">(--adapter-path)</text>
 <text x="1012" y="456" font-size="12.5" fill="#222">• Fit estimate and memory plan</text>
-<text x="1012" y="473" font-size="12.5" fill="#222">• ANE program compile at install time (planned)</text>
+<text x="1012" y="473" font-size="12.5" fill="#222">• ANE programs compiled at install (compile-ane)</text>
 <text x="1012" y="490" font-size="12.5" fill="#222">• Model download, search and upload: @mlx-bun/hub</text>
 </g>
 <g><rect x="30" y="587" width="352" height="406" rx="10" fill="#f3eefb" stroke="#7b5ea7" stroke-width="2"/>
@@ -84,11 +84,11 @@
 <text x="528" y="641" font-size="12.5" font-style="italic" fill="#333">The only component that decides at run time.</text>
 <text x="528" y="666" font-size="12.5" fill="#222">• Admission, queue, cancellation, sessions and</text>
 <text x="539" y="683" font-size="12.5" fill="#222">continuations</text>
-<text x="528" y="700" font-size="12.5" fill="#222">• Continuous batching: rows up to --batch-size;</text>
+<text x="528" y="700" font-size="12.5" fill="#222">• Continuous batching: rows up to --batch;</text>
 <text x="539" y="717" font-size="12.5" fill="#222">one request is a batch of one</text>
 <text x="528" y="734" font-size="12.5" fill="#222">• Names the phase and width: prefillChunk,</text>
-<text x="539" y="751" font-size="12.5" fill="#222">prefillTail, decode, verify, logits (width</text>
-<text x="539" y="768" font-size="12.5" fill="#222">classes 1, 2-3, 4, 5-8, wider)</text>
+<text x="539" y="751" font-size="12.5" fill="#222">prefillTail, decode, verify, appendKnown,</text>
+<text x="539" y="768" font-size="12.5" fill="#222">logits (widths 1, 2-3, 4, 5-8, wider)</text>
 <text x="528" y="785" font-size="12.5" fill="#222">• Dispatches prefill chunks to the GPU or the ANE:</text>
 <text x="539" y="802" font-size="12.5" fill="#222">the ANE is a compute unit it manages</text>
 <text x="528" y="819" font-size="12.5" fill="#222">• Mixed iteration: prefill rows and decode rows in</text>
@@ -113,18 +113,18 @@
 <text x="1023" y="729" font-size="12.5" fill="#222">from the target)</text>
 <text x="1012" y="746" font-size="12.5" fill="#222">• DeepSpec drafter, n-gram, assistant model</text>
 <text x="1023" y="763" font-size="12.5" fill="#222">(two-model)</text>
-<text x="1012" y="780" font-size="12.5" fill="#222">• Built by the loader; borrows the target's KV and</text>
-<text x="1023" y="797" font-size="12.5" fill="#222">hidden states through the DraftSource seam</text>
-<text x="1012" y="814" font-size="12.5" fill="#222">• draft() returns 1..n tokens; the scheduler</text>
-<text x="1023" y="831" font-size="12.5" fill="#222">prunes and verifies</text>
+<text x="1012" y="780" font-size="12.5" fill="#222">• Built by the loader; reads the target's KV and</text>
+<text x="1023" y="797" font-size="12.5" fill="#222">hidden states through its TargetView ports</text>
+<text x="1012" y="814" font-size="12.5" fill="#222">• Drafts through grouped rows (one request is a</text>
+<text x="1023" y="831" font-size="12.5" fill="#222">group of one); the scheduler verifies</text>
 </g>
 <g><rect x="30" y="1069" width="836" height="406" rx="10" fill="#fdeee3" stroke="#c25e1c" stroke-width="2"/>
 <text x="44" y="1093" font-size="18" font-weight="700" fill="#222">Graph</text>
 <text x="44" y="1109" font-size="11" font-family="'SF Mono', Menlo, Consolas, monospace" fill="#555">inference/models</text>
 <text x="44" y="1123" font-size="12.5" font-style="italic" fill="#333">One entire graph per model x quant x machine. Extends nothing; never inspects its input or its cache.</text>
-<text x="44" y="1148" font-size="12.5" fill="#222">• Generated: Qwen3.8-27B Trellis 3.2bpw (M4 Pro), Gemma 4 e4b / 12B / 26B</text>
+<text x="44" y="1148" font-size="12.5" fill="#222">• Generated: Qwen3.8-27B Trellis 3.2bpw (M4 Pro, M1 Max), Gemma 4 e4b / 12B / 26B</text>
 <text x="44" y="1165" font-size="12.5" fill="#222">• Generic, one per family: Qwen3 / 3.5 / MoE, Gemma 4, MiniCPM5, GLM-5.2, Llama (universal dense), DiffusionGemma, Whisper</text>
-<text x="44" y="1182" font-size="12.5" fill="#222">• Phases: prefillChunk { gpu, ane }, prefillTail, decode / verify / logits width tables</text>
+<text x="44" y="1182" font-size="12.5" fill="#222">• Phases: prefillChunk { gpu, ane }, prefillTail, decode / verify / appendKnown / logits width tables</text>
 <text x="44" y="1199" font-size="12.5" fill="#222">• makeCache(): composes the cache lego its composition names</text>
 <text x="44" y="1216" font-size="12.5" fill="#222">• Layer captures: residual basis and hidden taps for drafters</text>
 <text x="44" y="1233" font-size="12.5" fill="#222">• Declared capabilities: vision, audio, draft head, pooled embeddings; vision and audio towers</text>
