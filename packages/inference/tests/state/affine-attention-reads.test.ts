@@ -204,12 +204,12 @@ function advance(pair: [Cache, Cache], B: number, steps: readonly Step[], g: Geo
   }
 }
 
-/** One composition of the generic caches and the old dispatch it is compared
+/** One composition of the generic caches and the kernel call it is compared
  * with. `tiled-causal`: `tiledCausalAffineKernels` (`--kv-quant config`, OptiQ
- * parity) against the dispatch with fused SDPA on. `unfused`:
- * `unfusedAffineKernels` (uniform `--kv-quant N`, mlx-lm parity) against it
- * with MLX_BUN_NO_FUSED_SDPA=1. `tiled`: `tiledAffineKernels` (always tiled, no
- * oracle) against the fused-on dispatch, recorded. */
+ * parity) against the tiled window kernel the rule names. `unfused`:
+ * `unfusedAffineKernels` (uniform `--kv-quant N`, mlx-lm parity) against the
+ * unfused kernel. `tiled`: `tiledAffineKernels` (always tiled, no
+ * oracle) against the tiled-causal rule's kernel, recorded. */
 interface Variant { name: "tiled-causal" | "unfused" | "tiled"; noFused: boolean; kernels(groupSize: number, bits: number): AffineKernels }
 const VARIANTS: Variant[] = [
   { name: "tiled-causal", noFused: false, kernels: (groupSize, bits) => tiledCausalAffineKernels(bits, groupSize, Dtype.bfloat16) },

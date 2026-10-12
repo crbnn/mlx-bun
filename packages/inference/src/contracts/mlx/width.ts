@@ -5,8 +5,9 @@
  * from the shared-row one), five to eight rows on the matrix unit, and wider.
  * The caller picks the entry by the rows it is loading (`widthClass`) and hands
  * an entry only rows of its class; an entry never inspects its input to learn
- * its class. A graph with one forward supplies the same operation in every
- * entry; a specialized graph supplies the operation it built for each class. */
+ * its class. A graph whose blocks take any row count supplies the same
+ * operation in every entry; a graph built with row kernels supplies the
+ * operation it built for each class. */
 export interface MlxWidthTable<Operation> {
   /** Exactly one row. */
   readonly one: Operation;

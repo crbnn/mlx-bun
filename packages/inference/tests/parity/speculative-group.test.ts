@@ -33,8 +33,8 @@
 // the app's model host mounts it (`apps/mlx-bun/src/engine/model-host.ts`): the
 // Colibri runtime opened with the MTP tier planned for one drafting lane, and
 // the provider the graph declares (`GraphCapabilities.nativeDraft`) at the
-// plan's draft depth (the default depth here). It takes no draft artifact and
-// only plain KV (see optIn).
+// plan's draft depth (the default depth here). It takes no draft artifact; its
+// latent caches compose the KV scheme (the latent legos).
 // Observers watch the target phases the bindings call (prompt chunks and tails,
 // decode, verify, known tokens; streamed on the GLM target): the gateway and the
 // direct generator are bound to an observed view of the graph.
@@ -98,10 +98,6 @@ export function optIn(env: Record<string, string | undefined>) {
   if (kind === "glm-mtp") {
     const raw = JSON.parse(readFileSync(join(target, "config.json"), "utf8"));
     assert.equal(raw.model_type, "glm_moe_dsa", `${PREFIX}KIND=glm-mtp needs a GLM-5.2 (glm_moe_dsa) target, not ${raw.model_type}`);
-    // GLM's attention stores a compressed MLA latent cache: no quantized or paged
-    // form of it exists yet, so the loader refuses those compositions (owed). The
-    // KV matrix does not apply to this cache; plain KV is its only layout.
-    if (kv !== "bf16") throw new Error(`${PREFIX}KIND=glm-mtp takes plain KV only: GLM's MLA latent cache has no affine or TurboQuant conversion`);
   }
   if (window !== undefined) {
     const raw = JSON.parse(readFileSync(join(target, "config.json"), "utf8"));
@@ -134,8 +130,7 @@ async function load(inputs: Inputs) {
     config.text.layerTypes = [...types]; config.text.slidingWindow = inputs.window;
   }
   // The KV scheme the graph composes, which every request stores. Its affine
-  // reads are the tiled-causal kernels this test computed before E3, when its
-  // environment left fused SDPA on (MLX_BUN_NO_FUSED_SDPA unset).
+  // reads are the tiled-causal kernels (`fusedSdpa`: OptiQ's wrapper rule).
   const turboQuant = { kBits: 8, vBits: 3 };
   if (inputs.kv === "config") assert(config.kvQuant?.length, "the target has no kv_config.json");
   const kvRequest = inputs.kv === "bf16" ? undefined : inputs.kv === "turbo" ? { turboQuant, quantizedKvStart: inputs.start }
@@ -144,9 +139,11 @@ async function load(inputs: Inputs) {
   let model: A, defaultDepth: number | undefined, dispose: () => void;
   if (inputs.kind === "glm-mtp") {
     // `serve --mtp on`, as the app's model host opens it: the Colibri runtime with
-    // native MTP planned for one drafting lane (batchSize 1), its other defaults
-    // unchanged; the provider's draft depth is the plan's.
-    const opened = await openGlm52RuntimeModel(inputs.target, { batchSize: 1, enableMtp: true });
+    // native MTP planned for one drafting lane (batchSize 1), its latent caches the
+    // composition's KV scheme (the latent legos), its other defaults unchanged; the
+    // provider's draft depth is the plan's.
+    const opened = await openGlm52RuntimeModel(inputs.target, { batchSize: 1, enableMtp: true,
+      caches: { kv: composition.kv, pagedKv: composition.pagedKv } });
     model = opened.model;
     dispose = () => opened.model.dispose();
     if (!opened.plan.enableMtp) { dispose(); throw new Error("the GLM memory plan leaves native MTP disabled"); }
@@ -683,7 +680,7 @@ test("opt-in: none skips; partial, blank or inconsistent settings fail (CPU only
   expect(() => optIn(env({ TARGET: "/t", KIND: "ngram", KV_START: "8" }))).toThrow("needs a quantized");
   expect(() => optIn(env({ TARGET: "/t", KIND: "ngram", DEPTH: "0" }))).toThrow("integer >= 1");
   expect(() => optIn(env({ TARGET: "/nonexistent-spec-target", KIND: "ngram" }))).toThrow("no config.json");
-  // GLM-5.2 native MTP: no draft artifact, a glm_moe_dsa target, plain KV only, no custom window.
+  // GLM-5.2 native MTP: no draft artifact, a glm_moe_dsa target, any KV scheme, no custom window.
   expect(() => optIn(env({ TARGET: "/t", KIND: "glm-mtp", DRAFT: "/d" }))).toThrow("checkpoint-native");
   const dir = mkdtempSync(join(tmpdir(), "spec-glm-target-"));
   try {
@@ -691,7 +688,7 @@ test("opt-in: none skips; partial, blank or inconsistent settings fail (CPU only
     expect(() => optIn(env({ TARGET: dir, KIND: "glm-mtp" }))).toThrow("glm_moe_dsa");
     writeFileSync(join(dir, "config.json"), JSON.stringify({ model_type: "glm_moe_dsa" }));
     expect(optIn(env({ TARGET: dir, KIND: "glm-mtp" }))).toMatchObject({ kind: "glm-mtp", kv: "bf16", draft: undefined, depth: undefined });
-    for (const kv of ["4", "8", "turbo", "config"]) expect(() => optIn(env({ TARGET: dir, KIND: "glm-mtp", KV: kv }))).toThrow("plain KV only");
+    for (const kv of ["4", "8", "turbo", "config"]) expect(optIn(env({ TARGET: dir, KIND: "glm-mtp", KV: kv }))).toMatchObject({ kind: "glm-mtp", kv });
     expect(() => optIn(env({ TARGET: dir, KIND: "glm-mtp", WINDOW: "8" }))).toThrow("Llama-family");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

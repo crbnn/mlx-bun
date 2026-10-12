@@ -15,8 +15,9 @@
 // `--describe` prints for one. A change to the blocks, layers, kernels or this
 // template is a regeneration, never a hand edit: tests/models/qwen38-generated-sync.test.ts
 // regenerates every composition from tests/fixtures/qwen38-graphs and fails when a
-// committed file differs. Whether a regenerated graph computes the same bits is
-// tests/models/qwen38-m4pro-identity.test.ts and tests/models/qwen38-m1max-identity.test.ts.
+// committed file differs. Where a regenerated graph runs the generic blocks, its identity test holds it to the
+// generic Qwen 3.5 graph (tests/models/qwen38-m4pro-identity.test.ts, qwen38-m1max-identity.test.ts); its row
+// kernels are the real-artifact parity suite's (tests/parity/qwen-trellis-parity.test.ts) and the app digests'.
 
 import { parseArgs } from "node:util";
 import { loadModelConfig, quantFor } from "../src/artifacts/config";
@@ -53,10 +54,9 @@ export interface Qwen38Composition {
   /** The most rows per forward the table entry admits; null admits any number. */
   readonly maxRows: number | null;
   readonly aneBridge: boolean;
-  /** Layers whose gate and up widths differ, at one to four rows, on the reduce kernels (the TQ graph's
-   *  `MLX_BUN_QWEN38_TQ_MIXED_GATEUP` before D2). `"split"`, the default and measured best: `ReduceMixedGateUp` with
-   *  MLX's compiled-SwiGLU tail, bit-identical to the two projections plus a separate SwiGLU and one kernel instead of
-   *  three (the TQ graph measured about 1 ms less per verify forward over the artifact's ten such layers). `"fused"`:
+  /** Layers whose gate and up widths differ, at one to four rows, on the reduce kernels. `"split"`, the default and
+   *  measured best: `ReduceMixedGateUp` with MLX's compiled-SwiGLU tail, bit-identical to the two projections plus a separate SwiGLU and one kernel instead of
+   *  three (about 1 ms less per verify forward over the artifact's ten such layers on the M1 Max). `"fused"`:
    *  the same kernel with the same-width kernel's float32 sigmoid (last bits differ). `"off"`: those layers keep the
    *  generic blocks' two projections and separate SwiGLU, the A/B control. Only a device whose table names
    *  `ReduceMixedGateUp` reads it. */
@@ -87,7 +87,7 @@ export const QWEN38_COMPOSITIONS: Readonly<Record<string, Qwen38Composition>> = 
     // token, bf16 KV, greedy; six to eight rows (131.8 to 137.5 ms, not monotone) declared at the depth-7 plateau.
     verifyRoundCosts: { host: "M4 Pro 24 GB", costs: [[1, 1], [2, 1.3], [3, 1.46], [4, 1.68], [5, 1.82], [6, 1.92], [7, 1.93], [8, 1.94]] },
   },
-  // The hand-written TQ graph's served composition until D2: this artifact on the M1 Max GPU, whatever its KV
+  // This artifact on the M1 Max GPU, whatever its KV
   // scheme or rows.
   "qwen38-27b-trellis-m1max": {
     stem: "qwen38-27b-trellis-m1max",
@@ -216,7 +216,7 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     ane: { fraction: 0.55, rowMajorMlp: "AneTrellisMlpSplit", k3InterleavedMlp: "AneTrellisMlpSplitK3i", affine: "AneAffineSplit",
       projections: ["in_proj_z", "out_proj", "o_proj"] },
   },
-  // The TQ graph's kernels and evaluation, measured on the M1 Max: the reduce gate/up and scatter down kernels up to
+  // The kernels and evaluation measured best on the M1 Max: the reduce gate/up and scatter down kernels up to
   // four rows (the representations qualified on this GPU family, through TrellisLinear), the generic blocks above;
   // MLX's QuantizedLinear for every projection and the head; no graph submission; mixed rows packed on the generic
   // blocks; known tokens as windows.

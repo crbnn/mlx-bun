@@ -94,7 +94,7 @@ test.skipIf(!inputs)("Gemma4 assistant: donor attention and draft chains equal i
   let drafter: GemmaAssistantDrafter | null = null, caches: Cache[] = [];
   try {
     const model = createModel(weights, config) as unknown as {
-      makeCache(): Cache[]; forwardHidden(ids: MlxArray, caches: Cache[]): MlxArray; logitsFromHidden(h: MlxArray): MlxArray;
+      makeCache(): Cache[]; logitsFromHidden(h: MlxArray): MlxArray;
       embed: { encode(ids: MlxArray): MlxArray }; embedScale: number };
     drafter = await assistant.GemmaAssistantDrafter.load(inputs!.draft);
     const t = config.text, donors = t.numHiddenLayers - t.numKvSharedLayers;
@@ -264,9 +264,9 @@ test.skipIf(!inputs)("Gemma4 assistant: shared generation accepts, rejects and c
   const cleanup: (() => void)[] = [];
   try {
     const model = createModel(weights, config);
-    cleanup.push(() => { if ("dispose" in model) model.dispose(); });
+    cleanup.push(() => model.dispose());
     const replay = createModel(weights, config);
-    cleanup.push(() => { if ("dispose" in replay) replay.dispose(); });
+    cleanup.push(() => replay.dispose());
     const prefillTokens = prompt.length - 1;
     const provider = await AssistantProvider.load(inputs!.draft);
     cleanup.push(() => provider.dispose());

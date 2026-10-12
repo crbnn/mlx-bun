@@ -11,12 +11,11 @@
 // starting widths (it trims to `offset` and regrows in STEP chunks), so a
 // merged exact-width buffer needs no STEP alignment here.
 //
-// Composition contract (the L2 oracle binds per ROW): each joiner solo-
-// prefills with the SAME per-layer conversion the serial path runs
-// (maybeQuantizeKv at chunk boundaries — see BatchScheduler.#quantizeSolo),
-// so a row's quantized bytes are bit-exact vs serial `--kv-quant config` by
-// construction; this module only re-arranges those bytes across the batch
-// axis. Gates: `02d723a:tests/parity/batched-kv-quant-parity.test.ts`.
+// Composition contract (the L2 oracle binds per ROW): each joiner prefills
+// alone through the per-layer conversion its bf16-first lego runs (the
+// conversion at the scheme's start), so a row's quantized bytes are bit-exact
+// vs the same request run alone under `--kv-quant config` by construction;
+// this module only re-arranges those bytes across the batch axis. Gates: `02d723a:tests/parity/batched-kv-quant-parity.test.ts`.
 
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";

@@ -14,13 +14,11 @@ import { TurboQuantCodec,disposeTurboQuant,turboQuantFusedDecode,type TurboQuant
 import { AttentionMasks, causalLease, sdpaRead, unmaskedLease } from "./attention-read";
 import type { TurboQuantFetches, TurboQuantKernels } from "./turboquant-attention";
 
-/** TurboQuant KV cache — v1 (`02d723a:docs/design/turboquant.md`): dequantize-
- *  on-fetch. Deliberately does NOT subclass KVCache/RotatingKVCache (or
- *  QuantizedKVCache) — a novel class fails every generated-file
- *  `#matches()` guard and every batching `instanceof` allow-list, so it
- *  gets solo-only routing and monolith fallback for free, the same way
- *  QuantizedKVCache does today. Only full-attention (non-rotating)
- *  layers use this in v1; sliding-window layers stay bf16.
+/** TurboQuant KV cache (`02d723a:docs/design/turboquant.md`): encoded at rest,
+ *  decoded by its named reads with the kernel set the graph composed
+ *  (`TurboQuantKernels`). Its own storage class, not a KVCache subclass; its
+ *  row layouts are declared in `state/layout`. Only full-attention
+ *  (non-rotating) layers use it; sliding-window layers stay bf16.
  *
  *  Storage: 5 arrays per the vllm-metal reference's `turbo_quant_encode`
  *  tuple — kIdx (int8 unpacked at kBits=8, else bit-packed uint8),

@@ -145,8 +145,7 @@ test.skipIf(!inputs)("Gemma4 paged KV: gathered bf16 equals plain KV; direct rea
   const releases: (() => void)[] = [];
   try {
     // One graph per encoding, composed with that server-wide scheme: the
-    // tiled-causal affine reads this test computed before E3, when its
-    // environment left fused SDPA on (MLX_BUN_NO_FUSED_SDPA unset).
+    // tiled-causal affine reads (`fusedSdpa`: OptiQ's wrapper rule).
     const schemeFor = (encoding: Encoding) => encoding === "bf16" ? undefined : resolveKvScheme({ override: encoding, fusedSdpa: true });
     // One graph per encoding and paging (block size, or null unpaged): the composition pages every request.
     const models = new Map<string, A>();

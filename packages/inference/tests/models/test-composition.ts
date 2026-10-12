@@ -14,7 +14,8 @@ export function testComposition(kv: KvStorageScheme = { kind: "bf16" }, fields: 
   });
 }
 
-/** The KV flags a request carried before E3. */
+/** A test's KV scheme in the options `KvScheme` takes (what `--kv-quant` and
+ * `--quantized-kv-start` resolve to). */
 export interface KvOptions {
   readonly kvBits?: number;
   readonly kvGroupSize?: number;
@@ -23,12 +24,10 @@ export interface KvOptions {
   readonly turboQuant?: { readonly kBits: number; readonly vBits: number };
 }
 
-/** The composition's KV scheme for those flags, with the starts they had: a
- * uniform width converts at 5000 tokens unless a start is named, a per-layer
- * config and TurboQuant at 0. Affine reads take `kernels`, else the scheme's
- * default. A test that ran without the app before E3 read affine KV with the
- * tiled-causal set (MLX_BUN_NO_FUSED_SDPA unset); one that compares against
- * those numbers names it. */
+/** The composition's KV scheme for those options, with the schemes' default
+ * starts: a uniform width converts at 5000 tokens unless a start is named, a
+ * per-layer config and TurboQuant at 0. Affine reads take `kernels`, else the
+ * scheme's default; a test that compares against the tiled-causal set names it. */
 export function kvOf(options: KvOptions, kernels?: AffineKernelChoice): KvStorageScheme {
   if (options.turboQuant)
     return new KvScheme("turbo", { turboQuant: { ...options.turboQuant }, quantizedKvStart: options.quantizedKvStart ?? 0 }).storage;

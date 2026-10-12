@@ -299,8 +299,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    * layers compose a ring of the sliding window, whose reads own the window
    * mask, and stay bf16 under TurboQuant. The full-attention caches' TurboQuant
    * read is deferred (`deferredTurboQuantKernels`): values stay rotated through
-   * the fused SDPA and the read un-rotates the output, the sequence this graph
-   * ran after `updateAndFetchDeferredV` before its blocks read through the cache. */
+   * the fused SDPA and the read un-rotates the output. */
   makeCache(): Cache[] {
     const masks = new AttentionMasks(), kv = this.composition.kv;
     return this.layers.slice(0, this.numDonors).map((l, layer) =>

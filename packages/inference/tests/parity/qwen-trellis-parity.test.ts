@@ -119,7 +119,7 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis: logits, greedy tokens and MTP spec
   const report: Record<string, unknown> = {};
   try {
     const model = createModel(weights, config) as A;
-    // Main selected its purpose-built TQ graph for this artifact on the M1 Max; this tree selects the graph generated
+    // Main selected its hand-written graph for this artifact on the M1 Max; this tree selects the graph generated
     // for that composition (the reference runtime's GPU family is checked above).
     expect(model).toBeInstanceOf(Qwen38TrellisM1Max);
     report.graph = model.constructor.name;

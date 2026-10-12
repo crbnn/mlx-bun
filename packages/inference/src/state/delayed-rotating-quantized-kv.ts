@@ -77,13 +77,11 @@ export class DelayedRotatingQuantizedKVCache extends SpeculativeTransitioningKvR
 
   appendDecode(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v, false); }
   appendWindow(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v, false); }
-  /** The graph's committed read today (Qwen 3.5's `appendKnown` under `knownSpans`): the same
+  /** The committed read (Qwen 3.5's `appendKnown` under `knownSpans`): the same
    * mask and attention view, attended with independent positions, which the
-   * packed layout's view honours and the per-row views ignore, as they do in
-   * that call.
-   * TODO(B1b): the affine caches' own reads replace this, one call per phase. */
+   * packed layout's view honours and the per-row views ignore. */
   appendCommitted(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v, true); }
-  /** The graph's read today: the mask from this layout before the append, with
+  /** The read: the mask from this layout before the append, with
    * the ring's window, then the attention view the append returns. */
   #read(k: MlxArray, v: MlxArray, independentPositions: boolean): AttentionRead {
     const mask = this.makeMask(k.shape[2]!, this.maxSize);

@@ -61,18 +61,16 @@ function convTail(input: MlxArray, processed: number, nKeep: number, rowLengths?
  *  cache.ArraysCache(size=2): slot 0 = causal-conv state [B, K-1, conv_dim],
  *  slot 1 = recurrent state [B, Hv, Dv, Dk] f32. `recurDecode` and
  *  `recurWindow` own both slots and the kernels that update them
- *  (GatedDeltaCache); GatedDeltaNet.forward still reads and writes the slots
- *  directly until C1 moves the block onto those calls. `advance(N)` only
+ *  (GatedDeltaCache); the DeltaNet block hands them its projections. `advance(N)` only
  *  tracks token count for B=1 single-stream (lengths / left_padding are
- *  batched-decode concerns). Not a KVCache, so maybeQuantizeKv skips it. */
+ *  batched-decode concerns). Not a key/value cache: no KV scheme converts it. */
 /** One armed speculative verify round on an SSMCache: the pre-round state
  *  snapshot (retained refs — MLX arrays are immutable, so this is free) plus
  *  the recorded position-local kernel inputs, which make a partial reject
  *  bit-exactly replayable: state after the first `keep` window tokens is the
  *  same arithmetic prefix whether or not the rejected tail was ever
  *  processed. `recurDecode`/`recurWindow` record and install the cache's own
- *  replay over the borrowed layer; GatedDeltaNet.forward installs the block's
- *  replay until C1. */
+ *  replay over the borrowed layer. */
 export interface SsmSpecRound {
   /** True from specRoundBegin() until the layer's forward records. */
   armed: boolean;

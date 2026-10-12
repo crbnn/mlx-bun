@@ -92,6 +92,11 @@ test("the graph switch is a composition field, on by default; the runtime config
   expect(geglu()).toBe(true);
   expect(geglu({ compiledGeglu: false })).toBe(false);
   expect(geglu({}, { MLX_BUN_COMPILED_GEGLU: "0" })).toBe(true);
+  const swiglu = (request: Parameters<typeof resolveComposition>[1] = {}, values: Record<string, string> = {}) =>
+    withRuntimeConfig(createRuntimeConfig(values), () => resolveComposition(config, request).compiledSwiglu);
+  expect(swiglu()).toBe(true);
+  expect(swiglu({ compiledSwiglu: false })).toBe(false);
+  expect(swiglu({}, { MLX_BUN_COMPILED_SWIGLU: "0" })).toBe(true);
   // Speculation over a KV scheme is no composition fact: every cache lego holds the transaction.
   expect(resolveComposition(config)).not.toHaveProperty("speculativeAffineKv");
 });

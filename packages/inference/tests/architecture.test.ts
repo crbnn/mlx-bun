@@ -521,7 +521,7 @@ const nodeModules = new Set([...builtinModules, ...builtinModules.map(name => `n
 
 /** What to do instead, printed with a composition rule's failure. */
 const pavedRoad: Partial<Record<RatchetRule, string>> = {
-  "graph-extends": "A specialized graph is an entire graph; generate it with the family's generator under `packages/inference/scripts/` and compose shared blocks, never inherit a graph.",
+  "graph-extends": "Every graph is an entire graph built for a composition; add one by generating it with the family's generator under `packages/inference/scripts/` and compose shared blocks, never inherit a graph.",
   "hot-path-read": "This fact was fixed when the composition was built; read it in the constructor or the loader and store the result, or make the alternative a separately constructed layer or kernel.",
   "cache-escape": "The cache owns its read; append through `appendDecode`/`appendWindow` (or the named committed, bidirectional and block reads) and call `attend` on what it returns.",
   "phase-by-shape": "The scheduler names the phase it is in: call `prefillChunk`, `prefillTail`, `decode[width]` or `verify[width]` from `MlxTokenPhases`.",

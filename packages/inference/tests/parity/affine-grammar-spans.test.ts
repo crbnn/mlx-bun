@@ -48,8 +48,7 @@ test.skipIf(!target)("real-weight committed spans over delayed affine KV equal d
     type Projection = { shape: number[]; dtype: string; sha256: string };
     let lane: Projection[] | null = null, kinds: string[][] = [];
     // One graph per conversion start, composed with that scheme: the
-    // tiled-causal affine reads this test computed before E3, when its
-    // environment left fused SDPA on (MLX_BUN_NO_FUSED_SDPA unset).
+    // tiled-causal affine reads (`fusedSdpa`: OptiQ's wrapper rule).
     const affine = (start: number) => resolveKvScheme({ override: 4, quantizedKvStart: start, fusedSdpa: true });
     type Scheme = ReturnType<typeof affine>;
     const graphs = new Map<number, { model: ReturnType<typeof createModel>; binding: ReturnType<typeof bindMlxGateway> }>();

@@ -4,7 +4,7 @@
 // compares: each Qwen MLP is replaced by one that runs the variant-selected
 // dispatch TrellisLinear used before it fixed variant 13, with the variant
 // explicit, over the loaded weights. It uses the generic Qwen3.5 graph, which
-// reads each layer's MLP per forward; the specialized graphs bind their MLP
+// reads each layer's MLP per forward; the generated Trellis graphs bind their MLP
 // kernels when they are constructed.
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";

@@ -156,29 +156,23 @@ export class TrainingCache implements TrainingAttentionCache {
  *
  *  Its `recurDecode` and `recurWindow` run the recurrence with a backward
  *  attached (`gatedDeltaUpdate`'s `differentiable`), since the inference
- *  kernel has no gradient. Until C1 moves the block onto those calls,
- *  GatedDeltaNet.forward still reads the slots below and detects this class to
- *  choose the differentiable recurrence. */
+ *  kernel has no gradient; the DeltaNet block hands them its projections as it
+ *  does to any recurrent cache. */
 export class TrainingSSMCache implements GatedDeltaCache {
   /** Training-only adapter; never admitted, merged, or persisted. */
   signature(): string { return "train:training-ssm"; }
   offset = 0;
   specRound: null = null;
-  get conv(): MlxArray | null { return null; }
-  set conv(v: MlxArray | null) { v?.dispose(); }
-  get recurrent(): MlxArray | null { return null; }
-  set recurrent(v: MlxArray | null) { v?.dispose(); }
   recurDecode(qkv: MlxArray, a: MlxArray, b: MlxArray, layer: GatedDeltaParameters): MlxArray {
     return this.#recur(qkv, a, b, layer);
   }
   recurWindow(qkv: MlxArray, a: MlxArray, b: MlxArray, layer: GatedDeltaParameters): MlxArray {
     return this.#recur(qkv, a, b, layer);
   }
-  /** GatedDeltaNet.forward's training case, copied: a zero conv state, the
+  /** The training recurrence: a zero conv state, the
    *  causal convolution, the block's glue, and the differentiable recurrence
    *  from a zero recurrent state. Nothing is stored, so the new recurrent
-   *  state is disposed at once and the conv tail the block builds for its
-   *  setter to dispose is not built here. */
+   *  state is disposed at once and no conv tail is kept. */
   #recur(qkv: MlxArray, a: MlxArray, b: MlxArray, layer: GatedDeltaParameters): MlxArray {
     const [B, , D] = qkv.shape as [number, number, number];
     const convState = ops.zeros([B, layer.convWeight.shape[1]! - 1, D], qkv.dtype);

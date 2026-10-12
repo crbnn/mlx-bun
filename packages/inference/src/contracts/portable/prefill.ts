@@ -25,7 +25,7 @@ export interface PrefillStep {
   readonly kind: "drain" | "final";
   readonly snapshot: boolean;
   /** Batch admission may finish a short last drain and token zero in one tick.
-   * Serial execution still yields between every drain and the next forward. */
+   * Otherwise execution yields between every drain and the next forward. */
   readonly batchYield: boolean;
   readonly phase: PrefillPhase;
 }
@@ -36,7 +36,7 @@ export function prefillPhase(start: number, end: number, whole: boolean): Prefil
   return end - start === 1 ? "decode" : whole ? "chunk" : "tail";
 }
 
-/** Shared serial/solo-batch prefill program. No tensors, runtime policy reads,
+/** The prefill program a row follows, alone or in a batch. No tensors, runtime policy reads,
  * or sampling. Advance position only after executing the returned step. */
 export function nextPrefillStep(input: PrefillPosition): PrefillStep {
   const { length, position, chunkSize, tailSplit, snapshotAt } = input;

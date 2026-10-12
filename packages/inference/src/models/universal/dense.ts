@@ -1,7 +1,7 @@
 // UniversalDense — the Tier-0 config-driven dense llama-family module
 // (`02d723a:docs/design/generic-model-support.md` §4.1). One module, shaped exactly
 // like qwen3.ts, with every arch delta selected by the UniversalArgs
-// descriptor (archs.ts). Monolith path only: no compiled
+// descriptor (archs.ts). No compiled
 // decode. Each attention block reads its cache for the phase its caller names
 // (`ReadPhase`) with the read the descriptor composes at construction: the
 // cache's own read, or the score-softcapped read over dense KV
@@ -182,8 +182,8 @@ class UniversalAttention {
     // Batched decode: the scheduler's mask wrapper exposes each row's REAL
     // position as ropeOffsetArr (rows have different prompt lengths under
     // left-padding; the scalar offset would mis-position every padded row by
-    // its pad amount — the 2026-07-03 uneven-batch bug). Serial lane: scalar
-    // offset, byte-identical to before (the S1b.1 pattern, cf. qwen3_5.ts).
+    // its pad amount — the 2026-07-03 uneven-batch bug). One row: the scalar
+    // offset.
     const offArr = (cache as { ropeOffsetArr?: MlxArray }).ropeOffsetArr;
     q = disposing(q, offArr
       ? this.rope.applyDynamic(q, offArr)

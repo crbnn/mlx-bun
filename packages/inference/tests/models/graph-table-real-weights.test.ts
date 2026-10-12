@@ -53,7 +53,7 @@ test.skipIf(!inputs)("openModel builds the graph the table selects for the compo
     return;
   }
   assert(qwen35GraphFingerprint(config) === "cfa205c8f5af046a", `${MODEL}: no selection expectation for ${dir}`);
-  assert(device === "applegpu_g16s" || device === "applegpu_g13s", `${MODEL}: the Trellis artifact has a specialized graph on g16s and g13s, not ${device}`);
+  assert(device === "applegpu_g16s" || device === "applegpu_g13s", `${MODEL}: the Trellis artifact has a generated graph for g16s and g13s, not ${device}`);
   const expected = device === "applegpu_g16s" ? Qwen38TrellisM4Pro : Qwen38TrellisM1Max;
   expect(await built()).toBe(expected);
   console.log(`[graph-table] ${dir} on ${device}: default composition -> ${expected.name}`);

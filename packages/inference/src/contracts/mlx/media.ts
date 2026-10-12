@@ -3,8 +3,8 @@ import type { Cache } from './cache';
 import type { MlxWidthClass } from './width';
 
 /** Prepared embeddings for vision/audio prompts. Qualified models consume
- * this through shared preparation and decode; other bindings retain serial
- * execution. Token-only prefix caching remains disabled for media. */
+ * this through the media prompt input the graph binds (`bindMediaInput`).
+ * Token-only prefix caching remains disabled for media. */
 export type Vision = {
   /** Producer identity includes all media and preceding rendered tokens. */
   prefixIdentity?: string;
@@ -18,7 +18,7 @@ export type Vision = {
    *  where zeroing falls back to imageMask. */
   multimodalMask?: MlxArray;
   /** Qwen3.5/3.8 vision: the request's mRoPE positions + decode delta,
-   *  owned by shared forward input, or scoped to the explicit serial run. */
+   *  owned by the media prompt input the graph binds. */
   mrope?: import("./positions").MropeRequestState;
 };
 

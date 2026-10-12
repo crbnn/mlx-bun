@@ -59,9 +59,9 @@ function rotatedValueRead(keys: MlxArray, values: MlxArray, mask: MaskLease,
 }
 
 /** Decode keys and values back to their own domain, then the stock fused SDPA
- * under the mask. Qwen 3.5's graph composes this set: its attention block read
- * TurboQuant storage this way (`updateAndFetch`, then `ops.sdpa`) before it read
- * through the cache, and these are its served numbers. */
+ * under the mask. The Qwen graphs (Qwen3, Qwen3-MoE, Qwen 3.5 and the generated
+ * Trellis graphs) and the universal graph compose this set; it computes their
+ * served numbers. */
 export const denseTurboQuantKernels: TurboQuantKernels = Object.freeze({
   fetch: "decoded" as const,
   read: (fetches: TurboQuantFetches, mask: MaskLease) => withLease(mask, held => {
@@ -71,10 +71,10 @@ export const denseTurboQuantKernels: TurboQuantKernels = Object.freeze({
 });
 
 /** Leave values rotated, run the stock fused SDPA under the mask on them, then
- * undo the rotation on the output (B1c's read). Gemma 4's and MiniCPM5's graphs
- * compose this set: it is the sequence they run after
- * `updateAndFetchDeferredV` today, so it keeps their served numbers when they
- * read through the cache. */
+ * undo the rotation on the output: attention is linear in V, so one inverse
+ * rotation per query row replaces one per cached token. The Gemma 4 graphs
+ * (generic and generated), DiffusionGemma and MiniCPM5 compose this set; it computes their served
+ * numbers. */
 export const deferredTurboQuantKernels: TurboQuantKernels = Object.freeze({
   fetch: "rotated" as const,
   read: (fetches: TurboQuantFetches, mask: MaskLease) => withLease(mask, held => {

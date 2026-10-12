@@ -1719,7 +1719,7 @@ describe.skipIf(!native)("dense-read graphs with delayed affine KV", () => {
   });
 
   // The requantizing oracle (no artifact holds Gemma 2 numbers past the transition:
-  // main's serial path threw at the first forward that read a converted
+  // main threw at the first forward that read a converted
   // layer). The graph and its manual attention are the production graph's; the
   // storage is the oracle's: the plain storage the graph composes without a
   // scheme (KVCache, RotatingKVCache on a sliding layer), whose fetched window a
