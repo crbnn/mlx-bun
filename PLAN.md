@@ -462,8 +462,8 @@ below is a missing lego; the refusals disappear because the legos exist, not the
       digest cells identical; the parity suites at the base's lines. Left: `--kv-quant turbo`
       is still refused at startup for a head dimension outside {64, 128, 256, 512}, because the
       ported TurboQuant codec tabulates its rotation for those four sizes only (no cached
-      artifact hits it; Josh's decision whether to generate the missing sizes from the same
-      construction, KL-gated, or to declare the codec's sizes as a fact of the lego); two
+      artifact hits it; decided by Josh, 2026-10-12: generate the missing sizes from the same
+      construction and KL-gate them against bf16, with the final cleanup, so the refusal goes); two
       unreachable guards remain by inspection (`training/segmented.ts`'s quantized donor KV,
       the latent width checks).
 
