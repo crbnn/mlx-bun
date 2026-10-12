@@ -30,7 +30,8 @@ test("the default record: this machine, bf16, no drafter, the 2048-token chunk, 
   const composition = resolveComposition(config);
   expect(composition).toEqual({ device: deviceArchitecture(), aneBridge: true, kv: { kind: "bf16" },
     draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 8, speculativeAffineKv: true, packedMixedMlp: true,
-    vectorGreedySampling: true });
+    vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
+    grammarJump: false });
   // The Neural Engine bridge is composed unless the caller turns it off; nothing probes the machine.
   expect(resolveComposition(config, { aneBridge: false }).aneBridge).toBe(false);
   expect(Object.isFrozen(composition)).toBe(true);
@@ -91,6 +92,23 @@ test("the two graph switches are composition fields, on by default; the runtime 
   expect(switches({ packedMixedMlp: false })).toEqual({ speculativeAffineKv: true, packedMixedMlp: false });
   expect(switches({}, { MLX_BUN_QWEN_SPEC_KV4: "0", MLX_BUN_MIXED_PACKED_MLP: "0" }))
     .toEqual({ speculativeAffineKv: true, packedMixedMlp: true });
+});
+
+test("the scheduler switches are composition fields at their defaults; the runtime configuration does not reach them", () => {
+  const facts = (request: Parameters<typeof resolveComposition>[1] = {}, values: Record<string, string> = {}) =>
+    withRuntimeConfig(createRuntimeConfig(values), () => {
+      const { compiledDecode, mixedPrefill, mixedTokenBudget, prefillTailSplit, grammarJump } = resolveComposition(config, request);
+      return { compiledDecode, mixedPrefill, mixedTokenBudget, prefillTailSplit, grammarJump };
+    });
+  const defaults = { compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true, grammarJump: false };
+  expect(facts()).toEqual(defaults);
+  const flipped = { compiledDecode: false, mixedPrefill: true, mixedTokenBudget: 9, prefillTailSplit: false, grammarJump: true };
+  expect(facts(flipped)).toEqual(flipped);
+  // The environment keys these fields replaced change nothing.
+  expect(facts({}, { MLX_BUN_COMPILED_DECODE: "0", MLX_BUN_MIXED_PREFILL: "1", MLX_BUN_MIXED_TOKEN_BUDGET: "9",
+    MLX_BUN_PREFILL_TAIL_SPLIT: "0", MLX_BUN_GRAMMAR_JUMP: "1" })).toEqual(defaults);
+  for (const mixedTokenBudget of [0, 1.5, -2])
+    expect(() => resolveComposition(config, { mixedTokenBudget })).toThrow("composition mixedTokenBudget must be a positive integer");
 });
 
 test("the loaded drafter fixes the depth, or caps it when the scheduler adapts; rows and adapters are recorded as given", () => {

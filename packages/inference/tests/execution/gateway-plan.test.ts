@@ -22,7 +22,7 @@ import { Qwen3Model } from "../../src/models/qwen/qwen3";
 import { Qwen3MoeModel } from "../../src/models/qwen/qwen3-moe";
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
 import { resolveKvScheme } from "../../src/state/kv-scheme";
-import { BF16_KV } from "../../src/contracts/portable/composition";
+import { BF16_KV, COMPOSITION_DEFAULTS } from "../../src/contracts/portable/composition";
 import type { Composition, KvStorageScheme } from "../../src/contracts/portable/composition";
 import { stubPhases } from "../models/phase-forward";
 
@@ -49,10 +49,13 @@ const kvOf = (options: KvOptions): KvStorageScheme => options.turboQuant
 /** The composition facts a graph reads: the KV scheme, and the defaults of the
  * fields that were runtime flags. */
 const composition = (kv: KvStorageScheme = BF16_KV) =>
-  ({ kv, speculativeAffineKv: true, packedMixedMlp: true }) as unknown as Composition;
+  ({ kv, ...COMPOSITION_DEFAULTS }) as unknown as Composition;
 /** `model`, composed with the KV scheme every request it serves stores. */
 const composedWith = <M extends object>(model: M, options: KvOptions): M =>
   Object.assign(model, { composition: composition(kvOf(options)) });
+/** `model`, its composition (bf16 unless it names one) turning grammar jump on. */
+const jumpGraph = <M extends object>(model: M): M =>
+  Object.assign(model, { composition: { ...((model as { composition?: Composition }).composition ?? composition()), grammarJump: true } });
 const AFFINE4 = { kvBits: 4 } as const, TURBO = { turboQuant: { kBits: 8, vBits: 3 } } as const;
 const grammar = { ...shape, hasGrammar: true };
 const schedule = { continuous: true, quantizedBatch: true, checkpoints: false };
@@ -111,8 +114,7 @@ const refusals = (plan: ResolvedExecution) =>
 /** On graphs whose delayed affine rows are ordinary-only, the direct grammar
  * jump commits spans over delayed affine KV. */
 function expectOrdinaryAffineSpans(make: () => RuntimeModel, delayed: KvOptions, immediate: KvOptions) {
-  const bind = (kv: KvOptions) => withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }),
-    () => bindMlxGateway(composedWith(make(), kv), { provider: new NgramProvider(), numDraftTokens: 3 }));
+  const bind = (kv: KvOptions) => bindMlxGateway(jumpGraph(composedWith(make(), kv)), { provider: new NgramProvider(), numDraftTokens: 3 });
   const jump = bind(delayed);
   const scheduling = { continuous: true, quantizedBatch: true, checkpoints: false };
   const kv = { ...shape, hasGrammar: true };
@@ -219,9 +221,8 @@ test("TurboQuant on a dense-read graph decodes as main did: drafts and supplied 
   }
   // Direct grammar jump commits spans over TurboQuant, as main's serial path did,
   // once the gateway has certified the scheme; grammar keeps its checkpoint exclusion.
-  const jumpRuntime = createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" });
   const jumpingWith = (kv: KvOptions) => {
-    const binding = withRuntimeConfig(jumpRuntime, () => bindMlxGateway(composedWith(softcapUniversal(), kv)));
+    const binding = bindMlxGateway(jumpGraph(composedWith(softcapUniversal(), kv)));
     binding.configureContinuation!({ checkpointPersistence: {} } as never);
     return binding;
   };
@@ -245,8 +246,7 @@ test("TurboQuant on a dense-read graph decodes as main did: drafts and supplied 
     .toMatchObject({ mechanism: "continuous", grammarJump: false });
   expect(affineJumping.plan(affineRequest, {}, { ...scheduling, quantizedBatch: false }).mechanism).toBe("unsupported");
   // A configured draft is ignored and the spans still commit, as in main.
-  const draftedJump = withRuntimeConfig(jumpRuntime,
-    () => bindMlxGateway(composedWith(softcapUniversal(), turbo), { provider: new NgramProvider(), numDraftTokens: 3 }));
+  const draftedJump = bindMlxGateway(jumpGraph(composedWith(softcapUniversal(), turbo)), { provider: new NgramProvider(), numDraftTokens: 3 });
   const ignoredJump = draftedJump.plan({ ...request, hasGrammar: true, hasDraft: true }, {}, scheduling);
   expect(ignoredJump).toMatchObject({ method: "autoregressive", mechanism: "continuous", grammarJump: true });
   expect(draftedJump.methodRequest!(ignoredJump, {})!.key).toBe("grammar-forced-span");
@@ -271,15 +271,14 @@ test.each(families)("%s places ordinary grammar exactly like the same request wi
 });
 
 test.each(qualifiedFamilies)("%s qualifies multi-token grammar jump when it is enabled", (_, model) => {
-  const binding = withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }), () => bindMlxGateway(model()));
+  const binding = bindMlxGateway(jumpGraph(model()));
   const plan = place(binding, grammar);
   expect(plan).toMatchObject({ method: "speculative", mechanism: "continuous", grammarJump: true });
   expect(refusals(plan)).toEqual([]);
 });
 
 test("Gemma2 softcap selects committed grammar spans without changing the ordinary lane", () => {
-  const binding = withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }),
-    () => bindMlxGateway(softcapUniversal()));
+  const binding = bindMlxGateway(jumpGraph(softcapUniversal()));
   const plan = place(binding, grammar);
   expect(plan).toMatchObject({ method: "autoregressive", mechanism: "continuous", grammarJump: true,
     checkpoint: false, promptCache: true, fill: false });
@@ -297,8 +296,7 @@ test("Gemma2 softcap selects committed grammar spans without changing the ordina
   // which decodes on read, and over affine KV until a row stops reading plain;
   // an uncertified scheme stays refused.
   for (const kv of [TURBO, AFFINE4]) {
-    const composed = withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }),
-      () => bindMlxGateway(composedWith(softcapUniversal(), kv)));
+    const composed = bindMlxGateway(jumpGraph(composedWith(softcapUniversal(), kv)));
     expect(place(composed, grammar), JSON.stringify(kv)).toMatchObject({ mechanism: "continuous", grammarJump: true });
     expect(composed.plan(grammar, {}, { ...schedule, quantizedBatch: false }), JSON.stringify(kv))
       .toMatchObject({ mechanism: "unsupported", grammarJump: false });
@@ -339,7 +337,7 @@ describe("DiffusionGemma interleaved denoising binding", () => {
   ] as const)("an unsupported denoising shape is refused before execution: %#", (extra, options, reason, kv: KvOptions) => {
     const graph = () => composedWith(diffusion(), kv);
     for (const binding of [bindMlxGateway(graph()), bindMlxGateway(graph(), { provider: new NgramProvider(), numDraftTokens: 3 }),
-      withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }), () => bindMlxGateway(graph()))]) {
+      bindMlxGateway(jumpGraph(graph()))]) {
       const plan = planWith(binding, { ...shape, ...extra }, options as GenerateOptions);
       expect(plan).toMatchObject({ method: "denoising", mechanism: "unsupported", fill: false, grammarJump: false });
       expect(refusals(plan)).toEqual([reason]);
@@ -632,8 +630,7 @@ test.each([["two-model", twoModelDraft, "gemma2-draft"], ["n-gram", () => new Ng
   }
   // Plain softcap requests without a draft keep their placement; grammar proposals stay off this graph.
   expect(binding.plan(shape, {}, scheduling)).toMatchObject({ method: "autoregressive", mechanism: "continuous", checkpoint: true });
-  const jump = withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }),
-    () => bindMlxGateway(softcapUniversal(), { provider: provider(), numDraftTokens: 3 }));
+  const jump = bindMlxGateway(jumpGraph(softcapUniversal()), { provider: provider(), numDraftTokens: 3 });
   expect(jump.plan({ ...shape, hasGrammar: true }, {}, schedule)).toMatchObject({ method: "autoregressive", grammarJump: true });
   expect(jump.plan({ ...shape, hasGrammar: true, hasAdapters: true, hasDraft: true }, {}, schedule))
     .toMatchObject({ method: "autoregressive", mechanism: "continuous", grammarJump: true });

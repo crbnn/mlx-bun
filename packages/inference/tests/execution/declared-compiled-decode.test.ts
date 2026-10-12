@@ -11,6 +11,7 @@ import { createRuntimeConfig } from "../../src/runtime/config";
 import { KVCache } from "../../src/state/kv";
 import type { Cache } from "../../src/contracts/mlx/cache";
 import { stubPhases } from "../models/phase-forward";
+import { testComposition } from "../models/test-composition";
 
 // A graph that is none of the model classes and declares its own compiled step:
 // the scheduler and the autoregressive binding reach it only through that
@@ -48,9 +49,9 @@ function countingStep(model: { append: (caches: Cache[], width: number) => void 
   return { step, calls };
 }
 
-async function decode(model: MlxTokenGraph, options: { compiledDecode?: boolean; env?: Record<string, string> } = {},
+async function decode(model: MlxTokenGraph, options: { compiledDecode?: boolean } = {},
   tokens: number[] = []) {
-  const group = new MlxBatchExecutionGroup(model, { maxBatch: 2, runtime: createRuntimeConfig(options.env ?? {}) });
+  const group = new MlxBatchExecutionGroup(model, { maxBatch: 2, runtime: createRuntimeConfig({}) });
   try {
     await group.submit({ promptIds: [1, 2, 3], maxTokens: 6, eosTokenIds: [], sample: logits => ops.argmaxAxis(logits, -1),
       ...(options.compiledDecode === undefined ? {} : { compiledDecode: options.compiledDecode }),
@@ -80,13 +81,13 @@ test("a lone row decodes through the step its graph declares, and other graphs n
   expect(undeclared.forwards.length).toBeGreaterThan(1);
 });
 
-test("the request, the kill switch and caches the step cannot drive keep decoding on the decode operation", async () => {
-  for (const [name, options, makeCache] of [
-    ["request opt-out", { compiledDecode: false }, undefined],
-    ["kill switch", { env: { MLX_BUN_COMPILED_DECODE: "0" } }, undefined],
-    ["caches without decode slots", {}, unreplayable],
+test("the request, the composition and caches the step cannot drive keep decoding on the decode operation", async () => {
+  for (const [name, options, extra] of [
+    ["request opt-out", { compiledDecode: false }, {}],
+    ["composition off", {}, { composition: testComposition(undefined, { compiledDecode: false }) }],
+    ["caches without decode slots", {}, { makeCache: unreplayable }],
   ] as const) {
-    const fixture = graph({ compiledDecode: true }, makeCache ? { makeCache } : {});
+    const fixture = graph({ compiledDecode: true }, extra);
     const declared = countingStep(fixture);
     expect(await decode({ ...fixture.model, compiledDecodeStep: () => declared.step }, options), name).toEqual(Array(6).fill(0));
     expect(declared.calls.steps, name).toBe(0);

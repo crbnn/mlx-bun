@@ -62,8 +62,8 @@ test("each unsupported key form fails with its location; a comment does not", ()
   const serve = "apps/mlx-bun/src/cli/serve.ts", gateway = "packages/inference/src/execution/gateway-binding.ts";
   expect(() => configInventory(mutate(serve, 'runtimeValue("MLX_BUN_RD_CONTEXT_LIMIT")', "runtimeValue(profileKey)")))
     .toThrow(`${serve}:${lineOf(serve, 'runtimeValue("MLX_BUN_RD_CONTEXT_LIMIT")')}: non-literal runtime key \`runtimeValue(profileKey)\``);
-  expect(() => configInventory(mutate(gateway, 'runtime.flag("MLX_BUN_COMPILED_DECODE", true)', "runtime.flag(`MLX_BUN_${name}`, true)")))
-    .toThrow(`${gateway}:${lineOf(gateway, 'runtime.flag("MLX_BUN_COMPILED_DECODE", true)')}: non-literal runtime key`);
+  expect(() => configInventory(mutate(gateway, 'runtime.flag("MLX_BUN_MEDIA_PREFIX_CACHE", true)', "runtime.flag(`MLX_BUN_${name}`, true)")))
+    .toThrow(`${gateway}:${lineOf(gateway, 'runtime.flag("MLX_BUN_MEDIA_PREFIX_CACHE", true)')}: non-literal runtime key`);
   for (const [text, message] of [["process.env[name]", "computed environment read"], ["Bun.env[name]", "computed environment read"],
     ["process.env.MLX_BUN_NEW", "direct environment read"], ["Bun.env.MLX_BUN_NEW", "direct environment read"], ['process.env["MLX_BUN_LIBMLXC"]', "direct environment read"]])
     expect(() => configInventory(extra(`export const read = (name: string) =>\n  ${text};\n`))).toThrow(`packages/inference/src/extra.ts:2: ${message} \`${text}\``);

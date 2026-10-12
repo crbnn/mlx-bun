@@ -159,8 +159,7 @@ test.skipIf(!inputs)("Gemma4 paged KV: gathered bf16 equals plain KV; direct rea
     };
     const model = modelFor("bf16");
     const layers = (() => { const probe: Cache[] = model.makeCache(); try { return probe.length; } finally { releaseAll(probe.map(c => () => c.dispose())); } })();
-    const runtimeFor = (reader: Reader) => createRuntimeConfig({ MLX_BUN_COMPILED_DECODE: "0",
-      MLX_BUN_PAGED_ATTN: reader === "direct" ? "1" : "0" });
+    const runtimeFor = (reader: Reader) => createRuntimeConfig({ MLX_BUN_PAGED_ATTN: reader === "direct" ? "1" : "0" });
     // Direct dispatch accounting: the direct kernel serves the decode read
     // (`appendDecode`, one query, no mask; a window always gathers), and every
     // such call is checked against the gathered reader over the same query and pages.

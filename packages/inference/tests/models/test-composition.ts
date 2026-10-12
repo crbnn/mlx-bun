@@ -3,14 +3,14 @@
 // Neural Engine bridge (no program compiles); graphs read only the fields their
 // family uses.
 import { deviceArchitecture } from "@mlx-bun/mlx/ffi";
-import type { AffineKernelChoice, Composition, KvStorageScheme } from "../../src/contracts/portable/composition";
+import { COMPOSITION_DEFAULTS, type AffineKernelChoice, type Composition, type KvStorageScheme } from "../../src/contracts/portable/composition";
 import { PREFILL_CHUNK_TOKENS } from "../../src/models/composition";
 import { KvScheme } from "../../src/state/kv-scheme";
 
 export function testComposition(kv: KvStorageScheme = { kind: "bf16" }, fields: Partial<Composition> = {}): Composition {
   return Object.freeze({
     device: deviceArchitecture(), aneBridge: false, kv, draftDepth: 0, prefillChunkTokens: PREFILL_CHUNK_TOKENS,
-    adapters: false, maxRows: 8, speculativeAffineKv: true, packedMixedMlp: true, vectorGreedySampling: true, ...fields,
+    adapters: false, maxRows: 8, ...COMPOSITION_DEFAULTS, ...fields,
   });
 }
 

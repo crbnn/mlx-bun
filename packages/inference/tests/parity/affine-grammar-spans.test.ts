@@ -36,7 +36,7 @@ function spanGrammar(spans: readonly (readonly number[])[]) {
 
 test.skipIf(!target)("real-weight committed spans over delayed affine KV equal direct generation below and across the transition, and beside a peer", async () => {
   const { Weights, loadModelConfig, createModel, generateAutoregressive, resolveComposition } = await import("../../src/index");
-  const { bindMlxGateway, createRuntimeConfig, withRuntimeConfig } = await import("../../src/execution");
+  const { bindMlxGateway } = await import("../../src/execution");
   const { bindMlxAutoregressiveGraph } = await import("../../src/generation/bindings/autoregressive");
   const { resolveKvScheme } = await import("../../src/state/kv-scheme");
   const { observedPhases } = await import("../models/phase-forward");
@@ -57,13 +57,13 @@ test.skipIf(!target)("real-weight committed spans over delayed affine KV equal d
       if (existing) return existing;
       // The scheduler binds to a view whose phases report each forward's cache storage and each head's logits.
       const model = observedPhases(createModel(weights, config, resolveComposition(config,
-        { kv: { override: 4, quantizedKvStart: start, fusedSdpa: true } })), {
+        { kv: { override: 4, quantizedKvStart: start, fusedSdpa: true }, grammarJump: true })), {
         forward(_ids, caches) { kinds.push(caches.map(cache => (cache.composed?.storage() ?? cache).constructor.name)); },
         head(_hidden, logits) {
           lane?.push({ shape: [...logits.shape], dtype: logits.dtypeName, sha256: createHash("sha256").update(logits.rawBytes()).digest("hex") });
         },
       });
-      const graph = { model, binding: withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }), () => bindMlxGateway(model)) };
+      const graph = { model, binding: bindMlxGateway(model) };
       graphs.set(start, graph);
       return graph;
     };
@@ -87,8 +87,7 @@ test.skipIf(!target)("real-weight committed spans over delayed affine KV equal d
       hasLogitsExtras: false, hasGrammar: true, wantsLogprobs: false, hasDraft: false };
     const grouped = (scheme: Scheme) => {
       const { binding } = graphFor(scheme);
-      const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: chunk, kvScheme: scheme,
-        runtime: createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1" }) });
+      const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: chunk, kvScheme: scheme });
       const submit = async (prompt: number[], maxTokens: number, spans: number[][], onToken?: () => void) => {
         const grammar = spanGrammar(spans), tokens: number[] = [], request = options(maxTokens, grammar);
         const execution = binding.plan(shape, request, { continuous: true, quantizedBatch: binding.kvBatchable(scheme), checkpoints: false });

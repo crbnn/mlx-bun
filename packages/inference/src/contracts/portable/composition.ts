@@ -66,4 +66,33 @@ export interface Composition {
    * argmax over the batch instead of one sampler call per row (default on): the
    * same per-row arithmetic in one graph. Off, every row samples alone. */
   readonly vectorGreedySampling: boolean;
+  /** A lone ordinary row decodes through the graph's compiled step where the
+   * graph builds one (default on). The step is bit-identical to the ordinary
+   * decode forward; off, every row decodes through the forward. */
+  readonly compiledDecode: boolean;
+  /** One forward carries a decode group and a prefill group where the graph
+   * declares mixed rows (default off). */
+  readonly mixedPrefill: boolean;
+  /** Prompt tokens one mixed forward carries beside its decode rows (default 256). */
+  readonly mixedTokenBudget: number;
+  /** A prompt's last token prefills alone, as the first one-position step
+   * (mlx-lm's convention, default on); off, the final chunk prefills whole and
+   * token zero samples from it. */
+  readonly prefillTailSplit: boolean;
+  /** Grammar-forced continuations enter the KV without one forward per token
+   * (jump-forward decoding, default off). */
+  readonly grammarJump: boolean;
 }
+
+/** The value of each composition fact a caller leaves unstated: what
+ * `resolveComposition` resolves, and what a graph built without a record runs. */
+export const COMPOSITION_DEFAULTS = Object.freeze({
+  speculativeAffineKv: true,
+  packedMixedMlp: true,
+  vectorGreedySampling: true,
+  compiledDecode: true,
+  mixedPrefill: false,
+  mixedTokenBudget: 256,
+  prefillTailSplit: true,
+  grammarJump: false,
+} satisfies Partial<Composition>);

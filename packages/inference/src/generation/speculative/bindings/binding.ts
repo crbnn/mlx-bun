@@ -14,7 +14,7 @@ import type { GraphDescriptor } from "../../../contracts/portable/graph";
 import { bindLegacyDraftTarget } from "./draft-target";
 import type { MlxForwardWork } from "../../../contracts/mlx/forward-work";
 import type { PrefillPolicy } from "../../../contracts/portable/prefill";
-import type { KvStorageScheme } from "../../../contracts/portable/composition";
+import { COMPOSITION_DEFAULTS, type KvStorageScheme } from "../../../contracts/portable/composition";
 import { resolveMlxPrefillPolicy } from "../../bindings/prefill-policy";
 import { MlxPhaseDispatch, promptWorkStep, verifyWorkStep, type MlxPromptStep, type MlxVerifyWindow } from "../../phase-dispatch";
 
@@ -72,7 +72,7 @@ export function bindSpeculativeTargetModel(model: MlxTokenGraph): MlxSpeculative
     descriptor: Object.freeze({ id: `legacy-spec:${model.config.modelType}`, backend: "mlx",
       graphAbi: "mlx-hidden-bsh-v1", stateAbi: "legacy-cache-array-v1", artifact: "legacy-resident-model" }),
     eosTokenIds: model.config.eosTokenIds,
-    prefillTailSplit: runtime.flag("MLX_BUN_PREFILL_TAIL_SPLIT", true),
+    prefillTailSplit: (model.composition ?? COMPOSITION_DEFAULTS).prefillTailSplit,
     ...(model.composition ? { kv: model.composition.kv } : {}),
     makeCache: model.makeCache.bind(model),
     bindRollback: bindCacheRollback,

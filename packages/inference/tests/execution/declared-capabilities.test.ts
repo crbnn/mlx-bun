@@ -58,7 +58,8 @@ describe("placement follows the graph's declarations", () => {
     expect(bind(replacement({ adapters: { batched: true } })).plan({ ...shape, hasAdapters: true }, {}, schedule).mechanism).toBe("continuous");
     const compiled = bind(replacement({ compiledDecode: true }));
     expect(compiled.plan(shape, {}, schedule).compiledDecode).toBe(true);
-    expect(withRuntimeConfig(createRuntimeConfig({ MLX_BUN_COMPILED_DECODE: "0" }), () => bind(replacement({ compiledDecode: true })))
+    // A composition that turns the compiled step off is planned without it.
+    expect(bind(replacement({ compiledDecode: true }, { composition: testComposition(undefined, { compiledDecode: false }) }))
       .plan(shape, {}, schedule).compiledDecode).toBe(false);
   });
 

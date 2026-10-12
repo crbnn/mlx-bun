@@ -3,7 +3,7 @@
 // callers that supply no record.
 import { deviceArchitecture } from "@mlx-bun/mlx/ffi";
 import type { ModelConfig, TurboQuantScheme } from "../artifacts/config";
-import type { Composition } from "../contracts/portable/composition";
+import { COMPOSITION_DEFAULTS, type Composition } from "../contracts/portable/composition";
 import { runtimeConfig, type RuntimeConfig } from "../runtime/config";
 import { resolveKvScheme, type KvQuantOverride } from "../state/kv-scheme";
 
@@ -49,6 +49,16 @@ export interface CompositionRequest {
   readonly packedMixedMlp?: boolean;
   /** One argmax over a decode step whose live rows are all plain greedy. Default true. */
   readonly vectorGreedySampling?: boolean;
+  /** A lone ordinary row decodes through the graph's compiled step. Default true. */
+  readonly compiledDecode?: boolean;
+  /** One forward carries a decode group and a prefill group. Default false. */
+  readonly mixedPrefill?: boolean;
+  /** Prompt tokens a mixed forward carries beside its decode rows. Default 256. */
+  readonly mixedTokenBudget?: number;
+  /** A prompt's last token prefills alone, as the first one-position step. Default true. */
+  readonly prefillTailSplit?: boolean;
+  /** Grammar-forced continuations enter the KV without one forward per token. Default false. */
+  readonly grammarJump?: boolean;
   /** Compose the Neural Engine bridge where a graph builds a Neural Engine
    * operation. Default true: every Apple-silicon Mac has the unit. */
   readonly aneBridge?: boolean;
@@ -63,6 +73,9 @@ export function resolveComposition(config: ModelConfig, request: CompositionRequ
   const draft = request.draft;
   if (draft && (!Number.isSafeInteger(draft.numDraftTokens) || draft.numDraftTokens < 1))
     throw new Error("composition draft tokens must be a positive integer");
+  const mixedTokenBudget = request.mixedTokenBudget ?? COMPOSITION_DEFAULTS.mixedTokenBudget;
+  if (!Number.isSafeInteger(mixedTokenBudget) || mixedTokenBudget < 1)
+    throw new Error("composition mixedTokenBudget must be a positive integer");
   const runtime = runtimeConfig();
   return Object.freeze({
     device: deviceArchitecture(),
@@ -72,8 +85,13 @@ export function resolveComposition(config: ModelConfig, request: CompositionRequ
     prefillChunkTokens: resolveChunkTokens(runtime),
     adapters: request.adapters ?? false,
     maxRows,
-    speculativeAffineKv: request.speculativeAffineKv ?? true,
-    packedMixedMlp: request.packedMixedMlp ?? true,
-    vectorGreedySampling: request.vectorGreedySampling ?? true,
+    speculativeAffineKv: request.speculativeAffineKv ?? COMPOSITION_DEFAULTS.speculativeAffineKv,
+    packedMixedMlp: request.packedMixedMlp ?? COMPOSITION_DEFAULTS.packedMixedMlp,
+    vectorGreedySampling: request.vectorGreedySampling ?? COMPOSITION_DEFAULTS.vectorGreedySampling,
+    compiledDecode: request.compiledDecode ?? COMPOSITION_DEFAULTS.compiledDecode,
+    mixedPrefill: request.mixedPrefill ?? COMPOSITION_DEFAULTS.mixedPrefill,
+    mixedTokenBudget,
+    prefillTailSplit: request.prefillTailSplit ?? COMPOSITION_DEFAULTS.prefillTailSplit,
+    grammarJump: request.grammarJump ?? COMPOSITION_DEFAULTS.grammarJump,
   });
 }

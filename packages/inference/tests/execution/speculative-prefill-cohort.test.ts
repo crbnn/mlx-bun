@@ -60,7 +60,7 @@ function fixture(provider: Pick<DraftProvider, "id" | "grouped"> & { dispose(): 
     ...graph,
   } as unknown as RuntimeModel & { forwardHidden(ids: MlxArray, caches: Cache[]): MlxArray };
   const cache = new PromptCache(1024 ** 2);
-  const host: MlxGroupMethodHost = { rows: joined, runtime: runtimeConfig(), prefillChunkSize: 3,
+  const host: MlxGroupMethodHost = { rows: joined, runtime: runtimeConfig(), prefillChunkSize: 3, prefillTailSplit: true,
     kvMaintenance: scheme.kind === "bf16" ? undefined : createKvMaintenance(scheme),
     promptCache: { take: cache.take.bind(cache), put(tokens, caches, namespace, retain, attachments) {
       snapshots.push({ tokens: [...tokens], history: attachments![0]!.tensors[0]!.toIntTokens(), offset: caches[0]!.offset });

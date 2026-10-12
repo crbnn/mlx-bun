@@ -7,7 +7,7 @@ import { runtimeConfig, type RuntimeConfig } from "../../runtime/config";
 import type { MlxTokenGraph } from "../../models/graph";
 import type { PrefillPolicy } from "../../contracts/portable/prefill";
 import { resolveMlxPrefillPolicy } from "./prefill-policy";
-import type { KvStorageScheme } from "../../contracts/portable/composition";
+import { COMPOSITION_DEFAULTS, type KvStorageScheme } from "../../contracts/portable/composition";
 import { isCompiledDecodeCache, isRowBatchCache } from "../../state/capabilities";
 import { MlxPhaseDispatch } from "../phase-dispatch";
 
@@ -52,6 +52,10 @@ export interface MlxAutoregressiveBinding {
   readonly adapters?: { active: string[] };
   /** The composition's KV scheme, which `makeCache` composes; absent: bf16. */
   readonly kv?: KvStorageScheme;
+  /** The composition's `prefillTailSplit`; absent: the default. */
+  readonly prefillTailSplit?: boolean;
+  /** The composition's `grammarJump`; absent: the default. */
+  readonly grammarJump?: boolean;
   /** The graph's committed known-token spans, when it declares them. */
   readonly knownSpans?: MlxKnownSpans;
   makeCache(): Cache[];
@@ -73,7 +77,8 @@ export interface MlxAutoregressiveBinding {
  * model the graph is. */
 export function bindMlxAutoregressiveGraph(model: MlxTokenGraph): MlxAutoregressiveBinding {
   const runtime = runtimeConfig();
-  const compiledOn = runtime.flag("MLX_BUN_COMPILED_DECODE", true);
+  const facts = model.composition ?? COMPOSITION_DEFAULTS;
+  const compiledOn = facts.compiledDecode;
   return {
     runtime,
     prefillPolicy: resolveMlxPrefillPolicy(model, runtime),
@@ -84,6 +89,7 @@ export function bindMlxAutoregressiveGraph(model: MlxTokenGraph): MlxAutoregress
     memory: model,
     adapters: model.loraState,
     ...(model.composition ? { kv: model.composition.kv } : {}),
+    prefillTailSplit: facts.prefillTailSplit, grammarJump: facts.grammarJump,
     ...(model.knownSpans ? { knownSpans: model.knownSpans } : {}),
     makeCache: model.makeCache.bind(model),
     prefillEmbeddings: model.prefillEmbeddings?.bind(model),

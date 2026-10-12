@@ -65,6 +65,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { type Cache } from "../contracts/mlx/cache";
 import type { PrefillPolicy } from "../contracts/portable/prefill";
 import { widthClass, type MlxCompiledDecodeStep, type MlxMixedForward } from "../contracts/mlx/graph";
+import { COMPOSITION_DEFAULTS } from "../contracts/portable/composition";
 import { resolveMlxPrefillPolicy } from "../generation/bindings/prefill-policy";
 import { acquireModelWiredLimit } from "../generation/index";
 import { compiledDecodeStepOf, tokenPhasesOf } from "../models/capabilities";
@@ -80,9 +81,6 @@ import { cloneSingleRowState } from "../state/views";
 import { CancellationSource,GenerationCancelled } from "./cancellation";
 import { batchRowKvBytes } from "./kv-budget";
 import { ExecutionTasks } from "./tasks";
-
-/** Decode-pipeline kill switch (read once at load, like the serial loop's
- *  MLX_BUN_COMPILED_DECODE): 1 ⇒ read each step's tokens synchronously. */
 
 /** Per-step phase timing (MLX_BUN_BATCH_STEP_TRACE=1, debug-only): where a
  *  decode step's wall time goes — graph BUILD+dispatch (host), the pipelined
@@ -102,6 +100,8 @@ let nextMixedWorkId = 0;
 export class MlxBatchExecutionGroup {
   readonly #tasks = new ExecutionTasks();
   readonly #runtime: RuntimeConfig;
+  /** Decode-pipeline kill switch (MLX_BUN_BATCH_NO_PIPELINE=1, read once at
+   *  construction): read each step's tokens synchronously. */
   readonly #noPipeline: boolean;
   readonly #stepTrace: boolean;
   readonly #stateCodecs: import("../state/persistence-types").CacheCodecProvider | undefined;
@@ -157,7 +157,7 @@ export class MlxBatchExecutionGroup {
   readonly #kvScheme: KvScheme | undefined;
   readonly #maintainKv: KvMaintenance | null;
   /** The graph's compiled decode step, composed at bind when the graph declares
-   *  one, its caches can be driven by it and MLX_BUN_COMPILED_DECODE leaves it on.
+   *  one, its caches can be driven by it and the composition's `compiledDecode` is on.
    *  It runs a lone row whose caches are the graph's own (`#compiledRow`), never
    *  falling back to the ordinary forward: a failed step fails the batch. */
   readonly #compiled: MlxCompiledDecodeStep | null;
@@ -169,12 +169,15 @@ export class MlxBatchExecutionGroup {
   readonly #dispatch: MlxPhaseDispatch;
   /** The composition's vectorized greedy sampling: one argmax over the batch when every live row is plain greedy. */
   readonly #vectorGreedy: boolean;
-  /** The mixed iteration (MLX_BUN_MIXED_PREFILL, default off): the composition's mixed-rows forward when it
-   *  declares one and the flag is on, bound once; null otherwise. */
+  /** The mixed iteration: the graph's mixed-rows forward when it declares one and the composition's
+   *  `mixedPrefill` is on (default off), bound once; null otherwise. */
   readonly #mixed: MlxMixedForward | null;
+  /** The composition's `mixedTokenBudget`: prompt tokens one mixed forward carries. */
   readonly #mixedTokenBudget: number;
 
   constructor(private readonly model: MlxTokenGraph, opts: MlxBatchExecutionGroupOptions) {
+    // The composition facts this group runs, read once: the graph's record, else the defaults.
+    const facts = model.composition ?? COMPOSITION_DEFAULTS;
     this.#runtime = opts.runtime ?? runtimeConfig();
     this.#noPipeline = this.#runtime.value("MLX_BUN_BATCH_NO_PIPELINE") === "1";
     this.#stepTrace = this.#runtime.value("MLX_BUN_BATCH_STEP_TRACE") === "1";
@@ -187,7 +190,7 @@ export class MlxBatchExecutionGroup {
     this.#prefillPolicy = resolveMlxPrefillPolicy(model, this.#runtime, opts.prefillChunkSize);
     this.#prefillChunkSize = this.#prefillPolicy.chunkSize(0);
     this.#prefillBatchTokenLimit = opts.prefillBatchTokenLimit ?? 2048;
-    this.#prefillTailSplit = this.#runtime.flag("MLX_BUN_PREFILL_TAIL_SPLIT", true);
+    this.#prefillTailSplit = facts.prefillTailSplit;
     this.#kvBudgetBytes = opts.kvBudgetBytes;
     this.#defaultPromptCache = opts.promptCache;
     this.#kvScheme = opts.kvScheme;
@@ -219,13 +222,13 @@ export class MlxBatchExecutionGroup {
       : null;
     const replayable = proto.every(cache => isCompiledDecodeCache(cache) && !isRowBatchCache(cache));
     for (const c of proto) c.dispose();
-    this.#compiled = replayable && this.#runtime.flag("MLX_BUN_COMPILED_DECODE", true)
+    this.#compiled = replayable && facts.compiledDecode
       ? withRuntimeConfig(this.#runtime, () => compiledDecodeStepOf(model))
       : null;
     this.#dispatch = new MlxPhaseDispatch(tokenPhasesOf(model));
-    this.#vectorGreedy = model.composition?.vectorGreedySampling ?? true;
-    this.#mixed = this.#runtime.flag("MLX_BUN_MIXED_PREFILL", false) && model.mixed ? model.mixed : null;
-    this.#mixedTokenBudget = this.#runtime.number("MLX_BUN_MIXED_TOKEN_BUDGET", 256);
+    this.#vectorGreedy = facts.vectorGreedySampling;
+    this.#mixed = facts.mixedPrefill && model.mixed ? model.mixed : null;
+    this.#mixedTokenBudget = facts.mixedTokenBudget;
   }
 
   get activeRows(): number {
@@ -485,7 +488,8 @@ export class MlxBatchExecutionGroup {
           const executor = this;
           this.#method = row.req.method.open({
             get rows() { return executor.#running; }, runtime: this.#runtime,
-            prefillChunkSize: this.#prefillChunkSize, promptCache: this.#promptCache, kvMaintenance: this.#maintainKv ?? undefined,
+            prefillChunkSize: this.#prefillChunkSize, prefillTailSplit: this.#prefillTailSplit,
+            promptCache: this.#promptCache, kvMaintenance: this.#maintainKv ?? undefined,
             join: row => { this.#running.push(row); },
             filterRows: keep => this.#applyFilter(keep),
             publish: async (row, token, logprobs) => {
@@ -676,7 +680,7 @@ export class MlxBatchExecutionGroup {
     }
     // The composed caches converted inside their own appends (oracle
     // composition: prefill ids[:-1] → convert → L=1 step-0 under the default
-    // tail split; under MLX_BUN_PREFILL_TAIL_SPLIT=0, token 0 sampled from the
+    // tail split; with the composition's prefillTailSplit off, token 0 sampled from the
     // final chunk's bf16 read, then the conversion, before decode step 1).
     await this.#mergeJoiner(p);
     return;
@@ -903,7 +907,7 @@ export class MlxBatchExecutionGroup {
     const prevReal = this.#pendingReal;
     this.#pendingToks = nextToks;
     this.#pendingReal = nextReal;
-    // Kill switch / A-B lever (house style, cf. MLX_BUN_COMPILED_DECODE=0):
+    // Kill switch / A-B lever (house style):
     // MLX_BUN_BATCH_NO_PIPELINE=1 reads THIS step's tokens synchronously —
     // set from process start `prev` is always null, so the flush below IS the
     // whole phase 2. Same math either way (pipelining is scheduling).

@@ -56,7 +56,7 @@ class GrammarGroup implements MlxGroupedMethod {
     this.#requests.set(row, { sampling, caches: [], pending: null });
     const target = new MlxPrefillCohort({
       model: this.model, chunkSize: this.host.prefillChunkSize,
-      tailSplit: this.host.runtime.flag("MLX_BUN_PREFILL_TAIL_SPLIT", true),
+      tailSplit: this.host.prefillTailSplit,
       promptCache: this.host.promptCache, maintain: this.host.kvMaintenance, denseKvReads: this.denseKvReads,
       forward: async (ids, caches, step) => this.#dispatch.prompt(step.phase, step.sequences, step.tokens)(ids, caches, null),
       project: (hidden, _caches, _completed, step) => {

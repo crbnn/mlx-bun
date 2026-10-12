@@ -11,7 +11,7 @@ import { composeAtLayer, composedStorageOf, isPlainKvCache, isRecurrentCache, is
 import { bindRequiredDenseKvLayers } from "../state/dense-kv-reads";
 import { ownedCacheLayoutFactory } from "../state/layout";
 import { createKvMaintenance } from "../state/kv-maintenance";
-import { BF16_KV, type KvStorageScheme } from "../contracts/portable/composition";
+import { BF16_KV, COMPOSITION_DEFAULTS, type KvStorageScheme } from "../contracts/portable/composition";
 import type { Cache } from "../contracts/mlx/cache";
 import { runtimeConfig, type RuntimeConfig } from "../runtime/config";
 import { disposeResources } from "../runtime/resources";
@@ -102,6 +102,8 @@ function certifiesDenseKvReads(model: MlxTokenGraph, scheme: KvScheme): boolean 
 export function bindMlxGateway(model: MlxTokenGraph,
   draft?: { provider: DraftProvider; numDraftTokens: number; adaptiveDepth?: boolean }): MlxGatewayBinding {
   const kv: KvStorageScheme = model.composition?.kv ?? BF16_KV;
+  // The composition facts this binding plans with: the graph's record, else the defaults.
+  const facts = model.composition ?? COMPOSITION_DEFAULTS;
   const runtime = runtimeConfig();
   let continuationServices: ContinuationServices | undefined;
   // The declarations are resolved once, when the graph is bound; planning reads
@@ -167,7 +169,7 @@ export function bindMlxGateway(model: MlxTokenGraph,
   const grammarSpans = (denseReads || ordinaryAffineRows) && storage
     ? bindGrammarGroupRequests(model, storage.requiredDenseKvLayers, storage.convertible.length) : undefined;
   const grammarProvider = caps.method === "autoregressive" && verification.grammarProposals &&
-    runtime.flag("MLX_BUN_GRAMMAR_JUMP", false) && cachesBatchable() && supportsTargetRows()
+    facts.grammarJump && cachesBatchable() && supportsTargetRows()
     ? constraintDraftProvider() : undefined;
   const grammarProposals = grammarProvider ? bindSpeculativeGroupRequests(model, grammarProvider,
     Math.max(1, Math.trunc(runtime.number("MLX_BUN_GRAMMAR_DRAFT_TOKENS", 3)))) : undefined;
@@ -289,8 +291,7 @@ export function bindMlxGateway(model: MlxTokenGraph,
         ),
       }, {
         pagedKv: !!options.pagedKv, fill: !!options.fill,
-        compiledDecode: runtime.flag("MLX_BUN_COMPILED_DECODE", true),
-        grammarJump: runtime.flag("MLX_BUN_GRAMMAR_JUMP", false),
+        compiledDecode: facts.compiledDecode, grammarJump: facts.grammarJump,
       });
     },
     cachesBatchable,

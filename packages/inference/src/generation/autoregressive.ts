@@ -38,7 +38,7 @@ readStepExtras,
 stepExtrasArrays,
 type StepExtras
 } from "../sampling/index";
-import { BF16_KV, type KvStorageScheme } from "../contracts/portable/composition";
+import { BF16_KV, COMPOSITION_DEFAULTS, type KvStorageScheme } from "../contracts/portable/composition";
 import { maybePageKv } from "../state/request-policy";
 import { isRotatingPlainCache } from "../state/capabilities";
 import {
@@ -51,12 +51,14 @@ type Proposal
 import { Generation } from "./result";
 import { GenerateDiagnostics,GenerateOptions,GenerateStats,GeneratedToken } from "./types";
 
+/** Jump-forward decoding for this request under a composition whose
+ * `grammarJump` is `composed`: grammar requests that return no logprobs. */
 export function shouldUseGrammarJump(
   options: Pick<GenerateOptions, "grammar" | "logprobs" | "topLogprobs">,
-  runtime: RuntimeConfig = runtimeConfig(),
+  composed: boolean = COMPOSITION_DEFAULTS.grammarJump,
 ): boolean {
   return options.grammar !== undefined &&
-    runtime.flag("MLX_BUN_GRAMMAR_JUMP", false) &&
+    composed &&
     !options.logprobs &&
     !(options.topLogprobs && options.topLogprobs > 0);
 }
@@ -508,7 +510,7 @@ async function* generateInner(
       const snapshotAt = options.onPrefillDone && options.snapshotAt !== undefined
         ? Math.min(Math.max(options.snapshotAt, cachedTokens), promptTokens.length)
         : undefined;
-      const tailSplit = runtime.flag("MLX_BUN_PREFILL_TAIL_SPLIT", true);
+      const tailSplit = binding.prefillTailSplit ?? COMPOSITION_DEFAULTS.prefillTailSplit;
 
       while (true) {
         options.signal?.throwIfAborted();
@@ -570,14 +572,14 @@ async function* generateInner(
      *  the yield, avoiding a second readback). -1 when grammar is off — the
      *  pipelined path keeps its deferred itemUint32 below. */
     let grammarTok = -1;
-    // Jump-forward decoding (opt-in, MLX_BUN_GRAMMAR_JUMP=1; serial lane
+    // Jump-forward decoding (opt-in, the composition's grammarJump; serial lane
     // only — the batch lane's #stepGrammar doesn't jump yet): when the
     // grammar forces a unique continuation, emit its retokenized ids without
     // per-token forwards — ONE multi-token forward carries them into the KV
     // (see GrammarController.jumpForward for the contract + the fidelity
     // note on why this is opt-in). Excluded when logprobs are requested
     // (jumped tokens are never sampled, so they'd have no logprobs rows).
-    const grammarJump = options.decodePolicy?.grammarJump ?? shouldUseGrammarJump(options, runtime);
+    const grammarJump = options.decodePolicy?.grammarJump ?? shouldUseGrammarJump(options, binding.grammarJump);
     // Yield token zero before its own decode forward. The captured runtime
     // keeps this scheduling choice stable across consumer awaits.
     const earlyFirstToken = runtime.flag("MLX_BUN_EARLY_FIRST_TOKEN", true) &&

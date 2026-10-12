@@ -40,7 +40,8 @@ describe("a graph table", () => {
   const entry = (id: string, serves: ServedComposition): GraphEntry<null, string> => ({ id, serves, create: () => id });
   const composition = (fields: Partial<Composition> = {}): Composition => ({ device: M4_PRO, aneBridge: true, kv: { kind: "bf16" },
     draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 8, speculativeAffineKv: true, packedMixedMlp: true,
-    vectorGreedySampling: true, ...fields });
+    vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
+    grammarJump: false, ...fields });
 
   test("the most constrained entry the composition meets wins; the generic entry serves the rest", () => {
     const table = new GraphTable([

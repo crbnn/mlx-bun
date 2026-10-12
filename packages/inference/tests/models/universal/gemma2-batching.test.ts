@@ -191,7 +191,7 @@ test.skipIf(!native)("a fill group's last row leaving with a pipelined token dra
     hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
   // One scheduler for every request: a poisoned drain would surface on reuse.
   const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: 64,
-    runtime: createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1", MLX_BUN_COMPILED_DECODE: "0" }) });
+    runtime: createRuntimeConfig({}) });
   const prompt = [2, 4, 7, 9, 3];
   // A consumer stop or a cancellation ends the last row in an ordinary step
   // whose next token is already pipelined: the group filters to no rows while
@@ -665,7 +665,7 @@ test.skipIf(!native || !artifact)("cached Gemma2 preserves B1 and serves ragged 
       } finally { dispose(caches); }
     };
     const baseline = prompts.map(direct);
-    const runtime = createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1", MLX_BUN_COMPILED_DECODE: "0" });
+    const runtime = createRuntimeConfig({});
     for (const capacity of [1, 2, 4]) {
       let held = true, joined = false, highWater = 0;
       const group = binding.createBatchGroup({ maxBatch: capacity, admissionHeld: () => held,
@@ -885,7 +885,7 @@ test.skipIf(!native || !artifact)("cached Gemma2 plain fill matches main's seria
     });
 
     const binding = bindMlxGateway(model);
-    const runtime = createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1", MLX_BUN_COMPILED_DECODE: "0" });
+    const runtime = createRuntimeConfig({});
     const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
       hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
     const logitsFromHidden = model.logitsFromHidden;
@@ -977,7 +977,7 @@ test.skipIf(!native || !artifact)("cached Gemma2 two-model speculation keeps B1 
     const options = { maxTokens: 32, temperature: 0 };
     const plan = binding.plan(shape, options, { continuous: binding.cachesBatchable(), quantizedBatch: false, checkpoints: false });
     expect(plan).toMatchObject({ method: "speculative", mechanism: "continuous" });
-    const runtime = createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1", MLX_BUN_COMPILED_DECODE: "0" });
+    const runtime = createRuntimeConfig({});
     const group = binding.createBatchGroup({ maxBatch: 4, prefillChunkSize: 512, runtime });
     const submit = (index: number, hooks: { signal?: AbortSignal; onToken?: (tokens: number[]) => void } = {}) => {
       const tokens: number[] = [];
@@ -1132,7 +1132,7 @@ test.skipIf(!native || !artifact)("cached Gemma2 n-gram speculation mixes empty 
     // served n-gram default.
     const lookup = bindMlxGateway(view, { provider: recorded(), numDraftTokens: 10 });
     const strict = bindMlxGateway(view, { provider: recorded({ max: 4, min: 4 }), numDraftTokens: 10 });
-    const runtime = createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1", MLX_BUN_COMPILED_DECODE: "0" });
+    const runtime = createRuntimeConfig({});
     const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
       hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true };
     const greedy: GenerateOptions = { maxTokens: 32, temperature: 0 };
@@ -1337,7 +1337,7 @@ test.skipIf(!native || !artifact)("a structurally equivalent delegating provider
         grouped: { checkpointNamespace: () => grouped.checkpointNamespace!(), supportsTargetAdapters: grouped.supportsTargetAdapters,
           open: options => grouped.open(options), openPrefill: options => grouped.openPrefill(options) } };
     };
-    const runtime = createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1", MLX_BUN_COMPILED_DECODE: "0" });
+    const runtime = createRuntimeConfig({});
     const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
       hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true };
     const options = { maxTokens: 24, temperature: 0 };
@@ -1426,12 +1426,13 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
   const setupWith = async <M extends SpanGraph & import("../../../src/models/factory").RuntimeModel>(
     build: (composition: Composition) => { model: M; dispose(): void } | Promise<{ model: M; dispose(): void }>,
     start: number | null, options: SetupOptions = {}) => {
-    const { bindMlxGateway, createRuntimeConfig, createRowSampling, withRuntimeConfig, MlxBatchExecutionGroup } = await import("../../../src/execution");
+    const { bindMlxGateway, createRuntimeConfig, createRowSampling, MlxBatchExecutionGroup } = await import("../../../src/execution");
     const { makeStepSampler } = await import("../../../src/sampling");
     const kvScheme = options.kvScheme ?? (start === null ? undefined : options.turbo
       ? resolveKvScheme({ turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: start })
       : resolveKvScheme({ override: 4, quantizedKvStart: start }));
-    const f = await build(testComposition(kvScheme?.storage)), model = f.model;
+    const f = await build(testComposition(kvScheme?.storage,
+      { prefillTailSplit: options.tailSplit !== false, grammarJump: options.grammarJump === true })), model = f.model;
     // The scheduler binds to a view of the graph whose phases call the hooks a test adds (`forwardHooks`
     // before each forward, `headHooks` after each head projection); methods bind on first submission.
     const forwardHooks: ((ids: MlxArray, caches: Cache[]) => void)[] = [], headHooks: ((logits: MlxArray) => void)[] = [];
@@ -1439,15 +1440,12 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
       forward(ids, caches) { for (const hook of forwardHooks) hook(ids, caches); },
       head(_hidden, logits) { for (const hook of headHooks) hook(logits); },
     });
-    const binding = options.grammarJump
-      ? withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }), () => bindMlxGateway(view))
-      : bindMlxGateway(view);
+    const binding = bindMlxGateway(view);
     let held = false;
     const groupOptions = { maxBatch: 2, prefillChunkSize: options.chunk ?? 64, admissionHeld: () => held,
       ...(options.promptCache ? { promptCache: options.promptCache } : {}),
       // Compiled decode stays at its default: these graphs bind none (below).
-      runtime: createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: options.tailSplit === false ? "0" : "1",
-        ...(options.pipeline === false ? { MLX_BUN_BATCH_NO_PIPELINE: "1" } : {}) }),
+      runtime: createRuntimeConfig(options.pipeline === false ? { MLX_BUN_BATCH_NO_PIPELINE: "1" } : {}),
       ...(kvScheme ? { kvScheme } : {}) };
     // Composed directly, the group binds the graph's own declaration; only
     // the delayed-affine capability is the composer's to state.
@@ -1708,8 +1706,8 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
       const plan = env.binding.plan(shape, { maxTokens: 4 },
         { continuous: true, quantizedBatch: env.binding.kvBatchable(env.kvScheme!), checkpoints: false });
       expect(plan).toMatchObject({ method: "autoregressive", mechanism: "continuous", fill: false, compiledDecode: false });
-      // Requested (the flag is on) and refused by the capability, not disabled.
-      expect(env.binding.runtime.flag("MLX_BUN_COMPILED_DECODE", true)).toBe(true);
+      // Requested (the composition turns it on) and refused by the capability, not disabled.
+      expect(env.model.composition.compiledDecode).toBe(true);
       expect(plan.reasons).toContain("compiled-decode-unavailable-for-request");
     } finally { try { await env.close(); } finally { await turboEnv.close(); } }
   });
@@ -1850,7 +1848,7 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
         checkpointPersistence: persistence, identity: "plain-kv", cloneState: cloneKvCaches, adapterNamespace: () => "" });
       let held = true;
       const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: 64, ...(kv ? { kvScheme: kv } : {}), admissionHeld: () => held,
-        runtime: createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1" }) });
+        runtime: createRuntimeConfig({}) });
       const options = { maxTokens: 8, temperature: 0 };
       const execution = binding.plan(shape, options,
         { continuous: true, quantizedBatch: !!kv && binding.kvBatchable(kv), checkpoints: true });
@@ -2032,7 +2030,7 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
           checkpointPersistence: persistence, identity: "turbo", cloneState: cloneKvCaches, adapterNamespace: () => "" });
         let held = true;
         const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: 64, kvScheme: scheme, admissionHeld: () => held,
-          runtime: createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1" }) });
+          runtime: createRuntimeConfig({}) });
         const options = { maxTokens: 8, temperature: 0 };
         const execution = binding.plan(shape, options,
           { continuous: true, quantizedBatch: binding.kvBatchable(scheme), checkpoints: true });
@@ -2377,7 +2375,7 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
       const kvScheme = affine(11), env = await setup(null, { kvScheme });
       // Composed without the gateway: the method refuses by its own copy of the layers.
       const group = new MlxBatchExecutionGroup(env.model, { maxBatch: 2, prefillChunkSize: 64,
-        runtime: createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1" }), kvScheme, kvBatchCapabilities: { delayedAffine: true } });
+        runtime: createRuntimeConfig({}), kvScheme, kvBatchCapabilities: { delayedAffine: true } });
       const layers = [...LAYERS], bound = bindGrammarGroupRequests(env.model, layers, LAYERS.length);
       layers.length = 0;   // a later edit to the caller's list cannot reach the binding
       try {
@@ -2525,11 +2523,11 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
      * with `scheme`; its attention reads encoded KV. */
     const miniCpm = async (scheme: ReturnType<typeof resolveKvScheme>) => {
       const { MiniCPM5Model } = await import("../../../src/models/minicpm5/model");
-      return quantizedGraph(MiniCPM5Model, "minicpm5", { composition: testComposition(scheme.storage) });
+      return quantizedGraph(MiniCPM5Model, "minicpm5", { composition: testComposition(scheme.storage, { grammarJump: true }) });
     };
 
     test("a MiniCPM5 graph: spans before and after conversion equal the direct B1 jump in tokens, histories and every projection", async () => {
-      const { bindMlxGateway, createRuntimeConfig, withRuntimeConfig } = await import("../../../src/execution");
+      const { bindMlxGateway, createRuntimeConfig } = await import("../../../src/execution");
       const plainMini = ["KVCache", "KVCache"], convertedMini = ["QuantizedKVCache", "QuantizedKVCache"];
       const kvScheme = affine(7);
       const referenceGraph = await miniCpm(kvScheme), graph = await miniCpm(kvScheme);
@@ -2543,9 +2541,9 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
       expect(reference.tokens[4]).toBe(13);
       expect(reference.kinds).toEqual(convertedMini);
       const { view, forwardHooks } = hooked(graph.model);
-      const binding = withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }), () => bindMlxGateway(view));
+      const binding = bindMlxGateway(view);
       const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: 64,
-        runtime: createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1" }), kvScheme });
+        runtime: createRuntimeConfig({}), kvScheme });
       const env: SpanEnv = { binding, model: graph.model, view, kvScheme, group, forwardHooks };
       const forwards = observe(env);
       try {
@@ -2565,12 +2563,12 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
     /** The gateway's span method over a fresh MiniCPM5 graph; the environment owns the graph. */
     const miniCpmEnv = async (kvScheme: ReturnType<typeof resolveKvScheme>,
       promptCache?: import("../../../src/execution/batch-types").RowPromptCache) => {
-      const { bindMlxGateway, createRuntimeConfig, withRuntimeConfig } = await import("../../../src/execution");
+      const { bindMlxGateway, createRuntimeConfig } = await import("../../../src/execution");
       const graph = await miniCpm(kvScheme);
       const { view, forwardHooks } = hooked(graph.model);
-      const binding = withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }), () => bindMlxGateway(view));
+      const binding = bindMlxGateway(view);
       const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: 64, ...(promptCache ? { promptCache } : {}),
-        runtime: createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1" }), kvScheme });
+        runtime: createRuntimeConfig({}), kvScheme });
       return { binding, model: graph.model, view, kvScheme, group, forwardHooks, async close() {
         try { await group.close(); expect(group.activeRows + group.pendingRows).toBe(0); } finally { graph.dispose(); }
       } };

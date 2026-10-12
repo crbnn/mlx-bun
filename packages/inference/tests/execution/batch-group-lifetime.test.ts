@@ -17,6 +17,7 @@ import { declareGraph } from "../../src/models/capabilities";
 import type { Cache } from "../../src/contracts/mlx/cache";
 import type { MlxMixedForward } from "../../src/contracts/mlx/graph";
 import { stubPhases } from "../models/phase-forward";
+import { testComposition } from "../models/test-composition";
 
 /** The fixture graph: its one forward and head, which tests replace, and the mixed forward a test may declare. */
 type StandIn = RuntimeModel & { forward(ids: MlxArray, caches: Cache[]): MlxArray; logitsFromHidden(hidden: MlxArray): MlxArray;
@@ -451,8 +452,9 @@ test.each(["finish", "cancel", "consumer", "grammar"])("mixed work preserves row
     shapes.push(groups.map(group => [...group.ids.shape]));
     return groups.map(group => forward(group.ids, group.state));
   };
-  const group = new MlxBatchExecutionGroup(f.model, { maxBatch: 4, prefillChunkSize: 32,
-    runtime: createRuntimeConfig({ MLX_BUN_MIXED_PREFILL: "1", MLX_BUN_MIXED_TOKEN_BUDGET: "9" }) });
+  // Its composition turns the mixed iteration on, nine prompt tokens beside the decode rows.
+  (f.model as { composition?: unknown }).composition = testComposition(undefined, { mixedPrefill: true, mixedTokenBudget: 9 });
+  const group = new MlxBatchExecutionGroup(f.model, { maxBatch: 4, prefillChunkSize: 32 });
   const request = (index: number): BatchRequest => ({
     promptIds: Array.from({ length: index ? 31 + index : 5 }, (_, t) => t + index * 100),
     maxTokens: index ? 3 : 12, eosTokenIds: [], sample: logits => ops.argmaxAxis(logits, -1),

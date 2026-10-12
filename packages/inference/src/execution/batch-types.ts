@@ -41,6 +41,8 @@ export interface MlxGroupMethodHost {
   readonly rows: readonly Row[];
   readonly runtime: RuntimeConfig;
   readonly prefillChunkSize: number;
+  /** The composition's `prefillTailSplit`: a prompt's last token prefills alone. */
+  readonly prefillTailSplit: boolean;
   readonly promptCache: RowPromptCache | undefined;
   /** The row-layout maintenance of the composition's KV scheme (where a row's
    * composed caches join row layouts); absent under bf16. */
