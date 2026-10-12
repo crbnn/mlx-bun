@@ -48,7 +48,8 @@ export type MlxPrefillForward = MlxPromptStep;
  * completion. This driver owns common target batching and work boundaries.
  * Checkpoint factories return owned cache state; close/dispose are idempotent. */
 export interface MlxPrefillRowsHost<State extends MlxPrefillState> {
-  stateCodecs?: CacheCodecProvider;
+  /** The snapshot form of the composition's caches (the cache service's), for a single row's boundary snapshot. */
+  codecs?: CacheCodecProvider;
   maintain?: KvMaintenance;
   open(row: Row): State;
   plan(state: State): MlxPrefillStep;
@@ -236,7 +237,7 @@ export class MlxPrefillRows<State extends MlxPrefillState> implements MlxGroupPr
           if (state.planned!.snapshot) {
             using span = traceRows([state], "prefill.checkpoint", { ...work, row });
             this.operations.checkpoint(state, () =>
-              this.#stateRows ? this.#stateRows.extractRow(row) : cloneKvCaches(state.solo, this.operations.stateCodecs), row);
+              this.#stateRows ? this.#stateRows.extractRow(row) : cloneKvCaches(state.solo, this.operations.codecs), row);
           }
           if (!finals.includes(row)) state.planned = undefined;
         }

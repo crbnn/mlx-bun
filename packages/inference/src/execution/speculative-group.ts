@@ -153,8 +153,8 @@ class SpeculativeGroup implements MlxGroupedMethod {
       let caches: Cache[] = [], attachments: CheckpointAttachment[] = [];
       try {
         caches = snapshot(); attachments.push(prefix!.capture(index).attachment);
-        method.host.promptCache!.put(state.row.req.promptIds.slice(0, state.pos), caches,
-          state.request.namespace, undefined, attachments, state.row.req.cacheSessionId);
+        method.host.cache.publish(state.row.req, state.request.namespace, state.row.req.promptIds.slice(0, state.pos),
+          { caches, attachments });
         caches = []; attachments = [];
       } finally { disposeResources([...caches, { dispose: () => disposeAttachments(attachments) }]); }
     };
@@ -173,7 +173,7 @@ class SpeculativeGroup implements MlxGroupedMethod {
         const request: RequestState = { draftSampling: sampler, draftSubset: makeSubsetDraftSampler(draftOptions),
           namespace: "", prefixLength: 0,
           fill: method.provider.grouped.supportsExternalTokens ? options.fill : undefined,
-          processed: method.host.promptCache ? [] : undefined,
+          processed: method.host.cache.keeps(row.req) ? [] : undefined,
           sampling: makeStepSampler(options, { tokenRepresentation: "number", grammarWait: "before-sample",
             historyUpdate: "after-sample", initialHistory: row.req.promptIds, acceptGrammar: true,
             eosTokenIds: row.req.eosTokenIds, captureSelectedLogprob: options.logprobs === true,
@@ -183,34 +183,39 @@ class SpeculativeGroup implements MlxGroupedMethod {
         let appended = false;
         const previous = prefix?.rowCount ?? 0;
         try {
-          // The request's state (the composition's paging over the graph's caches), else the graph's caches.
-          caches = row.req.statePolicy?.create() ?? method.binding.makeCache();
-          prefix ??= declaredTaps(method.provider, method.taps,
-            method.provider.grouped.openPrefill({ target: bindLegacyDraftTarget(method.model, caches), checkpoints: [] }));
+          if (!prefix) {
+            // The draft prefill binds its target view once per preparation, over
+            // fresh caches of the graph that bind and are released.
+            const probe = method.binding.makeCache();
+            try {
+              prefix = declaredTaps(method.provider, method.taps,
+                method.provider.grouped.openPrefill({ target: bindLegacyDraftTarget(method.model, probe), checkpoints: [] }));
+            } finally { disposeResources(probe); }
+          }
           const prompt = row.req.promptIds;
           const pendingPrompt = prefix.prefillMode !== "full" && method.binding.prefillTailSplit && prompt.length > 1;
           request.prefixLength = prompt.length - Number(pendingPrompt);
           request.namespace = speculativePrefixNamespace(prefix.namespace, row.cacheNamespace ?? "", options);
-          const hit = method.host.promptCache?.take(prompt, request.namespace, row.req.cacheSessionId);
-          if (hit) {
+          // The request's state from the cache service: a reused prefix with its
+          // draft state, else fresh state (paged when the composition pages).
+          const acquired = method.host.cache.acquire(row.req, request.namespace);
+          caches = acquired.caches; retained = acquired.retain;
+          if (acquired.reusedTokens) {
             try {
-              disposeResources(caches); caches = hit.caches.splice(0);
-              retained = hit.retain; hit.retain = undefined;
-              prefix.append([{ processedTokens: hit.tokens.length, attachment: hit.attachments![0]! }]);
+              prefix.append([{ processedTokens: acquired.reusedTokens, attachment: acquired.attachments![0]! }]);
               appended = true;
               // Target membership later releases backing leases after its own
               // copies resolve. Settle companion copies under the same lease.
               if (retained) prefix.materialize();
-              row.cachedTokens = hit.tokens.length;
-            } finally { disposeResources([...hit.caches, { dispose: () => disposeAttachments(hit.attachments) },
-              { dispose: () => hit.retain?.() }]); }
+              row.cachedTokens = acquired.reusedTokens;
+            } finally { disposeAttachments(acquired.attachments); }
           } else { prefix.append([null]); appended = true; }
           // The graph's composed caches, or a stored prefix composed again by
-          // the prompt cache: either converts inside its own appends.
+          // the cache service: either converts inside its own appends.
           return { row, request, solo: caches, retain: retained, pos: row.cachedTokens,
             end: request.prefixLength, pendingPrompt, transferred: false, closed: false,
             chunkSize: options.prefillChunkSize ?? row.req.prefillChunkSize ?? method.host.prefillChunkSize,
-            boundary: method.host.promptCache ? Math.min(row.req.snapshotAt ?? prompt.length, prompt.length - 1) : -1 };
+            boundary: method.host.cache.keeps(row.req) ? Math.min(row.req.snapshotAt ?? prompt.length, prompt.length - 1) : -1 };
         } catch (error) {
           return cleanupFailure(error, () => disposeResources([
             { dispose: () => { if (appended) prefix!.filterRows(Array.from({ length: previous }, (_, i) => i)); } },
@@ -257,14 +262,14 @@ class SpeculativeGroup implements MlxGroupedMethod {
           const sampled = await state.request.sampling.sample(scores, 0);
           row.current = sampled.token; row.generated = row.sampled = 1;
           if (row.req.eosTokenIds.includes(row.current)) {
-            if (method.host.promptCache) capture(state, () => cloneKvCaches(state.solo), index);
+            if (method.host.cache.keeps(row.req)) capture(state, () => cloneKvCaches(state.solo), index);
             disposeResources(state.solo.splice(0)); state.retain?.(); state.retain = undefined;
             method.host.finish(row, "stop"); return;
           }
           const more = await method.host.publish(row, row.current, readStepExtras(sampled.extras));
           state.request.fill?.observe(row.current);
           if (more === false || row.req.grammar?.isTerminated || row.generated >= row.req.maxTokens) {
-            if (method.host.promptCache && !row.req.signal?.aborted) capture(state, () => cloneKvCaches(state.solo), index);
+            if (method.host.cache.keeps(row.req) && !row.req.signal?.aborted) capture(state, () => cloneKvCaches(state.solo), index);
             disposeResources(state.solo.splice(0)); state.retain?.(); state.retain = undefined;
             method.host.finish(row, more === false || row.req.grammar?.isTerminated ? "stop" : "length"); return;
           }
@@ -509,13 +514,13 @@ class SpeculativeGroup implements MlxGroupedMethod {
   /** The method aligns token coverage and captures its state. The cache owns
    * RAM retention and eventual SSD persistence; no storage work is awaited. */
   #publishCheckpoint(row: Row, index: number, request: RequestState): void {
-    if (!this.host.promptCache || !request.processed) return;
+    if (!this.host.cache.keeps(row.req) || !request.processed) return;
     let target: Cache[] = [], attachments: CheckpointAttachment[] = [];
     try {
       target = this.#target!.extractRow(index);
       attachments.push(this.#draft!.capture(index).attachment);
-      this.host.promptCache.put([...row.req.promptIds.slice(0, request.prefixLength), ...request.processed], target,
-        request.namespace, undefined, attachments, row.req.cacheSessionId);
+      this.host.cache.publish(row.req, request.namespace,
+        [...row.req.promptIds.slice(0, request.prefixLength), ...request.processed], { caches: target, attachments });
       target = []; attachments = [];
     } finally { disposeResources([...target, { dispose: () => disposeAttachments(attachments) }]); }
   }

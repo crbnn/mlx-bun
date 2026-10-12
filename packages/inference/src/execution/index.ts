@@ -12,7 +12,7 @@ export * from "./gateway-binding";
 export * from "./row-sampling";
 export * from "./prefill-cohort";
 export * from "./prefill-rows";
-export * from "./continuation";
+export * from "./continuation-types";
 export * from "./continuation-request";
 export * from "../runtime/resources";
 export * from "../runtime/config";

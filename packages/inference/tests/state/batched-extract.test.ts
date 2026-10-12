@@ -33,7 +33,15 @@ import { BatchedRotatingQuantCache } from "../../src/state/batched-rotating-quan
 import { SSMCache } from "../../src/state/ssm";
 import { resolveKvScheme } from "../../src/state/kv-scheme";
 import { testComposition } from "../models/test-composition";
-import { MlxBatchExecutionGroup, type RowPromptCache } from "../../src/execution/batch-group";
+import { MlxBatchExecutionGroup } from "../../src/execution/batch-group";
+import { KvCacheService } from "../../src/state/cache-service";
+import type { PromptCache } from "../../src/state/prefix-cache";
+
+/** The prefix store a test observes: what the cache service keeps. */
+type RowPromptCache = Pick<PromptCache, "take" | "put">;
+/** A cache service over `model` keeping prefixes in `prefixes`. */
+const keeping = (model: RuntimeModel, prefixes: RowPromptCache) =>
+  new KvCacheService(model, { prefixes: { reclaim() {}, ...prefixes } as unknown as PromptCache });
 import type { RuntimeModel } from "../../src/models/factory";
 import { declareGraph } from "../../src/models/capabilities";
 import { stubPhases } from "../models/phase-forward";
@@ -503,7 +511,7 @@ describe("MlxBatchExecutionGroup per-row extraction (stub model)", () => {
     };
     const sched = newGroup(quantModel, {
       maxBatch: 2,
-      promptCache: pc,
+      cache: keeping(quantModel, pc),
     });
 
     const stats = await sched.submit({
@@ -528,7 +536,7 @@ describe("MlxBatchExecutionGroup per-row extraction (stub model)", () => {
       take: () => null,
       put: (tokens, caches) => { puts.push({ tokens: [...tokens], caches }); },
     };
-    const sched = newGroup(stubModel, { maxBatch: 2, promptCache: pc });
+    const sched = newGroup(stubModel, { maxBatch: 2, cache: keeping(stubModel, pc) });
 
     const promptA = Array.from({ length: 300 }, (_, i) => 1000 + i);
     const promptB = Array.from({ length: 256 }, (_, i) => 2000 + i);
@@ -585,7 +593,7 @@ describe("MlxBatchExecutionGroup per-row extraction (stub model)", () => {
         for (const c of caches) c.dispose();
       },
     };
-    const sched = newGroup(stubModel, { maxBatch: 2, promptCache: pc });
+    const sched = newGroup(stubModel, { maxBatch: 2, cache: keeping(stubModel, pc) });
     const submit = (base: number, maxTokens: number) =>
       sched.submit({
         promptIds: Array.from({ length: 8 }, (_, i) => base + i),
@@ -667,7 +675,7 @@ describe("MlxBatchExecutionGroup per-row extraction (hybrid stub: KV + SSM)", ()
       take: () => null,
       put: (tokens, caches) => { puts.push({ tokens: [...tokens], caches }); },
     };
-    const sched = newGroup(hybridStub, { maxBatch: 2, promptCache: pc });
+    const sched = newGroup(hybridStub, { maxBatch: 2, cache: keeping(hybridStub, pc) });
 
     const promptA = Array.from({ length: 300 }, (_, i) => 1000 + i);
     const promptB = Array.from({ length: 256 }, (_, i) => 2000 + i);

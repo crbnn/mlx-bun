@@ -1,27 +1,25 @@
 import type { Cache } from "../contracts/mlx/cache";
-import type { MlxTokenGraph } from "../models/graph";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import { nextPrefillStep, prefillPhase } from "../contracts/portable/prefill";
-import type { CacheCodecProvider } from "../state/persistence-types";
 import { disposeResources, cleanupFailure } from "../runtime/resources";
-import type { Row, RowPromptCache } from "./batch-types";
+import type { Row } from "./batch-types";
 import type { KvMaintenance } from "../state/kv-maintenance";
+import type { ContinuationState, RequestStateCache } from "../state/cache-service";
 import { MlxPrefillRows, type MlxPrefillForward, type MlxPrefillState } from "./prefill-rows";
 import { widthClass } from "../contracts/mlx/graph";
 import { promptWorkStep } from "../generation/phase-dispatch";
 
 export interface PrefillState extends MlxPrefillState {
   snapAt: number | null;
-  continuation?: import("./continuation-types").OrdinaryContinuationState;
+  continuation?: ContinuationState;
   closePrefill?: () => void;
 }
 
 interface PrefillHost {
-  model: Pick<MlxTokenGraph, "makeCache">;
   chunkSize: number;
   tailSplit: boolean;
-  promptCache?: RowPromptCache;
-  stateCodecs?: CacheCodecProvider;
+  /** Each row's state comes from the cache service, and boundary snapshots return to it. */
+  cache: RequestStateCache;
   maintain?: KvMaintenance;
   denseKvReads?: readonly number[];
   /** One cohort forward of `ids` [sequences, tokens] in the phase its planner named. */
@@ -42,34 +40,28 @@ export class MlxPrefillCohort extends MlxPrefillRows<PrefillState> {
   get supportsMixedWork(): boolean { return !this.rows.some(row => row.req.promptInput); }
   constructor(readonly host: PrefillHost) {
     super({
-      stateCodecs: host.stateCodecs, maintain: host.maintain, denseKvReads: host.denseKvReads,
+      codecs: host.cache.codecs, maintain: host.maintain, denseKvReads: host.denseKvReads,
       open(row) {
         let owned: { caches: Cache[]; retain?: () => void } | undefined;
         let closeCache: (() => void) | undefined;
         let closePrefill: (() => void) | undefined;
         try {
           closeCache = row.req.trace?.begin("cache.lookup_restore", { mechanism: "continuous" });
-          const continuation = row.req.continuation?.restore(row.cacheNamespace ?? "");
-          if (continuation) {
-            owned = { caches: continuation.caches };
-            return { row, solo: continuation.caches, pos: row.req.promptIds.length,
-              snapAt: null, continuation };
-          }
-          const hit = host.promptCache?.take(row.req.promptIds, row.cacheNamespace, row.req.cacheSessionId) ?? null;
-          if (hit) owned = hit;
+          // The row's resumed generation, a reused prefix composed again as the
+          // graph's caches, or fresh state: each converts inside its own appends.
+          const acquired = owned = host.cache.acquire(row.req, row.cacheNamespace ?? "");
+          if (acquired.continuation)
+            return { row, solo: acquired.caches, pos: row.req.promptIds.length,
+              snapAt: null, continuation: acquired.continuation };
           closeCache?.(); closeCache = undefined;
-          if (hit) row.cachedTokens = hit.tokens.length;
+          row.cachedTokens = acquired.reusedTokens;
           const length = row.req.promptIds.length;
           const boundary = Math.min(row.req.snapshotAt ?? length, length - 1);
-          const snapAt = host.promptCache && boundary >= 256 && boundary > (hit?.tokens.length ?? 0) ? boundary : null;
+          const snapAt = host.cache.keeps(row.req) && boundary >= 256 && boundary > acquired.reusedTokens ? boundary : null;
           closePrefill = row.req.trace?.begin("prefill.total", {
             mechanism: "continuous", promptTokens: row.promptTokens, cachedTokens: row.cachedTokens,
           });
-          const closeSetup = row.req.trace?.begin("prefill.batch_setup", { mechanism: "continuous" });
-          // The graph's composed caches, or a stored prefix composed again by
-          // the prompt cache: either converts inside its own appends.
-          owned ??= { caches: row.req.statePolicy?.create() ?? host.model.makeCache() }; closeSetup?.();
-          return { row, solo: owned.caches, pos: hit?.tokens.length ?? 0, retain: owned.retain, snapAt, closePrefill };
+          return { row, solo: acquired.caches, pos: acquired.reusedTokens, retain: acquired.retain, snapAt, closePrefill };
         } catch (error) {
           return cleanupFailure(error, () => disposeResources([...(owned?.caches ?? []),
             { dispose: () => owned?.retain?.() }, { dispose: () => closePrefill?.() }]));
@@ -95,7 +87,7 @@ export class MlxPrefillCohort extends MlxPrefillRows<PrefillState> {
         let snapshot: Cache[] | undefined;
         try {
           snapshot = capture();
-          host.promptCache!.put(state.row.req.promptIds.slice(0, state.pos), snapshot, state.row.cacheNamespace, undefined, undefined, state.row.req.cacheSessionId);
+          host.cache.publish(state.row.req, state.row.cacheNamespace ?? "", state.row.req.promptIds.slice(0, state.pos), { caches: snapshot });
           snapshot = undefined;
         } catch (error) {
           if (snapshot) disposeResources(snapshot);
