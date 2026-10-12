@@ -967,13 +967,14 @@ on main and the refactor is only useful when investigating a behavior difference
 
 ## Ideas and research
 
-- Width tables as a LUT keyed by exact row count (Josh, 2026-10-11): the graph binds each width
-  to the operation its kernels were measured best at, several widths aliasing one bound operation;
-  the scheduler describes the work as N rows wide and indexes, choosing nothing. New kernels change
-  the bindings a generator emits, never the contract. Replaces the five named classes when a
-  measurement first needs a boundary they cannot express.
 One line per idea: the question and the domains it touches. Picking one up makes it an item
 above with an exit; an answered one moves its finding to the owning documentation and is deleted.
+
+- **Width tables as a LUT keyed by exact row count** (graphs, scheduler; Josh, 2026-10-11): the
+  graph binds each width to the operation its kernels were measured best at, several widths
+  aliasing one bound operation; the scheduler describes the work as N rows wide and indexes,
+  choosing nothing. New kernels change the bindings a generator emits, never the contract.
+  Replaces the five named classes when a measurement first needs a boundary they cannot express.
 
 - **SkillOpt skill optimization** (chat, memory, a new optimization domain; [research](https://github.com/joshuarossi/mlx-bun/pull/247)):
   can SkillOpt's gated skill-edit loop (Microsoft, MIT, arXiv:2605.23904) improve the default
