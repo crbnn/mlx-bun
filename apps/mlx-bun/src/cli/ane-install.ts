@@ -27,7 +27,7 @@ function recordedVersion(path: string): string | undefined {
   catch { return undefined; }
 }
 
-const seconds = (ms: number) => ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${ms.toFixed(ms < 10 ? 1 : 0)} ms`;
+const duration = (ms: number) => ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${ms.toFixed(ms < 10 ? 1 : 0)} ms`;
 
 /** `mlx-bun compile-ane`: compile (or, with `--check`, only list) this Mac's Neural Engine programs. Returns the exit
  * code: 0, or 1 when `--check` finds a program the cache lacks. A refused compile throws `AneBridgeError`. */
@@ -49,7 +49,7 @@ export async function runCompileAne(args: CommandArgs, log: (line: string) => vo
   } else {
     log(`Compiling the Neural Engine programs this Mac's models use (${where}):`);
     compileAnePrograms({ composition, onProgram: result =>
-      log(`  ${result.status === "compiled" ? "compiled" : "cached  "}  ${result.spec.label} in ${seconds(result.milliseconds)} ${used(result.graphs)}`) });
+      log(`  ${result.status === "compiled" ? "compiled" : "cached  "}  ${result.spec.label} in ${duration(result.milliseconds)} ${used(result.graphs)}`) });
   }
   if (!args.values.check) record({ version: pkg.version, device: composition.device,
     prefillChunkTokens: composition.prefillChunkTokens, programs: programs.map(program => program.spec.label) });
