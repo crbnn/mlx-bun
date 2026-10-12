@@ -92,10 +92,34 @@ export function parseDigestArgs(argv: string[]): DigestOptions | null {
     cells: specs.flatMap(spec => rows.flatMap(r => chunks.map(chunk => ({ spec, rows: r, prefillChunk: chunk, label: cellLabel(spec, r, chunk) })))) };
 }
 
+export interface DigestLine { label: string; hashes: string; graph: string }
+/** The cell lines of a digest output ("CELL: tokens … logprobs …" or "CELL: ERROR …"); other output is skipped. */
+export function parseDigestOutput(text: string): DigestLine[] {
+  return text.split("\n").flatMap(line => {
+    const match = /^(\S+): (tokens \S+ logprobs \S+|ERROR .*?)(?: n=| \| graph=|$)/.exec(line);
+    return match ? [{ label: match[1]!, hashes: match[2]!, graph: /\| graph=(\S+)/.exec(line)?.[1] ?? "?" }] : [];
+  });
+}
+/** A markdown row per cell of either output: both trees' hashes and whether they are identical. */
+export function compareDigests(baseline: string, candidate: string): { identical: boolean; table: string } {
+  const a = parseDigestOutput(baseline), b = parseDigestOutput(candidate);
+  const labels = [...new Set([...a, ...b].map(line => line.label))];
+  let identical = labels.length > 0;
+  const rows = labels.map(label => {
+    const x = a.find(line => line.label === label), y = b.find(line => line.label === label);
+    const same = !!x && !!y && x.hashes === y.hashes && !x.hashes.startsWith("ERROR");
+    if (!same) identical = false;
+    return `| ${label} | ${x?.hashes ?? "—"} | ${y?.hashes ?? "—"} | ${y?.graph ?? "—"} | ${same ? "identical" : "**differs**"} |`;
+  });
+  return { identical, table: ["| cell | baseline | candidate | candidate graph | |", "|---|---|---|---|---|", ...rows].join("\n") };
+}
+
 export const USAGE = `App-path digest: token ids and top-${TOP_LOGPROBS} logprobs of N greedy tokens through the app's generate path.
 
   bun packages/inference/scripts/digest.ts --model /abs/snapshot [--root /abs/tree] [--tokens 32]
       [--rows 1[,R...]] [--prefill-chunk default[,N...]] [CELL ...]
+  bun packages/inference/scripts/digest.ts compare BASELINE.txt CANDIDATE.txt
+      A markdown table of two saved outputs, cell by cell; exits 0 only when every cell is identical.
 
   CELL      "bf16" or a comma list of generate flags, e.g. kv-quant=4,fused-sdpa=on or kv-quant=turbo.
             Default: ${DEFAULT_CELLS.join(" ")}
@@ -213,6 +237,12 @@ async function together(gateway: Loose, rows: number, starts: Array<() => Promis
 }
 
 async function main(argv: string[]): Promise<number> {
+  if (argv[0] === "compare") {
+    if (argv.length !== 3) throw new Error("compare needs BASELINE.txt CANDIDATE.txt");
+    const result = compareDigests(await Bun.file(argv[1]!).text(), await Bun.file(argv[2]!).text());
+    console.log(result.table);
+    return result.identical ? 0 : 1;
+  }
   const options = parseDigestArgs(argv);
   if (!options) { console.log(USAGE); return 0; }
   if (!existsSync(join(options.model, "config.json"))) throw new Error(`${options.model} has no config.json`);

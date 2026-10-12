@@ -2,7 +2,7 @@
 // measurement itself needs real weights and runs in the gates that consume the tool.
 import { expect, test } from "bun:test";
 import { resolve } from "node:path";
-import { cellFlags, cellLabel, DEFAULT_CELLS, digestRows, parseDigestArgs, REPOSITORY, sha16 } from "../../scripts/digest";
+import { cellFlags, cellLabel, compareDigests, DEFAULT_CELLS, digestRows, parseDigestArgs, parseDigestOutput, REPOSITORY, sha16 } from "../../scripts/digest";
 
 const SCRIPT = resolve(import.meta.dir, "../../scripts/digest.ts");
 
@@ -61,6 +61,29 @@ test("arguments: defaults, and every cell crossed with each row count and chunk"
   expect(() => parseDigestArgs(["--model", "/m", "--tokens", "x"])).toThrow("--tokens: x");
   expect(() => parseDigestArgs(["--model", "/m", "--kv", "4"])).toThrow();
   expect(() => parseDigestArgs(["--model", "/m", "kv-quant"])).toThrow("is not flag=value");
+});
+
+test("compare: two saved outputs cell by cell, other output skipped, an error never identical", () => {
+  const baseline = ["loading model…", 'bf16: tokens aaaa logprobs bbbb n=32 | graph=Qwen35Model | "x"',
+    'bf16,rows=4: tokens cccc logprobs dddd n=32,32,32,32 | rows a/b c/d e/f g/h | graph=Qwen35Model | "y"',
+    "kv-quant=4: ERROR the drafter did not load | graph=?"].join("\n");
+  const candidate = ['bf16: tokens aaaa logprobs bbbb n=32 | graph=M1MaxGraph | "x"',
+    'bf16,rows=4: tokens cccc logprobs eeee n=32,32,32,32 | rows a/b c/d e/f g/h | graph=M1MaxGraph | "y"',
+    'kv-quant=4: tokens ffff logprobs gggg n=32 | graph=M1MaxGraph | "z"', 'kv-quant=8: tokens 1111 logprobs 2222 n=32 | graph=M1MaxGraph | "w"'].join("\n");
+  expect(parseDigestOutput(baseline).map(line => [line.label, line.hashes, line.graph])).toEqual([
+    ["bf16", "tokens aaaa logprobs bbbb", "Qwen35Model"], ["bf16,rows=4", "tokens cccc logprobs dddd", "Qwen35Model"],
+    ["kv-quant=4", "ERROR the drafter did not load", "?"]]);
+  const result = compareDigests(baseline, candidate);
+  expect(result.identical).toBe(false);
+  expect(result.table.split("\n")).toEqual(["| cell | baseline | candidate | candidate graph | |", "|---|---|---|---|---|",
+    "| bf16 | tokens aaaa logprobs bbbb | tokens aaaa logprobs bbbb | M1MaxGraph | identical |",
+    "| bf16,rows=4 | tokens cccc logprobs dddd | tokens cccc logprobs eeee | M1MaxGraph | **differs** |",
+    "| kv-quant=4 | ERROR the drafter did not load | tokens ffff logprobs gggg | M1MaxGraph | **differs** |",
+    "| kv-quant=8 | — | tokens 1111 logprobs 2222 | M1MaxGraph | **differs** |"]);
+  expect(compareDigests(candidate, candidate).identical).toBe(true);
+  expect(compareDigests("", "").identical).toBe(false);
+  const error = "kv-quant=4: ERROR boom | graph=?";
+  expect(compareDigests(error, error).identical).toBe(false);
 });
 
 test("--help documents the cells and the line format and loads no native library", () => {
