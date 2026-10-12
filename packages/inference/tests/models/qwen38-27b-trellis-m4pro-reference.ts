@@ -66,6 +66,7 @@ import type { AttentionRead } from "../../src/contracts/mlx/cache";
 import { disposeTriple } from "../../src/state/quantized-tensor";
 import { qwen35GraphFingerprint as qwen38TrellisTqFingerprint } from "../../src/models/qwen/checkpoint";
 import { testComposition } from "./test-composition";
+import { kvStorage } from "../../src/state/kv-storage";
 
 // Moved here from src/models/qwen/blocks.ts, where nothing else used it once D1 landed. `cacheRead.read` is the
 // `appendFor[phase](cache, k, v)` it called there.
@@ -86,7 +87,7 @@ export type QuantizedAttentionCore = (q: MlxArray, keys: ops.QuantizedTensor, va
 export function quantizedCoreRead(core: QuantizedAttentionCore): AttentionReadStrategy {
   return Object.freeze({
     read(cache: Cache, phase: ReadPhase, k: MlxArray, v: MlxArray): AttentionRead {
-      const quantized = cache.attentionState ? undefined : cache.quantizedAttention;
+      const quantized = kvStorage(cache).attentionState ? undefined : kvStorage(cache).quantizedAttention;
       if (!quantized) return cacheRead.read(cache, phase, k, v);
       const { groupSize, bits } = quantized;
       const [keys, values] = quantized.updateAndFetchQuantized(k, v);
@@ -327,12 +328,12 @@ export class Qwen38TrellisM4Pro extends DeprecatedQwen35Base {
   /** Text forward over the plan the row count matches. Consumes h0. */
   protected override forwardLayers(h0: MlxArray, cache: Cache[], phase: ReadPhase, positions: MlxArray | undefined,
     capture: ((layer: number, hidden: MlxArray) => void) | null, width: MlxWidthClass, boundedGeneric: boolean): MlxArray {
-    const kv = cache[this.faIdx]!.quantizedAttention;
+    const kv = kvStorage(cache[this.faIdx]!).quantizedAttention;
     if (positions || this.mrope || phase === "committed" || h0.shape[0] !== 1 || this.loraState.active.length ||
         (kv && (kv.bits !== 4 || kv.groupSize !== 64)) || (globalThis as Record<string, unknown>).__deltaProf)
       return super.forwardLayers(h0, cache, phase, positions, capture, width, boundedGeneric);
     const L = h0.shape[1]!;
-    const faMask = cache[this.faIdx]!.makeMask(L, null);
+    const faMask = kvStorage(cache[this.faIdx]!).makeMask(L, null);
     if (faMask.arr) {
       faMask.arr.dispose();
       return super.forwardLayers(h0, cache, phase, positions, capture, width, boundedGeneric);

@@ -20,6 +20,7 @@ import { PagedKvRows } from "../../src/state/paged/rows";
 import { RotatingKVCache } from "../../src/state/rotating-kv";
 import { SpeculativeRotatingKVCache } from "../../src/state/speculative-rotating-kv";
 import { disposeResources } from "../../src/runtime/resources";
+import { kvStorage } from "../../src/state/kv-storage";
 
 const HKV = 2, HQ = 8, D = 128, SCALE = 0.088, WINDOW = 32;
 
@@ -49,8 +50,8 @@ function maxDiff(a: MlxArray, b: MlxArray): number {
 
 /** The graphs' read today: mask before the append, updateAndFetch, fused SDPA. */
 function oldRead(cache: Cache, window: number | null, k: MlxArray, v: MlxArray, q: MlxArray): MlxArray {
-  const mask = cache.makeMask(k.shape[2]!, window);
-  const [keys, values] = cache.updateAndFetch(k, v);
+  const mask = kvStorage(cache).makeMask(k.shape[2]!, window);
+  const [keys, values] = kvStorage(cache).updateAndFetch(k, v);
   try { return ops.sdpa(q, keys, values, SCALE, mask.mode, mask.arr); }
   finally { keys.dispose(); values.dispose(); mask.arr?.dispose(); }
 }
@@ -58,13 +59,13 @@ function oldRead(cache: Cache, window: number | null, k: MlxArray, v: MlxArray, 
 /** Qwen3Attention's paged branch today: the attention-state view when the
  * cache has one, else updateAndFetch and the fused SDPA. */
 function oldPagedRead(cache: Cache, k: MlxArray, v: MlxArray, q: MlxArray): MlxArray {
-  const mask = cache.makeMask(k.shape[2]!, null);
+  const mask = kvStorage(cache).makeMask(k.shape[2]!, null);
   try {
-    if (cache.attentionState) {
-      const view = cache.attentionState.appendAndFetch(k, v);
+    if (kvStorage(cache).attentionState) {
+      const view = kvStorage(cache).attentionState!.appendAndFetch(k, v);
       try { return view.attend(q, SCALE, mask, false); } finally { view.dispose(); }
     }
-    const [keys, values] = cache.updateAndFetch(k, v);
+    const [keys, values] = kvStorage(cache).updateAndFetch(k, v);
     try { return ops.sdpa(q, keys, values, SCALE, mask.mode, mask.arr); }
     finally { keys.dispose(); values.dispose(); }
   } finally { mask.arr?.dispose(); }
@@ -109,7 +110,7 @@ function twice<C>(make: () => C): [C, C] { return [make(), make()]; }
 function advance(pair: [Cache, Cache], B: number, steps: readonly Step[], d = D): void {
   for (const [index, step] of steps.entries()) {
     const [k, v] = kv(B, step === "D" ? 1 : step, d);
-    try { for (const cache of pair) for (const a of cache.updateAndFetch(k, v)) a.dispose(); }
+    try { for (const cache of pair) for (const a of kvStorage(cache).updateAndFetch(k, v)) a.dispose(); }
     finally { k.dispose(); v.dispose(); }
     if (index % 64 === 63) ops.evalAll(pair.flatMap(cache => cache.state()));
   }
@@ -121,7 +122,7 @@ function soloRows<C extends Cache>(make: () => C, lengths: readonly number[], d 
   for (const length of lengths) {
     const [x, y] = twice(make);
     const [k, v] = kv(1, length, d);
-    try { for (const c of [x, y]) for (const arr of c.updateAndFetch(k, v)) arr.dispose(); }
+    try { for (const c of [x, y]) for (const arr of kvStorage(c).updateAndFetch(k, v)) arr.dispose(); }
     finally { k.dispose(); v.dispose(); }
     a.push(x); b.push(y);
   }

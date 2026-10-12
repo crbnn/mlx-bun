@@ -34,6 +34,7 @@ import { Kv4Head256Cache } from "../../src/state/kv4-head256-cache";
 import { GroupedHeadsKv4Cache } from "../../src/state/grouped-heads-kv4-cache";
 import { disposeTriple } from "../../src/state/quantized-tensor";
 import { disposeResources } from "../../src/runtime/resources";
+import { kvStorage } from "../../src/state/kv-storage";
 
 const HKV = 2, HQ = 8, D = 128, SCALE = 0.088, WINDOW = 32, TOLERANCE = 4 * 2 ** -6;
 const M4PRO = deviceArchitecture() === "applegpu_g16s";
@@ -171,8 +172,8 @@ function oldQuantizedSdpa(q: MlxArray, kq: ops.QuantizedTensor, vq: ops.Quantize
  * quantized append, then `quantizedSdpa`. */
 function oldRead(cache: Cache, window: number | null, k: MlxArray, v: MlxArray, q: MlxArray, noFused: boolean,
   scale = SCALE): Result {
-  const mask = cache.makeMask(k.shape[2]!, window);
-  const quantized = cache.quantizedAttention!;
+  const mask = kvStorage(cache).makeMask(k.shape[2]!, window);
+  const quantized = kvStorage(cache).quantizedAttention!;
   const [keys, values] = quantized.updateAndFetchQuantized(k, v);
   try { return { ...oldQuantizedSdpa(q, keys, values, scale, mask, quantized.groupSize, quantized.bits, noFused), masked: mask.mode === "array" }; }
   finally { disposeTriple(keys); disposeTriple(values); mask.arr?.dispose(); }
@@ -181,8 +182,8 @@ function oldRead(cache: Cache, window: number | null, k: MlxArray, v: MlxArray, 
 /** Qwen3Attention's independent-rows branch (token fill) today. */
 function oldCommittedRead(cache: Cache, k: MlxArray, v: MlxArray, q: MlxArray): Result {
   const L = k.shape[2]!;
-  const mask = cache.makeMask(L, null);
-  const quantized = cache.quantizedAttention!;
+  const mask = kvStorage(cache).makeMask(L, null);
+  const quantized = kvStorage(cache).quantizedAttention!;
   const [keys, values] = quantized.updateAndFetchQuantized(k, v);
   try {
     if (L > 1) return { out: quantizedAppendAttention(q, keys, values, SCALE, quantized.groupSize, quantized.bits), kernel: "append" };
@@ -288,7 +289,7 @@ function soloRows<C extends Cache>(make: () => C, lengths: readonly number[], g:
   for (const length of lengths) {
     const [x, y] = twice(make);
     const [k, v] = kv(1, length, g);
-    try { for (const c of [x, y]) for (const t of c.quantizedAttention!.updateAndFetchQuantized(k, v)) disposeTriple(t); }
+    try { for (const c of [x, y]) for (const t of kvStorage(c).quantizedAttention!.updateAndFetchQuantized(k, v)) disposeTriple(t); }
     finally { k.dispose(); v.dispose(); }
     a.push(x); b.push(y);
   }
@@ -299,7 +300,7 @@ function soloRows<C extends Cache>(make: () => C, lengths: readonly number[], g:
 function advance(pair: [Cache, Cache], B: number, steps: readonly Step[], g: Geometry = BASE): void {
   for (const [index, step] of steps.entries()) {
     const [k, v] = kv(B, step === "D" ? 1 : step, g);
-    try { for (const cache of pair) for (const t of cache.quantizedAttention!.updateAndFetchQuantized(k, v)) disposeTriple(t); }
+    try { for (const cache of pair) for (const t of kvStorage(cache).quantizedAttention!.updateAndFetchQuantized(k, v)) disposeTriple(t); }
     finally { k.dispose(); v.dispose(); }
     if (index % 64 === 63) ops.evalAll(pair.flatMap(cache => cache.state()));
   }

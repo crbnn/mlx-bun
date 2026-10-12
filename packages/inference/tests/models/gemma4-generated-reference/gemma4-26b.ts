@@ -23,6 +23,7 @@ import { DeprecatedGemma4Base } from "./deprecated-base";
 import type { DecoderLayer } from "../../../src/models/gemma4/blocks";
 
 import { GENERATED_GEMMA_FINGERPRINTS } from "../../../src/models/gemma4/family";
+import { kvStorage } from "../../../src/state/kv-storage";
 export const FINGERPRINT = GENERATED_GEMMA_FINGERPRINTS["26b"];
 
 /** Forward passes served by the generated fast path (vs monolith
@@ -342,8 +343,8 @@ export class GeneratedGemma4 extends DeprecatedGemma4Base {
       return super.forwardLayers(h0, cache, bidir, ids);
     generatedForwardUses++;
     const L = h0.shape[1]!;
-    const maskS = cache[0]!.makeMask(L, this.windowSize);
-    const maskF = cache[5]!.makeMask(L, null);
+    const maskS = kvStorage(cache[0]!).makeMask(L, this.windowSize);
+    const maskF = kvStorage(cache[5]!).makeMask(L, null);
     let h = h0;
     let next: MlxArray;
     next = donorSlidQuantG64B8VMoeScal(this.layers[0]!, h, maskS, cache[0] as RotatingQuantizedKVCache);

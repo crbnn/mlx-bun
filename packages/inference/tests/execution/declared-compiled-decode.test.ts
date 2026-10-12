@@ -11,6 +11,7 @@ import { createRuntimeConfig } from "../../src/runtime/config";
 import { KVCache } from "../../src/state/kv";
 import type { Cache } from "../../src/contracts/mlx/cache";
 import { stubPhases } from "../models/phase-forward";
+import { kvStorage } from "../../src/state/kv-storage";
 
 // A graph that is none of the model classes and declares its own compiled step:
 // the scheduler and the autoregressive binding reach it only through that
@@ -21,7 +22,7 @@ function graph(declared: Parameters<typeof declareGraph>[0], extra: Partial<MlxT
   const forwards: number[] = [];
   const append = (caches: Cache[], width: number) => {
     using kv = ops.zeros([1, 1, width, 4], Dtype.float32);
-    for (const cache of caches) { const [k, v] = cache.updateAndFetch(kv, kv); k.dispose(); v.dispose(); }
+    for (const cache of caches) { const [k, v] = kvStorage(cache).updateAndFetch(kv, kv); k.dispose(); v.dispose(); }
   };
   const model: MlxTokenGraph = {
     weightsBytes: 0,

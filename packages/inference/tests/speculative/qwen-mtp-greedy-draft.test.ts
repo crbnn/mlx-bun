@@ -10,6 +10,7 @@ import { mtpModule } from "../models/phase-forward";
 import { toLogprobs } from "../../src/sampling/index";
 import { createRuntimeConfig, withRuntimeConfig } from "../../src/runtime/config";
 import { greedyDraftPolicy } from "../../src/generation/speculative/draft-policy";
+import { kvStorage } from "../../src/state/kv-storage";
 
 const V = 6;
 /** Row r at chained step s favors token (r * 2 + s) % V by a clear margin. */
@@ -34,7 +35,7 @@ function fixture(sampling: ConstructorParameters<typeof QwenMtpRows>[2]) {
     const [B, N] = embeds.shape;
     using k = ops.reshape(embeds, [B!, 1, N!, 1]);
     using v = ops.reshape(hidden, [B!, 1, N!, 1]);
-    for (const view of cache.updateAndFetch(k, v)) view.dispose();
+    for (const view of kvStorage(cache).updateAndFetch(k, v)) view.dispose();
     return ops.copyOf(hidden);
   }) as unknown as MtpModule;
   const rows = new QwenMtpRows(target, module, sampling, []);

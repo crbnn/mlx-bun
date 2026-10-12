@@ -14,6 +14,7 @@ import { fusedSdpaConfigSupported, quantizedSdpaTiled, quantizedSdpaUnfused } fr
 import { disposeTriple } from "../../src/state/quantized-tensor";
 import { isCompiledTrace } from "../../src/runtime/compiled-trace";
 import { runtimeValue } from "../../src/runtime/config";
+import { kvStorage } from "../../src/state/kv-storage";
 
 /** The runtime half of `fusedSdpaSupported` before E3 (the flag, the activation
  * dtype and the mask), which the frozen pre-D2 generated graphs
@@ -36,8 +37,8 @@ function fusedSdpaSupported(q: MlxArray, mask: Mask, groupSize: number, bits: nu
  * layout's own view, affine storage through `quantizedSdpa` above (or the
  * committed append for independent positions), plain storage through SDPA. */
 export function referenceKvAttention(cache: Cache, k: MlxArray, v: MlxArray): KvAttentionView {
-  if (cache.attentionState) return cache.attentionState.appendAndFetch(k, v);
-  const quantized = cache.quantizedAttention;
+  if (kvStorage(cache).attentionState) return kvStorage(cache).attentionState!.appendAndFetch(k, v);
+  const quantized = kvStorage(cache).quantizedAttention!;
   if (quantized) {
     const { groupSize, bits } = quantized;
     const [keys, values] = quantized.updateAndFetchQuantized(k, v);
@@ -48,7 +49,7 @@ export function referenceKvAttention(cache: Cache, k: MlxArray, v: MlxArray): Kv
       dispose() { disposeTriple(keys); disposeTriple(values); },
     };
   }
-  const [keys, values] = cache.updateAndFetch(k, v);
+  const [keys, values] = kvStorage(cache).updateAndFetch(k, v);
   return {
     attend: (q, scale, mask) => ops.sdpa(q, keys, values, scale, mask.mode, mask.arr),
     dispose() { keys.dispose(); values.dispose(); },

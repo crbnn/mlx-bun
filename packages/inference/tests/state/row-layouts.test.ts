@@ -23,6 +23,7 @@ import { QuantizedKVCache } from "../../src/state/quantized-kv";
 import { RotatingKVCache } from "../../src/state/rotating-kv";
 import { RotatingQuantizedKVCache } from "../../src/state/rotating-quantized-kv";
 import { SSMCache } from "../../src/state/ssm";
+import { kvStorage } from "../../src/state/kv-storage";
 
 const bytes = (a: MlxArray): number[] => { using c = ops.contiguous(a); return [...c.rawBytes()]; };
 const grid = (L: number, D: number, f: (t: number, d: number) => number): MlxArray => {
@@ -46,14 +47,14 @@ function stepAll(layout: Cache, rows: { solo: Cache; id: number; f: (b: number, 
   rows.forEach((row, b) => { for (let d = 0; d < dim; d++) data[b * dim + d] = row.f(row.id, row.solo.offset, d); });
   using batch = MlxArray.fromFloat32(data, [rows.length, 1, 1, dim]);
   if (quantized) {
-    const [k, v] = layout.quantizedAttention!.updateAndFetchQuantized(batch, batch); dispose3(k); dispose3(v);
-  } else { const [k, v] = layout.updateAndFetch(batch, batch); k.dispose(); v.dispose(); }
+    const [k, v] = kvStorage(layout).quantizedAttention!.updateAndFetchQuantized(batch, batch); dispose3(k); dispose3(v);
+  } else { const [k, v] = kvStorage(layout).updateAndFetch(batch, batch); k.dispose(); v.dispose(); }
   (layout as { releaseRopeArr?: () => void }).releaseRopeArr?.();
   for (const row of rows) {
     using one = grid(1, dim, (_t, d) => row.f(row.id, row.solo.offset, d));
     if (quantized) {
-      const [k, v] = row.solo.quantizedAttention!.updateAndFetchQuantized(one, one); dispose3(k); dispose3(v);
-    } else { const [k, v] = row.solo.updateAndFetch(one, one); k.dispose(); v.dispose(); }
+      const [k, v] = kvStorage(row.solo).quantizedAttention!.updateAndFetchQuantized(one, one); dispose3(k); dispose3(v);
+    } else { const [k, v] = kvStorage(row.solo).updateAndFetch(one, one); k.dispose(); v.dispose(); }
   }
 }
 
@@ -171,7 +172,7 @@ describe("padded full-attention rows (affine quantized)", () => {
     const joiner = quant(1, lens[1]!);
     layout.mergeRows([adopted, joiner]); adopted.dispose(); joiner.dispose();
     expect(layout.rowOffsets).toEqual([5, 3]); expect(layout.leftPad).toEqual([0, 2]);
-    const mask = layout.makeMask(1, null);
+    const mask = kvStorage(layout).makeMask(1, null);
     expect([...mask.arr!.toIntTokens()]).toEqual([1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1]);
     expect([...layout.ropeOffsetArr!.toIntTokens()]).toEqual([5, 3]);
     mask.arr!.dispose(); (layout as PaddedQuantKVRows).releaseRopeArr();

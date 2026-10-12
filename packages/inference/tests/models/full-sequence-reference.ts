@@ -33,6 +33,7 @@ import { isRecurrentCache } from "../../src/state/capabilities";
 import { TrainingCache, TrainingSSMCache } from "../../src/state/training-cache";
 import type { RuntimeModel } from "../../src/models/factory";
 import { widthClass } from "../../src/contracts/mlx/width";
+import { kvStorage } from "../../src/state/kv-storage";
 
 /** Run a full-sequence forward for training.
  *  @param ids int32 array [B, L].
@@ -165,12 +166,12 @@ class BatchedMaskCache implements AttentionCache {
   #read(k: MlxArray, v: MlxArray): AttentionRead {
     const mask = this.makeMask(k.shape[2]!, this.window);
     let keys: MlxArray, values: MlxArray;
-    try { [keys, values] = this.inner.updateAndFetch(k, v); } catch (error) { mask.arr?.dispose(); throw error; }
+    try { [keys, values] = kvStorage(this.inner).updateAndFetch(k, v); } catch (error) { mask.arr?.dispose(); throw error; }
     return sdpaRead(keys, values, { mask, release: () => mask.arr?.dispose() });
   }
 
   updateAndFetch(k: MlxArray, v: MlxArray): [MlxArray, MlxArray] {
-    return this.inner.updateAndFetch(k, v);
+    return kvStorage(this.inner).updateAndFetch(k, v);
   }
 
   makeMask(N: number, _windowSize: number | null): Mask {

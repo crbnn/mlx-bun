@@ -20,6 +20,7 @@ import { QuantizedKVCache } from "../../src/state/quantized-kv";
 import { RotatingKVCache } from "../../src/state/rotating-kv";
 import { RotatingQuantizedKVCache } from "../../src/state/rotating-quantized-kv";
 import { TurboQuantKVCache } from "../../src/state/turboquant-kv";
+import { kvStorage } from "../../src/state/kv-storage";
 
 const W = 8, H = 2, D = 64, GROUP = 32, BITS = 4;
 type Kind = { name: string; make: () => CompiledDecodeCache & Cache; quantized: boolean; ring: boolean };
@@ -55,7 +56,7 @@ function append(cache: Cache, quantized: boolean, k: MlxArray, v: MlxArray): Mlx
     const [kq, vq] = (cache as QuantizedKVCache).updateAndFetchQuantized(k, v);
     return [...planes(kq), ...planes(vq)];
   }
-  return cache.updateAndFetch(k, v).slice();
+  return kvStorage(cache).updateAndFetch(k, v).slice();
 }
 
 for (const kind of KINDS) {

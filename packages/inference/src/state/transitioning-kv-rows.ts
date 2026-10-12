@@ -2,13 +2,14 @@ import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { BatchableCache, Cache, Mask, DenseKvReads } from "../contracts/mlx/cache";
 import { KvTensorRows } from "./kv-tensor-rows";
+import type { KvStorage } from "./kv-storage";
 import { leaseCacheStates } from "./leases";
 import { minimumReusableOffset } from "./views";
 import { withResource, disposeResources } from "../runtime/resources";
 import { cloneKvCaches } from "./persistence";
 
 /** Encoded layouts retain physical row alignment across precision changes. */
-export interface TransitionedKvLayout extends BatchableCache {
+export interface TransitionedKvLayout extends BatchableCache, KvStorage {
   alignRows?(leftPad: readonly number[]): void;
 }
 export interface SpeculativeTransitionedKvLayout extends TransitionedKvLayout {

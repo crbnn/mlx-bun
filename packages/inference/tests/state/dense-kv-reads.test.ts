@@ -31,6 +31,7 @@ import { AttentionMasks } from "../../src/state/attention-read";
 import { composedFullAttentionCache, composedSlidingAttentionCache } from "../../src/state/bf16-first-kv";
 import type { Cache } from "../../src/contracts/mlx/cache";
 import type { KvStorageScheme } from "../../src/contracts/portable/composition";
+import { kvStorage } from "../../src/state/kv-storage";
 
 const W = 8;
 const tensor = (b: number, n: number, seed: number) => {
@@ -53,7 +54,7 @@ const appendable = (cache: Cache, rows: number) => Array.from({ length: rows }, 
 /** Attempt the actual plain read; true when it appended. */
 const reads = (cache: Cache, rows: number, seed: number) => {
   using k = tensor(rows, 1, seed), v = tensor(rows, 1, seed + 1);
-  try { for (const a of cache.updateAndFetch(k, v)) a.dispose(); return true; }
+  try { for (const a of kvStorage(cache).updateAndFetch(k, v)) a.dispose(); return true; }
   catch (error) { expect(String(error)).toContain("mixed precision rows use their attention state"); return false; }
 };
 const kinds = (cache: Delayed) => cache.rowOffsets.map((_, row) => { const r = cache.extractRow(row); try { return r.constructor.name; } finally { r.dispose(); } });
@@ -99,7 +100,7 @@ test("per-layer policy: a configured layer's lego reads dense through the append
   try {
     for (const [index, cache] of caches.entries()) {
       using k = tensor(1, 2, 40 + 2 * index), v = tensor(1, 2, 41 + 2 * index);
-      for (const a of cache.updateAndFetch(k, v)) a.dispose();
+      for (const a of kvStorage(cache).updateAndFetch(k, v)) a.dispose();
     }
     expect(caches.map(cache => cache.denseKvReads?.appendable(0) ?? false)).toEqual([true, true, true]);
     // The append that reaches the start reads bf16; the lego converts after it.
@@ -200,7 +201,7 @@ test("plain storage and storage that decodes on read declare dense reads; affine
 /** A dense read of `cache` for `rows` rows appending one position: its shapes and dtypes. */
 const denseRead = (cache: Cache, rows: number, seed: number) => {
   using k = tensor(rows, 1, seed), v = tensor(rows, 1, seed + 1);
-  const [keys, values] = cache.updateAndFetch(k, v);
+  const [keys, values] = kvStorage(cache).updateAndFetch(k, v);
   try { return [keys.shape, values.shape, keys.dtypeName, values.dtypeName]; } finally { keys.dispose(); values.dispose(); }
 };
 
@@ -212,7 +213,7 @@ test("a TurboQuant conversion keeps dense reads: the converted entry declares th
     expect(caches.map(cache => cache.denseKvReads?.appendable(0))).toEqual([true, true]);
     for (const [index, cache] of caches.entries()) {
       using k = tensor(1, 5, 120 + 2 * index), v = tensor(1, 5, 121 + 2 * index);
-      for (const a of cache.updateAndFetch(k, v)) a.dispose();
+      for (const a of kvStorage(cache).updateAndFetch(k, v)) a.dispose();
     }
     expect(caches[0]!.composed!.storage()).toBeInstanceOf(TurboQuantKVCache);   // a full layer past start converts
     expect(caches[1]).toBeInstanceOf(RotatingKVCache);     // a sliding layer stays plain
@@ -254,7 +255,7 @@ test("prepared co-prefill rows answer through their current storage: padded full
       group.beginPrefill();
       expect(appendable(group, 2), `${label}: prepared`).toEqual([true, true]);
       using k = tensor(2, 4, 160), v = tensor(2, 4, 161);
-      for (const a of group.updateAndFetch(k, v)) a.dispose();
+      for (const a of kvStorage(group).updateAndFetch(k, v)) a.dispose();
       expect(appendable(group, 2), `${label}: after the chunk`).toEqual([true, true]);   // transition deferred
       group.commitPrefill([0, 1]);
       expect(appendable(group, 2), `${label}: committed`).toEqual([...converted]);

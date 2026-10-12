@@ -2,6 +2,7 @@ import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { Cache } from "../contracts/mlx/cache";
 import { fullRowPadding } from "./full-prefill-row";
+import { kvStorage } from "./kv-storage";
 import { disposeResources } from "../runtime/resources";
 
 /** Assemble full-attention tensors at the model's B while storage retains
@@ -10,7 +11,7 @@ export function appendFullKvRows(rows: readonly Cache[], leftPad: readonly numbe
   k: MlxArray, v: MlxArray, deferredValues = false): [MlxArray, MlxArray] {
   const parts: [MlxArray, MlxArray][] = [], padded: MlxArray[] = [];
   try {
-    for (const [index, row] of rows.entries()) {
+    for (const [index, row] of rows.map(kvStorage).entries()) {
       using kr = k.slice([index, 0, 0, 0], [index + 1, k.shape[1]!, k.shape[2]!, k.shape[3]!]);
       using vr = v.slice([index, 0, 0, 0], [index + 1, v.shape[1]!, v.shape[2]!, v.shape[3]!]);
       parts.push(deferredValues && row.rotatedValueAttention

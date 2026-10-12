@@ -50,6 +50,7 @@ import { QuantizedSwitchLinear } from "../../src/layers/quantized-switch-linear"
 import { RMSNorm } from "../../src/layers/normalization";
 import { type Cache, type Mask } from "../../src/contracts/mlx/cache";
 import { Qwen3Attention } from "./qwen3-reference";
+import { kvStorage } from "../../src/state/kv-storage";
 
 // ── qwen3_moe.py Attention (== plain qwen3, rope_theta default 1e7) ───────────
 const MOE_ROPE_THETA = 10000000;                                        // args.rope_theta
@@ -316,7 +317,7 @@ export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
 
   protected forwardLayers(h0: MlxArray, cache: Cache[]): MlxArray {
     const L = h0.shape[1]!;
-    const mask = cache[0]!.makeMask(L, null);                       // create_attention_mask(h, cache[0])
+    const mask = kvStorage(cache[0]!).makeMask(L, null);                       // create_attention_mask(h, cache[0])
     let cur = h0;
     for (let i = 0; i < this.layers.length; i++) {                  // for layer, c in zip(self.layers, cache)
       const next = this.layers[i]!.forward(cur, mask, cache[i]!);   // h = layer(h, mask, c)

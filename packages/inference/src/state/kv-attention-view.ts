@@ -2,6 +2,7 @@ import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { Cache, KvAttentionView, KvDonorAttention } from "../contracts/mlx/cache";
 import { disposeTriple } from "./quantized-tensor";
+import { kvStorage } from "./kv-storage";
 import { quantizedAppendAttention } from "../layers/quantized-append-attention";
 import { viewAffineKernel, type AffineKernels } from "./affine-attention";
 
@@ -30,7 +31,8 @@ export function quantizedDonorAttention(keys: ops.QuantizedTensor, values: ops.Q
 /** Append `k` and `v` to `cache` and return its attention view. Plain storage
  * reads with the stock SDPA; affine storage with `kernels`, the kernel set of
  * the row layout reading it (`viewAffineKernel`). */
-export function captureKvAttention(cache: Cache, k: MlxArray, v: MlxArray, kernels: AffineKernels): KvAttentionView {
+export function captureKvAttention(row: Cache, k: MlxArray, v: MlxArray, kernels: AffineKernels): KvAttentionView {
+    const cache = kvStorage(row);
     if (cache.attentionState) return cache.attentionState.appendAndFetch(k, v);
     const quantized = cache.quantizedAttention;
     if (quantized) {

@@ -5,6 +5,7 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import { PagedKVCache } from "../../src/state/paged/cache";
 import { PagedKvRows } from "../../src/state/paged/rows";
 import { ownedCacheLayout, prefillCacheLayout } from "../../src/state/layout";
+import { kvStorage } from "../../src/state/kv-storage";
 
 const heads = 2, dim = 4;
 function read(a: MlxArray): Float32Array { using value = ops.contiguous(a); return value.toFloat32(); }
@@ -90,8 +91,8 @@ test("paged storage binds through the same layout interface at B1", () => {
   try {
     expect(layout).toBeInstanceOf(PagedKvRows); expect(prefill).toBeInstanceOf(PagedKvRows);
     layout.mergeRows([source]); expect(layout.ropeOffsetArr).toBeUndefined();
-    expect(layout.makeMask(1,null)).toEqual({mode:"",arr:null});
-    const [k,v]=pair([0],[0],3), values=layout.updateAndFetch(k,v);
+    expect(kvStorage(layout).makeMask(1,null)).toEqual({mode:"",arr:null});
+    const [k,v]=pair([0],[0],3), values=kvStorage(layout).updateAndFetch(k,v);
     try { expect(read(values[0])).toEqual(data(0,0,3)); }
     finally { for(const a of [k,v,...values]) a.dispose(); }
     expect(layout.projectedBytes(5)).toBe(8*heads*dim*4*2);

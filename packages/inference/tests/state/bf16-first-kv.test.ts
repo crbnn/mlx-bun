@@ -32,6 +32,7 @@ import { turboQuantFusedDecode } from "../../src/state/turboquant-codec";
 import { TurboQuantKVCache } from "../../src/state/turboquant-kv";
 import { disposeResources } from "../../src/runtime/resources";
 import { createRuntimeConfig, runtimeConfig, withRuntimeConfig } from "../../src/runtime/config";
+import { kvStorage } from "../../src/state/kv-storage";
 
 const HKV = 2, HQ = 8, D = 128, SCALE = 0.088, GROUP = 64;
 /** The sliding window of the rotating cases: the 300- and 250-position windows
@@ -90,7 +91,7 @@ const UNIFORM_FLAG = createRuntimeConfig({ ...runtimeConfig().values, MLX_BUN_NO
 
 /** The graphs' read before E3 on whichever storage the old path holds. */
 function oldRead(cache: Cache, window: number | null, k: MlxArray, v: MlxArray, q: MlxArray): MlxArray {
-  const mask = cache.makeMask(k.shape[2]!, window);
+  const mask = kvStorage(cache).makeMask(k.shape[2]!, window);
   try {
     if (cache instanceof QuantizedKVCache || cache instanceof RotatingQuantizedKVCache) {
       const [keys, values] = cache.updateAndFetchQuantized(k, v);
@@ -102,7 +103,7 @@ function oldRead(cache: Cache, window: number | null, k: MlxArray, v: MlxArray, 
       try { using rotated = ops.sdpa(q, keys, values, SCALE, mask.mode, mask.arr); return unrotateValues(rotated); }
       finally { keys.dispose(); values.dispose(); }
     }
-    const [keys, values] = cache.updateAndFetch(k, v);
+    const [keys, values] = kvStorage(cache).updateAndFetch(k, v);
     try { return ops.sdpa(q, keys, values, SCALE, mask.mode, mask.arr); }
     finally { keys.dispose(); values.dispose(); }
   } finally { mask.arr?.dispose(); }
@@ -245,7 +246,7 @@ function joiningRows(scheme: Scheme, start: number, lengths: readonly number[]):
   const rows = lengths.map(length => {
     const row = plainOf(scheme);
     const [k, v] = kv(1, length);
-    try { for (const a of row.updateAndFetch(k, v)) a.dispose(); } finally { k.dispose(); v.dispose(); }
+    try { for (const a of kvStorage(row).updateAndFetch(k, v)) a.dispose(); } finally { k.dispose(); v.dispose(); }
     return row;
   });
   maintenanceOf(scheme, start)(rows);
@@ -260,15 +261,15 @@ const rowsOf = (scheme: Scheme, start: number): AttentionCache & Cache & { merge
  * attention view (affine) or its deferred-V fetch and captured value transform
  * (TurboQuant). */
 function oldRowsRead(cache: Cache, window: number | null, k: MlxArray, v: MlxArray, q: MlxArray): MlxArray {
-  const mask = cache.makeMask(k.shape[2]!, window);
+  const mask = kvStorage(cache).makeMask(k.shape[2]!, window);
   try {
-    if (cache.rotatedValueAttention) {
-      const [keys, values] = cache.rotatedValueAttention.updateAndFetchDeferredV(k, v);
-      const restore = cache.rotatedValueAttention.captureValueTransform!();
+    if (kvStorage(cache).rotatedValueAttention) {
+      const [keys, values] = kvStorage(cache).rotatedValueAttention!.updateAndFetchDeferredV(k, v);
+      const restore = kvStorage(cache).rotatedValueAttention!.captureValueTransform!();
       try { using rotated = ops.sdpa(q, keys, values, SCALE, mask.mode, mask.arr); return restore(rotated); }
       finally { keys.dispose(); values.dispose(); }
     }
-    const view = cache.attentionState!.appendAndFetch(k, v);
+    const view = kvStorage(cache).attentionState!.appendAndFetch(k, v);
     try { return view.attend(q, SCALE, mask); } finally { view.dispose(); }
   } finally { mask.arr?.dispose(); }
 }

@@ -5,6 +5,7 @@ import { MlxArray } from "@mlx-bun/mlx/array";
 import { KVCache } from "../../src/state/kv";
 import { type Cache } from "../../src/contracts/mlx/cache";
 import { specRun } from "../../src/generation/speculative/run";
+import { kvStorage } from "../../src/state/kv-storage";
 
 // A tie-free vocabulary predicts token i+1, with 7 as EOS. This exercises
 // the real verifier and sampler without weights or an external model.
@@ -14,7 +15,7 @@ function fixture(drafts: "accepted" | "rejected" | "none", fallback = false) {
   const forward = (ids: MlxArray, caches: Cache[]) => {
     const tokens = ids.toIntTokens();
     using kv = MlxArray.fromFloat32(new Float32Array(tokens.length), [1, 1, tokens.length, 1]);
-    for (const view of caches[0]!.updateAndFetch(kv, kv)) view.dispose();
+    for (const view of kvStorage(caches[0]!).updateAndFetch(kv, kv)) view.dispose();
     return MlxArray.fromFloat32(Float32Array.from(tokens), [1, tokens.length, 1]);
   };
   const head = (hidden: MlxArray) => {

@@ -26,6 +26,7 @@ import { cloneKvCaches } from "../../src/state/persistence";
 import { specServeRun } from "../../src/generation/speculative/run";
 import type { DraftProvider, DraftSource } from "../../src/generation/speculative/source";
 import { declareGraph } from "../../src/models/capabilities";
+import { kvStorage } from "../../src/state/kv-storage";
 
 const VOCAB = 128;
 const EOS = 2;
@@ -86,7 +87,7 @@ class StubModel {
     const L = list.length;
     const k = MlxArray.fromFloat32(new Float32Array(L * 4), [1, 1, L, 4]);
     const v = MlxArray.fromFloat32(new Float32Array(L * 4), [1, 1, L, 4]);
-    const [outK, outV] = cache[0]!.updateAndFetch(k, v);
+    const [outK, outV] = kvStorage(cache[0]!).updateAndFetch(k, v);
     for (const a of [k, v, outK, outV]) a.dispose();
     // The "hidden state" carries each position's token id, so logits can be
     // produced PER POSITION — which is what the verify policy reads.

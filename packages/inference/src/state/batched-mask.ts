@@ -24,6 +24,7 @@ import { KVCache } from "./kv";
 import { plainKvStorage } from "./dense-kv-reads";
 import { type AttentionCache, type AttentionRead, type BatchableCache, type Cache, type Mask } from "../contracts/mlx/cache";
 import { AttentionMasks, causalLease, sdpaRead, unmaskedLease, withLease, type MaskLease } from "./attention-read";
+import type { KvStorage } from "./kv-storage";
 
 /** Padding-aware key-validity mask for batched DECODE with left-padded rows.
  *
@@ -104,7 +105,7 @@ export class BatchedDecodeMaskCache implements Cache {
   signature(): string { return `kv:batched-mask:${cacheSignature(this.inner)}`; }
 
   constructor(
-    private readonly inner: Cache,
+    private readonly inner: KvStorage,
     private readonly B: number,
     private readonly leftPad: number[],
     private readonly window: number | null,

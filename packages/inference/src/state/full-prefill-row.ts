@@ -7,6 +7,7 @@ import { KVCache, type AffineKernelSet } from "./kv";
 import { QuantizedKVCache } from "./quantized-kv";
 import { TurboQuantKVCache } from "./turboquant-kv";
 import { type Cache, type Mask, type PrefillPadding } from "../contracts/mlx/cache";
+import { kvStorage } from "./kv-storage";
 
 type FullCache = KVCache | QuantizedKVCache | TurboQuantKVCache;
 
@@ -24,8 +25,8 @@ export class FullPrefillRow implements Cache {
   get stateNeedsDispose(): boolean { return (this.inner as Cache).stateNeedsDispose ?? false; }
   get affineConversion(): FullPrefillRow | undefined { return this.inner instanceof KVCache ? this : undefined; }
   get turboConversion(): FullPrefillRow | undefined { return this.inner instanceof KVCache ? this : undefined; }
-  get quantizedAttention() { return (this.inner as Cache).quantizedAttention; }
-  get rotatedValueAttention() { return (this.inner as Cache).rotatedValueAttention; }
+  get quantizedAttention() { return kvStorage(this.inner).quantizedAttention; }
+  get rotatedValueAttention() { return kvStorage(this.inner).rotatedValueAttention; }
   /** The current inner storage's dense reads (maintenance replaces it in
    * place); this one row is its row 0. */
   get denseKvReads() { return (this.inner as Cache).denseKvReads; }

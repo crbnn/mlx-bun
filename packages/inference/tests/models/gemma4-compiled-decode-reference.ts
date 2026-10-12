@@ -55,6 +55,7 @@ import type {
   Cache, CompiledDecodeCache, DecodeSlot, DecodeTrace, Mask, SharedKv,
 } from "../../src/contracts/mlx/cache";
 import type { MlxCompiledDecodeStep } from "../../src/contracts/mlx/graph";
+import { kvStorage } from "../../src/state/kv-storage";
 
 /** What the runner reads of the Gemma graph it compiles (the graph passes
  * itself; a structural type keeps the graph file and this one acyclic). */
@@ -166,7 +167,7 @@ function makeSegmentTraceFn(
         const layer = model.layers[i]!;
         const adapter = adapters[i - from]!;
         const window = layer.layerType === "sliding_attention" ? model.windowSize : null;
-        const mask = adapter.makeMask(1, window); // N=1 → mode ""
+        const mask = kvStorage(adapter).makeMask(1, window); // N=1 → mode ""
         const { h: next, shared } = layer.forward(h, mask, adapter, null, null);
         h.dispose();
         h = next;
@@ -434,7 +435,7 @@ export class CompiledDecode implements MlxCompiledDecodeStep {
           const layer = this.model.layers[li]!;
           const c = caches[li]!;
           const window = layer.layerType === "sliding_attention" ? this.model.windowSize : null;
-          const mask = c.makeMask(1, window); // N=1 → mode ""
+          const mask = kvStorage(c).makeMask(1, window); // N=1 → mode ""
           committedJs.push({ c, offsetBefore: c.offset });
           const { h: next, shared } = layer.forward(carried, mask, c, null, null);
           if (carriedOwned) carried.dispose();

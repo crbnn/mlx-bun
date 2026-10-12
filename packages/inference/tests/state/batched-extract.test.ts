@@ -36,6 +36,7 @@ import { MlxBatchExecutionGroup, type RowPromptCache } from "../../src/execution
 import type { RuntimeModel } from "../../src/models/factory";
 import { declareGraph } from "../../src/models/capabilities";
 import { stubPhases } from "../models/phase-forward";
+import { kvStorage } from "../../src/state/kv-storage";
 
 /** Contiguous raw bytes of a (possibly strided) view, as a plain array. */
 const bytes = (a: MlxArray): number[] => {
@@ -433,7 +434,7 @@ const stubModel = phased({
     const [B, L] = ids.shape as [number, number];
     const k = kvFromIds(ids);
     for (const c of caches) {
-      const [rk, rv] = c.updateAndFetch(k, k);
+      const [rk, rv] = kvStorage(c).updateAndFetch(k, k);
       rk.dispose(); rv.dispose();
     }
     k.dispose();
@@ -656,7 +657,7 @@ const hybridStub = phased({
         continue;
       }
       const k = kvFromIds(ids);
-      const [rk, rv] = c.updateAndFetch(k, k);
+      const [rk, rv] = kvStorage(c).updateAndFetch(k, k);
       rk.dispose(); rv.dispose(); k.dispose();
     }
     return ops.zeros([B, L, HD], Dtype.float32);

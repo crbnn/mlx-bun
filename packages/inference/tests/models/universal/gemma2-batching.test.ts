@@ -12,6 +12,7 @@ import type { Composition } from "../../../src/contracts/portable/composition";
 import type { ReadPhase } from "../../../src/models/graph";
 import type { DraftProvider } from "../../../src/generation/speculative/source";
 import type { GenerateOptions } from "../../../src/generation/index";
+import { kvStorage } from "../../../src/state/kv-storage";
 
 // Native numerical tests are explicit: CPU-only planning/CI never initializes
 // model tensors. All synthetic weights exist in memory, not tracked fixtures.
@@ -162,7 +163,7 @@ function maskedRead(mask: Mask, softcap: number | null) {
       const view = captureKvAttention(cache, k, v, unfusedAffineKernels(4, 64, k.dtype));
       return { attend: (q: MlxArray, scale: number) => view.attend(q, scale, mask), dispose: () => view.dispose() };
     }
-    const [keys, values] = cache.updateAndFetch(k, v);
+    const [keys, values] = kvStorage(cache).updateAndFetch(k, v);
     return { attend: (q: MlxArray, scale: number) => softcapAttention(q, keys, values, mask, scale, softcap),
       dispose() { keys.dispose(); values.dispose(); } };
   } };
@@ -357,16 +358,16 @@ class PreviousSelectionModel extends SelectedMaskModel {
     let faMask: Mask;
     let swaMask: Mask | null = null;
     if (a.maskArray) {
-      faMask = cache[0]!.makeMask(L, null);
+      faMask = kvStorage(cache[0]!).makeMask(L, null);
       if (faMask.mode === "causal")
         faMask = { mode: "array", arr: createCausalMask(L, cache[0]!.offset, null) };
     } else if (a.layerTypes && a.layerTypes.includes("sliding_attention")) {
       const faIdx = a.layerTypes.indexOf("full_attention");
       const swaIdx = a.layerTypes.indexOf("sliding_attention");
-      faMask = cache[faIdx === -1 ? 0 : faIdx]!.makeMask(L, null);
-      swaMask = cache[swaIdx]!.makeMask(L, a.slidingWindow);
+      faMask = kvStorage(cache[faIdx === -1 ? 0 : faIdx]!).makeMask(L, null);
+      swaMask = kvStorage(cache[swaIdx]!).makeMask(L, a.slidingWindow);
     } else {
-      faMask = cache[0]!.makeMask(L, null);
+      faMask = kvStorage(cache[0]!).makeMask(L, null);
     }
     return this.layers.map((_, i) => a.layerTypes?.[i] === "sliding_attention" && swaMask ? swaMask : faMask);
   }
@@ -537,7 +538,7 @@ describe.skipIf(!native)("Universal forward ownership", () => {
         const out = forward(x, cache, phase); hidden.push(out); return out;
       }) as never;
     });
-    for (const cache of caches) cache.makeMask = (length: number, window: number | null) => {
+    for (const cache of caches) kvStorage(cache).makeMask = (length: number, window: number | null) => {
       const arr = createCausalMask(length, cache.offset, window); masks.push(arr); return { mode: "array", arr };
     };
     return { hidden, masks };
@@ -580,7 +581,7 @@ describe.skipIf(!native)("Universal forward ownership", () => {
     try {
       counting(count => {
         const seen = instrument(model, caches);
-        caches[1]!.makeMask = () => { throw new Error("full mask failed"); };
+        kvStorage(caches[1]!).makeMask = () => { throw new Error("full mask failed"); };
         using ids = tokens();
         expect(() => phaseHidden(model, ids, caches)).toThrow("full mask failed");
         expect(seen.masks.length).toBe(1);
@@ -599,7 +600,7 @@ describe.skipIf(!native)("Universal forward ownership", () => {
         counting(count => {
           const seen = instrument(model, caches);
           let failing: MlxArray | null = null;
-          caches[1]!.makeMask = (length: number) => {
+          kvStorage(caches[1]!).makeMask = (length: number) => {
             const arr = failing = createCausalMask(length, 0, null), release = arr.dispose.bind(arr);
             arr.dispose = () => { release(); throw new Error("mask release failed"); };
             return { mode: "array", arr };

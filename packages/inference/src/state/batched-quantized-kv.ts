@@ -5,7 +5,8 @@ import { BatchedKVCache } from "./batched-kv";
 import { KVCache } from "./kv";
 import { QuantizedKVCache } from "./quantized-kv";
 import { isQuantizedKvCache } from "./capabilities";
-import { type AttentionRead, type BatchableCache, type Cache, type CommittedAttentionCache, type Mask, type QuantizedAttentionState, type PaddedPrefillCache, type PrefillPadding } from "../contracts/mlx/cache";
+import { type AttentionRead, type BatchableCache, type Cache, type CommittedAttentionCache, type Mask, type PaddedPrefillCache, type PrefillPadding } from "../contracts/mlx/cache";
+import type { QuantizedAttentionState } from "./kv-storage";
 
 import { KvTensorRows } from "./kv-tensor-rows";
 import { quantizedDonorAttention } from "./kv-attention-view";

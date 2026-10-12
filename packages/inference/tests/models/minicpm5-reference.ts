@@ -42,6 +42,7 @@ import { disposeTriple } from "../../src/state/quantized-tensor";
 
 import { flashAttention,flashSupported,getTrainingAttn } from "../../src/kernels/attention/flash";
 import { compiledSwiglu } from "../../src/layers/swiglu";
+import { kvStorage } from "../../src/state/kv-storage";
 
 export class LlamaAttention {
   readonly qProj: QuantizedLinear;
@@ -97,31 +98,31 @@ export class LlamaAttention {
     q = disposing(q, ropeStep(q));
     k = disposing(k, ropeStep(k));
     let attn: MlxArray;
-    if (cache.attentionState) {
-      const view = cache.attentionState.appendAndFetch(k, v);
+    if (kvStorage(cache).attentionState) {
+      const view = kvStorage(cache).attentionState!.appendAndFetch(k, v);
       k.dispose(); v.dispose();
       try { attn = view.attend(q, this.scale, mask); } finally { view.dispose(); }
-    } else if (cache.quantizedAttention) {
-      const quantized = cache.quantizedAttention;
+    } else if (kvStorage(cache).quantizedAttention) {
+      const quantized = kvStorage(cache).quantizedAttention!;
       const [keys, values] = quantized.updateAndFetchQuantized(k, v);
       k.dispose();
       v.dispose();
       attn = quantizedSdpa(q, keys, values, this.scale, mask, quantized.groupSize, quantized.bits);
       disposeTriple(keys);
       disposeTriple(values);
-    } else if (cache.rotatedValueAttention) {
+    } else if (kvStorage(cache).rotatedValueAttention) {
       // Deferred-V: sdpa runs on rotated values, then one InvFWHT on the
       // output (linear in V) — see TurboQuantKVCache.updateAndFetchDeferredV.
-      const [keys, values] = cache.rotatedValueAttention.updateAndFetchDeferredV(k, v);
+      const [keys, values] = kvStorage(cache).rotatedValueAttention!.updateAndFetchDeferredV(k, v);
       k.dispose();
       v.dispose();
       const rotated = ops.sdpa(q, keys, values, this.scale, mask.mode, mask.arr);
       keys.dispose();
       values.dispose();
-      attn = cache.rotatedValueAttention.captureValueTransform?.()(rotated) ?? tqUnrotateValues(rotated);
+      attn = kvStorage(cache).rotatedValueAttention!.captureValueTransform?.()(rotated) ?? tqUnrotateValues(rotated);
       rotated.dispose();
     } else {
-      const [keys, values] = cache.updateAndFetch(k, v);
+      const [keys, values] = kvStorage(cache).updateAndFetch(k, v);
       k.dispose();
       v.dispose();
       // Training: ops.sdpa's dK vjp is wrong, so route the backward through
@@ -304,7 +305,7 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
   runLayerRange(h: MlxArray, aIdx: number, bIdx: number, cache: Cache[]): MlxArray {
     if (aIdx >= bIdx) return h;
     const L = h.shape[1]!;
-    const mask = cache[aIdx]!.makeMask(L, null);
+    const mask = kvStorage(cache[aIdx]!).makeMask(L, null);
     let cur = h;
     for (let i = aIdx; i < bIdx; i++) {
       const next = this.layers[i]!.forward(cur, mask, cache[i]!);

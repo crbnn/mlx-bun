@@ -9,13 +9,14 @@ import { KVCache } from "../../src/state/kv";
 import { type Cache } from "../../src/contracts/mlx/cache";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { configureRuntime, createRuntimeConfig, runtimeValue } from "../../src/runtime/config";
+import { kvStorage } from "../../src/state/kv-storage";
 
 function fixture() {
   const seen = { forwards: 0, steps: 0, allocations: 0, disposals: 0 };
   function advance(state: Cache[], length: number) {
     const kv = MlxArray.fromFloat32(new Float32Array(length * 4), [1, 1, length, 4]);
     try {
-      const outputs = state[0]!.updateAndFetch(kv, kv);
+      const outputs = kvStorage(state[0]!).updateAndFetch(kv, kv);
       for (const output of outputs) output.dispose();
     } finally { kv.dispose(); }
   }

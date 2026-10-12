@@ -12,6 +12,7 @@ import { turboQuantFusedDecode } from "../../src/state/turboquant-codec";
 import { settleTurbo } from "./convert-after-reference";
 import { cloneKvCaches } from "../../src/state/persistence";
 import { unrotateValues } from "../../src/kernels/turboquant/ops";
+import { kvStorage } from "../../src/state/kv-storage";
 
 function input(B: number, N: number, seed: number): MlxArray {
   using key = ops.randomKey(BigInt(seed));
@@ -74,8 +75,8 @@ for (const fused of ["0", "1"]) test(`delayed TQ preserves exact row boundaries,
         for (const [index, row] of reference.entries()) {
           using kr = k.slice([index, 0, 0, 0], [index + 1, 2, 1, 64]);
           using vr = v.slice([index, 0, 0, 0], [index + 1, 2, 1, 64]);
-          parts.push(row.rotatedValueAttention
-            ? row.rotatedValueAttention.updateAndFetchDeferredV(kr, vr) : row.updateAndFetch(kr, vr));
+          parts.push(kvStorage(row).rotatedValueAttention
+            ? kvStorage(row).rotatedValueAttention!.updateAndFetchDeferredV(kr, vr) : kvStorage(row).updateAndFetch(kr, vr));
           const extracted = group.extractRow(index);
           try { stateEqual(extracted, row); } finally { extracted.dispose(); }
         }
@@ -143,7 +144,7 @@ for (const fused of ["0", "1"]) test(`speculative delayed TQ converts committed 
       for (let row = 0; row < 2; row++) {
         using kr = k.slice([row, 0, 0, 0], [row + 1, 2, 4, 64]);
         using vr = v.slice([row, 0, 0, 0], [row + 1, 2, 4, 64]);
-        for (const a of reference[row]!.updateAndFetch(kr, vr)) a.dispose();
+        for (const a of kvStorage(reference[row]!).updateAndFetch(kr, vr)) a.dispose();
       }
       const keep = round === 0 ? [1, 2] : round === 1 ? [2, 1] : [4, 4];
       if (keep.every(n => n === 4)) group.specRoundCommit(); else group.specRoundRollback(keep);
