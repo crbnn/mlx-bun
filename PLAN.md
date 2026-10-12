@@ -738,7 +738,24 @@ unchanged.
       ARM64, m1max, gpu`, a launch agent in the logged-in session under `~/actions-runner`. No
       prior M1 Max numbers exist (the refactor came before measurement moved there); the check
       is paired, head against base on the same host in one run, so its first run on the
-      integration PR is the first M1 Max measurement of both. For a PR
+      integration PR is the first M1 Max measurement of both. Landed on the integration branch
+      (918a6afb): `.github/workflows/perf.yml` (pull requests to main touching kernels, layers,
+      models, state, execution, mlx or native sources; job-level guard so a fork's PR schedules
+      nothing on the runner; read-only token; one measurement at a time, never cancelled) and
+      `scripts/bench/perf-check.ts` (main's preflight thresholds; the paired delta as the
+      geometric mean of per-request ratios with a 95% Student-t interval; a metric fails only
+      when the whole interval is on the worse side; exit 0 pass / 1 regression / 2 no qualified
+      numbers). First run, 2026-10-12 on #339 (918a6afb vs main 9593d881), preflight clear
+      before and after, default configuration (bf16 KV, no drafter): Trellis 27B on the TQ
+      graph decode 14.4 → 14.3 tok/s (0.994 [0.989, 0.999], flagged), prefill 1k 123.4 →
+      125.5, cold TTFT 1k 6136 → 6032 ms; e4b on the generic graph decode 64.4 → 64.4, prefill
+      993.6 → 1001.1, TTFT 674 → 670 ms, all within noise. The flag is the per-step cost E2
+      removes (the TQ graph still runs through `deprecatedPhase` and the bf16-first wrapper on
+      every decode step); rerun after E2. Follow-ups: each tree runs in one server session, so
+      the interval covers request noise but not session drift; alternate sessions (ABAB) so
+      the band includes it. Add the DFlash 2 adaptive configuration (`--kv-quant 4`,
+      `--num-draft-tokens adaptive`) to `scripts/bench/plan.ts` so the served composition is
+      what the check measures; the drafter is in the M1 Max's hub cache since 2026-10-11. For a PR
       that touches `kernels/`, `layers/` or `models/`, run the existing paired serve benchmark
       against `main` with the preflight gate, and fail on a regression outside the paired noise
       band. Unqualified numbers never gate; the check reports the paired delta and its interval.
