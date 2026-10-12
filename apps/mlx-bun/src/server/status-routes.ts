@@ -1,29 +1,22 @@
 import { detectChip, fit, skuMatrix, thisMachine, type MachineSpec } from "@mlx-bun/inference/execution/fit";
+import type { KvCacheService } from "@mlx-bun/inference/state";
 import type { createCacheServices } from "../engine/cache-services";
 import type { GenerationGateway } from "../engine/generation-gateway";
 import type { LoadedModelContext } from "../engine/model-host";
 import type { ModelBinding } from "../engine/model-binding";
 
 type CacheServices = Awaited<ReturnType<typeof createCacheServices>>;
-type PromptCounters = Pick<CacheServices["promptCache"], "size" | "totalBytes" | "maxBytes" |
-  "hits" | "misses" | "sessionHits" | "sessionMisses" | "prefixScans" |
-  "objectHits" | "objectMisses" | "objectRestores" | "demotions">;
-type DiskCounters = Pick<NonNullable<CacheServices["checkpoints"]>, "entries" | "totalBytes" |
-  "maxBytes" | "longestDurablePrefixTokens"> & {
-    stats: Pick<NonNullable<CacheServices["checkpoints"]>["stats"], "restores" | "spills" | "restoreMsLast">;
-  };
 
 /** Read-only HTTP views borrow counters and metadata. They neither open model
- * storage nor acquire execution leases, and fit estimates never set admission. */
+ * storage nor acquire execution leases, and fit estimates never set admission.
+ * What the cache holds is the cache service's own report. */
 export function createStatusRoutes(input: {
   context: Pick<LoadedModelContext, "modelId" | "memoryPlan"> & {
     model: Pick<LoadedModelContext["model"], "config" | "weightsBytes">;
   };
-  caches: Pick<CacheServices, "stats"> & {
-    resolvedKvScheme: Pick<CacheServices["resolvedKvScheme"], "fitOptions" | "describe">;
-    promptCache: PromptCounters; checkpoints: DiskCounters | null;
-  };
-  gateway: Pick<GenerationGateway, "activeRows" | "pendingRows" | "submittedRows" | "kvBytes">;
+  cache: Pick<KvCacheService, "report">;
+  resolvedKvScheme: Pick<CacheServices["resolvedKvScheme"], "fitOptions" | "describe">;
+  gateway: Pick<GenerationGateway, "activeRows" | "pendingRows" | "submittedRows">;
   diagnostics: ModelBinding["diagnostics"];
   responseStats(): { entries: number; bytes: number; max_bytes: number; ttl_ms: number };
   /** The served artifact's registry sizes; a caller-built context may know neither (main's 0 and null). */
@@ -39,38 +32,38 @@ export function createStatusRoutes(input: {
   machine?: MachineSpec;
   chip?: string | null;
 }) {
-  const { context: ctx, caches, gateway } = input;
+  const { context: ctx, gateway } = input;
+  const kvScheme = input.resolvedKvScheme;
   const machine = input.machine ?? thisMachine();
   const chip = input.chip === undefined ? detectChip().name : input.chip;
   const plan = ctx.memoryPlan;
   const admission = plan ?? fit(ctx.model.config, ctx.model.weightsBytes, 1,
-    machine, undefined, 0, input.memoryBudgetBytes, caches.resolvedKvScheme.fitOptions);
+    machine, undefined, 0, input.memoryBudgetBytes, kvScheme.fitOptions);
 
   return { async handle(request: Request): Promise<Response | null> {
     if (request.method !== "GET") return null;
     const path = new URL(request.url).pathname;
     if (path === "/stats") {
-      const pc = caches.promptCache, disk = caches.checkpoints;
-      const pending = caches.stats();
+      const held = input.cache.report(), pc = held.prefixes, disk = held.saved, pending = held.pending;
       return Response.json({
         server: { owner: input.owner ?? "embedded", model: ctx.modelId, started_at: input.startedAt },
-        prompt_cache: { entries: pc.size, bytes: pc.totalBytes, max_bytes: pc.maxBytes,
+        prompt_cache: { entries: pc.entries, bytes: pc.bytes, max_bytes: pc.maxBytes,
           hits: pc.hits, misses: pc.misses, session_hits: pc.sessionHits, session_misses: pc.sessionMisses,
           prefix_scans: pc.prefixScans, object_hits: pc.objectHits, object_misses: pc.objectMisses, object_restores: pc.objectRestores },
-        ...(disk ? { ssd_cache: { dir: input.ssdCacheDir, entries: disk.entries, bytes: disk.totalBytes,
+        ...(disk ? { ssd_cache: { dir: input.ssdCacheDir, entries: disk.entries, bytes: disk.bytes,
           max_bytes: Number.isFinite(disk.maxBytes) ? disk.maxBytes : null,
-          restores: disk.stats.restores, spills: disk.stats.spills, restore_ms_last: Math.round(disk.stats.restoreMsLast),
+          restores: disk.restores, spills: disk.spills, restore_ms_last: Math.round(disk.restoreMsLast),
           demotions: pc.demotions, pending_snapshots: pending.pendingSnapshots, pending_spills: pending.pendingSpills,
           pending_spill_bytes: pending.pendingSpillBytes, dropped_spills: pending.droppedSpills, failed_spills: pending.failedSpills,
           longest_durable_prefix_tokens: disk.longestDurablePrefixTokens } } : {}),
         response_store: input.responseStats(),
-        kv_quant: caches.resolvedKvScheme.describe(ctx.model.config),
+        kv_quant: kvScheme.describe(ctx.model.config),
         admission: { max_safe_context: admission.maxSafeContext, enforced_context_tokens: input.contextLimit,
           memory_budget_bytes: plan?.usableBytes ?? input.memoryBudgetBytes ?? null, usable_bytes: admission.usableBytes, weights_bytes: ctx.model.weightsBytes },
         ...input.diagnostics(),
         batch: { configured: input.capacity, mode: "batch", batched: true,
           active_rows: gateway.activeRows, pending_rows: gateway.pendingRows, submitted_rows: gateway.submittedRows,
-          kv_bytes: gateway.kvBytes.projected, kv_budget_bytes: gateway.kvBytes.budget },
+          kv_bytes: held.kv.projectedBytes, kv_budget_bytes: held.kv.budgetBytes },
       });
     }
     if (path !== "/fit") return null;
@@ -95,12 +88,12 @@ export function createStatusRoutes(input: {
       });
     }
     const report = fit(ctx.model.config, ctx.model.weightsBytes, admission.maxSafeContext,
-      machine, undefined, input.artifact.expertsBytes, input.memoryBudgetBytes, caches.resolvedKvScheme.fitOptions);
+      machine, undefined, input.artifact.expertsBytes, input.memoryBudgetBytes, kvScheme.fitOptions);
     const typicalContext = Math.min(8192, admission.maxSafeContext);
     return Response.json({ machine: machineWire, context_tokens: admission.maxSafeContext,
       typical_context_tokens: typicalContext,
       typical_decode_tps: fit(ctx.model.config, ctx.model.weightsBytes, typicalContext,
-        machine, undefined, input.artifact.expertsBytes, input.memoryBudgetBytes, caches.resolvedKvScheme.fitOptions).predictedDecodeTps,
+        machine, undefined, input.artifact.expertsBytes, input.memoryBudgetBytes, kvScheme.fitOptions).predictedDecodeTps,
       // The old EvalDB and machine-specific historical measurements are not
       // live evidence for this server. Preserve the fields without inventing data.
       measured_decode_tps: null, measured_at: null,

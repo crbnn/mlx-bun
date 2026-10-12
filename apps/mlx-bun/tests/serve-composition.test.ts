@@ -161,12 +161,14 @@ test("the model host takes persistent services by parameter, mounts the app's ro
     const group = name => ({ async handle() { visited.push(name); return null; } });
     const context = { modelId: "test", model: { config: { text: { maxPositionEmbeddings: 4096 } }, weightsBytes: 1e9 }, memoryPlan: null, tokenizer: {},
       template: { supportsThinking: false }, genDefaults: {}, draft: null, dispose() { events.push("model close"); } };
-    const cache = { promptCache: { totalBytes: 0 }, resolvedKvScheme: { mode: "off", fitOptions: undefined }, kvScheme: {}, stateCodecs: {}, adapterNamespace() {},
-      checkpoints: null, continuationServices: {}, stopIdleDemotion() { events.push("timer stop"); }, async close() { events.push("cache close"); return { durable: true }; } };
-    const gateway = { activeRows: 0, kvBytes: { projected: 0, budget: null }, async acquireExecutionLease(signal) { events.push("lease"); return { dispose() {} }; }, async runExclusive(fn) { return fn(); } };
+    const cache = { cache: { savedPrefixes: () => [], set onPut(_observe) {},
+        report: () => ({ prefixes: { entries: 0, bytes: 0, maxBytes: 0, hits: 0, misses: 0 }, saved: null, kv: { projectedBytes: 0, budgetBytes: null } }),
+        stopIdleDemotion() { events.push("timer stop"); }, async close() { events.push("cache close"); return { durable: true }; } },
+      resolvedKvScheme: { mode: "off", fitOptions: undefined }, adapterNamespace() {} };
+    const gateway = { activeRows: 0, async acquireExecutionLease(signal) { events.push("lease"); return { dispose() {} }; }, async runExclusive(fn) { return fn(); } };
     let engine;
     mock.module(app + "src/engine/index.ts", () => ({
-      loadContext: async () => context, modelServingBinding: async () => ({ discovery: { embeddings: false }, gateway: { configureContinuation() {} } }),
+      loadContext: async () => context, modelServingBinding: async () => ({ discovery: { embeddings: false }, gateway: {} }),
       createCacheServices: async () => cache,
       createAppEngine: async (_context, options) => engine = { gateway, async close() { events.push("engine close"); await options.beforeModelDispose(); context.dispose(); } },
     }));
@@ -262,12 +264,14 @@ test("two sequential model hosts share one persistent state; only the app closes
     const events = [], loads = [];
     const contextFor = path => ({ modelId: path, model: { config: { text: { maxPositionEmbeddings: 4096 } }, weightsBytes: 1e9 }, memoryPlan: null, tokenizer: {},
       template: { supportsThinking: false }, genDefaults: {}, draft: null, dispose() { events.push("model close " + path); } });
-    const cache = { promptCache: { totalBytes: 0 }, resolvedKvScheme: { mode: "off", fitOptions: undefined }, kvScheme: {}, stateCodecs: {}, adapterNamespace() {},
-      checkpoints: null, continuationServices: {}, stopIdleDemotion() {}, async close() { return { durable: true }; } };
+    const cache = { cache: { savedPrefixes: () => [], set onPut(_observe) {},
+        report: () => ({ prefixes: { entries: 0, bytes: 0, maxBytes: 0, hits: 0, misses: 0 }, saved: null, kv: { projectedBytes: 0, budgetBytes: null } }),
+        stopIdleDemotion() {}, async close() { return { durable: true }; } },
+      resolvedKvScheme: { mode: "off", fitOptions: undefined }, adapterNamespace() {} };
     mock.module(app + "src/engine/index.ts", () => ({
-      loadContext: async path => { loads.push(path); return contextFor(path); }, modelServingBinding: async () => ({ discovery: { embeddings: false }, gateway: { configureContinuation() {} } }),
+      loadContext: async path => { loads.push(path); return contextFor(path); }, modelServingBinding: async () => ({ discovery: { embeddings: false }, gateway: {} }),
       createCacheServices: async () => cache,
-      createAppEngine: async context => ({ gateway: { activeRows: 0, kvBytes: { projected: 0, budget: null } }, async close() { events.push("engine close " + context.modelId); context.dispose(); } }),
+      createAppEngine: async context => ({ gateway: { activeRows: 0 }, async close() { events.push("engine close " + context.modelId); context.dispose(); } }),
     }));
     mock.module("@mlx-bun/mlx/ffi", () => ({ maxRecommendedWorkingSetSize: () => 32e9, activeMemory: () => 0 }));
     const histories = [];

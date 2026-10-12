@@ -1,4 +1,4 @@
-import type { PromptCache } from "@mlx-bun/inference/state";
+import type { KvCacheService } from "@mlx-bun/inference/state";
 import { runtimeValue } from "@mlx-bun/inference/runtime/config";
 import { createPromptResponseTrace } from "@mlx-bun/inference/runtime/trace";
 import type { LoadedModelContext as ModelContext } from "../engine/model-host";
@@ -39,7 +39,8 @@ export function createCompletionRoutes(engine: {
   binding: Pick<ModelBinding, "discovery" | "embed">;
   gateway: Pick<GenerationGateway, "runExclusive">;
 }, options: RequestPrepOptions & {
-  promptCache: Pick<PromptCache, "peekPrefixLen"> & Partial<Pick<PromptCache, "objects">>;
+  /** The loaded model's cache service: the prefix peek and the encoder-output object cache. */
+  promptCache: Pick<KvCacheService, "peekPrefixLen"> & Partial<Pick<KvCacheService, "objects">>;
   contextLimit: number | null;
   defaultGeneratedTokens?: number;
   defaultAdapter?: string;
