@@ -1,18 +1,18 @@
-// D3 bit-identity gate for DiffusionGemma. The graph whose blocks read through
-// the cache (models/diffusion-gemma/model.ts: the window read for prefill and
-// continuation, the block read for the canvas pass, the encoder window read for
-// the vision prompt) against the frozen pre-D3 graph (diffusion-gemma-reference.ts,
-// deleted with this test after the merge), on small synthetic weights: six
-// layers (sliding, sliding, full, sliding, sliding, full) with the real model's
-// head shapes (sliding 256, full 512 with k reused as v and partial rotary), a
-// sliding window of 16 so prompts cross it, the parallel dense and 8-expert MoE
-// branch, self-conditioning, the tied 4-bit head and a two-layer vision tower
-// fed synthetic pixels. Text prefill, continuation (extendPrefill), the canvas
-// pass at several seeded denoising steps with self-conditioning feedback, the
-// vision prefill, the D1 entry point and seeded generation through the
-// denoising engine (both samplers, text and image): every logit, every soft
-// embedding and every cache tensor must agree to the bit, and generation must
-// produce the same tokens. No model, no download.
+// DiffusionGemma's graph over small synthetic weights, held to its recorded
+// digest (tests/fixtures/synthetic-digests/diffusion-gemma.json;
+// tests/models/synthetic-digest.ts): six layers (sliding, sliding, full,
+// sliding, sliding, full) with the real model's head shapes (sliding 256, full
+// 512 with k reused as v and partial rotary), a sliding window of 16 so prompts
+// cross it, the parallel dense and 8-expert MoE branch, self-conditioning, the
+// tied 4-bit head and a two-layer vision tower fed synthetic pixels. Text
+// prefill, continuation (extendPrefill), the canvas pass at several seeded
+// denoising steps with self-conditioning feedback, the vision prefill, the D1
+// entry point and seeded generation through the denoising engine (both
+// samplers, text and image): every logit, every soft embedding, every cache
+// tensor and the generated tokens. The digest was recorded from the tree whose
+// graph equalled the pre-D3 graph at maxDiff 0 on these cases, so it carries that
+// check forward. Then the composition's legos: paged bf16 against the bf16 lego
+// at maxDiff 0, the quantized forms by KL. No model, no download.
 import { afterAll, expect, test } from "bun:test";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
@@ -24,9 +24,10 @@ import { DenoisingKeys, denoiseSync, type DiffusionGenOptions } from "../../src/
 import { bindLegacyDenoisingModel } from "../../src/generation/bindings/denoising";
 import { disposeResources } from "../../src/runtime/resources";
 import { DiffusionGemmaModel } from "../../src/models/diffusion-gemma/model";
-import { DiffusionGemmaModel as FrozenDiffusionGemmaModel } from "./diffusion-gemma-reference";
+import { syntheticDigests, type DigestCase } from "./synthetic-digest";
 import { testComposition } from "./test-composition";
 import type { KvStorageScheme } from "../../src/contracts/portable/composition";
+
 
 const HIDDEN = 128, VOCAB = 256, HEADS = 4, SLIDING_KV = 2, SLIDING_DIM = 256, FULL_KV = 1, FULL_DIM = 512;
 const INTER = 128, EXPERTS = 8, TOP_K = 2, MOE_INTER = 64, WINDOW = 16, CANVAS = 24;
@@ -148,63 +149,21 @@ function artifact(): { weights: Weights; config: ModelConfig } {
   return { weights, config };
 }
 
-// ── Comparison ──────────────────────────────────────────────────────────────
+// ── Digest ──────────────────────────────────────────────────────────────────
 
-const results = new Map<string, { worst: number; tensors: number }>();
-const record = (label: string, diff: number, tensors: number) => {
-  const prior = results.get(label) ?? { worst: 0, tensors: 0 };
-  results.set(label, { worst: Math.max(prior.worst, diff), tensors: prior.tensors + tensors });
-};
-afterAll(() => {
-  for (const [label, { worst, tensors }] of results)
-    console.log(`diffusion-gemma-identity ${label}: maxDiff ${worst} over ${tensors} tensors`);
-});
-
-/** 0 when shape, dtype and bytes are equal; otherwise throws with the largest difference. */
-function maxDiff(actual: MlxArray, expected: MlxArray, what: string): number {
-  expect(actual.shape, what).toEqual(expected.shape);
-  expect(actual.dtype, what).toBe(expected.dtype);
-  using left = ops.contiguous(actual);
-  using right = ops.contiguous(expected);
-  const a = left.rawBytesView(), b = right.rawBytesView();
-  if (Buffer.from(a.buffer, a.byteOffset, a.byteLength).equals(Buffer.from(b.buffer, b.byteOffset, b.byteLength))) return 0;
-  using leftWide = left.astype(Dtype.float32);
-  using rightWide = right.astype(Dtype.float32);
-  const x = leftWide.toFloat32(), y = rightWide.toFloat32();
-  let worst = 0;
-  for (let i = 0; i < x.length; i++) worst = Math.max(worst, Math.abs(x[i]! - y[i]!));
-  throw new Error(`${what}: bytes differ, maxDiff ${worst}`);
-}
-
-/** Every tensor of every layer's cache, with its signature and offset, recorded under `category`. */
-function stateDiff(category: string, label: string, actual: readonly Cache[], expected: readonly Cache[]): void {
-  expect(actual.length).toBe(expected.length);
-  let worst = 0, count = 0;
-  for (let layer = 0; layer < expected.length; layer++) {
-    const a = actual[layer]!, b = expected[layer]!;
-    expect(a.signature(), `${label} layer ${layer}`).toBe(b.signature());
-    expect(a.offset, `${label} layer ${layer}`).toBe(b.offset);
-    const left = a.state(), right = b.state();
-    expect(left.length, `${label} layer ${layer}`).toBe(right.length);
-    expect(right.length, `${label} layer ${layer}`).toBeGreaterThan(0);
-    for (let i = 0; i < right.length; i++) { worst = Math.max(worst, maxDiff(left[i]!, right[i]!, `${label} layer ${layer} state ${i}`)); count++; }
-  }
-  record(category, worst, count);
-}
-
-/** Owned arrays from both graphs, disposed here, recorded under `category`. */
-function outputDiff(category: string, label: string, actual: MlxArray, expected: MlxArray): void {
-  try {
-    const diff = maxDiff(actual, expected, label);
-    using wide = expected.astype(Dtype.float32);
-    expect(wide.toFloat32().every(Number.isFinite), `${label} finite`).toBe(true);
-    record(category, diff, 1);
-  } finally { actual.dispose(); expected.dispose(); }
-}
-
+const digests = syntheticDigests("diffusion-gemma");
 const { weights, config } = artifact();
 const current = new DiffusionGemmaModel(weights, config, testComposition());
-const frozen = new FrozenDiffusionGemmaModel(weights, config);
+
+/** Same shape, dtype and bytes; both owned by the caller and disposed here. */
+function expectSame(label: string, actual: MlxArray, expected: MlxArray): void {
+  try {
+    expect(actual.shape, label).toEqual(expected.shape);
+    expect(actual.dtype, label).toBe(expected.dtype);
+    using left = ops.contiguous(actual), right = ops.contiguous(expected);
+    expect(Buffer.from(left.rawBytes()).equals(Buffer.from(right.rawBytes())), `${label} maxDiff 0`).toBe(true);
+  } finally { actual.dispose(); expected.dispose(); }
+}
 
 const prompt = (n: number, salt: number) => Array.from({ length: n }, (_, i) => (i * 37 + salt * 11 + 5) % 240);
 /** Channel-first synthetic pixels in [0, 1]: a 9x9 patch grid, nine soft tokens. */
@@ -219,32 +178,28 @@ const visionPrompt = (before: number, soft: number, after: number) =>
 
 /** The engine's canvas step with self-conditioning feedback: decoder logits at
  * the scheduled temperature, the argmax as the next canvas where the draw
- * accepts it, and the next soft embeddings, on both graphs, compared at every
- * step. Leaves both cache sets as they were (the canvas pass stores nothing). */
-function canvasSteps(label: string, caches: { current: Cache[]; frozen: Cache[] }, seed: bigint, steps: number): void {
+ * accepts it, and the next soft embeddings, each step handed to the digest.
+ * Leaves the cache set as it was (the canvas pass stores nothing). */
+function canvasSteps(digest: DigestCase, label: string, caches: Cache[], seed: bigint, steps: number): void {
   const keys = new DenoisingKeys(seed);
-  try { canvasStepsWith(keys, label, caches, steps); } finally { keys.dispose(); }
+  try { canvasStepsWith(digest, keys, label, caches, steps); } finally { keys.dispose(); }
 }
-function canvasStepsWith(keys: DenoisingKeys, label: string, caches: { current: Cache[]; frozen: Cache[] }, steps: number): void {
-  const kind = label.split(" ")[0]!;
-  using weightCurrent = current.dequantEmbedWeight();
-  using weightFrozen = frozen.dequantEmbedWeight();
-  outputDiff("dequantized embedding", `${label} embed weight`, ops.contiguous(weightCurrent), ops.contiguous(weightFrozen));
+function canvasStepsWith(digest: DigestCase, keys: DenoisingKeys, label: string, caches: Cache[], steps: number): void {
+  using weight = current.dequantEmbedWeight();
+  digest.tensors(`${label} embed weight`, weight);
   let canvas = keys.randint(VOCAB, [1, CANVAS]);
-  let feedback: { current: MlxArray; frozen: MlxArray } | null = null;
+  let feedback: MlxArray | null = null;
   try {
     for (let step = 1; step <= steps; step++) {
-      using lc = current.decoderLogits(canvas, caches.current, feedback?.current ?? null);
-      using lf = frozen.decoderLogits(canvas, caches.frozen, feedback?.frozen ?? null);
-      record(`${kind} canvas decoder logits`, maxDiff(lc, lf, `${label} step ${step} logits`), 1);
-      using temperature = ops.scalarLike(0.4 + 0.1 * step, lc);
-      using pc = ops.div(lc, temperature);
-      using pf = ops.div(lf, temperature);
-      const next = { current: current.softEmbeddings(pc, weightCurrent), frozen: frozen.softEmbeddings(pf, weightFrozen) };
-      if (feedback) { feedback.current.dispose(); feedback.frozen.dispose(); }
+      using logits = current.decoderLogits(canvas, caches, feedback);
+      digest.tensors(`${label} step ${step} logits`, logits);
+      using temperature = ops.scalarLike(0.4 + 0.1 * step, logits);
+      using scaled = ops.div(logits, temperature);
+      const next = current.softEmbeddings(scaled, weight);
+      feedback?.dispose();
       feedback = next;
-      record(`${kind} canvas soft embeddings`, maxDiff(next.current, next.frozen, `${label} step ${step} soft embeddings`), 1);
-      using argmax = ops.argmaxAxis(pc, -1);
+      digest.tensors(`${label} step ${step} soft embeddings`, next);
+      using argmax = ops.argmaxAxis(scaled, -1);
       using ids = argmax.astype(Dtype.int32);
       using noiseIds = keys.randint(VOCAB, [1, CANVAS]);
       using half = keys.randint(2, [1, CANVAS]);
@@ -253,69 +208,66 @@ function canvasStepsWith(keys: DenoisingKeys, label: string, caches: { current: 
       const nextCanvas = ops.where(accept, ids, noiseIds);
       canvas.dispose();
       canvas = nextCanvas;
-      stateDiff(`${kind} cache after a canvas pass`, `${label} step ${step} after canvas pass`, caches.current, caches.frozen);
+      digest.caches(`${label} step ${step} after canvas pass`, caches);
     }
   } finally {
     canvas.dispose();
-    if (feedback) { feedback.current.dispose(); feedback.frozen.dispose(); }
+    feedback?.dispose();
   }
 }
 
-/** Continuation over an accepted block of `length` tokens on both cache sets. */
-function extend(label: string, caches: { current: Cache[]; frozen: Cache[] }, length: number, salt: number): void {
+/** Continuation over an accepted block of `length` tokens. */
+function extend(digest: DigestCase, label: string, caches: Cache[], length: number, salt: number): void {
   using block = ops.fromInt32(prompt(length, salt), [1, length]);
-  current.extendPrefill(block, caches.current);
-  frozen.extendPrefill(block, caches.frozen);
-  stateDiff(`${label.split(" ")[0]} extendPrefill cache`, `${label} extendPrefill ${length}`, caches.current, caches.frozen);
+  current.extendPrefill(block, caches);
+  digest.caches(`${label} extendPrefill ${length}`, caches);
 }
 
-test("text: prefill, canvas passes and continuations are bit-identical across the window", () => {
-  // 5 < window - 1, 15 = window - 1 (no block mask), 16 and 37 past it (block mask and cut).
-  for (const length of [2, 5, 15, 16, 37]) {
-    const ids = prompt(length, length);
-    const caches = { current: current.prefill(ids), frozen: frozen.prefill(ids) };
-    try {
-      stateDiff("text prefill cache", `text prefill ${length}`, caches.current, caches.frozen);
-      canvasSteps(`text ${length}`, caches, BigInt(length), 4);
-      // Continuations: a full canvas block, then a short one that lands the ring mid-buffer.
-      extend(`text ${length}`, caches, CANVAS, 7);
-      canvasSteps(`text ${length} +${CANVAS}`, caches, BigInt(length) + 100n, 3);
-      extend(`text ${length} +${CANVAS}`, caches, 5, 9);
-      canvasSteps(`text ${length} +${CANVAS}+5`, caches, BigInt(length) + 200n, 2);
-    } finally { disposeResources([...caches.current, ...caches.frozen]); }
-  }
+// 5 < window - 1, 15 = window - 1 (no block mask), 16 and 37 past it (block mask and cut).
+for (const length of [2, 5, 15, 16, 37]) digests.test(`text ${length}: prefill, canvas passes and continuations across the window`, digest => {
+  const caches = current.prefill(prompt(length, length));
+  try {
+    digest.caches(`text prefill ${length}`, caches);
+    canvasSteps(digest, `text ${length}`, caches, BigInt(length), 4);
+    // Continuations: a full canvas block, then a short one that lands the ring mid-buffer.
+    extend(digest, `text ${length}`, caches, CANVAS, 7);
+    canvasSteps(digest, `text ${length} +${CANVAS}`, caches, BigInt(length) + 100n, 3);
+    extend(digest, `text ${length} +${CANVAS}`, caches, 5, 9);
+    canvasSteps(digest, `text ${length} +${CANVAS}+5`, caches, BigInt(length) + 200n, 2);
+  } finally { disposeResources(caches); }
 }, 120_000);
 
-test("vision: the encoder window over synthetic pixels is bit-identical, inside and past the sliding window", () => {
-  for (const [before, after] of [[0, 1], [2, 3], [8, 13]] as const) {
+for (const [before, after] of [[0, 1], [2, 3], [8, 13]] as const) {
+  digests.test(`vision ${before}+${after}: the encoder window over synthetic pixels, inside and past the sliding window`, digest => {
     const ids = visionPrompt(before, VISION.output, after);
     using image = pixels(before + 1);
-    const caches = { current: current.prefillVision(ids, image), frozen: frozen.prefillVision(ids, image) };
+    const caches = current.prefillVision(ids, image);
     try {
-      stateDiff("vision prefill cache", `vision prefill ${ids.length}`, caches.current, caches.frozen);
-      canvasSteps(`vision ${ids.length}`, caches, BigInt(ids.length), 3);
-      extend(`vision ${ids.length}`, caches, CANVAS, 11);
-      canvasSteps(`vision ${ids.length} +${CANVAS}`, caches, BigInt(ids.length) + 50n, 2);
-    } finally { disposeResources([...caches.current, ...caches.frozen]); }
-  }
-  // The longest prompt crosses the window, where the encoder read differs from a windowed one.
+      digest.caches(`vision prefill ${ids.length}`, caches);
+      canvasSteps(digest, `vision ${ids.length}`, caches, BigInt(ids.length), 3);
+      extend(digest, `vision ${ids.length}`, caches, CANVAS, 11);
+      canvasSteps(digest, `vision ${ids.length} +${CANVAS}`, caches, BigInt(ids.length) + 50n, 2);
+    } finally { disposeResources(caches); }
+  }, 120_000);
+}
+test("the longest vision prompt crosses the window, where the encoder read differs from a windowed one", () => {
   expect(visionPrompt(8, VISION.output, 13).length).toBeGreaterThan(WINDOW);
-}, 120_000);
+});
 
-test("D1 entry and the training forward: forwardCanvasLogits and forwardCanvasLogitsArr are bit-identical", () => {
+digests.test("D1 entry and the training forward: forwardCanvasLogits and forwardCanvasLogitsArr", digest => {
   for (const length of [6, 29]) {
     const ids = prompt(length, 2 * length), canvas = prompt(CANVAS, length);
-    outputDiff("forwardCanvasLogits logits", `forwardCanvasLogits ${length}`,
-      current.forwardCanvasLogits(ids, canvas), frozen.forwardCanvasLogits(ids, canvas));
+    using logits = current.forwardCanvasLogits(ids, canvas);
+    digest.tensors(`forwardCanvasLogits ${length}`, logits);
     using canvasArr = ops.fromInt32(canvas, [1, CANVAS]);
-    outputDiff("forwardCanvasLogitsArr logits", `forwardCanvasLogitsArr ${length}`,
-      current.forwardCanvasLogitsArr(ids, canvasArr), frozen.forwardCanvasLogitsArr(ids, canvasArr));
+    using logitsArr = current.forwardCanvasLogitsArr(ids, canvasArr);
+    digest.tensors(`forwardCanvasLogitsArr ${length}`, logitsArr);
   }
 }, 120_000);
 
 /** One seeded run through the denoising engine, recording every step's logits and the final state. */
-function generate(model: DiffusionGemmaModel | FrozenDiffusionGemmaModel, ids: number[], options: DiffusionGenOptions) {
-  const { graph } = bindLegacyDenoisingModel(model);
+function generate(ids: number[], options: DiffusionGenOptions) {
+  const { graph } = bindLegacyDenoisingModel(current);
   const logits: MlxArray[] = [];
   const closed: Cache[][] = [];
   const result = denoiseSync({ ...graph,
@@ -330,29 +282,25 @@ function generate(model: DiffusionGemmaModel | FrozenDiffusionGemmaModel, ids: n
   return { result, logits, state: closed[0]! };
 }
 
-test("seeded generation: the denoising engine produces identical tokens, step logits and final caches", () => {
-  const runs: { label: string; ids: number[]; image?: () => MlxArray }[] = [
-    { label: "text 9", ids: prompt(9, 1) },
-    { label: "text 30", ids: prompt(30, 5) },
-    { label: "vision", ids: visionPrompt(4, VISION.output, 6), image: () => pixels(3) },
-  ];
-  for (const run of runs) for (const sampler of ["confidence-threshold", "entropy-bound"] as const) for (const seed of [0n, 11n]) {
+const runs: { label: string; ids: number[]; image?: () => MlxArray }[] = [
+  { label: "text 9", ids: prompt(9, 1) },
+  { label: "text 30", ids: prompt(30, 5) },
+  { label: "vision", ids: visionPrompt(4, VISION.output, 6), image: () => pixels(3) },
+];
+for (const run of runs) digests.test(`seeded generation, ${run.label}: the denoising engine's tokens, step logits and final caches`, digest => {
+  for (const sampler of ["confidence-threshold", "entropy-bound"] as const) for (const seed of [0n, 11n]) {
     const image = run.image?.();
     const options: DiffusionGenOptions = { maxTokens: 2 * CANVAS + 10, maxDenoisingSteps: 4, minCanvasLength: 8,
       sampler, seed, eosTokenIds: [], visionPixels: image };
-    const label = `generate ${run.label} ${sampler} seed ${seed}`;
-    const a = generate(current, run.ids, options);
-    const b = generate(frozen, run.ids, options);
+    const label = `${sampler} seed ${seed}`;
+    const a = generate(run.ids, options);
     try {
-      expect(a.result, label).toEqual(b.result);
       expect(a.result.blocks.length, label).toBeGreaterThan(1);
-      expect(a.logits.length, label).toBe(b.logits.length);
-      let worst = 0;
-      for (let i = 0; i < b.logits.length; i++) worst = Math.max(worst, maxDiff(a.logits[i]!, b.logits[i]!, `${label} step ${i} logits`));
-      record("generation step logits", worst, b.logits.length);
-      stateDiff("generation final cache", label, a.state, b.state);
+      digest.value(`${label} result`, a.result);
+      digest.tensors(`${label} step logits`, ...a.logits);
+      digest.caches(`${label} final cache`, a.state);
     } finally {
-      disposeResources([...a.logits, ...b.logits, ...a.state, ...b.state]);
+      disposeResources([...a.logits, ...a.state]);
       image?.dispose();
     }
   }
@@ -360,40 +308,37 @@ test("seeded generation: the denoising engine produces identical tokens, step lo
 
 // The composition's KV scheme and paging (B4): makeCache composes the legos
 // they name. Bf16 pages read the bf16 lego's bits, so the paged graph's canvas
-// logits equal the frozen bf16 graph's at maxDiff 0 over text and vision
-// prompts and continuations. The quantized forms have no oracle (no DiffusionGemma
-// weights run here): their canvas logits are compared with the bf16 graph's on
-// the same canvases, by KL, and reported.
+// logits equal the bf16 lego's at maxDiff 0 over text and vision prompts and
+// continuations. The quantized forms have no oracle: their canvas logits are
+// compared with the bf16 graph's on the same canvases, by KL, and reported.
 const composedGraph = (kv: KvStorageScheme, paged: boolean) =>
   new DiffusionGemmaModel(weights, config, testComposition(kv, paged ? { pagedKv: { blockSize: 16, direct: false } } : {}));
 
-test("the composition's paging: paged bf16 canvas passes equal the frozen bf16 graph's", () => {
+test("the composition's paging: paged bf16 canvas passes equal the bf16 lego's", () => {
   const paged = composedGraph({ kind: "bf16" }, true);
   for (const length of [5, 37]) {
     const ids = prompt(length, length);
-    const caches = { current: paged.prefill(ids), frozen: frozen.prefill(ids) };
+    const caches = { paged: paged.prefill(ids), plain: current.prefill(ids) };
     try {
-      expect(caches.current.filter(cache => cache.signature() === "kv:paged").length).toBe(2);
+      expect(caches.paged.filter(cache => cache.signature() === "kv:paged").length).toBe(2);
       const step = (label: string, salt: number) => {
         using canvas = ops.fromInt32(prompt(CANVAS, salt), [1, CANVAS]);
-        outputDiff("paged bf16 canvas logits", label, paged.decoderLogits(canvas, caches.current, null),
-          frozen.decoderLogits(canvas, caches.frozen, null));
+        expectSame(label, paged.decoderLogits(canvas, caches.paged, null), current.decoderLogits(canvas, caches.plain, null));
       };
       step(`paged text ${length}`, 3);
       using block = ops.fromInt32(prompt(CANVAS, 7), [1, CANVAS]);
-      paged.extendPrefill(block, caches.current);
-      frozen.extendPrefill(block, caches.frozen);
+      paged.extendPrefill(block, caches.paged);
+      current.extendPrefill(block, caches.plain);
       step(`paged text ${length} +${CANVAS}`, 4);
-    } finally { disposeResources([...caches.current, ...caches.frozen]); }
+    } finally { disposeResources([...caches.paged, ...caches.plain]); }
   }
   const ids = visionPrompt(8, VISION.output, 13);
   using image = pixels(9);
-  const caches = { current: paged.prefillVision(ids, image), frozen: frozen.prefillVision(ids, image) };
+  const caches = { paged: paged.prefillVision(ids, image), plain: current.prefillVision(ids, image) };
   try {
     using canvas = ops.fromInt32(prompt(CANVAS, 5), [1, CANVAS]);
-    outputDiff("paged bf16 canvas logits", "paged vision", paged.decoderLogits(canvas, caches.current, null),
-      frozen.decoderLogits(canvas, caches.frozen, null));
-  } finally { disposeResources([...caches.current, ...caches.frozen]); }
+    expectSame("paged vision", paged.decoderLogits(canvas, caches.paged, null), current.decoderLogits(canvas, caches.plain, null));
+  } finally { disposeResources([...caches.paged, ...caches.plain]); }
 }, 120_000);
 
 /** KL(bf16 ‖ form) per canvas position, from two logit tensors [1, positions, vocab]. */
