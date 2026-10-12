@@ -98,7 +98,10 @@ const commands = {
     "batch-size": { type: "string", description: "Rows per forward [default: 8]" },
     seed: { type: "string", description: "Sample-shuffle seed [default: 123]" },
   } },
-
+  "compile-ane": { description: "Compile the Neural Engine programs this Mac's models use, once (the install step)", positional: "",
+    details: "Compiles every Neural Engine program the models mlx-bun ships load on this Mac into the system's compile\ncache, then exits. The installer runs it; otherwise the first launch of a new version runs it before\nloading a model. Loading a model only loads its programs from the cache (about 4 ms each) and never\ncompiles: a model whose program is missing fails to load and names this command. The cache belongs to\nthe executable that compiled it, so run the same mlx-bun that serves. Programs are built for the prefill\nchunk size (MLX_BUN_RD_PREFILL_CHUNK), so run it in the environment you serve in.", options: {
+    check: { type: "boolean", description: "List each program and whether the compile cache holds it; compile nothing (exit 1 when one is missing)" },
+  } },
 } satisfies Record<string, { description: string; positional: string; usage?: string; details?: string; options: Record<string, { type: "string" | "boolean"; description: string; short?: string }> }>;
 export type Command = keyof typeof commands;
 export type CommandArgs = { values: Record<string, string | boolean | undefined>; positionals: string[] };
@@ -170,5 +173,5 @@ export function help(command?: string): string {
   if (!isCommand(command)) throw new Error(`Unknown command: ${command}`);
   const info = commands[command];
   const details = (info as { details?: string }).details;
-  return `mlx-bun ${command} — ${info.description}\n\nUsage: mlx-bun ${command} ${info.positional} [options]\n${details ? `\n${details}\n` : ""}\nOptions:\n${Object.entries(info.options).map(([name, option]: [string, { type: string; description: string; short?: string }]) => `  ${((option.short ? `-${option.short}, ` : "") + `--${name}` + (option.type === "string" ? " <value>" : "")).padEnd(24)} ${option.description}`).join("\n")}\n  -h, --help               Show help`;
+  return `mlx-bun ${command} — ${info.description}\n\nUsage: mlx-bun ${command}${info.positional ? ` ${info.positional}` : ""} [options]\n${details ? `\n${details}\n` : ""}\nOptions:\n${Object.entries(info.options).map(([name, option]: [string, { type: string; description: string; short?: string }]) => `  ${((option.short ? `-${option.short}, ` : "") + `--${name}` + (option.type === "string" ? " <value>" : "")).padEnd(24)} ${option.description}`).join("\n")}\n  -h, --help               Show help`;
 }

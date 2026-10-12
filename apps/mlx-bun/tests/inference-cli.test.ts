@@ -311,10 +311,12 @@ test("production CLI composition requests optional templates and a continuous en
     import { mock } from "bun:test";
     import { strict as assert } from "node:assert";
     const app = ${JSON.stringify(app)};
-    let loaded = 0, opened = 0, closed = 0, output = "";
+    let loaded = 0, opened = 0, closed = 0, installs = 0, output = "";
     const context = { modelId: "test", model: { config: {} }, template: null, kvConfig: null,
       tokenizer: { encode: (text, special) => { assert.equal(text, "hello"); assert.equal(special, true); return [1]; },
         decode: (ids, special) => { assert.deepEqual(ids, [2]); assert.equal(special, true); return "answer"; } } };
+    // The first launch's Neural Engine install step runs before every model load (it skips itself once recorded).
+    mock.module(app + "src/cli/ane-install.ts", () => ({ ensureAneInstall: async () => { installs++; assert.equal(installs, loaded + 1); } }));
     mock.module(app + "src/engine/model-host.ts", () => ({ loadContext: async (path, id, options) => {
       loaded++; assert.equal(path, "/unused"); assert.equal(id, "test");
       assert.deepEqual(options, { requireChatTemplate: false, runtime: { nativeDraft: false, maxGenerationTokens: loaded === 1 ? 256 : undefined },
@@ -335,7 +337,7 @@ test("production CLI composition requests optional templates and a continuous en
     await runInference("embed", { positionals: [], values: {} }, {
       resolve: async () => ({ path: "/unused", repoId: "test" }), write: text => { output += text; },
     });
-    assert.equal(output, "answer\\n[5]\\n[4]\\n"); assert.equal(loaded, 2); assert.equal(opened, 2); assert.equal(closed, 2);
+    assert.equal(output, "answer\\n[5]\\n[4]\\n"); assert.equal(loaded, 2); assert.equal(opened, 2); assert.equal(closed, 2); assert.equal(installs, 2);
   `;
   const child = Bun.spawn([process.execPath, "--eval", script], { stdin: "pipe", stdout: "pipe", stderr: "pipe",
     env: { ...process.env, MLX_BUN_LIBMLXC: "/nonexistent" } });

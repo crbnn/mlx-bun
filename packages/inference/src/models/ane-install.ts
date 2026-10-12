@@ -53,6 +53,12 @@ export function aneInstallPrograms(options: AneInstallOptions = {}): AneInstallP
   return [...programs.values()];
 }
 
+/** Each program {@link aneInstallPrograms} lists and whether this Mac's Neural Engine compile cache holds it for
+ * this process (the framework's `compiledModelExists`). Compiles nothing. */
+export function aneInstallStatus(options: AneInstallOptions = {}): (AneInstallProgram & { readonly cached: boolean })[] {
+  return aneInstallPrograms(options).map(program => ({ ...program, cached: AneProgram.cached(program.spec) }));
+}
+
 /** The install step: compiles every program {@link aneInstallPrograms} lists into this Mac's Neural Engine
  * compile cache, skipping those already there, and returns what it did for each, in order (`onProgram` hears each
  * as it finishes). Throws `AneBridgeError` when the bridge does not load or the compiler refuses a program. */

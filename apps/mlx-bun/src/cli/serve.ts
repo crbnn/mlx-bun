@@ -388,6 +388,9 @@ export async function probeServer(hostname: string, port: number, timeoutMs = 15
 
 export interface ServeDependencies {
   resolve: typeof resolveModelAuto;
+  /** The Neural Engine install step when this version has not run it on this machine (the app's first launch),
+   * before the chat model loads (`ensureAneInstall`). */
+  installAne(): Promise<void>;
   start: typeof startModelServer;
   startTranscription: typeof startTranscriptionServer;
   interactive: boolean;
@@ -400,7 +403,8 @@ export interface ServeDependencies {
   error(error: unknown): void;
 }
 const defaults: ServeDependencies = {
-  resolve: resolveModelAuto, start: startModelServer, startTranscription: startTranscriptionServer, interactive: !!process.stdout.isTTY,
+  resolve: resolveModelAuto, installAne: async () => (await import("./ane-install")).ensureAneInstall(),
+  start: startModelServer, startTranscription: startTranscriptionServer, interactive: !!process.stdout.isTTY,
   probe: (hostname, port) => probeServer(hostname, port), open: url => openChatUi(url),
   log: message => console.log(message), signals: process, exit: code => process.exit(code),
   error: error => console.error(error instanceof Error ? error.message : String(error)),
@@ -459,6 +463,8 @@ export async function runServe(args: CommandArgs, supplied: Partial<ServeDepende
           throw new Error(`--whisper-model ${options.whisper.model} resolved to ${whisper.m.repoId} (model_type ${whisper.m.modelType}), not a Whisper checkpoint`);
         options = { ...options, whisper: { ...options.whisper, modelDir: whisper.m.path, modelId: whisper.m.repoId } };
       }
+      await deps.installAne();
+      startup.signal.throwIfAborted();
       deps.log(`Loading ${selection.m.repoId}${selection.picked ? " (auto-selected)" : ""}`);
       running = await deps.start(selection.m, options);
     }

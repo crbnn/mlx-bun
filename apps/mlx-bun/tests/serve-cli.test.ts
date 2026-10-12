@@ -138,18 +138,30 @@ test("invalid serving input fails before model selection", async () => {
 function runtime(interactive = true) {
   const signals = new EventEmitter(), opens: string[] = [], exits: number[] = [], errors: unknown[] = [], starts: ServeOptions[] = [];
   const downloads: string[] = [], logs: string[] = [], transcriptionStarts: [ModelRecord, ServeOptions][] = [];
+  /** The install step and model starts in the order they ran. */
+  const steps: string[] = [];
   let closes = 0;
   const dependencies: ServeDependencies = {
     resolve: async () => ({ m: model, picked: true }),
-    start: async (m, options) => { expect(m).toBe(model); starts.push(options); return { port: 4321,
+    installAne: async () => { steps.push("install"); },
+    start: async (m, options) => { expect(m).toBe(model); steps.push("start"); starts.push(options); return { port: 4321,
       downloads: { start: repo => { downloads.push(repo); }, active: [] }, close: async () => { closes++; } }; },
-    startTranscription: async (m, options) => { transcriptionStarts.push([m, options]); return { port: 4321,
+    startTranscription: async (m, options) => { steps.push("transcription"); transcriptionStarts.push([m, options]); return { port: 4321,
       downloads: { start() { throw new Error("no downloads"); }, active: [] }, close: async () => { closes++; } }; },
     interactive, probe: async () => null, open: url => { opens.push(url); }, log: message => { logs.push(message); }, signals,
     exit: code => { exits.push(code); }, error: error => { errors.push(error); },
   };
-  return { dependencies, signals, opens, exits, errors, starts, transcriptionStarts, downloads, logs, closes: () => closes };
+  return { dependencies, signals, opens, exits, errors, starts, transcriptionStarts, downloads, logs, steps, closes: () => closes };
 }
+
+test("the Neural Engine install step runs before a chat model starts, and not for the transcription-only server", async () => {
+  const run = runtime(false);
+  const app = await runServe(parseCommand("serve", ["--port", "0"]), run.dependencies);
+  await app.close();
+  const whisper = { repoId: "mlx-community/whisper-large-v3-turbo", path: "/whisper", modelType: "whisper" } as ModelRecord;
+  await runServe(parseCommand("serve", ["whisper"]), { ...run.dependencies, resolve: async () => ({ m: whisper, picked: false }) });
+  expect(run.steps).toEqual(["install", "start", "transcription"]);
+});
 
 test("isolated model workers are the default; --in-process opts out, --isolate is a deprecated no-op, and --model-budget is a positive number of GB", async () => {
   expect(parse()).not.toHaveProperty("inProcess");

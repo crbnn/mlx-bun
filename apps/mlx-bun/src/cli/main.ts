@@ -47,7 +47,8 @@ try {
       finally { process.off("SIGINT", stop); process.off("SIGTERM", stop); }
     } else if (command === "perplexity") {
       await (await import("./perplexity")).runPerplexity(parsed);
-
+    } else if (command === "compile-ane") {
+      process.exitCode = await (await import("./ane-install")).runCompileAne(parsed);
     }
   }
 } catch (error) {
