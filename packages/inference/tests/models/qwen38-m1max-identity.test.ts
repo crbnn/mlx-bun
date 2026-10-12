@@ -427,9 +427,12 @@ describe("Qwen3.8 M1 Max graph on the real artifact", () => {
     if (shared) return shared;
     const { Weights } = await import("../../src/artifacts/weights");
     const { loadModelConfig } = await import("../../src/artifacts/config");
+    const { qwen35WeightsView } = await import("../../src/models/qwen/checkpoint");
     const config = await loadModelConfig(ARTIFACT!);
     const weights = await Weights.open(ARTIFACT!);
-    // The generated graph installs the checkpoint view; the TQ graph reads through it and must not install it again.
+    // The checkpoint view both graphs install, installed once here; every graph reads through it and installs nothing.
+    const installed = qwen35WeightsView(weights);
+    if (installed) weights.setView(installed);
     const view = {
       tensor: (name: string) => weights.tensor(name), has: (name: string) => weights.has(name), info: (name: string) => weights.info(name),
       get tensorNames() { return weights.tensorNames; }, shards: weights.shards, setView: () => {},
@@ -441,9 +444,9 @@ describe("Qwen3.8 M1 Max graph on the real artifact", () => {
 
   for (const scheme of Object.keys(SCHEMES))
     test.skipIf(!ARTIFACT || !g13s)(`${scheme}: 2048-token chunk, tails, decodes, verify 2 to 12 with capture, known tokens, two and four sequences`, async () => {
-      const { weights, config, view } = await open();
+      const { config, view } = await open();
       const facts = composition({ kv: SCHEMES[scheme]!, prefillChunkTokens: 2048 });
-      const currentGraph = new Qwen38TrellisM1Max(weights, config, facts);
+      const currentGraph = new Qwen38TrellisM1Max(view, config, facts);
       const oldGraph = new FrozenTQ(view, config, facts);
       const p: Pair = { old: oldGraph as unknown as Graph, current: currentGraph as unknown as Graph, oldGraph, currentGraph };
       const caches = { old: p.old.makeCache(), current: p.current.makeCache() };
