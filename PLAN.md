@@ -522,8 +522,16 @@ Exit: no graph reads `quantizedAttention`; bit-identical generic forwards.
       M4 Pro graph ran its own internal fallback; the app-path digests differ for those two
       schemes (every other artifact and scheme equals base). The generic graph is the loader's
       selection by design; the old fallback was the path this refactor deletes, and the generic
-      graph's numbers are what main served before the M4 Pro graph existed. Owed: a
-      teacher-forced KL of merged vs base on the artifact under kv8 and turbo, recorded here.
+      graph's numbers are what main served before the M4 Pro graph existed. Measured
+      (teacher-forced decode KL, 16 default prompts cut to 256 tokens, last 32 teacher-forced,
+      487 positions, base 30412523 → d71467c4): kv8 mean 9.4e-4 (median 5.8e-4, p95 2.4e-3,
+      argmax agrees 476/487), turbo mean 1.7e-3 (median 1.2e-3, p95 5.5e-3, 473/487); bf16
+      control byte-identical. Scale: kv8's own cost over bf16 on base is 9.8e-4 and turbo's
+      6.1e-3, so the graph change costs about one kv8 quantization and a quarter of a turbo
+      one. The tiled null is 0 at the method's own settings (no multi-query read ever touches
+      a quantized cache for prompts under one chunk); with a 2-token chunk it is 1.6e-4 (the
+      four prompts that get such reads: null 6.6e-4 vs 7.2e-4 for the change). Limit: the
+      default prompts give contexts of at most about 48 tokens. Accepted.
 
 Exit: selection is data; `qwen38TrellisM4ProAccepts` and the nested ternary are gone.
 
@@ -632,9 +640,10 @@ paired batched-lane benchmark records the gain at one and four rows.
       grammar jump through the speculative method, so e4b is not a model that test accepts).
       Under `--kv-quant 4` the Trellis app-path digests differ from base: base served the
       generic read (D1's regression, logits 0.028), merged serves the composed KV4 lego, which
-      E3's gate proved equal to the old graph's injected cores. Owed: the app-path digest on
-      `main` (9593d881) for the artifact under kv4 equals merged's, closing the loop through the
-      scheduler. The generated Gemma graphs needed no new read: with D2 merged they have no
+      E3's gate proved equal to the old graph's injected cores. Closed: the app-path digests on
+      `main` (9593d881) under kv4 with `--fused-sdpa` unset, on and off, and bf16, equal
+      d71467c4's token for token and logprob for logprob (`69e8cc07…` / `ee58a136…` for kv4),
+      so the loop is closed through the scheduler. The generated Gemma graphs needed no new read: with D2 merged they have no
       run-time match, the template builds the bf16-first lego on every listed cache, and the
       gate records every cache read (bf16 first, quantized after) with digests equal to base.
 
@@ -722,6 +731,12 @@ unchanged.
       band. Unqualified numbers never gate; the check reports the paired delta and its interval.
 - [ ] Agent briefs for this plan point at the generator and the contract, never at an example
       file to copy; copying the nearest example is how the M4 Pro graph inherited the fallback.
+- [ ] The app-path digest (token ids plus top-8 logprobs over 32 greedy tokens through
+      `generate`, per KV scheme and `--fused-sdpa` setting) and the teacher-forced decode KL
+      (the 16 default prompts, last 32 tokens forced, `klPerToken`) become
+      `packages/inference/scripts/` tools with `--help`: three agents reconstructed each from
+      earlier transcripts (E3, the merge, the Trellis checks). Their consumer is every gate in
+      this plan and the perf workflow's correctness check.
 - [x] ARCHITECTURE.md: the cache owns the read; phases are named; a specialized graph extends
       nothing; the exemplar sentence points at the regenerated graphs; the loader-level generic
       fallback is stated and the in-graph one forbidden; the one-way-per-pattern list above.
