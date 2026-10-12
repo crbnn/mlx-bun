@@ -22,8 +22,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { createCausalMask } from "../kernels/attention/masks";
 import { type AttentionCache, type AttentionRead, type Cache, type Mask } from "../contracts/mlx/cache";
 import { AttentionMasks, sdpaRead } from "../state/attention-read";
-import { isRecurrentCache } from "../state/capabilities";
-import { TrainingCache, TrainingSSMCache } from "../state/training-cache";
+import { TrainingCache, TrainingSSMCache, trainingStandIn } from "../state/training-cache";
 import type { RuntimeModel } from "../models/factory";
 import { widthClass } from "../contracts/mlx/width";
 
@@ -65,8 +64,7 @@ export function trainForwardHidden(
   // keeps its layer's sliding window, and they share one mask memo.
   const probe = model.makeCache();
   const masks = new AttentionMasks();
-  const cache: Cache[] = probe.map((c) =>
-    isRecurrentCache(c) ? new TrainingSSMCache() : new TrainingCache(cacheWindow(c), masks));
+  const cache: Cache[] = probe.map((c) => trainingStandIn(c, window => new TrainingCache(window, masks)));
   for (const c of probe) c.dispose();
   try {
     return model.sequenceHidden(ids, cache, width); // [B, L, hidden]
@@ -196,29 +194,19 @@ class BatchedMaskCache implements AttentionCache {
   }
 }
 
-/** Wrap each real cache in a BatchedMaskCache, precomputing one padding-aware
- *  mask per distinct window. Caches without a sliding window get the
- *  full-attention (null) mask. Recurrent layers get the stateless
- *  TrainingSSMCache instead: rows are right-padded and the recurrence is
- *  causal, so padding never reaches a real position and needs no mask. */
+/** Wrap each real attention cache in a BatchedMaskCache over one
+ *  padding-aware mask per distinct window (the full-attention mask for a
+ *  cache without one). The state's stand-in for a recurrent layer is the
+ *  stateless TrainingSSMCache (`trainingStandIn`). */
 function wrapWithBatchedMask(
   realCache: Cache[],
   B: number,
   L: number,
   validLengths: number[],
 ): Cache[] {
-  const windows = realCache.map((c) => cacheWindow(c));
-  const distinct = new Set(windows);
   const store = new Map<number | null, MlxArray>();
-  for (const w of distinct) store.set(w, buildBatchedPadMask(B, L, validLengths, w));
-  return realCache.map((c, i) => isRecurrentCache(c) ? new TrainingSSMCache() : new BatchedMaskCache(c, windows[i]!, store));
-}
-
-/** The sliding-window size a cache enforces, or null for full attention.
- *  RotatingKVCache stores its window as `maxSize`; KVCache has none. Mirrors
- *  gemma4 forwardLayers, where sliding layers use windowSize == the rotating
- *  cache's maxSize. (Quantized KV caches are not used on the training path.) */
-function cacheWindow(c: Cache): number | null {
-  const maxSize = (c as { maxSize?: number }).maxSize;
-  return typeof maxSize === "number" ? maxSize : null;
+  return realCache.map(c => trainingStandIn(c, window => {
+    if (!store.has(window)) store.set(window, buildBatchedPadMask(B, L, validLengths, window));
+    return new BatchedMaskCache(c, window, store);
+  }));
 }

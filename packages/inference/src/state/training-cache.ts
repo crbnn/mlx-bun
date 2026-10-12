@@ -6,6 +6,7 @@ import { gatedDeltaUpdate } from "../kernels/delta/gated";
 import type { AttentionCache, AttentionRead, Cache, GatedDeltaCache, GatedDeltaParameters, Mask } from "../contracts/mlx/cache";
 import { AttentionMasks, causalLease, sdpaRead, unmaskedLease, withLease } from "./attention-read";
 import type { PrefixLayout } from "../contracts/mlx/trainable";
+import { isRecurrentCache } from "./capabilities";
 
 /** Stateless cache for the training forward. Training is always a single
  *  offset-0 full-sequence pass, so `updateAndFetch` is a pure pass-through (no
@@ -219,4 +220,15 @@ export class PrefixSharedCache implements Cache {
 export function prefixSharedCaches(count: number, layout: PrefixLayout): Cache[] {
   const memo: { mask: MlxArray | null } = { mask: null };
   return Array.from({ length: count }, () => new PrefixSharedCache(layout, memo));
+}
+
+/** The stateless stand-in a training or scoring forward runs in place of one
+ * of the graph's fresh caches: recurrent state takes `TrainingSSMCache` (fixed
+ * size and causal, so right padding never reaches a real position and needs no
+ * mask); an attention cache takes `attention(window)`, the caller's stand-in
+ * over that cache's sliding window (its ring size; null for full attention). */
+export function trainingStandIn(cache: Cache, attention: (window: number | null) => Cache): Cache {
+  if (isRecurrentCache(cache)) return new TrainingSSMCache();
+  const maxSize = (cache as { maxSize?: number }).maxSize;
+  return attention(typeof maxSize === "number" ? maxSize : null);
 }

@@ -416,7 +416,8 @@ test.skipIf(!target || !adapter || !Bun.env.MLX_BUN_TEST_CONTINUATION_KV_START |
   const { AdapterManager } = await import("@mlx-bun/inference/adapters");
   const { bindMlxGateway, createRowSampling } = await import("@mlx-bun/inference/execution");
   const { makeStepSampler } = await import("@mlx-bun/inference/sampling");
-  const { leaseCacheState, isBatchableCache } = await import("@mlx-bun/inference/state");
+  const { leaseCacheState } = await import("@mlx-bun/inference/state");
+  const { isBatchableCache } = await import("../../src/state/capabilities");
   const { observedPhases } = await import("../models/phase-forward");
   const ops = await import("@mlx-bun/mlx/ops");
   const weights = await Weights.open(target!);

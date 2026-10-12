@@ -11,7 +11,7 @@ import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { Cache, CompiledDecodeCache } from "../../src/contracts/mlx/cache";
-import { isCompiledDecodeCache } from "../../src/state/capabilities";
+import { decodesCompiled } from "../../src/state/kv-maintenance";
 import { decodeStepInputs } from "../../src/state/decode-step-inputs";
 import { BatchedKVCache } from "../../src/state/batched-kv";
 import { KVCache } from "../../src/state/kv";
@@ -104,11 +104,18 @@ for (const kind of KINDS) {
   }
 }
 
-test("only the caches that implement the protocol answer the compiled-decode probe", () => {
+/** The protocol's members, as the compiled step calls them. */
+const drivesCompiledDecode = (cache: Cache) => (["prepareDecodeStep", "decodePhase", "decodeSlot", "decodeInputs",
+  "commitDecodeStep"] as const).every(name => typeof (cache as Partial<CompiledDecodeCache>)[name] === "function");
+
+test("every storage a compiled-decode composition holds implements the protocol; TurboQuant storage does not yet", () => {
   const caches = KINDS.map(k => k.make());
   try {
-    for (const cache of caches) expect(isCompiledDecodeCache(cache)).toBe(true);
-    expect(isCompiledDecodeCache(new BatchedKVCache())).toBe(false);
-    expect(isCompiledDecodeCache(new TurboQuantKVCache(4, 4, deferredTurboQuantKernels, false))).toBe(false);
+    for (const cache of caches) expect(drivesCompiledDecode(cache)).toBe(true);
+    // The loader resolves compiled decode off for these (decodesCompiled): no row of such a composition reaches the step.
+    expect(drivesCompiledDecode(new BatchedKVCache())).toBe(false);
+    expect(drivesCompiledDecode(new TurboQuantKVCache(4, 4, deferredTurboQuantKernels, false))).toBe(false);
+    expect(decodesCompiled({ kind: "turbo", kBits: 4, vBits: 4 }, false)).toBe(false);
+    expect(decodesCompiled({ kind: "affine", bits: 4, groupSize: 64, kernels: "unfused" }, false)).toBe(true);
   } finally { for (const cache of caches) cache.dispose(); }
 });

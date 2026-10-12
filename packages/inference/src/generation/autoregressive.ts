@@ -40,7 +40,7 @@ type StepExtras
 } from "../sampling/index";
 import { BF16_KV, COMPOSITION_DEFAULTS, type KvStorageScheme } from "../contracts/portable/composition";
 import { maybePageKv } from "../state/request-policy";
-import { isRotatingPlainCache } from "../state/capabilities";
+import { rollbackVerifyBlock, rollsBackVerifyBlock } from "../state/rollback";
 import {
 fillTraceEnabled,
 fillTracePath,
@@ -222,9 +222,7 @@ async function* generateInner(
   // restore a pre-round snapshot and bit-exactly replay the accepted prefix.
   // A model whose caches can do neither still gets assert-policy fills; verify
   // proposals are dropped and counted (stats.verifyUnsupported).
-  const verifyCapable = fillOn && kv.kind === "bf16" && cache.every(
-    (c) => c.isTrimmable() || isRotatingPlainCache(c) || typeof rewindable(c).specRoundRollback === "function",
-  );
+  const verifyCapable = fillOn && rollsBackVerifyBlock(kv, cache);
   closeBatchSetup?.();
 
   // logits [1,1,V] → sampled token array [1] (+ optional logprob capture,
@@ -403,20 +401,9 @@ async function* generateInner(
         traceProposal(proposal, generatedNow, accepted, [inFlight, ...pred.slice(0, ids.length - 1)]);
       const t1 = performance.now();
       if (accepted < ids.length) {
-        // Trimmable caches drop the rejected tail; recurrent caches restore
-        // their pre-round snapshot and bit-exactly replay the accepted prefix
-        // (Cache.specRoundRollback — the same primitive
-        // packages/inference/src/generation/speculative/run.ts
-        // uses after its accept walk).
-        for (const c of cache) {
-          const rc = rewindable(c);
-          if (rc.specRoundRollback) rc.specRoundRollback(accepted);
-          // A ring stops being trimmable once it wraps, but the verify block
-          // was one concat write that keeps the newest window-1 positions plus
-          // the block in temporal order: dropping its rejected tail leaves at
-          // least the window (accepted >= 1).
-          else rc.trim(ids.length - accepted, isRotatingPlainCache(c));
-        }
+        // The state drops the rejected tail (trim, a ring's rollback trim, or
+        // a recurrence's restore and replay).
+        rollbackVerifyBlock(cache, accepted, ids.length);
         roundOpen = false;
       } else if (roundOpen) {
         for (const c of cache) rewindable(c).specRoundCommit?.();
