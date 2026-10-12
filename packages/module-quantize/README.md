@@ -14,7 +14,7 @@ execution lease so no model generates meanwhile), three HTTP routes under `/api/
   `catalog` entry (no tensor bytes).
 - `POST /api/quantize/resolve-folder`: where a folder the browser's picker selected lives, from the
   catalog's `locate` (hub cache snapshot, the models directory, or an indexed model).
-  `/api/model/resolve-folder` is the same question asked by the fine-tune wizard; the app answers it.
+  `/api/model/resolve-folder` is the same question asked by the fine-tune wizard; the models module answers it.
 - `POST /api/quantize/submit`: names a plain model directory under the `models/` storage entry
   (`<name>-<bits>bit`, `-mixed-<bpw>bpw`, `-rot<seed>`; the same request names the same directory, which the
   producer refuses to overwrite) and submits the `quantize` job.

@@ -23,7 +23,7 @@ export const openAiUsage = (usage: CompletionUsage) => ({
   ...(usage.fill ? { fill: usage.fill } : {}),
 });
 
-/** Terminal usage: the wire block plus mlx-bun's `lane` (batch|serial|…). */
+/** Terminal usage: the wire block plus mlx-bun's `lane` (always `batched`: one request is a batch of one). */
 export const openAiSummaryUsage = (summary: CompletionSummary) => ({
   ...openAiUsage(summary.usage),
   lane: summary.lane,

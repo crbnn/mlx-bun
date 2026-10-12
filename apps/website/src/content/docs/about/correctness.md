@@ -15,7 +15,7 @@ not every model and every serving option.
 Read the [verification policy](https://github.com/joshuarossi/mlx-bun/blob/main/CONTRIBUTING.md#numerical-and-performance-evidence)
 and the inference package's
 [parity evidence](https://github.com/joshuarossi/mlx-bun/blob/main/packages/inference/README.md#external-parity-evidence).
-Open model and specialized-path checks live in the
+Open model and path checks live in the
 [plan](https://github.com/joshuarossi/mlx-bun/blob/main/PLAN.md).
 
 Reference oracles, experiments, golden data, and benchmark runs live outside this

@@ -3,7 +3,8 @@
 Trains and produces adapters for graphs from `@mlx-bun/inference`. The package
 owns SFT, DPO, ORPO, diffusion LoRA, training datasets, losses, optimizers,
 trainable adapter parameters, and adapter merging, fusion, and export.
-Job orchestration, terminal dashboards, and model discovery belong to the app.
+Job orchestration, the CLI verbs and terminal dashboards belong to the app's train module
+([`@mlx-bun/module-train`](../module-train/README.md)); model discovery to the app.
 
 `trainLora(model, tokenizer, template, dataDirectory, config, onProgress)` takes
 a caller-loaded graph and reads `train.jsonl` plus optional `valid.jsonl`.
@@ -50,8 +51,8 @@ hiddens over each full sequence through the speculative target binding, as shard
 stored final hiddens, and confidence BCE against the analytic acceptance) and saves the best
 held-out expected accepted length (τ) as `<outDir>` (`dspark.json`, `model.safetensors` and a
 `config.json` whose `dspark_assistant` type marks it a companion `--draft-model` resolves by
-path). `calibrateDrafter` runs speculative generations through a provider that drafts the
-unpruned block, fits per-position confidence thresholds with `fitStsThresholds`, and
+path). `calibrateDrafter` runs speculative generations through the gateway's speculative group
+at one row, with a provider that drafts the unpruned block, fits per-position confidence thresholds with `fitStsThresholds`, and
 `writeSts` sets them in `dspark.json`. The target is any graph declaring hidden-layer taps and
 the draft projection (`embed`, and `logits`, its output head per width class); `tapLayers` must be identical for regen
 and train (shards record them, and a mismatch is refused). Losses, shard sampling geometry,
@@ -75,10 +76,12 @@ The native command opts in with `MLX_BUN_TEST_NATIVE=1`; Mac CI runs it after
 staging natives. Bare test discovery skips those tests before native imports.
 An explicitly requested native run fails if its native installation is missing.
 
-Inherited experimental selectors remain in the [trainer](src/trainer.ts),
-[segmented backward](src/segmented.ts), [loss](src/loss.ts), and
-[flash CCE kernel](src/kernels/flash-cce.ts). Record their `MLX_BUN_*` settings
-with numerical evidence. `MLX_BUN_MEM_LOG` and `MLX_BUN_SEG_MEM_LOG` enable
+Experimental selectors are read once, never per dispatch: the flash-CCE kernel
+choices when the [trainer](src/trainer.ts) composes a run (`flashCceOptions`, held by
+the [`FlashCce`](src/kernels/flash-cce.ts) kernel owner the losses call), the
+training attention (`MLX_BUN_TRAIN_ATTN`) in the trainer, and the bounded head of the
+[segmented backward](src/segmented.ts) when it loads. Record their `MLX_BUN_*`
+settings with numerical evidence. `MLX_BUN_MEM_LOG` and `MLX_BUN_SEG_MEM_LOG` enable
 diagnostic console output independently of the progress callback.
 
 

@@ -297,7 +297,7 @@ const PROCESS_LIST_ARGS = ["ps", "-axo", "pid=,ppid=,pgid="];
 /** Memory of the process holding the model, read between phases. Not `ps` RSS: on the M1 Max
  * neither tree pins the model (12 GB is under half the 26.8 GB working set), so the OS drops pages
  * from a process's RSS without freeing them, and RSS read 5.6 to 8.2 GB for main against 12.0 GB
- * for the head while both held 10.7 GB (MLX active 10.52 GB, `vmmap` identical; PLAN, the E2 merge,
+ * for the head while both held 10.7 GB (MLX active 10.52 GB, `vmmap` identical; measured on the composition refactor's merge,
  * bisected 2026-10-12). What a tree holds is its worker's MLX allocator, which the server reports on
  * `/stats`, and the process's physical footprint. */
 export interface MemoryReading {
@@ -582,7 +582,7 @@ export async function runCell(spec: CellSpec, workload: Workload, raw: RawReques
       return { readyMs: readyMs2, ctxTtftMs: after.ttftMs, cachedTokens: after.cachedTokens, durability };
     }) : null;
     await markLeg("restart");
-    // Four concurrent generations; budget is the serial worst case at the measured rate.
+    // Four concurrent generations; budget is the one-after-another worst case at the measured rate.
     const agg = await runPhase("agg", async () => {
       const budget = scaledBudgetMs(workload.aggregateTokens * workload.aggregateStreams, decodeMedianTps, FIXED_BUDGET_MS) +
         (workload.aggregateContext ? scaledBudgetMs(workload.aggregateContext * workload.aggregateStreams,

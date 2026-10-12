@@ -1,13 +1,13 @@
 /** App-path digest: the token ids and top-8 logprobs of N greedy tokens (default 32)
  * through the app's one-shot `generate` path (`runInference`: the command's KV flags,
- * the loaded composition, `createAppEngine`, the scheduler), hashed. Every gate in
- * PLAN compares trees by these hashes; the perf workflow's numerical check runs it
+ * the loaded composition, `createAppEngine`, the scheduler), hashed. Numerical gates
+ * compare trees by these hashes; the perf workflow's numerical check runs it
  * on both trees. The tree is imported by path (`--root`, default this checkout), so
  * one tool measures main and the candidate alike; nothing here imports the
  * workspace statically, and `--help` loads no native library.
  *
- * Reconstructed from the Trellis checks' digest.ts (the E1+D2+E3 merge's final form),
- * so a one-row cell hashes as the plan records (Trellis kv4 `69e8cc07…` / `ee58a136…`):
+ * Reconstructed from the Trellis checks' digest.ts, so a one-row cell hashes as those
+ * checks recorded (Trellis kv4 `69e8cc07…` / `ee58a136…`):
  * tokens = sha256 of the ids joined by ",", logprobs = sha256 of one JSON line per
  * token joined by "\n", both cut to 16 hex digits.
  *

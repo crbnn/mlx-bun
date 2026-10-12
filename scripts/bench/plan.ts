@@ -11,9 +11,9 @@ export const TREES: readonly Tree[] = ["baseline", "candidate"];
 /** Server configurations measured on both trees, as main's matrix measured its own arms. */
 export const CONFIGURATIONS = {
   default: { args: [] as string[], note: "real CLI defaults" },
-  /** Capacity-1 control: main's `--batch 1` serial path versus the candidate's
-   * continuous scheduler at capacity 1. Not a candidate serial lane. */
-  serial: { args: ["--batch", "1"], note: "capacity-1 control (baseline serial, candidate continuous at capacity 1)" },
+  /** Capacity-1 control: main at `--batch 1` (its one-request executor) against the
+   * candidate's continuous scheduler at capacity 1, a batch of one. */
+  serial: { args: ["--batch", "1"], note: "capacity-1 control (baseline one-request executor, candidate continuous at capacity 1)" },
   mixed: { args: ["--kv-quant", "config"], note: "artifact kv_config.json", requiresKvConfig: true },
   /** Native MTP companion (`--draft ID=PATH`) at a fixed verify depth; models without one are not applicable. */
   mtp2: { args: [] as string[], note: "MTP companion, depth 2", draftDepth: 2 },
@@ -22,7 +22,7 @@ export const CONFIGURATIONS = {
    * adaptive depth over 4-bit KV. Models without a drafter are not applicable. */
   dflash2: { args: ["--kv-quant", "4", "--num-draft-tokens", "adaptive"], note: "DFlash 2 drafter, adaptive depth, 4-bit KV", dflash2: true },
   /** The served DFlash 2 composition against a baseline that cannot serve it: a graph that declares no verify costs
-   * refuses `--num-draft-tokens adaptive` (main's TQ graph on the M1 Max), so the baseline drafts 7 every round and
+   * refuses `--num-draft-tokens adaptive` (main's hand-written Trellis graph on the M1 Max), so the baseline drafts 7 every round and
    * the candidate adapts, both over 4-bit KV. The trees run different configurations, so the pair is context and
    * never gates, and its probes and request pairing are reported, not required. */
   "dflash2-d7-baseline": { args: ["--kv-quant", "4"],
@@ -82,8 +82,8 @@ export interface ModelSpec {
   /** MTP companion for the mtp configurations, pinned like the model. */
   draft?: { path: string; files: FileRecord[] };
   /** DFlash 2 drafter for the dflash2 configuration, pinned like the model. `basis` is the target's
-   * rotation basis file: main's DFlash 2 provider reads it from MLX_BUN_DFLASH2_TARGET_BASIS, the
-   * refactor declares it from the artifact's sidecar and ignores the variable; both servers get it. */
+   * rotation basis file: main's DFlash 2 provider reads it from MLX_BUN_DFLASH2_TARGET_BASIS, this
+   * tree declares it from the artifact's sidecar and ignores the variable; both servers get it. */
   dflash2?: { path: string; files: FileRecord[]; basis?: FileRecord & { path: string } };
 }
 export interface Plan {
@@ -317,7 +317,7 @@ export function cellArgs(plan: Plan, cell: PlannedCell, port: number, ssdDir: st
 }
 
 /** Environment a cell's configuration adds, identical for both trees: the DFlash 2 basis file
- * when one is pinned (main reads it; the refactor ignores the variable). */
+ * when one is pinned (main reads it; this tree ignores the variable). */
 export function cellExtraEnvironment(plan: Plan, cell: PlannedCell): Record<string, string> {
   if (cell.kind !== "tree" || !("dflash2" in CONFIGURATIONS[cell.configuration!])) return {};
   const basis = plan.models.find(m => m.id === cell.model)?.dflash2?.basis;
