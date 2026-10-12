@@ -1131,7 +1131,19 @@ unchanged.
       TTFT is still narrower than their drift; the numerical check had every digest identical.
       Not run: a 4-bit KV sweep in `bench-mtp` (its KV option fails on the first drafted arm
       with "No target row layout for kv:bf16-first:kv:quant:4:64"; `serve --kv-quant 4`
-      works), owed to the final gate pass.
+      works), owed to the final gate pass. The M1 Max's measurement of record for this branch
+      (run 38283201516 at d2487133, the head before B4, 2026-10-12, the machine clean, preflight
+      clear before and after, two sessions per tree): Trellis default decode 14.1 → 14.0
+      (1.000 [0.995, 1.006]), prefill 1k 124.4 → 124.9, cold TTFT 6091 → 6065 ms, peak MLX
+      active 15457 → 15457 MB; Trellis DFlash 2 (main at depth 7, head adaptive, context):
+      decode 3.8 → 12.1 (3.26×), prefill 1k 105.4 → 117.2, cold TTFT 7181 → 6463 ms, peak MLX
+      active 16795 → 17768 MB; e4b default decode 64.4 → 64.3 (0.998 [0.997, 1.000], flagged;
+      sessions 64.4 → 64.4 and 64.4 → 64.2), prefill 1k 988.8 → 993.7, cold TTFT 678 → 675 ms,
+      peak MLX active 7759 → 7871 MB. The e4b flag is a 0.2% difference with an interval whose
+      upper edge touches 1.000: the band still lacks a calibrated floor. Owed: an A/A run
+      (main against main, same host, two sessions) on a quiet M1 Max to measure the null
+      spread per metric, recorded as the decision's floor so sub-percent noise stops flagging;
+      until then a flag inside about 1% with sessions disagreeing on the sign is read by hand.
 - [x] ARCHITECTURE.md: the cache owns the read; phases are named; a graph extends
       nothing; the exemplar sentence points at the regenerated graphs; the loader-level generic
       fallback is stated and the in-graph one forbidden; the one-way-per-pattern list above.
