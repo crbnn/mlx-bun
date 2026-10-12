@@ -5,6 +5,7 @@ import type { AttentionRead,BlockAttentionCache,Cache,CommittedAttentionCache,Co
 import type { RotatedValueAttentionState } from "./kv-storage";
 import type { KvCodec } from "../contracts/mlx/kv-codec";
 import * as tq from "../kernels/turboquant/ops";
+import { TURBOQUANT_HEAD_DIMS } from "../kernels/turboquant/signs";
 import { createCausalMask } from "../kernels/attention/masks";
 import { decodedKvDonorAttention } from "./decoded-kv-donor";
 import type { KVCache } from "./kv";
@@ -145,7 +146,7 @@ export class TurboQuantKVCache implements CommittedAttentionCache, BlockAttentio
 
   #validateHeadDim(dim: number): void {
     if (this.#headDim !== null) return;
-    const supported = [64, 128, 256, 512];
+    const supported: readonly number[] = TURBOQUANT_HEAD_DIMS;
     if (dim % 32 !== 0 || !supported.includes(dim)) {
       throw new Error(
         `TurboQuantKVCache: head_dim ${dim} must be divisible by 32 and in {${supported.join(",")}}`,

@@ -23,10 +23,8 @@
 import { Dtype, type MlxHandle } from "@mlx-bun/mlx/ffi";
 import { MlxArray, gpuStream } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
-import {
-  SIGN_VECTORS, LLOYD_MAX, TURBOQUANT_HEAD_DIMS, TURBOQUANT_VALUE_BITS,
-  type TurboQuantHeadDim, type TurboQuantValueBits,
-} from "./tables";
+import { LLOYD_MAX, TURBOQUANT_VALUE_BITS, type TurboQuantValueBits } from "./tables";
+import { SIGN_VECTORS, TURBOQUANT_HEAD_DIMS, type TurboQuantHeadDim } from "./signs";
 
 import { tryJointDecodePackedKv, type PackedKvArrays } from "./decode";
 import { tryDecodePackedKvInverse256 } from "./inverse";

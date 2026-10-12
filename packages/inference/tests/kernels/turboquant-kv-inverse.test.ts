@@ -5,7 +5,8 @@ import { Dtype, activeMemory, clearCache, synchronize } from "@mlx-bun/mlx/ffi";
 import { CompiledFunction } from "@mlx-bun/mlx/compile";
 import * as ops from "@mlx-bun/mlx/ops";
 import * as tq from "../../src/kernels/turboquant/ops";
-import { LLOYD_MAX, SIGN_VECTORS } from "../../src/kernels/turboquant/tables";
+import { LLOYD_MAX } from "../../src/kernels/turboquant/tables";
+import { SIGN_VECTORS } from "../../src/kernels/turboquant/signs";
 import { type PackedKvArrays } from "../../src/kernels/turboquant/decode";
 import { tryDecodePackedKvInverse256 } from "../../src/kernels/turboquant/inverse";
 
