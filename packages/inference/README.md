@@ -24,10 +24,10 @@ own implementations without subclassing a concrete model or cache.
 Each graph declares what it can do (`GraphCapabilities`, portable; a model exposes
 it as `graphCapabilities`): its method, batched adapters, media input, compiled
 decode, hidden-layer taps for drafts, a draft head its
-checkpoint carries (`nativeDraft`), which delayed affine KV levels its attention is
-qualified for, dense reads, whether long prompts prefill in workspace-bounded
-chunks, and what its verifier qualifies (adapters, logprobs, affine and TurboQuant
-KV, external tokens, grammar proposals).
+checkpoint carries (`nativeDraft`), whether long prompts prefill in workspace-bounded
+chunks, and what its verifier qualifies (adapters, logprobs, external tokens,
+grammar proposals). None names a cache format: the composition's caches serve
+every method, and the planner never reads how they store keys and values.
 `MlxDeclaredGraph` names the operations behind those promises (`bindMediaInput`,
 `mediaEncoders`, `pixelInput`, `draftTarget`, `nativeDraftHead`, `compiledDecodeStep` and
 `releaseCompiledDecode`, `trainable`, `expertResidency`), and
@@ -67,8 +67,11 @@ out). `trainable`
 runs and which reused K/V crosses segment boundaries), `prefixShared` forwards,
 `gradCheckpoint`, the `flashAttention` constraint, and the `denoising` objective.
 The trainer names the declaration a graph lacks. A model-level option is a
-composition field its graph reads: Qwen3.5 reads `speculativeAffineKv` (on by
-default) where it declares speculation over affine KV.
+composition field, resolved once at load by `resolveComposition` and settable
+through the composition request: the KV scheme and paging (`kv`, `pagedKv`), and
+the scheduler's `compiledDecode` (on), `mixedPrefill` (off), `mixedTokenBudget`
+(256), `prefillTailSplit` (on) and `grammarJump` (off). Nothing below the loader
+reads them from the environment.
 
 ## Numerical and execution policy
 
@@ -502,9 +505,10 @@ caches of 2 or 5 planes. The main-paired evidence is B1 only; a wrapped sliding
 ring, a delayed TurboQuant start, hard-kill durability, external-oracle parity
 and performance are not claimed.
 
-MiniCPM5 and these universal graphs also ignore a configured draft and supplied
-fill for adapter requests, as main did; requested logprobs remain available.
-Without fill/logprobs/grammar, ordinary checkpoints remain eligible. The fallback
+MiniCPM5 and these universal graphs also ignore a configured draft for adapter
+requests, as main did; requested logprobs remain available. Main also ignored
+supplied fill for them, which the shared fill method now serves (the pairing
+below predates that). Without fill/logprobs/grammar, ordinary checkpoints remain eligible. The fallback
 does not invoke the provider during a request; loading an artifact-backed draft
 still performs its existing compatibility probe. Paired B1 acceptance on cached
 Qwen2.5-0.5B and MiniCPM5-1B compared six scenarios per model, each with a matched
@@ -518,19 +522,21 @@ uninterrupted output after graceful cancellation and fresh-process restoration.
 This does not qualify every combination or multi-row configured-draft requests.
 
 Only the first cold decode/resume token may have signed versus unsigned int32
-metadata; its raw bytes, value and computed state must match exactly. Supplied
-fill also falls back to ordinary decoding without adapters or a configured draft:
-main ignored it on these graphs because no affine append binding exists.
-Paired B1 acceptance on cached MiniCPM5-1B and Qwen2.5-0.5B matched main and
+metadata; its raw bytes, value and computed state must match exactly. Main
+ignored supplied fill on these graphs without adapters or a configured draft
+too, having no affine append binding; the planner then fell back to ordinary
+decoding, which the pairing below qualified, and now serves it through the
+shared fill method. Paired B1 acceptance on cached MiniCPM5-1B and Qwen2.5-0.5B matched main and
 no-fill controls for supplied strict/echo fill, unseeded greedy sampling and
 KV4 starting at token 8. Each request generated 16 tokens across conversion;
 all 17 forward states, 16 full-vocabulary projections and valid cache planes
 matched, and every fill hook stayed unused. Main planned fill and disabled it
-inside generation; the new planner reports `fill-incompatible-with-request`
-and selects ordinary continuous decoding. This pair does not qualify B2 or
+inside generation; the planner of that pairing reported `fill-incompatible-with-request`
+and selected ordinary continuous decoding. This pair does not qualify B2 or
 cancellation.
-Requests that supply fill remain ineligible for generation checkpoints. Actual
-delayed speculation remains excluded. Each graph declares at construction the
+Requests that supply fill remain ineligible for generation checkpoints.
+Speculation, grammar proposals and fill are planned over delayed affine KV as
+over any other scheme. Each graph declares at construction the
 layers its attention reads as plain keys and values (`requiredDenseKvLayers`:
 Gemma2's softcap layers; none for graphs that attend the storage their caches
 hold). The gateway and a directly composed
@@ -543,19 +549,15 @@ scheme when that scheme's own maintenance leaves every layer's storage certified
 for dense reads (`Cache.denseKvReads`, answered by the storage and the
 maintenance that owns it, probed when the binding or group is composed). Affine
 KV serves ordinary continuous decoding, with checkpoints, while each row's
-storage still reads plain; on a softcap graph a drafted request ignores the
-draft. At a row's actual transition its pending token publishes first, and the
+storage still reads plain. At a row's actual transition its pending token publishes first, and the
 row may finish there; otherwise that row alone is rejected with `DenseKvReadError` before any shared append (HTTP 501
 `unsupported_kv_transition`, or the stream's error event once it has opened).
 Main's serial path threw at that forward instead. TurboQuant storage decodes on
 read, so these graphs admit TurboQuant KV for ordinary continuous decoding
-throughout, with checkpoints; a drafted request ignores the draft. Supplied
-fill decodes ordinarily without fill, as in main, whose serial path filled
-only through a committed append declaring the scheme's formats (none for
-TurboQuant on this graph). Direct grammar jump commits its
+throughout, with checkpoints. Direct grammar jump commits its
 spans over it through the shared span method, as main's serial jump did: one
 maintenance call, then one unsplit forward of the pending token and the forced
-span, once the gateway has certified the scheme. Affine KV commits spans the
+span. Affine KV commits spans the
 same way while a row's storage still reads plain: a span whose maintenance ran
 before the transition appends unsplit even across it, and a row whose next
 append would no longer read plain is refused with `DenseKvReadError` before any
@@ -588,9 +590,8 @@ Universal graphs
 with sliding layers take the same ordinary delayed path when their bound
 attention reads encoded KV. Qwen3 and Qwen3-MoE attend affine KV as mlx-lm's
 `scaled_dot_product_attention` does (quantized SDPA over a quantized cache) and
-take the same encoded-read path: immediate affine KV batches and speculates,
-and delayed affine rows serve ordinary decoding, generation checkpoints and
-committed grammar spans across their conversion. On 2026-09-28 UTC (M1 Max,
+take the same encoded-read path: affine KV, immediate or delayed, batches,
+speculates and takes generation checkpoints across its conversion. On 2026-09-28 UTC (M1 Max,
 MLX 0.32.2), cached Qwen3-4B-Instruct-2507-4bit `50d42775` matched mlx-lm
 0.31.3's `generate_step` order bit for bit in six greedy steps' full logits
 through direct generation with KV8 and KV4 at starts 0, 8 and 14 (a one-off
@@ -598,9 +599,10 @@ comparison); the opt-in spans test and the ordinary-continuation test (KV8 from
 0, KV4 from prompt+4, KV8 from prompt+2) passed on it; and a grouped n-gram
 draft over immediate KV8 and KV4 reproduced ordinary greedy output. No
 Qwen3-MoE artifact was run.
-On encoded-read universal graphs and on MiniCPM5, delayed affine
-rows stay ordinary-only, and their direct grammar jump commits spans through the
-same span method with no dense-read requirement, before and after conversion.
+On encoded-read universal graphs, Qwen3 and MiniCPM5, whose verifiers qualify
+grammar proposals, grammar jump is planned as verified proposals over every KV
+scheme; bound directly, the span method commits spans over their delayed affine
+rows with no dense-read requirement, before and after conversion.
 The same opt-in real-weight spans test passed on cached MiniCPM5-1B-OptiQ-4bit
 `664aabae` and Qwen2.5-0.5B-Instruct-4bit `a5339a41` with KV4: B1 spans matched
 direct generation in tokens, matcher history and every projection's bytes, both
@@ -1287,7 +1289,7 @@ after the last row's run closes. Each unit runs with only its row's adapters
 active. An image request passes its pixels as the row's prefill input: only the
 first unit reads them (the vision encoder runs there), and the request owner
 releases them after the row settles. Grammar, draft, logprobs, logits processors,
-fill and encoded KV requests are refused with typed plan reasons, and a paged composition at load. `DenoisingKeys` reproduces MLX's
+fill requests are refused with typed plan reasons; a KV scheme or paging is refused at load, since this graph composes its own denoising state, which has no quantized or paged form yet. `DenoisingKeys` reproduces MLX's
 global key sequence per request, so denoising never reads or reseeds the process
 key. The [denoising tests](tests/generation/denoising-binding.test.ts) take
 `MLX_BUN_DIFFUSION_MODEL=/cached/diffusiongemma` for the real-weight check and

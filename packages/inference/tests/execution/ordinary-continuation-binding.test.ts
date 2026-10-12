@@ -23,7 +23,7 @@ test(`ordinary shared continuation binds ${name} through its loaded backend`, ()
   const model = make();
   const binding = bindMlxGateway(model);
   const unconfigured = bindMlxGateway(model);
-  const schedule = { continuous: true, quantizedBatch: true, checkpoints: true };
+  const schedule = { checkpoints: true };
   expect(binding.plan(shape, {}, schedule).checkpoint).toBe(false);
   binding.configureContinuation!({ checkpointPersistence: {}, checkpoints: {}, checkpointEveryTokens: 4 } as ContinuationServices);
   expect(binding.plan(shape, {}, schedule)).toMatchObject({ mechanism: "continuous", checkpoint: true });
@@ -62,7 +62,7 @@ test("Gemma2 softcap plans shared continuation for plain, affine and TurboQuant 
   }) as UniversalDenseModel;
   const model = make();
   const binding = bindMlxGateway(model), unconfigured = bindMlxGateway(model);
-  const schedule = { continuous: true, quantizedBatch: true, checkpoints: true };
+  const schedule = { checkpoints: true };
   expect(binding.plan(shape, {}, schedule)).toMatchObject({ mechanism: "continuous", checkpoint: false });
   binding.configureContinuation!({ checkpointPersistence: {}, checkpoints: {}, checkpointEveryTokens: 4 } as ContinuationServices);
   // Greedy, seeded and history-dependent sampling, and adapter requests, which Gemma2 already batches.
@@ -115,7 +115,7 @@ test("a paged composition pages plain, adapter and media requests alike and keys
   const binding = bindMlxGateway(graph(Gemma4Model.prototype, "gemma4", { blockSize: 16 }));
   const unpaged = bindMlxGateway(graph(Gemma4Model.prototype, "gemma4", null));
   for (const each of [binding, unpaged]) each.configureContinuation!(services);
-  const schedule = { continuous: true, quantizedBatch: true, checkpoints: true };
+  const schedule = { checkpoints: true };
   const adapters = { adapters: ["upper"] }, adapterShape = { ...shape, hasAdapters: true };
   const prompt = [2, 651, 9];
   const fill = { fill: new FillSession({ rows: [], eos: [], echo: null }, prompt) };

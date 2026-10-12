@@ -420,9 +420,8 @@ export class ${c.className} implements MlxDeclaredGraph, MlxTokenPhases {
   readonly finalNorm: RMSNorm;
   readonly lmHead: QuantizedLinear;
   /** Prepared image and video embeddings with request mRoPE positions, layer
-   *  taps for drafts (verify's capture), delayed affine rows, bounded prefill
-   *  workspace; adapters only when the composition mounts them. Speculation over
-   *  affine KV is the composition's \`speculativeAffineKv\`. */
+   *  taps for drafts (verify's capture), bounded prefill workspace; adapters only
+   *  when the composition mounts them. */
   readonly graphCapabilities: GraphCapabilities;
   /** Verify forward cost by rows relative to one decode step (M4 Pro 24 GB). */
   readonly verifyRoundCosts: ReadonlyMap<number, number> = new Map([
@@ -544,9 +543,8 @@ ${narrowSets}
 
     this.graphCapabilities = declareGraph({
       media: { input: "embeddings+positions", video: true }, hiddenLayerTaps: true,
-      kv: { delayedAffine: "all" }, prefill: { boundedWorkspace: true },
+      prefill: { boundedWorkspace: true },
       adapters: composition.adapters ? {} : { batched: false, mountable: false },
-      speculation: { affineKv: composition.speculativeAffineKv, immediateAffine4: true },
     });
 
     // The attention cache the composition's KV scheme names, chosen once: affine ${c.kv.bits}-bit group ${c.kv.groupSize}

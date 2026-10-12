@@ -15,12 +15,6 @@ export interface ExecutionRequirements {
 
 export interface ExecutionCapabilities {
   readonly method: "autoregressive" | "denoising";
-  readonly continuous: boolean;
-  /** The composition's KV scheme, which every request stores: affine-quantized
-   * (`--kv-quant N` or `config`) or TurboQuant-encoded keys and values. */
-  readonly kvQuant?: boolean;
-  readonly turboQuant?: boolean;
-  readonly quantizedBatch: boolean;
   /** Executor coordination, not a model capability: the shared group drives
    * each row's own grammar state (wait for its mask, advance it with the
    * emitted token, stop the row when it terminates). The shared sampler masks
@@ -33,10 +27,6 @@ export interface ExecutionCapabilities {
   readonly checkpoints: boolean;
   /** Bound ordinary driver can restore/capture this request configuration. */
   readonly sharedCheckpoints?: boolean;
-  /** Model-qualified speculative execution can retain this request's KV codec. */
-  readonly speculativeKvQuant?: boolean;
-  readonly speculativeTurboQuant?: boolean;
-  readonly turboQuantBatch?: boolean;
   readonly speculativeLogprobs?: boolean;
   /** The grouped provider supports the target's mounted adapter context. */
   readonly sharedSpeculativeAdapters?: boolean;
@@ -50,7 +40,7 @@ export interface ExecutionCapabilities {
   readonly sharedFill?: boolean;
   /** A mounted provider can consume verified external continuations. */
   readonly sharedSpeculativeEcho?: boolean;
-  /** A graph-owned compiled step exists; cache geometry can still decline it. */
+  /** The graph owns a compiled decode step. */
   readonly compiledDecode?: boolean;
 }
 
@@ -64,8 +54,7 @@ export interface ExecutionFeatures {
  * (`mechanism: "unsupported"`) name the capability the executor or graph lacks;
  * the rest name a requested feature the request's other choices make incompatible. */
 export type ExecutionReason =
-  | "continuous-unavailable" | "media-batch-unsupported" | "adapter-batch-unsupported"
-  | "kv-scheme-batch-unsupported" | "turbo-kv-batch-unsupported" | "grammar-batch-unsupported"
+  | "media-batch-unsupported" | "adapter-batch-unsupported" | "grammar-batch-unsupported"
   | "method-batch-unsupported"
   | "draft-method-unsupported" | "logprobs-method-unsupported" | "repetition-penalty-method-unsupported"
   | "logits-extras-method-unsupported" | "fill-method-unsupported"

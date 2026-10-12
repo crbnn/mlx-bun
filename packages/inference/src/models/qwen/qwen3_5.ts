@@ -60,16 +60,12 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
   /** Layers whose attention reads plain keys and values: none; it attends the storage its caches hold. */
   readonly requiredDenseKvLayers: readonly number[] = Object.freeze([]);
   /** Prepared image and video embeddings with request-owned mRoPE positions,
-   * layer taps for drafts. Its caches convert delayed affine rows and every
-   * method is qualified over them. Speculation over affine KV is the
-   * composition's `speculativeAffineKv`; immediate 4-bit KV is qualified even
-   * without a grouped method. Its few full-attention layers materialize their
+   * layer taps for drafts. Its few full-attention layers materialize their
    * scores at long context, so prefill chunks shrink to bound that workspace. */
   get graphCapabilities(): GraphCapabilities {
     return declareGraph({
       media: { input: "embeddings+positions", video: true }, hiddenLayerTaps: true,
-      kv: { delayedAffine: "all" }, prefill: { boundedWorkspace: true },
-      speculation: { affineKv: this.composition.speculativeAffineKv, immediateAffine4: true },
+      prefill: { boundedWorkspace: true },
     });
   }
   bindMediaInput(input: Vision): MlxPromptInput { return bindQwenMediaInput(this, input.embeddings, input.mrope!); }

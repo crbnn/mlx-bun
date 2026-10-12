@@ -107,7 +107,7 @@ export async function createServingUnit(context: LoadedModelContext, options: Co
     const engine = await createAppEngine(context, { capacity: options.capacity, binding, ownership: input.ownership,
       gateway: { kvBudgetBytes: options.kvBudgetBytes,
         checkpoints: !!(options.cache.generationCheckpointTokens && caches.checkpoints),
-        stateCodecs: caches.stateCodecs, kvScheme: caches.resolvedKvScheme,
+        stateCodecs: caches.stateCodecs,
         promptCache: caches.promptCache, adapterNamespace: caches.adapterNamespace },
       beforeModelDispose: closeCaches,
     });

@@ -16,7 +16,7 @@ export interface MlxTokenGraph extends MlxDeclaredGraph, Partial<MlxTokenPhases>
   readonly composition?: Composition;
   /** The mounted-adapter selection; absent when the graph mounts none. */
   readonly loraState?: { active: string[] };
-  /** Attention layers whose reads must be plain keys and values (see `kv.denseReads`). */
+  /** Attention layers whose reads must be plain keys and values (the softcapped read). */
   readonly requiredDenseKvLayers: readonly number[];
   /** One cache per cache layer: the caches the composition's KV scheme names
    * (`composedFullAttentionCache`, `composedSlidingAttentionCache`). */

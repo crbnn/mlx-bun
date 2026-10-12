@@ -641,8 +641,7 @@ export class Qwen35Model implements MlxDeclaredGraph {
   get graphCapabilities(): GraphCapabilities {
     return declareGraph({
       media: { input: "embeddings+positions", video: true }, hiddenLayerTaps: "hiddenTap" in this,
-      kv: { delayedAffine: "all" }, prefill: { boundedWorkspace: true },
-      speculation: { affineKv: runtimeFlag("MLX_BUN_QWEN_SPEC_KV4", true), immediateAffine4: true },
+      prefill: { boundedWorkspace: true },
     });
   }
   /** E2 changed the media graph contract; the identity tests compare the vision prefill phase directly. */

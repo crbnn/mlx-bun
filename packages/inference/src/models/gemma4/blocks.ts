@@ -25,7 +25,7 @@ import { QuantizedLinear } from "../../layers/quantized-linear";
 import { QuantizedSwitchLinear } from "../../layers/quantized-switch-linear";
 import { isCompiledTrace } from "../../runtime/compiled-trace";
 import { isExpertTracing, recordRouting } from "../../runtime/expert-trace";
-import { captureRopeOffsets } from "../../state/capabilities";
+import { captureRopeOffsets } from "../../state/attention-read";
 import type { ReadPhase } from "../graph";
 
 /** The phase a Gemma 4 forward runs, named by its caller: one new position per

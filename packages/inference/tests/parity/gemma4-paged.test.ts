@@ -196,11 +196,9 @@ test.skipIf(!inputs)("Gemma4 paged KV: gathered bf16 equals plain KV; direct rea
       const binding = withRuntimeConfig(runtime, () => bindMlxGateway(modelFor(setup.encoding, setup.paged ? setup.blockSize : null)));
       const scheme = schemeFor(setup.encoding);
       const options: A = {};
-      const quantizedBatch = scheme ? binding.kvBatchable(scheme) : false;
-      assert(!scheme || quantizedBatch, `${scheme?.label} must batch on this graph`);
       const plan = binding.plan({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
         hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false },
-      options, { continuous: true, quantizedBatch, checkpoints: false });
+      options, { checkpoints: false });
       assert.equal(plan.mechanism, "continuous", `placement: ${plan.reasons.join(", ")}`);
       // A paged composition gives every request the paged state; an unpaged one, the group's own caches.
       assert.equal(binding.statePolicy!(plan, options, 1) !== undefined, setup.paged);
@@ -216,7 +214,7 @@ test.skipIf(!inputs)("Gemma4 paged KV: gathered bf16 equals plain KV; direct rea
       const prefetched: (() => void)[] = [];
       let held = true;
       const group = binding.createBatchGroup({ maxBatch: 3, runtime, prefillChunkSize: 2048, admissionHeld: () => held,
-        ...(scheme ? { kvScheme: scheme } : {}), ...(opts.cache ? { promptCache: opts.cache } : {}) });
+        ...(opts.cache ? { promptCache: opts.cache } : {}) });
       const submit = (row: RowSpec, index: number): Promise<Outcome> => {
         const out: Outcome = { status: "fulfilled", tokens: [], vectors: [], finite: true, afterRetire: 0 };
         const controller = new AbortController();

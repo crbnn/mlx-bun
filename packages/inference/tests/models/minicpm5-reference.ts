@@ -221,7 +221,7 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
   /** Layers whose attention reads plain keys and values: none; it attends the storage its caches hold. */
   readonly requiredDenseKvLayers: readonly number[] = Object.freeze([]);
   /** Delayed affine rows convert per layer and serve ordinary decoding only. */
-  get graphCapabilities(): GraphCapabilities { return declareGraph({ kv: { delayedAffine: "ordinary" } }); }
+  get graphCapabilities(): GraphCapabilities { return declareGraph(); }
   #trainable: TrainableGraph | undefined;
   /** The separate quantized head, segmented backward, prefix-shared ORPO and flash training attention. */
   get trainable(): TrainableGraph { return this.#trainable ??= miniCpmTrainable(this); }

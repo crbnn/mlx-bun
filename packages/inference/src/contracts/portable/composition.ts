@@ -61,9 +61,6 @@ export interface Composition {
   readonly adapters: boolean;
   /** The most rows one forward carries (`--batch`, mlx-lm's `--batch-size`). */
   readonly maxRows: number;
-  /** Speculative verification over affine-quantized KV: a graph whose verifier
-   * qualifies it declares it (default on). */
-  readonly speculativeAffineKv: boolean;
   /** The groups of a mixed forward share one MLP pass (default on); off, each
    * group runs its own. */
   readonly packedMixedMlp: boolean;
@@ -93,7 +90,6 @@ export interface Composition {
  * `resolveComposition` resolves, and what a graph built without a record runs. */
 export const COMPOSITION_DEFAULTS = Object.freeze({
   pagedKv: null,
-  speculativeAffineKv: true,
   packedMixedMlp: true,
   vectorGreedySampling: true,
   compiledDecode: true,

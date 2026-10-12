@@ -47,7 +47,7 @@ function harness(template = true) {
       Object.assign(context, { composition: { kv: resolveKvScheme({ ...composition?.kv, config: context.kvConfig }).storage } });
       return context;
     },
-    engine: async (loaded, scheme) => { expect(loaded).toBe(context); schemes.push(scheme.storage); return engine; },
+    engine: async loaded => { expect(loaded).toBe(context); schemes.push(loaded.composition?.kv); return engine; },
     write: text => { writes.push(text); }, stdin: async () => " first \n\n second\r\n", stdinIsTTY: () => false,
   };
   return { dependencies, context, engine, events, encoded, decoded, rendered, writes, selections, runs, schemes, embeds,
@@ -322,7 +322,7 @@ test("production CLI composition requests optional templates and a continuous en
       return context;
     } }));
     mock.module(app + "src/engine/index.ts", () => ({ createAppEngine: async (supplied, options) => {
-      opened++; assert.equal(supplied, context); assert.equal(options.capacity, 1); assert.equal(options.gateway.kvScheme.kind, "bf16");
+      opened++; assert.equal(supplied, context); assert.equal(options.capacity, 1); assert.equal(options.gateway, undefined);
       return { context, binding: { embed: (texts) => { assert.deepEqual(texts, ["alpha", "beta"]); return texts.map(text => ({ vector: Float32Array.from([text.length]), tokens: text.length })); } }, gateway: { runExclusive: async work => work() }, completion: {
         place: shape => ({ shape, mechanism: "continuous" }),
         run: async (ids, options, token, vision, shape, placement) => { assert.deepEqual(ids, [1]); assert.equal(placement.mechanism, "continuous"); await token(2); },

@@ -176,7 +176,7 @@ export class Qwen3Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly requiredDenseKvLayers: readonly number[] = Object.freeze([]);
   /** Attends the storage its caches hold: delayed affine rows convert per layer
    * and serve ordinary decoding only. Exposes the pooled embedding path. */
-  get graphCapabilities(): GraphCapabilities { return declareGraph({ embeddings: true, kv: { delayedAffine: "ordinary" } }); }
+  get graphCapabilities(): GraphCapabilities { return declareGraph({ embeddings: true }); }
   readonly embed: QuantizedEmbedding;
   readonly layers: Qwen3Layer[];
   readonly finalNorm: RMSNorm;

@@ -5,7 +5,6 @@ import { type RuntimeConfig } from "../runtime/config";
 import type { PromptResponseTrace } from "../runtime/trace";
 import type { GrammarController } from "../sampling/grammar";
 import type { KvMaintenance } from "../contracts/mlx/cache";
-import type { KvScheme } from "../state/kv-scheme";
 import type { MlxRequestStatePolicy } from "../state/request-policy";
 import type { OrdinaryContinuation } from "./continuation-types";
 
@@ -228,13 +227,6 @@ export interface MlxBatchExecutionGroupOptions {
    *  evict. A request that can NEVER fit (over budget alone, empty batch)
    *  is rejected instead of deadlocking. Unset = unlimited (v1 behavior). */
   kvBudgetBytes?: number;
-  /** The composition's KV scheme, which the graph's caches compose. Each
-   * joiner's solo prefill converts inside its own legos at the same chunk
-   * boundaries as the serial path, so a row's quantized bytes preserve the L2
-   * composition. Unsupported schemes fail at construction. */
-  kvScheme?: KvScheme;
-  /** Model binding owns support for precision transitions. */
-  kvBatchCapabilities?: { delayedAffine?: boolean };
   /** Prompt-cache hook: admission take()s the longest usable
    *  prefix into the joiner's solo caches (suffix-only prefill — the
    *  multi-turn chat TTFT path); rows that finish never-merged put() their

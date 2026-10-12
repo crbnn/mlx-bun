@@ -143,7 +143,7 @@ test("closing the app drains borrowed execution before disposing the model", asy
     promptCache: false, checkpoint: false, fill: false, compiledDecode: false,
     grammarJump: false, reasons: [] } as const;
   const supplied = { gateway: { runtime: runtimeConfig(), config: { eosTokenIds: [2] },
-    cachesBatchable: () => true, plan: () => execution,
+    plan: () => execution,
     continuationRequest(_plan: unknown, _opts: unknown, _prompt: unknown, onToken: unknown) {
       return { continuation: {}, sample() {}, plainGreedy: true, onToken, dispose() {} };
     },

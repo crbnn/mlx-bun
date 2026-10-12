@@ -158,3 +158,39 @@ export function targetCacheLayout(cache: Cache): SpeculativeRowLayout {
   if (!make) throw new Error(`No target row layout for ${cache.signature()}`);
   return make();
 }
+
+/** A one-row layout's row in its serial form (owned; the layout keeps its own
+ * state), or null for a cache that is already serial: what persistence takes
+ * for a row that never joined another. */
+export function extractSoleRow(cache: Cache): Cache | null {
+  return isBatchableCache(cache) && cache.batchSize === 1 ? cache.extractRow(0) : null;
+}
+
+/** Row `row` of a running layout in its serial form (owned), or null when the
+ * layout cannot publish that row covering exactly `tokens` positions (a
+ * recurrence that cannot be trimmed to them). */
+export function publishRow(layout: Cache, row: number, tokens: number): Cache | null {
+  return isBatchableCache(layout) && (layout.canPublishRow?.(row, tokens) ?? true) ? layout.extractRow(row) : null;
+}
+
+/** Keep only the rows `keep` (sorted ascending) of a running layout. Serial
+ * state is not row-filtered: a lone adopted row leaves with the whole batch. */
+export function filterLayoutRows(layout: Cache, keep: readonly number[]): void {
+  if (!isBatchableCache(layout)) throw new Error(`applyFilter: adopted ${layout.signature()} state cannot be row-filtered`);
+  layout.filterRows(keep);
+}
+
+/** What a graph's fresh caches say about admitting a row when each one's
+ * storage owns its dynamic-row batching (a layout such as GLM-5.2's compressed
+ * state): its projected KV bytes at a length, and the most positions it holds.
+ * Null otherwise: admission bills the composition's KV scheme by the config.
+ * The projections read geometry only, so the caches may be released after. */
+export function rowAdmission(caches: readonly Cache[]): { bytes(tokens: number): number; readonly maxTokens: number } | null {
+  if (!caches.every(isBatchableCache)) return null;
+  const layouts = caches as readonly BatchableCache[];
+  const projectors = layouts.map(cache => (tokens: number) => cache.projectedBytes(tokens));
+  return Object.freeze({
+    bytes: (tokens: number) => projectors.reduce((sum, project) => sum + project(tokens), 0),
+    maxTokens: Math.min(...layouts.map(cache => cache.maxTokens ?? Infinity)),
+  });
+}

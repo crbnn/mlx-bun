@@ -33,8 +33,8 @@ function fixture() {
     config: { modelType: "fixture", text: { numHiddenLayers: 1, layerTypes: ["full_attention"],
       numGlobalKeyValueHeads: 1, globalHeadDim: 8, slidingWindow: 0 } },
     makeCache() { calls.allocations++; return [new TrackedCache()]; },
-    // Its one layer's keys and values are read plain (updateAndFetch).
-    requiredDenseKvLayers: [0], graphCapabilities: declareGraph({ kv: { denseReads: true } }),
+    // Its one layer's keys and values are read plain (updateAndFetch, requiredDenseKvLayers).
+    requiredDenseKvLayers: [0], graphCapabilities: declareGraph(),
     // Every phase runs the fixture's one forward and head, which a test replaces (late-bound).
     forward(): MlxArray { throw new Error("unexpected forward"); },
     logitsFromHidden(): MlxArray { throw new Error("unexpected projection"); },
@@ -238,7 +238,7 @@ test("automatic request chunks reach ordinary and grouped preparation without re
   Object.assign(f.model.config.text, { numHiddenLayers: 2, numAttentionHeads: 24,
     globalHeadDim: 256, headDim: 256, layerTypes: ["linear_attention", "full_attention"] });
   // A recurrent-attention graph declares its bounded prefill workspace.
-  Object.assign(f.model, { graphCapabilities: declareGraph({ kv: { denseReads: true }, prefill: { boundedWorkspace: true } }) });
+  Object.assign(f.model, { graphCapabilities: declareGraph({ prefill: { boundedWorkspace: true } }) });
   f.model.forward = ids => { chunks.push(ids.shape[1]!); throw new Error("observed chunk"); };
   const runtime = createRuntimeConfig({});
   const ordinary = new MlxBatchExecutionGroup(f.model, { maxBatch: 2, runtime });

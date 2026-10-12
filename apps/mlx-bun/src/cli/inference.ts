@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import type { Registry } from "@mlx-bun/hub/registry";
-import { kvSchemeOf, type KvQuantOverride, type KvScheme } from "@mlx-bun/inference/state/kv-scheme";
+import type { KvQuantOverride } from "@mlx-bun/inference/state/kv-scheme";
 import { runtimeValue } from "@mlx-bun/inference/runtime/config";
 import { parseTurboQuantScheme, type TurboQuantScheme } from "@mlx-bun/inference/artifacts/config";
 import type { GenerateOptions } from "@mlx-bun/inference/generation";
@@ -51,7 +51,7 @@ export interface InferenceDependencies {
   /** `composition`: the command's KV flags and adapter, which the loaded composition records. */
   load(model: SelectedModel, maxTokens?: number, composition?: Pick<LoadContextOptions, "kv" | "adapters">): Promise<LoadedModelContext>;
   /** Takes ownership of the context even if construction rejects. */
-  engine(context: LoadedModelContext, scheme: KvScheme): Promise<OneShotEngine>;
+  engine(context: LoadedModelContext): Promise<OneShotEngine>;
   write(text: string): void;
   stdin(signal?: AbortSignal): Promise<string>;
   stdinIsTTY(): boolean;
@@ -64,9 +64,9 @@ const defaults: InferenceDependencies = {
     return loadContext(model.path, model.repoId, { requireChatTemplate: false,
       runtime: { nativeDraft: false, maxGenerationTokens: maxTokens }, ...composition, maxRows: 1 });
   },
-  async engine(context, scheme) {
+  async engine(context) {
     const { createAppEngine } = await import("../engine");
-    return createAppEngine(context, { capacity: 1, gateway: { kvScheme: scheme } });
+    return createAppEngine(context, { capacity: 1 });
   },
   write: text => { process.stdout.write(text); },
   async stdin(signal) {
@@ -160,9 +160,8 @@ export async function runInference(command: InferenceCommand, args: CommandArgs,
   let failure: unknown, failed = false;
   try {
     signal?.throwIfAborted();
-    const scheme = kvSchemeOf(context.composition?.kv ?? { kind: "bf16" });
     close = undefined; // engine construction owns failure cleanup from here
-    const engine = await deps.engine(context, scheme);
+    const engine = await deps.engine(context);
     close = () => engine.close();
     signal?.throwIfAborted();
     if (generation) {

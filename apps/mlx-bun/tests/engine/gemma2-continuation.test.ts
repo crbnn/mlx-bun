@@ -94,7 +94,7 @@ test.skipIf(!native || !modelDir)("Gemma2 plain-KV generation checkpoints surviv
         binding.gateway.configureContinuation!(caches.continuationServices);
         let flushed: Awaited<ReturnType<typeof caches.close>> | undefined;
         const engine = await createAppEngine(context, { capacity: 4, binding, ownership: "borrowed",
-          gateway: { checkpoints: true, stateCodecs: caches.stateCodecs, kvScheme: caches.resolvedKvScheme,
+          gateway: { checkpoints: true, stateCodecs: caches.stateCodecs,
             promptCache: caches.promptCache, adapterNamespace: caches.adapterNamespace },
           beforeModelDispose: async () => { flushed = await caches.close(); } });
         const tokens: number[] = [], abort = new AbortController();

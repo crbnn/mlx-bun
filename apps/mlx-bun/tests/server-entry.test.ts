@@ -96,7 +96,7 @@ const prelude = (mocks = "") => `
     } };
   // No RuntimeModel, forward(), makeCache(), or native weights: this binding is the model.
   const binding = (stateCompatibility = "synthetic-runtime-v1") => ({ stateCompatibility,
-    gateway: { config, runtime: runtimeConfig(), cachesBatchable: () => true, kvBatchable: () => false,
+    gateway: { config, runtime: runtimeConfig(),
       plan: (_shape, options) => ({ method: options.temperature === 0 ? "custom-exact" : "custom-alternate", mechanism: "continuous",
         promptCache: false, checkpoint: false, fill: false, compiledDecode: false, grammarJump: false, reasons: [] }),
       methodRequest: execution => ({ id: execution.method }), createBatchGroup: () => group, configureContinuation() {} },

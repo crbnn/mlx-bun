@@ -24,7 +24,7 @@ function fake(options: { submit?: MlxBatchGroup["submit"]; plan?: MlxGatewayBind
     submit: options.submit ?? (async request => { await request.onToken(7); return result; }),
   };
   const binding = { config: { modelType: "replacement", eosTokenIds: [2] } as MlxGatewayBinding["config"], runtime: runtimeConfig(), capabilities: declareGraph(),
-    plan: options.plan ?? (() => execution), cachesBatchable: () => true, kvBatchable: () => true, composeState: caches => caches,
+    plan: options.plan ?? (() => execution), composeState: caches => caches,
     continuationRequest(_execution, _options, _prompt, onToken) {
       if (options.failSetup) throw new Error("sampling setup failed");
       return { continuation: { interval: 1, restore: () => null, resumeSampling() {}, captureOwned() {}, complete() {} },
@@ -135,17 +135,6 @@ test("unsupported methods report typed exclusion reasons without unrelated compi
   expect(f.created).toBe(0);
 });
 
-test("unsupported cache capability is probed once even when every placement fails", () => {
-  const f = fake({ plan: (_shape, _options, support) => ({ ...execution,
-    mechanism: support.continuous ? "continuous" : "unsupported", reasons: support.continuous ? [] : ["continuous-unavailable"] }) });
-  let probes = 0;
-  f.binding.cachesBatchable = () => { probes++; return false; };
-  const gateway = new GenerationGateway(f.binding, 2);
-  expect(() => gateway.place(shape())).toThrow(UnsupportedExecutionError);
-  expect(() => gateway.place(shape())).toThrow(UnsupportedExecutionError);
-  expect(probes).toBe(1); expect(f.created).toBe(0);
-});
-
 test("two rows interleave at shared capacity and cancelling one preserves the other", async () => {
   type Request = Parameters<MlxBatchGroup["submit"]>[0];
   const rows = new Map<number, { request: Request; finish: () => void }>();
@@ -160,8 +149,6 @@ test("two rows interleave at shared capacity and cancelling one preserves the ot
     return task.promise.finally(() => { request.signal?.removeEventListener("abort", abort); rows.delete(id); });
   } });
   Object.defineProperty(f.group, "activeRows", { get: () => rows.size });
-  let probes = 0;
-  f.binding.cachesBatchable = () => { probes++; return true; };
   const gateway = new GenerationGateway(f.binding, 2), abort = new AbortController();
   const firstShape = shape(), secondShape = shape(), firstGrammar = grammar(), secondGrammar = grammar();
   const emitted: string[] = [];
@@ -171,7 +158,7 @@ test("two rows interleave at shared capacity and cancelling one preserves the ot
     undefined, secondShape, gateway.place(secondShape));
   await bothEntered.promise;
   expect(gateway.activeRows).toBe(2); expect(f.created).toBe(1); expect(f.capacity).toBe(2);
-  expect(probes).toBe(1); expect(gateway.submittedRows).toBe(2);
+  expect(gateway.submittedRows).toBe(2);
   await rows.get(1)!.request.onToken(7);
   await rows.get(2)!.request.onToken(8);
   await rows.get(1)!.request.onToken(9);
@@ -232,40 +219,30 @@ test("exclusive mutations share the scheduler lock and release aborted waiters",
 
 // Importing the real graph/binding loads MLX, even though placement creates no
 // tensors. Keep this qualification check out of the native-blocked CPU suite.
-test.skipIf(process.env.MLX_BUN_GEMMA2_NATIVE !== "1")("Gemma2 admits plain KV, grammar, adapter, plain fill and n-gram draft requests and rejects unqualified shared compositions before execution", async () => {
+test.skipIf(process.env.MLX_BUN_GEMMA2_NATIVE !== "1")("Gemma2 admits grammar, adapter, fill and n-gram draft requests under every KV scheme its composition names", async () => {
   const { UniversalDenseModel } = await import("@mlx-bun/inference/models/universal");
   const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
   const { KVCache } = await import("@mlx-bun/inference/state");
-  const { resolveKvScheme } = await import("@mlx-bun/inference/state/kv-scheme");
   /** The graph composed with `kv`, the scheme every request it serves stores (bf16 unless named). */
   const graph = (kv: KvStorageScheme = { kind: "bf16" }) => Object.assign(Object.create(UniversalDenseModel.prototype), {
     args: { modelType: "gemma2", maskArray: true, attnLogitSoftcap: 50, layerTypes: null }, encodedKvAttention: false,
     // The text facts KV scheme policy reads; this one-layer graph uses full attention.
     config: { modelType: "gemma2", text: { enableMoeBlock: false, numHiddenLayers: 1, layerTypes: ["full_attention"] }, eosTokenIds: [] },
     makeCache: () => [new KVCache()], loraState: { active: [] }, requiredDenseKvLayers: [0], composition: { kv },
+    // The token phases a speculative binding reads; placement never forwards.
+    ...Object.fromEntries(["prefillChunk", "prefillTail", "decode", "verify", "appendKnown", "logits"]
+      .map(name => [name, () => { throw new Error("placement never forwards"); }])),
   });
   const model = graph();
   const binding = bindMlxGateway(model);
   const AFFINE: KvStorageScheme = { kind: "affine", bits: 4, groupSize: 64, kernels: "unfused" };
   const TURBO: KvStorageScheme = { kind: "turbo", kBits: 8, vBits: 3 };
-  // A gateway serving a composed scheme it was not configured to batch (no `kvScheme`) refuses its requests.
-  const unconfigured = (kv: KvStorageScheme) => {
-    const composed = bindMlxGateway(graph(kv));
-    composed.createBatchGroup = () => { throw new Error("unexpected execution"); };
-    return { binding: composed, gateway: new GenerationGateway(composed, 4) };
-  };
   let created = false;
   binding.createBatchGroup = () => { created = true; throw new Error("unexpected execution"); };
   const gateway = new GenerationGateway(binding, 4);
   try {
     expect(gateway.place(shape())).toMatchObject({ mechanism: "continuous",
       execution: { method: "autoregressive", compiledDecode: false, fill: false, checkpoint: false } });
-    // Affine and TurboQuant KV batch through the scheme's dense-read certification.
-    for (const scheme of [resolveKvScheme({ override: 4, quantizedKvStart: 0 }), resolveKvScheme({ override: 8, quantizedKvStart: 64 }),
-      resolveKvScheme({ override: "config", config: [{ layerIdx: 0, bits: 4, groupSize: 64 }] }),
-      resolveKvScheme({ turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: 0 }),
-      resolveKvScheme({ turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: 64 }), resolveKvScheme({ override: "off" })])
-      expect(binding.kvBatchable(scheme), scheme.cacheKey).toBe(true);
     for (const request of [{ hasGrammar: true }, { hasAdapters: true }, { hasGrammar: true, hasAdapters: true }])
       expect(gateway.place({ ...shape(), ...request })).toMatchObject({ mechanism: "continuous",
         execution: { method: "autoregressive", compiledDecode: false, fill: false, checkpoint: false, grammarJump: false } });
@@ -274,13 +251,19 @@ test.skipIf(process.env.MLX_BUN_GEMMA2_NATIVE !== "1")("Gemma2 admits plain KV, 
     // ignore a configured draft on this graph as on every other, as main did.
     for (const request of [{ hasDraft: true }, { hasVision: true }, { hasGrammar: true, hasVision: true }])
       expect(() => gateway.place({ ...shape(), ...request })).toThrow(UnsupportedExecutionError);
+    // The composition's KV scheme is the cache lego's: plain, grammar and fill
+    // requests place the same way over affine and TurboQuant storage.
     for (const kv of [AFFINE, TURBO]) {
-      const { gateway: refusing } = unconfigured(kv);
+      const composed = bindMlxGateway(graph(kv));
+      composed.createBatchGroup = binding.createBatchGroup;
+      const storing = new GenerationGateway(composed, 4);
       try {
-        for (const request of [{}, { hasGrammar: true }])
-          expect(() => refusing.place({ ...shape(), ...request })).toThrow(UnsupportedExecutionError);
-        expect(() => refusing.place(shape(), { fill: { plan: { echo: null } } } as GenerateOptions)).toThrow(UnsupportedExecutionError);
-      } finally { await refusing.close(); }
+        for (const request of [{}, { hasGrammar: true }, { hasAdapters: true }])
+          expect(storing.place({ ...shape(), ...request })).toMatchObject({ mechanism: "continuous",
+            execution: { method: "autoregressive", fill: false } });
+        expect(storing.place(shape(), { fill: { plan: { echo: null } } } as GenerateOptions)).toMatchObject({ mechanism: "continuous",
+          execution: { method: "autoregressive", fill: true } });
+      } finally { await storing.close(); }
     }
     for (const request of [{ hasDraft: true, wantsLogprobs: true }, { hasAdapters: true, hasDraft: true }])
       expect(gateway.place({ ...shape(), ...request })).toMatchObject({ mechanism: "continuous", execution: { method: "autoregressive" } });
@@ -308,15 +291,6 @@ test.skipIf(process.env.MLX_BUN_GEMMA2_NATIVE !== "1")("Gemma2 admits plain KV, 
       expect(speculating.place({ ...shape(), hasDraft: true }, fill)).toMatchObject({ mechanism: "continuous",
         execution: { method: "speculative", fill: false } });
     } finally { await speculating.close(); }
-    // Once the gateway certifies the scheme, affine and TurboQuant KV place
-    // ordinarily; a scheme it did not certify stays refused.
-    for (const kv of [AFFINE, TURBO]) {
-      const composed = unconfigured(kv).binding;
-      expect(composed.plan(shape(), {}, { continuous: true, quantizedBatch: true, checkpoints: true }))
-        .toMatchObject({ method: "autoregressive", mechanism: "continuous" });
-      expect(composed.plan(shape(), {}, { continuous: true, quantizedBatch: false, checkpoints: true }).mechanism)
-        .toBe("unsupported");
-    }
     expect(created).toBe(false);
   } finally { await gateway.close(); }
 });
@@ -348,29 +322,18 @@ test.skipIf(process.env.MLX_BUN_GEMMA2_NATIVE !== "1")("Gemma2 places shared gen
         execution: { checkpoint: false } });
     for (const request of [{ hasDraft: true }, { hasVision: true }])
       expect(() => enabled!.place({ ...shape(), ...request })).toThrow(UnsupportedExecutionError);
-    // A composed KV scheme the gateway was not configured to batch stays refused, checkpoints or not.
+    // A composed KV scheme checkpoints as bf16 does: its lego owns the state's codec.
     for (const kv of [{ kind: "affine", bits: 4, groupSize: 64, kernels: "unfused" }, { kind: "turbo", kBits: 8, vBits: 3 }] as const) {
       const composed = bindMlxGateway(Object.assign(Object.create(UniversalDenseModel.prototype), { ...model, composition: { kv } }));
       composed.createBatchGroup = () => { throw new Error("unexpected execution"); };
-      const refusing = new GenerationGateway(composed, 4, { checkpoints: true });
-      try { expect(() => refusing.place(shape())).toThrow(UnsupportedExecutionError); } finally { await refusing.close(); }
+      composed.configureContinuation!({ checkpointPersistence: {}, checkpoints: {}, checkpointEveryTokens: 4 } as never);
+      const storing = new GenerationGateway(composed, 4, { checkpoints: true });
+      try {
+        expect(storing.place(shape())).toMatchObject({ mechanism: "continuous",
+          execution: { method: "autoregressive", promptCache: true, checkpoint: true } });
+      } finally { await storing.close(); }
     }
   } finally { for (const gateway of gateways) await gateway.close(); }
-});
-
-test("a requested KV scheme the model cannot serve is refused at startup; a missing kv_config and a servable scheme are not", async () => {
-  const { resolveKvScheme } = await import("@mlx-bun/inference/state/kv-scheme");
-  const f = fake(), refusing = { ...f.binding, kvBatchable: () => false } as MlxGatewayBinding;
-  for (const scheme of [resolveKvScheme({ override: 4 }), resolveKvScheme({ override: 8, quantizedKvStart: 64 }),
-    resolveKvScheme({ turboQuant: { kBits: 8, vBits: 3 } }),
-    resolveKvScheme({ override: "config", config: [{ layerIdx: 0, bits: 4, groupSize: 64 }] })])
-    expect(() => new GenerationGateway(refusing, 1, { kvScheme: scheme }))
-      .toThrow(`replacement cannot serve the requested KV cache scheme ${scheme.cacheKey}`);
-  // `config` without the model's kv_config.json resolves to bf16: no scheme was requested.
-  const absent = resolveKvScheme({ override: "config", config: null });
-  expect(absent.kind).toBe("bf16");
-  await new GenerationGateway(refusing, 1, { kvScheme: absent }).close();
-  await new GenerationGateway(f.binding, 1, { kvScheme: resolveKvScheme({ override: 4 }) }).close();
 });
 
 /** A binding with no method/continuation hooks, so ordinary rows sample through the step sampler. */

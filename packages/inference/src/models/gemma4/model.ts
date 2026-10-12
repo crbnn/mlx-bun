@@ -49,13 +49,12 @@ import { flashAttention, flashSupported, getTrainingAttn } from "../../kernels/a
 import { compiledGegluActive } from "../../layers/geglu";
 import { disposing } from "../../layers/helpers";
 import { activePrefixLayout, ropeBlocks } from "../../layers/prefix-layout";
-import { captureRopeOffsets } from "../../state/capabilities";
 import { RMSNorm } from "../../layers/normalization";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import type { QuantizedLinear } from "../../layers/quantized-linear";
 import { logitSoftcap } from "../../kernels/logits";
 import { compiledLogitSoftcap } from "../../kernels/softcap";
-import { AttentionMasks } from "../../state/attention-read";
+import { AttentionMasks, captureRopeOffsets } from "../../state/attention-read";
 import { composedFullAttentionCache, composedSlidingAttentionCache } from "../../state/bf16-first-kv";
 import type { Composition } from "../../contracts/portable/composition";
 import { deferredTurboQuantKernels } from "../../state/turboquant-attention";
@@ -205,13 +204,11 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly requiredDenseKvLayers: readonly number[] = Object.freeze([]);
   /** Prepared image/audio embeddings, layer taps for drafts, and a compiled
    * decode step, except through experts: shapeless replay
-   * retraces their growing windows. Its caches convert delayed affine rows and
-   * every method is qualified over them. */
+   * retraces their growing windows. */
   get graphCapabilities(): GraphCapabilities {
     return declareGraph({
       media: { input: "embeddings", video: false }, hiddenLayerTaps: true,
       compiledDecode: this.config?.modelType?.startsWith("gemma4") === true && !this.config.text.enableMoeBlock,
-      kv: { delayedAffine: "all" },
     });
   }
   #trainable: TrainableGraph | undefined;

@@ -491,8 +491,8 @@ than running a hidden serial path. Diffusion models are served through the same
 scheduler by the library's interleaved denoising method. An image request's pixels
 ride its options, and the gateway releases them exactly once, whether the row
 settles or fails before submission. Requests the method cannot apply (grammar,
-draft, logprobs, logits processors, fill, encoded or paged KV) receive the typed
-capability error.
+draft, logprobs, logits processors, fill) receive the typed
+capability error; a KV scheme or paging is refused when the model loads.
 
 `engine/cache-services` composes the library prompt cache and persistence. Its
 default is 8 GB of RAM with plain KV; a caller supplies `ssdCacheDir` for saved state.

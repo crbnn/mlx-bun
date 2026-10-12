@@ -1,11 +1,12 @@
 // Opt in with MLX_BUN_TEST_AFFINE_SPANS_MODEL=/cached/checkpoint. No downloads.
 // Committed grammar spans over delayed affine KV on real weights: the span
-// method the gateway binds, in a batch group, against this tree's direct
-// jump-forward generation at B1, below and across the transition, and beside
-// an interleaved peer. A graph that reads plain KV refuses the crossing row
-// before the forward direct generation fails in; a graph that reads encoded KV
-// continues over converted layers. The model must be one whose gateway admits
-// the jump over affine KV.
+// method in a batch group, against this tree's direct jump-forward generation
+// at B1, below and across the transition, and beside an interleaved peer. A
+// graph that reads plain KV refuses the crossing row before the forward direct
+// generation fails in; a graph that reads encoded KV continues over converted
+// layers. The gateway binds spans as the grammar jump of a graph whose verifier
+// does not qualify grammar proposals; on any other graph it verifies proposals,
+// over every cache lego, and the span method is bound directly.
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -37,6 +38,7 @@ function spanGrammar(spans: readonly (readonly number[])[]) {
 test.skipIf(!target)("real-weight committed spans over delayed affine KV equal direct generation below and across the transition, and beside a peer", async () => {
   const { Weights, loadModelConfig, createModel, generateAutoregressive, resolveComposition } = await import("../../src/index");
   const { bindMlxGateway } = await import("../../src/execution");
+  const { bindGrammarGroupRequests } = await import("../../src/execution/grammar-group");
   const { bindMlxAutoregressiveGraph } = await import("../../src/generation/bindings/autoregressive");
   const { resolveKvScheme } = await import("../../src/state/kv-scheme");
   const { observedPhases } = await import("../models/phase-forward");
@@ -86,14 +88,20 @@ test.skipIf(!target)("real-weight committed spans over delayed affine KV equal d
     const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
       hasLogitsExtras: false, hasGrammar: true, wantsLogprobs: false, hasDraft: false };
     const grouped = (scheme: Scheme) => {
-      const { binding } = graphFor(scheme);
-      const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: chunk, kvScheme: scheme });
+      const { model, binding } = graphFor(scheme);
+      const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: chunk });
+      // The committed-span method, bound as the gateway binds it for a graph whose verifier does not
+      // qualify grammar proposals; on any other graph the gateway verifies proposals over every cache
+      // lego, and the span method is checked here bound directly.
+      const probe = model.makeCache(), count = probe.length;
+      for (const cache of probe) cache.dispose();
+      const spanMethod = bindGrammarGroupRequests(model, model.requiredDenseKvLayers, count);
       const submit = async (prompt: number[], maxTokens: number, spans: number[][], onToken?: () => void) => {
         const grammar = spanGrammar(spans), tokens: number[] = [], request = options(maxTokens, grammar);
-        const execution = binding.plan(shape, request, { continuous: true, quantizedBatch: binding.kvBatchable(scheme), checkpoints: false });
-        expect(execution).toMatchObject({ method: "autoregressive", mechanism: "continuous", grammarJump: true });
+        const execution = binding.plan(shape, request, { checkpoints: false });
+        expect(execution).toMatchObject({ method: dense ? "autoregressive" : "speculative", mechanism: "continuous", grammarJump: true });
         const outcome = await group.submit({ promptIds: prompt, maxTokens, eosTokenIds: [], grammar,
-          method: binding.methodRequest!(execution, request)!,
+          method: dense ? binding.methodRequest!(execution, request)! : spanMethod(request),
           onToken(token: number) { tokens.push(token); onToken?.(); return undefined; } })
           .then(stats => stats.finishReason as string, (error: Error) => error.name);
         return { tokens, accepted: grammar.accepted, outcome };

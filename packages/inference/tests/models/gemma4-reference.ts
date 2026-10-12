@@ -76,7 +76,7 @@ import { QuantizedLinear } from "../../src/layers/quantized-linear";
 import { QuantizedSwitchLinear } from "../../src/layers/quantized-switch-linear";
 import { argmaxLastPosition,logitSoftcap } from "../../src/kernels/logits";
 import { compiledLogitSoftcap } from "../../src/kernels/softcap";
-import { captureRopeOffsets } from "../../src/state/capabilities";
+import { captureRopeOffsets } from "../../src/state/attention-read";
 import { KVCache } from "../../src/state/kv";
 import { deferredTurboQuantKernels } from "../../src/state/turboquant-attention";
 import { RotatingKVCache } from "../../src/state/rotating-kv";
@@ -603,7 +603,6 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
     return declareGraph({
       media: { input: "embeddings", video: false }, hiddenLayerTaps: "hiddenTap" in this,
       compiledDecode: this.config?.modelType?.startsWith("gemma4") === true && !this.config.text.enableMoeBlock,
-      kv: { delayedAffine: "all" },
     });
   }
   #trainable: TrainableGraph | undefined;

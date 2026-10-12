@@ -368,7 +368,7 @@ async function setup() {
           hasLogitsExtras: false, hasGrammar: !!options.grammar, wantsLogprobs: false, hasDraft: false };
         let sampling: ReturnType<typeof createRowSampling> | undefined;
         try {
-          const execution = binding.plan(shape, options, { continuous: binding.cachesBatchable(), quantizedBatch: false, checkpoints: false });
+          const execution = binding.plan(shape, options, { checkpoints: false });
           assert.equal(execution.mechanism, "continuous", `placement refused ${JSON.stringify(request)}: ${execution.reasons.join(", ")}`);
           const method = binding.methodRequest?.(execution, options);
           const sink = (token: number) => {

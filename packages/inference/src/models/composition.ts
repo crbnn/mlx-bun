@@ -48,9 +48,6 @@ export interface CompositionRequest {
   readonly adapters?: boolean;
   /** The most rows one forward carries. Default {@link DEFAULT_MAX_ROWS}. */
   readonly maxRows?: number;
-  /** Speculative verification over affine-quantized KV where a graph's
-   * verifier qualifies it. Default true. */
-  readonly speculativeAffineKv?: boolean;
   /** The groups of a mixed forward share one MLP pass. Default true. */
   readonly packedMixedMlp?: boolean;
   /** One argmax over a decode step whose live rows are all plain greedy. Default true. */
@@ -98,7 +95,6 @@ export function resolveComposition(config: ModelConfig, request: CompositionRequ
     prefillChunkTokens: resolveChunkTokens(runtime),
     adapters: request.adapters ?? false,
     maxRows,
-    speculativeAffineKv: request.speculativeAffineKv ?? COMPOSITION_DEFAULTS.speculativeAffineKv,
     packedMixedMlp: request.packedMixedMlp ?? COMPOSITION_DEFAULTS.packedMixedMlp,
     vectorGreedySampling: request.vectorGreedySampling ?? COMPOSITION_DEFAULTS.vectorGreedySampling,
     compiledDecode: request.compiledDecode ?? COMPOSITION_DEFAULTS.compiledDecode,

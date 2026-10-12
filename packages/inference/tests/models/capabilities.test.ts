@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { declareGraph, declaredGraph, PLAIN_KV_VERIFICATION } from "../../src/models/capabilities";
+import { declareGraph, declaredGraph, ORDINARY_VERIFICATION } from "../../src/models/capabilities";
 import { testComposition } from "./test-composition";
 import { Gemma4Model } from "../../src/models/gemma4/model";
 import { UniversalDenseModel } from "../../src/models/universal/dense";
@@ -21,35 +21,27 @@ describe("every graph declares its capabilities", () => {
     // Taps are every phase's capture parameter, so the graph always declares them.
     const text = (enableMoeBlock: boolean, modelType = "gemma4") => ({ config: { modelType, text: { enableMoeBlock } } });
     expect(graph(Gemma4Model.prototype, text(false)).graphCapabilities).toEqual(declareGraph({
-      media: { input: "embeddings", video: false }, hiddenLayerTaps: true, compiledDecode: true,
-      kv: { delayedAffine: "all" } }));
+      media: { input: "embeddings", video: false }, hiddenLayerTaps: true, compiledDecode: true }));
     expect(graph(Gemma4Model.prototype, text(true)).graphCapabilities.compiledDecode).toBe(false);
     expect(graph(Gemma4Model.prototype, text(false, "gemma3n")).graphCapabilities.compiledDecode).toBe(false);
   });
 
-  test("Qwen3.5 and its Trellis specialization: prepared embeddings with positions, video, speculation over affine KV as its own option", () => {
-    // Speculation over affine KV is the composition's field (`MLX_BUN_QWEN_SPEC_KV4`, read when it resolves).
-    for (const prototype of [Qwen35Model.prototype, Qwen38TrellisTQ.prototype]) {
-      const declared = graph(prototype, { composition: testComposition() }).graphCapabilities;
-      expect(declared).toEqual(declareGraph({ media: { input: "embeddings+positions", video: true }, hiddenLayerTaps: true,
-        kv: { delayedAffine: "all" }, prefill: { boundedWorkspace: true }, speculation: { immediateAffine4: true } }));
-      const off = graph(prototype, { composition: testComposition(undefined, { speculativeAffineKv: false }) })
-        .graphCapabilities;
-      expect(off.speculation).toEqual({ ...declared.speculation, affineKv: false });
-    }
+  test("Qwen3.5 and its Trellis specialization: prepared embeddings with positions, video, bounded prefill workspace", () => {
+    for (const prototype of [Qwen35Model.prototype, Qwen38TrellisTQ.prototype])
+      expect(graph(prototype, { composition: testComposition() }).graphCapabilities).toEqual(declareGraph({
+        media: { input: "embeddings+positions", video: true }, hiddenLayerTaps: true, prefill: { boundedWorkspace: true } }));
   });
 
-  test("dense-attention graphs delay affine rows for ordinary decoding only", () => {
-    expect(graph(MiniCPM5Model.prototype).graphCapabilities).toEqual(declareGraph({ kv: { delayedAffine: "ordinary" } }));
-    expect(graph(Qwen3MoeModel.prototype).graphCapabilities).toEqual(declareGraph({ kv: { delayedAffine: "ordinary" } }));
-    expect(graph(Qwen3Model.prototype).graphCapabilities).toEqual(declareGraph({ embeddings: true, kv: { delayedAffine: "ordinary" } }));
+  test("ordinary autoregressive graphs declare the defaults: every method over every cache lego", () => {
+    expect(graph(MiniCPM5Model.prototype).graphCapabilities).toEqual(plainCaps);
+    expect(graph(Qwen3MoeModel.prototype).graphCapabilities).toEqual(plainCaps);
+    expect(graph(Qwen3Model.prototype).graphCapabilities).toEqual(declareGraph({ embeddings: true }));
   });
 
-  test("a universal graph reads its own attention: softcapped layers read dense KV and verify plain-KV rounds only", () => {
-    expect(graph(UniversalDenseModel.prototype, { encodedKvAttention: true }).graphCapabilities)
-      .toEqual(declareGraph({ kv: { delayedAffine: "ordinary" } }));
+  test("a universal graph reads its own attention: softcapped layers verify ordinary rounds only", () => {
+    expect(graph(UniversalDenseModel.prototype, { encodedKvAttention: true }).graphCapabilities).toEqual(plainCaps);
     expect(graph(UniversalDenseModel.prototype, { encodedKvAttention: false }).graphCapabilities)
-      .toEqual(declareGraph({ kv: { denseReads: true }, speculation: PLAIN_KV_VERIFICATION }));
+      .toEqual(declareGraph({ speculation: ORDINARY_VERIFICATION }));
     // Before the attention facts are bound, neither is declared.
     expect(graph(UniversalDenseModel.prototype).graphCapabilities).toEqual(plainCaps);
   });

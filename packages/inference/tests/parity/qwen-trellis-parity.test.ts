@@ -161,7 +161,7 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis: logits, greedy tokens and MTP spec
       forwards = [];
       const plan = binding.plan({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
         hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true }, options,
-      { continuous: true, quantizedBatch: false, checkpoints: false });
+      { checkpoints: false });
       assert.equal(plan.method, "speculative");
       const method = binding.methodRequest!(plan, options);
       assert(method, "the MTP method must bind");

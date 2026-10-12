@@ -7,9 +7,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { configureRuntime } from "@mlx-bun/inference/runtime/config";
-import type { KvScheme } from "@mlx-bun/inference/state/kv-scheme";
 import type { GenerateOptions } from "@mlx-bun/inference/generation";
-import type { LoadedModelContext } from "../src/engine/model-host";
+import type { LoadContextOptions, LoadedModelContext } from "../src/engine/model-host";
 import { CHUNK_ADAPTER, createInProcessMemoryClient, type MemoryEngine, type MemoryEngineDependencies } from "../src/cli/memory-engine";
 import { MEMORY_TASK_MODEL, locateTaskModel, memoryPromptIds, type MemoryCompletionRequest } from "@mlx-bun/module-memory/model";
 
@@ -32,7 +31,7 @@ function harness(options: { adapterDir?: string; run?: RunImpl; locate?: () => P
   load?: () => Promise<LoadedModelContext> } = {}) {
   const events: string[] = [];
   const calls: Call[] = [];
-  let scheme: KvScheme | undefined, capacity = 0;
+  let loadedWith: Pick<LoadContextOptions, "adapters" | "maxRows" | "kv"> | undefined, capacity = 0;
   const context = () => ({
     tokenizer, template, kvConfig: null, memoryPlan: null,
     adapters: { async mount(id: string, dir: string) { events.push(`mount ${id} ${dir}`); } },
@@ -41,9 +40,9 @@ function harness(options: { adapterDir?: string; run?: RunImpl; locate?: () => P
   const run: RunImpl = options.run ?? (async (call, emit) => { for (const id of call.promptIds.slice(-2)) emit(id); });
   const deps: MemoryEngineDependencies = {
     async locate(repoId) { events.push(`locate ${repoId}`); return options.locate ? options.locate() : "/cache/e4b"; },
-    async load(path, repoId) { events.push(`load ${path} ${repoId}`); return options.load ? options.load() : context(); },
-    async engine(loaded, kv, width) {
-      scheme = kv; capacity = width; events.push("engine");
+    async load(path, repoId, composition) { loadedWith = composition; events.push(`load ${path} ${repoId}`); return options.load ? options.load() : context(); },
+    async engine(loaded, width) {
+      capacity = width; events.push("engine");
       const engine: MemoryEngine = {
         context: loaded,
         completion: {
@@ -62,7 +61,7 @@ function harness(options: { adapterDir?: string; run?: RunImpl; locate?: () => P
     },
     adapterDir: stage => stage === "chunk" ? options.adapterDir : undefined,
   };
-  return { deps, events, calls, scheme: () => scheme, capacity: () => capacity };
+  return { deps, events, calls, loadedWith: () => loadedWith, capacity: () => capacity };
 }
 const request = (stage: string, user: string, maxTokens = 16): MemoryCompletionRequest => ({ stage, input: { user }, maxTokens });
 
@@ -92,7 +91,7 @@ test("main's policy: rendered prompt ids, greedy with no stop strings, full-prec
   try {
     for (const stage of ["chunk", "entity", "route", "synthesis", "section", "editor"])
       await memory.client.complete(request(stage, `input for ${stage}`, 32));
-    expect(h.scheme()!.kind).toBe("bf16");
+    expect(h.loadedWith()).not.toHaveProperty("kv"); // no KV flags: the full-precision composition default
     for (const [index, stage] of ["chunk", "entity", "route", "synthesis", "section", "editor"].entries()) {
       const call = h.calls[index]!;
       expect(call.promptIds).toEqual(memoryPromptIds(stage, { user: `input for ${stage}` }, tokenizer, template as never));

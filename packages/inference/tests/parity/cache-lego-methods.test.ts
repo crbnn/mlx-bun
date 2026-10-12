@@ -209,7 +209,7 @@ test.skipIf(!target)("the speculative group with the assistant drafter over page
       const binding = bindMlxGateway(model, { provider, numDraftTokens: 2 });
       const plan = binding.plan({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
         hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true }, options,
-        { continuous: true, quantizedBatch: false, checkpoints: false });
+        { checkpoints: false });
       expect(plan.method).toBe("speculative");
       let held = true;
       const group = binding.createBatchGroup({ maxBatch: 4, admissionHeld: () => held });

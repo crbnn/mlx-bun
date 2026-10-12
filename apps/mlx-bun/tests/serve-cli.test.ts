@@ -429,7 +429,6 @@ for (const [sessionDir, jobPaths, expectedStore] of [
         assert.equal(supplied, context); assert.equal(options.binding, binding);
         assert.equal(options.gateway.promptCache, cache.promptCache);
         assert.equal(options.gateway.stateCodecs, cache.stateCodecs);
-        assert.equal(options.gateway.kvScheme, cache.resolvedKvScheme);
         assert.equal(options.gateway.adapterNamespace, cache.adapterNamespace);
         assert.equal(options.gateway.checkpoints, true);
         assert.deepEqual(events, ["continuation"]); events.push("engine");

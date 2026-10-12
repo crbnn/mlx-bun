@@ -29,7 +29,7 @@ afterAll(() => rmSync(dir, { recursive: true, force: true }));
 test("the default record: this machine, bf16, no drafter, the 2048-token chunk, no adapters, eight rows", () => {
   const composition = resolveComposition(config);
   expect(composition).toEqual({ device: deviceArchitecture(), aneBridge: true, kv: { kind: "bf16" }, pagedKv: null,
-    draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 8, speculativeAffineKv: true, packedMixedMlp: true,
+    draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 8, packedMixedMlp: true,
     vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
     grammarJump: false });
   // The Neural Engine bridge is composed unless the caller turns it off; nothing probes the machine.
@@ -81,17 +81,14 @@ test("--fused-sdpa picks the affine read kernels: on tiled-causal, off unfused, 
   expect(resolveComposition(config, { kv: { fusedSdpa: true } }).kv).toEqual({ kind: "bf16" });
 });
 
-test("the two graph switches are composition fields, on by default; the runtime configuration does not reach them", () => {
-  const switches = (request: Parameters<typeof resolveComposition>[1] = {}, values: Record<string, string> = {}) =>
-    withRuntimeConfig(createRuntimeConfig(values), () => {
-      const { speculativeAffineKv, packedMixedMlp } = resolveComposition(config, request);
-      return { speculativeAffineKv, packedMixedMlp };
-    });
-  expect(switches()).toEqual({ speculativeAffineKv: true, packedMixedMlp: true });
-  expect(switches({ speculativeAffineKv: false })).toEqual({ speculativeAffineKv: false, packedMixedMlp: true });
-  expect(switches({ packedMixedMlp: false })).toEqual({ speculativeAffineKv: true, packedMixedMlp: false });
-  expect(switches({}, { MLX_BUN_QWEN_SPEC_KV4: "0", MLX_BUN_MIXED_PACKED_MLP: "0" }))
-    .toEqual({ speculativeAffineKv: true, packedMixedMlp: true });
+test("the graph switch is a composition field, on by default; the runtime configuration does not reach it", () => {
+  const packed = (request: Parameters<typeof resolveComposition>[1] = {}, values: Record<string, string> = {}) =>
+    withRuntimeConfig(createRuntimeConfig(values), () => resolveComposition(config, request).packedMixedMlp);
+  expect(packed()).toBe(true);
+  expect(packed({ packedMixedMlp: false })).toBe(false);
+  expect(packed({}, { MLX_BUN_MIXED_PACKED_MLP: "0" })).toBe(true);
+  // Speculation over a KV scheme is no composition fact: every cache lego holds the transaction.
+  expect(resolveComposition(config)).not.toHaveProperty("speculativeAffineKv");
 });
 
 test("the scheduler switches are composition fields at their defaults; the runtime configuration does not reach them", () => {

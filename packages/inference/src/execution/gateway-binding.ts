@@ -4,13 +4,10 @@ import type { ContinuationServices } from "./continuation";
 import { bindRequestState, type MlxRequestStatePolicy } from "../state/request-policy";
 import type { ExecutionContext } from "../contracts/portable/scheduling";
 import type { ModelConfig } from "../artifacts/config";
-import type { KvScheme } from "../state/kv-scheme";
 import type { MlxTokenGraph } from "../models/graph";
 import { declaredGraph } from "../models/capabilities";
-import { composeAtLayer, composedStorageOf, isPlainKvCache, isRecurrentCache, isRotatingPlainCache } from "../state/capabilities";
+import { composeAtLayer } from "../state/persistence";
 import { bindRequiredDenseKvLayers } from "../state/dense-kv-reads";
-import { ownedCacheLayoutFactory } from "../state/layout";
-import { createKvMaintenance } from "../state/kv-maintenance";
 import { BF16_KV, COMPOSITION_DEFAULTS, type KvStorageScheme } from "../contracts/portable/composition";
 import type { Cache } from "../contracts/mlx/cache";
 import { runtimeConfig, type RuntimeConfig } from "../runtime/config";
@@ -19,7 +16,6 @@ import { MlxBatchExecutionGroup } from "./batch-group";
 import { type MlxBatchExecutionGroupOptions, type MlxGroupMethodRequest } from "./batch-types";
 import type { DraftProvider } from "../generation/speculative/source";
 import { constraintDraftProvider } from "../generation/speculative/sources/ngram-source";
-import { targetRowLayoutFactory } from "../state/target-layout";
 import { bindSpeculativeGroupRequests } from "./speculative-group";
 import { bindGrammarGroupRequests } from "./grammar-group";
 import { bindFillGroupRequests } from "./fill-group";
@@ -37,7 +33,9 @@ export interface MlxBatchGroup extends Pick<MlxBatchExecutionGroup,
 }
 
 /** Planning consumes the graph's declared capabilities (`declaredGraph`), the
- * request, and dynamic state; it never inspects a model's class, type, or name. */
+ * request, and dynamic state; it never inspects a model's class, type, or name,
+ * nor how the composition's caches store keys and values: every cache lego
+ * serves every method. */
 export interface MlxGatewayBinding {
   mediaInput?(input: Vision): MlxPromptInput;
   configureContinuation?(services: ContinuationServices): void;
@@ -47,58 +45,36 @@ export interface MlxGatewayBinding {
   readonly runtime: RuntimeConfig;
   /** What the bound graph declares, as resolved when it was bound. */
   readonly capabilities: GraphCapabilities;
-  plan(request: ExecutionRequirements, options: GenerateOptions,
-    scheduling: { continuous: boolean; quantizedBatch: boolean; checkpoints: boolean }): ResolvedExecution;
+  /** `scheduling.checkpoints`: the application persists generation checkpoints. */
+  plan(request: ExecutionRequirements, options: GenerateOptions, scheduling: { checkpoints: boolean }): ResolvedExecution;
   bindAdapterContext?(adapters: string[], key: string): ExecutionContext;
-  cachesBatchable(): boolean;
-  kvBatchable(scheme: KvScheme): boolean;
   /** Stored caches (owned; a prompt cache's clones) handed back for serial
    * use as the caches the graph composes: each layer's storage, composed by the
    * graph's cache for that layer, so a lego converts it as the lego that stored
    * it would have. Returns the caches the caller now owns. */
   composeState(caches: Cache[]): Cache[];
   statePolicy?(execution: ResolvedExecution | undefined, options: GenerateOptions, capacityTokens: number): MlxRequestStatePolicy | undefined;
-  prefixNamespace?(execution: ResolvedExecution | undefined, options: GenerateOptions, adapters: string): string | null;
+  /** The prefix namespace of a request whose own namespace is `base` (its adapters, a prepared media prefix). */
+  prefixNamespace?(execution: ResolvedExecution | undefined, options: GenerateOptions, base: string): string | null;
   methodRequest?(execution: ResolvedExecution | undefined, options: GenerateOptions): MlxGroupMethodRequest | undefined;
   createBatchGroup(options: MlxBatchExecutionGroupOptions): MlxBatchGroup;
 }
 
-/** Which operations the storage of the graph's own caches provides: a batch
- * row layout for every layer (recurrent state only under the binding's policy),
- * target transaction rows and per-layer quantized conversion; and the graph's
- * declared dense-read layers, bound against those caches. */
-function probeStorage(model: MlxTokenGraph, ssm: boolean) {
+/** The layers the graph's attention reads as plain keys and values (its
+ * softcapped read), bound once against its own fresh caches, and how many caches
+ * it composes. Every probe cache is released. */
+function plainReadLayers(model: MlxTokenGraph): { layers: readonly number[]; count: number } {
   const caches = model.makeCache();
-  try {
-    const storage = caches.map(composedStorageOf);
-    return Object.freeze({
-      batchable: storage.every(cache => ownedCacheLayoutFactory(cache) !== undefined && (ssm || !isRecurrentCache(cache))),
-      targetRows: storage.every(cache => targetRowLayoutFactory(cache) !== undefined),
-      convertible: Object.freeze(storage.map(cache => isPlainKvCache(cache) || isRotatingPlainCache(cache))),
-      requiredDenseKvLayers: bindRequiredDenseKvLayers(model.requiredDenseKvLayers, caches),
-    });
-  } finally { disposeResources(caches); }
-}
-
-/** Whether this graph's storage, once `scheme`'s own maintenance binds it,
- * certifies dense KV reads in every layer: the storage's capability, answered
- * with that maintenance. Probed over fresh caches that hold no buffers, when a
- * binding or group is composed (never per request, never remembered: the
- * scheme is read as given each time); every probe cache is released. */
-function certifiesDenseKvReads(model: MlxTokenGraph, scheme: KvScheme): boolean {
-  const caches = model.makeCache() as Cache[];
-  try {
-    createKvMaintenance(scheme.storage).preparePrefill?.(caches);
-    return caches.every(cache => cache.denseKvReads !== undefined);
-  } finally { disposeResources(caches); }
+  try { return { layers: bindRequiredDenseKvLayers(model.requiredDenseKvLayers, caches), count: caches.length }; }
+  finally { disposeResources(caches); }
 }
 
 /** `adaptiveDepth`: each round drafts up to `numDraftTokens`, chosen from the
  *  decayed acceptance rate and the graph's measured `verifyRoundCosts` (the
  *  graph must declare them); otherwise every round drafts `numDraftTokens`.
- *  The graph's composition names the KV scheme its caches compose (a graph
- *  without one stores bf16): what every request stores, so planning reads it
- *  once, here. */
+ *  The graph's composition names its KV scheme, paging and scheduler switches
+ *  (a graph without one runs the defaults): every request's, so the binding
+ *  reads them once, here. */
 export function bindMlxGateway(model: MlxTokenGraph,
   draft?: { provider: DraftProvider; numDraftTokens: number; adaptiveDepth?: boolean }): MlxGatewayBinding {
   const kv: KvStorageScheme = model.composition?.kv ?? BF16_KV;
@@ -113,70 +89,26 @@ export function bindMlxGateway(model: MlxTokenGraph,
   const graph = declaredGraph(model);
   const caps = graph.graphCapabilities;
   const verification = caps.speculation;
-  // A graph whose attention reads plain K/V (softcapped) is qualified for
-  // plain-KV requests, including grammar-constrained and adapter requests, for
-  // plain-KV fill through the shared fill binding, for shared generation
-  // continuation checkpoints, and for grouped drafts (below); plain-KV fill runs
-  // inside the request's adapter context like any other row. Configured drafts
-  // ignore fill; adapter-bearing drafted requests also ignore the draft and
-  // decode ordinarily. Encoded storage is admitted only where it certifies
-  // dense reads (kvBatchable).
-  const denseReads = caps.kv.denseReads;
   // Denoising rows interleave through their own grouped method. Token-level
   // methods (speculation, grammar proposals, fill) never bind to this graph.
   const denoising = caps.method === "denoising" ? bindDenoisingGroupRequests(bindLegacyDenoisingModel(model)) : undefined;
-  // The graph's state operations, probed once when the binding is built and
-  // released on every path. Only these facts are retained; planning never
-  // allocates or touches a probe. Denoising rows keep private encoder state.
-  const storage = denoising ? null : probeStorage(model, runtime.value("MLX_BUN_BATCH_SSM") !== "0");
-  // Delayed affine KV: `all` graphs convert rows in their own caches; `ordinary`
-  // graphs convert row by row where every cache layer, plain or rotating, does.
-  // The scheme's per-layer cache guard still decides.
-  const rowsConvert = !!storage?.convertible.length && storage.convertible.every(Boolean);
-  const ordinaryAffineRows = caps.kv.delayedAffine === "ordinary" && rowsConvert;
-  const delayedAffineRows = caps.kv.delayedAffine === "all" || ordinaryAffineRows;
-  // A graph reading dense KV takes a scheme whose own maintenance leaves every
-  // layer's storage certified for dense reads: affine rows until their
-  // transition (rows the storage no longer certifies are rejected before any
-  // shared append, execution/batch-group.ts), TurboQuant rows throughout, as
-  // they decode on read. Answered for the scheme at hand when composed.
-  const kvBatchCapabilities = (scheme: KvScheme | undefined) => {
-    const dense = denseReads && !!scheme && scheme.kind !== "bf16" ? certifiesDenseKvReads(model, scheme) : undefined;
-    return { certified: dense !== false, capabilities: { delayedAffine: delayedAffineRows || dense === true } };
-  };
-  // The composition's KV scheme, which every request stores.
-  const affineKv = kv.kind === "affine" || kv.kind === "affine-layers";
-  const turboKv = kv.kind === "turbo";
-  const kvStart = kv.kind === "bf16" ? 0 : kv.quantizedKvStart ?? 0;
-  const uniformBits = kv.kind === "affine" ? kv.bits : undefined;
-  const delayedAffine = affineKv && kvStart > 0;
-  // Ordinary-only delayed affine KV is qualified for ordinary continuous
-  // decoding only. Adapter requests ignore a configured draft and fill;
-  // actual delayed speculation and fill remain refused. Their direct grammar
-  // jump commits spans. Generation checkpoints are qualified for both. Their
-  // adapters use the same row context.
-  const ordinaryOnly = (ordinaryAffineRows && delayedAffine) || (denseReads && affineKv);
-  const cachesBatchable = () => storage?.batchable ?? true;
-  const supportsTargetRows = () => storage?.targetRows ?? false;
-  // Grouped speculation needs batchable caches, row layouts for verification and
-  // rollback, and a forward that captures any hidden layers the provider taps.
-  // Any provider meeting those operations binds; one that cannot bind is refused
-  // by placement rather than served ordinarily.
-  const speculative = !denoising && draft?.provider.grouped && cachesBatchable() && supportsTargetRows()
+  // Grouped speculation binds any provider whose taps the graph's forward
+  // captures; one that cannot bind is refused by placement rather than served
+  // ordinarily.
+  const speculative = !denoising && draft?.provider.grouped
     ? bindSpeculativeGroupRequests(model, draft.provider, draft.numDraftTokens, draft.adaptiveDepth ?? false) : undefined;
-  // Committed spans serve the direct grammar jump, held to the graph's declared
-  // dense-read layers, as its ordinary rows are: every layer of a graph reading
-  // dense KV; none of a graph whose delayed affine rows are ordinary-only, as it
-  // attends the encoded storage it holds.
-  const grammarSpans = (denseReads || ordinaryAffineRows) && storage
-    ? bindGrammarGroupRequests(model, storage.requiredDenseKvLayers, storage.convertible.length) : undefined;
-  const grammarProvider = caps.method === "autoregressive" && verification.grammarProposals &&
-    facts.grammarJump && cachesBatchable() && supportsTargetRows()
+  // Grammar jump: verified proposals where the graph's verifier qualifies them,
+  // committed spans otherwise, held to the layers the graph's attention reads
+  // plain (a row whose next append its storage would not read plain is refused
+  // before that append).
+  const grammarProvider = caps.method === "autoregressive" && verification.grammarProposals && facts.grammarJump
     ? constraintDraftProvider() : undefined;
   const grammarProposals = grammarProvider ? bindSpeculativeGroupRequests(model, grammarProvider,
     Math.max(1, Math.trunc(runtime.number("MLX_BUN_GRAMMAR_DRAFT_TOKENS", 3)))) : undefined;
+  const grammarSpans = caps.method === "autoregressive" && !verification.grammarProposals
+    ? (({ layers, count }) => bindGrammarGroupRequests(model, layers, count))(plainReadLayers(model)) : undefined;
   const adapterState = caps.adapters.batched ? model.loraState : undefined;
-  const fillRequests = !denoising && supportsTargetRows() ? bindFillGroupRequests(model, kv) : undefined;
+  const fillRequests = !denoising ? bindFillGroupRequests(model, kv) : undefined;
   const mediaInput = caps.media && caps.media.input !== "pixels"
     ? (input: Vision): MlxPromptInput => graph.bindMediaInput!(input) : undefined;
   return {
@@ -225,32 +157,18 @@ export function bindMlxGateway(model: MlxTokenGraph,
       } };
     } } : {}),
     plan(request, options, scheduling) {
-      // TurboQuant on a graph reading dense KV decodes ordinarily; a configured
-      // draft is ignored.
-      const decodedDense = denseReads && turboKv;
       const sharedMethod = request.hasDraft ? speculative : grammarProposals;
       const provider = request.hasDraft ? draft?.provider : grammarProvider;
-      // A graph whose verifier does not qualify adapters serves adapter requests
-      // ordinarily even when a draft is configured.
-      const sharedSpeculativeAdapters = verification.adapters && scheduling.continuous && !!sharedMethod &&
+      // A graph whose verifier does not qualify adapters, or a provider that
+      // cannot serve the target's adapters, serves adapter requests ordinarily
+      // even when a draft is configured.
+      const sharedSpeculativeAdapters = verification.adapters && !!sharedMethod &&
         caps.adapters.batched && provider?.grouped?.supportsTargetAdapters === true;
-      // A drafted request placed ordinarily opens no draft provider and keeps the
-      // ordinary checkpoint rules: an adapter request the provider cannot serve
-      // (its verifier does not qualify adapters) or whose delayed affine KV keeps
-      // it ordinary, and a drafted request over encoded KV on a graph reading
-      // dense KV.
-      const ignoredDraft = request.hasDraft &&
-        ((request.hasAdapters && (ordinaryOnly || !sharedSpeculativeAdapters)) || decodedDense ||
-          (denseReads && affineKv));
+      // Such a drafted request opens no draft provider and keeps the ordinary checkpoint rules.
+      const ignoredDraft = request.hasDraft && request.hasAdapters && !sharedSpeculativeAdapters;
       return resolveExecution(request, {
-        ...scheduling,
-        kvQuant: affineKv, turboQuant: turboKv,
-        continuous: scheduling.continuous && !(ordinaryOnly && !ignoredDraft && request.hasDraft),
-        // The scheme's dense-read certification is part of the scheduling fact (kvBatchable).
-        quantizedBatch: !denoising && scheduling.quantizedBatch,
-        // Paging is decided on the resolved plan, which never checkpoints a paged
-        // row; an adapter row that bypasses paging still checkpoints.
-        sharedCheckpoints: (!ordinaryOnly || ordinaryAffineRows || denseReads) && !!continuationServices?.checkpointPersistence &&
+        checkpoints: scheduling.checkpoints,
+        sharedCheckpoints: !!continuationServices?.checkpointPersistence &&
           (!request.hasDraft || ignoredDraft) && !request.hasVision && !request.hasGrammar &&
           !request.wantsLogprobs && !options.fill,
         adapterBatch: caps.adapters.batched,
@@ -258,54 +176,26 @@ export function bindMlxGateway(model: MlxTokenGraph,
         mediaPrefixCache: runtime.flag("MLX_BUN_MEDIA_PREFIX_CACHE", true),
         groupedMethods: denoising ? ["denoising"] : sharedMethod ? ["autoregressive", "speculative"] : ["autoregressive"],
         sharedGrammarProposals: !!grammarProposals,
-        // Committed spans append after one maintenance call, once the gateway
-        // has certified the scheme (kvBatchable). On a graph reading dense KV,
-        // TurboQuant storage decodes on read throughout; a row whose affine
-        // storage would no longer read plain at its next append is refused before
-        // that append. Elsewhere spans serve only ordinary-only delayed affine
-        // requests; other grammar requests keep verified proposals.
-        sharedGrammarJump: !!grammarSpans && (denseReads || ordinaryOnly) && !request.hasVision &&
-          (!(affineKv || turboKv) || scheduling.quantizedBatch),
-        // Fill needs a committed append declaring the scheme's formats; a graph
-        // reading dense KV declares none for TurboQuant, so supplied fill decodes
-        // ordinarily there.
-        sharedFill: !ordinaryOnly && !decodedDense && !!fillRequests && !!options.fill,
+        // Committed spans take ordinary grammar rows; prepared media keeps masking.
+        sharedGrammarJump: !!grammarSpans && !request.hasVision,
+        sharedFill: !!fillRequests && !!options.fill,
         sharedSpeculativeEcho: verification.externalTokens && !!options.fill?.plan.echo &&
           provider?.grouped?.supportsExternalTokens === true,
-        speculativeLogprobs: scheduling.continuous && !!sharedMethod && verification.logprobs,
+        speculativeLogprobs: !!sharedMethod && verification.logprobs,
         sharedSpeculativeAdapters,
-        turboQuantBatch: !denoising && scheduling.quantizedBatch,
-        speculativeTurboQuant: verification.turboKv && scheduling.continuous && !!sharedMethod && turboKv,
         method: caps.method,
         compiledDecode: caps.compiledDecode,
         // The batch group coordinates per-row grammar for every token method;
         // masks come from the shared sampler, so no graph qualifies or declines
         // them. Denoising samples canvases, which an AR token mask cannot apply to.
         grammarBatch: !denoising,
-        speculativeKvQuant: !ordinaryOnly && verification.affineKv && (
-          (scheduling.continuous && !!sharedMethod && (uniformBits === 4 || uniformBits === 8 || kv.kind === "affine-layers")) ||
-          (verification.immediateAffine4 && kv.kind === "affine" &&
-            (uniformBits === 4 || (scheduling.continuous && !!sharedMethod && uniformBits === 8)) &&
-            (kvStart === 0 || (scheduling.continuous && !!sharedMethod)))
-        ),
-      }, {
-        fill: !!options.fill,
-        compiledDecode: facts.compiledDecode, grammarJump: facts.grammarJump,
-      });
+      }, { fill: !!options.fill, compiledDecode: facts.compiledDecode, grammarJump: facts.grammarJump });
     },
-    cachesBatchable,
     composeState(caches) {
       const prototypes = model.makeCache();
       try { return caches.map((cache, layer) => composeAtLayer(prototypes[layer]!, cache)); }
       finally { disposeResources(prototypes); }
     },
-    kvBatchable(scheme) {
-      if (!storage) return false;
-      const { certified, capabilities } = kvBatchCapabilities(scheme);
-      return certified && scheme.batchable(model.config, layer => storage.convertible[layer] === true,
-        storage.convertible.length, capabilities);
-    },
-    createBatchGroup: (options) => new MlxBatchExecutionGroup(model, { ...options,
-      kvBatchCapabilities: kvBatchCapabilities(options.kvScheme).capabilities }),
+    createBatchGroup: (options) => new MlxBatchExecutionGroup(model, options),
   };
 }

@@ -30,9 +30,9 @@ await runInference("generate", parseCommand("generate", argv), {
     loadMs = performance.now() - t;
     return context;
   },
-  async engine(context, scheme) {
+  async engine(context) {
     const t = performance.now();
-    const engine = await createAppEngine(context, { capacity: 1, gateway: { kvScheme: scheme } });
+    const engine = await createAppEngine(context, { capacity: 1 });
     engineMs = performance.now() - t;
     return { ...engine, completion: {
       place: engine.completion.place.bind(engine.completion),

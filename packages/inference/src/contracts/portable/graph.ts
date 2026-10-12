@@ -7,15 +7,6 @@ export interface GraphDescriptor {
   readonly artifact: string;
 }
 
-/** Which methods a graph's delayed affine KV is qualified for. Delayed affine rows
- * start plain and convert once a row passes its `quantizedKvStart`.
- * - `none`: rows never convert; an affine start past 0 is refused.
- * - `ordinary`: rows convert per layer where every cache layer is plain or
- *   rotating-plain; qualified for ordinary continuous decoding, generation
- *   checkpoints and committed grammar spans, not for speculation or fill.
- * - `all`: the graph's own caches convert and every method is qualified. */
-export type DelayedAffineKv = "none" | "ordinary" | "all";
-
 /** How prepared media reaches the graph.
  * - `embeddings`: spliced prompt embeddings (image/audio soft tokens, optional
  *   bidirectional and multimodal masks) enter the ordinary forward.
@@ -63,28 +54,15 @@ export interface GraphCapabilities {
      * workspace. It changes work size, never admission. */
     readonly boundedWorkspace: boolean;
   };
-  readonly kv: {
-    /** Attention reads plain keys and values only (softcapped attention);
-     * encoded storage must decode on read. The layers are the graph's
-     * `requiredDenseKvLayers`. */
-    readonly denseReads: boolean;
-    readonly delayedAffine: DelayedAffineKv;
-  };
-  /** What the graph's target verification qualifies beyond ordinary plain-KV
-   * rounds. Each is a property of the graph's verifier, independent of the
-   * draft that supplies proposals. */
+  /** What the graph's target verification qualifies beyond ordinary rounds.
+   * Each is a property of the graph's verifier, independent of the draft that
+   * supplies proposals and of how the composition's caches store keys and
+   * values (every cache lego holds the speculative transaction). */
   readonly speculation: {
     /** Verification under mounted adapters. */
     readonly adapters: boolean;
     /** Verification of requests that return logprobs. */
     readonly logprobs: boolean;
-    /** Verification over affine KV. */
-    readonly affineKv: boolean;
-    /** Verification over TurboQuant KV. */
-    readonly turboKv: boolean;
-    /** Immediate (start 0) 4-bit affine KV is qualified even where no grouped
-     * method is bound, so such a draft is refused rather than ignored. */
-    readonly immediateAffine4: boolean;
     /** Verification of externally supplied tokens (echo of a known continuation). */
     readonly externalTokens: boolean;
     /** Verified grammar-constraint proposals. */

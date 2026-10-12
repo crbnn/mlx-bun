@@ -26,16 +26,6 @@ export function composedStorageOf(cache: Cache): Cache {
   return cache.composed ? cache.composed.storage() : cache;
 }
 
-/** `stored` (restored or cloned storage) as the cache of a layer whose graph
- * cache is `layer`: composed again by that layer's lego (`ComposedStorage.over`),
- * so it converts as the lego that stored it would have. A cache that already is
- * a lego stays, and so do paged pages, which the paged request policy holds in
- * the lego's place (`state/request-policy.ts`). */
-export function composeAtLayer(layer: Cache, stored: Cache): Cache {
-  const composed = layer.composed;
-  return !composed || stored.composed || cacheSignature(stored) === "kv:paged" ? stored : composed.over(stored);
-}
-
 export function isRowBatchCache(cache: Cache): cache is RowBatchCache {
   const candidate = cache as Partial<RowBatchCache>;
   return typeof candidate.batchSize === "number" &&

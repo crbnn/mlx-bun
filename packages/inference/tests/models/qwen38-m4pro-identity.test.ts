@@ -138,7 +138,7 @@ function artifact(): { weights: Weights; config: ModelConfig } {
 
 const composition = (overrides: Partial<Composition> = {}): Composition => Object.freeze<Composition>({
   device: "applegpu_g16s", aneBridge: false, kv: { kind: "bf16" }, pagedKv: null, draftDepth: { adaptive: true, max: 7 },
-  prefillChunkTokens: CHUNK, adapters: false, maxRows: 8, speculativeAffineKv: true, packedMixedMlp: true,
+  prefillChunkTokens: CHUNK, adapters: false, maxRows: 8, packedMixedMlp: true,
   vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
   grammarJump: false, ...overrides,
 });
