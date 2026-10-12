@@ -1,17 +1,15 @@
-// E4 bit-identity gate: the DFlash 2 drafter loaded in its trained basis and
-// given the target's basis when a draft group binds proposes exactly what the
-// pre-change drafter (basis at load, per-call row switch; dflash2-frozen.ts)
-// proposes, on small synthetic weights whose 4-bit projections fit the
-// simdgroup matrix unit (and, at these widths, round differently from MLX's
-// quantized matmul, so a kernel change shows in the logits). Context chunks are
-// 12 and 2×12 rows, plus a commit of 4 or 2×5 rows: outside 5..8 rows, the one
-// range where context projection changed kernel (a later test pins that).
-// E4b: the rotated Trellis graphs' declaration (the basis their constructor reads
-// once from turboquant_fold.json and the ports their draftTarget hands out), over
-// a synthetic artifact's graph, carries the basis the record holds, and the
+// The DFlash 2 drafter loaded in its trained basis and given the target's basis
+// when a draft group binds, on small synthetic weights whose 4-bit projections
+// fit the simdgroup matrix unit: every proposal holds its depth's tokens, the
+// 4-bit drafter runs the matrix unit for exactly one block width and context
+// projection never does, and a drafter keeps the basis it was first bound to.
+// Context chunks are 12 and 2×12 rows, plus a commit of 4 or 2×5 rows. The
+// rotated Trellis graphs' declaration (the basis their constructor reads once
+// from turboquant_fold.json and the ports their draftTarget hands out), over a
+// synthetic artifact's graph, carries the basis the record holds, and the
 // drafter bound through it proposes exactly what the same basis given directly
-// proposes. That the generated Trellis graph declares the record's basis as the
-// hand-written one did is tests/models/qwen38-m1max-identity.test.ts.
+// proposes. The drafter's numbers on the real artifact are the teacher-forced
+// DFlash 2 blocks the parity suites hash.
 import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -31,11 +29,9 @@ import { Affine4MmaLinear } from "../../src/layers/affine-verify-linear";
 import type { DraftProjection } from "../../src/contracts/mlx/draft-projection";
 import { atEveryWidth } from "../../src/models/graph";
 import type { ResidualBasis, TargetView } from "../../src/contracts/mlx/draft-target";
-import { projectedDraftGroups } from "../../src/generation/speculative/bindings/projected-draft-rows";
 import type { DraftPrefillGroup, GroupedDraftProvider } from "../../src/generation/speculative/source";
 import { Dflash2Provider } from "../../src/generation/speculative/sources/dflash2-source";
 import { Dflash2Drafter } from "../../src/models/speculative/dflash2";
-import { FrozenDflash2Drafter, r1Signs, type Dflash2TargetBasis } from "./dflash2-frozen";
 
 // Every 4-bit projection fits the matrix unit: K a multiple of 256, N of 8.
 const H = 1024, HEADS = 8, KV_HEADS = 2, HEAD_DIM = 128, INTER = 2048, LAYERS = 2, BLOCK = 8;
@@ -134,19 +130,6 @@ const targetOf = (residualBasis: ResidualBasis | undefined): TargetView => Objec
   identity: {}, hiddenLayerTaps: { layerCount: TARGET_LAYERS, projection }, ...(residualBasis ? { residualBasis } : {}),
 });
 
-/** The pre-change provider's grouped binding around the frozen drafter. */
-function frozenGroups(drafter: FrozenDflash2Drafter): GroupedDraftProvider {
-  return projectedDraftGroups("frozen", drafter.tapLayers, target => ({
-    namespace: "frozen", schema: "dflash2-context-v1", layers: drafter.cfg.layers,
-    project(hidden, positions) {
-      using context = drafter.projectContext(hidden);
-      return drafter.projectContextKVRows(context, positions);
-    },
-    draft: (context, pending, positions, depth) =>
-      drafter.draftRows(context, target.hiddenLayerTaps!.projection, pending, positions, depth),
-  }));
-}
-
 interface Run { tokens: number[][]; logits: Float32Array }
 
 /** Prefill `anchors.length` rows with the same taps, commit `accepted`, then draft each depth. */
@@ -188,10 +171,7 @@ const CASES = [
 ];
 
 for (const [bits, folded] of [[4, true], [4, false], [0, true], [0, false]] as const) {
-  test(`basis at bind proposes exactly what basis at load proposed (${bits ? "4-bit" : "BF16"}, ${folded ? "R1 fold" : "trained basis"}), depths 1, 3, 7`, async () => {
-    const frozenBasis: Dflash2TargetBasis | null = folded
-      ? { seed: SEED, signs: r1Signs(SEED, H), finalGain: basis.finalGain } : null;
-    const frozen = await FrozenDflash2Drafter.load(dir, { bits, basis: frozenBasis });
+  test(`basis at bind (${bits ? "4-bit" : "BF16"}, ${folded ? "R1 fold" : "trained basis"}): every proposal holds its depth, the matrix unit runs for one block width, depths 1, 3, 7`, async () => {
     const provider = await Dflash2Provider.load(dir, { bits });
     const mma = spyOn(Affine4MmaLinear.prototype, "forward");
     try {
@@ -200,21 +180,18 @@ for (const [bits, folded] of [[4, true], [4, false], [0, true], [0, false]] as c
         const B = anchors.length, width = Math.max(...accepted) + 1;
         using taps = bf16([B, CONTEXT, TAPS.length * H], 1);
         using commit = bf16([B, width, TAPS.length * H], 1);
-        const before = drafts(frozenGroups(frozen), target, taps, commit, anchors, accepted, DEPTHS);
         const calls = mma.mock.calls.length;
-        const after = drafts(provider.grouped, target, taps, commit, anchors, accepted, DEPTHS);
+        const runs = drafts(provider.grouped, target, taps, commit, anchors, accepted, DEPTHS);
         for (const [i, depth] of DEPTHS.entries()) {
-          expect(maxDiff(after[i]!.logits, before[i]!.logits)).toBe(0);
-          expect(after[i]!.tokens).toEqual(before[i]!.tokens);
-          expect(after[i]!.tokens.every(row => row.length === depth)).toBe(true);
-          expect(after[i]!.logits.length).toBe(B * depth * V);
+          expect(runs[i]!.logits.every(Number.isFinite)).toBe(true);
+          expect(runs[i]!.tokens.every(row => row.length === depth)).toBe(true);
+          expect(runs[i]!.logits.length).toBe(B * depth * V);
         }
-        // The new 4-bit drafter ran the matrix unit for exactly one block width: B·G = 8 rows.
+        // The 4-bit drafter ran the matrix unit for exactly one block width: B·G = 8 rows.
         expect(mma.mock.calls.length - calls).toBe(bits ? LAYERS * 7 : 0);
       }
     } finally {
       mma.mockRestore();
-      frozen.dispose();
       provider.dispose();
     }
   });
@@ -233,24 +210,19 @@ test("a drafter keeps the basis it was first bound to and refuses another", asyn
 });
 
 test("context projection runs MLX's quantized matmul at every row count (the matrix unit only drafts)", async () => {
-  const frozen = await FrozenDflash2Drafter.load(dir, { bits: 4, basis: null });
   const drafter = await Dflash2Drafter.load(dir, { bits: 4 });
   drafter.bindResidualBasis(null);
   const mma = spyOn(Affine4MmaLinear.prototype, "forward");
   try {
+    // A 6-row chunk sits in the one range (5..8 rows) where a row-count switch would pick the matrix unit.
     using taps = bf16([1, 6, TAPS.length * H], 1);
-    using frozenContext = frozen.projectContext(taps);
-    for (const pair of frozen.projectContextKVRows(frozenContext, 0)) { pair.k.dispose(); pair.v.dispose(); }
-    // Before E4 a 6-row chunk took the matrix unit: fc, then k and v per layer.
-    expect(mma.mock.calls.length).toBe(1 + 2 * LAYERS);
     using context = drafter.projectContext(taps);
     const kv = drafter.projectContextKVRows(context, 0);
     ops.evalAll(kv.flatMap(pair => [pair.k, pair.v]));
     for (const pair of kv) { pair.k.dispose(); pair.v.dispose(); }
-    expect(mma.mock.calls.length).toBe(1 + 2 * LAYERS);
+    expect(mma.mock.calls.length).toBe(0);
   } finally {
     mma.mockRestore();
-    frozen.dispose();
     drafter.dispose();
   }
 });

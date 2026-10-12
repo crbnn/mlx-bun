@@ -74,7 +74,7 @@ test.skipIf(!inputs)("Gemma4 assistant: donor attention and draft chains equal i
   const { readAssistantDonors } = await import("../../src/models/gemma4/assistant-target");
   const { phaseHidden } = await import("../models/phase-forward");
   const assistant = await import("../../src/models/gemma4/assistant");
-  const { quantizedSdpa } = await import("../models/quantized-sdpa-reference");
+  const { quantizedSdpaUnfused } = await import("../../src/layers/quantized-attention");
   const { unfusedAffineKernels } = await import("../../src/state/affine-attention");
   type Triple = Ops.QuantizedTensor;
   type Rows = MlxArray | Triple;
@@ -180,13 +180,13 @@ test.skipIf(!inputs)("Gemma4 assistant: donor attention and draft chains equal i
             expect({ label, layer, selected: keys.shape[2] }).toEqual({ label, layer, selected: width });
             using q = query(D, keys.dtype);
             using got = reader[layer].attend(q, D ** -0.5, layer === "sliding" ? window : null);
-            using want = "packed" in k ? quantizedSdpa(q, k, v as Triple, D ** -0.5, { mode: "", arr: null }, GROUP, BITS)
+            using want = "packed" in k ? quantizedSdpaUnfused(q, k, v as Triple, D ** -0.5, { mode: "", arr: null }, GROUP, BITS)
               : ops.sdpa(q, k, v as MlxArray, D ** -0.5, "", null);
             expectSame(`${label} ${layer} attention`, got, want, [1, t.numAttentionHeads, 1, D]);
           }
           // The deterministic draft chain, fed each way; each chain is owned before the next runs.
           const bind = ([k, v]: Rows[]) => ({ attend: (q: MlxArray, scale: number) =>
-            quantizedSdpa(q, k as Triple, v as Triple, scale, { mode: "", arr: null }, GROUP, BITS) });
+            quantizedSdpaUnfused(q, k as Triple, v as Triple, scale, { mode: "", arr: null }, GROUP, BITS) });
           const independent = quantized ? { sliding: bind(selected[0]!), full: bind(selected[1]!) }
             : assistant.plainAssistantDonors({ sliding: selected[0] as [MlxArray, MlxArray], full: selected[1] as [MlxArray, MlxArray] }, position);
           const got = chain(reader, anchor, pending, position);

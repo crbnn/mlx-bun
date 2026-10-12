@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import { createHash } from "node:crypto";
 import { KVCache } from "../../src/state/kv";
 import { QuantizedKVCache } from "../../src/state/quantized-kv";
-import { quantizedSdpa } from "../models/quantized-sdpa-reference";
+import { quantizedSdpaUnfused } from "../../src/layers/quantized-attention";
 import { disposeTriple } from "../../src/state/quantized-tensor";
 import { type Cache } from "../../src/contracts/mlx/cache";
 import { unfusedAffineKernels } from "../../src/state/affine-attention";
@@ -56,7 +56,7 @@ for (const bits of [4,8]) test(`delayed KV${bits} retains independent precision,
           let expected:MlxArray;
           if(cache instanceof QuantizedKVCache) {
             const [keys,values]=cache.updateAndFetchQuantized(kr,vr);
-            try {expected=quantizedSdpa(qr,keys,values,0.125,local,64,bits);} finally {disposeTriple(keys);disposeTriple(values);}
+            try {expected=quantizedSdpaUnfused(qr,keys,values,0.125,local,64,bits);} finally {disposeTriple(keys);disposeTriple(values);}
           } else {
             const [keys,values]=kvStorage(cache).updateAndFetch(kr,vr);
             try {expected=ops.sdpa(qr,keys,values,0.125,"array",arr);} finally {keys.dispose();values.dispose();}

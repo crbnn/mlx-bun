@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import { Dtype, clearCache } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { QuantizedKVCache } from "../../src/state/quantized-kv";
-import { quantizedSdpa } from "../models/quantized-sdpa-reference";
+import { quantizedSdpaUnfused } from "../../src/layers/quantized-attention";
 import { quantizedAppendAttention } from "../../src/layers/quantized-append-attention";
 
 test("affine committed spans retain sequential attention at each causal prefix", () => {
@@ -31,7 +31,7 @@ test("affine committed spans retain sequential attention at each causal prefix",
           using ki = slice(k, prefix + position, prefix + position + 1);
           using vi = slice(v, prefix + position, prefix + position + 1);
           const [keys, values] = sequential.updateAndFetchQuantized(ki, vi);
-          try { outputs.push(quantizedSdpa(qi, keys, values, 1 / 16, { mode: "", arr: null }, groupSize, bits)); }
+          try { outputs.push(quantizedSdpaUnfused(qi, keys, values, 1 / 16, { mode: "", arr: null }, groupSize, bits)); }
           finally { dispose(keys); dispose(values); }
         }
         using expected = ops.concatAxis(outputs, 2);

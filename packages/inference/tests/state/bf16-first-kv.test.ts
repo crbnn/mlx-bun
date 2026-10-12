@@ -3,7 +3,7 @@
 // read it (`makeMask` before the append, `updateAndFetch`, the fused SDPA),
 // converted after every append as the served path's maintenance converted it
 // after each forward before E3 (`convert-after-reference.ts`), then the graphs' affine call
-// (`updateAndFetchQuantized`, `quantizedSdpa`) or TurboQuant call (deferred-V
+// (`updateAndFetchQuantized`, the unfused kernel the uniform scheme reads with) or TurboQuant call (deferred-V
 // fetch, SDPA, inverse rotation) once it has converted. "New" is the lego's
 // phase-named read. Same random q/k/v. Every read's output must match (maxDiff
 // 0), and after every step the stored positions below the offset (bytes),
@@ -15,7 +15,7 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { AttentionCache, AttentionRead, Cache } from "../../src/contracts/mlx/cache";
 import { unrotateValues } from "../../src/kernels/turboquant/ops";
-import { quantizedSdpa } from "../models/quantized-sdpa-reference";
+import { quantizedSdpaUnfused } from "../../src/layers/quantized-attention";
 import { unfusedAffineKernels } from "../../src/state/affine-attention";
 import { Bf16FirstQuantizedKVCache, Bf16FirstRotatingQuantizedKVCache, Bf16FirstTurboQuantKVCache } from "../../src/state/bf16-first-kv";
 import { DelayedQuantizedKVCache } from "../../src/state/delayed-quantized-kv";
@@ -31,7 +31,6 @@ import { RotatingQuantizedKVCache } from "../../src/state/rotating-quantized-kv"
 import { turboQuantFusedDecode } from "../../src/state/turboquant-codec";
 import { TurboQuantKVCache } from "../../src/state/turboquant-kv";
 import { disposeResources } from "../../src/runtime/resources";
-import { createRuntimeConfig, runtimeConfig, withRuntimeConfig } from "../../src/runtime/config";
 import { kvStorage } from "../../src/state/kv-storage";
 
 const HKV = 2, HQ = 8, D = 128, SCALE = 0.088, GROUP = 64;
@@ -85,17 +84,13 @@ function materialize(cache: Cache): void {
   try { ops.evalAll(state); } finally { if (cache.stateNeedsDispose) for (const array of state) array.dispose(); }
 }
 
-/** The flag the app wrote for `--kv-quant N` before E3 (fused SDPA off: the
- * uniform composition reads unfused, `unfusedAffineKernels`). */
-const UNIFORM_FLAG = createRuntimeConfig({ ...runtimeConfig().values, MLX_BUN_NO_FUSED_SDPA: "1" });
-
 /** The graphs' read before E3 on whichever storage the old path holds. */
 function oldRead(cache: Cache, window: number | null, k: MlxArray, v: MlxArray, q: MlxArray): MlxArray {
   const mask = kvStorage(cache).makeMask(k.shape[2]!, window);
   try {
     if (cache instanceof QuantizedKVCache || cache instanceof RotatingQuantizedKVCache) {
       const [keys, values] = cache.updateAndFetchQuantized(k, v);
-      try { return withRuntimeConfig(UNIFORM_FLAG, () => quantizedSdpa(q, keys, values, SCALE, mask, cache.groupSize, cache.bits)); }
+      try { return quantizedSdpaUnfused(q, keys, values, SCALE, mask, cache.groupSize, cache.bits); }
       finally { disposeTriple(keys); disposeTriple(values); }
     }
     if (cache instanceof TurboQuantKVCache) {
