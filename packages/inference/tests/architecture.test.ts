@@ -847,7 +847,6 @@ const seamRatchet: RatchetTable = {
     "packages/inference/src/generation/speculative/sources/two-model.ts": 1, // E2 (prefill tail split)
     "packages/inference/src/layers/geglu.ts": 1, // C2
     "packages/inference/src/models/glm52/model.ts": 2, // no item yet: B1 defers GLM-5.2 MLA
-    "packages/inference/src/state/layout.ts": 3, // no item yet: prefillCacheLayout dispatches on cache class
     "packages/training/src/kernels/flash-cce.ts": 9, // C2 for now
   },
   "cache-escape": {
