@@ -159,7 +159,7 @@ class SpeculativeGroup implements MlxGroupedMethod {
       } finally { disposeResources([...caches, { dispose: () => disposeAttachments(attachments) }]); }
     };
     const target = new MlxPrefillRows<Preparation>({
-      maintain,
+      maintain, codecs: method.host.cache.codecs,
       open(row) {
         const options = row.req.method!.data as GenerateOptions;
         row.spec = { drafted: 0, accepted: 0, targetCalls: 0, rejected: 0, rounds: 0,
@@ -262,14 +262,14 @@ class SpeculativeGroup implements MlxGroupedMethod {
           const sampled = await state.request.sampling.sample(scores, 0);
           row.current = sampled.token; row.generated = row.sampled = 1;
           if (row.req.eosTokenIds.includes(row.current)) {
-            if (method.host.cache.keeps(row.req)) capture(state, () => cloneKvCaches(state.solo), index);
+            if (method.host.cache.keeps(row.req)) capture(state, () => cloneKvCaches(state.solo, method.host.cache.codecs), index);
             disposeResources(state.solo.splice(0)); state.retain?.(); state.retain = undefined;
             method.host.finish(row, "stop"); return;
           }
           const more = await method.host.publish(row, row.current, readStepExtras(sampled.extras));
           state.request.fill?.observe(row.current);
           if (more === false || row.req.grammar?.isTerminated || row.generated >= row.req.maxTokens) {
-            if (method.host.cache.keeps(row.req) && !row.req.signal?.aborted) capture(state, () => cloneKvCaches(state.solo), index);
+            if (method.host.cache.keeps(row.req) && !row.req.signal?.aborted) capture(state, () => cloneKvCaches(state.solo, method.host.cache.codecs), index);
             disposeResources(state.solo.splice(0)); state.retain?.(); state.retain = undefined;
             method.host.finish(row, more === false || row.req.grammar?.isTerminated ? "stop" : "length"); return;
           }
