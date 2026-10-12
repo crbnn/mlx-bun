@@ -64,7 +64,7 @@ export class DelayedQuantizedKVCache extends FullTransitioningKvRows<BatchedQuan
 
   appendDecode(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v, false); }
   appendWindow(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v, false); }
-  /** The graph's committed read today (Qwen 3.5's `createAppend`): the same
+  /** The graph's committed read today (Qwen 3.5's `appendKnown` under `knownSpans`): the same
    * mask and attention view, attended with independent positions, so a
    * converted row keeps the single-position reduction order.
    * TODO(B1b): the affine caches' own reads replace this, one call per phase. */

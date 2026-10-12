@@ -44,7 +44,7 @@ import { cacheRead, type AttentionReadStrategy } from "../qwen/blocks";
 
 /** The score-softcapped read as a block's read strategy: decode reads
  * `appendDecode`, a window `appendWindow`; this graph has no committed append
- * (no `createAppend`), so a committed span reads as a window. */
+ * (its `appendKnown` is the window read), so a committed span reads as a window. */
 function softcapRead(softcap: number, window: number | null, arrayMasks: boolean): AttentionReadStrategy {
   const reads = softcapAttentionReads(softcap, window, arrayMasks);
   const byPhase: Readonly<Record<ReadPhase, typeof reads.appendDecode>> = {
