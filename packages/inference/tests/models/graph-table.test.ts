@@ -16,7 +16,7 @@ import { MLX_GRAPH_TABLES } from "../../src/models/factory";
 import { GraphTable, type GraphEntry, type ServedComposition } from "../../src/models/implementation";
 import { QWEN38_TRELLIS_M4PRO_GRAPH } from "../../src/models/qwen/qwen38-27b-trellis-m4pro";
 import { qwen35GraphFingerprint } from "../../src/models/qwen/checkpoint";
-import { QWEN38_TRELLIS_TQ_GRAPH } from "../../src/models/qwen/qwen38-27b-trellis-tq";
+import { QWEN38_TRELLIS_M1MAX_GRAPH } from "../../src/models/qwen/qwen38-27b-trellis-m1max";
 
 const TRELLIS = "cfa205c8f5af046a";
 const M4_PRO = "applegpu_g16s", M1_MAX = "applegpu_g13s";
@@ -136,10 +136,11 @@ describe("the Qwen 3.5 table", () => {
     expect(select(on(M4_PRO, qwen, { maxRows: 16 }))).toBe("qwen3.5");
   });
 
-  test("on applegpu_g13s the TQ graph serves the artifact whatever its KV scheme or rows; other GPUs get the generic graph", () => {
-    expect(select(on(M1_MAX, qwen))).toBe(QWEN38_TRELLIS_TQ_GRAPH);
-    expect(select(on(M1_MAX, qwen, { kv: { override: 8 } }))).toBe(QWEN38_TRELLIS_TQ_GRAPH);
-    expect(select(on(M1_MAX, qwen, { kv: { override: 4 }, maxRows: 16 }))).toBe(QWEN38_TRELLIS_TQ_GRAPH);
+  test("on applegpu_g13s the generated M1 Max graph serves the artifact whatever its KV scheme or rows; other GPUs get the generic graph", () => {
+    expect(select(on(M1_MAX, qwen))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
+    expect(select(on(M1_MAX, qwen, { kv: { override: 8 } }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
+    expect(select(on(M1_MAX, qwen, { kv: { override: 4 }, maxRows: 16 }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
+    expect(select(on(M1_MAX, qwen, { kv: { turboQuant: { kBits: 8, vBits: 3 } }, adapters: true }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
     expect(select(on("applegpu_g15s", qwen))).toBe("qwen3.5");
   });
 
@@ -158,7 +159,7 @@ describe("the Qwen 3.5 table", () => {
     const config = await loadModelConfig(dir);
     expect(qwen35GraphFingerprint(config)).toBe(TRELLIS);
     expect(table.select(config, on(M4_PRO, config)).id).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
-    expect(table.select(config, on(M1_MAX, config)).id).toBe(QWEN38_TRELLIS_TQ_GRAPH);
+    expect(table.select(config, on(M1_MAX, config)).id).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
     expect(table.select(config, on(M4_PRO, config, { kv: { override: 8 } })).id).toBe("qwen3.5");
   });
 });
