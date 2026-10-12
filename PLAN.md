@@ -1191,6 +1191,50 @@ unchanged.
       on unload; the fix is the graph contract requiring `dispose()` on every graph
       (generic graphs release nothing), called by every provider and by the host, not an
       optional-method probe; done here because B4 is editing the graph files now.
+      Landed in two PRs into `refactor/composition`. #345 (documents and the comments outside
+      the inference package): thirty documents read in full and corrected (the serve flag is
+      `--batch`; ARCHITECTURE's ownership rows say what `state/`, `models/`, `generation/` and
+      `execution/` hold; the root README's layout, native build and CI list; CONTRIBUTING names
+      the digest, KL, bench and perf-check scripts; the app README's one-lane wording, the
+      memory schedule needing no server, DiffusionGemma's caches as legos; the inference
+      README's runtime-oracle commands without `MLX_BUN_COMPILED_DECODE` and its M4 Pro
+      paragraph in phases and width classes; the quantize, training, website and module
+      READMEs; the diagram) and every comment hit outside the package rewritten; the
+      identifiers kept by name are composition fields, artifact data and main's own API used
+      by the baseline tooling. #346 (the inference source): every comment hit inside the
+      package rewritten; every frozen copy of replaced code deleted, with recorded synthetic
+      digests (`tests/models/synthetic-digest.ts`, fixtures under
+      `tests/fixtures/synthetic-digests/`, `scripts/synthetic-digests.ts record|check`, per
+      GPU architecture, recorded for `applegpu_g16s`, skipping elsewhere until recorded)
+      carrying the checks no artifact covers, each verified against its copy before the
+      deletion (DiffusionGemma 12/12, the dense copies 80/80, Gemma 2's previous selection
+      2/2, GLM 8/10 with the two MTP cases held by the baseline identity test); the identity
+      tests now compare each generated graph against its family's generic graph at maxDiff 0
+      where both serve the composition. TurboQuant: the sign tables are generated from the
+      construction the port cites (`scripts/gen-turboquant-signs.ts`, byte-identical for the
+      four existing sizes, a drift test); the one served head dimension outside them is 96
+      (Phi-3; 72 is a vision-tower dimension with no KV cache), added and gated (3-bit value
+      round-trip error 0.0321 beside 0.0306 to 0.0325; teacher-forced KL 0.021 beside 0.034
+      to 0.135); the startup refusal is gone. `MlxDeclaredGraph` requires `dispose()`;
+      `TwoModelProvider` disposes the graph before the weights, with a model-free ownership
+      test; the host and module-train's loaders call it without a probe. Dead members gone
+      (`forwardInfer`, `draftBlock`, `projectContextKV`, `Qwen35Model.mrope`, the recurrent
+      training cache's accessors, the stub `hiddenTap` fields). `activePrefixLayout()` is a
+      construction-time fact of the training caches (`TrainingAttentionCache.ropePositions`;
+      the module global deleted; prefix-shared and segmented outputs hash identically);
+      `isCompiledTrace()` and `isShapelessTracing()` are compile-context queries the gate now
+      exempts by name. `MLX_BUN_COMPILED_SWIGLU` is the composition field `compiledSwiglu`.
+      The `sliding-grammar-fill` Llama 3B case predates the refactor (main 9593d881 fails
+      identically; the test's first commit already failed it): an exact fp16 tie at token 12
+      that two-row decode tips, with no state leak (the cancelled pair equals the uncancelled
+      pair); decided: the case compares the cancelled pair's peer against the uncancelled
+      pair's peer, which is the invariant, done in the final gate pass. Follow-up commits on
+      the branch: the documents #346 made stale (the app README's TurboQuant paragraph, the
+      inference README's Gemma 2 gate, field list and what gates a generated graph,
+      ARCHITECTURE's `dispose()`, rope positions and compile-context exemptions, CONTRIBUTING's
+      recorded synthetic hashes beside their script) and the per-lego compiled-decode test's
+      timeout (5.4 s on GitHub's runner against bun's 5 s default). Still mine: the closed
+      blocks of this file deleted when the final gate reports.
       case bisected to its first failing commit. Exit: the sweep returns nothing but
       diagnostics and history; every document names only what the tree contains; the
       architecture gate's documentation generators run clean.
