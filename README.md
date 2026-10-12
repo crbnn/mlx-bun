@@ -28,6 +28,9 @@ Each provides the `mlx-bun` command. The installer and npm package also provide
 `mlx-bun.server`, `mlx-bun.generate`, `mlx-bun.convert`, `mlx-bun.fuse`,
 `mlx-bun.lora` and `mlx-bun.upload`, which accept mlx-lm's arguments. See
 [installation](https://mlx-bun.dev/getting-started/installation/) for options.
+The installer then runs `mlx-bun compile-ane`, which compiles the Neural Engine
+programs your Mac's models use into the system's cache once, so no model load
+or prompt compiles them; after a Homebrew or npm install, the first launch runs it.
 
 ## Quickstart
 

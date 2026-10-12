@@ -57,7 +57,14 @@ exec /bin/mv "$@"
   async function archive(version: string, missing?: string) {
     const directory = await mkdtemp(join(home, "input-"));
     for (const file of required) if (file !== missing) await writeFile(join(directory, file), `fixture ${file}\n`);
-    await writeFile(join(directory, "mlx-bun"), `#!/bin/sh\n[ "$1" = --version ] || exit 2\nprintf 'mlx-bun ${version}\\n'\n`);
+    // The executable answers --version and records each Neural Engine install step it runs.
+    await writeFile(join(directory, "mlx-bun"), `#!/bin/sh
+case "$1" in
+  --version) printf 'mlx-bun ${version}\\n';;
+  compile-ane) printf '%s\\n' "${version}" >> "$HOME/compile-ane-runs"; [ -z "\${TEST_FAIL_COMPILE:-}" ] || exit 1;;
+  *) exit 2;;
+esac
+`);
     await chmod(join(directory, "mlx-bun"), 0o755);
     const path = join(home, `mlx-bun-v${version}-arm64.tar.gz`);
     expect((await run(["tar", "-czf", path, "-C", directory, "."])).code).toBe(0);
@@ -103,6 +110,19 @@ test("latest and pinned reinstalls replace only the owned bundle and keep user d
     await expect(readFile(join(f.app, old, "mlx-bun"))).rejects.toThrow("ENOENT");
     for (const file of ["sessions/chat.jsonl", "wiki/article.md", "hf.json", "mlx-bun", "libmlx.dylib"])
       expect(await readFile(join(f.installRoot, file), "utf8")).toBe("preserved");
+    // Each install ran the Neural Engine install step once, with the bundle it installed.
+    expect(await readFile(join(f.home, "compile-ane-runs"), "utf8")).toBe("1.2.3\n1.2.4\n1.2.5\n");
+  } finally { await f.close(); }
+}, 30000);
+
+test("a failed Neural Engine install step leaves the installed bundle in place and names the verb", async () => {
+  const f = await fixture();
+  try {
+    const result = await f.install(await f.archive("1.0.0"), { TEST_FAIL_COMPILE: "1" });
+    expect(result.code, result.err).toBe(0);
+    expect(result.err).toContain("the Neural Engine install step failed; run mlx-bun compile-ane");
+    expect((await run([f.bin, "--version"])).out).toBe("mlx-bun 1.0.0\n");
+    expect(await readFile(join(f.home, "compile-ane-runs"), "utf8")).toBe("1.0.0\n");
   } finally { await f.close(); }
 }, 30000);
 

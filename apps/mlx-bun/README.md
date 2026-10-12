@@ -1321,7 +1321,9 @@ bundle under `${MLX_BUN_INSTALL_DIR:-$HOME/.mlx-bun}/app-install/` and links
 executable; all are refused where a directory stands and switch with the app).
 `MLX_BUN_VERSION` selects `latest` or a pinned tag.
 The installer validates the files and version before switching its `current`
-symlink and retains the old app on failure. Successful updates keep the current
+symlink and retains the old app on failure. After switching it runs the
+installed `mlx-bun compile-ane` (the Neural Engine install step; a failure warns
+and keeps the installation). Successful updates keep the current
 and immediate previous bundles, plus any older bundle used by a running app.
 Other older owned bundles and stale stages are removed on the next install;
 vnode inspection keeps bundles used by apps launched through PATH or symlinks,
