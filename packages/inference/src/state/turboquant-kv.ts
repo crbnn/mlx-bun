@@ -1,7 +1,7 @@
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
-import type { AttentionRead,Cache,CommittedAttentionCache,KvDonorAttention,KvDonorRows,Mask,RotatedValueAttentionState } from "../contracts/mlx/cache";
+import type { AttentionRead,BlockAttentionCache,Cache,CommittedAttentionCache,KvDonorAttention,KvDonorRows,Mask,RotatedValueAttentionState } from "../contracts/mlx/cache";
 import type { KvCodec } from "../contracts/mlx/kv-codec";
 import * as tq from "../kernels/turboquant/ops";
 import { createCausalMask } from "../kernels/attention/masks";
@@ -10,7 +10,7 @@ import type { KVCache } from "./kv";
 import type { RotatingKVCache } from "./rotating-kv";
 import { TurboQuantCodec,disposeTurboQuant,turboQuantFusedDecode,type TurboQuantTensor } from "./turboquant-codec";
 import { decodedKvStorage } from "./dense-kv-reads";
-import { AttentionMasks, causalLease, unmaskedLease } from "./attention-read";
+import { AttentionMasks, causalLease, sdpaRead, unmaskedLease } from "./attention-read";
 import type { TurboQuantFetches, TurboQuantKernels } from "./turboquant-attention";
 
 /** TurboQuant KV cache — v1 (`02d723a:docs/design/turboquant.md`): dequantize-
@@ -43,7 +43,7 @@ import type { TurboQuantFetches, TurboQuantKernels } from "./turboquant-attentio
  *  full-attention only, so no read builds a mask array.
  *  Built empty, it encodes from token zero, unlike the served path's
  *  `Bf16FirstTurboQuantKVCache`, so its first chunk's numbers differ. */
-export class TurboQuantKVCache implements CommittedAttentionCache {
+export class TurboQuantKVCache implements CommittedAttentionCache, BlockAttentionCache {
   readonly denseKvReads = decodedKvStorage;
   minimumReusableOffset = 0;
   readonly stateNeedsDispose = true;
@@ -84,6 +84,22 @@ export class TurboQuantKVCache implements CommittedAttentionCache {
    * the same call as its window. */
   appendCommitted(k: MlxArray, v: MlxArray): AttentionRead {
     return this.appendWindow(k, v);
+  }
+
+  /** A block read (`BlockAttentionCache.readBlock`): the stored positions
+   * decoded, then the block's keys and values, not appended, through the stock
+   * fused SDPA with no mask (the dense read, whichever kernel set the cache
+   * composes, since the block's values are not in the rotated domain). */
+  readBlock(k: MlxArray, v: MlxArray): AttentionRead {
+    if (!this.#kv || this.#headDim === null) throw new Error("cache is empty");
+    const [storedK, storedV] = this.#decode(this.#kv, this.offset, this.#headDim, false);
+    let keys: MlxArray, values: MlxArray;
+    try {
+      keys = ops.concatAxis([storedK, k], 2);
+      try { values = ops.concatAxis([storedV, v], 2); }
+      catch (error) { keys.dispose(); throw error; }
+    } finally { storedK.dispose(); storedV.dispose(); }
+    return sdpaRead(keys, values, unmaskedLease);
   }
 
   /** The appends a kernel set chooses between for `k` and `v`. */

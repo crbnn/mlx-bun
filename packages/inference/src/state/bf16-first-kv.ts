@@ -9,7 +9,8 @@ import type { MlxArray } from "@mlx-bun/mlx/array";
 import { clearCache, Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type {
-  AttentionCache, AttentionRead, BidirectionalAttentionCache, Cache, CommittedAttentionCache, CompiledDecodeCache, ComposedStorage,
+  AttentionCache, AttentionRead, BidirectionalAttentionCache, BlockAttentionCache, Cache, CommittedAttentionCache, CompiledDecodeCache, ComposedStorage,
+  EncoderAttentionCache,
   DecodeSlot, DecodeStepInputs, DecodeStepPlan, Mask,
 } from "../contracts/mlx/cache";
 import type { KvStorageScheme } from "../contracts/portable/composition";
@@ -101,10 +102,10 @@ function fetchThenSettle(fetched: [MlxArray, MlxArray], settle: () => void): [Ml
   return fetched;
 }
 
-/** The bidirectional read is defined for a sequence's first window only, which
- * a lego always holds in bf16. */
-function firstWindowOnly(): never {
-  throw new Error("appendBidirectional reads a sequence's first window (offset 0); this cache already holds positions");
+/** The bidirectional and encoder reads are defined for a sequence's first
+ * window only, which a lego always holds in bf16. */
+function firstWindowOnly(read: string): never {
+  throw new Error(`${read} reads a sequence's first window (offset 0); this cache already holds positions`);
 }
 
 /**
@@ -139,7 +140,7 @@ function firstWindowOnly(): never {
  * (`composed`): its signature is its own (`kv:bf16-first:` and the storage's),
  * and its storage is what the convert-after path saves.
  */
-export class Bf16FirstQuantizedKVCache implements CommittedAttentionCache, BidirectionalAttentionCache, CompiledDecodeCache {
+export class Bf16FirstQuantizedKVCache implements CommittedAttentionCache, BidirectionalAttentionCache, EncoderAttentionCache, BlockAttentionCache, CompiledDecodeCache {
   #plain: KVCache | null;
   #quantized: QuantizedKVCache | null = null;
 
@@ -206,9 +207,20 @@ export class Bf16FirstQuantizedKVCache implements CommittedAttentionCache, Bidir
   }
 
   appendBidirectional(k: MlxArray, v: MlxArray, bidirectional: MlxArray): AttentionRead {
-    if (this.#quantized) return firstWindowOnly();
+    if (this.#quantized) return firstWindowOnly("appendBidirectional");
     return this.#settle(this.#plain!.appendBidirectional(k, v, bidirectional));
   }
+
+  /** The encoder window, a first window: bf16 storage's read, then the
+   * transition its append owes. */
+  appendEncoderWindow(k: MlxArray, v: MlxArray, bidirectional: MlxArray): AttentionRead {
+    if (this.#quantized) return firstWindowOnly("appendEncoderWindow");
+    return this.#settle(this.#plain!.appendEncoderWindow(k, v, bidirectional));
+  }
+
+  /** The block read of the storage held now (it appends nothing, so nothing
+   * converts). */
+  readBlock(k: MlxArray, v: MlxArray): AttentionRead { return this.#storage.readBlock(k, v); }
 
   /** Positions an append may add before the transition: up to the start. */
   maxAppendTokens(): number {
@@ -277,7 +289,7 @@ export class Bf16FirstQuantizedKVCache implements CommittedAttentionCache, Bidir
  * later append. Every written ring position equals the convert-after path's
  * bit for bit.
  */
-export class Bf16FirstRotatingQuantizedKVCache implements CommittedAttentionCache, BidirectionalAttentionCache, CompiledDecodeCache {
+export class Bf16FirstRotatingQuantizedKVCache implements CommittedAttentionCache, BidirectionalAttentionCache, EncoderAttentionCache, BlockAttentionCache, CompiledDecodeCache {
   #plain: RotatingKVCache | null;
   #quantized: RotatingQuantizedKVCache | null = null;
 
@@ -342,9 +354,20 @@ export class Bf16FirstRotatingQuantizedKVCache implements CommittedAttentionCach
   }
 
   appendBidirectional(k: MlxArray, v: MlxArray, bidirectional: MlxArray): AttentionRead {
-    if (this.#quantized) return firstWindowOnly();
+    if (this.#quantized) return firstWindowOnly("appendBidirectional");
     return this.#settle(this.#plain!.appendBidirectional(k, v, bidirectional));
   }
+
+  /** The encoder window, a first window: bf16 storage's read, then the
+   * transition its append owes. */
+  appendEncoderWindow(k: MlxArray, v: MlxArray, bidirectional: MlxArray): AttentionRead {
+    if (this.#quantized) return firstWindowOnly("appendEncoderWindow");
+    return this.#settle(this.#plain!.appendEncoderWindow(k, v, bidirectional));
+  }
+
+  /** The block read of the storage held now (it appends nothing, so nothing
+   * converts). */
+  readBlock(k: MlxArray, v: MlxArray): AttentionRead { return this.#storage.readBlock(k, v); }
 
   maxAppendTokens(): number {
     return this.#plain && this.#plain.offset < this.start ? this.start - this.#plain.offset : Infinity;
@@ -422,7 +445,7 @@ export class Bf16FirstRotatingQuantizedKVCache implements CommittedAttentionCach
  * resolved by whoever builds the cache; nothing here reads the runtime
  * configuration.
  */
-export class Bf16FirstTurboQuantKVCache implements CommittedAttentionCache, BidirectionalAttentionCache {
+export class Bf16FirstTurboQuantKVCache implements CommittedAttentionCache, BidirectionalAttentionCache, EncoderAttentionCache, BlockAttentionCache {
   #plain: KVCache | null;
   #encoded: TurboQuantKVCache | null = null;
 
@@ -483,9 +506,20 @@ export class Bf16FirstTurboQuantKVCache implements CommittedAttentionCache, Bidi
   }
 
   appendBidirectional(k: MlxArray, v: MlxArray, bidirectional: MlxArray): AttentionRead {
-    if (this.#encoded) return firstWindowOnly();
+    if (this.#encoded) return firstWindowOnly("appendBidirectional");
     return this.#settle(this.#plain!.appendBidirectional(k, v, bidirectional));
   }
+
+  /** The encoder window, a first window: bf16 storage's read, then the
+   * transition its append owes. */
+  appendEncoderWindow(k: MlxArray, v: MlxArray, bidirectional: MlxArray): AttentionRead {
+    if (this.#encoded) return firstWindowOnly("appendEncoderWindow");
+    return this.#settle(this.#plain!.appendEncoderWindow(k, v, bidirectional));
+  }
+
+  /** The block read of the storage held now (it appends nothing, so nothing
+   * converts). */
+  readBlock(k: MlxArray, v: MlxArray): AttentionRead { return this.#storage.readBlock(k, v); }
 
   maxAppendTokens(): number {
     return this.#plain && this.#plain.offset < this.start ? this.start - this.#plain.offset : Infinity;

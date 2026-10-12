@@ -6,7 +6,7 @@ import { bidirMask, createCausalMask } from "../kernels/attention/masks";
 import { concatDecodeSlot, type AffineKernelSet } from "./kv";
 import { RotatingQuantizedKVCache } from "./rotating-quantized-kv";
 import { plainKvStorage } from "./dense-kv-reads";
-import { AttentionMasks, causalLease, decodeByPosition, encoderWindowMask, sdpaRead, unmaskedLease, withLease, type MaskLease } from "./attention-read";
+import { AttentionMasks, causalLease, decodeByPosition, encoderWindowMask, rotatingBlockMask, sdpaRead, unmaskedLease, withLease, type MaskLease } from "./attention-read";
 
 
 /** Rotating (sliding-window) KV cache — port of mlx-lm RotatingKVCache
@@ -132,31 +132,9 @@ export class RotatingKVCache implements CompiledDecodeCache, CommittedAttentionC
   }
 
   /** DiffusionGemma's sliding-layer decoder mask over `storedLength` stored
-   * positions and an `N`-position block (its `#makeDecoderMasks`). */
+   * positions and an `N`-position block (`rotatingBlockMask`). */
   #blockMask(N: number, storedLength: number): MaskLease {
-    const valid = Math.min(this.offset, storedLength);
-    return this.masks.lease(`rotating-block:${this.maxSize}`, `${N}:${storedLength}:${valid}`, () => {
-      const start = Math.max(0, valid - Math.max(this.maxSize - 1, 0));
-      const positions = ops.arange(0, storedLength, 1, Dtype.int32);
-      const startArr = ops.scalarLike(start, positions);
-      const validArr = ops.scalarLike(valid, positions);
-      const geStart = ops.greaterEqual(positions, startArr);
-      const ltValid = ops.less(positions, validArr);
-      const stored = ops.logicalAnd(geStart, ltValid);
-      positions.dispose();
-      startArr.dispose();
-      validArr.dispose();
-      geStart.dispose();
-      ltValid.dispose();
-      using ones = ops.fromInt32(new Array(N).fill(1), [N]);
-      const block = ones.astype(stored.dtype);
-      const row = ops.concatAxis([stored, block], 0);
-      stored.dispose();
-      block.dispose();
-      const reshaped = ops.reshape(row, [1, 1, 1, storedLength + N]);
-      row.dispose();
-      return { mode: "array", arr: reshaped };
-    });
+    return rotatingBlockMask(this.masks, this.maxSize, this.offset, N, storedLength);
   }
 
   bytesPerToken(): number {

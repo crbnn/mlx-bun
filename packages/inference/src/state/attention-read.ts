@@ -1,4 +1,5 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
+import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { AttentionCache, AttentionRead, Mask } from "../contracts/mlx/cache";
 import { bidirMask } from "../kernels/attention/masks";
@@ -99,6 +100,39 @@ export function encoderWindowMask(masks: AttentionMasks, L: number, bidirectiona
     try { return { mode: "array", arr: ops.reshape(arr!, [1, 1, L, L]) }; }
     finally { arr!.dispose(); }
   }, bidirectional);
+}
+
+/** DiffusionGemma's sliding-layer decoder mask (its `#makeDecoderMasks`) for a
+ * block read over a ring of `maxSize` holding `offset` positions:
+ * `storedLength` stored positions in temporal order, of which the newest
+ * `maxSize - 1` that hold a valid position are visible, then all `N` block
+ * positions, as one bool [1, 1, 1, storedLength + N] row every query shares.
+ * The rings of a model lease it under one family per window. */
+export function rotatingBlockMask(masks: AttentionMasks, maxSize: number, offset: number, N: number,
+  storedLength: number): MaskLease {
+  const valid = Math.min(offset, storedLength);
+  return masks.lease(`rotating-block:${maxSize}`, `${N}:${storedLength}:${valid}`, () => {
+    const start = Math.max(0, valid - Math.max(maxSize - 1, 0));
+    const positions = ops.arange(0, storedLength, 1, Dtype.int32);
+    const startArr = ops.scalarLike(start, positions);
+    const validArr = ops.scalarLike(valid, positions);
+    const geStart = ops.greaterEqual(positions, startArr);
+    const ltValid = ops.less(positions, validArr);
+    const stored = ops.logicalAnd(geStart, ltValid);
+    positions.dispose();
+    startArr.dispose();
+    validArr.dispose();
+    geStart.dispose();
+    ltValid.dispose();
+    using ones = ops.fromInt32(new Array(N).fill(1), [N]);
+    const block = ones.astype(stored.dtype);
+    const row = ops.concatAxis([stored, block], 0);
+    stored.dispose();
+    block.dispose();
+    const reshaped = ops.reshape(row, [1, 1, 1, storedLength + N]);
+    row.dispose();
+    return { mode: "array", arr: reshaped };
+  });
 }
 
 /** The read over dense stored keys and values: the stock fused SDPA kernel

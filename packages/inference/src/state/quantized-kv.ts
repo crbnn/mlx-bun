@@ -1,9 +1,9 @@
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
-import type { AttentionRead,CommittedAttentionCache,CompiledDecodeCache,DecodeSlot,DecodeStepInputs,DecodeStepPlan,DecodeTrace,KvDonorAttention,Mask,QuantizedAttentionState } from "../contracts/mlx/cache";
+import type { AttentionRead,BlockAttentionCache,CommittedAttentionCache,CompiledDecodeCache,DecodeSlot,DecodeStepInputs,DecodeStepPlan,DecodeTrace,KvDonorAttention,Mask,QuantizedAttentionState } from "../contracts/mlx/cache";
 import { createCausalMask } from "../kernels/attention/masks";
-import { disposeTriple } from "./quantized-tensor";
+import { disposeTriple, mapTriple } from "./quantized-tensor";
 import { AttentionMasks, unmaskedLease, withLease } from "./attention-read";
 import { affineCausalLease, affineRead, committedAffineRead, unfusedAffineKernels, viewAffineKernel, type AffineKernels, type AffineKernelSet } from "./affine-attention";
 
@@ -25,7 +25,7 @@ import { affineCausalLease, affineRead, committedAffineRead, unfusedAffineKernel
  *  for `--kv-quant config` and `--fused-sdpa on`, unfused otherwise). The
  *  committed read is `quantizedAppendAttention`. This cache has no sliding
  *  window (graphs compose `RotatingQuantizedKVCache` for sliding layers). */
-export class QuantizedKVCache implements CompiledDecodeCache, CommittedAttentionCache {
+export class QuantizedKVCache implements CompiledDecodeCache, CommittedAttentionCache, BlockAttentionCache {
   minimumReusableOffset?: number;
   static readonly STEP = 256;
   /** Set only by compiled-decode trace adapters (see Cache). */
@@ -68,6 +68,23 @@ export class QuantizedKVCache implements CompiledDecodeCache, CommittedAttention
   appendCommitted(k: MlxArray, v: MlxArray): AttentionRead {
     const [keys, values] = this.updateAndFetchQuantized(k, v);
     return committedAffineRead(keys, values, this.groupSize, this.bits);
+  }
+
+  /** A block read (`BlockAttentionCache.readBlock`): the stored positions,
+   * then the block's keys and values quantized as this cache stores them and
+   * not appended, read with no mask by the masked-window kernel, which takes
+   * any query count. */
+  readBlock(k: MlxArray, v: MlxArray): AttentionRead {
+    if (!this.keys || !this.values) throw new Error("cache is empty");
+    const live = (a: MlxArray) => a.slice([0, 0, 0, 0], [a.shape[0]!, a.shape[1]!, this.offset, a.shape[3]!]);
+    const blockK = ops.quantize(k, this.groupSize, this.bits), blockV = ops.quantize(v, this.groupSize, this.bits);
+    const storedK = mapTriple(this.keys, live), storedV = mapTriple(this.values, live);
+    let keys: ops.QuantizedTensor;
+    try {
+      keys = catAxis2(storedK, blockK);
+      try { return affineRead(keys, catAxis2(storedV, blockV), unmaskedLease, this.kernels.maskedWindow); }
+      catch (error) { disposeTriple(keys); throw error; }
+    } finally { for (const t of [blockK, blockV, storedK, storedV]) disposeTriple(t); }
   }
 
   bytesPerToken(): number {
