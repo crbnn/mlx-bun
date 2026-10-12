@@ -7,6 +7,7 @@
 
 import { disposeResources } from "../../runtime/resources";
 import { pagedAttentionView } from "../../kernels/attention/paged";
+import type { KvStorageScheme, PagedKvComposition } from "../../contracts/portable/composition";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
@@ -290,6 +291,19 @@ function directReadable(quantization: PagedQuantization | undefined, turbo: Page
   return !turbo && (!quantization || 32 % quantization.bits === 0);
 }
 
+/** Whether the paged lego the composition's paging `paged` and KV scheme `kv`
+ *  name has a compiled decode form: gathered pages do (a concat slot), and so
+ *  do direct pages the kernel does not read (TurboQuant, affine widths that
+ *  straddle a 32-bit word), which read gathered. Direct pages the kernel reads
+ *  have none: the kernel's partitions follow the context length, which a
+ *  shapeless recorded graph cannot hold, and the lego reads one way, so a
+ *  composition with them decodes eagerly (`resolveComposition`). Per-layer
+ *  affine schemes leave their unlisted layers bf16, which the kernel reads. */
+export function pagedDecodeCompiles(paged: PagedKvComposition, kv: KvStorageScheme): boolean {
+  if (!paged.direct) return true;
+  return kv.kind === "turbo" || (kv.kind === "affine" && !directReadable({ bits: kv.bits, groupSize: kv.groupSize }, undefined));
+}
+
 /** Cache implementation over a BlockPool. Same values as a plain KVCache
  *  at every step (parity-gated); only the physical arrangement differs.
  *  The pool allocates lazily on the first write (KVCache's lazy-alloc
@@ -319,16 +333,16 @@ function directReadable(quantization: PagedQuantization | undefined, turbo: Page
  *  affine widths that divide 32 bits; other pages read gathered whatever the
  *  composition says.
  *
- *  Compiled decode: a concat slot. The stored positions are gathered (and
- *  dequantized) outside the recorded graph, as the decode read gathers them; in
- *  it the new position is stored as the pages store it (quantized and
- *  dequantized again on affine pages) and joined to them, and the fused SDPA
- *  reads the joined window with no mask, the gathered decode read. The direct
- *  read (`pagedKv.direct`, Lab) is a custom kernel whose partitions follow
- *  the context length, which a shapeless recorded graph cannot hold: a direct
- *  cache decodes through the gathered read (its numerical control) inside a
- *  compiled step. The row leaves the graph as it was appended; the write after
- *  the step appends it to the pages. */
+ *  Compiled decode, gathered pages: a concat slot. The stored positions are
+ *  gathered (and dequantized) outside the recorded graph, as the decode read
+ *  gathers them; in it the new position is stored as the pages store it
+ *  (quantized and dequantized again on affine pages) and joined to them, and
+ *  the fused SDPA reads the joined window with no mask, the gathered decode
+ *  read. The row leaves the graph as it was appended; the write after the step
+ *  appends it to the pages. Direct pages have no compiled form
+ *  (`pagedDecodeCompiles`): their read is a custom kernel whose partitions
+ *  follow the context length, which a shapeless recorded graph cannot hold, so
+ *  their composition decodes eagerly and this cache refuses a compiled slot. */
 export class PagedKVCache implements CommittedAttentionCache, BidirectionalAttentionCache, EncoderAttentionCache, BlockAttentionCache, CompiledDecodeCache {
   /** Distinct storage kind; the row adapter preserves its block pools. */
   signature(): string { return "kv:paged"; }
@@ -533,6 +547,7 @@ export class PagedKVCache implements CommittedAttentionCache, BidirectionalAtten
   /** TurboQuant pages take TurboQuant storage's slot (the codes leave the
    *  graph); bf16 and affine pages the paged one (the row leaves it). */
   decodeSlot(_plan: DecodeStepPlan): DecodeSlot {
+    if (this.direct) throw new Error("direct pages have no compiled decode form; their composition decodes eagerly (pagedDecodeCompiles)");
     return this.turbo ? turboQuantDecodeSlot(this.offset, this.turbo.kBits, this.turbo.vBits, this.turbo.kernels)
       : pagedDecodeSlot(this.offset, this.quantization);
   }

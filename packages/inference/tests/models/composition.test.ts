@@ -167,6 +167,13 @@ test("paging is a composition fact over every KV scheme, the block size given or
   expect(resolveComposition(config).pagedKv).toBeNull();
   expect(resolveComposition(config, { pagedKv: {} }).pagedKv).toEqual({ blockSize: 256, direct: false });
   expect(resolveComposition(config, { pagedKv: { direct: true } }).pagedKv).toEqual({ blockSize: 256, direct: true });
+  // Direct pages the kernel reads have no compiled decode form: the composition decodes eagerly, whatever the request says.
+  for (const [kv, compiles] of [[undefined, false], [{ override: 8 as const }, false], [{ override: 3 as const }, true],
+    [{ turboQuant: { kBits: 8, vBits: 3 } }, true]] as const) {
+    expect(resolveComposition(config, { ...(kv ? { kv } : {}), pagedKv: { direct: true }, compiledDecode: true }).compiledDecode,
+      JSON.stringify(kv)).toBe(compiles);
+    expect(resolveComposition(config, { ...(kv ? { kv } : {}), pagedKv: {} }).compiledDecode, JSON.stringify(kv)).toBe(true);
+  }
   expect(resolveComposition(config, { pagedKv: { blockSize: 16 }, kv: { override: 8 } })).toMatchObject({
     pagedKv: { blockSize: 16, direct: false }, kv: { kind: "affine", bits: 8 } });
   expect(() => resolveComposition(config, { pagedKv: { blockSize: 0 } })).toThrow("composition paged KV block size must be a positive integer");

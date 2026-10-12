@@ -6,7 +6,7 @@ import type { ModelConfig, TurboQuantScheme } from "../artifacts/config";
 import { COMPOSITION_DEFAULTS, type Composition } from "../contracts/portable/composition";
 import { runtimeConfig, type RuntimeConfig } from "../runtime/config";
 import { resolveKvScheme, type KvQuantOverride } from "../state/kv-scheme";
-import { PagedKVCache } from "../state/paged/cache";
+import { PagedKVCache, pagedDecodeCompiles } from "../state/paged/cache";
 
 /** Rows per forward when the caller states no cap (the app's `--batch` default). */
 export const DEFAULT_MAX_ROWS = 8;
@@ -52,7 +52,8 @@ export interface CompositionRequest {
   readonly packedMixedMlp?: boolean;
   /** One argmax over a decode step whose live rows are all plain greedy. Default true. */
   readonly vectorGreedySampling?: boolean;
-  /** A lone ordinary row decodes through the graph's compiled step. Default true. */
+  /** A lone ordinary row decodes through the graph's compiled step. Default true;
+   * off whatever the request says where the caches have no compiled form (direct pages). */
   readonly compiledDecode?: boolean;
   /** One forward carries a decode group and a prefill group. Default false. */
   readonly mixedPrefill?: boolean;
@@ -111,7 +112,8 @@ function compose(request: Omit<CompositionRequest, "kv">, kv: Composition["kv"])
     maxRows,
     packedMixedMlp: request.packedMixedMlp ?? COMPOSITION_DEFAULTS.packedMixedMlp,
     vectorGreedySampling: request.vectorGreedySampling ?? COMPOSITION_DEFAULTS.vectorGreedySampling,
-    compiledDecode: request.compiledDecode ?? COMPOSITION_DEFAULTS.compiledDecode,
+    // The caches' declaration: direct pages have no compiled form.
+    compiledDecode: (request.compiledDecode ?? COMPOSITION_DEFAULTS.compiledDecode) && (!pagedKv || pagedDecodeCompiles(pagedKv, kv)),
     mixedPrefill: request.mixedPrefill ?? COMPOSITION_DEFAULTS.mixedPrefill,
     mixedTokenBudget,
     prefillTailSplit: request.prefillTailSplit ?? COMPOSITION_DEFAULTS.prefillTailSplit,

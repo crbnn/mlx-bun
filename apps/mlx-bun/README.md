@@ -74,7 +74,8 @@ request, drafted, grammar, fill, media and adapter rows included, keeps its
 full-attention keys and values in blocks. Pages store what `--kv-quant` names
 for each layer: bf16, affine at the scheme's width (per layer under `config`),
 or TurboQuant. `--paged-kv-direct` reads them with the direct Metal kernel
-(Lab numerics) for decode and windows of up to eight queries.
+(Lab numerics) for decode and windows of up to eight queries; the kernel has
+no compiled form, so that composition decodes without the compiled step.
 As main's server did, startup also rejects `--kv-quant turbo` when the model's
 full-attention head dimension is not one the TurboQuant codec encodes
 (`TURBOQUANT_HEAD_DIMS`), before any request, instead of failing each request in

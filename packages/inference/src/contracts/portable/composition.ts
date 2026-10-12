@@ -30,8 +30,9 @@ export interface PagedKvComposition {
    * over the blocks (Lab numerics) where true, otherwise the gathered blocks
    * through the fused SDPA (the numerical control). Pages the kernel does not
    * read (TurboQuant, affine widths that straddle a 32-bit word) read gathered.
-   * A compiled decode step cannot hold the kernel (its partitions follow the
-   * context length); one that records a paged layer reads it gathered. */
+   * Pages the kernel reads have no compiled decode form (the kernel's
+   * partitions follow the context length): their composition resolves
+   * `compiledDecode` off. */
   readonly direct: boolean;
 }
 
@@ -84,8 +85,9 @@ export interface Composition {
   readonly vectorGreedySampling: boolean;
   /** A lone ordinary row decodes through the graph's compiled step where the
    * graph builds one (default on). The step is bit-identical to the ordinary
-   * decode forward over every cache lego; off, every row decodes through the
-   * forward. */
+   * decode forward over every cache lego that has a compiled form; off, every
+   * row decodes through the forward. Direct pages have none (`pagedKv.direct`),
+   * so their composition resolves it off. */
   readonly compiledDecode: boolean;
   /** One forward carries a decode group and a prefill group where the graph
    * declares mixed rows (default off). */
