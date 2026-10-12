@@ -38,8 +38,9 @@
 // the provider the graph declares (`GraphCapabilities.nativeDraft`) at the
 // plan's draft depth (the default depth here). It takes no draft artifact and
 // only plain KV (see optIn).
-// Observers wrap the target forward the bindings call, forwardHiddenAsync where
-// the graph provides one (the streamed GLM target), otherwise forwardHidden.
+// Observers watch the target phases the bindings call (prompt chunks and tails,
+// decode, verify, known tokens; streamed on the GLM target): the gateway and the
+// direct generator are bound to an observed view of the graph.
 // Opt in with all of
 //   MLX_BUN_TEST_SPEC_TARGET=/target/snapshot
 //   MLX_BUN_TEST_SPEC_KIND=ngram|two-model|assistant|mtp|dspark|deepspec|glm-mtp
@@ -181,17 +182,20 @@ async function load(inputs: Inputs) {
     const { clearCache } = await import("@mlx-bun/mlx/ffi");
     try { dispose(); } finally { clearCache(); }
   };
-  // The target forward the bindings call: forwardHiddenAsync where the graph
-  // provides one, as the execution group and speculative binding select it.
-  const targetForward = typeof model.forwardHiddenAsync === "function" ? "forwardHiddenAsync" as const : "forwardHidden" as const;
-  return { model, config, loadProvider, kv, requirements, release, defaultDepth, targetForward };
+  // The target phases the bindings call, observed: bind to `view`; `watch` adds a
+  // watcher of every target forward's input and caches until its returned stop.
+  const { observedPhases } = await import("../models/phase-forward");
+  const watchers = new Set<(ids: A, caches: A) => void>();
+  const view = observedPhases(model, { forward(ids, caches) { for (const watcher of [...watchers]) watcher(ids, caches); } });
+  const watch = (watcher: (ids: A, caches: A) => void) => { watchers.add(watcher); return () => { watchers.delete(watcher); }; };
+  return { model, view, watch, config, loadProvider, kv, requirements, release, defaultDepth };
 }
 type Loaded = Awaited<ReturnType<typeof load>>;
 
 /** The gateway binding for one provider, its placement and its execution group. */
 async function bindFor(loaded: Loaded, provider: A, depth: number) {
   const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
-  const binding = bindMlxGateway(loaded.model, provider ? { provider, numDraftTokens: depth } : undefined);
+  const binding = bindMlxGateway(loaded.view, provider ? { provider, numDraftTokens: depth } : undefined);
   const quantizedBatch = loaded.kv.scheme ? binding.kvBatchable(loaded.kv.scheme) : false;
   const place = (options: A, extra: Record<string, boolean> = {}) => binding.plan(loaded.requirements({ ...extra, hasDraft: !!provider }),
     options, { continuous: true, quantizedBatch, checkpoints: false });
@@ -215,14 +219,10 @@ async function bindFor(loaded: Loaded, provider: A, depth: number) {
 }
 
 /** Target forward shapes while no row has produced a token: the prefill cohort. */
-function watchPrefill(model: A, method: "forwardHidden" | "forwardHiddenAsync", outputs: number[][]) {
+function watchPrefill(loaded: Loaded, outputs: number[][]) {
   const shapes: number[][] = [];
-  const forward = model[method].bind(model);
-  const spy = spyOn(model, method).mockImplementation((ids: A, ...rest: A[]) => {
-    if (outputs.every(tokens => tokens.length === 0)) shapes.push([...ids.shape]);
-    return forward(ids, ...rest);
-  });
-  return { shapes, restore: () => spy.mockRestore() };
+  const restore = loaded.watch((ids: A) => { if (outputs.every(tokens => tokens.length === 0)) shapes.push([...ids.shape]); });
+  return { shapes, restore };
 }
 
 const inputs = optIn(Bun.env);
@@ -253,7 +253,7 @@ test.skipIf(!inputs)("grouped speculation: placement, the serial producer at B1,
       const group = groupOf({ held: true });
       let maxRows = 0;
       const tokens = Array.from({ length: count }, () => [] as number[]);
-      const prefill = watchPrefill(model, loaded.targetForward, tokens);
+      const prefill = watchPrefill(loaded, tokens);
       try {
         const pending = tokens.map(output => group.submit({
           method: method(options), promptIds: prompt, maxTokens: options.maxTokens, eosTokenIds: [],
@@ -354,8 +354,7 @@ test.skipIf(!inputs)("grouped speculation: placement, the serial producer at B1,
       const chunked = { ...options, prefillChunkSize: 4 };
       const output: number[][] = [[], []], shapes: number[][] = [];
       let joiner: Promise<unknown> | undefined, submitted = false, sharedBeforeOutput = false;
-      const original = model[loaded.targetForward].bind(model);
-      const probe = spyOn(model, loaded.targetForward).mockImplementation((ids: A, caches: A, ...rest: A[]) => {
+      const stopProbe = loaded.watch((ids: A) => {
         if (ids.shape[1] === 4) {
           shapes.push([...ids.shape]);
           if (ids.shape[0] === 2 && output.every(tokens => !tokens.length)) sharedBeforeOutput = true;
@@ -365,7 +364,6 @@ test.skipIf(!inputs)("grouped speculation: placement, the serial producer at B1,
               maxTokens: 8, eosTokenIds: [], onToken(token: number) { output[1]!.push(token); } });
           }
         }
-        return original(ids, caches, ...rest);
       });
       try {
         await group.submit({ method: method(chunked), promptIds: [...prompt, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
@@ -376,7 +374,7 @@ test.skipIf(!inputs)("grouped speculation: placement, the serial producer at B1,
         expect(output.map(tokens => tokens.length)).toEqual([8, 8]);
         expect(group.activeRows + group.pendingRows).toBe(0);
         return output;
-      } finally { probe.mockRestore(); await group.close(); clearCache(); }
+      } finally { stopProbe(); await group.close(); clearCache(); }
     };
     expect(await prefillJoin()).toEqual(await prefillJoin());
 
@@ -448,7 +446,7 @@ test.skipIf(!inputs)("generated prefixes: retired rows publish their companion s
     }
     return put(...args);
   });
-  const prefill = watchPrefill(model, loaded.targetForward, outputs);
+  const prefill = watchPrefill(loaded, outputs);
   try {
     provider = await loaded.loadProvider();
     const bound = await bindFor(loaded, provider, depth);
@@ -554,11 +552,7 @@ test.skipIf(!inputs?.adapter)("adapter rows with a configured draft: placement, 
     return put(...args);
   });
   const frames: { batch: number; adapters: string[] }[] = [];
-  const forward = model[loaded.targetForward].bind(model);
-  const probe = spyOn(model, loaded.targetForward).mockImplementation((ids: A, caches: A, ...rest: A[]) => {
-    frames.push({ batch: ids.shape[0]!, adapters: [...model.loraState.active] });
-    return forward(ids, caches, ...rest);
-  });
+  const stopProbe = loaded.watch((ids: A) => { frames.push({ batch: ids.shape[0]!, adapters: [...model.loraState.active] }); });
   type Request = { adapters: string[]; tokens?: number; fail?: boolean };
   try {
     provider = await loaded.loadProvider();
@@ -594,7 +588,7 @@ test.skipIf(!inputs?.adapter)("adapter rows with a configured draft: placement, 
       // B1 control: the direct generator without a draft.
       if (batch === 1) return { frames: [...frames], results: await Promise.all(requests.map(async request => {
         const out = collect();
-        const generation = generate(model, promptIds, optionsFor(request, promptIds, seeded));
+        const generation = generate(loaded.view, promptIds, optionsFor(request, promptIds, seeded));
         for await (const value of generation) out.sink(value.token, value.logprobs);
         return { ...out, stats: generation.stats! };
       })) };
@@ -685,7 +679,7 @@ test.skipIf(!inputs?.adapter)("adapter rows with a configured draft: placement, 
     console.log(`[speculative-group] adapter rows ${adapterSpeculates ? "speculate" : "decode ordinarily, draft ignored"}; ` +
       `drafted base rows ${baseServed ? basePlan.method : "refused"}: B1 controls, grouped contexts, failure cleanup and isolated prefix reuse pass`);
   } finally {
-    probe.mockRestore(); publication.mockRestore(); cache.clear();
+    stopProbe(); publication.mockRestore(); cache.clear();
     try { manager.unmount("upper"); provider?.dispose(); } finally { await loaded.release(); clearCache(); }
   }
 }, 900_000);

@@ -90,7 +90,11 @@ export function observedPhases<Model extends object>(model: Model, observer: Pha
     verify: forwards(phases.verify, "verify"),
     appendKnown: forwards(phases.appendKnown as MlxWidthTable<Forward>, "appendKnown"),
     logits: Object.freeze(Object.fromEntries(Object.entries(phases.logits).map(([width, head]) =>
-      [width, (hidden: MlxArray) => { const out = (head as Head)(hidden); observer.head?.(hidden, out); return out; }]))),
+      [width, (hidden: MlxArray) => {
+        const out = (head as Head)(hidden);
+        try { observer.head?.(hidden, out); } catch (error) { out.dispose(); throw error; }
+        return out;
+      }]))),
   };
   return new Proxy(model, {
     get(target, key) {
