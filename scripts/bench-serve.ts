@@ -42,7 +42,7 @@ const USAGE = `Paired serve benchmark: baseline tree versus candidate tree over 
 Profile all must be main's full matrix (cpm5, e4b, 12B, qwen27b × default, serial, mixed, plus the
 mlx-lm reference), optionally followed by mtp2,mtp3 for models given a --draft MTP companion and dflash2
 for models given a --dflash2-draft drafter (--kv-quant 4 --num-draft-tokens adaptive; the optional basis
-file goes to both servers as MLX_BUN_DFLASH2_TARGET_BASIS, which main reads and the refactor ignores);
+file goes to both servers as MLX_BUN_DFLASH2_TARGET_BASIS, which main reads and this tree ignores);
 anything narrower is scoped and never full qualification. dflash2-d7-baseline is the DFlash 2
 configuration against a baseline graph that declares no verify costs: the baseline at
 --num-draft-tokens 7, the candidate adaptive; its trees differ, so its probes and pairing are notes. --sessions N (default 1) runs every tree N

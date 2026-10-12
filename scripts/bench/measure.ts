@@ -582,7 +582,7 @@ export async function runCell(spec: CellSpec, workload: Workload, raw: RawReques
       return { readyMs: readyMs2, ctxTtftMs: after.ttftMs, cachedTokens: after.cachedTokens, durability };
     }) : null;
     await markLeg("restart");
-    // Four concurrent generations; budget is the serial worst case at the measured rate.
+    // Four concurrent generations; budget is the one-after-another worst case at the measured rate.
     const agg = await runPhase("agg", async () => {
       const budget = scaledBudgetMs(workload.aggregateTokens * workload.aggregateStreams, decodeMedianTps, FIXED_BUDGET_MS) +
         (workload.aggregateContext ? scaledBudgetMs(workload.aggregateContext * workload.aggregateStreams,

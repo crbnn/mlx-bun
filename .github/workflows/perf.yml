@@ -1,5 +1,5 @@
-# Performance check (PLAN, Phase F): the paired serve benchmark (scripts/bench-serve.ts) of a pull
-# request's head against its base on the M1 Max runner, on the batched lane: the Trellis 27B artifact in
+# Performance check: the paired serve benchmark (scripts/bench-serve.ts) of a pull
+# request's head against its base on the M1 Max runner, through the server's scheduler: the Trellis 27B artifact in
 # the default configuration and with the DFlash 2 drafter over 4-bit KV, e4b in the default, two
 # alternating server sessions per tree. main's M1 Max graph declares no verify costs and refuses adaptive
 # depth, so the DFlash 2 pair is main at depth 7 against the head adaptive (dflash2-d7-baseline), shown as
@@ -113,7 +113,7 @@ jobs:
           QWEN="$(snapshot mlx-bun/Qwen3.8-27B-Trellis-3.2bpw)"
           E4B="$(snapshot mlx-community/gemma-4-e4b-it-OptiQ-4bit)"
           DFLASH2="$(snapshot incoai/Qwen3.8-27B-DFlash2)"
-          # The Trellis target's DFlash 2 rotation basis: main reads it from MLX_BUN_DFLASH2_TARGET_BASIS, the refactor
+          # The Trellis target's DFlash 2 rotation basis: main reads it from MLX_BUN_DFLASH2_TARGET_BASIS, this tree
           # declares it from the artifact's sidecar; bench-serve hands it to both servers.
           BASIS="$HOME/mlx-bun-perf/models/Qwen3.8-27B-Trellis-3.2bpw-dflash2-basis.json"
           [ -f "$BASIS" ] || { echo "::error::no DFlash 2 basis at $BASIS"; exit 1; }
@@ -121,7 +121,7 @@ jobs:
           E4B_GRAPH="$(graph "$E4B")"
           echo "candidate graphs on this machine: qwen27b $QWEN_GRAPH, e4b $E4B_GRAPH"
           { echo "QWEN=$QWEN"; echo "E4B=$E4B"; echo "NATIVE=$NATIVE"; } >> "$GITHUB_ENV"
-          # DFlash 2 as dflash2-d7-baseline, not dflash2: main's M1 Max graph (the hand-written TQ graph) declares no
+          # DFlash 2 as dflash2-d7-baseline, not dflash2: main's M1 Max graph (its hand-written Trellis graph) declares no
           # verifyRoundCosts and refuses --num-draft-tokens adaptive (run 38244416727), so main drafts 7 every round
           # and the head adapts over the costs its generated graph declares. Context, never gated. Once the base
           # branch's M1 Max graph declares verify costs, this becomes dflash2: both trees adaptive, gated.
