@@ -70,9 +70,8 @@ export interface Composition {
   readonly vectorGreedySampling: boolean;
   /** A lone ordinary row decodes through the graph's compiled step where the
    * graph builds one (default on). The step is bit-identical to the ordinary
-   * decode forward; off, every row decodes through the forward. Resolved off
-   * for a KV scheme or paging whose storage has no compiled form (TurboQuant, a
-   * delayed start, paged blocks). */
+   * decode forward over every cache lego; off, every row decodes through the
+   * forward. */
   readonly compiledDecode: boolean;
   /** One forward carries a decode group and a prefill group where the graph
    * declares mixed rows (default off). */

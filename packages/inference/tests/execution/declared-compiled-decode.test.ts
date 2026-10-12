@@ -87,15 +87,25 @@ test("the request and the composition keep decoding on the decode operation", as
   for (const [name, options, extra] of [
     ["request opt-out", { compiledDecode: false }, {}],
     ["composition off", {}, { composition: testComposition(undefined, { compiledDecode: false }) }],
-    // The loader resolves compiled decode off for storage with no compiled form.
-    ["TurboQuant storage", {}, { composition: testComposition(TURBO) }],
-    ["delayed affine storage", {}, { composition: testComposition(DELAYED_AFFINE) }],
-    ["paged storage", {}, { composition: testComposition(undefined, { pagedKv: { blockSize: 16 } }) }],
   ] as const) {
     const fixture = graph({ compiledDecode: true }, extra);
     const declared = countingStep(fixture);
     expect(await decode({ ...fixture.model, compiledDecodeStep: () => declared.step }, options), name).toEqual(Array(6).fill(0));
     expect(declared.calls.steps, name).toBe(0);
+  }
+});
+
+test("every KV scheme and paging keeps the compiled step: each cache lego has its compiled form", async () => {
+  for (const [name, extra] of [
+    ["TurboQuant storage", { composition: testComposition(TURBO) }],
+    ["delayed affine storage", { composition: testComposition(DELAYED_AFFINE) }],
+    ["paged storage", { composition: testComposition(undefined, { pagedKv: { blockSize: 16 } }) }],
+  ] as const) {
+    const fixture = graph({ compiledDecode: true }, extra);
+    const declared = countingStep(fixture);
+    const tokens = await decode({ ...fixture.model, compiledDecodeStep: () => declared.step });
+    expect(tokens.slice(1), name).toEqual(Array(5).fill(COMPILED_TOKEN));
+    expect(declared.calls.steps, name).toBeGreaterThan(0);
   }
 });
 
@@ -124,9 +134,12 @@ test("the autoregressive binding offers the declared step where the composition 
   const caches = fixture.model.makeCache();
   try {
     expect(binding.createDecode!({ hasAdapters: true })).toBeNull();
+    // Every KV scheme keeps the step; a composition that turns it off does not.
     for (const composition of [testComposition(TURBO), testComposition(DELAYED_AFFINE)])
       expect(bindMlxAutoregressiveGraph({ ...fixture.model, composition, compiledDecodeStep: () => declared.step })
-        .createDecode!({ hasAdapters: false })).toBeNull();
+        .createDecode!({ hasAdapters: false })).not.toBeNull();
+    expect(bindMlxAutoregressiveGraph({ ...fixture.model, composition: testComposition(TURBO, { compiledDecode: false }),
+      compiledDecodeStep: () => declared.step }).createDecode!({ hasAdapters: false })).toBeNull();
     const decoder = binding.createDecode!({ hasAdapters: false })!;
     try {
       using token = MlxArray.fromFloat32(new Float32Array([0]), [1]);

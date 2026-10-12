@@ -121,16 +121,15 @@ test("a paged composition pages plain, adapter and media requests alike and keys
   const prompt = [2, 651, 9];
   const fill = { fill: new FillSession({ rows: [], eos: [], echo: null }, prompt) };
   // Paging is the composition's state, never a planner input: every request is
-  // planned exactly as on the unpaged composition, checkpoints included. Only
-  // compiled decode differs, which the loader resolves off for paged blocks.
-  const placed = ({ compiledDecode: _compiled, ...plan }: ResolvedExecution) =>
-    ({ ...plan, reasons: plan.reasons.filter(reason => reason !== "compiled-decode-unavailable-for-request") });
+  // planned exactly as on the unpaged composition, checkpoints and compiled
+  // decode included.
+  const placed = (plan: ResolvedExecution) => plan;
   for (const [request, options] of [[shape, {}], [adapterShape, adapters], [{ ...shape, hasVision: true }, {}],
     [{ ...adapterShape, hasGrammar: true }, adapters], [adapterShape, { ...adapters, ...fill }],
     [{ ...adapterShape, wantsLogprobs: true }, adapters]] as const)
     expect({ request, plan: placed(binding.plan(request, options, schedule)) })
       .toEqual({ request, plan: placed(unpaged.plan(request, options, schedule)) });
-  expect(binding.plan(shape, {}, schedule).compiledDecode).toBe(false);
+  expect(binding.plan(shape, {}, schedule).compiledDecode).toBe(true);
   expect(unpaged.plan(shape, {}, schedule).compiledDecode).toBe(true);
   // The adapter row pages; its prefixes and checkpoints live in the paged namespace over its own.
   const plan = binding.plan(adapterShape, adapters, schedule);

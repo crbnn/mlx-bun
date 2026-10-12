@@ -115,16 +115,15 @@ test("the scheduler switches are composition fields at their defaults; the runti
     expect(() => resolveComposition(config, { mixedTokenBudget })).toThrow("composition mixedTokenBudget must be a positive integer");
 });
 
-test("compiled decode is resolved at load from the storage's compiled form: bf16 and affine converting at the first append keep it", () => {
+test("compiled decode is a plain composition field: on by default over every cache lego, off when asked", () => {
   const compiled = (request: Parameters<typeof resolveComposition>[1]) => resolveComposition(config, request).compiledDecode;
-  expect(compiled({})).toBe(true);
-  expect(compiled({ kv: { override: 4, quantizedKvStart: 0 } })).toBe(true);
-  expect(compiled({ kv: { override: 8 } })).toBe(true);
-  // TurboQuant storage, a delayed start and paged blocks have no compiled form, whatever is asked.
-  for (const request of [{ kv: { turboQuant: { kBits: 8, vBits: 3 } } }, { kv: { override: 4 as const, quantizedKvStart: 40 } },
-    { pagedKv: {} }, { pagedKv: {}, compiledDecode: true }])
+  // Every lego the composition can name has a compiled form (tests/state/compiled-decode-protocol.test.ts).
+  for (const request of [{}, { kv: { override: 4 as const, quantizedKvStart: 0 } }, { kv: { override: 8 as const } },
+    { kv: { turboQuant: { kBits: 8, vBits: 3 } } }, { kv: { override: 4 as const, quantizedKvStart: 40 } },
+    { pagedKv: {} }, { pagedKv: {}, kv: { override: 4 as const } }])
+    expect(compiled(request), JSON.stringify(request)).toBe(true);
+  for (const request of [{ compiledDecode: false }, { compiledDecode: false, kv: { turboQuant: { kBits: 8, vBits: 3 } } }])
     expect(compiled(request), JSON.stringify(request)).toBe(false);
-  expect(compiled({ compiledDecode: false })).toBe(false);
 });
 
 test("the loaded drafter fixes the depth, or caps it when the scheduler adapts; rows and adapters are recorded as given", () => {
