@@ -1,8 +1,8 @@
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import { cloneKvCaches } from "./persistence";
-import { type AttentionCache, type AttentionRead, type BatchableCache, type Cache, type Mask, type PaddedPrefillCache, type PrefillPadding } from "../contracts/mlx/cache";
-import { AttentionMasks } from "./attention-read";
+import { type AttentionRead, type BatchableCache, type Cache, type CommittedAttentionCache, type Mask, type PaddedPrefillCache, type PrefillPadding } from "../contracts/mlx/cache";
+import { AttentionMasks, decodeByPosition } from "./attention-read";
 import { affineCausalLease, type AffineKernels } from "./affine-attention";
 import type { AffineKernelSet } from "./kv";
 import { RotatingKVCache } from "./rotating-kv";
@@ -211,7 +211,7 @@ export class RotatingKvPositions implements TransitioningKvPositions {
  * without changing ring columns or rebuilding any attention mask.
  * Reads are the current ring's (`BatchedRotatingQuantCache`); every ring this
  * layout builds shares its `masks` and `kernels`. */
-export class RotatingAffineLayout implements TransitionedKvLayout, PaddedPrefillCache, AttentionCache {
+export class RotatingAffineLayout implements TransitionedKvLayout, PaddedPrefillCache, CommittedAttentionCache {
   #inner?: BatchedRotatingQuantCache;
   #before?: number[];
   #minimum: number[] = [];
@@ -232,6 +232,8 @@ export class RotatingAffineLayout implements TransitionedKvLayout, PaddedPrefill
   protected get ring(): BatchedRotatingQuantCache { return this.#inner!; }
   appendDecode(k: MlxArray, v: MlxArray): AttentionRead { return this.#inner!.appendDecode(k, v); }
   appendWindow(k: MlxArray, v: MlxArray): AttentionRead { return this.#inner!.appendWindow(k, v); }
+  /** A committed span, one decode per position (`decodeByPosition`). */
+  appendCommitted(k: MlxArray, v: MlxArray): AttentionRead { return decodeByPosition(this, k, v); }
   captureDonorAttention(): import("../contracts/mlx/cache").KvDonorAttention {
     return captureRotatingDonorAttention(this.#inner!);
   }

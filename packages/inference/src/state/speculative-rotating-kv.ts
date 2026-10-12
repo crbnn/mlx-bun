@@ -1,21 +1,21 @@
 import { rotatingSourcePosition } from "./rotating-kv-layout";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
-import { type AttentionCache, type AttentionRead, type BatchableCache, type Cache, type Mask, type PrefillPadding } from "../contracts/mlx/cache";
+import { type AttentionRead, type Cache, type CommittedAttentionCache, type Mask, type PrefillPadding, type SpeculativeRowLayout } from "../contracts/mlx/cache";
 import { RotatingKVCache } from "./rotating-kv";
 import { BatchedRotatingCache } from "./batched-rotating";
 import { rollbackRotatingRing } from "./rotating-row-transaction";
 import { BatchedRotatingState } from "./batched-rotating-state";
 import { plainRowStorage, temporalStorageView } from "./batched-row-storage";
 import { disposeResources } from "../runtime/resources";
-import { AttentionMasks } from "./attention-read";
+import { AttentionMasks, decodeByPosition } from "./attention-read";
 
 /** Ring transactions retain accepted KV columns, including rounds that cross
  * the window boundary. The verify block already retains the complete history
  * needed by its earliest query; no target recomputation or scheduler policy.
  * Reads are the current ring's (`BatchedRotatingCache`); every ring this layout
  * builds shares its `masks`. */
-export class SpeculativeRotatingKVCache implements AttentionCache, BatchableCache {
+export class SpeculativeRotatingKVCache implements CommittedAttentionCache, SpeculativeRowLayout {
   #inner: BatchedRotatingCache;
   #before?: number[];
   constructor(
@@ -32,6 +32,8 @@ export class SpeculativeRotatingKVCache implements AttentionCache, BatchableCach
   makeEmptyBatch(): SpeculativeRotatingKVCache { return new SpeculativeRotatingKVCache(this.maxSize, this.masks); }
   appendDecode(k: MlxArray, v: MlxArray): AttentionRead { return this.#inner.appendDecode(k, v); }
   appendWindow(k: MlxArray, v: MlxArray): AttentionRead { return this.#inner.appendWindow(k, v); }
+  /** A committed span, one decode per position (`decodeByPosition`). */
+  appendCommitted(k: MlxArray, v: MlxArray): AttentionRead { return decodeByPosition(this, k, v); }
   makeMask(tokens: number, window: number | null): Mask { return this.#inner.makeMask(tokens, window); }
   updateAndFetch(k: MlxArray, v: MlxArray): [MlxArray, MlxArray] { return this.#inner.updateAndFetch(k, v); }
   preparePrefill(padding: PrefillPadding): void { this.#inner.preparePrefill(padding); }

@@ -14,7 +14,7 @@ import type {
 } from "../contracts/mlx/cache";
 import type { KvStorageScheme } from "../contracts/portable/composition";
 import { composedAffineKernels, type AffineKernels, type AffineKernelSet } from "./affine-attention";
-import { AttentionMasks } from "./attention-read";
+import { AttentionMasks, decodeByPosition } from "./attention-read";
 import { KVCache } from "./kv";
 import { kv4Head256Kernels } from "./kv4-head256-cache";
 import { QuantizedKVCache } from "./quantized-kv";
@@ -277,7 +277,7 @@ export class Bf16FirstQuantizedKVCache implements CommittedAttentionCache, Bidir
  * later append. Every written ring position equals the convert-after path's
  * bit for bit.
  */
-export class Bf16FirstRotatingQuantizedKVCache implements BidirectionalAttentionCache, CompiledDecodeCache {
+export class Bf16FirstRotatingQuantizedKVCache implements CommittedAttentionCache, BidirectionalAttentionCache, CompiledDecodeCache {
   #plain: RotatingKVCache | null;
   #quantized: RotatingQuantizedKVCache | null = null;
 
@@ -333,6 +333,12 @@ export class Bf16FirstRotatingQuantizedKVCache implements BidirectionalAttention
   appendWindow(k: MlxArray, v: MlxArray): AttentionRead {
     if (this.#quantized) return this.#quantized.appendWindow(k, v);
     return this.#settle(this.#plain!.appendWindow(k, v));
+  }
+
+  /** A committed span, one decode per position through this lego
+   * (`decodeByPosition`), so the transition falls where `L` decodes put it. */
+  appendCommitted(k: MlxArray, v: MlxArray): AttentionRead {
+    return decodeByPosition(this, k, v);
   }
 
   appendBidirectional(k: MlxArray, v: MlxArray, bidirectional: MlxArray): AttentionRead {

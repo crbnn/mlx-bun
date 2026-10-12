@@ -1,7 +1,8 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
-import type { AttentionRead, Mask } from "../contracts/mlx/cache";
+import type { AttentionCache, AttentionRead, Mask } from "../contracts/mlx/cache";
 import { bidirMask } from "../kernels/attention/masks";
+import { disposeResources } from "../runtime/resources";
 
 /** A mask held by one attention read until that read is disposed. */
 export interface MaskLease {
@@ -107,6 +108,39 @@ export function sdpaRead(keys: MlxArray, values: MlxArray, mask: MaskLease): Att
   return {
     attend: (q, scale) => ops.sdpa(q, keys, values, scale, mask.mask.mode, mask.mask.arr),
     dispose() { keys.dispose(); values.dispose(); mask.release(); },
+  };
+}
+
+/** A committed span (`CommittedAttentionCache.appendCommitted`) read one
+ * position at a time: each of the span's `L` positions appends through
+ * `cache.appendDecode` and keeps that one-position read, so query `i` attends
+ * its own causal prefix with the decode arithmetic and the storage holds what
+ * `L` decodes leave. The committed read of ring storage, whose window read is
+ * not the one-position arithmetic (a ring writes a window by concatenation and,
+ * once it wraps, reorders its keys). `k` and `v` are borrowed, as for every
+ * append. */
+export function decodeByPosition(cache: AttentionCache, k: MlxArray, v: MlxArray): AttentionRead {
+  const L = k.shape[2]!;
+  const at = (a: MlxArray, i: number) => a.slice([0, 0, i, 0], [a.shape[0]!, a.shape[1]!, i + 1, a.shape[3]!]);
+  const reads: AttentionRead[] = [];
+  try {
+    for (let i = 0; i < L; i++) {
+      using key = at(k, i), value = at(v, i);
+      reads.push(cache.appendDecode(key, value));
+    }
+  } catch (error) { disposeResources(reads); throw error; }
+  return {
+    attend(q, scale) {
+      const outputs: MlxArray[] = [];
+      try {
+        for (const [i, read] of reads.entries()) {
+          using query = at(q, i);
+          outputs.push(read.attend(query, scale));
+        }
+        return outputs.length === 1 ? ops.contiguous(outputs[0]!) : ops.concatAxis(outputs, 2);
+      } finally { disposeResources(outputs); }
+    },
+    dispose() { disposeResources(reads); },
   };
 }
 

@@ -1,12 +1,12 @@
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
-import type { AttentionCache,AttentionRead,CompiledDecodeCache,DecodeSlot,DecodeStepInputs,DecodeStepPlan,DecodeTrace,KvDonorAttention,Mask,QuantizedAttentionState } from "../contracts/mlx/cache";
+import type { AttentionRead,CommittedAttentionCache,CompiledDecodeCache,DecodeSlot,DecodeStepInputs,DecodeStepPlan,DecodeTrace,KvDonorAttention,Mask,QuantizedAttentionState } from "../contracts/mlx/cache";
 import { createCausalMask } from "../kernels/attention/masks";
 
 import { activeQuantViews,quantConcatDecodeSlot } from "./quantized-kv";
 import { disposeTriple,mapTriple } from "./quantized-tensor";
-import { AttentionMasks, unmaskedLease, withLease, type MaskLease } from "./attention-read";
+import { AttentionMasks, decodeByPosition, unmaskedLease, withLease, type MaskLease } from "./attention-read";
 import { affineCausalLease, affineRead, unfusedAffineKernels, viewAffineKernel, type AffineKernel, type AffineKernels, type AffineKernelSet } from "./affine-attention";
 
 
@@ -33,7 +33,7 @@ import { affineCausalLease, affineRead, unfusedAffineKernels, viewAffineKernel, 
  *  write for one position and `quantizedSdpa` picks the unfused port for one
  *  query, so a one-row window concatenates here (the same keys, in another
  *  order once the ring wraps) and takes the window kernel. */
-export class RotatingQuantizedKVCache implements CompiledDecodeCache, AttentionCache {
+export class RotatingQuantizedKVCache implements CompiledDecodeCache, CommittedAttentionCache {
   get quantizedAttention(): QuantizedAttentionState { return this; }
   declare minimumReusableOffset?: number;
   static readonly STEP = 256;
@@ -79,6 +79,12 @@ export class RotatingQuantizedKVCache implements CompiledDecodeCache, AttentionC
       ? this.#windowRead(k, v, affineCausalLease(this.masks, N, offset + N), this.kernels.window)
       : this.#windowRead(k, v, this.masks.lease(`rotating:${this.maxSize}`, `${N}:${offset}`,
         () => ({ mode: "array", arr: createCausalMask(N, offset, this.maxSize) })), this.kernels.maskedWindow);
+  }
+
+  /** A committed span, one decode per position (`decodeByPosition`): the
+   * in-place ring write and the decode kernel each position would get. */
+  appendCommitted(k: MlxArray, v: MlxArray): AttentionRead {
+    return decodeByPosition(this, k, v);
   }
 
   #windowRead(k: MlxArray, v: MlxArray, mask: MaskLease, kernel: AffineKernel): AttentionRead {

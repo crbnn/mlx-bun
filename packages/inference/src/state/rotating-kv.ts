@@ -1,12 +1,12 @@
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
-import type { AttentionRead,BidirectionalAttentionCache,BlockAttentionCache,CompiledDecodeCache,DecodeSlot,DecodeStepInputs,DecodeStepPlan,DecodeTrace,EncoderAttentionCache,KvDonorRows,Mask } from "../contracts/mlx/cache";
+import type { AttentionRead,BidirectionalAttentionCache,BlockAttentionCache,CommittedAttentionCache,CompiledDecodeCache,DecodeSlot,DecodeStepInputs,DecodeStepPlan,DecodeTrace,EncoderAttentionCache,KvDonorRows,Mask } from "../contracts/mlx/cache";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import { bidirMask, createCausalMask } from "../kernels/attention/masks";
 import { concatDecodeSlot, type AffineKernelSet } from "./kv";
 import { RotatingQuantizedKVCache } from "./rotating-quantized-kv";
 import { plainKvStorage } from "./dense-kv-reads";
-import { AttentionMasks, causalLease, encoderWindowMask, sdpaRead, unmaskedLease, withLease, type MaskLease } from "./attention-read";
+import { AttentionMasks, causalLease, decodeByPosition, encoderWindowMask, sdpaRead, unmaskedLease, withLease, type MaskLease } from "./attention-read";
 
 
 /** Rotating (sliding-window) KV cache — port of mlx-lm RotatingKVCache
@@ -23,7 +23,7 @@ import { AttentionMasks, causalLease, encoderWindowMask, sdpaRead, unmaskedLease
  *  picks the in-place write for one position and concatenation otherwise. The
  *  method picks here, so a one-row window concatenates: the same bits until the
  *  ring wraps, a different key order after. */
-export class RotatingKVCache implements CompiledDecodeCache, BidirectionalAttentionCache, EncoderAttentionCache, BlockAttentionCache {
+export class RotatingKVCache implements CompiledDecodeCache, CommittedAttentionCache, BidirectionalAttentionCache, EncoderAttentionCache, BlockAttentionCache {
   readonly denseKvReads = plainKvStorage;
   declare minimumReusableOffset?: number;
   static readonly STEP = 256;
@@ -56,6 +56,12 @@ export class RotatingKVCache implements CompiledDecodeCache, BidirectionalAttent
       const [keys, values] = this.#updateConcat(k, v);
       return sdpaRead(keys, values, mask);
     });
+  }
+
+  /** A committed span, one decode per position (`decodeByPosition`): the
+   * in-place ring write and read each position would get. */
+  appendCommitted(k: MlxArray, v: MlxArray): AttentionRead {
+    return decodeByPosition(this, k, v);
   }
 
   /** Gemma 4's vision prefill read on a sliding layer: `bidirMask` with this
