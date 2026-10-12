@@ -282,7 +282,32 @@ cache class against its pre-refactor read on the existing parity inputs; `grep` 
 - [ ] The scheduler's surface is acquire(request) returning state plus reused-token count, or a
       miss, and release(request). The scheduler never learns what is resident or when it was
       evicted.
-- [ ] Delete `state/kv-maintenance.ts`; its batch preparation moves to `state/layout.ts`.
+- [x] Delete `state/kv-maintenance.ts`; its batch preparation moves to `state/layout.ts`.
+- [x] Landed (PR #343 into `refactor/composition`, c7d39b5a). `state/cache-service.ts`:
+      `createKvCacheService(graph, options)` builds one service with the prompt-cache bytes, the
+      KV budget, the saved-state directory and its byte budget, write-behind, prefetch and the
+      checkpoint interval; the paging block size comes from the composition. Scheduler side
+      (`RequestStateCache`): `admit`, `fits`, `keeps`, `acquire` (caches plus reused-token
+      count, a resumed continuation, or fresh state), `publish`, `checkpoint`, `release`,
+      `boundary`, `codecs`; residency, eviction, SSD, paging and continuation persistence stay
+      inside. App side: `report()`, `stats()`, `prefetch`, `savedPrefixes()`, `flush`, `close`.
+      Moved into `state/`: `kv-budget.ts`, continuation persistence; deleted:
+      `namespaced-cache.ts`, `execution/continuation.ts`, `bindRequestState`,
+      `configureContinuation`, `kv-maintenance.ts` (batch preparation verbatim into
+      `layout.ts`; `decodesCompiled` parked there for B4 to delete). Every scheduler caller
+      (batch group, prefill cohort, speculative, grammar and fill groups) goes through the
+      service; the gateway exposes `reusesPrefix`; `/stats`, the cache routes and telemetry
+      read `report()`. Gates against e436ccf5: typecheck clean; architecture 21, ratchet
+      empty; cache-contract 196/196; state + execution 1152 pass; root test exit 0 (inference
+      2369 pass); 12 digest cells identical; SSD save and fresh-process restore over HTTP
+      identical on e4b, MiniCPM5 and Llama 1B under five schemes and on the Trellis artifact
+      under kv4 (435 cached tokens on the repeat and on the restore); cache routes identical;
+      the real-weight suites at the head's lines; inventories: routes and CLI identical, the
+      library API +13 symbols (the service types) −6 (the continuation bindings). Behaviour
+      notes: the `prefill.batch_setup` trace span is gone; an admission probe adds one
+      `makeCache` per group; the speculative group's probe caches are disposed right after
+      `openPrefill`. Not run: the isolate test's memory-synthesis case (loads a second model),
+      the Gemma 2 natives (no weights), `qwen-mtp-group-prefix` (Trellis kept for the SSD run).
 
 Exit: saved KV under `MLX_BUN_HOME/kv` round-trips as before; prefix hit rate on the existing
 warm-reuse test is unchanged; no `toQuantized` caller outside `state/`.
@@ -986,7 +1011,7 @@ unchanged.
 - [ ] Each new rule's failure message names the paved road, in the style of the existing
       "scheduling reaches storage through the row-layout port" message.
 - [x] Make the library checks a required status check on `main`, so a PR with a failing gate is
-      not mergeable (#312 merged with its checks still pending).
+      not mergeable (#312 merged with its checks still pending). Green on `refactor/composition` at fa811ff2 (2026-10-12) after the job limit went to 90 minutes and the package consumer learned to copy the installed source its test helpers reach through `../../src`.
 - [ ] Automatic performance-regression check. GitHub's runners have no Apple GPU, so this needs
       a self-hosted runner on a quiet named Mac (the M4 Pro, or the M1 Max over SSH). Runner
       installed 2026-10-11 on the M1 Max (Josh's go): name `m1max`, labels `self-hosted, macOS,
