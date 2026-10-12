@@ -1045,6 +1045,41 @@ unchanged.
       fallback is stated and the in-graph one forbidden; the one-way-per-pattern list above.
 - [ ] PLAN.md: first decision updated per the off-composition decision; this file's closed phases
       deleted.
+- [ ] Final cleanup, after B2 and B4 land (Josh, 2026-10-12: every allowed document fully
+      correct, no stale information; every comment up to date). The documents, each read in
+      full against the merged tree and corrected: `README.md`, `ARCHITECTURE.md`,
+      `CONTRIBUTING.md`, `AGENTS.md`, `CLAUDE.md`, `PLAN.md` (closed blocks deleted),
+      `apps/mlx-bun/README.md`, `apps/website/README.md`, the website's hand-written pages
+      (`apps/website/src/content/docs/about/correctness.md`, `getting-started/installation.md`,
+      `introduction.md`, `quickstart.md`, `guides/library.md`, `index.md`; the generated
+      reference regenerates), `packages/inference/README.md`, `packages/mlx/README.md`,
+      `packages/hub/README.md`, `packages/quantize/README.md`, `packages/training/README.md`,
+      `packages/web-shell/README.md`, every `packages/module-*/README.md`, and
+      `packages/module-memory/src/skills/memory/SKILL.md`; the `THIRD_PARTY_NOTICES.md` files
+      are generated. Comments: a sweep of every source file for mechanisms this refactor
+      deleted, each hit rewritten or removed, with the grep terms recorded here so the sweep
+      is repeatable: `deprecatedPhase`, `hiddenTap`, `forwardHidden`, `forwardHiddenMixed`,
+      `updateAndFetch`, `makeMask`, `quantizedAttention`, `affineConversion`,
+      `turboConversion`, `serial lane`, `serial path`, `serial source`, `aneAvailable`,
+      `mbane_available`, `kvBits`, `kvConfig`, `quantizedKvStart` (as request options),
+      `#matches`, `TQ graph`, `qwen38-27b-trellis-tq`, `GENERATED` map, `generated-graph`,
+      `legacyForwardWithTaps`, `DraftSource`, `open()` on a provider, `specRun`,
+      `bindMlxGraph`, `createAppend`, `MlxTokenAppend`, every `MLX_BUN_*` key that became a
+      composition field (`NO_FUSED_SDPA`, `QWEN_SPEC_KV4`, `MIXED_PACKED_MLP`,
+      `BATCH_VEC_SAMPLE`, `COMPILED_DECODE`, `MIXED_PREFILL`, `MIXED_TOKEN_BUDGET`,
+      `PREFILL_TAIL_SPLIT`, `GRAMMAR_JUMP`, `SPEC_GREEDY_DRAFT`, `BATCH_SSM`, `COMPILED_GEGLU`,
+      `QWEN38_TQ_*`, `DFLASH2_TARGET_BASIS`), "plan" where it means the M4 Pro graph's old
+      whole-forward plans, "fallback" or "generic" where a graph is described as falling back,
+      "capability" where it names a cache format. At e436ccf5 the sweep still finds: `serial
+      lane` 1, `serial path` 4, `quantizedKvStart` 1, `MLX_BUN_COMPILED_DECODE` 3 (the
+      inference README's runtime-oracle commands), `MLX_BUN_SPEC_GREEDY_DRAFT` 1,
+      `generated-graph` 1. Also: the frozen oracle files and test references headed "NOT A
+      PATTERN TO FOLLOW" are deleted with their identity tests' oracle halves (the generator
+      drift tests and the real-weight digests remain the gates); the drafter port's unused
+      `forwardInfer`, `draftBlock` and `projectContextKV`; the `sliding-grammar-fill` Llama 3B
+      case bisected to its first failing commit. Exit: the sweep returns nothing but
+      diagnostics and history; every document names only what the tree contains; the
+      architecture gate's documentation generators run clean.
 - [ ] `packages/inference/README.md`: the M4 Pro graph paragraph describes phases, not plans.
 
 Exit: `bun test packages/inference/tests/architecture.test.ts` passes with the ratchet table
