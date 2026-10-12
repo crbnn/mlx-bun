@@ -191,6 +191,14 @@ regenerates all three from the committed inputs in `tests/fixtures/gemma4-graphs
 file differs; it does not say the regenerated graph is numerically right, which
 is the real-weight test above.
 
+What says a generated graph is numerically right: the identity tests compare each generated
+graph against its family's generic graph at maxDiff 0 wherever both serve the composition (the
+M4 Pro graph's chunk, tail and verify, the M1 Max graph's every phase from five rows, each
+generated Gemma graph under its `kv_config`); the real-weight parity suites and the app-path
+digests (`scripts/digest.ts`) hold the served numbers; recorded synthetic digests
+(`scripts/synthetic-digests.ts`) hold the cases no artifact covers. The tree keeps no frozen
+copy of replaced code.
+
 On 2026-09-27 UTC, the rotating live-window correction (source `5ec1f4ae`) was
 checked on the same M1 Max (MLX 0.32.2, pinned native library) against selections
 made independently of `temporalView`, main `02d723a`, and pinned optiq 0.2.7.
