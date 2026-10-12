@@ -493,8 +493,9 @@ same phase; the Qwen generator (D2) produces it.
       diff). The M1 Max output needs, first: layer classes for the fused gate/up reduce kernels
       and the packed down (today functions), the TQ graph's three env A/B flags turned into
       composition facts or separate kernels, and an identity gate run on that host. Landed
-      (`refactor/composition-d2-m1max`, da549488, nine commits on 832ac8b1; merging onto the
-      integration head with the install-time compile). The generator takes the composition
+      (`refactor/composition-d2-m1max`, da549488, nine commits on 832ac8b1; merged onto the
+      integration head with the install-time compile at 6fe59e7c, both generators regenerating
+      with no diff, every gate repeated on both machines). The generator takes the composition
       `qwen38-27b-trellis-m1max` (fingerprint `cfa205c8f5af046a`, device `applegpu_g13s`,
       every KV scheme, any row count, no bridge) and emits `Qwen38TrellisM1Max`, an entire
       graph over the shared blocks; its device table is the LUT the width-table idea
