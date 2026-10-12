@@ -2,12 +2,12 @@ import {captureSpeculativeOptions, speculativePrefixNamespace} from "../generati
 import type { MlxTokenGraph } from "../models/graph";
 import type { GenerateOptions } from "../generation/index";
 import type { FillSession, Proposal } from "../generation/fill/session";
-import type { DraftProvider, DraftRowGroup, DraftPrefillGroup } from "../generation/speculative/source";
+import type { DraftProvider, DraftRowGroup, DraftPrefillGroup, DraftSelection } from "../generation/speculative/source";
 import type { DraftRowCheckpoint } from "../contracts/mlx/draft-checkpoint";
 import { makeSampler, makeStepSampler, readStepExtras, type NumberStepSampler, type Sampler } from "../sampling/index";
 import { draftSamplerOptions } from "../generation/speculative/draft-policy";
 import { COMPOSITION_DEFAULTS } from "../contracts/portable/composition";
-import { configuredDraftVocabulary, makeSubsetDraftSampler, type DraftVocabularyHead, type SubsetDraftSampler } from "../generation/speculative/draft-vocab";
+import { makeSubsetDraftSampler, type DraftVocabularyHead, type SubsetDraftSampler } from "../generation/speculative/draft-vocab";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import { clearCache } from "@mlx-bun/mlx/ffi";
@@ -52,22 +52,37 @@ export function bindSpeculativeGroupRequests(model: MlxTokenGraph, provider: Pic
   if (adaptiveDepth && !model.verifyRoundCosts)
     throw new Error("adaptive draft depth needs a graph that declares its measured verify costs (verifyRoundCosts)");
   const binding = bindSpeculativeTargetModel(model);
+  // The target's ports, viewed only for a provider that asks about them.
+  let view: ReturnType<typeof bindLegacyDraftTarget> | undefined;
+  const target = () => view ??= bindLegacyDraftTarget(model, []);
   // Resolved once for this target into a snapshot the binding owns: the checked
   // list cannot change afterwards, and prefill and decode rows must tap exactly it.
-  const taps = Object.freeze([...(provider.grouped?.targetTapLayers?.(bindLegacyDraftTarget(model, [])) ?? [])]);
-  // The composition's draft selection, read once for every request this binding opens.
-  const greedyDraft = (model.composition ?? COMPOSITION_DEFAULTS).greedyDraft;
+  const taps = Object.freeze([...(provider.grouped.targetTapLayers?.(target()) ?? [])]);
   if (!binding.supportsTapLayers(taps)) return undefined;
+  // The selection's composition facts, resolved once for this target: argmax
+  // drafts (the composition's `greedyDraft`), else the vocabulary the provider
+  // declares for it.
+  const greedy = (model.composition ?? COMPOSITION_DEFAULTS).greedyDraft;
+  const listed = greedy ? null : provider.grouped.draftVocabulary?.(target()) ?? null;
   return (input: GenerateOptions): MlxGroupMethodRequest => {
     const options = captureSpeculativeOptions(input);
+    // The request's selection, resolved once here: the listed vocabulary only
+    // when its draft sampler reproduces there. Rows sharing a group share it, so
+    // the draft rows bind one selection operation when they open.
+    const selection: GroupSelection = greedy ? { kind: "greedy" }
+      : listed && makeSubsetDraftSampler(draftSamplerOptions(options, false)) ? { kind: "listed", ids: listed } : { kind: "sampled" };
     return {
       // The KV scheme is the composition's, shared by every request.
-      key: JSON.stringify(["speculative", provider.id, depth, adaptiveDepth]),
+      key: JSON.stringify(["speculative", provider.id, depth, adaptiveDepth, selection.kind]),
       data: options,
-      open: host => new SpeculativeGroup(host, model, provider, binding, depth, taps, adaptiveDepth, greedyDraft),
+      open: host => new SpeculativeGroup(host, model, provider, binding, depth, taps, adaptiveDepth, selection),
     };
   };
 }
+
+/** The draft selection one group's requests share, before the group binds its rows' draws. */
+type GroupSelection = { readonly kind: "sampled" } | { readonly kind: "greedy" } |
+  { readonly kind: "listed"; readonly ids: readonly number[] };
 
 /** Rows must tap exactly the target layers resolved for their provider at binding time. */
 function declaredTaps<Rows extends { readonly tapLayers: readonly number[]; dispose(): void }>(
@@ -90,7 +105,7 @@ class SpeculativeGroup implements MlxGroupedMethod {
 
   constructor(readonly host: MlxGroupMethodHost, readonly model: MlxTokenGraph,
     readonly provider: Pick<DraftProvider, "id" | "grouped">, readonly binding: MlxSpeculativeTargetBinding, readonly depth: number,
-    readonly taps: readonly number[], adaptiveDepth: boolean, readonly greedyDraft: boolean) {
+    readonly taps: readonly number[], adaptiveDepth: boolean, readonly selection: GroupSelection) {
     this.#gate = adaptiveDepth ? new AdaptiveDraftGate(model.verifyRoundCosts!, { maxDraftTokens: depth }) : null;
   }
 
@@ -153,10 +168,11 @@ class SpeculativeGroup implements MlxGroupedMethod {
         // The verifier accepts a draft only when the TARGET's own sample equals
         // it, so the output distribution never depends on how drafts are chosen;
         // the argmax of the head's estimate maximizes the expected match.
-        const sampler = makeSampler(draftSamplerOptions(options, method.greedyDraft));
-        const request: RequestState = { draftSampling: sampler, draftSubset: makeSubsetDraftSampler(draftSamplerOptions(options, method.greedyDraft)),
+        const draftOptions = draftSamplerOptions(options, method.selection.kind === "greedy");
+        const sampler = makeSampler(draftOptions);
+        const request: RequestState = { draftSampling: sampler, draftSubset: makeSubsetDraftSampler(draftOptions),
           namespace: "", prefixLength: 0,
-          fill: method.provider.grouped?.supportsExternalTokens ? options.fill : undefined,
+          fill: method.provider.grouped.supportsExternalTokens ? options.fill : undefined,
           processed: method.host.promptCache ? [] : undefined,
           sampling: makeStepSampler(options, { tokenRepresentation: "number", grammarWait: "before-sample",
             historyUpdate: "after-sample", initialHistory: row.req.promptIds, acceptGrammar: true,
@@ -170,7 +186,7 @@ class SpeculativeGroup implements MlxGroupedMethod {
           // The request's state (the composition's paging over the graph's caches), else the graph's caches.
           caches = row.req.statePolicy?.create() ?? method.binding.makeCache();
           prefix ??= declaredTaps(method.provider, method.taps,
-            method.provider.grouped!.openPrefill({ target: bindLegacyDraftTarget(method.model, caches), checkpoints: [] }));
+            method.provider.grouped.openPrefill({ target: bindLegacyDraftTarget(method.model, caches), checkpoints: [] }));
           const prompt = row.req.promptIds;
           const pendingPrompt = prefix.prefillMode !== "full" && method.binding.prefillTailSplit && prompt.length > 1;
           request.prefixLength = prompt.length - Number(pendingPrompt);
@@ -288,9 +304,8 @@ class SpeculativeGroup implements MlxGroupedMethod {
               }
               maintain?.prepareBatch?.(state.caches);
               this.#target ??= new MlxStateRows(state.caches.map(targetCacheLayout));
-              this.#draft ??= declaredTaps(this.provider, this.taps, this.provider.grouped!.open({ target: bindLegacyDraftTarget(this.model, this.#target.caches),
-                checkpoints: [], sampling: { sample: (lp, steps) => this.#sampleDraftRows(lp, steps), greedy: this.greedyDraft,
-                  vocabulary: this.#draftVocabulary() },
+              this.#draft ??= declaredTaps(this.provider, this.taps, this.provider.grouped.open({ target: bindLegacyDraftTarget(this.model, this.#target.caches),
+                checkpoints: [], sampling: { sample: (lp, steps) => this.#sampleDraftRows(lp, steps), selection: this.#draftSelection() },
                 constraints: { propose: async (row, maxTokens) => this.host.rows[row]!.req.grammar?.proposeTokens(maxTokens) ?? [] } }));
               applyStateChanges([() => this.#target!.prepareAppend(state.caches),
                 () => this.#draft!.prepareAppend([state.draft]), () => ({ commit: () => {
@@ -314,14 +329,14 @@ class SpeculativeGroup implements MlxGroupedMethod {
     catch (error) { return cleanupFailure(error, () => preparation.dispose()); }
   }
 
-  /** Frequency-ranked draft vocabulary for this model, when configured. */
-  #draftVocabulary() {
-    const vocabSize = (this.model as { config?: { text?: { vocabSize?: number } } }).config?.text?.vocabSize;
-    const ids = vocabSize && !this.greedyDraft ? configuredDraftVocabulary(vocabSize, this.provider.grouped?.artifactDir) : null;
-    if (!ids) return undefined;
-    return { ids, sample: (logits: MlxArray, head: DraftVocabularyHead, steps: readonly number[]): MlxArray | null => {
+  /** The selection this group's requests resolved when they were bound. Under
+   *  `listed` every row's draft sampler reproduces on the subset (the request
+   *  binding keyed its group on that), so each row draws its own coupled token. */
+  #draftSelection(): DraftSelection {
+    const selection = this.selection;
+    if (selection.kind !== "listed") return selection;
+    return { kind: "listed", ids: selection.ids, sample: (logits: MlxArray, head: DraftVocabularyHead, steps: readonly number[]): MlxArray => {
       const rows = this.host.rows.map(row => this.#requests.get(row)!);
-      if (rows.some(request => !request.draftSubset)) return null;
       const tokens: MlxArray[] = [];
       try {
         for (let row = 0; row < rows.length; row++) {

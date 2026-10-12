@@ -1,60 +1,72 @@
 import * as ops from "@mlx-bun/mlx/ops";
 import { expect, test } from "bun:test";
-import { AssistantSource } from "../../src/generation/speculative/sources/assistant-source";
-import { DflashSource } from "../../src/generation/speculative/sources/dflash-source";
-import { DeepspecSource } from "../../src/generation/speculative/sources/deepspec-source";
 import type { TargetView } from "../../src/generation/speculative/source";
 import { projectedDraftGroups } from "../../src/generation/speculative/bindings/projected-draft-rows";
 import { deepspecGroups } from "../../src/generation/speculative/bindings/deepspec-rows";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { bindSpeculativeTargetModel } from "../../src/generation/speculative/bindings/binding";
 import { declareGraph } from "../../src/models/capabilities";
+import { atEveryWidth } from "../../src/models/graph";
 import { stubPhases } from "../models/phase-forward";
+import { assistantGroups } from "../../src/generation/speculative/bindings/assistant-rows";
+import { DRAFT_CHECKPOINT_SCHEMA } from "../../src/contracts/mlx/draft-checkpoint";
+import type { AssistantDraftStep } from "../../src/contracts/mlx/drafter";
 
-test("an assistant uses an independent target's ports and releases each borrowed view", () => {
+/** Assistant draft rows holding one row whose true hidden is `hidden`, over `target`. */
+function assistantRows(forward: AssistantDraftStep, target: TargetView, hidden: MlxArray) {
+  const checkpoint = { processedTokens: 4, attachment: { schema: DRAFT_CHECKPOINT_SCHEMA.assistant, metadata: { processedTokens: 4 }, tensors: [hidden] } };
+  return assistantGroups({ forwardRows: atEveryWidth(forward), dispose() {} }, "assistant").open({ target, checkpoints: [checkpoint],
+    sampling: { selection: { kind: "sampled" }, sample() { throw new Error("the assistant drafts with its own head"); } } });
+}
+
+test("assistant rows use an independent target's ports and release each borrowed view", async () => {
   const released: number[] = [];
-  const tensor = (id: number) => ({ dispose() { released.push(id); } }) as MlxArray;
+  const tensor = (id: number) => ({ dispose() { released.push(id); }, [Symbol.dispose]() { released.push(id); } }) as unknown as MlxArray;
   const positions: number[] = [];
   let step = 0;
-  const source = new AssistantSource({
-    forwardRows(_embedding, _hidden, _donors, position) {
-      positions.push(position as number);
-      const token = 4 + step;
-      return { tokens: ops.fromInt32([token], [1]), nextHidden: tensor(20 + step++) };
-    },
+  using hidden = MlxArray.fromFloat32(new Float32Array([0.5]), [1, 1, 1]);
+  const rows = assistantRows((_embedding, _hidden, _donors, position) => {
+    positions.push(position as number);
+    const token = 4 + step;
+    return { tokens: ops.fromInt32([token], [1]), nextHidden: tensor(20 + step++) };
   }, {
     identity: {},
     assistantRows: {
       hiddenSize: 1, embed: (ids) => tensor(ops.itemUint32(ids)),
       readDonors: () => ({ positions: [9], sliding: {} as never, full: {} as never, dispose() { released.push(10, 11, 12, 13); } }),
     },
-  });
-  expect(source.draft([3], 2, 0, tensor(99))).toEqual([4, 5]);
-  expect(positions).toEqual([9, 10]);
-  expect(released.sort((a, b) => a - b)).toEqual([3, 4, 10, 11, 12, 13, 20, 21]);
-  // The anchor is borrowed from the verifier, which owns its release.
-  expect(released).not.toContain(99);
-  source.dispose();
+  }, hidden);
+  try {
+    expect(await rows.draft([3], 2, [0])).toEqual([[4, 5]]);
+    expect(positions).toEqual([9, 10]);
+    expect(released.sort((a, b) => a - b)).toEqual([3, 4, 10, 11, 12, 13, 20, 21]);
+  } finally { rows.dispose(); }
 });
 
-test("assistant draft failure releases retained donors and its current embedding", () => {
+test("an assistant draft failure releases retained donors and its current embedding", async () => {
   const released: number[] = [];
-  const tensor = (id: number) => ({ dispose() { released.push(id); } }) as MlxArray;
-  const source = new AssistantSource({ forwardRows() { throw new Error("draft failed"); } }, {
+  const tensor = (id: number) => ({ dispose() { released.push(id); }, [Symbol.dispose]() { released.push(id); } }) as unknown as MlxArray;
+  using hidden = MlxArray.fromFloat32(new Float32Array([0.5]), [1, 1, 1]);
+  const rows = assistantRows(() => { throw new Error("draft failed"); }, {
     identity: {}, assistantRows: {
       hiddenSize: 1, embed: () => tensor(1),
       readDonors: () => ({ positions: [0], sliding: {} as never, full: {} as never, dispose() { released.push(2, 3, 4, 5); } }),
     },
-  });
-  expect(() => source.draft([1], 1, 0, tensor(99))).toThrow("draft failed");
-  expect(released).toEqual([1, 2, 3, 4, 5]);
+  }, hidden);
+  try {
+    expect(() => rows.draft([1], 1, [0])).toThrow("draft failed");
+    expect(released).toEqual([1, 2, 3, 4, 5]);
+  } finally { rows.dispose(); }
 });
 
-test("target extensions refuse unsupported pairings before touching the drafter", () => {
+test("grouped rows refuse a target that lacks their port before touching the drafter", () => {
   const target: TargetView = { identity: {} };
-  expect(() => new AssistantSource(undefined as never, target)).toThrow("target graph does not provide assistantRows");
-  expect(() => new DflashSource(undefined as never, target)).toThrow("target graph does not provide hiddenLayerTaps");
-  expect(() => new DeepspecSource(undefined as never, target)).toThrow("target graph does not provide hiddenLayerTaps");
+  for (const open of [(groups: ReturnType<typeof assistantGroups>) => groups.openPrefill({ target, checkpoints: [] }),
+    (groups: ReturnType<typeof assistantGroups>) => groups.open({ target, checkpoints: [], sampling: {} as never })]) {
+    expect(() => open(assistantGroups(undefined as never, "assistant"))).toThrow("target graph does not provide assistantRows");
+    expect(() => open(deepspecGroups({ tapLayers: [1], cfg: { num_target_layers: 2 } } as never, "deepspec")))
+      .toThrow("target graph does not provide hiddenLayerTaps");
+  }
 });
 
 test("projected draft providers declare the immutable target tap list their rows consume", () => {

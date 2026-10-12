@@ -9,7 +9,7 @@ import { declareGraph } from "../../src/models/capabilities";
 import { Glm52Model } from "../../src/models/glm52/model";
 import { NATIVE_MTP_DRAFT } from "../../src/models/drafters";
 
-const provider = (id: string) => ({ id, weightsBytes: 0, open() { throw new Error("unused"); }, dispose() {} }) as DraftProvider;
+const provider = (id: string): DraftProvider => ({ id, weightsBytes: 0, grouped: { open() { throw new Error("unused"); }, openPrefill() { throw new Error("unused"); } }, dispose() {} });
 const kind = (name: string, detects: boolean | undefined, extra: Partial<DraftProviderKind> = {}): DraftProviderKind => ({
   kind: name, artifact: true,
   ...(detects === undefined ? {} : { detect: async () => detects }),
