@@ -682,7 +682,12 @@ unchanged.
 - [x] Make the library checks a required status check on `main`, so a PR with a failing gate is
       not mergeable (#312 merged with its checks still pending).
 - [ ] Automatic performance-regression check. GitHub's runners have no Apple GPU, so this needs
-      a self-hosted runner on a quiet named Mac (the M4 Pro, or the M1 Max over SSH). For a PR
+      a self-hosted runner on a quiet named Mac (the M4 Pro, or the M1 Max over SSH). Runner
+      installed 2026-10-11 on the M1 Max (Josh's go): name `m1max`, labels `self-hosted, macOS,
+      ARM64, m1max, gpu`, a launch agent in the logged-in session under `~/actions-runner`. No
+      prior M1 Max numbers exist (the refactor came before measurement moved there); the check
+      is paired, head against base on the same host in one run, so its first run on the
+      integration PR is the first M1 Max measurement of both. For a PR
       that touches `kernels/`, `layers/` or `models/`, run the existing paired serve benchmark
       against `main` with the preflight gate, and fail on a regression outside the paired noise
       band. Unqualified numbers never gate; the check reports the paired delta and its interval.
