@@ -11,8 +11,8 @@
 //   tokens, every sampled full-vocabulary vector, and each retired row's valid
 //   K/V in every layer (main's paged-kv-parity contract, extended to KV planes);
 // - direct reads at B3 over bf16, KV4 and KV8 pages: the direct kernel actually
-//   serves decode and windows of at most eight queries (the prompt's last token,
-//   which prefills alone), and on
+//   serves decode, and a window of at most eight queries (a six-token prompt's
+//   prefill, run alone), and on
 //   every such call its output equals the gathered reader's over the same query
 //   and pages within DIRECT_TOLERANCE of the output's scale (the two differ only
 //   in reduction order and where dequantized values round); every sampled
@@ -306,6 +306,9 @@ test.skipIf(!inputs)("Gemma4 paged KV: gathered bf16 equals plain KV; direct rea
       const direct = await runGroup(directSetup, rows.map(prompt => ({ prompt })));
       completed(gatheredSetup, gathered.outcomes); completed(directSetup, direct.outcomes);
       expect(directCalls - before).toBeGreaterThan(0);
+      // A prompt whose prefill window is at most eight queries reads it directly.
+      const short = await runGroup(directSetup, [{ prompt: rows[0]!.slice(0, 6) }]);
+      completed(directSetup, short.outcomes);
       expect(directWindows - windowsBefore).toBeGreaterThan(0);
       const equalRows = direct.outcomes.map((o, row) => Bun.deepEquals(o.tokens, gathered.outcomes[row]!.tokens));
       console.log(`[paged] direct ${encoding}: ${directCalls - before} direct attention calls (${directWindows - windowsBefore} windows) within ${worstRelative.toExponential(2)} ` +
