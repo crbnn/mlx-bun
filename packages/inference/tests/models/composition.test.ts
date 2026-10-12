@@ -31,7 +31,7 @@ test("the default record: this machine, bf16, no drafter, the 2048-token chunk, 
   expect(composition).toEqual({ device: deviceArchitecture(), aneBridge: true, kv: { kind: "bf16" }, pagedKv: null,
     draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 8, packedMixedMlp: true,
     vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
-    grammarJump: false });
+    grammarJump: false, greedyDraft: false });
   // The Neural Engine bridge is composed unless the caller turns it off; nothing probes the machine.
   expect(resolveComposition(config, { aneBridge: false }).aneBridge).toBe(false);
   expect(Object.isFrozen(composition)).toBe(true);
@@ -94,16 +94,18 @@ test("the graph switch is a composition field, on by default; the runtime config
 test("the scheduler switches are composition fields at their defaults; the runtime configuration does not reach them", () => {
   const facts = (request: Parameters<typeof resolveComposition>[1] = {}, values: Record<string, string> = {}) =>
     withRuntimeConfig(createRuntimeConfig(values), () => {
-      const { compiledDecode, mixedPrefill, mixedTokenBudget, prefillTailSplit, grammarJump } = resolveComposition(config, request);
-      return { compiledDecode, mixedPrefill, mixedTokenBudget, prefillTailSplit, grammarJump };
+      const { compiledDecode, mixedPrefill, mixedTokenBudget, prefillTailSplit, grammarJump, greedyDraft } = resolveComposition(config, request);
+      return { compiledDecode, mixedPrefill, mixedTokenBudget, prefillTailSplit, grammarJump, greedyDraft };
     });
-  const defaults = { compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true, grammarJump: false };
+  const defaults = { compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true, grammarJump: false,
+    greedyDraft: false };
   expect(facts()).toEqual(defaults);
-  const flipped = { compiledDecode: false, mixedPrefill: true, mixedTokenBudget: 9, prefillTailSplit: false, grammarJump: true };
+  const flipped = { compiledDecode: false, mixedPrefill: true, mixedTokenBudget: 9, prefillTailSplit: false, grammarJump: true,
+    greedyDraft: true };
   expect(facts(flipped)).toEqual(flipped);
   // The environment keys these fields replaced change nothing.
   expect(facts({}, { MLX_BUN_COMPILED_DECODE: "0", MLX_BUN_MIXED_PREFILL: "1", MLX_BUN_MIXED_TOKEN_BUDGET: "9",
-    MLX_BUN_PREFILL_TAIL_SPLIT: "0", MLX_BUN_GRAMMAR_JUMP: "1" })).toEqual(defaults);
+    MLX_BUN_PREFILL_TAIL_SPLIT: "0", MLX_BUN_GRAMMAR_JUMP: "1", MLX_BUN_SPEC_GREEDY_DRAFT: "1" })).toEqual(defaults);
   for (const mixedTokenBudget of [0, 1.5, -2])
     expect(() => resolveComposition(config, { mixedTokenBudget })).toThrow("composition mixedTokenBudget must be a positive integer");
 });

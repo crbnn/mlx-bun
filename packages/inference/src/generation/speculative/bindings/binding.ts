@@ -38,6 +38,8 @@ export interface MlxSpeculativeBinding {
   readonly descriptor: GraphDescriptor;
   readonly eosTokenIds: readonly number[];
   readonly prefillTailSplit: boolean;
+  /** The composition's `greedyDraft`: the serial run's drafts select by argmax. */
+  readonly greedyDraft: boolean;
   /** The composition's KV scheme, which `makeCache` composes; absent: bf16. */
   readonly kv?: KvStorageScheme;
   makeCache(): Cache[];
@@ -73,6 +75,7 @@ export function bindSpeculativeTargetModel(model: MlxTokenGraph): MlxSpeculative
       graphAbi: "mlx-hidden-bsh-v1", stateAbi: "legacy-cache-array-v1", artifact: "legacy-resident-model" }),
     eosTokenIds: model.config.eosTokenIds,
     prefillTailSplit: (model.composition ?? COMPOSITION_DEFAULTS).prefillTailSplit,
+    greedyDraft: (model.composition ?? COMPOSITION_DEFAULTS).greedyDraft,
     ...(model.composition ? { kv: model.composition.kv } : {}),
     makeCache: model.makeCache.bind(model),
     bindRollback: bindCacheRollback,

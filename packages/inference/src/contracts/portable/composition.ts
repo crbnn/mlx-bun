@@ -86,6 +86,10 @@ export interface Composition {
   /** Grammar-forced continuations enter the KV without one forward per token
    * (jump-forward decoding, default off). */
   readonly grammarJump: boolean;
+  /** Every speculative row drafts by argmax instead of the request sampler's
+   * coupled draw (default off). The draft moves acceptance and draft cost, not
+   * the output distribution (see `generation/speculative/draft-policy`). */
+  readonly greedyDraft: boolean;
 }
 
 /** The value of each composition fact a caller leaves unstated: what
@@ -99,4 +103,5 @@ export const COMPOSITION_DEFAULTS = Object.freeze({
   mixedTokenBudget: 256,
   prefillTailSplit: true,
   grammarJump: false,
+  greedyDraft: false,
 } satisfies Partial<Composition>);

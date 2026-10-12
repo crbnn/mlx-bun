@@ -9,7 +9,8 @@ import { atEveryWidth } from "../../src/models/graph";
 import { mtpModule } from "../models/phase-forward";
 import { toLogprobs } from "../../src/sampling/index";
 import { createRuntimeConfig, withRuntimeConfig } from "../../src/runtime/config";
-import { greedyDraftPolicy } from "../../src/generation/speculative/draft-policy";
+import { draftSamplerOptions } from "../../src/generation/speculative/draft-policy";
+import { COMPOSITION_DEFAULTS } from "../../src/contracts/portable/composition";
 
 const V = 6;
 /** Row r at chained step s favors token (r * 2 + s) % V by a clear margin. */
@@ -58,10 +59,11 @@ test("greedy draft rows select the fused argmax without calling the request samp
   } finally { greedy.dispose(); sampledRows.dispose(); }
 });
 
-test("greedy draft policy is an explicit opt-in runtime flag", () => {
-  expect(withRuntimeConfig(createRuntimeConfig({}), greedyDraftPolicy)).toBe(false);
-  expect(withRuntimeConfig(createRuntimeConfig({ MLX_BUN_SPEC_GREEDY_DRAFT: "1" }), greedyDraftPolicy)).toBe(true);
-  expect(withRuntimeConfig(createRuntimeConfig({ MLX_BUN_SPEC_GREEDY_DRAFT: "0" }), greedyDraftPolicy)).toBe(false);
+test("greedy drafting is the composition's opt-in field: it argmaxes the draft sampler, and the runtime configuration does not reach it", () => {
+  expect(COMPOSITION_DEFAULTS.greedyDraft).toBe(false);
+  const options = { temperature: 0.7, topP: 0.9 };
+  expect(draftSamplerOptions(options, true)).toEqual({ temperature: 0, topP: 0.9 });
+  expect(withRuntimeConfig(createRuntimeConfig({ MLX_BUN_SPEC_GREEDY_DRAFT: "1" }), () => draftSamplerOptions(options, false))).toBe(options);
 });
 
 test("normalized argmax and sampled argmax agree on the draft logits", () => {

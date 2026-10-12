@@ -217,8 +217,8 @@ async function specRunInner(
       throw new Error("speculative KV requires uniform KV4/KV8 or TurboQuant start=0");
     caches = binding.makeCache();
     // Draft policy (see packages/inference/src/generation/speculative/draft-policy.ts): the target's stepSampler
-    // above is untouched; only the drafter's selection changes under the flag.
-    const draftOptions = draftSamplerOptions(options);
+    // above is untouched; only the drafter's selection changes under the composition's greedyDraft.
+    const draftOptions = draftSamplerOptions(options, binding.greedyDraft);
     const src = binding.openDraft(draftOptions === options ? sampler : makeSampler(draftOptions), caches);
     source = src;
     tapLayers = src.tapLayers;

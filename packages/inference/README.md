@@ -73,7 +73,8 @@ The trainer names the declaration a graph lacks. A model-level option is a
 composition field, resolved once at load by `resolveComposition` and settable
 through the composition request: the KV scheme and paging (`kv`, `pagedKv`), and
 the scheduler's `compiledDecode` (on), `mixedPrefill` (off), `mixedTokenBudget`
-(256), `prefillTailSplit` (on) and `grammarJump` (off). Nothing below the loader
+(256), `prefillTailSplit` (on) and `grammarJump` (off), and the drafter's
+`greedyDraft` (off). Nothing below the loader
 reads them from the environment.
 
 ## Numerical and execution policy
@@ -641,7 +642,7 @@ the window:
 - Grammar (JSON schema, choice, EBNF): at B1, tokens, every forward's IDs and
   valid K/V, and every projection's complete logits. At B2, prepared together
   or joining late, each row's tokens.
-- With `MLX_BUN_GRAMMAR_JUMP=1`: the speculative group verifies the matcher's
+- With the composition's `grammarJump` on: the speculative group verifies the matcher's
   forced string instead of committing it. Tokens equal direct token-by-token
   generation at B1 and B2, rejected proposals leave the ring, and proposals are
   both accepted and rejected.
@@ -689,7 +690,7 @@ The app gateway's real Gemma2 placement test uses the same
 that test only checks placement and allocates no tensors. Native-blocked CPU
 runs skip this check; synthetic gateway tests remain CPU-only.
 
-With `MLX_BUN_GRAMMAR_JUMP=1`, Gemma2 plain-KV ordinary requests preserve
+With the composition's `grammarJump` on, Gemma2 plain-KV ordinary requests preserve
 main's direct forced spans through the shared scheduler: one graph append for
 `[pending, ...forced]`, with no sampling of forced IDs. Graphs already using
 verified grammar proposals retain that behavior. Paired greedy Gemma2-2B checks

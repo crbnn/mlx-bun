@@ -64,6 +64,8 @@ export interface CompositionRequest {
   readonly prefillTailSplit?: boolean;
   /** Grammar-forced continuations enter the KV without one forward per token. Default false. */
   readonly grammarJump?: boolean;
+  /** Speculative rows draft by argmax. Default false. */
+  readonly greedyDraft?: boolean;
   /** Compose the Neural Engine bridge where a graph builds a Neural Engine
    * operation. Default true: every Apple-silicon Mac has the unit. */
   readonly aneBridge?: boolean;
@@ -105,6 +107,7 @@ export function resolveComposition(config: ModelConfig, request: CompositionRequ
     mixedTokenBudget,
     prefillTailSplit: request.prefillTailSplit ?? COMPOSITION_DEFAULTS.prefillTailSplit,
     grammarJump: request.grammarJump ?? COMPOSITION_DEFAULTS.grammarJump,
+    greedyDraft: request.greedyDraft ?? COMPOSITION_DEFAULTS.greedyDraft,
   });
 }
 
