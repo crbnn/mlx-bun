@@ -1,12 +1,13 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { Checkpoint } from "@mlx-bun/mlx/checkpoint";
 import * as ops from "@mlx-bun/mlx/ops";
-import type { Cache, Mask, SharedKv } from "../../contracts/mlx/cache";
+import type { Cache, SharedKv } from "../../contracts/mlx/cache";
 import type {
   GradCheckpointRun, HeadQuant, LoraLeaves, PrefixLayout, SegmentedPass, TrainableGraph,
 } from "../../contracts/mlx/trainable";
 import { setActivePrefixLayout } from "../../layers/prefix-layout";
-import { PrefixSharedCache, TrainingCache } from "../../state/training-cache";
+import { AttentionMasks } from "../../state/attention-read";
+import { prefixSharedCaches, selectedTrainingAttention, TrainingCache } from "../../state/training-cache";
 import type { LoraWeights } from "../../layers/lora";
 import type { RMSNorm } from "../../layers/normalization";
 import type { QuantizedEmbedding } from "../../layers/quantized-embedding";
@@ -39,22 +40,35 @@ export interface Gemma4Training {
   readonly config: { readonly text: { readonly finalLogitSoftcapping: number | null } };
   readonly embed: QuantizedEmbedding;
   readonly finalNorm: RMSNorm;
-  readonly layers: readonly unknown[];
+  readonly layers: readonly { readonly layerType: string }[];
+  /** The sliding layers' window. */
+  readonly windowSize: number;
   /** Donor count: layers [0, numDonors) own caches; the rest share. */
   readonly numDonors: number;
   readonly previousKvs: readonly number[];
   readonly cacheIndex: readonly number[];
   readonly reusedDonors: Set<number>;
   gradCkpt: GradCheckpointCtx | null;
-  /** The training forward over training caches, whose masks the caches build
-   * and whose donors hand their sharers plain keys and values. */
+  /** The training forward over one training cache per donor layer, which owns
+   * its read; donors hand their sharers plain keys and values. */
   forwardTrainingHidden(ids: MlxArray, cache: Cache[]): MlxArray;
   embedForSegmented(ids: MlxArray): { hScaled: MlxArray; perLayer: MlxArray | null };
-  makeTrainingMasks(cache: Cache[], L: number): Map<string, Mask>;
   runLayerRange(
     h: MlxArray, aIdx: number, bIdx: number, cache: Cache[],
-    masks: Map<string, Mask>, perLayer: MlxArray | null, donorKvIn: Map<number, SharedKv>,
+    perLayer: MlxArray | null, donorKvIn: Map<number, SharedKv>,
   ): { h: MlxArray; donorKvOut: Map<number, SharedKv> };
+}
+
+/** One stateless training cache per donor layer, with that layer's sliding
+ *  window, sharing one mask memo and attending with the run's training
+ *  attention: prefix-shared caches under a layout, plain ones otherwise. */
+function trainingCaches(model: Gemma4Training, prefix?: PrefixLayout): Cache[] {
+  const attention = selectedTrainingAttention();
+  const windows = model.layers.slice(0, model.numDonors)
+    .map(layer => layer.layerType === "sliding_attention" ? model.windowSize : null);
+  if (prefix) return prefixSharedCaches(prefix, windows, attention);
+  const masks = new AttentionMasks();
+  return windows.map(window => new TrainingCache(window, masks, attention));
 }
 
 /** Copy `a` into a graph-free leaf (an evaluated, row-major copy), disposing `a`. */
@@ -67,30 +81,24 @@ function detached(a: MlxArray): MlxArray {
 }
 
 /** One segmented pass over a Gemma 4 sequence: the per-layer-input tensor (a
- *  constant boundary sliced per layer), the per-layer-type masks (block-sparse
- *  with a logical-position window when prefix-shared), and one stateless cache
- *  per donor layer (sharers reuse the donors' fetched K/V). */
+ *  constant boundary sliced per layer) and one stateless training cache per
+ *  donor layer (block-sparse with a logical-position window when
+ *  prefix-shared), which builds its masks once for the pass; sharers read the
+ *  donors' K/V through the donors' caches. */
 class Gemma4SegmentedPass implements SegmentedPass {
   readonly input: MlxArray;
   private readonly caches: Cache[];
-  private readonly prefixCaches: Cache[] = [];
   private readonly perLayer: MlxArray | null = null;
-  private readonly masks: Map<string, Mask>;
 
   constructor(private readonly model: Gemma4Training, ids: MlxArray, private readonly prefix?: PrefixLayout) {
-    this.caches = Array.from({ length: model.numDonors }, () => new TrainingCache());
-    if (prefix) {
-      this.prefixCaches = Array.from({ length: model.numDonors }, () => new PrefixSharedCache(prefix));
-      setActivePrefixLayout(prefix);
-    }
+    this.caches = trainingCaches(model, prefix);
+    if (prefix) setActivePrefixLayout(prefix);
     let input: MlxArray | null = null;
     let perLayer: MlxArray | null = null;
     try {
       const embedded = model.embedForSegmented(ids);
       input = embedded.hScaled;
       perLayer = embedded.perLayer ? detached(embedded.perLayer) : null;
-      // Prefix masks come from the prefix caches; the running K/V still fetches into `caches`.
-      this.masks = model.makeTrainingMasks(prefix ? this.prefixCaches : this.caches, ids.shape[1]!);
     } catch (error) {
       input?.dispose();
       perLayer?.dispose();
@@ -103,18 +111,16 @@ class Gemma4SegmentedPass implements SegmentedPass {
 
   private releaseCaches(): void {
     if (this.prefix) setActivePrefixLayout(null);
-    for (const c of this.prefixCaches) c.dispose();
     for (const c of this.caches) c.dispose();
   }
 
   runRange(h: MlxArray, lo: number, hi: number, donorKvIn: Map<number, SharedKv>) {
-    return this.model.runLayerRange(h, lo, hi, this.caches, this.masks, this.perLayer, donorKvIn);
+    return this.model.runLayerRange(h, lo, hi, this.caches, this.perLayer, donorKvIn);
   }
 
   dispose(): void {
     this.releaseCaches();
     this.perLayer?.dispose();
-    for (const m of this.masks.values()) m.arr?.dispose();
   }
 }
 
@@ -168,9 +174,9 @@ export function gemma4Trainable(model: Gemma4Training): TrainableGraph {
     },
     prefixShared: {
       prefixSharedHidden(ids: MlxArray, layout: PrefixLayout): MlxArray {
-        // One prefix cache per DONOR layer (sharers consume donors' fetched K/V
-        // inside the training forward); the caches build the block-sparse masks.
-        const caches: Cache[] = Array.from({ length: model.numDonors }, () => new PrefixSharedCache(layout));
+        // One prefix cache per DONOR layer (sharers read donors' K/V through
+        // the donors' caches); the caches read under the block-sparse masks.
+        const caches = trainingCaches(model, layout);
         setActivePrefixLayout(layout);
         try {
           return model.forwardTrainingHidden(ids, caches); // [1, T, hidden], post-finalNorm
