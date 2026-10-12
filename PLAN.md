@@ -635,7 +635,7 @@ Exit: selection is data; `qwen38TrellisM4ProAccepts` and the nested ternary are 
       width. M1 Max paired check, workflow steps, preflight clear: against main, Trellis TQ
       decode 14.1 → 14.0 (0.995 [0.989, 1.002]), prefill 1k 120.5 → 121.8, cold TTFT 6284 →
       6217 ms; e4b decode 63.1 → 63.0, prefill 954 → 961, TTFT 702 → 697 ms; against the
-      previous head within noise everywhere. Found: Trellis decode RSS on the M1 Max is
+      previous head within noise everywhere. The workflow's own run on #339 at 832ac8b1 (2026-10-12, preflight clear): no regression outside the band, Trellis TQ decode 0.997 [0.991, 1.003], e4b decode 0.999 [0.998, 1.000], every metric within noise. Found: Trellis decode RSS on the M1 Max is
       7614 MB on main and 12050 MB merged (11843 MB already at 918a6afb, so it predates E2
       and B3): owed, a bisection across the landed steps and the reason, before the merge to
       main; memory is one of the three axes. Not run: both M4 Pro benchmarks (its preflight
