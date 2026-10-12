@@ -1,8 +1,9 @@
 # Performance check (PLAN, Phase F): the paired serve benchmark (scripts/bench-serve.ts) of a pull
-# request's head against its base on the M1 Max runner, on the batched lane: the Trellis 27B artifact and
-# e4b in the default configuration, two alternating server sessions per tree (bench-serve's dflash2
-# configuration needs graph verify costs this machine lacks; see the plan step). Gated by the machine
-# preflight and decided from the saved run record by
+# request's head against its base on the M1 Max runner, on the batched lane: the Trellis 27B artifact in
+# the default configuration and with the DFlash 2 drafter over 4-bit KV, e4b in the default, two
+# alternating server sessions per tree. main's M1 Max graph declares no verify costs and refuses adaptive
+# depth, so the DFlash 2 pair is main at depth 7 against the head adaptive (dflash2-d7-baseline), shown as
+# context and never gated. Gated by the machine preflight and decided from the saved run record by
 # scripts/bench/perf-check.ts. A numerical check follows on the same artifacts (app-path digests and the
 # teacher-forced decode KL, packages/inference/scripts/), reported and not gated.
 # The repository is public, so the job runs only for branches of this repository or a manual
@@ -111,20 +112,26 @@ jobs:
           graph() { MLX_BUN_LIBMLXC="$NATIVE" bun head/scripts/bench/perf-check.ts graph --model "$1" | tail -n 1; }
           QWEN="$(snapshot mlx-bun/Qwen3.8-27B-Trellis-3.2bpw)"
           E4B="$(snapshot mlx-community/gemma-4-e4b-it-OptiQ-4bit)"
+          DFLASH2="$(snapshot incoai/Qwen3.8-27B-DFlash2)"
+          # The Trellis target's DFlash 2 rotation basis: main reads it from MLX_BUN_DFLASH2_TARGET_BASIS, the refactor
+          # declares it from the artifact's sidecar; bench-serve hands it to both servers.
+          BASIS="$HOME/mlx-bun-perf/models/Qwen3.8-27B-Trellis-3.2bpw-dflash2-basis.json"
+          [ -f "$BASIS" ] || { echo "::error::no DFlash 2 basis at $BASIS"; exit 1; }
           QWEN_GRAPH="$(graph "$QWEN")"
           E4B_GRAPH="$(graph "$E4B")"
           echo "candidate graphs on this machine: qwen27b $QWEN_GRAPH, e4b $E4B_GRAPH"
           { echo "QWEN=$QWEN"; echo "E4B=$E4B"; echo "NATIVE=$NATIVE"; } >> "$GITHUB_ENV"
-          # Not the dflash2 configuration: on this machine neither tree's Trellis graph declares verify costs
-          # (verifyRoundCosts; only the M4 Pro graph does), and both servers refuse --num-draft-tokens adaptive
-          # without them (run 38244416727). Its inputs here: --dflash2-draft "qwen27b=<incoai/Qwen3.8-27B-DFlash2
-          # snapshot>=$HOME/mlx-bun-perf/models/Qwen3.8-27B-Trellis-3.2bpw-dflash2-basis.json".
-          bun head/scripts/bench-serve.ts plan --out "$W/plan.json" --profile scoped --configurations default --sessions 2 \
+          # DFlash 2 as dflash2-d7-baseline, not dflash2: main's M1 Max graph (the hand-written TQ graph) declares no
+          # verifyRoundCosts and refuses --num-draft-tokens adaptive (run 38244416727), so main drafts 7 every round
+          # and the head adapts over the costs its generated graph declares. Context, never gated. Once the base
+          # branch's M1 Max graph declares verify costs, this becomes dflash2: both trees adaptive, gated.
+          bun head/scripts/bench-serve.ts plan --out "$W/plan.json" --profile scoped --configurations default,dflash2-d7-baseline --sessions 2 \
             --baseline-root "$PWD/base" --baseline-command "[\"$BUN\",\"$PWD/base/apps/mlx-bun/bin/mlx-bun.mjs\",\"serve\"]" \
             --candidate-root "$PWD/head" --candidate-command "[\"$BUN\",\"$PWD/head/apps/mlx-bun/bin/mlx-bun.mjs\",\"serve\"]" \
             --native "$NATIVE" \
             --model "qwen27b=$QWEN=mlx-bun/Qwen3.8-27B-Trellis-3.2bpw, candidate graph $QWEN_GRAPH" \
-            --model "e4b=$E4B=mlx-community/gemma-4-e4b-it-OptiQ-4bit, candidate graph $E4B_GRAPH"
+            --model "e4b=$E4B=mlx-community/gemma-4-e4b-it-OptiQ-4bit, candidate graph $E4B_GRAPH" \
+            --dflash2-draft "qwen27b=$DFLASH2=$BASIS"
 
       - name: Preflight
         id: preflight
