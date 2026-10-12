@@ -587,6 +587,39 @@ Exit: selection is data; `qwen38TrellisM4ProAccepts` and the nested ternary are 
       - A verify window that crosses a lego's start converts even if its tail is rejected; the
         lego converts on commit while a speculative round is armed (the cache's own state).
 - [ ] Delete `forwardHiddenMixed` and `forwardHidden` from the contract.
+- [x] Landed (`refactor/composition-e2`, 24dce86d, twelve commits on d71467c4; merging onto the
+      integration head with B3). The five scheduler files dispatch through the phase table
+      indexed by the rows they batched; verify width is rows × (depth+1); `AdaptiveDraftGate`
+      chooses among the built verify widths. The ANE is the scheduler's: a chunk runs on
+      `prefillChunk.ane` only when the composition built it, the forward holds one sequence
+      and the chunk is exactly the composition's chunk size; `aneAvailable()` and
+      `mbane_available` are deleted (the dylib no longer exports the symbol) and a bridge that
+      does not load or a program that does not compile fails the load with `AneBridgeError`.
+      One capture path (`withCapture`, bit-identical to `hiddenTap`); mixed iteration is the
+      composition-declared `mixed`; compiled decode is chosen at bind with no run-time
+      fallback; the media prefill phase takes embeddings and positions; known tokens go
+      through `appendKnown` over the committed read; planner steps map to chunk, tail and
+      decode and a planned chunk is never split; GLM verify is pinned at load; the DFlash 2
+      and MTP draft operations are width tables. Deleted: `forwardHidden`,
+      `forwardHiddenMixed`, `deprecatedPhase`, `hiddenTap`, `createAppend`, `MlxTokenAppend`,
+      `bindMlxGraph`, the `accepts` probe; `MLX_BUN_BATCH_VEC_SAMPLE` is the composition fact
+      `vectorGreedySampling`. Ratchet: `phase-by-shape` empty, the `hot-path-read` entries for
+      batch-group and two-model gone, nothing added. Exit criterion met: on the M4 Pro
+      composition no TrellisLinear or generic block in `decode.one`, `decode.twoToThree` or
+      `decode.four` (factored row kernels at 1–3, the matrix-unit down at 4), where the head
+      ran the generic blocks at four rows; the identity tests at maxDiff 0 with and without
+      the ANE and on the real artifact; every real-weight suite at the head's counts and lines.
+      Digests: 44 of 50 cells identical to the head; the rest are the two accepted classes of
+      change, whole chunks of one sequence on the ANE under the 128-token override (fp16, the
+      C3 KL gate; with the bridge off every one-row digest equals the head) and the row
+      kernels at 2–8 rows where the head fell to generic (the bit-stability decision). Found:
+      the remaining bind-time env reads, `MLX_BUN_COMPILED_DECODE`, `MLX_BUN_MIXED_PREFILL`,
+      `MLX_BUN_MIXED_TOKEN_BUDGET`, `MLX_BUN_PREFILL_TAIL_SPLIT` and `MLX_BUN_GRAMMAR_JUMP`,
+      are allowed by the rules but belong in the composition record the way E3 placed
+      `speculativeAffineKv` (owner: the B3 planner-side item). Owed: a teacher-forced KL of a
+      request at four rows against the same request at one row on the M4 Pro composition, the
+      number the bit-stability decision promised to record; the paired benchmark, which E2
+      could not run on a busy machine, runs on the merge.
 
 Exit: one request and four concurrent requests on the M4 Pro composition both dispatch the
 Trellis row kernels for their width, shown by the op inventory diagnostic, with no generic path
