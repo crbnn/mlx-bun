@@ -26,6 +26,8 @@ export abstract class FullTransitioningKvRows<Layout extends FullLayout>
     super({ ...transition,
       converted: row => transition.converted(fullRowInner(row)),
       extractRow: row => row instanceof FullPrefillRow ? row.extract() : cloneKvCaches([row])[0]!,
+      // An unpadded row is storage the lone row's lego adopts as it is.
+      adopt: row => row instanceof FullPrefillRow ? null : row,
       packRows(layout, rows) {
         layout.mergeRows(rows.map(fullRowInner));
         if (rows.some(row => row instanceof FullPrefillRow)) {

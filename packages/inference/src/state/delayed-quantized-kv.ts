@@ -9,7 +9,7 @@ import { FullTransitioningKvRows } from "./full-transitioning-kv-rows";
 import { BatchedQuantizedKVCache } from "./batched-quantized-kv";
 import { KVCache, type AffineKernelSet } from "./kv";
 import { QuantizedKVCache } from "./quantized-kv";
-import { convertToAffine, transitionDue } from "./bf16-first-kv";
+import { Bf16FirstQuantizedKVCache, convertToAffine, transitionDue } from "./bf16-first-kv";
 import { type AttentionRead, type Cache, type CommittedAttentionCache, type Mask, type KvAttentionView } from "../contracts/mlx/cache";
 import { kvStorage, type KvAttentionState } from "./kv-storage";
 
@@ -53,6 +53,7 @@ export class DelayedQuantizedKVCache extends FullTransitioningKvRows<BatchedQuan
       keepsDenseReads: row => { const source = affineSource(row); return !source || !transitionDue(source.offset, start); },
       converted: row => row instanceof QuantizedKVCache,
       makeLayout: () => new BatchedQuantizedKVCache(groupSize, bits, kernelSet(bits, groupSize, Dtype.bfloat16)),
+      lone: storage => new Bf16FirstQuantizedKVCache(groupSize, bits, start, kernelSet, undefined, storage),
       ...(compose ? { compose } : {}) }, row);
   }
   get attentionState(): KvAttentionState { return this; }

@@ -32,6 +32,10 @@ export interface TurboQuantFetches {
  * cache names its set: `denseTurboQuantKernels` for Qwen 3.5's,
  * `deferredTurboQuantKernels` for Gemma 4's and MiniCPM5's. */
 export interface TurboQuantKernels {
+  /** The fetch `read` calls: the window decoded to the values' own domain, or
+   * with values left rotated. A compiled decode step decodes the stored prefix
+   * in this domain outside its recorded graph (`TurboQuantKVCache`). */
+  readonly fetch: "decoded" | "rotated";
   /** Appends through `fetches` and returns the read under `mask`. Takes
    * ownership of `mask` (released if the fetch throws) and of what the fetch
    * returns. */
@@ -59,6 +63,7 @@ function rotatedValueRead(keys: MlxArray, values: MlxArray, mask: MaskLease,
  * TurboQuant storage this way (`updateAndFetch`, then `ops.sdpa`) before it read
  * through the cache, and these are its served numbers. */
 export const denseTurboQuantKernels: TurboQuantKernels = Object.freeze({
+  fetch: "decoded" as const,
   read: (fetches: TurboQuantFetches, mask: MaskLease) => withLease(mask, held => {
     const [keys, values] = fetches.decoded();
     return sdpaRead(keys, values, held);
@@ -71,6 +76,7 @@ export const denseTurboQuantKernels: TurboQuantKernels = Object.freeze({
  * `updateAndFetchDeferredV` today, so it keeps their served numbers when they
  * read through the cache. */
 export const deferredTurboQuantKernels: TurboQuantKernels = Object.freeze({
+  fetch: "rotated" as const,
   read: (fetches: TurboQuantFetches, mask: MaskLease) => withLease(mask, held => {
     const { keys, values, restore } = fetches.rotated();
     return rotatedValueRead(keys, values, held, restore);
@@ -82,6 +88,7 @@ export const deferredTurboQuantKernels: TurboQuantKernels = Object.freeze({
  * storage through the deprecated fetches, which take no set. A TurboQuant cache
  * converted from such storage serves those fetches; its named reads throw. */
 export const uncomposedTurboQuantKernels: TurboQuantKernels = Object.freeze({
+  fetch: "decoded" as const,
   read(_fetches: TurboQuantFetches, mask: MaskLease): AttentionRead {
     mask.release();
     throw new Error("this TurboQuant cache was converted from storage whose graph composed no TurboQuant read: " +

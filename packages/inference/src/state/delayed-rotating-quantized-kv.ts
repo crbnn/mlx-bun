@@ -8,8 +8,9 @@ import { SpeculativeTransitioningKvRows } from "./transitioning-kv-rows";
 import { AlignedRotatingCache, alignRotatingRows, RotatingAffineLayout, SpeculativeRotatingAffineLayout, RotatingKvPositions } from "./rotating-kv-layout";
 import { BatchedRotatingQuantCache } from "./batched-rotating-quant";
 import { captureKvAttention, combineKvDonorAttention } from "./kv-attention-view";
-import { convertToAffine, transitionDue } from "./bf16-first-kv";
+import { Bf16FirstRotatingQuantizedKVCache, convertToAffine, transitionDue } from "./bf16-first-kv";
 import type { AffineKernelSet } from "./kv";
+import type { DecodeStepPlan } from "../contracts/mlx/cache";
 
 /** The affine transition of `Bf16FirstRotatingQuantizedKVCache` over aligned
  * ring rows: a plain ring converts its physical columns with its own
@@ -52,9 +53,15 @@ export class DelayedRotatingQuantizedKVCache extends SpeculativeTransitioningKvR
       makeLayout: () => { const kernels = kernelSet(bits, groupSize, Dtype.bfloat16);
         return speculative ? new SpeculativeRotatingAffineLayout(maxSize, groupSize, bits, kernels) : new RotatingAffineLayout(maxSize, groupSize, bits, kernels); },
       prepareRows: alignRotatingRows,
+      lone: storage => new Bf16FirstRotatingQuantizedKVCache(maxSize, groupSize, bits, start, kernelSet, undefined, storage),
       packRows: (layout, rows) => layout.adoptAlignedRows(rows as readonly AlignedRotatingCache[]),
       extractRow: row => (row as AlignedRotatingCache).extract(speculative ? maxSize : undefined),
       rollbackRow: (row, before, keep, preserve) => (row as AlignedRotatingCache).rollback(before, keep, preserve) }, row, new RotatingKvPositions(maxSize));
+  }
+  /** A ring's lone row fetches by its ring: concat until the next write lands at
+   * the window, the ring after (`RotatingKVCache.decodePhase`). */
+  protected override decodePhaseOfRows(): DecodeStepPlan["fetch"] {
+    return this.rowOffsets[0]! + 1 < this.maxSize ? "concat" : "ring";
   }
   get attentionState(): KvAttentionState { return this; }
   captureDonorAttention(): import("../contracts/mlx/cache").KvDonorAttention {

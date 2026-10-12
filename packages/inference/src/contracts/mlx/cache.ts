@@ -472,6 +472,10 @@ export interface DecodeStepInputs {
   activeView(array: MlxArray, length: number): MlxArray;
   /** The int32 `[1]` write position (shared between caches at the same position). */
   writePosition(position: number): MlxArray;
+  /** Registers `array`, which the cache computed for this step's inputs (a
+   *  prefix it decodes outside the recorded graph), for release after the step;
+   *  returns it. Takes ownership. */
+  own(array: MlxArray): MlxArray;
 }
 
 /** The stand-in a cache places in the traced graph for one step: attention

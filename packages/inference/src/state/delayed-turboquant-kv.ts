@@ -12,7 +12,7 @@ import { BatchedTurboQuantKVCache } from "./batched-turboquant-kv";
 import { FullTransitioningKvRows } from "./full-transitioning-kv-rows";
 import { FullPrefillRow } from "./full-prefill-row";
 import { KVCache } from "./kv";
-import { completeConversion, convertToTurboQuant, transitionDue } from "./bf16-first-kv";
+import { Bf16FirstTurboQuantKVCache, completeConversion, convertToTurboQuant, transitionDue } from "./bf16-first-kv";
 import type { TurboQuantKernels } from "./turboquant-attention";
 
 /** The TurboQuant transition of `Bf16FirstTurboQuantKVCache` over
@@ -62,6 +62,7 @@ export class DelayedTurboQuantKVCache extends FullTransitioningKvRows<BatchedTur
       keepsDenseReads: () => true,
       converted: row => row instanceof TurboQuantKVCache,
       makeLayout: () => new BatchedTurboQuantKVCache(kBits, vBits, turboQuantKernels, fusedDecode),
+      lone: storage => new Bf16FirstTurboQuantKVCache(kBits, vBits, start, fusedDecode, turboQuantKernels, undefined, storage),
       ...(compose ? { compose } : {}) }, row);
   }
   /** Rows made for an empty layout carry the graph's read into their conversion. */

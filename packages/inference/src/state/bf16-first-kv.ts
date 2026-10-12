@@ -235,8 +235,11 @@ export class Bf16FirstQuantizedKVCache implements CommittedAttentionCache, Bidir
   decodeInputs(plan: DecodeStepPlan, step: DecodeStepInputs): MlxArray[] { return this.#storage.decodeInputs(plan, step); }
   commitDecodeStep(slot: DecodeSlot, outputs: MlxArray[]): MlxArray[] {
     const evalWith = this.#storage.commitDecodeStep(slot, outputs);
-    if (this.#plain) this.#convertIfDue();
-    return evalWith;
+    if (!this.#plain || !transitionDue(this.#plain.offset, this.start)) return evalWith;
+    // The conversion consumes the arrays the step wrote and evaluates the
+    // converted storage before it returns: nothing is left to evaluate here.
+    this.#convertIfDue();
+    return [];
   }
 
   /** After a bf16 append: convert once the stored length reaches the start.
@@ -381,8 +384,11 @@ export class Bf16FirstRotatingQuantizedKVCache implements CommittedAttentionCach
   decodeInputs(plan: DecodeStepPlan, step: DecodeStepInputs): MlxArray[] { return this.#storage.decodeInputs(plan, step); }
   commitDecodeStep(slot: DecodeSlot, outputs: MlxArray[]): MlxArray[] {
     const evalWith = this.#storage.commitDecodeStep(slot, outputs);
-    if (this.#plain) this.#convertIfDue();
-    return evalWith;
+    if (!this.#plain || !transitionDue(this.#plain.offset, this.start)) return evalWith;
+    // The conversion consumes the arrays the step wrote and evaluates the
+    // converted storage before it returns: nothing is left to evaluate here.
+    this.#convertIfDue();
+    return [];
   }
 
   #settle(read: AttentionRead): AttentionRead {
@@ -445,7 +451,7 @@ export class Bf16FirstRotatingQuantizedKVCache implements CommittedAttentionCach
  * resolved by whoever builds the cache; nothing here reads the runtime
  * configuration.
  */
-export class Bf16FirstTurboQuantKVCache implements CommittedAttentionCache, BidirectionalAttentionCache, EncoderAttentionCache, BlockAttentionCache {
+export class Bf16FirstTurboQuantKVCache implements CommittedAttentionCache, BidirectionalAttentionCache, EncoderAttentionCache, BlockAttentionCache, CompiledDecodeCache {
   #plain: KVCache | null;
   #encoded: TurboQuantKVCache | null = null;
 
@@ -523,6 +529,21 @@ export class Bf16FirstTurboQuantKVCache implements CommittedAttentionCache, Bidi
 
   maxAppendTokens(): number {
     return this.#plain && this.#plain.offset < this.start ? this.start - this.#plain.offset : Infinity;
+  }
+
+  // The compiled decode step drives the storage held now; a committed step
+  // owes the transition an append owes.
+  prepareDecodeStep(): DecodeStepPlan { return this.#storage.prepareDecodeStep(); }
+  decodePhase(): DecodeStepPlan["fetch"] { return this.#storage.decodePhase(); }
+  decodeSlot(plan: DecodeStepPlan): DecodeSlot { return this.#storage.decodeSlot(plan); }
+  decodeInputs(plan: DecodeStepPlan, step: DecodeStepInputs): MlxArray[] { return this.#storage.decodeInputs(plan, step); }
+  commitDecodeStep(slot: DecodeSlot, outputs: MlxArray[]): MlxArray[] {
+    const evalWith = this.#storage.commitDecodeStep(slot, outputs);
+    if (!this.#plain || !transitionDue(this.#plain.offset, this.start)) return evalWith;
+    // The conversion consumes the arrays the step wrote and evaluates the
+    // converted storage before it returns: nothing is left to evaluate here.
+    this.#convertIfDue();
+    return [];
   }
 
   #settle(read: AttentionRead): AttentionRead {

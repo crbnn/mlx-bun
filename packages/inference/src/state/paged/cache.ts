@@ -13,6 +13,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { bidirMask, createCausalMask } from "../../kernels/attention/masks";
 import {
   type AttentionRead, type BidirectionalAttentionCache, type BlockAttentionCache, type CommittedAttentionCache,
+  type CompiledDecodeCache, type DecodeSlot, type DecodeStepInputs, type DecodeStepPlan, type DecodeTrace,
   type EncoderAttentionCache, type KvAttentionView, type KvDonorRows, type Mask,
 } from "../../contracts/mlx/cache";
 import { AttentionMasks, encoderWindowMask, sdpaRead, unmaskedLease, withLease } from "../attention-read";
@@ -214,16 +215,27 @@ export class BlockPool {
  *  read (as `KVCache` qualifies it); the bidirectional and encoder windows
  *  append, gather and attend under `KVCache`'s masks; a block read attends the
  *  gathered positions and the block's own keys with no mask; the donor rows are
- *  the gathered positions. Affine pages gather dequantized. */
-export class PagedKVCache implements CommittedAttentionCache, BidirectionalAttentionCache, EncoderAttentionCache, BlockAttentionCache {
+ *  the gathered positions. Affine pages gather dequantized.
+ *
+ *  Compiled decode: a concat slot. The stored positions are gathered (and
+ *  dequantized) outside the recorded graph, as the decode read gathers them; in
+ *  it the new position is stored as the pages store it (quantized and
+ *  dequantized again on affine pages) and joined to them, and the fused SDPA
+ *  reads the joined window with no mask, the gathered decode read. The direct
+ *  read (`MLX_BUN_PAGED_ATTN`, Lab) is a custom kernel whose partitions follow
+ *  the context length, which a shapeless recorded graph cannot hold: a direct
+ *  cache decodes through the gathered read (its numerical control) inside a
+ *  compiled step. The row leaves the graph as it was appended; the write after
+ *  the step appends it to the pages. */
+export class PagedKVCache implements CommittedAttentionCache, BidirectionalAttentionCache, EncoderAttentionCache, BlockAttentionCache, CompiledDecodeCache {
   /** Distinct storage kind; the row adapter preserves its block pools. */
   signature(): string { return "kv:paged"; }
   /** Matches KVCache.STEP: v1's growth granularity is a permutation of
    *  today's 256-token step into fixed reusable slots, not a new tuning
    *  axis (--paged-kv-block-size overrides for experiments). */
   static readonly DEFAULT_BLOCK_SIZE = 256;
-  /** Compiled-decode trace adapters never wrap paged caches (see Cache);
-   *  always unset here. */
+  /** Set only by compiled-decode trace adapters (see Cache); a real cache
+   *  leaves it unset. */
   readonly ropeOffsetArr?: MlxArray;
   offset = 0;
   /** Logical block order → physical pool slot. */
@@ -382,6 +394,31 @@ export class PagedKVCache implements CommittedAttentionCache, BidirectionalAtten
 
   }
 
+  /** Compiled decode: nothing to prepare on the host; the pages grow when the
+   *  step's row is appended. */
+  prepareDecodeStep(): DecodeStepPlan {
+    if (!this.pool) throw new Error("compiled decode on an empty cache");
+    return { fetch: "concat", writePos: this.offset, activeLen: this.offset };
+  }
+
+  decodePhase(): DecodeStepPlan["fetch"] { return "concat"; }
+
+  decodeSlot(_plan: DecodeStepPlan): DecodeSlot { return pagedDecodeSlot(this.offset, this.quantization); }
+
+  /** The stored positions gathered (dequantized on affine pages), owned by the step. */
+  decodeInputs(_plan: DecodeStepPlan, step: DecodeStepInputs): MlxArray[] {
+    const [keys, values] = this.#gathered();
+    return [step.own(keys), step.own(values)];
+  }
+
+  /** The write half: append the step's row (taking ownership) as an ordinary
+   *  append does; returns the pages to evaluate with the step. */
+  commitDecodeStep(_slot: DecodeSlot, outputs: MlxArray[]): MlxArray[] {
+    const [k, v] = outputs as [MlxArray, MlxArray];
+    try { this.append(k, v); } finally { k.dispose(); v.dispose(); }
+    return this.pool!.arrays();
+  }
+
   /** Same mask policy as KVCache.makeMask (it reads only offset). */
   makeMask(N: number, windowSize: number | null): Mask {
     if (N === 1) return { mode: "", arr: null };
@@ -429,4 +466,53 @@ function pagedRead(view: KvAttentionView, mask: Mask): AttentionRead {
  *  blocks. Exported for the wiring in generate.ts (maybePageKv). */
 export function poolBlocksFor(capacityTokens: number, blockSize: number): number {
   return Math.max(1, Math.ceil(capacityTokens / blockSize));
+}
+
+/** A paged cache inside a compiled decode trace: the new position joins the
+ *  gathered prefix as the pages store it (affine pages: quantized, then
+ *  dequantized as the gather dequantizes them), read with no mask by the fused
+ *  SDPA; the row as appended is the closure output. */
+class TracedPagedKVCache implements DecodeTrace {
+  outs: MlxArray[] = [];
+  constructor(
+    readonly offset: number,
+    readonly quantization: PagedQuantization | undefined,
+    readonly prefixKeys: MlxArray,
+    readonly prefixValues: MlxArray,
+    readonly ropeOffsetArr: MlxArray,
+  ) {}
+
+  appendDecode(k: MlxArray, v: MlxArray): AttentionRead {
+    // same-shape reshape: owned aliases that survive the caller's dispose of k and v
+    this.outs = [ops.reshape(k, k.shape), ops.reshape(v, v.shape)];
+    const stored = (row: MlxArray): MlxArray => {
+      if (!this.quantization) return ops.reshape(row, row.shape);
+      const { bits, groupSize } = this.quantization;
+      const q = ops.quantize(row, groupSize, bits);
+      try { return ops.dequantize(q.packed, q.scales, q.biases, { bits, groupSize, mode: "affine" }); }
+      finally { q.packed.dispose(); q.scales.dispose(); q.biases.dispose(); }
+    };
+    const join = (prefix: MlxArray, row: MlxArray): MlxArray => {
+      using held = stored(row);
+      return ops.concatAxis([prefix, held], 2);
+    };
+    const keys = join(this.prefixKeys, k);
+    let values: MlxArray;
+    try { values = join(this.prefixValues, v); } catch (error) { keys.dispose(); throw error; }
+    return sdpaRead(keys, values, unmaskedLease);
+  }
+
+  signature(): string { return "kv:paged-trace"; }
+  state(): MlxArray[] { return []; }
+  isTrimmable(): boolean { return false; }
+  trim(): void { throw new Error("a compiled decode trace is not trimmed"); }
+  dispose(): void {}
+}
+
+/** The concat slot of a paged cache at `offset` whose pages store `quantization` (bf16 when absent). */
+export function pagedDecodeSlot(offset: number, quantization: PagedQuantization | undefined): DecodeSlot {
+  return {
+    key: quantization ? `paged-cat:${quantization.bits}:${quantization.groupSize}` : "paged-cat:bf16", fetch: "concat", inputs: 2, outputs: 2,
+    trace: (inputs, ropeOffset) => new TracedPagedKVCache(offset, quantization, inputs[0]!, inputs[1]!, ropeOffset),
+  };
 }
