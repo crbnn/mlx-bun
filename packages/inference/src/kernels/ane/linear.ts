@@ -37,7 +37,10 @@ const errorBuffer = new Uint8Array(512);
 const errorText = () => new TextDecoder().decode(errorBuffer.subarray(0, errorBuffer.indexOf(0)));
 const cstring = (text: string) => new TextEncoder().encode(text + "\0");
 
-/** One compiled ANE program. Inputs follow MIL symbol order (input names sorted). */
+/** One compiled ANE program. Inputs follow MIL symbol order (input names sorted).
+ *  A loaded program holds one of the ANE driver's direct-path clients, about a
+ *  thousand on the whole machine, until its last holder is disposed; creating
+ *  one while none is free blocks (native/ane-bridge.m). */
 export class AneProgram implements Disposable {
   readonly #lib: Lib;
   #handle: Pointer | null;
@@ -47,7 +50,11 @@ export class AneProgram implements Disposable {
     this.#handle = handle;
   }
 
-  /** `weights`: BLOBFILE payloads by file name (already in blob format). */
+  /** `weights`: BLOBFILE payloads by file name (already in blob format).
+   *  `share`: a program that never runs at the same time as this one. With the
+   *  same MIL and weights the result holds that same loaded program; otherwise
+   *  a new program loads on its buffers (each at least as large). Either way
+   *  the shared resources live until every holder is disposed. */
   static create(mil: string, inputBytes: readonly number[], outputBytes: number,
     options: { weights?: Record<string, Uint8Array>; share?: AneProgram } = {}): AneProgram {
     const l = native();

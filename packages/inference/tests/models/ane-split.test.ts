@@ -82,6 +82,29 @@ test.skipIf(!process.env.MLX_BUN_TEST_ANE)("two split layers of different shapes
   a.expected.dispose(); b.expected.dispose();
 }, 120_000);
 
+test.skipIf(!process.env.MLX_BUN_TEST_ANE)("splits of one MLP at two chunk sizes coexist in one process: interleaved runs, then either disposed first", () => {
+  using x = hidden(M), wide = hidden(2 * M);
+  const { gate, up, down, expected } = mlp(D, R, false, 11, x);
+  using g = gate.forward(wide, true), u = up.forward(wide, true);
+  using mid = compiledSwiglu(g, u);
+  using expectedWide = down.forward(mid, true);
+  for (const disposeFirst of ["narrow", "wide"] as const) {
+    const narrow = AneTrellisMlpSplit.build(gate, up, down, 0.5, M), broad = AneTrellisMlpSplit.build(gate, up, down, 0.5, 2 * M);
+    for (let round = 0; round < 2; round++) {
+      using a = narrow.forward(x, compiledSwiglu);
+      using b = broad.forward(wide, compiledSwiglu);
+      expect(relErr(a, expected)).toBeLessThan(2e-2);
+      expect(relErr(b, expectedWide)).toBeLessThan(2e-2);
+    }
+    const [first, second, input, reference] = disposeFirst === "narrow" ? [narrow, broad, wide, expectedWide] : [broad, narrow, x, expected];
+    first.dispose();
+    using again = second.forward(input, compiledSwiglu);
+    expect(relErr(again, reference)).toBeLessThan(2e-2);
+    second.dispose();
+  }
+  expected.dispose();
+}, 120_000);
+
 test.skipIf(!process.env.MLX_BUN_TEST_ANE)("a split built on another's buffers keeps them after that split is disposed", () => {
   using x = hidden();
   const a = mlp(D, R, false, 11, x), b = mlp(D, R, true, 53, x);
