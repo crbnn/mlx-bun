@@ -40,7 +40,7 @@ response body ends or is cancelled. Pi's own model id, `local`, is the host's to
 `src/extensions.ts` reads the registry when each session is built: `chat.tool` contributions (a name, schema, `run`, and
 the attestation `readOnly: true`; a tool that does not attest is never offered; an optional `available()` decides per
 session) become Pi tools that run without an approval prompt, and `chat.guidance` contributions add a prompt hint and a
-skill directory. Memory is the first contributor (`apps/mlx-bun/src/memory/chat.ts`), offered only while the vault exists.
+skill directory. Memory is the first contributor (`@mlx-bun/module-memory/chat`), offered only while the vault exists.
 
 ## Browser panel
 

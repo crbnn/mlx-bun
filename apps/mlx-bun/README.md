@@ -969,9 +969,9 @@ main's subcommands: `init`/`setup` (the wizard below), `status` (default),
 `open`, `list`, `search`, `toc`, `section`, `links`, `read`, `synthesize`
 (`--dry-run`; `--since`/`--model` parsed but not consumed, as in main), the
 stage workers `segment`, `extract`, `route`, `synthesize-stage` (`--limit`,
-`--convs`), `link`, and `schedule`/`unschedule`. Model-driven subcommands talk
-to the server named by `--host`/`--port` (the serve defaults) and fail with a
-pointer to `mlx-bun serve` when none answers. The entity gold main read from
+`--convs`), `link`, and `schedule`/`unschedule`. Model-driven subcommands load
+the memory task model in-process on first use (`cli/memory-engine.ts`), as main
+did, or talk to the serving mlx-bun named by `--host`/`--port`. The entity gold main read from
 `goldens/dreaming-entities-gold.json` is a published dataset: without that
 file the resolver runs unseeded (store aliases still fold).
 
@@ -1002,9 +1002,9 @@ not thrown. `memory unschedule` runs `launchctl unload -w` and deletes the
 plist. The job runs `/bin/zsh -lc "exec <program> memory synthesize"`, where
 the program is the executable identity captured at startup
 (`jobs/executable.ts`) plus the CLI entry when running from source; it is
-never a PATH lookup and never `process.execPath` read later. Because synthesis
-runs through a serving mlx-bun, the job needs `mlx-bun serve` running at that
-time; every status surface says so.
+never a PATH lookup and never `process.execPath` read later. The job's
+`memory synthesize` loads the memory task model itself, so it needs no running
+server; every status surface says so.
 
 `scheduleStatus` reports `installed` (plist present), `loaded` (`launchctl
 list com.mlx-bun.memory` succeeds), `at` (read back from the plist; `null`
