@@ -544,7 +544,7 @@ const ANE_FRACTION = ${ane.fraction};
 type Step = (x: MlxArray, cache: Cache, phase: ReadPhase, mrope: MropeForwardState | null, width: MlxWidthClass) => MlxArray;
 type Mixer = (normed: MlxArray, cache: Cache, phase: ReadPhase) => MlxArray;
 /** A phase operation of this graph: each runs synchronously (\`MlxCapturingForward\` without the promise). */
-type RowsForward = (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) => MlxArray;
+export type RowsForward = (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) => MlxArray;
 
 /** A layer of one width class: \`mixer\` then \`mlp\` (post-attention-normed hidden to the MLP output, owned). */
 function layerStep(layer: Qwen3Layer, mixer: Mixer, mlp: (post: MlxArray) => MlxArray): Step {
