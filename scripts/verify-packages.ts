@@ -207,7 +207,7 @@ try {
     // Reuse behavioral tests, rather than keeping a second consumer implementation.
     const tests = {
       mlx: ["mlx-abi.test.ts", "compile.test.ts", "metal-kernel.test.ts"],
-      inference: ["models/qwen3.test.ts", "models/phase-forward.ts", "kernels/trellis-vector-expand.test.ts", "execution/expert-io-native.test.ts"],
+      inference: ["models/qwen3.test.ts", "models/phase-forward.ts", "models/test-composition.ts", "kernels/trellis-vector-expand.test.ts", "execution/expert-io-native.test.ts"],
     };
     for (const [name, files] of Object.entries(tests)) {
       const installed = join(consumer, "node_modules", "@mlx-bun", name);
@@ -215,6 +215,8 @@ try {
       const destination = join(consumer, "packages", name);
       // Examples come from the tarball, so forgetting to publish them fails here.
       await cp(join(installed, "examples"), join(destination, "examples"), { recursive: true });
+      // Test helpers reach the package through `../../src`, so the installed source sits where they look.
+      await cp(join(installed, "src"), join(destination, "src"), { recursive: true });
       for (const file of files) {
         const target = join(destination, "tests", file);
         await mkdir(dirname(target), { recursive: true });
