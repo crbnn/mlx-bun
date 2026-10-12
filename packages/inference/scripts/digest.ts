@@ -16,7 +16,8 @@
  * (the chunk override is `MLX_BUN_RD_PREFILL_CHUNK`, which the tree's runtime reads
  * once when it loads). R rows run on an engine of capacity R, composed for R rows,
  * admitted together under one execution lease: row 0 is the one-row cell's request,
- * row r drops the last 24·r prompt tokens so the rows sit at different positions.
+ * row r drops 24·r prompt tokens after its first 32, so every row keeps the prompt's end
+ * (the chat template's generation prompt) and the rows sit at different positions.
  * An R-row cell hashes its rows in order (ids joined "\n", logprob lines "\n\n") and
  * lists each row's own pair, so row 0 compares directly with the one-row cell. */
 import { createHash } from "node:crypto";
@@ -27,7 +28,11 @@ import { parseArgs } from "node:util";
 /** This checkout: the default tree. */
 export const REPOSITORY = resolve(import.meta.dir, "../../..");
 export const TOP_LOGPROBS = 8;
-export const ROW_TRIM_TOKENS = 24;
+export const ROW_TRIM_TOKENS = 24, ROW_KEEP_TOKENS = 32;
+/** Row r's prompt: row 0's without the 24·r tokens after its first 32. The end stays (a trimmed
+ * end would cut the generation prompt, and a chat model closes the turn at once). */
+export const rowPrompt = (ids: readonly number[], row: number): number[] =>
+  [...ids.slice(0, ROW_KEEP_TOKENS), ...ids.slice(ROW_KEEP_TOKENS + ROW_TRIM_TOKENS * row)];
 /** The saved digest's default cells: bf16, TurboQuant, then affine 4, 8 and the
  * artifact's kv_config, each with `--fused-sdpa` unset, on and off. */
 export const DEFAULT_CELLS = ["bf16", "kv-quant=turbo",
@@ -127,7 +132,8 @@ export const USAGE = `App-path digest: token ids and top-${TOP_LOGPROBS} logprob
             library (MLX_BUN_LIBMLXC or its staged files).
   --tokens  Greedy tokens per row (default 32).
   --rows    Rows per cell (default 1). R rows share one engine of capacity R, composed for R rows and admitted
-            together; row 0 is the one-row request, row r drops the last ${ROW_TRIM_TOKENS}·r prompt tokens.
+            together; row 0 is the one-row request, row r drops ${ROW_TRIM_TOKENS}·r prompt tokens after its
+            first ${ROW_KEEP_TOKENS} (the end stays). A row that emits no token makes the cell an ERROR.
   --prefill-chunk  Prefill chunk override (MLX_BUN_RD_PREFILL_CHUNK); "default" leaves the environment's.
 
 Every cell (each cell × row count × chunk) runs in its own process and prints one line:
@@ -147,6 +153,7 @@ async function measureCell(o: DigestOptions, cell: PlannedCell): Promise<boolean
   const { createAppEngine } = await app("engine/index.ts");
   const { planRequest, RequestOwnership } = await app("server/request-plan.ts");
   const captures: RowCapture[] = Array.from({ length: cell.rows }, () => ({ tokens: [], logprobs: [] }));
+  const finishes: Array<string | undefined> = [];
   let graph = "?", text = "";
   const record = (row: number, onToken?: (token: number, lp: unknown) => unknown) => (token: number, lp: unknown) => {
     captures[row]!.tokens.push(token);
@@ -172,10 +179,10 @@ async function measureCell(o: DigestOptions, cell: PlannedCell): Promise<boolean
           if (prop === "run") return (ids: number[], options: Loose, onToken: Loose, vision: Loose, shape: Loose, placement: Loose, signal: Loose, trace: Loose) => {
             const primary = () => target.run(ids, opts(options), record(0, onToken), vision, shapeOf(shape), placement, signal, trace);
             if (cell.rows === 1) return primary();
-            if (ids.length - ROW_TRIM_TOKENS * (cell.rows - 1) < ROW_TRIM_TOKENS)
+            if (ids.length - ROW_TRIM_TOKENS * (cell.rows - 1) < ROW_KEEP_TOKENS + ROW_TRIM_TOKENS)
               throw new Error(`the prompt (${ids.length} tokens) is too short for ${cell.rows} rows`);
             const extra = async (row: number) => {
-              const promptIds = ids.slice(0, ids.length - ROW_TRIM_TOKENS * row);
+              const promptIds = rowPrompt(ids, row);
               const plan = planRequest({ promptIds, options: { ...options, stopSequences: [] }, requestedMaxTokens: options.maxTokens,
                 contextLimit: null, stream: false, wantLogprobs: true, topLogprobs: TOP_LOGPROBS, adapterIds: [], hasVision: false,
                 userSeed: false, hasGrammar: false, hasDraft: false, ownership: new RequestOwnership() });
@@ -183,10 +190,11 @@ async function measureCell(o: DigestOptions, cell: PlannedCell): Promise<boolean
               try {
                 const placed = target.place(plan.shape, plan.options);
                 plan.transferOwnership();
-                await target.run(plan.promptIds, plan.options, record(row), undefined, plan.shape, placed, signal);
+                finishes[row] = (await target.run(plan.promptIds, plan.options, record(row), undefined, plan.shape, placed, signal))?.finishReason;
               } finally { plan.dispose(); }
             };
-            return together(engine.gateway, cell.rows, [primary, ...Array.from({ length: cell.rows - 1 }, (_, i) => () => extra(i + 1))]);
+            const first = async () => { const stats = await primary(); finishes[0] = stats?.finishReason; return stats; };
+            return together(engine.gateway, cell.rows, [first, ...Array.from({ length: cell.rows - 1 }, (_, i) => () => extra(i + 1))]);
           };
           const value = target[prop];
           return typeof value === "function" ? value.bind(target) : value;
@@ -209,6 +217,9 @@ async function measureCell(o: DigestOptions, cell: PlannedCell): Promise<boolean
     console.log(`${cell.label}: ERROR ${String((error as Error)?.message ?? error).split("\n")[0]} | graph=${graph}`);
     return false;
   }
+  // A row that emitted nothing digests nothing: name it rather than hash an empty row.
+  const silent = captures.flatMap((row, r) => row.tokens.length ? [] : [`row ${r} emitted no tokens (finish ${finishes[r] ?? "?"})`]);
+  if (silent.length) { console.log(`${cell.label}: ERROR ${silent.join("; ")} | graph=${graph}`); return false; }
   const digest = digestRows(captures);
   const rows = cell.rows > 1 ? ` | rows ${digest.rows.map(row => `${row.tokens}/${row.logprobs}`).join(" ")}` : "";
   console.log(`${cell.label}: tokens ${digest.tokens} logprobs ${digest.logprobs} n=${digest.rows.map(row => row.n).join(",")}${rows}` +

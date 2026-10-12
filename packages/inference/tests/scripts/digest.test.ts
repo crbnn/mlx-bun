@@ -2,7 +2,7 @@
 // measurement itself needs real weights and runs in the gates that consume the tool.
 import { expect, test } from "bun:test";
 import { resolve } from "node:path";
-import { cellFlags, cellLabel, compareDigests, DEFAULT_CELLS, digestRows, parseDigestArgs, parseDigestOutput, REPOSITORY, sha16 } from "../../scripts/digest";
+import { cellFlags, cellLabel, compareDigests, DEFAULT_CELLS, digestRows, parseDigestArgs, parseDigestOutput, REPOSITORY, rowPrompt, sha16 } from "../../scripts/digest";
 
 const SCRIPT = resolve(import.meta.dir, "../../scripts/digest.ts");
 
@@ -24,6 +24,16 @@ test("an R-row digest hashes the rows in order and lists each row's own pair", (
   expect(four.rows.map(row => row.n)).toEqual([3, 2]);
   // Order matters: swapping rows changes the cell's hashes.
   expect(digestRows([rows[1]!, rows[0]!]).tokens).not.toBe(four.tokens);
+});
+
+test("row r keeps the prompt's first 32 tokens and its end, dropping 24·r tokens between", () => {
+  const ids = Array.from({ length: 200 }, (_, i) => i);
+  expect(rowPrompt(ids, 0)).toEqual(ids);
+  const row2 = rowPrompt(ids, 2);
+  expect(row2).toHaveLength(200 - 48);
+  expect(row2.slice(0, 32)).toEqual(ids.slice(0, 32));
+  expect(row2.slice(32, 34)).toEqual([80, 81]);
+  expect(row2.at(-1)).toBe(199); // the generation prompt at the end survives
 });
 
 test("cells are the saved digest's flag lists; this tool's own options are refused inside a cell", () => {
