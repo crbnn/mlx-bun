@@ -262,8 +262,6 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph, MlxTokenPhases {
   /** Base path for LoRA target keys (weights carry the language_model prefix). */
   readonly prefixBase = PREFIX;
   readonly loraState = new LoraState();
-  /** Layers whose attention reads plain keys and values: none; it attends the storage its caches hold. */
-  readonly requiredDenseKvLayers: readonly number[] = Object.freeze([]);
   /** The full-attention layer whose cache supplies logical positions. */
   readonly faIdx: number;
   readonly embed: QuantizedEmbedding;

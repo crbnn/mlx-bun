@@ -458,8 +458,6 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
   // Shared RuntimeModel surface. LoRA mounts onto the (quantized) decoder
   // linears like the AR models; the diffusion engine activates it per request.
   readonly loraState = new LoraState();
-  /** Layers whose attention reads plain keys and values: none; every pass reads through its cache's own reads. */
-  readonly requiredDenseKvLayers: readonly number[] = Object.freeze([]);
   /** Denoising rows interleave through their own grouped method; images enter as
    * the method's pixel prefill input. */
   get graphCapabilities(): GraphCapabilities {

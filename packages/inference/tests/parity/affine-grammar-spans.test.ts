@@ -1,10 +1,10 @@
 // Opt in with MLX_BUN_TEST_AFFINE_SPANS_MODEL=/cached/checkpoint. No downloads.
 // Committed grammar spans over delayed affine KV on real weights: the span
 // method in a batch group, against this tree's direct jump-forward generation
-// at B1, below and across the transition, and beside an interleaved peer. A
-// graph that reads plain KV refuses the crossing row before the forward direct
-// generation fails in; a graph that reads encoded KV continues over converted
-// layers. The gateway binds spans as the grammar jump of a graph whose verifier
+// at B1, below and across the transition, and beside an interleaved peer. Every
+// graph continues over converted layers: one that reads dense KV (Gemma 2's
+// softcapped read) reads them dequantized, one that reads encoded KV through
+// its affine kernels. The gateway binds spans as the grammar jump of a graph whose verifier
 // does not qualify grammar proposals; on any other graph it verifies proposals,
 // over every cache lego, and the span method is bound directly.
 import { expect, test } from "bun:test";
@@ -69,7 +69,8 @@ test.skipIf(!target)("real-weight committed spans over delayed affine KV equal d
       graphs.set(start, graph);
       return graph;
     };
-    const dense = graphFor(affine(64)).model.requiredDenseKvLayers.length > 0;
+    // A graph that reads dense KV (the softcapped read) verifies ordinary rounds only: its grammar jump is the span method.
+    const dense = (graphFor(affine(64)).model as { encodedKvAttention?: boolean }).encodedKvAttention === false;
     const chunk = 64;
     const options = (maxTokens: number, grammar: GrammarController): GenerateOptions =>
       ({ temperature: 0, maxTokens, eosTokenIds: [], prefillChunkSize: chunk, grammar });
@@ -93,9 +94,7 @@ test.skipIf(!target)("real-weight committed spans over delayed affine KV equal d
       // The committed-span method, bound as the gateway binds it for a graph whose verifier does not
       // qualify grammar proposals; on any other graph the gateway verifies proposals over every cache
       // lego, and the span method is checked here bound directly.
-      const probe = model.makeCache(), count = probe.length;
-      for (const cache of probe) cache.dispose();
-      const spanMethod = bindGrammarGroupRequests(model, model.requiredDenseKvLayers, count);
+      const spanMethod = bindGrammarGroupRequests(model);
       const submit = async (prompt: number[], maxTokens: number, spans: number[][], onToken?: () => void) => {
         const grammar = spanGrammar(spans), tokens: number[] = [], request = options(maxTokens, grammar);
         const execution = binding.plan(shape, request, { checkpoints: false });
@@ -110,9 +109,6 @@ test.skipIf(!target)("real-weight committed spans over delayed affine KV equal d
     };
     const A = [2, 651, 6037, 576, 6081, 603, 1000, 1200], B = [2, 651, 6037];
     const spansA = [[3000, 3001], [3002]], spansB = [[3003], [3004, 3005]];
-    // Direct generation fails in the forward that reads a converted layer on a
-    // plain-read graph; the span method refuses before that forward.
-    const refused = dense ? "DenseKvReadError" : "length";
 
     // Below the transition.
     const below = await direct(A, 9, affine(64), spansA);
@@ -130,7 +126,7 @@ test.skipIf(!target)("real-weight committed spans over delayed affine KV equal d
     // Across the transition: A converts three tokens into decode, after its span.
     const start = A.length + 3;
     const across = await direct(A, 10, affine(start), [[3000, 3001]]);
-    expect(across.outcome).toBe(dense ? "Error" : "length");
+    expect(across.outcome).toBe("length");
     expect(across.kinds.at(-1)!.some(kind => kind.includes("Quantized"))).toBe(true);
     const peer = await direct(B, 7, affine(start), spansB);
     expect(peer.outcome).toBe("length");
@@ -138,7 +134,7 @@ test.skipIf(!target)("real-weight committed spans over delayed affine KV equal d
       const env = grouped(affine(start)), seen: Projection[] = [];
       lane = seen;
       try {
-        expect(await env.submit(A, 10, [[3000, 3001]])).toEqual({ tokens: across.tokens, accepted: across.accepted, outcome: refused });
+        expect(await env.submit(A, 10, [[3000, 3001]])).toEqual({ tokens: across.tokens, accepted: across.accepted, outcome: "length" });
         expect(seen).toEqual(across.seen);
         lane = null;
         // Beside an interleaved peer, each row equals its solo direct run; the group serves again.
@@ -146,7 +142,7 @@ test.skipIf(!target)("real-weight committed spans over delayed affine KV equal d
         const watch = () => { overlap = Math.max(overlap, env.group.activeRows); };
         const [a, b] = await Promise.all([env.submit(A, 10, [[3000, 3001]], watch), env.submit(B, 7, spansB, watch)]);
         expect(overlap).toBe(2);
-        expect(a).toEqual({ tokens: across.tokens, accepted: across.accepted, outcome: refused });
+        expect(a).toEqual({ tokens: across.tokens, accepted: across.accepted, outcome: "length" });
         expect(b).toEqual({ tokens: peer.tokens, accepted: peer.accepted, outcome: "length" });
         expect(await env.submit(B, 7, spansB)).toEqual({ tokens: peer.tokens, accepted: peer.accepted, outcome: "length" });
       } finally { lane = null; await env.close(); }

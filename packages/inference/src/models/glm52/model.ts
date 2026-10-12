@@ -690,8 +690,6 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly capabilities: Glm52ModelCapabilities;
   readonly prefixBase = "model";
   readonly loraState = new LoraState();
-  /** Layers whose attention reads plain keys and values: none; it attends its own compressed MLA storage, which no KV scheme converts. */
-  readonly requiredDenseKvLayers: readonly number[] = Object.freeze([]);
   /** Attends its own compressed MLA storage, which no KV scheme converts. Adapters
    * are not offered on streamed experts. */
   get graphCapabilities(): GraphCapabilities {

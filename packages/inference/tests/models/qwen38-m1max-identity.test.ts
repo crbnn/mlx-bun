@@ -291,7 +291,6 @@ describe("the composition the generated graph declares", () => {
       expect((currentGraph as { verifyRoundCosts?: unknown }).verifyRoundCosts).toBeUndefined();
       expect((oldGraph as { verifyRoundCosts?: unknown }).verifyRoundCosts).toBeUndefined();
       expect(currentGraph.prefillChunk.ane).toBeUndefined();
-      expect(currentGraph.requiredDenseKvLayers).toEqual(oldGraph.requiredDenseKvLayers);
       const a = currentGraph.makeCache(), b = oldGraph.makeCache();
       try { expect(a.map(cache => `${cache.constructor.name} ${cache.signature()}`)).toEqual(b.map(cache => `${cache.constructor.name} ${cache.signature()}`)); }
       finally { disposeAll(a, b); }

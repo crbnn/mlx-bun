@@ -277,18 +277,6 @@ export interface KvDonorAttention extends KvAttentionView {
   readonly ends: readonly number[];
 }
 
-/** Dense key/value reads (stored keys and values as arrays) for a read that
- * attends them that way (`state/softcap-attention.ts`): plain storage returns
- * them directly, storage that decodes on read returns its dequantized window.
- * Storage that can answer declares it. A cache without it is not certified for
- * a composed dense read. */
-export interface DenseKvReads {
-  /** Pure: whether `row` can take its next append and still be read dense —
-   * its storage reads dense now, and the maintenance that append schedules
-   * (deferred during prefill) leaves it reading dense. */
-  appendable(row: number): boolean;
-}
-
 /** The row-layout half of a composition's KV scheme, over one request's layer
  * caches: where its serial caches (the graph's composed legos) join row
  * layouts. The legos convert themselves inside their own appends; nothing here
@@ -321,8 +309,6 @@ export interface ComposedStorage {
 export interface Cache {
   /** Present on a cache that composes the storage it holds (see ComposedStorage). */
   readonly composed?: ComposedStorage;
-  /** Dense reads, when this storage can answer for them (see DenseKvReads). */
-  readonly denseKvReads?: DenseKvReads;
   /** Maximum committed positions before this state changes precision. */
   maxAppendTokens?(): number;
   captureDonorRows?(): KvDonorRows;

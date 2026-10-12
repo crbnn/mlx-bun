@@ -4,7 +4,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import type { AttentionRead,BlockAttentionCache,CommittedAttentionCache,CompiledDecodeCache,DecodeSlot,DecodeStepInputs,DecodeStepPlan,DecodeTrace,KvDonorAttention,Mask } from "../contracts/mlx/cache";
 import type { QuantizedAttentionState } from "./kv-storage";
 import { createCausalMask } from "../kernels/attention/masks";
-import { disposeTriple, mapTriple } from "./quantized-tensor";
+import { dequantizedFetch, disposeTriple, mapTriple } from "./quantized-tensor";
 import { AttentionMasks, unmaskedLease, withLease } from "./attention-read";
 import { affineCausalLease, affineRead, committedAffineRead, unfusedAffineKernels, viewAffineKernel, type AffineKernels, type AffineKernelSet } from "./affine-attention";
 
@@ -98,8 +98,9 @@ export class QuantizedKVCache implements CompiledDecodeCache, CommittedAttention
     return tensors.reduce((bytes, array) => bytes + array.nbytes, 0) / steps;
   }
 
-  updateAndFetch(): [MlxArray, MlxArray] {
-    throw new Error("QuantizedKVCache: use updateAndFetchQuantized");
+  /** The dense fetch: appends, then the stored window dequantized. */
+  updateAndFetch(k: MlxArray, v: MlxArray): [MlxArray, MlxArray] {
+    return dequantizedFetch(this.updateAndFetchQuantized(k, v), this.groupSize, this.bits);
   }
 
   #grow(triple: ops.QuantizedTensor | null, lastDims: number[], B: number, H: number, steps: number, dtype: Dtype): ops.QuantizedTensor {

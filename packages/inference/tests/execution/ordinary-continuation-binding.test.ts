@@ -19,7 +19,7 @@ test(`ordinary shared continuation binds ${name} through its loaded backend`, ()
   const make = (kv: KvOptions = {}) => Object.assign(Object.create(prototype), {
     config: { modelType: name, text: { enableMoeBlock: false }, eosTokenIds: [] },
     makeCache: () => [new KVCache()], composition: testComposition(kvOf(kv)),
-    loraState: { active: [] }, requiredDenseKvLayers: [],
+    loraState: { active: [] },
   }) as Gemma4Model;
   const model = make();
   const binding = bindMlxGateway(model);
@@ -58,7 +58,7 @@ test("Gemma2 softcap plans shared continuation for plain, affine and TurboQuant 
   const make = (kv: KvOptions = {}) => Object.assign(Object.create(UniversalDenseModel.prototype), { encodedKvAttention: false,
     args: { modelType: "gemma2", maskArray: true, attnLogitSoftcap: 50, layerTypes: null },
     config: { modelType: "gemma2", text: { enableMoeBlock: false }, eosTokenIds: [] },
-    makeCache: () => [new KVCache()], loraState: { active: [] }, requiredDenseKvLayers: [0],
+    makeCache: () => [new KVCache()], loraState: { active: [] },
     composition: testComposition(kvOf(kv)),
   }) as UniversalDenseModel;
   const model = make();
@@ -106,7 +106,7 @@ test("Gemma2 softcap plans shared continuation for plain, affine and TurboQuant 
 test("a paged composition pages plain, adapter and media requests alike and keys their checkpoints in its namespace", () => {
   const graph = <M extends object>(prototype: M, modelType: string, pagedKv: { blockSize: number; direct: boolean } | null) => Object.assign(Object.create(prototype), {
     config: { modelType, text: { enableMoeBlock: false }, eosTokenIds: [] },
-    makeCache: () => [new KVCache()], loraState: { active: [] }, requiredDenseKvLayers: [],
+    makeCache: () => [new KVCache()], loraState: { active: [] },
     composition: testComposition(undefined, { pagedKv }),
   }) as M;
   const lookups: unknown[][] = [];

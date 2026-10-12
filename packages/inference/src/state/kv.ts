@@ -4,7 +4,6 @@ import * as ops from "@mlx-bun/mlx/ops";
 import type { AttentionRead,BidirectionalAttentionCache,BlockAttentionCache,Cache,CommittedAttentionCache,CompiledDecodeCache,DecodeSlot,DecodeStepInputs,DecodeStepPlan,DecodeTrace,EncoderAttentionCache,KvDonorRows,Mask } from "../contracts/mlx/cache";
 import { bidirMask, createCausalMask } from "../kernels/attention/masks";
 import { QuantizedKVCache } from "./quantized-kv";
-import { plainKvStorage } from "./dense-kv-reads";
 import { AttentionMasks, causalLease, encoderWindowMask, sdpaRead, unmaskedLease, withLease } from "./attention-read";
 import type { AffineKernelSet } from "./affine-attention";
 import { uncomposedTurboQuantKernels, type TurboQuantKernels } from "./turboquant-attention";
@@ -23,7 +22,6 @@ export type { AffineKernelSet };
  *  `RotatingKVCache` for sliding layers), so only the bidirectional and encoder
  *  reads build a mask array. */
 export class KVCache implements CompiledDecodeCache, CommittedAttentionCache, BidirectionalAttentionCache, EncoderAttentionCache, BlockAttentionCache {
-  readonly denseKvReads = plainKvStorage;
   static readonly STEP = 256;
   /** Set only by compiled-decode trace adapters (see Cache). */
   readonly ropeOffsetArr?: MlxArray;

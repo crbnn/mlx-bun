@@ -11,7 +11,6 @@ import { makeStepSampler, type DeviceStepSampler } from "../sampling/index";
 import { cleanupFailure, disposeResources } from "../runtime/resources";
 import { snapshotGenerationPolicy } from "./request-policy";
 import { MlxPrefillCohort } from "./prefill-cohort";
-import { DenseKvReadError, denseKvLayerList, unreadableRows } from "../state/dense-kv-reads";
 import type { MlxGroupedMethod, MlxGroupMethodHost, MlxGroupMethodRequest, MlxGroupPreparation, Row } from "./batch-types";
 
 interface RequestState {
@@ -23,16 +22,11 @@ interface RequestState {
 
 /** Preserve committed grammar spans while the shared scheduler interleaves
  * active requests. Graph calls remain B1: spans of different lengths are not
- * padded, split, or verified. The gateway owns each borrowed grammar matcher.
- * `denseKvReads` is the graph's requirement: the layers its attention reads as
- * plain keys and values, each an index into the graph's `cacheCount` caches.
- * It is copied once; a row whose next append would not be read plain there is
- * refused before any layer appends. */
-export function bindGrammarGroupRequests(model: MlxTokenGraph, denseKvReads: readonly number[], cacheCount: number) {
-  const layers = denseKvLayerList(denseKvReads, cacheCount);
+ * padded, split, or verified. The gateway owns each borrowed grammar matcher. */
+export function bindGrammarGroupRequests(model: MlxTokenGraph) {
   return (input: GenerateOptions): MlxGroupMethodRequest => ({
     key: "grammar-forced-span", data: snapshotGenerationPolicy(input),
-    open: host => new GrammarGroup(host, model, layers),
+    open: host => new GrammarGroup(host, model),
   });
 }
 
@@ -41,8 +35,7 @@ class GrammarGroup implements MlxGroupedMethod {
   readonly #requests = new Map<Row, RequestState>();
   #next = 0;
 
-  constructor(readonly host: MlxGroupMethodHost, readonly model: MlxTokenGraph,
-    readonly denseKvReads: readonly number[]) {
+  constructor(readonly host: MlxGroupMethodHost, readonly model: MlxTokenGraph) {
     this.#dispatch = new MlxPhaseDispatch(tokenPhasesOf(model));
   }
 
@@ -57,7 +50,7 @@ class GrammarGroup implements MlxGroupedMethod {
     const target = new MlxPrefillCohort({
       model: this.model, chunkSize: this.host.prefillChunkSize,
       tailSplit: this.host.prefillTailSplit,
-      promptCache: this.host.promptCache, maintain: this.host.kvMaintenance, denseKvReads: this.denseKvReads,
+      promptCache: this.host.promptCache, maintain: this.host.kvMaintenance,
       forward: async (ids, caches, step) => this.#dispatch.prompt(step.phase, step.sequences, step.tokens)(ids, caches, null),
       project: (hidden, _caches, _completed, step) => {
         const [, length, width] = hidden.shape as [number, number, number];
@@ -141,7 +134,6 @@ class GrammarGroup implements MlxGroupedMethod {
     let next: MlxArray | null = null;
     try {
       if (forced) {
-        this.#readable(state);
         state.sampling.commitDevice(current);
         state.sampling.commitNumbers(forced);
         const after = step + 1 + forced.length;
@@ -150,7 +142,6 @@ class GrammarGroup implements MlxGroupedMethod {
           after < row.req.maxTokens && !grammar.isTerminated
             ? logits => { next = state.sampling.sample(logits, after).token; } : undefined);
       } else if (step + 1 < row.req.maxTokens && !grammar.isTerminated) {
-        this.#readable(state);
         state.sampling.commitDevice(current);
         using ids = ops.reshape(current, [1, 1]);
         using hidden = await this.#dispatch.decode(1)(ids, state.caches, null);
@@ -183,13 +174,6 @@ class GrammarGroup implements MlxGroupedMethod {
         this.#complete(row, stop || row.generated < row.req.maxTokens ? "stop" : "length");
       } else { state.pending = next; next = null; }
     } finally { next?.dispose(); }
-  }
-
-  /** The graph's read requirement before the step's forward: a row whose next
-   * append would not be read plain is refused with `DenseKvReadError` before
-   * any layer appends. */
-  #readable(state: RequestState): void {
-    if (unreadableRows(state.caches, this.denseKvReads, 1).length) throw new DenseKvReadError();
   }
 
   #complete(row: Row, reason: "stop" | "length"): void {

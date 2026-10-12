@@ -7,7 +7,6 @@ import type { ModelConfig } from "../artifacts/config";
 import type { MlxTokenGraph } from "../models/graph";
 import { declaredGraph, stateCodecsOf } from "../models/capabilities";
 import { composeAtLayer } from "../state/persistence";
-import { bindRequiredDenseKvLayers } from "../state/dense-kv-reads";
 import { BF16_KV, COMPOSITION_DEFAULTS, type KvStorageScheme } from "../contracts/portable/composition";
 import type { Cache } from "../contracts/mlx/cache";
 import { runtimeConfig, type RuntimeConfig } from "../runtime/config";
@@ -60,15 +59,6 @@ export interface MlxGatewayBinding {
   createBatchGroup(options: MlxBatchExecutionGroupOptions): MlxBatchGroup;
 }
 
-/** The layers the graph's attention reads as plain keys and values (its
- * softcapped read), bound once against its own fresh caches, and how many caches
- * it composes. Every probe cache is released. */
-function plainReadLayers(model: MlxTokenGraph): { layers: readonly number[]; count: number } {
-  const caches = model.makeCache();
-  try { return { layers: bindRequiredDenseKvLayers(model.requiredDenseKvLayers, caches), count: caches.length }; }
-  finally { disposeResources(caches); }
-}
-
 /** `adaptiveDepth`: each round drafts up to `numDraftTokens`, chosen from the
  *  decayed acceptance rate and the graph's measured `verifyRoundCosts` (the
  *  graph must declare them); otherwise every round drafts `numDraftTokens`.
@@ -98,15 +88,13 @@ export function bindMlxGateway(model: MlxTokenGraph,
   const speculative = !denoising && draft?.provider.grouped
     ? bindSpeculativeGroupRequests(model, draft.provider, draft.numDraftTokens, draft.adaptiveDepth ?? false) : undefined;
   // Grammar jump: verified proposals where the graph's verifier qualifies them,
-  // committed spans otherwise, held to the layers the graph's attention reads
-  // plain (a row whose next append its storage would not read plain is refused
-  // before that append).
+  // committed spans otherwise.
   const grammarProvider = caps.method === "autoregressive" && verification.grammarProposals && facts.grammarJump
     ? constraintDraftProvider() : undefined;
   const grammarProposals = grammarProvider ? bindSpeculativeGroupRequests(model, grammarProvider,
     Math.max(1, Math.trunc(runtime.number("MLX_BUN_GRAMMAR_DRAFT_TOKENS", 3)))) : undefined;
   const grammarSpans = caps.method === "autoregressive" && !verification.grammarProposals
-    ? (({ layers, count }) => bindGrammarGroupRequests(model, layers, count))(plainReadLayers(model)) : undefined;
+    ? bindGrammarGroupRequests(model) : undefined;
   const adapterState = caps.adapters.batched ? model.loraState : undefined;
   const fillRequests = !denoising ? bindFillGroupRequests(model, kv) : undefined;
   const mediaInput = caps.media && caps.media.input !== "pixels"

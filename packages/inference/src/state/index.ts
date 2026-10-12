@@ -11,7 +11,6 @@ export * from "./glm52-cache";
 export * from "./views";
 export * from "./checkpoint";
 export * from "./kv-maintenance";
-export * from "./dense-kv-reads";
 export * from "./kv-scheme";
 export * from "./persistence";
 export * from "./batched-kv";

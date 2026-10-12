@@ -1,6 +1,6 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
-import type { BatchableCache, Cache, CompiledDecodeCache, DecodeSlot, DecodeStepInputs, DecodeStepPlan, Mask, DenseKvReads } from "../contracts/mlx/cache";
+import type { BatchableCache, Cache, CompiledDecodeCache, DecodeSlot, DecodeStepInputs, DecodeStepPlan, Mask } from "../contracts/mlx/cache";
 import { KvTensorRows } from "./kv-tensor-rows";
 import type { KvStorage } from "./kv-storage";
 import { leaseCacheStates } from "./leases";
@@ -25,9 +25,6 @@ export interface KvRowTransition<Layout extends TransitionedKvLayout> {
   /** Converts, in place, every row whose stored length has reached the
    * conversion offset. Converted rows, and rows below the offset, stay. */
   settle(rows: Cache[]): void;
-  /** Pure: whether `row`, reading dense now, still reads dense after `settle`
-   * next runs on it. */
-  keepsDenseReads(row: Cache): boolean;
   converted(row: Cache): boolean;
   makeLayout(): Layout;
   packRows?(layout: Layout, rows: readonly Cache[]): void;
@@ -144,14 +141,6 @@ export abstract class TransitioningKvRows<Layout extends TransitionedKvLayout> i
   decodeInputs(plan: DecodeStepPlan, step: DecodeStepInputs): MlxArray[] { return this.#loneLego().decodeInputs(plan, step); }
   commitDecodeStep(slot: DecodeSlot, outputs: MlxArray[]): MlxArray[] { return this.#loneLego().commitDecodeStep(slot, outputs); }
   signature(): string { return this.transition.signature; }
-  /** Plain reads per row: the row reads dense now, by its own capability or
-   * the packed layout's, and still reads dense after the transition its next
-   * append runs (deferred during prefill; a packed layout is past it). */
-  readonly denseKvReads: DenseKvReads = { appendable: row => {
-    if (this.packed) return this.packed.denseKvReads?.appendable(row) ?? false;
-    const cache = this.rows[row];
-    return !!cache?.denseKvReads?.appendable(0) && (this.#prefilling || this.transition.keepsDenseReads(cache));
-  } };
   get prefillMaintenance() { return this; }
   beginPrefill(): void { this.#prefilling = true; }
   commitPrefill(indices: readonly number[]): void {
@@ -191,15 +180,6 @@ export abstract class TransitioningKvRows<Layout extends TransitionedKvLayout> i
     else { for (const row of this.rows) row.trim(count); this.syncPositions(true); }
   }
   protected syncPositions(preserve = false): void { this.positions.sync(this.rows, preserve); }
-  /** Reject incompatible storage before appending any row: rows already
-   * converted refuse with no change; otherwise the transition runs (deferred
-   * during prefill), then every row must still be plain. */
-  protected advancePlain(): void {
-    const plain = () => !this.packed && this.rows.every(row => !this.transition.converted(row));
-    if (!plain()) throw new Error("mixed precision rows use their attention state");
-    this.advance();
-    if (!plain()) throw new Error("mixed precision rows use their attention state");
-  }
   protected advance(): void {
     if (this.packed) return;
     if (!this.#prefilling) this.transition.settle(this.rows);

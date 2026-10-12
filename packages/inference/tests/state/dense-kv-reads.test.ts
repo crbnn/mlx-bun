@@ -1,266 +1,178 @@
-// Dense KV reads (`updateAndFetch` returning keys and values as arrays) are
-// certified per row by the storage that can answer and by what its own
-// transition leaves. For delayed affine KV the query is pure and must predict
-// the actual plain read: it holds exactly when that read appends. TurboQuant
-// storage decodes on read, so its rows stay dense-readable through conversion.
-// A cache without the capability is not certified, whatever a direct read of
-// it would do.
-import { unfusedAffineKernels } from "../../src/state/affine-attention";
+// Every KV storage answers the dense fetch (`updateAndFetch`: the window an
+// append leaves, as keys and values arrays), which a read that attends them that
+// way (Gemma 2's softcapped read) takes: plain storage as stored, TurboQuant
+// decoded, affine storage dequantized, before and after a row's transition.
+//
+// The oracle for affine storage: the plain storage the lego starts as (KVCache,
+// RotatingKVCache, or the plain row layouts), with a converted row's fetched
+// window affine-quantized and dequantized again by mlx itself. Groups run along
+// the head dimension, so a position's codes do not depend on when it was
+// quantized: quantizing the window at the conversion and each later append on
+// its own equals quantizing the fetched window at every read. A row converts
+// after the append that leaves it holding the start (the bf16-first rule).
 import { expect, test } from "bun:test";
 import * as ops from "@mlx-bun/mlx/ops";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import { KVCache } from "../../src/state/kv";
-import { deferredTurboQuantKernels } from "../../src/state/turboquant-attention";
 import { RotatingKVCache } from "../../src/state/rotating-kv";
-import { QuantizedKVCache } from "../../src/state/quantized-kv";
-import { RotatingQuantizedKVCache } from "../../src/state/rotating-quantized-kv";
-import { BatchedKVCache } from "../../src/state/batched-kv";
 import { BatchedRotatingCache } from "../../src/state/batched-rotating";
-import { BatchedQuantizedKVCache } from "../../src/state/batched-quantized-kv";
-import { RotatingAffineLayout } from "../../src/state/rotating-kv-layout";
-import { TurboQuantKVCache } from "../../src/state/turboquant-kv";
-import { BatchedTurboQuantKVCache } from "../../src/state/batched-turboquant-kv";
 import { DelayedQuantizedKVCache } from "../../src/state/delayed-quantized-kv";
 import { DelayedRotatingQuantizedKVCache } from "../../src/state/delayed-rotating-quantized-kv";
 import { DelayedTurboQuantKVCache } from "../../src/state/delayed-turboquant-kv";
-import { createKvMaintenance } from "../../src/state/kv-maintenance";
+import { unfusedAffineKernels } from "../../src/state/affine-attention";
+import { deferredTurboQuantKernels } from "../../src/state/turboquant-attention";
 import { turboQuantFusedDecode } from "../../src/state/turboquant-codec";
-import { prefillCacheLayout } from "../../src/state/layout";
 import { AttentionMasks } from "../../src/state/attention-read";
-import { composedFullAttentionCache, composedSlidingAttentionCache } from "../../src/state/bf16-first-kv";
+import { composedFullAttentionCache, composedSlidingAttentionCache, transitionDue } from "../../src/state/bf16-first-kv";
 import type { Cache } from "../../src/contracts/mlx/cache";
 import type { KvStorageScheme } from "../../src/contracts/portable/composition";
 import { kvStorage } from "../../src/state/kv-storage";
+import { disposeResources } from "../../src/runtime/resources";
 
-const W = 8;
+const W = 8, GROUP = 64;
 const tensor = (b: number, n: number, seed: number) => {
-  using key = ops.randomKey(BigInt(seed)); return ops.randomNormal([b, 2, n, 64], Dtype.bfloat16, 0, 1, key);
+  using key = ops.randomKey(BigInt(seed)); return ops.randomNormal([b, 2, n, GROUP], Dtype.bfloat16, 0, 1, key);
 };
-const plainRow = (rotating: boolean, length: number, seed: number): Cache => {
-  const row = rotating ? new RotatingKVCache(W) : new KVCache();
-  using k = tensor(1, length, seed), v = tensor(1, length, seed + 1);
-  for (const a of row.updateAndFetch(k, v)) a.dispose();
-  return row;
+/** `x` affine-quantized at `bits` and dequantized again (owned). */
+const requantized = (x: MlxArray, bits: number): MlxArray => {
+  const q = ops.quantize(x, GROUP, bits);
+  try { return ops.dequantize(q.packed, q.scales, q.biases, { groupSize: GROUP, bits, mode: "affine" }); }
+  finally { q.packed.dispose(); q.scales.dispose(); q.biases.dispose(); }
 };
-type Delayed = DelayedQuantizedKVCache | DelayedRotatingQuantizedKVCache;
-const delayed = (rotating: boolean, start: number, lengths: number[], seed: number): Delayed => {
-  const group = rotating ? new DelayedRotatingQuantizedKVCache(W, 64, 4, start, unfusedAffineKernels) : new DelayedQuantizedKVCache(64, 4, start, unfusedAffineKernels);
-  const rows = lengths.map((length, index) => plainRow(rotating, length, seed + 2 * index));
-  try { group.mergeRows(rows); } finally { for (const row of rows) row.dispose(); }
-  return group;
+/** The same shape, dtype and bytes. */
+const expectSame = (label: string, actual: MlxArray, expected: MlxArray) => {
+  expect([actual.shape, actual.dtypeName], label).toEqual([expected.shape, expected.dtypeName]);
+  // Boolean masks compare as integers (no raw byte view of bool).
+  const bytes = (x: MlxArray) => x.dtypeName === "bool" ? x.astype(Dtype.int32) : ops.contiguous(x);
+  using a = bytes(actual), b = bytes(expected);
+  expect(Buffer.from(a.rawBytes()).equals(Buffer.from(b.rawBytes())), `${label}: bytes`).toBe(true);
 };
-const appendable = (cache: Cache, rows: number) => Array.from({ length: rows }, (_, row) => cache.denseKvReads!.appendable(row));
-/** Attempt the actual plain read; true when it appended. */
-const reads = (cache: Cache, rows: number, seed: number) => {
-  using k = tensor(rows, 1, seed), v = tensor(rows, 1, seed + 1);
-  try { for (const a of kvStorage(cache).updateAndFetch(k, v)) a.dispose(); return true; }
-  catch (error) { expect(String(error)).toContain("mixed precision rows use their attention state"); return false; }
-};
-const kinds = (cache: Delayed) => cache.rowOffsets.map((_, row) => { const r = cache.extractRow(row); try { return r.constructor.name; } finally { r.dispose(); } });
+const fetch = (cache: Cache, k: MlxArray, v: MlxArray) => kvStorage(cache).updateAndFetch(k, v);
+/** Appends of these lengths cross the ring's window and the starts below. */
+const APPENDS = [4, 1, 1, 3, 1, 1, 1, 5, 1, 2];
 
-for (const rotating of [false, true]) for (const start of [0, 3, 6]) for (const lengths of [[2], [5], [2, 6], [3, 3], [1, 4, 7]]) for (const prefilling of [false, true])
-test(`${rotating ? "rotating" : "full"} start ${start}, rows ${lengths}${prefilling ? ", prefilling" : ""}: the query predicts the plain read`, () => {
-  const probe = delayed(rotating, start, lengths, 11), attempt = delayed(rotating, start, lengths, 11);
-  try {
-    if (prefilling) { probe.beginPrefill(); attempt.beginPrefill(); }
-    const predicted = appendable(probe, lengths.length);
-    const offsets = [...attempt.rowOffsets];
-    // Asking is pure: nothing about the probe changed.
-    expect(kinds(probe)).toEqual(lengths.map(() => rotating ? "RotatingKVCache" : "KVCache"));
-    expect(reads(attempt, lengths.length, 20)).toBe(predicted.every(Boolean));
-    if (predicted.every(Boolean)) expect(attempt.rowOffsets).toEqual(offsets.map(o => o + 1));
-    else {
-      // No row appended; exactly the rows the query refused were converted by the transition.
-      expect(attempt.rowOffsets).toEqual(offsets);
-      expect(kinds(attempt).map(kind => kind === "RotatingKVCache" || kind === "KVCache")).toEqual(predicted);
-    }
-  } finally { if (prefilling) { probe.endPrefill(); attempt.endPrefill(); } probe.dispose(); attempt.dispose(); }
-});
-
-test("an empty prepared row never converts, even from start 0", () => {
-  for (const rotating of [false, true]) {
-    const group = rotating ? new DelayedRotatingQuantizedKVCache(W, 64, 4, 0, unfusedAffineKernels) : new DelayedQuantizedKVCache(64, 4, 0, unfusedAffineKernels);
+for (const rotating of [false, true]) for (const bits of [4, 8]) for (const start of [0, 3, 6, 11]) {
+  test(`${rotating ? "sliding" : "full"} affine ${bits} from ${start}: the lego's dense fetch is its bf16 window, then its window dequantized`, () => {
+    const kv: KvStorageScheme = { kind: "affine", bits, groupSize: GROUP, quantizedKvStart: start, kernels: "unfused" };
+    const masks = new AttentionMasks();
+    const lego = rotating ? composedSlidingAttentionCache(kv, 0, W, masks) : composedFullAttentionCache(kv, 0, masks, deferredTurboQuantKernels);
+    const plain = rotating ? new RotatingKVCache(W) : new KVCache();
+    let converted = false, seed = 100;
     try {
-      group.preparePrefill({ lengths: [2, 2] });
-      expect(appendable(group, 2)).toEqual([true, true]);
-      expect(reads(group, 2, 30)).toBe(true);
-      // Now populated: the next append's transition converts both.
-      expect(appendable(group, 2)).toEqual([false, false]);
-      expect(reads(group, 2, 32)).toBe(false);
-    } finally { group.dispose(); }
-  }
-});
+      for (const [step, length] of APPENDS.entries()) {
+        const label = `append ${step} (${length} at ${plain.offset})`;
+        const mask = kvStorage(lego).makeMask(length, rotating ? W : null), expectedMask = plain.makeMask(length, rotating ? W : null);
+        try {
+          expect(mask.mode, label).toBe(expectedMask.mode);
+          if (expectedMask.arr) expectSame(`${label} mask`, mask.arr!, expectedMask.arr);
+        } finally { mask.arr?.dispose(); expectedMask.arr?.dispose(); }
+        using k = tensor(1, length, seed++), v = tensor(1, length, seed++);
+        const actual = fetch(lego, k, v), stored = plain.updateAndFetch(k, v);
+        const expected = converted ? stored.map(x => requantized(x, bits)) : stored;
+        try { for (const index of [0, 1]) expectSame(`${label} ${index ? "values" : "keys"}`, actual[index]!, expected[index]!); }
+        finally { disposeResources([...actual, ...stored, ...(converted ? expected : [])]); }
+        converted ||= transitionDue(plain.offset, start);
+      }
+      expect((lego.composed!.storage()).constructor.name).toBe(rotating ? "RotatingQuantizedKVCache" : "QuantizedKVCache");
+    } finally { lego.dispose(); plain.dispose(); }
+  });
+}
 
-test("per-layer policy: a configured layer's lego reads dense through the append that converts it; unconfigured layers stay plain", () => {
-  const kv: KvStorageScheme = { kind: "affine-layers", layers: [{ layer: 0, bits: 4, groupSize: 64 }], quantizedKvStart: 3, kernels: "unfused" };
+test("per-layer affine: a listed layer converts and fetches dequantized; an unlisted layer stays bf16", () => {
+  const kv: KvStorageScheme = { kind: "affine-layers", layers: [{ layer: 0, bits: 4, groupSize: GROUP }], quantizedKvStart: 3, kernels: "unfused" };
   const masks = new AttentionMasks();
-  const caches: Cache[] = [composedFullAttentionCache(kv, 0, masks, deferredTurboQuantKernels),
-    composedSlidingAttentionCache(kv, 1, W, masks), composedFullAttentionCache(kv, 2, masks, deferredTurboQuantKernels)];
+  const listed = composedFullAttentionCache(kv, 0, masks, deferredTurboQuantKernels), unlisted = composedFullAttentionCache(kv, 1, masks, deferredTurboQuantKernels);
+  const plain = [new KVCache(), new KVCache()];
+  let seed = 200;
   try {
-    for (const [index, cache] of caches.entries()) {
-      using k = tensor(1, 2, 40 + 2 * index), v = tensor(1, 2, 41 + 2 * index);
-      for (const a of kvStorage(cache).updateAndFetch(k, v)) a.dispose();
+    for (const [step, length] of [2, 1, 2, 1].entries()) {
+      for (const [index, cache] of [listed, unlisted].entries()) {
+        const before = plain[index]!.offset;
+        using k = tensor(1, length, seed++), v = tensor(1, length, seed++);
+        const actual = fetch(cache, k, v), stored = plain[index]!.updateAndFetch(k, v);
+        const converted = index === 0 && transitionDue(before, 3);
+        const expected = converted ? stored.map(x => requantized(x, 4)) : stored;
+        try { for (const plane of [0, 1]) expectSame(`step ${step} layer ${index}`, actual[plane]!, expected[plane]!); }
+        finally { disposeResources([...actual, ...stored, ...(converted ? expected : [])]); }
+      }
     }
-    expect(caches.map(cache => cache.denseKvReads?.appendable(0) ?? false)).toEqual([true, true, true]);
-    // The append that reaches the start reads bf16; the lego converts after it.
-    expect(denseRead(caches[0]!, 1, 46)).toEqual([[1, 2, 3, 64], [1, 2, 3, 64], "bfloat16", "bfloat16"]);
-    expect(caches.map(cache => cache.denseKvReads?.appendable(0) ?? false)).toEqual([false, true, true]);
-    createKvMaintenance(kv).preparePrefill!(caches);
-    expect(caches[0]).toBeInstanceOf(DelayedQuantizedKVCache);
-    expect(caches[1]).toBeInstanceOf(RotatingKVCache);
-    expect(caches.map(cache => cache.denseKvReads!.appendable(0))).toEqual([false, true, true]);
-  } finally { for (const cache of caches) cache.dispose(); }
+    expect([listed.composed!.storage().constructor.name, unlisted.constructor.name]).toEqual(["QuantizedKVCache", "KVCache"]);
+  } finally { disposeResources([listed, unlisted, ...plain]); }
 });
 
-test("adoption and filtering: the query follows the rows each cache currently holds", () => {
-  for (const rotating of [false, true]) {
-    const maintain = createKvMaintenance({ kind: "affine", bits: 4, groupSize: 64, quantizedKvStart: 5, kernels: "unfused" });
-    const solo = [plainRow(rotating, 3, 50)];
+/** `lengths` rows, each prefilled with its own tokens, in the delayed layout
+ * `make` builds and, as plain rows, in `plainLayout` (the plain row layout the
+ * same rows join, the oracle's storage). */
+function rowsIn<L extends Cache>(make: () => L, plainLayout: () => Cache & { mergeRows(rows: readonly Cache[]): void },
+  rotating: boolean, lengths: readonly number[], seed: number) {
+  const rows = lengths.map((length, index) => {
+    const row = rotating ? new RotatingKVCache(W) : new KVCache();
+    using k = tensor(1, length, seed + 2 * index), v = tensor(1, length, seed + 2 * index + 1);
+    disposeResources(row.updateAndFetch(k, v));
+    return row;
+  });
+  const layout = make() as L & { mergeRows(rows: readonly Cache[]): void };
+  const plain = plainLayout();
+  try { layout.mergeRows(rows); plain.mergeRows(rows); } finally { disposeResources(rows); }
+  return { layout, plain };
+}
+
+for (const rotating of [false, true]) for (const [start, lengths] of [[4, [2, 6]], [5, [1, 4, 7]], [0, [3, 3]], [40, [2, 5]]] as const) {
+  test(`delayed ${rotating ? "sliding" : "full"} affine rows ${lengths} from ${start}: each row fetches bf16 until its transition, then dequantized, mixed and packed alike`, () => {
+    const make = (): Cache => rotating ? new DelayedRotatingQuantizedKVCache(W, GROUP, 4, start, unfusedAffineKernels)
+      : new DelayedQuantizedKVCache(GROUP, 4, start, unfusedAffineKernels);
+    // The plain row layout: the one a full layout pads its rows in (zeros on
+    // the left), or the plain ring layout.
+    const plainLayout = rotating ? () => new BatchedRotatingCache(W, []) : () => new DelayedQuantizedKVCache(GROUP, 4, Number.MAX_SAFE_INTEGER, unfusedAffineKernels);
+    const { layout, plain } = rowsIn(make, plainLayout, rotating, lengths, 300);
+    const B = lengths.length, offsets = [...lengths] as number[];
+    const converted = offsets.map(offset => transitionDue(offset, start));
+    let seed = 400;
     try {
-      maintain.prepareBatch!(solo);   // adopt one row
-      const adopted = solo[0] as Delayed;
-      expect(appendable(adopted, 1)).toEqual([true]);
-      expect(reads(adopted, 1, 52)).toBe(true);
-      expect(reads(adopted, 1, 54)).toBe(true);
-      expect(adopted.rowOffsets).toEqual([5]);
-      expect(appendable(adopted, 1)).toEqual([false]);
-    } finally { for (const cache of solo) cache.dispose(); }
-    for (const [keep, expected] of [[[1], [false]], [[0], [true]], [[1, 0], [false, true]]] as const) {
-      const group = delayed(rotating, 5, [2, 6], 60);
+      for (const [step, length] of [1, 1, 2, 1, 1, 3, 1].entries()) {
+        using k = tensor(B, length, seed++), v = tensor(B, length, seed++);
+        const actual = fetch(layout, k, v), stored = fetch(plain, k, v);
+        const expected = stored.map(plane => {
+          const parts = Array.from({ length: B }, (_, row) => {
+            const slice = plane.slice([row, 0, 0, 0], [row + 1, plane.shape[1]!, plane.shape[2]!, plane.shape[3]!]);
+            if (!converted[row]) return slice;
+            // A full row's left padding stays zeros; its stored positions requantize.
+            const pad = rotating ? 0 : plane.shape[2]! - (offsets[row]! + length);
+            if (!pad) { try { return requantized(slice, 4); } finally { slice.dispose(); } }
+            using padding = slice.slice([0, 0, 0, 0], [1, plane.shape[1]!, pad, plane.shape[3]!]);
+            using held = slice.slice([0, 0, pad, 0], [1, plane.shape[1]!, plane.shape[2]!, plane.shape[3]!]);
+            using dense = requantized(held, 4);
+            slice.dispose();
+            return ops.concatAxis([padding, dense], 2);
+          });
+          try { return ops.concatAxis(parts, 0); } finally { disposeResources(parts); }
+        });
+        try { for (const index of [0, 1]) expectSame(`step ${step} ${index ? "values" : "keys"}`, actual[index]!, expected[index]!); }
+        finally { disposeResources([...actual, ...stored, ...expected]); }
+        for (let row = 0; row < B; row++) { offsets[row]! += length; converted[row] ||= transitionDue(offsets[row]!, start); }
+      }
+    } finally { layout.dispose(); plain.dispose(); }
+  });
+}
+
+test("delayed TurboQuant rows fetch decoded before, across and after their transition", () => {
+  const group = new DelayedTurboQuantKVCache(8, 3, 3, turboQuantFusedDecode(), deferredTurboQuantKernels);
+  const rows = [2, 5].map((length, index) => {
+    const row = new KVCache();
+    using k = tensor(1, length, 500 + 2 * index), v = tensor(1, length, 501 + 2 * index);
+    disposeResources(row.updateAndFetch(k, v));
+    return row;
+  });
+  try {
+    group.mergeRows(rows);
+    for (const [step, length] of [1, 1, 2].entries()) {
+      using k = tensor(2, length, 600 + 2 * step), v = tensor(2, length, 601 + 2 * step);
+      const [keys, values] = fetch(group, k, v);
       try {
-        expect(appendable(group, 2)).toEqual([true, false]);
-        group.filterRows([...keep]);
-        expect(appendable(group, keep.length)).toEqual([...expected]);
-        expect(reads(group, keep.length, 62)).toBe(expected.every(Boolean));
-      } finally { group.dispose(); }
+        expect([keys.shape[0], keys.shape[2], values.dtypeName]).toEqual([2, Math.max(...group.rowOffsets), keys.dtypeName]);
+        expect(keys.toFloat32().every(Number.isFinite) && values.toFloat32().every(Number.isFinite)).toBe(true);
+      } finally { keys.dispose(); values.dispose(); }
     }
-  }
-});
-
-test("prefill deferral lasts until the row's prefill commits", () => {
-  for (const rotating of [false, true]) {
-    const group = delayed(rotating, 3, [4, 2], 70);
-    try {
-      group.beginPrefill();
-      expect(appendable(group, 2)).toEqual([true, true]);
-      group.commitPrefill([0]);
-      expect(appendable(group, 2)).toEqual([false, true]);
-      expect(reads(group, 2, 72)).toBe(false);
-    } finally { group.endPrefill(); group.dispose(); }
-  }
-});
-
-test("converted and packed affine storage is never dense-readable", () => {
-  for (const rotating of [false, true]) {
-    const group = delayed(rotating, 2, [3, 5], 80);
-    try {
-      using k = tensor(2, 1, 81), v = tensor(2, 1, 82);
-      group.appendAndFetch(k, v).dispose();   // converts both rows and packs them
-      expect(kinds(group).every(kind => kind.includes("Quantized"))).toBe(true);
-      expect(appendable(group, 2)).toEqual([false, false]);
-      expect(reads(group, 2, 83)).toBe(false);
-    } finally { group.dispose(); }
-  }
-});
-
-test("a start the rows never reach keeps every row plain, and the capability is built once", () => {
-  for (const rotating of [false, true]) {
-    const stays = delayed(rotating, Infinity, [6, 7], 90);
-    try {
-      expect(stays.denseKvReads).toBe(stays.denseKvReads);
-      expect(appendable(stays, 2)).toEqual([true, true]);
-      expect(reads(stays, 2, 91)).toBe(true);
-      expect(kinds(stays).every(kind => kind === "RotatingKVCache" || kind === "KVCache")).toBe(true);
-    } finally { stays.dispose(); }
-  }
-});
-
-test("plain storage and storage that decodes on read declare dense reads; affine storage does not", () => {
-  const fused = turboQuantFusedDecode();
-  const dense: Cache[] = [new KVCache(), new RotatingKVCache(W), new BatchedKVCache(), new BatchedRotatingCache(W, []),
-    new TurboQuantKVCache(8, 3, deferredTurboQuantKernels), new BatchedTurboQuantKVCache(8, 3, deferredTurboQuantKernels),
-    new DelayedTurboQuantKVCache(8, 3, 0, fused, deferredTurboQuantKernels, new KVCache(undefined, deferredTurboQuantKernels))];   // one real (empty) row: its row 0
-  // Capability presence is the storage's declaration; appendability is asked of
-  // an actual row. An empty delayed layout declares, but has no row 0 to append.
-  const empty = new DelayedTurboQuantKVCache(8, 3, 0, fused, deferredTurboQuantKernels);
-  const encoded: Cache[] = [new QuantizedKVCache(64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16)), new RotatingQuantizedKVCache(W, 64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16)), new BatchedQuantizedKVCache(64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16)),
-    new RotatingAffineLayout(W, 64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16))];
-  try {
-    for (const cache of dense) expect(cache.denseKvReads?.appendable(0), cache.constructor.name).toBe(true);
-    expect(empty.denseKvReads).toBeDefined();
-    expect(empty.denseKvReads!.appendable(0)).toBe(false);
-    for (const cache of encoded) expect(cache.denseKvReads, cache.constructor.name).toBeUndefined();
-    // The prefill cohort's rotating layout never converts, and says so.
-    const layout = prefillCacheLayout(new RotatingKVCache(W));
-    try { expect(layout).toBeInstanceOf(DelayedRotatingQuantizedKVCache); expect(layout.denseKvReads).toBeDefined(); }
-    finally { layout.dispose(); }
-  } finally { for (const cache of [...dense, ...encoded, empty]) cache.dispose(); }
-});
-
-/** A dense read of `cache` for `rows` rows appending one position: its shapes and dtypes. */
-const denseRead = (cache: Cache, rows: number, seed: number) => {
-  using k = tensor(rows, 1, seed), v = tensor(rows, 1, seed + 1);
-  const [keys, values] = kvStorage(cache).updateAndFetch(k, v);
-  try { return [keys.shape, values.shape, keys.dtypeName, values.dtypeName]; } finally { keys.dispose(); values.dispose(); }
-};
-
-test("a TurboQuant conversion keeps dense reads: the converted entry declares them and reads its dequantized window", () => {
-  const kv: KvStorageScheme = { kind: "turbo", kBits: 8, vBits: 3, quantizedKvStart: 3 };
-  const masks = new AttentionMasks();
-  const caches: Cache[] = [composedFullAttentionCache(kv, 0, masks, deferredTurboQuantKernels), composedSlidingAttentionCache(kv, 1, W, masks)];
-  try {
-    expect(caches.map(cache => cache.denseKvReads?.appendable(0))).toEqual([true, true]);
-    for (const [index, cache] of caches.entries()) {
-      using k = tensor(1, 5, 120 + 2 * index), v = tensor(1, 5, 121 + 2 * index);
-      for (const a of kvStorage(cache).updateAndFetch(k, v)) a.dispose();
-    }
-    expect(caches[0]!.composed!.storage()).toBeInstanceOf(TurboQuantKVCache);   // a full layer past start converts
-    expect(caches[1]).toBeInstanceOf(RotatingKVCache);     // a sliding layer stays plain
-    expect(caches.map(cache => cache.denseKvReads?.appendable(0))).toEqual([true, true]);
-    expect(denseRead(caches[0]!, 1, 124)).toEqual([[1, 2, 6, 64], [1, 2, 6, 64], "bfloat16", "bfloat16"]);
-    expect(denseRead(caches[1]!, 1, 126)).toEqual([[1, 2, 6, 64], [1, 2, 6, 64], "bfloat16", "bfloat16"]);   // below its window
-  } finally { for (const cache of caches) cache.dispose(); }
-});
-
-test("delayed TurboQuant rows stay dense-readable before, across and after conversion, and packed", () => {
-  const group = new DelayedTurboQuantKVCache(8, 3, 4, turboQuantFusedDecode(), deferredTurboQuantKernels);
-  const rows = [plainRow(false, 2, 130), plainRow(false, 5, 132)];
-  try { group.mergeRows(rows); } finally { for (const row of rows) row.dispose(); }
-  try {
-    // Row 1 converts at the first append, row 0 at the third; then the rows pack.
-    for (const [step, width] of [[0, 6], [1, 7], [2, 8]] as const) {
-      expect(appendable(group, 2), `step ${step}`).toEqual([true, true]);
-      expect(denseRead(group, 2, 134 + 2 * step)).toEqual([[2, 2, width, 64], [2, 2, width, 64], "bfloat16", "bfloat16"]);
-    }
-    expect(group.rowOffsets).toEqual([5, 8]);
-    expect(group.rowOffsets.map((_, row) => { const r = group.extractRow(row); try { return r.constructor.name; } finally { r.dispose(); } }))
-      .toEqual(["TurboQuantKVCache", "TurboQuantKVCache"]);
-    expect(appendable(group, 2)).toEqual([true, true]);
-  } finally { group.dispose(); }
-});
-
-test("prepared co-prefill rows answer through their current storage: padded full rows and aligned rotating rows", () => {
-  // Row 0 (4 tokens) passes start 3 at the chunk's commit; row 1 (2 tokens) does not.
-  const cases = [
-    ["affine full", () => new DelayedQuantizedKVCache(64, 4, 3, unfusedAffineKernels), [false, true]],
-    ["affine rotating", () => new DelayedRotatingQuantizedKVCache(W, 64, 4, 3, unfusedAffineKernels), [false, true]],
-    ["TurboQuant full", () => new DelayedTurboQuantKVCache(8, 3, 3, turboQuantFusedDecode(), deferredTurboQuantKernels), [true, true]],
-  ] as const;
-  for (const [label, make, converted] of cases) {
-    const group: Cache & { beginPrefill(): void; endPrefill(): void; commitPrefill(rows: number[]): void;
-      preparePrefill(padding: { lengths: number[]; rightPadding: number[] }): void; finalizePrefill(): void } = make();
-    try {
-      group.preparePrefill({ lengths: [4, 2], rightPadding: [0, 2] });   // the rows are now prepared owners
-      group.beginPrefill();
-      expect(appendable(group, 2), `${label}: prepared`).toEqual([true, true]);
-      using k = tensor(2, 4, 160), v = tensor(2, 4, 161);
-      for (const a of kvStorage(group).updateAndFetch(k, v)) a.dispose();
-      expect(appendable(group, 2), `${label}: after the chunk`).toEqual([true, true]);   // transition deferred
-      group.commitPrefill([0, 1]);
-      expect(appendable(group, 2), `${label}: committed`).toEqual([...converted]);
-      group.finalizePrefill(); group.endPrefill();
-      expect(appendable(group, 2), `${label}: finalized`).toEqual([...converted]);
-    } finally { group.dispose(); }
-  }
+  } finally { disposeResources([group, ...rows]); }
 });

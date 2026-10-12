@@ -186,8 +186,6 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
   readonly prefixBase = PREFIX;
   /** Active LoRA adapters for the current generation. */
   readonly loraState = new LoraState();
-  /** Layers whose attention reads plain keys and values: none; it attends the storage its caches hold. */
-  readonly requiredDenseKvLayers: readonly number[] = Object.freeze([]);
   /** Prepared image and audio embeddings, layer taps for drafts, a compiled decode step.
    *  No training operations. */
   readonly graphCapabilities: GraphCapabilities;

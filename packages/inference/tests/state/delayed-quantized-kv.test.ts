@@ -184,32 +184,32 @@ test("plain reads are owned by the caller and outlive later appends", () => {
   } finally { group.dispose(); for (const c of [...source, ...control]) c.dispose(); }
 });
 
-test("a plain read appends to no row once any row is converted, before or by the scheduled maintenance", () => {
+test("a dense read appends every row once any row is converted, before or by the scheduled maintenance", () => {
   const maintain = (rows: Cache[]) => settle(rows, 4);
-  const snapshot = (group: DelayedQuantizedKVCache) => ({ offsets: [...group.rowOffsets], pads: [...group.leftPad],
-    rows: group.rowOffsets.map((_, row) => { const s = group.extractRow(row); try { return [s.constructor.name, ...hashes(s)]; } finally { s.dispose(); } }) });
   using k = tensor(2, 1, 1, 50), v = tensor(2, 1, 1, 51);
-  // Mixed and fully converted rows refuse with no change at all.
+  // Mixed and fully converted rows: every row appends and fetches dense
+  // (`tests/state/dense-kv-reads.test.ts` holds the values to their oracle).
   for (const lengths of [[2, 6], [6, 7]]) {
     const source = plainRows(lengths, 40); maintain(source);
     const group = new DelayedQuantizedKVCache(64, 4, 5, unfusedAffineKernels); group.mergeRows(source);
     try {
-      const before = snapshot(group);
-      expect(() => group.updateAndFetch(k, v)).toThrow("mixed precision rows use their attention state");
-      expect(snapshot(group)).toEqual(before);
+      const [keys, values] = group.updateAndFetch(k, v);
+      try { expect([keys.shape, values.shape]).toEqual([[2, 1, Math.max(...lengths) + 1, 64], [2, 1, Math.max(...lengths) + 1, 64]]); }
+      finally { keys.dispose(); values.dispose(); }
+      expect(group.rowOffsets).toEqual(lengths.map(length => length + 1));
     } finally { group.dispose(); for (const c of source) c.dispose(); }
   }
-  // Scheduled maintenance converts the second row at its offset; the first,
-  // still plain, is not advanced.
+  // Scheduled maintenance converts the second row at its offset; both rows
+  // go on appending, the first still plain.
   const source = plainRows([2, 4], 60), control = cloneKvCaches(source);
   const group = new DelayedQuantizedKVCache(64, 4, 5, unfusedAffineKernels); group.mergeRows(source);
   try {
     for (const a of group.updateAndFetch(k, v)) a.dispose();
     expect(group.rowOffsets).toEqual([3, 5]);
-    expect(() => group.updateAndFetch(k, v)).toThrow("mixed precision rows use their attention state");
-    expect(group.rowOffsets).toEqual([3, 5]);
+    for (const a of group.updateAndFetch(k, v)) a.dispose();
+    expect(group.rowOffsets).toEqual([4, 6]);
     using k0 = k.slice([0, 0, 0, 0], [1, 1, 1, 64]), v0 = v.slice([0, 0, 0, 0], [1, 1, 1, 64]);
-    for (const a of kvStorage(control[0]!).updateAndFetch(k0, v0)) a.dispose();
+    for (let step = 0; step < 2; step++) for (const a of kvStorage(control[0]!).updateAndFetch(k0, v0)) a.dispose();
     const first = group.extractRow(0), second = group.extractRow(1);
     try {
       expect([first.constructor.name, ...hashes(first)]).toEqual([control[0]!.constructor.name, ...hashes(control[0]!)]);
@@ -218,7 +218,7 @@ test("a plain read appends to no row once any row is converted, before or by the
   } finally { group.dispose(); for (const c of [...source, ...control]) c.dispose(); }
 });
 
-test("prefill defers conversion: a plain read past the offset appends while prefilling, and the next one after it refuses", () => {
+test("prefill defers conversion: a dense read past the offset appends plain while prefilling, and the next one reads the converted rows", () => {
   const source = plainRows([6, 3], 70), control = cloneKvCaches(source);
   const group = new DelayedQuantizedKVCache(64, 4, 5, unfusedAffineKernels); group.mergeRows(source);
   try {
@@ -238,8 +238,12 @@ test("prefill defers conversion: a plain read past the offset appends while pref
     } finally { keys.dispose(); values.dispose(); group.endPrefill(); }
     expect(group.rowOffsets).toEqual([8, 5]);
     using k1 = tensor(2, 1, 1, 73), v1 = tensor(2, 1, 1, 74);
-    expect(() => group.updateAndFetch(k1, v1)).toThrow("mixed precision rows use their attention state");
-    expect(group.rowOffsets).toEqual([8, 5]);
+    for (const a of group.updateAndFetch(k1, v1)) a.dispose();
+    expect(group.rowOffsets).toEqual([9, 6]);
+    for (let row = 0; row < 2; row++) {
+      const state = group.extractRow(row);
+      try { expect(state).toBeInstanceOf(QuantizedKVCache); } finally { state.dispose(); }
+    }
   } finally { group.dispose(); for (const c of [...source, ...control]) c.dispose(); }
 });
 

@@ -10,7 +10,6 @@ import { decodedKvDonorAttention } from "./decoded-kv-donor";
 import type { KVCache } from "./kv";
 import type { RotatingKVCache } from "./rotating-kv";
 import { TurboQuantCodec,disposeTurboQuant,turboQuantFusedDecode,type TurboQuantTensor } from "./turboquant-codec";
-import { decodedKvStorage } from "./dense-kv-reads";
 import { AttentionMasks, causalLease, sdpaRead, unmaskedLease } from "./attention-read";
 import type { TurboQuantFetches, TurboQuantKernels } from "./turboquant-attention";
 
@@ -54,7 +53,6 @@ import type { TurboQuantFetches, TurboQuantKernels } from "./turboquant-attentio
  *  so the joined window equals the window the ordinary read decodes. The codes
  *  leave the graph unpacked; the write after the step packs and stores them. */
 export class TurboQuantKVCache implements CommittedAttentionCache, BlockAttentionCache, CompiledDecodeCache {
-  readonly denseKvReads = decodedKvStorage;
   minimumReusableOffset = 0;
   readonly stateNeedsDispose = true;
   static readonly STEP = 256;

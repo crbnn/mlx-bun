@@ -10,6 +10,7 @@ import type { QuantizedAttentionState } from "./kv-storage";
 
 import { KvTensorRows } from "./kv-tensor-rows";
 import { quantizedDonorAttention } from "./kv-attention-view";
+import { dequantizedFetch } from "./quantized-tensor";
 import { AttentionMasks, unmaskedLease, withLease, type MaskLease } from "./attention-read";
 import { affineCausalLease, affineRead, committedAffineRead, rowLayoutKernels, type AffineKernel, type AffineKernels } from "./affine-attention";
 
@@ -114,7 +115,10 @@ export class BatchedQuantizedKVCache implements BatchableCache, QuantizedAttenti
   specRoundRollback(keep: number | readonly number[]): void {
     for (const plane of this.#planes) plane.specRoundRollback(keep);
   }
-  updateAndFetch(): [MlxArray, MlxArray] { throw new Error("quantized attention uses updateAndFetchQuantized"); }
+  /** The dense fetch: appends, then the rows' stored windows dequantized. */
+  updateAndFetch(k: MlxArray, v: MlxArray): [MlxArray, MlxArray] {
+    return dequantizedFetch(this.updateAndFetchQuantized(k, v), this.groupSize, this.bits);
+  }
 
   updateAndFetchQuantized(k: MlxArray, v: MlxArray): [ops.QuantizedTensor, ops.QuantizedTensor] {
     using inputs = new DisposableStack();

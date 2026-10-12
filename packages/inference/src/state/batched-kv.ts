@@ -6,7 +6,6 @@ import { KVCache } from "./kv";
 import { isPlainKvCache } from "./capabilities";
 import { type AttentionRead, type BatchableCache, type Cache, type CommittedAttentionCache, type Mask, type PaddedPrefillCache, type PrefillPadding } from "../contracts/mlx/cache";
 import { FullPrefillPadding } from "./full-prefill-padding";
-import { plainKvStorage } from "./dense-kv-reads";
 import { AttentionMasks, causalLease, sdpaRead, unmaskedLease, withLease, type MaskLease } from "./attention-read";
 
 /** Full-attention storage with independently advancing row positions.
@@ -20,7 +19,6 @@ import { AttentionMasks, causalLease, sdpaRead, unmaskedLease, withLease, type M
  * each row's left padding) for their query count, built once per forward
  * through `masks`. */
 export class BatchedKVCache implements BatchableCache, PaddedPrefillCache, CommittedAttentionCache {
-  readonly denseKvReads = plainKvStorage;
   keys: MlxArray | null = null;
   values: MlxArray | null = null;
   rowOffsets: number[] = [];

@@ -25,7 +25,7 @@ const phases = { prefillChunk: { gpu: never }, prefillTail: atEveryWidth(never),
 function replacement(declared: Parameters<typeof declareGraph>[0] = {}, extra: object = {}, modelType = "replacement"): RuntimeModel {
   return {
     config: { modelType, text: { enableMoeBlock: false, numHiddenLayers: 1, layerTypes: ["full_attention"] }, eosTokenIds: [] },
-    makeCache: () => [new KVCache()], loraState: { active: [] }, requiredDenseKvLayers: [], logitsFromHidden() {}, ...phases,
+    makeCache: () => [new KVCache()], loraState: { active: [] }, logitsFromHidden() {}, ...phases,
     graphCapabilities: declareGraph(declared), ...extra,
   } as unknown as RuntimeModel;
 }

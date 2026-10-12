@@ -50,7 +50,6 @@ export class DelayedQuantizedKVCache extends FullTransitioningKvRows<BatchedQuan
     readonly compose?: (storage: Cache) => Cache) {
     super({ signature: `kv:delayed-quant:${bits}:${groupSize}:${start}`, conversionOffset: start,
       settle: rows => settleAffineRows(rows, groupSize, bits, start, kernelSet),
-      keepsDenseReads: row => { const source = affineSource(row); return !source || !transitionDue(source.offset, start); },
       converted: row => row instanceof QuantizedKVCache,
       makeLayout: () => new BatchedQuantizedKVCache(groupSize, bits, kernelSet(bits, groupSize, Dtype.bfloat16)),
       lone: storage => new Bf16FirstQuantizedKVCache(groupSize, bits, start, kernelSet, undefined, storage),
@@ -80,12 +79,14 @@ export class DelayedQuantizedKVCache extends FullTransitioningKvRows<BatchedQuan
     return { attend: (q, scale) => view.attend(q, scale, mask, independentPositions),
       dispose() { view.dispose(); mask.arr?.dispose(); } };
   }
-  /** Plain keys and values at the model's B while every row is still plain,
-   * assembled as the plain attention view does; the caller owns them. Once a
-   * row is converted, or the transition this append runs converts one, reading plain
-   * is an error raised before any row appends. */
+  /** The dense fetch at the model's B (the softcapped read's): after the
+   * transition the append runs, every row's keys and values as its storage
+   * fetches them dense (a converted row's dequantized), joined left-padded as
+   * the plain attention view joins them, or the packed layout's dense fetch
+   * once every row is converted; the caller owns them. */
   updateAndFetch(k: MlxArray, v: MlxArray): [MlxArray, MlxArray] {
-    this.advancePlain();
+    this.advance();
+    if (this.packed) return kvStorage(this.packed).updateAndFetch(k, v);
     return this.#appendPlain(k, v);
   }
   #appendPlain(k: MlxArray, v: MlxArray): [MlxArray, MlxArray] {

@@ -21,7 +21,6 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { createCausalMask } from "../kernels/attention/masks";
 import { runtimeValue } from "../runtime/config";
 import { KVCache } from "./kv";
-import { plainKvStorage } from "./dense-kv-reads";
 import { type AttentionCache, type AttentionRead, type BatchableCache, type Cache, type Mask } from "../contracts/mlx/cache";
 import { AttentionMasks, causalLease, sdpaRead, unmaskedLease, withLease, type MaskLease } from "./attention-read";
 import type { KvStorage } from "./kv-storage";
@@ -302,7 +301,6 @@ export function filterKVRows(
  *  (`buildBatchedDecodeMask`) for their query count, built once per forward
  *  through `masks`. */
 export class PaddedKVRows implements AttentionCache, BatchableCache {
-  readonly denseKvReads = plainKvStorage;
   #inner = new KVCache();
   #leftPad: number[] = [];
   #padded = false;

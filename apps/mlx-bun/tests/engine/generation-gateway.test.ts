@@ -228,7 +228,7 @@ test.skipIf(process.env.MLX_BUN_GEMMA2_NATIVE !== "1")("Gemma2 admits grammar, a
     args: { modelType: "gemma2", maskArray: true, attnLogitSoftcap: 50, layerTypes: null }, encodedKvAttention: false,
     // The text facts KV scheme policy reads; this one-layer graph uses full attention.
     config: { modelType: "gemma2", text: { enableMoeBlock: false, numHiddenLayers: 1, layerTypes: ["full_attention"] }, eosTokenIds: [] },
-    makeCache: () => [new KVCache()], loraState: { active: [] }, requiredDenseKvLayers: [0], composition: { kv },
+    makeCache: () => [new KVCache()], loraState: { active: [] }, composition: { kv },
     // The token phases a speculative binding reads; placement never forwards.
     ...Object.fromEntries(["prefillChunk", "prefillTail", "decode", "verify", "appendKnown", "logits"]
       .map(name => [name, () => { throw new Error("placement never forwards"); }])),
@@ -302,7 +302,7 @@ test.skipIf(process.env.MLX_BUN_GEMMA2_NATIVE !== "1")("Gemma2 places shared gen
   const model = Object.assign(Object.create(UniversalDenseModel.prototype), {
     args: { modelType: "gemma2", maskArray: true, attnLogitSoftcap: 50, layerTypes: null }, encodedKvAttention: false,
     config: { modelType: "gemma2", text: { enableMoeBlock: false }, eosTokenIds: [] },
-    makeCache: () => [new KVCache()], loraState: { active: [] }, requiredDenseKvLayers: [0],
+    makeCache: () => [new KVCache()], loraState: { active: [] },
   });
   const binding = bindMlxGateway(model);
   binding.createBatchGroup = () => { throw new Error("unexpected execution"); };

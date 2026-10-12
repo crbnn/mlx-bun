@@ -184,8 +184,6 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly prefixBase: string;
   /** Active LoRA adapters for the current generation (see LoraState). */
   readonly loraState = new LoraState();
-  /** Layers whose attention reads plain keys and values: none; it attends the storage its caches hold. */
-  readonly requiredDenseKvLayers: readonly number[] = Object.freeze([]);
   /** Prepared image/audio embeddings, layer taps for drafts, and a compiled
    * decode step, except through experts: shapeless replay
    * retraces their growing windows. */

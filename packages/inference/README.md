@@ -540,39 +540,26 @@ and selected ordinary continuous decoding. This pair does not qualify B2 or
 cancellation.
 Requests that supply fill remain ineligible for generation checkpoints.
 Speculation, grammar proposals and fill are planned over delayed affine KV as
-over any other scheme. Each graph declares at construction the
-layers its attention reads as plain keys and values (`requiredDenseKvLayers`:
-Gemma2's softcap layers; none for graphs that attend the storage their caches
-hold). The gateway and a directly composed
-batch group each bind that declaration once against the graph's fresh caches;
-an absent or malformed declaration is refused rather than read as none. A row
-whose next append would not read plain in a declared layer is refused with
-`DenseKvReadError` before that append. A graph whose attention reads dense KV
-(a softcap graph such as Gemma2, reading keys and values as arrays) admits a KV
-scheme when that scheme's own maintenance leaves every layer's storage certified
-for dense reads (`Cache.denseKvReads`, answered by the storage and the
-maintenance that owns it, probed when the binding or group is composed). Affine
-KV serves ordinary continuous decoding, with checkpoints, while each row's
-storage still reads plain. At a row's actual transition its pending token publishes first, and the
-row may finish there; otherwise that row alone is rejected with `DenseKvReadError` before any shared append (HTTP 501
-`unsupported_kv_transition`, or the stream's error event once it has opened).
-Main's serial path threw at that forward instead. TurboQuant storage decodes on
-read, so these graphs admit TurboQuant KV for ordinary continuous decoding
-throughout, with checkpoints. Direct grammar jump commits its
-spans over it through the shared span method, as main's serial jump did: one
-maintenance call, then one unsplit forward of the pending token and the forced
-span. Affine KV commits spans the
-same way while a row's storage still reads plain: a span whose maintenance ran
-before the transition appends unsplit even across it, and a row whose next
-append would no longer read plain is refused with `DenseKvReadError` before any
-layer appends, where direct generation fails in that forward. The span method
-binds the graph's dense-read layers explicitly; the gateway supplies the
-graph's own declaration. On 2026-09-28 UTC (M1 Max, MLX 0.32.2) the opt-in
+over any other scheme. A graph whose attention reads dense KV (a softcap graph
+such as Gemma2, reading keys and values as arrays) reads every storage through
+its dense fetch (`updateAndFetch`): plain storage as stored, TurboQuant
+decoded, affine storage dequantized, paged storage gathered. Its manual
+attention runs unchanged over the dequantized keys and values (dequantize and
+read, not a quantized kernel), so affine KV serves its ordinary, grammar,
+speculative and fill rows, with checkpoints, before and after each row's
+transition; main's serial path threw at the first forward past it. No artifact
+holds those numbers, so the native Gemma2 suite (`MLX_BUN_GEMMA2_NATIVE=1`)
+gates every phase against a frozen synthetic oracle at maxDiff 0: the plain
+storage the graph composes without a scheme, its fetched window requantized by
+mlx past the transition. Direct grammar jump commits its spans over any storage
+through the shared span method, as main's serial jump did: one maintenance
+call, then one unsplit forward of the pending token and the forced span, plain
+across the start and over the converted layers after it. On 2026-09-28 UTC (M1 Max, MLX 0.32.2) the opt-in
 `tests/parity/affine-grammar-spans.test.ts` (`MLX_BUN_TEST_AFFINE_SPANS_MODEL`)
 passed on cached Gemma2-2B-4bit `2c715097` with KV4: below the transition, B1
 spans matched direct jump-forward generation in tokens, matcher history and
-every projection's bytes; a row crossing it was refused with the same published
-tokens and matcher history; an interleaved peer matched its solo run and the
+every projection's bytes (a row crossing it was then refused, which this tree
+no longer does); an interleaved peer matched its solo run and the
 group served again.
 
 On 2026-09-28 UTC, cached Gemma2-2B-4bit snapshot `2c715097` (26 full-attention

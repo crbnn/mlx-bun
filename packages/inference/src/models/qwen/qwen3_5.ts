@@ -57,8 +57,6 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
   /** Base path for LoRA target keys (weights carry the language_model prefix). */
   readonly prefixBase = "language_model.model";
   readonly loraState = new LoraState();
-  /** Layers whose attention reads plain keys and values: none; it attends the storage its caches hold. */
-  readonly requiredDenseKvLayers: readonly number[] = Object.freeze([]);
   /** Prepared image and video embeddings with request-owned mRoPE positions,
    * layer taps for drafts. Its few full-attention layers materialize their
    * scores at long context, so prefill chunks shrink to bound that workspace. */

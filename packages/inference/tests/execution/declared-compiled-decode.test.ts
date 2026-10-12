@@ -30,7 +30,7 @@ function graph(declared: Parameters<typeof declareGraph>[0], extra: Partial<MlxT
     weightsBytes: 0,
     config: { modelType: "fixture", eosTokenIds: [], text: { numHiddenLayers: 1, layerTypes: ["full_attention"],
       numGlobalKeyValueHeads: 1, globalHeadDim: 4, slidingWindow: 0 } } as never,
-    makeCache: () => [new KVCache()], requiredDenseKvLayers: [], graphCapabilities: declareGraph(declared),
+    makeCache: () => [new KVCache()], graphCapabilities: declareGraph(declared),
     ...stubPhases((ids, caches) => { forwards.push(ids.shape[1]!); append(caches, ids.shape[1]!); return ops.zeros([1, ids.shape[1]!, VOCAB], Dtype.float32); },
       hidden => ops.copyOf(hidden)),
     ...extra,

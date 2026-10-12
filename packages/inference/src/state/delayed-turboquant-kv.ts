@@ -58,8 +58,6 @@ export class DelayedTurboQuantKVCache extends FullTransitioningKvRows<BatchedTur
     readonly compose?: (storage: Cache) => Cache) {
     super({ signature: `kv:delayed-turboquant:${kBits}:${vBits}:${start}`, conversionOffset: start,
       settle: rows => settleTurboQuantRows(rows, kBits, vBits, start, fusedDecode),
-      // The conversion leaves storage that decodes on read.
-      keepsDenseReads: () => true,
       converted: row => row instanceof TurboQuantKVCache,
       makeLayout: () => new BatchedTurboQuantKVCache(kBits, vBits, turboQuantKernels, fusedDecode),
       lone: storage => new Bf16FirstTurboQuantKVCache(kBits, vBits, start, fusedDecode, turboQuantKernels, undefined, storage),
