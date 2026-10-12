@@ -50,7 +50,7 @@ import type { MlxDeclaredGraph, MlxDenoisingOperations } from "../../src/contrac
 import type { TrainableGraph } from "../../src/contracts/mlx/trainable";
 import { declareGraph } from "../../src/models/capabilities";
 import type { PixelInput } from "../../src/contracts/mlx/media";
-import { compiledGegluActive,geglu,GegluMLP } from "../../src/layers/geglu";
+import { compiledGegluActive,geglu,GegluMLP } from "./geglu-reference";
 import { logitSoftcap } from "../../src/kernels/logits";
 import { compiledLogitSoftcap } from "../../src/kernels/softcap";
 import { QuantizedEmbedding } from "../../src/layers/quantized-embedding";

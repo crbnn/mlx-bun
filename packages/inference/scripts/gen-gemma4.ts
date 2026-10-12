@@ -213,10 +213,9 @@ const ownCache = (layer: DecoderLayer, i: number): Attend => (x, caches, phase) 
 
   const softcapHead = softcap === null ? `    this.#head = hidden => embed.asLinear(hidden);`
     : `    // The compiled softcap matches mlx-lm's @mx.compile logit_softcap; a compiled-decode trace records the plain ops.
-    const compiled = compiledGegluActive();
     this.#head = hidden => {
       const logits = embed.asLinear(hidden);
-      return disposing(logits, compiled && !isCompiledTrace()
+      return disposing(logits, compiledGeglu && !isCompiledTrace()
         ? compiledLogitSoftcap(logits, FINAL_LOGIT_SOFTCAP) : logitSoftcap(logits, FINAL_LOGIT_SOFTCAP));
     };`;
 
@@ -321,14 +320,14 @@ import type { GraphCapabilities } from "../../../contracts/portable/graph";
 import { mapPackedTokens } from "../../../input/token-groups";
 ${softcap === null ? "" : `import { logitSoftcap } from "../../../kernels/logits";
 import { compiledLogitSoftcap } from "../../../kernels/softcap";
-import { compiledGegluActive } from "../../../layers/geglu";
 `}import { disposing } from "../../../layers/helpers";
 import { LoraState } from "../../../layers/lora";
 import { RMSNorm } from "../../../layers/normalization";
 import { QuantizedEmbedding } from "../../../layers/quantized-embedding";
 import type { QuantizedLinear } from "../../../layers/quantized-linear";
 ${softcap === null ? "" : `import { isCompiledTrace } from "../../../runtime/compiled-trace";
-`}import { disposeResources } from "../../../runtime/resources";
+`}import { runtimeFlag } from "../../../runtime/config";
+import { disposeResources } from "../../../runtime/resources";
 import { AttentionMasks } from "../../../state/attention-read";
 import { composedFullAttentionCache, composedSlidingAttentionCache } from "../../../state/bf16-first-kv";
 import { deferredTurboQuantKernels } from "../../../state/turboquant-attention";
@@ -435,7 +434,10 @@ ${perLayer ? "  readonly #perLayerInputs: PerLayerInputs;\n" : ""}  readonly #he
     this.composition = composition;
     this.weightsBytes = [...weights.shards.files.values()].reduce((a, f) => a + f.mmap.size, 0);
     this.embed = QuantizedEmbedding.load(weights, \`\${PREFIX}.embed_tokens\`, config);
-    this.layers = Object.freeze(LAYERS.map((_, i) => new DecoderLayer(weights, config, PREFIX, i, i < CACHES)));
+    // The GeGLU activations${softcap === null ? "" : " and the head's softcap"} run the compiled closures unless MLX_BUN_COMPILED_GEGLU=0
+    // asked for the spelled-out ops: read once, here.
+    const compiledGeglu = runtimeFlag("MLX_BUN_COMPILED_GEGLU", true);
+    this.layers = Object.freeze(LAYERS.map((_, i) => new DecoderLayer(weights, config, PREFIX, i, i < CACHES, compiledGeglu)));
     this.finalNorm = new RMSNorm(weights.tensor(\`\${PREFIX}.norm.weight\`), t.rmsNormEps);
     this.embedScale = Math.sqrt(t.hiddenSize);
     this.windowSize = t.slidingWindow;

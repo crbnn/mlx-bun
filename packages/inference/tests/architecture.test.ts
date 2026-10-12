@@ -841,7 +841,6 @@ const seamRatchet: RatchetTable = {
   // Composition rules: each entry names the PLAN.md item that removes it.
   "graph-extends": {},
   "hot-path-read": {
-    "packages/inference/src/layers/geglu.ts": 1, // C2
     "packages/training/src/kernels/flash-cce.ts": 9, // C2 for now
   },
   "cache-escape": {},

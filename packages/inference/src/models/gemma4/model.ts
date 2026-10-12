@@ -45,7 +45,7 @@ import { bindGemma4MediaInput, gemma4DraftTarget, gemma4MediaEncoders } from "./
 import type { AttentionCache, AttentionRead, Cache, SharedKv } from "../../contracts/mlx/cache";
 import { isCompiledTrace } from "../../runtime/compiled-trace";
 import { mapPackedTokens } from "../../input/token-groups";
-import { compiledGegluActive } from "../../layers/geglu";
+import { runtimeFlag } from "../../runtime/config";
 import { disposing } from "../../layers/helpers";
 import { activePrefixLayout, ropeBlocks } from "../../layers/prefix-layout";
 import { captureRopeOffsets } from "../../state/capabilities";
@@ -241,12 +241,17 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
   /** The composition's `packedMixedMlp`: the groups of a mixed forward share
    *  one MLP call. */
   readonly #packMixedMlp: boolean;
+  /** The GeGLU activations and the head's softcap run the compiled closures
+   *  (mlx-lm's @mx.compile'd geglu and logit_softcap), unless
+   *  `MLX_BUN_COMPILED_GEGLU=0` asked for the spelled-out ops: read once, here. */
+  readonly #compiledGeglu: boolean;
 
   constructor(weights: Weights, config: ModelConfig, composition: Composition) {
     const t = config.text;
     if (t.hiddenSize === 0 || !config.text.tieWordEmbeddings)
       throw new Error("only tied-embedding text configs are supported");
 
+    this.#compiledGeglu = runtimeFlag("MLX_BUN_COMPILED_GEGLU", true);
     this.config = config;
     this.composition = composition;
     this.weightsBytes = [...weights.shards.files.values()]
@@ -260,7 +265,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
     this.numDonors = t.numHiddenLayers - t.numKvSharedLayers;
     this.layers = Array.from(
       { length: t.numHiddenLayers },
-      (_, i) => new DecoderLayer(weights, config, prefixBase, i, i < this.numDonors),
+      (_, i) => new DecoderLayer(weights, config, prefixBase, i, i < this.numDonors, this.#compiledGeglu),
     );
     // previous_kvs (reference Gemma4TextModel): sharer j uses the LAST
     // donor of its own layer type
@@ -843,7 +848,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
     let logits = this.embed.asLinear(h);
     const softcap = this.config.text.finalLogitSoftcapping;
     if (softcap !== null)
-      logits = disposing(logits, compiledGegluActive() && !isCompiledTrace()
+      logits = disposing(logits, this.#compiledGeglu && !isCompiledTrace()
         ? compiledLogitSoftcap(logits, softcap)   // fused, matches @mx.compile logit_softcap
         : logitSoftcap(logits, softcap));
     return logits;

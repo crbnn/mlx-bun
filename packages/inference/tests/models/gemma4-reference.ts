@@ -66,7 +66,7 @@ import { mapPackedTokens } from "../../src/input/token-groups";
 import { type TokenGroup } from "./frozen-token-groups";
 import { flashAttention,flashSupported,getTrainingAttn } from "../../src/kernels/attention/flash";
 import { unrotateValues as tqUnrotateValues } from "../../src/kernels/turboquant/ops";
-import { compiledGegluActive,geglu,GegluMLP } from "../../src/layers/geglu";
+import { compiledGegluActive,geglu,GegluMLP } from "./geglu-reference";
 import { disposing } from "../../src/layers/helpers";
 import { bidirMask } from "../../src/kernels/attention/masks";
 import { RMSNorm } from "../../src/layers/normalization";

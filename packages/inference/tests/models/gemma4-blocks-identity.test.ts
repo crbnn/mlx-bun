@@ -733,6 +733,22 @@ for (const kind of ["dense", "shared"] as const) {
           } finally { disposeAll(oldCohort, newCohort, oldRows, newRows, ...extracted); }
         }), 120_000);
 
+    test(`${kind}: MLX_BUN_COMPILED_GEGLU=0 is read once at construction: spelled-out GeGLU, the same bits as the old per-call read`, () => {
+      const spelled = createRuntimeConfig({ ...runtimeConfig().values, MLX_BUN_COMPILED_GEGLU: "0" });
+      withRuntimeConfig(spelled, () => {
+        const { weights, config } = artifact(kind);
+        const p: Pair = { kind, old: new FrozenGemma4Model(weights, config), current: new Gemma4Model(weights, config, testComposition()) };
+        expect(p.current.layers.every(layer => !layer.mlp.compiled && (layer.experts?.switchGlu.compiled ?? false) === false)).toBe(true);
+        const oldCaches = p.old.makeCache(), newCaches = p.current.makeCache();
+        try {
+          both(`${kind} spelled-out geglu prefill 37`, p, oldCaches, newCaches, forwardHidden([prompt(37, 71)]));
+          both(`${kind} spelled-out geglu decode`, p, oldCaches, newCaches, forwardHidden([[72]]));
+          both(`${kind} spelled-out geglu window 5`, p, oldCaches, newCaches, forwardHidden([prompt(5, 73)]));
+        } finally { disposeAll(oldCaches, newCaches); }
+      });
+      expect(pair(kind).current.layers.every(layer => layer.mlp.compiled)).toBe(true);
+    }, 120_000);
+
     test(`${kind} training forwards: full-sequence scoring, padded batch, prefix-shared, segmented, checkpointed`, () => {
       const p = pair(kind), tag = `${kind} training`;
       // 49 positions: past the sliding window, so the sliding layers' training

@@ -38,7 +38,8 @@ import type { MlxDeclaredGraph, MlxDenoisingOperations, MlxWidthClass } from "..
 import type { TrainableGraph } from "../../contracts/mlx/trainable";
 import { declareGraph } from "../capabilities";
 import type { PixelInput } from "../../contracts/mlx/media";
-import { compiledGegluActive,geglu,GegluMLP } from "../../layers/geglu";
+import { geglu, GegluMLP } from "../../layers/geglu";
+import { runtimeFlag } from "../../runtime/config";
 import { logitSoftcap } from "../../kernels/logits";
 import { compiledLogitSoftcap } from "../../kernels/softcap";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
@@ -132,7 +133,7 @@ class DiffExperts {
   readonly gateUp: QuantizedSwitchLinear;
   readonly down: QuantizedSwitchLinear;
   readonly hiddenDims: number; // moe_intermediate_size (split point)
-  constructor(weights: Weights, config: ModelConfig, prefix: string) {
+  constructor(weights: Weights, config: ModelConfig, prefix: string, readonly compiledGeglu: boolean) {
     this.gateUp = QuantizedSwitchLinear.load(weights, `${prefix}.gate_up_proj`, config);
     this.down = QuantizedSwitchLinear.load(weights, `${prefix}.down_proj`, config);
     this.hiddenDims = config.text.moeIntermediateSize;
@@ -169,7 +170,7 @@ class DiffExperts {
     gateUp.dispose();
     const gate = parts[0]!;
     const up = parts[1]!;
-    const mid = geglu(gate, up);
+    const mid = geglu(gate, up, this.compiledGeglu);
     let y = this.down.forward(mid, idx, doSort);
     mid.dispose();
     if (idx !== indices) idx.dispose();
@@ -204,7 +205,7 @@ class SelfConditioning {
   readonly gate: QuantizedLinear;
   readonly up: QuantizedLinear;
   readonly down: QuantizedLinear;
-  constructor(weights: Weights, config: ModelConfig, prefix: string) {
+  constructor(weights: Weights, config: ModelConfig, prefix: string, readonly compiledGeglu: boolean) {
     const eps = config.text.rmsNormEps;
     this.preNorm = new RMSNorm(weights.tensor(`${prefix}.pre_norm.weight`), eps);
     this.postNorm = new RMSNorm(null, eps);
@@ -214,7 +215,7 @@ class SelfConditioning {
   }
   forward(inputsEmbeds: MlxArray, signal: MlxArray): MlxArray {
     const normed = this.preNorm.forward(signal);
-    const m = geglu(this.gate.forward(normed), this.up.forward(normed));
+    const m = geglu(this.gate.forward(normed), this.up.forward(normed), this.compiledGeglu);
     normed.dispose();
     const s = this.down.forward(m);
     m.dispose();
@@ -369,15 +370,15 @@ class DiffDecoderLayer {
   readonly preFfNorm2: RMSNorm;
   readonly layerScalar: MlxArray;
 
-  constructor(weights: Weights, config: ModelConfig, idx: number) {
+  constructor(weights: Weights, config: ModelConfig, idx: number, compiledGeglu: boolean) {
     const t = config.text;
     const prefix = `model.decoder.layers.${idx}`;
     this.layerType = t.layerTypes[idx]!;
     const norm = (n: string) => new RMSNorm(weights.tensor(`${prefix}.${n}.weight`), t.rmsNormEps);
     this.attn = new DiffAttention(weights, config, `${prefix}.self_attn`, this.layerType);
-    this.mlp = new GegluMLP(weights, config, `${prefix}.mlp`);
+    this.mlp = new GegluMLP(weights, config, `${prefix}.mlp`, compiledGeglu);
     this.router = new DiffRouter(weights, config, `${prefix}.router`);
-    this.experts = new DiffExperts(weights, config, `${prefix}.experts`);
+    this.experts = new DiffExperts(weights, config, `${prefix}.experts`, compiledGeglu);
     this.inputNorm = norm("input_layernorm");
     this.postAttnNorm = norm("post_attention_layernorm");
     this.preFfNorm = norm("pre_feedforward_layernorm");
@@ -481,18 +482,24 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
   readonly visionTower: DiffusionVisionTower | null;
   readonly imageTokenId: number;
 
+  /** The GeGLU activations and the head's softcap run the compiled closures
+   * (the reference's mx.compile'd geglu and softcap), unless
+   * `MLX_BUN_COMPILED_GEGLU=0` asked for the spelled-out ops: read once, here. */
+  readonly #compiledGeglu: boolean;
+
   constructor(weights: Weights, config: ModelConfig) {
     const t = config.text;
     this.config = config;
+    this.#compiledGeglu = runtimeFlag("MLX_BUN_COMPILED_GEGLU", true);
     this.weightsBytes = [...weights.shards.files.values()].reduce((a, f) => a + f.mmap.size, 0);
     this.embed = QuantizedEmbedding.load(weights, "model.decoder.embed_tokens", config);
     this.embedScale = Math.pow(t.hiddenSize, 0.5);
     this.layers = Array.from(
       { length: t.numHiddenLayers },
-      (_, i) => new DiffDecoderLayer(weights, config, i),
+      (_, i) => new DiffDecoderLayer(weights, config, i, this.#compiledGeglu),
     );
     this.finalNorm = new RMSNorm(weights.tensor("model.decoder.norm.weight"), t.rmsNormEps);
-    this.selfConditioning = new SelfConditioning(weights, config, "model.decoder.self_conditioning");
+    this.selfConditioning = new SelfConditioning(weights, config, "model.decoder.self_conditioning", this.#compiledGeglu);
     this.encoderLayerScalars = this.layers.map((_, i) =>
       weights.tensor(`model.encoder.language_model.layers.${i}.layer_scalar`),
     );
@@ -811,7 +818,7 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
     // (stays f32; the golden is dumped f32). The flag-off arm spells out the same math.
     const wide = logits.astype(Dtype.float32);
     logits.dispose();
-    const capped = compiledGegluActive() ? compiledLogitSoftcap(wide, this.softcap) : logitSoftcap(wide, this.softcap);
+    const capped = this.#compiledGeglu ? compiledLogitSoftcap(wide, this.softcap) : logitSoftcap(wide, this.softcap);
     wide.dispose();
     return capped;
   }
