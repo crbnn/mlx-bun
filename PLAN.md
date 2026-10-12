@@ -964,6 +964,22 @@ unchanged.
       `tests/models/full-sequence-reference.ts` and `geglu-reference.ts` go with the other
       oracles after the merge; the preserved bug that the flash path ignores the block-sparse
       mask under prefix-shared training stays as found.
+- [x] E5, the B3 planner side and the ratchet item merged together (0eb1e42b on 6fe59e7c, then
+      onto the bench tooling at e436ccf5): generators regenerated with both sides (the M1 Max
+      template takes B3's deletions: no `kv`, `speculation` or paged refusal in `declareGraph`);
+      `composition.ts` keeps C3's split with B3's fields and the compiled-decode decision;
+      `full-sequence.ts` runs branch 1's stateless training caches through B3's
+      `trainingStandIn`; E5's selection reads `greedyDraft` and `prefillTailSplit` from the
+      composition (no `MLX_BUN_SPEC_GREEDY_DRAFT` reader left); the per-request sources and
+      the serial runner deleted as E5 intended. Gates: all 50 digest cells identical to
+      6fe59e7c on the M4 Pro (Trellis kv4 `69e8cc07…`), 10 of 10 on the M1 Max; identity at
+      maxDiff 0 on both; every real-weight suite at its branch's lines; training native 64
+      pass / 0 fail (the required check's failure fixed); root test exit 0. Found, pre-existing
+      on 6fe59e7c: `sliding-grammar-fill` with Llama 3B at window 8 fails one case ("a
+      cancelled row leaves its peer equal to its B1 output"), token-identical on every tree;
+      with Llama 1B it passes 9/9; owed to the final gate pass, with its first failing commit.
+      `packages/inference/README.md` still names `MLX_BUN_COMPILED_DECODE=0` three times for
+      the runtime oracle (the final cleanup).
 - [ ] Each new rule's failure message names the paved road, in the style of the existing
       "scheduling reaches storage through the row-layout port" message.
 - [x] Make the library checks a required status check on `main`, so a PR with a failing gate is
