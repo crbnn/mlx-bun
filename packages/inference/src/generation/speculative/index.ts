@@ -16,3 +16,4 @@ export * from "./sources/dflash-source";
 export * from "./sources/dflash2-source";
 export * from "./sources/ngram-source";
 export { specServeRun as generateSpeculative } from "./run";
+export { projectedDraftGroups, type ProjectedDraftMethod } from "./bindings/projected-draft-rows";

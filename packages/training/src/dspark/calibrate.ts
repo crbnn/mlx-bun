@@ -1,24 +1,77 @@
 // STS calibration (§3.2.1) of a trained drafter: run the production speculative
-// executor over a prompt set with confidence pruning DISABLED, so every draft
-// position's confidence AND its real accept/reject outcome are visible (pruning
-// would hide the positions it drops), fit per-position thresholds (sts.ts) and
-// write them into the checkpoint's dspark.json (`config.sts`). Every other
-// field of the checkpoint is preserved verbatim.
+// group over a prompt set, one request at a time (a batch of one), with
+// confidence pruning DISABLED, so every draft position's confidence AND its real
+// accept/reject outcome are visible (pruning would hide the positions it drops),
+// fit per-position thresholds (sts.ts) and write them into the checkpoint's
+// dspark.json (`config.sts`). Every other field of the checkpoint is preserved
+// verbatim.
 
 import type { RuntimeModel } from "@mlx-bun/inference/models";
 import type { ChatTemplate, ChatMessage, LoadedTokenizer } from "@mlx-bun/inference/input";
-import { generateSpeculative, DflashSource, type DraftProvider, type DraftSource, type TargetView } from "@mlx-bun/inference/generation/speculative";
+import { bindMlxGateway } from "@mlx-bun/inference/execution";
+import { DflashSource, projectedDraftGroups, targetLacks, type DraftProvider, type DraftRowGroup, type DraftSource,
+  type GroupedDraftProvider, type TargetView } from "@mlx-bun/inference/generation/speculative";
 import { loadDsparkDrafter, type DflashDrafter, type StsCalibration } from "@mlx-bun/inference/generation/speculative/loader";
 import { fitStsThresholds, type ConfSample } from "./sts";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-/** A DSpark draft provider that drafts the FULL unpruned block and reports each
- *  round's (confidence, accepted) outcomes once the target has verified it. */
+/** The drafter operations calibration drafts with. */
+type CalibrationDrafter = Pick<DflashDrafter, "cfg" | "forwardRows" | "projectContextRows" | "forwardInfer" | "dispose">;
+
+/** Rows that report, at each commit, every drafted position's confidence and
+ *  whether the target accepted it. `confidence` is the last draft's, per row. */
+function observedRows(rows: DraftRowGroup, confidence: () => readonly (readonly number[])[],
+  observe: (samples: ConfSample[]) => void): DraftRowGroup {
+  let drafted: number[] = [];
+  return {
+    get namespace() { return rows.namespace; }, get tapLayers() { return rows.tapLayers; }, get rowCount() { return rows.rowCount; },
+    append: checkpoints => rows.append(checkpoints), prepareAppend: checkpoints => rows.prepareAppend(checkpoints),
+    filterRows: keep => rows.filterRows(keep), capture: row => rows.capture(row), dispose: () => rows.dispose(),
+    async draft(pending, depth, steps) {
+      const proposals = await rows.draft(pending, depth, steps);
+      drafted = proposals.map(tokens => tokens.length);
+      return proposals;
+    },
+    commit(accepted, context) {
+      const conf = confidence();
+      // `drafted` positions this round verified; the first `accepted` matched.
+      for (const [row, count] of drafted.entries())
+        observe(Array.from({ length: count }, (_, pos) => ({ pos, conf: conf[row]![pos]!, accepted: pos < accepted[row]! })));
+      drafted = [];
+      return rows.commit(accepted, context);
+    },
+  };
+}
+
+/** A DSpark draft provider whose rows draft the FULL unpruned block and report
+ *  each round's (confidence, accepted) outcomes once the target has verified it. */
 export class CalibrationProvider implements DraftProvider {
   readonly id: string;
   readonly weightsBytes = 0;
-  constructor(private readonly drafter: DflashDrafter, private readonly observe: (samples: ConfSample[]) => void, id: string) { this.id = id; }
+  readonly grouped: GroupedDraftProvider;
+  constructor(private readonly drafter: CalibrationDrafter, private readonly observe: (samples: ConfSample[]) => void, id: string) {
+    this.id = id;
+    const namespace = `dspark-calibration:${id}`;
+    let confidence: readonly (readonly number[])[] = [];
+    const groups = projectedDraftGroups(namespace, drafter.cfg.tapLayers, target => {
+      if (!target.hiddenLayerTaps) throw targetLacks("hiddenLayerTaps");
+      const projection = target.hiddenLayerTaps.projection;
+      return {
+        namespace, schema: "dflash-context-v1", layers: drafter.cfg.nLayers,
+        project: hidden => drafter.projectContextRows(hidden),
+        draft(context, pending, _positions, depth) {
+          // No thresholds and no minimum confidence: every position is drafted
+          // and scored, whatever the checkpoint carries.
+          const block = drafter.forwardRows(projection, null, pending, depth,
+            { collectLogits: false, collectConfidence: true }, context);
+          confidence = block.conf;
+          return block.tokens;
+        },
+      };
+    });
+    this.grouped = { ...groups, open: options => observedRows(groups.open(options), () => confidence, observe) };
+  }
 
   open({ target }: { target: TargetView }): DraftSource {
     let confidence: number[] = [];
@@ -74,18 +127,30 @@ export async function calibrateDrafter(
   const gamma = drafter.cfg.gamma, samples: ConfSample[] = [];
   const provider = new CalibrationProvider(drafter, round => samples.push(...round), drafterDir);
   try {
-    const count = Math.min(opts.count ?? 32, opts.prompts.length);
-    for (let index = 0; index < count; index++) {
-      opts.signal?.throwIfAborted();
-      const row = opts.prompts[index]!;
-      const messages: ChatMessage[] = typeof row === "string" ? [{ role: "user", content: row }] : row;
-      let ids = tokenizer.encode(template.render(messages, { addGenerationPrompt: true }), true);
-      if (ids.length >= 2 && ids[0] === ids[1] && ids[0] === tokenizer.bosTokenId) ids = ids.slice(1);
-      const stats = await generateSpeculative(model, provider, gamma, ids,
-        { maxTokens: opts.maxTokens ?? 128, temperature: 0, eosTokenIds: [...model.config.eosTokenIds] }, () => {});
-      const spec = stats.spec!;
-      opts.onPrompt?.({ index, promptTokens: ids.length, generated: stats.generatedTokens, acceptance: spec.drafted ? spec.accepted / spec.drafted : 0 });
-    }
+    // The served lane: placement, the speculative method and its group, one row.
+    const binding = bindMlxGateway(model, { provider, numDraftTokens: gamma });
+    const group = binding.createBatchGroup({ maxBatch: 1 });
+    try {
+      const count = Math.min(opts.count ?? 32, opts.prompts.length);
+      for (let index = 0; index < count; index++) {
+        opts.signal?.throwIfAborted();
+        const row = opts.prompts[index]!;
+        const messages: ChatMessage[] = typeof row === "string" ? [{ role: "user", content: row }] : row;
+        let ids = tokenizer.encode(template.render(messages, { addGenerationPrompt: true }), true);
+        if (ids.length >= 2 && ids[0] === ids[1] && ids[0] === tokenizer.bosTokenId) ids = ids.slice(1);
+        const maxTokens = opts.maxTokens ?? 128, eosTokenIds = [...model.config.eosTokenIds];
+        const options = { maxTokens, temperature: 0, eosTokenIds };
+        const plan = binding.plan({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
+          hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true }, options,
+          { continuous: true, quantizedBatch: false, checkpoints: false });
+        if (plan.method !== "speculative" || plan.mechanism !== "continuous")
+          throw new Error(`calibration needs speculative placement for this target and drafter (${plan.reasons.join(", ") || plan.method})`);
+        const stats = await group.submit({ method: binding.methodRequest!(plan, options)!, promptIds: ids, maxTokens, eosTokenIds,
+          onToken() {}, ...(opts.signal ? { signal: opts.signal } : {}) });
+        const spec = stats.spec!;
+        opts.onPrompt?.({ index, promptTokens: ids.length, generated: stats.generatedTokens, acceptance: spec.drafted ? spec.accepted / spec.drafted : 0 });
+      }
+    } finally { await group.close(); }
   } finally { provider.dispose(); }
   const sts = fitStsThresholds(samples, gamma, opts.target ?? 0.5, opts.minSamples ?? 50);
   const positionSamples = new Array<number>(gamma).fill(0);

@@ -259,6 +259,47 @@ describe.skipIf(!native)("calibration provider", () => {
   });
 });
 
+describe.skipIf(!native)("calibration rows", () => {
+  test("draft the full unpruned block and report each verified round's outcomes per row", async () => {
+    const seen: object[] = [];
+    const conf = [0.9, 0.4, 0.2];
+    const fake = {
+      cfg: { ...DEFAULT_DFLASH_CONFIG, gamma: 3, nLayers: 1, tapLayers: TAPS, sts: { thresholds: [0, 0.8, 0.8], target: 0.5 } },
+      projectContextRows(hidden: MlxArray) {
+        const [B, L] = hidden.shape as [number, number];
+        return [{ k: ops.zeros([B, 1, L, 4], Dtype.float32), v: ops.zeros([B, 1, L, 4], Dtype.float32) }];
+      },
+      forwardRows(_model: unknown, _h: unknown, anchors: readonly number[], gamma: number, opts: object) {
+        seen.push({ ...opts });
+        return { tokens: anchors.map(() => [5, 6, 7].slice(0, gamma)), conf: anchors.map(() => conf.slice(0, gamma)) };
+      },
+      forwardInfer() { throw new Error("calibration drafts through its rows"); },
+      dispose() {},
+    };
+    const rounds: { pos: number; conf: number; accepted: boolean }[][] = [];
+    const provider = new CalibrationProvider(fake as never, round => rounds.push(round), "fake");
+    const target = { identity: {}, hiddenLayerTaps: { layerCount: 3, projection: {} } } as never;
+    // The prompt's tapped context seeds a row, which joins the draft rows as the group joins it.
+    const prefill = provider.grouped.openPrefill({ target, checkpoints: [null] });
+    const tokens = ops.fromInt32([1, 2, 3], [1, 3]);
+    const context = MlxArray.fromFloat32(new Float32Array(3 * M * H), [1, 3, M * H]);
+    await prefill.prefill(tokens, context);
+    const checkpoint = prefill.capture(0);
+    prefill.dispose(); tokens.dispose(); context.dispose();
+    const rows = provider.grouped.open({ target, checkpoints: [checkpoint],
+      sampling: { selection: { kind: "sampled" }, sample() { throw new Error("calibration drafts greedily"); } } });
+    for (const tensor of checkpoint.attachment.tensors) tensor.dispose();
+    try {
+      expect(await rows.draft([9], 3, [0])).toEqual([[5, 6, 7]]);
+      expect(seen).toEqual([{ collectLogits: false, collectConfidence: true }]);
+      const verified = MlxArray.fromFloat32(new Float32Array(4 * M * H), [1, 4, M * H]);
+      await rows.commit([1], verified); // one of three accepted
+      verified.dispose();
+      expect(rounds).toEqual([[{ pos: 0, conf: 0.9, accepted: true }, { pos: 1, conf: 0.4, accepted: false }, { pos: 2, conf: 0.2, accepted: false }]]);
+    } finally { rows.dispose(); }
+  });
+});
+
 describe.skipIf(!native)("calibration output", () => {
   test("writeSts sets config.sts and preserves every other field of dspark.json", () => {
     const dir = join(root, "sts-write");
