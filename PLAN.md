@@ -637,8 +637,18 @@ Exit: selection is data; `qwen38TrellisM4ProAccepts` and the nested ternary are 
       6217 ms; e4b decode 63.1 → 63.0, prefill 954 → 961, TTFT 702 → 697 ms; against the
       previous head within noise everywhere. The workflow's own run on #339 at 832ac8b1 (2026-10-12, preflight clear): no regression outside the band, Trellis TQ decode 0.997 [0.991, 1.003], e4b decode 0.999 [0.998, 1.000], every metric within noise. Found: Trellis decode RSS on the M1 Max is
       7614 MB on main and 12050 MB merged (11843 MB already at 918a6afb, so it predates E2
-      and B3): owed, a bisection across the landed steps and the reason, before the merge to
-      main; memory is one of the three axes. Not run: both M4 Pro benchmarks (its preflight
+      and B3). Bisected 2026-10-12, no regression: on main, 30412523, d71467c4, 33c7f5be and
+      832ac8b1 the worker holds 10.71 GB after warm-up and 11.38 GB after three decodes under
+      bf16 and under kv4 alike (MLX active 10.52 → 11.22 GB), `vmmap` identical (10.5 GB of
+      GPU memory in 1796 regions on both), the M4 Pro identical too. The workflow's main
+      readings (5582, 7614, 8156 MB across runs; the head steady at 12.0 GB; main first in
+      every run) are `ps` RSS undercounting: on the M1 Max neither tree pins the model (12 GB
+      is under half the 26.8 GB working set), so the OS drops pages from the process's count
+      without freeing them, and a decode at 14.4 tok/s over 10.5 GB of weights cannot hold
+      5 GB. Follow-up for the perf check: report the worker's MLX active memory (`/stats`) or
+      physical footprint, not `ps` RSS. Also seen on every tree: MLX active grows about
+      180 MB per request (157 under kv4), the prefix cache keeping each request's state. Not
+      run: both M4 Pro benchmarks (its preflight
       failed 90 times on 4.5 GB of swap; the machine needs a reboot) and the DFlash 2
       comparison anywhere (the M1 Max's artifact snapshot lacked `final_gain` until
       2026-10-12, now copied in). Owed on a rebooted M4 Pro: the default and the DFlash 2
