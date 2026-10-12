@@ -30,7 +30,7 @@ test("serve checks, serve-written keys, and each read site's fallback come from 
     .toEqual(["MLX_BUN_FORCE_WIRE force-wire", "MLX_BUN_ALLOW_PRIVATE_MEDIA allow-private-media"]);
   // Different contextual fallbacks at different sites are listed, not an error.
   expect(rows(baseline, "MLX_BUN_RD_PREFILL_CHUNK").map(row => row.split(" | ").slice(1, 3).join(" | "))).toEqual(["value | computed", "number | `2048`", "number | computed"]);
-  expect(rows(baseline, "MLX_BUN_FLASH_MIN_M")).toEqual(["| `MLX_BUN_FLASH_MIN_M` | value | `1024` | [loss.ts:" + lineOf("packages/training/src/loss.ts", 'runtimeValue("MLX_BUN_FLASH_MIN_M")') + "] |"]);
+  expect(rows(baseline, "MLX_BUN_FLASH_MIN_M")).toEqual(["| `MLX_BUN_FLASH_MIN_M` | value | `1024` | [trainer.ts:" + lineOf("packages/training/src/trainer.ts", 'runtimeValue("MLX_BUN_FLASH_MIN_M")') + "] |"]);
   expect(rows(baseline, "MLX_BUN_SESSION_CACHE")[0]).toContain("| value | unset (only `0` changes it) |");
   expect(rows(baseline, "MLX_BUN_LIBMLXC")[0]).toContain("| process.env | computed | [native.ts:");
   expect(rows(baseline, "MLX_BUN_PAGED_KV")[0]).toContain("[cli/serve.ts:");

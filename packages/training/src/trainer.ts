@@ -36,7 +36,7 @@ import {
 import { resolveRanks, bitsMapFromModel, readPerLayerKl, DEFAULT_TARGET_MODULES, type RankScaling } from "./rank";
 import { sftLoss, dpoLoss, dpoRefLogps, dpoMetrics, orpoLoss, orpoMetrics, type ChunkCtx, type SftScope } from "./loss";
 import { orpoLossPrefixShared, splitPrefixBatch } from "./prefix-shared";
-import { DEFAULT_FLASH_CCE, FlashCce, type FlashCceOptions } from "./kernels/flash-cce";
+import { FlashCce, type FlashCceOptions } from "./kernels/flash-cce";
 import { AdamW, warmupCosineSchedule } from "./optimizer";
 import { writeFileSync, appendFileSync, mkdirSync } from "node:fs";
 
@@ -207,18 +207,18 @@ export const DEFAULT_TRAIN_CONFIG: TrainConfig = {
  *  once, when the run is composed (A/B and diagnostic overrides; unset, the
  *  production kernels, `DEFAULT_FLASH_CCE`). */
 export function flashCceOptions(): FlashCceOptions {
-  const on = (name: `MLX_BUN_${string}`) => runtimeValue(name) === "1";
   return {
-    minRows: Number(runtimeValue("MLX_BUN_FLASH_MIN_M") ?? String(DEFAULT_FLASH_CCE.minRows)),
-    forwardSteel: !on("MLX_BUN_CCE_NOSTEEL"),
-    forwardFallback: on("MLX_BUN_CCE_LANE") ? "lane" : on("MLX_BUN_CCE_SCALAR") ? "scalar" : "simdgroup",
-    forwardSkipDequant: on("MLX_BUN_CCE_SG_SKIPDQ"),
-    backwardSteel: !on("MLX_BUN_CCE_BWD_NOSTEEL"),
-    backwardFallback: on("MLX_BUN_CCE_BWD_SCALAR") ? "scalar" : "simdgroup",
-    backwardSkipPhase2Dequant: on("MLX_BUN_CCE_BWD_SKIP_P2DQ"),
-    backwardSkipPhase2: on("MLX_BUN_CCE_BWD_SKIP_P2"),
-    backwardFilterEps: runtimeValue("MLX_BUN_CCE_BWD_FILTER_EPS") ?? DEFAULT_FLASH_CCE.backwardFilterEps,
-    backwardBlockEps: runtimeValue("MLX_BUN_CCE_BWD_BLOCK_EPS") ?? DEFAULT_FLASH_CCE.backwardBlockEps,
+    minRows: Number(runtimeValue("MLX_BUN_FLASH_MIN_M") ?? "1024"),
+    forwardSteel: runtimeValue("MLX_BUN_CCE_NOSTEEL") !== "1",
+    forwardFallback: runtimeValue("MLX_BUN_CCE_LANE") === "1" ? "lane"
+      : runtimeValue("MLX_BUN_CCE_SCALAR") === "1" ? "scalar" : "simdgroup",
+    forwardSkipDequant: runtimeValue("MLX_BUN_CCE_SG_SKIPDQ") === "1",
+    backwardSteel: runtimeValue("MLX_BUN_CCE_BWD_NOSTEEL") !== "1",
+    backwardFallback: runtimeValue("MLX_BUN_CCE_BWD_SCALAR") === "1" ? "scalar" : "simdgroup",
+    backwardSkipPhase2Dequant: runtimeValue("MLX_BUN_CCE_BWD_SKIP_P2DQ") === "1",
+    backwardSkipPhase2: runtimeValue("MLX_BUN_CCE_BWD_SKIP_P2") === "1",
+    backwardFilterEps: runtimeValue("MLX_BUN_CCE_BWD_FILTER_EPS") ?? "1e-5",
+    backwardBlockEps: runtimeValue("MLX_BUN_CCE_BWD_BLOCK_EPS") ?? "1e-5",
   };
 }
 
