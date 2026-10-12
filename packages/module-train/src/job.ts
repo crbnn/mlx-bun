@@ -63,7 +63,7 @@ export function createFinetuneRunner(runtime: () => Promise<FinetuneRuntime> = l
       const weights = await r.openWeights(modelDir);
       owned.push(weights);
       const model = r.createModel(weights, modelConfig);
-      if ("dispose" in model && typeof model.dispose === "function") owned.push(model as { dispose(): void });
+      owned.push(model);
       const tokenizer = await r.loadTokenizer(modelDir);
       const template = await r.loadTemplate(modelDir);
       const oldLimit = r.setWiredLimit(r.recommendedLimit());
