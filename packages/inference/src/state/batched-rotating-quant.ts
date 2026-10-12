@@ -2,8 +2,8 @@
 // per-layer kv_config naming ROTATING layers (gemma) batch. No stack ships
 // this (mlx-lm's batched path is bf16-only; optiq's mixed-KV hook is
 // serial-only), so per the composition rule the oracle is the SERIAL
-// RotatingQuantizedKVCache per row: each joiner's solo prefill converts with
-// the serial ops (BatchScheduler.#quantizeSolo), and this class only
+// RotatingQuantizedKVCache per row: each joiner's prefill alone converts through
+// its bf16-first lego, and this class only
 // re-arranges those bytes across the batch axis + runs the mlx-lm
 // BatchRotatingKVCache ring mechanics (batched-rotating.ts) over
 // (packed, scales, biases) triples instead of bf16 tensors.
@@ -78,13 +78,11 @@ export class BatchedRotatingQuantCache extends RotatingQuantizedKVCache implemen
   #rows: BatchedRotatingState;
   /** Per-row RoPE positions. STABLE ACROSS A STEP — refreshed only at
    *  releaseRopeArr() (the scheduler's post-dispatch hook), never inside
-   *  the update: the monolith CAPTURES it pre-update and ropes Q after
-   *  (an in-update dispose is a use-after-dispose there), and the
-   *  GENERATED specializations RE-READ it for Q post-update (an in-update
-   *  refresh hands K and Q different positions there — found the hard way
-   *  2026-07-05: the twin passes the generated files' instanceof cache
-   *  guards by subclassing, so an all-quant gemma batch decodes through
-   *  the generated graph). Widens the base's readonly to mutable. */
+   *  the update: a graph that captures it before the update ropes Q after
+   *  (an in-update dispose would be a use-after-dispose), and one that
+   *  re-reads it for Q after the update would see K and Q at different
+   *  positions after an in-update refresh. Widens the base's readonly to
+   *  mutable. */
   override ropeOffsetArr: MlxArray;
 
   private constructor(

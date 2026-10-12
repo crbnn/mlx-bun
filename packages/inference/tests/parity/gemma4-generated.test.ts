@@ -2,7 +2,7 @@
 // generated graph (12B, e4b or 26B, selected by config fingerprint) is an entire
 // graph built for the artifact's kv_config composition; it composes that
 // scheme's caches and reads every cache through that cache's own read, and must
-// equal the monolith bit for bit. This ports
+// equal the generic Gemma 4 graph bit for bit. This ports
 // `02d723a:tests/parity/generated-parity.test.ts` (12B and e4b cells) to every
 // registered fingerprint:
 // - createModel selects the generated graph registered for the fingerprint, for
@@ -21,10 +21,10 @@
 //   forward on every listed cache answers from its quantized storage;
 // - under plain bf16 caches, which the composition does not name, the
 //   generated graph reads them through their own reads: identical vectors;
-// - two different rows in one forward over kv_config caches equal the monolith's.
+// - two different rows in one forward over kv_config caches equal the generic graph's.
 // Each case logs a digest of the generated graph's outputs, for comparing runs
 // across trees. This is within-tree specialization identity, not
-// external-oracle parity; the monolith's oracle consumer is gemma4-parity.test.ts.
+// external-oracle parity; the generic graph's oracle consumer is gemma4-parity.test.ts.
 // Opt in with MLX_BUN_TEST_GENERATED_MODEL=/gemma4/snapshot (an artifact whose
 // fingerprint has a generated graph and which ships kv_config.json). Unset
 // skips; a blank value or an artifact without kv_config.json fails. No downloads.
@@ -71,7 +71,7 @@ export function recordReads(caches: A[], storageOf: (cache: A) => { signature():
 
 const inputs = optIn(Bun.env);
 
-test.skipIf(!inputs)("generated Gemma4 graph equals the monolith under kv_config and under plain caches", async () => {
+test.skipIf(!inputs)("generated Gemma4 graph equals the generic graph under kv_config and under plain caches", async () => {
   const ffi = await import("@mlx-bun/mlx/ffi");
   const ops = await import("@mlx-bun/mlx/ops");
   const { loadModelConfig, Weights, configFingerprint } = await import("@mlx-bun/inference/artifacts");

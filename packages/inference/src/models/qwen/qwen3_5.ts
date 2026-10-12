@@ -41,8 +41,8 @@ import { declareGraph } from "../capabilities";
 import { atEveryWidth, byWidth, type ReadPhase } from "../graph";
 import { bindQwenMediaInput, qwenDraftTarget, qwenMediaEncoders } from "./media-input";
 import { SSMCache } from "../../state/ssm";
-import { buildMropePositions, mropeInvFreq } from "../../layers/qwen-mrope";
-import { type MropeRequestState } from "../../contracts/mlx/positions";
+import { mropeInvFreq } from "../../layers/qwen-mrope";
+import type { MropeForwardState } from "../../contracts/mlx/positions";
 import { Qwen3Layer } from "./blocks";
 
 const PREFIX = "language_model";
@@ -143,12 +143,17 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
     return out;
   }
 
+  /** Releases the mRoPE frequencies a vision forward built; the weights are its owner's. */
+  dispose(): void {
+    this.#mropeInvFreq?.dispose();
+    this.#mropeInvFreq = null;
+  }
+
   /** One cache per layer, the full-attention caches sharing one mask memo:
    * the cache the composition's KV scheme names for each attention layer
    * (`composedFullAttentionCache`). Their TurboQuant read is dense
-   * (`denseTurboQuantKernels`): this graph read TurboQuant storage decoded,
-   * through `updateAndFetch` and the fused SDPA, before its blocks read through
-   * the cache, so the TurboQuant lego keeps its served numbers. */
+   * (`denseTurboQuantKernels`): the read decodes keys and values, then runs the
+   * fused SDPA. */
   makeCache(): Cache[] {
     const masks = new AttentionMasks(), kv = this.composition.kv;
     return this.layers.map((l, layer) => (l.isLinear ? new SSMCache() : composedFullAttentionCache(kv, layer, masks, denseTurboQuantKernels)));
@@ -281,11 +286,8 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
     finally { for (const h of hidden) h.dispose(); }
   };
 
-  /** Active vision mRoPE request state (serial lane; set by the generation
-   *  gateway around a vision request's run, null for text-only — which keeps
-   *  the bit-exact fast-rope path). The explicit serial executor scopes this value.
-   *  Shared media forwards pass request-owned positions directly. */
-  mrope: MropeRequestState | null = null;
+  /** The interleaved-mRoPE inverse frequencies, built by the first forward a
+   *  media request hands its positions; a text forward keeps the fast rope. */
   #mropeInvFreq: MlxArray | null = null;
 
   /** The vision prefill phase without request positions: spliced input embeddings [1, L, H] (image features
@@ -310,14 +312,13 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
     const L = h0.shape[1]!;
     // Vision requests: one interleaved-mRoPE cos/sin table per forward,
     // shared by all 12 full-attention layers (positions are layer-invariant).
-    let mropeFwd: ReturnType<typeof buildMropePositions> | null = null;
-    if (positions || this.mrope) {
+    let mropeFwd: MropeForwardState | null = null;
+    if (positions) {
       const t = this.config.text;
       const ropeDims = Math.trunc(t.headDim * t.partialRotaryFactor);
       const base = t.ropeParameters.full_attention?.ropeTheta ?? 10000;
       this.#mropeInvFreq ??= mropeInvFreq(ropeDims, base);
-      mropeFwd = positions ? { posIds: positions, invFreq: this.#mropeInvFreq, rotaryDims: ropeDims }
-        : buildMropePositions(this.mrope!, cache[this.faIdx]!.offset, L, this.#mropeInvFreq, ropeDims);
+      mropeFwd = { posIds: positions, invFreq: this.#mropeInvFreq, rotaryDims: ropeDims };
     }
     let h: MlxArray | null = h0;
     const prof = (globalThis as Record<string, unknown>).__deltaProf as

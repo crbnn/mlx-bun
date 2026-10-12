@@ -139,9 +139,9 @@ export interface BatchStats {
   fill?: import("../generation/index").GenerateStats["fill"];
   promptTokens: number;
   generatedTokens: number;
-  /** Prompt tokens served from the prompt cache: a joiner's solo
-   *  prefill starts from the longest usable cached prefix, exactly like the
-   *  serial lane's runGeneration take(). 0 on a cold prefill. */
+  /** Prompt tokens served from the prompt cache: a joiner's prefill starts
+   *  from the longest usable cached prefix the cache service acquires. 0 on a
+   *  cold prefill. */
   cachedTokens: number;
   finishReason: "stop" | "length";
   /** Wall-clock from admission (leaving the pending queue) to the first

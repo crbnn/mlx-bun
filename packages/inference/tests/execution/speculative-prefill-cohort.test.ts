@@ -50,16 +50,16 @@ function fixture(provider: Pick<DraftProvider, "id" | "grouped"> & { dispose(): 
   const scheme = kvOf(kv);
   const model = { config: { modelType: "fixture", eosTokenIds: [] }, graphCapabilities: declareGraph(),
     makeCache: () => [composedFullAttentionCache(scheme, 0, new AttentionMasks(), denseTurboQuantKernels)],
-    forwardHidden(ids: MlxArray, caches: Cache[]) {
+    forwardStub(ids: MlxArray, caches: Cache[]) {
       shapes.push([...ids.shape]); inputs.push([...ids.toIntTokens()]);
       using kv = ops.reshape(ids, [ids.shape[0]!, 1, ids.shape[1]!, 1]);
       for (const cache of caches) captureKvAttention(cache, kv, kv, unfusedAffineKernels(4, 64, kv.dtype)).dispose();
       return ops.reshape(ids, [ids.shape[0]!, ids.shape[1]!, 1]);
     },
     logitsFromHidden(hidden: MlxArray) { return ops.copyOf(hidden); },
-    ...stubPhases((ids, caches) => model.forwardHidden(ids, caches), hidden => model.logitsFromHidden(hidden)),
+    ...stubPhases((ids, caches) => model.forwardStub(ids, caches), hidden => model.logitsFromHidden(hidden)),
     ...graph,
-  } as unknown as RuntimeModel & { forwardHidden(ids: MlxArray, caches: Cache[]): MlxArray };
+  } as unknown as RuntimeModel & { forwardStub(ids: MlxArray, caches: Cache[]): MlxArray };
   const cache = new PromptCache(1024 ** 2);
   // The cache service's prefix store: the RAM cache, every put observed. A test may replace `take`.
   const prefixes: Pick<PromptCache, "take" | "put" | "reclaim"> = { take: cache.take.bind(cache), reclaim() {},
@@ -208,7 +208,7 @@ test("rows that tap exactly the layers resolved for their target are admitted", 
   const declared = { id: "declared", dispose() {}, grouped: { checkpointNamespace: () => "declared",
     targetTapLayers: () => [0], open: () => { throw new Error("decode rows must not open"); }, openPrefill: () => rows } };
   // The graph offers the hidden-tap operation over one layer, so the binding admits the declaration.
-  const f = fixture(declared as never, { hiddenTap: null, graphCapabilities: declareGraph({ hiddenLayerTaps: true }),
+  const f = fixture(declared as never, { graphCapabilities: declareGraph({ hiddenLayerTaps: true }),
     config: { modelType: "fixture", eosTokenIds: [], text: { numHiddenLayers: 1 } } }), row = f.row([1, 2, 3, 4]);
   try {
     f.method.prepare(row);
@@ -223,7 +223,7 @@ test("the binding checks its own snapshot of the declared taps: a later change t
     append() {}, filterRows() {}, materialize() {}, dispose() { disposed++; } };
   const mutable = { id: "mutable", dispose() {}, grouped: { checkpointNamespace: () => "mutable",
     targetTapLayers: () => taps, open: () => { throw new Error("decode rows must not open"); }, openPrefill: () => rows } };
-  const f = fixture(mutable as never, { hiddenTap: null, graphCapabilities: declareGraph({ hiddenLayerTaps: true }),
+  const f = fixture(mutable as never, { graphCapabilities: declareGraph({ hiddenLayerTaps: true }),
     config: { modelType: "fixture", eosTokenIds: [], text: { numHiddenLayers: 1 } } }), row = f.row([1, 2, 3, 4]);
   // After the binding checked [0], the provider's shared list gains a layer this graph cannot capture.
   taps.push(5);
@@ -248,7 +248,7 @@ const delayed: [string, KvOptions][] = [
 function readingGraph() {
   const kinds: string[][] = [], inputs: number[][] = [];
   const graph = {
-    forwardHidden(ids: MlxArray, caches: Cache[]) {
+    forwardStub(ids: MlxArray, caches: Cache[]) {
       const [batch, count] = ids.shape as [number, number], tokens = [...ids.toIntTokens()];
       kinds.push(caches.map(cache => (cache.composed?.storage() ?? cache).constructor.name)); inputs.push(tokens);
       using values = MlxArray.fromFloat32(Float32Array.from(tokens.flatMap(token =>

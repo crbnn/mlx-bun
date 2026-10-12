@@ -29,7 +29,7 @@ import { join } from "node:path";
  *  (confidence, accepted) verify outcomes (`fitStsThresholds` in
  *  `@mlx-bun/training/dspark`; `mlx-bun draft calibrate` writes them into
  *  dspark.json). Consumed by the confidence-scheduled
- *  draft-length pruning (Alg 1, single-user form) in forwardInfer. Stored
+ *  draft-length pruning (Alg 1) in forwardRows. Stored
  *  inside DflashConfig so it round-trips through dspark.json for free.
  *  ABSENT ⟹ no pruning — an uncalibrated checkpoint drafts exactly as before. */
 export interface StsCalibration {
@@ -71,11 +71,10 @@ export const DEFAULT_DFLASH_CONFIG: DflashConfig = {
 export interface TargetDims { hiddenSize: number; vocabSize: number; eps: number }
 
 export interface DflashTrainOut { draftLogits: MlxArray; conf: MlxArray }
-/** tokens/conf may be SHORTER than the requested γ when confidence pruning
- *  fires (Alg 1); always ≥1. draftLogits covers exactly tokens.length
+/** Per row, tokens/conf may be SHORTER than the requested γ when confidence
+ *  pruning fires (Alg 1); always ≥1. draftLogits covers the drafted
  *  positions — ABSENT when the caller passed collectLogits:false (the loop
  *  never materialized/concatenated the per-position logits). */
-export interface DflashDraftBlock { tokens: number[]; conf: number[]; draftLogits?: MlxArray }
 export interface DflashDraftRows { tokens: number[][]; conf: number[][]; draftLogits?: MlxArray; }
 export type DflashContextAttention = DsparkContextAttention;
 export interface DflashDraftOpts {
@@ -91,8 +90,8 @@ export interface DflashDraftOpts {
   thresholds?: number[];
   minConf?: number;
   /** Materialize+concat the per-position draft logits into the returned
-   *  DflashDraftBlock.draftLogits. Default true. The serve-loop
-   *  draft() path runs its own verify lm-head and never reads it — pass false
+   *  DflashDraftRows.draftLogits. Default true. The grouped draft rows
+   *  run their own verify lm-head and never read it — pass false
    *  there to skip the dead concat + a host-unrelated GPU alloc every round. */
   collectLogits?: boolean;
   /** Return confidence telemetry; pruning still computes it when needed. */
@@ -364,7 +363,7 @@ export class DflashDrafter implements DsparkDrafterModel {
     const wH = this.get("rnn.wH"), bH = this.get("rnn.bH"), wO = this.get("rnn.wO");
     let s: MlxArray | null = zerosArray([A, r]); // s_{-1} = 0
     const bSlices: MlxArray[] = [];
-    const pending: MlxArray[] = []; // iteration temps, for the catch (forwardInfer pattern)
+    const pending: MlxArray[] = []; // iteration temps, released by the catch
     try {
       for (let k = 0; k < G; k++) {
         const e1S = emb1.slice([0, k, 0], [A, k + 1, r]); pending.push(e1S);
@@ -434,11 +433,6 @@ export class DflashDrafter implements DsparkDrafterModel {
     }
   }
 
-  /** Single-request callers use the same graph and proposal head at B1. */
-  forwardInfer(model: DraftProjection, hCtx: MlxArray, anchor: number, gamma: number, opts: DflashDraftOpts = {}): DflashDraftBlock {
-    const result = this.forwardRows(model, hCtx, [anchor], gamma, opts);
-    return { tokens: result.tokens[0]!, conf: result.conf[0]!, draftLogits: result.draftLogits };
-  }
 
   forwardRows(model: DraftProjection, hCtx: MlxArray | null, anchors: readonly number[], gamma: number,
     opts: DflashDraftOpts = {}, context?: DflashContextAttention): DflashDraftRows {

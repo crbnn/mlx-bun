@@ -401,7 +401,7 @@ test.each([["two-model", twoModelDraft, "gemma2-draft"], ["n-gram", () => new Ng
       expect(refusals(plan)).toEqual([]);
       expect(JSON.parse(binding.methodRequest!(plan, options as GenerateOptions)!.key).slice(0, 2)).toEqual(["speculative", id]);
     }
-    // As main's serial path did, a logprobs request ignores its draft and decodes ordinarily.
+    // As main did, a logprobs request ignores its draft and decodes ordinarily.
     const logprobs = binding.plan({ ...draft, wantsLogprobs: true }, {}, scheduling);
     expect(logprobs).toMatchObject({ method: "autoregressive", mechanism: "continuous" });
     expect(logprobs.reasons).toContain("draft-incompatible-with-request");

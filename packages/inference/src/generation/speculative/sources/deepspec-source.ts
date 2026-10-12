@@ -21,7 +21,7 @@
 //                              semantics: rejected rows never enter the
 //                              context).
 // Context rows are cached post-norm-post-rope — bit-equivalent to their
-// in-round concat (per-row RMSNorm/RoPE; argued in projectContextKV's doc).
+// in-round concat (per-row RMSNorm/RoPE; argued in projectContextKVRows's doc).
 
 import { artifactIdentity } from "../../../artifacts/identity";
 import { deepspecGroups } from "../bindings/deepspec-rows";

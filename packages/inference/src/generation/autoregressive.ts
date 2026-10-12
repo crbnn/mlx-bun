@@ -552,9 +552,9 @@ async function* generateInner(
      *  the yield, avoiding a second readback). -1 when grammar is off — the
      *  pipelined path keeps its deferred itemUint32 below. */
     let grammarTok = -1;
-    // Jump-forward decoding (opt-in, the composition's grammarJump; serial lane
-    // only — the batch lane's #stepGrammar doesn't jump yet): when the
-    // grammar forces a unique continuation, emit its retokenized ids without
+    // Jump-forward decoding in this direct loop (opt-in, the composition's
+    // grammarJump; the scheduler's grammar rows jump through the span method
+    // the planner binds): when the grammar forces a unique continuation, emit its retokenized ids without
     // per-token forwards — ONE multi-token forward carries them into the KV
     // (see GrammarController.jumpForward for the contract + the fidelity
     // note on why this is opt-in). Excluded when logprobs are requested

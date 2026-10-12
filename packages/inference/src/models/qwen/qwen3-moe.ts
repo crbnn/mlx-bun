@@ -282,11 +282,13 @@ export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
     return out;
   }
 
+  /** Builds no constants and opens no weights: nothing to release. */
+  dispose(): void {}
+
   /** One cache per layer, sharing one mask memo (create_attention_mask's one
    * mask per forward, built by the caches). Their TurboQuant read is dense
-   * (`denseTurboQuantKernels`): this graph read TurboQuant storage decoded,
-   * through `updateAndFetch` and the fused SDPA, before its blocks read through
-   * the cache. */
+   * (`denseTurboQuantKernels`): the read decodes keys and values, then runs the
+   * fused SDPA. */
   makeCache(): Cache[] {
     const masks = new AttentionMasks();
     return this.layers.map((_, layer) => composedFullAttentionCache(this.composition.kv, layer, masks, denseTurboQuantKernels));

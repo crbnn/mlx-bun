@@ -67,6 +67,8 @@ export interface CompositionRequest {
   readonly greedyDraft?: boolean;
   /** The GeGLU activations run the compiled closures. Default true. */
   readonly compiledGeglu?: boolean;
+  /** The SwiGLU activations run the compiled closure. Default true. */
+  readonly compiledSwiglu?: boolean;
   /** Compose the Neural Engine bridge where a graph builds a Neural Engine
    * operation. Default true: every Apple-silicon Mac has the unit. */
   readonly aneBridge?: boolean;
@@ -120,5 +122,6 @@ function compose(request: Omit<CompositionRequest, "kv">, kv: Composition["kv"])
     grammarJump: request.grammarJump ?? COMPOSITION_DEFAULTS.grammarJump,
     greedyDraft: request.greedyDraft ?? COMPOSITION_DEFAULTS.greedyDraft,
     compiledGeglu: request.compiledGeglu ?? COMPOSITION_DEFAULTS.compiledGeglu,
+    compiledSwiglu: request.compiledSwiglu ?? COMPOSITION_DEFAULTS.compiledSwiglu,
   });
 }

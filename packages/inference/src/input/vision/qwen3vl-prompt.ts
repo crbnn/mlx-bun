@@ -43,7 +43,7 @@ export interface Qwen3VLVisionPrompt {
   prefixIdentity?: string;
   /** [1, L, H] bf16 spliced input embeddings (caller owns → generate()). */
   embeddings: MlxArray;
-  /** Request mRoPE state for Qwen35Model.mrope. */
+  /** The request's mRoPE positions state (the media input binds it to its forwards). */
   mrope: MropeRequestState;
 }
 

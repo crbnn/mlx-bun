@@ -10,13 +10,10 @@
 // layouts per row, before and after a row's transition), paged storage
 // gathered. Affine storage is dequantized and then read by the same manual
 // attention, so a converted layer keeps the graph's own arithmetic over the
-// values its storage holds. The read is the call such a graph made before it
-// read through the cache: the cache's mask for the query count before the
-// append, the append through `updateAndFetch`, then the manual attention under
-// that mask.
-// TODO(B1): the dense caches own this read as a kernel set chosen at
-// construction, with their own masks, once the deprecated fetches leave the
-// cache contract.
+// values its storage holds. The read takes the storage's mask for the query
+// count before the append, appends through `updateAndFetch`, then attends
+// manually under that mask. The fetch and the mask are storage reads internal
+// to `state/` (`KvStorage`); the cache contract carries neither.
 
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";

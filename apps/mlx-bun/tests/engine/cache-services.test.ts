@@ -159,26 +159,13 @@ test("engine construction failure preserves the original error and attempts hook
   expect(f.events).toEqual(["cache close", "model dispose"]);
 });
 
-test("a TurboQuant scheme the codec cannot encode for this model is refused before any cache is composed, as main's startup did", async () => {
+test("a TurboQuant scheme composes the cache service at every served head dimension", async () => {
   const turbo: KvStorageScheme = { kind: "turbo", kBits: 8, vBits: 3 };
-  const withHeadDim = (globalHeadDim: number, kv: KvStorageScheme) => {
-    const f = setup({}, kv); (f.context.model.config as { text?: unknown }).text = { globalHeadDim }; return f;
-  };
-  for (const globalHeadDim of [96, 72]) {
-    const f = withHeadDim(globalHeadDim, turbo);
-    await expect(createCacheServices(f.context, f.binding, {}, f.deps)).rejects.toThrow(
-      `--kv-quant turbo: this model's full-attention head_dim is ${globalHeadDim}; TurboQuant supports {64,128,256,512}`);
-    expect(f.events).toEqual([]);   // no cache service was built
-  }
-  for (const globalHeadDim of [128, 256]) {
-    const f = withHeadDim(globalHeadDim, turbo);
+  for (const globalHeadDim of [64, 96, 128, 256, 512]) {
+    const f = setup({}, turbo); (f.context.model.config as { text?: unknown }).text = { globalHeadDim };
     const caches = await createCacheServices(f.context, f.binding, {}, f.deps);
     expect(caches.resolvedKvScheme.kind).toBe("turbo");
   }
-  // Other schemes do not depend on the TurboQuant codec's dimensions.
-  const f = withHeadDim(96, { kind: "affine", bits: 4, groupSize: 64, kernels: "unfused" });
-  const caches = await createCacheServices(f.context, f.binding, {}, f.deps);
-  expect(caches.resolvedKvScheme.options.kvBits).toBe(4);
 });
 
 test("model directories have separate saved-prefix stores; restarts reuse them without reading weights", async () => {

@@ -330,7 +330,7 @@ export async function loadContext(
       draft: draft && { numDraftTokens: draft.numDraftTokens, adaptive: opts.adaptiveDraftDepth } });
     if (!planned) {
       model = createModel(weights!, config, composition, profile);
-      if ("dispose" in model && typeof model.dispose === "function") owned.add(model);
+      owned.add(model);
     }
     // Generation must stop on the tokenizer's eos_token — the chat turn
     // terminator (e.g. Qwen <|im_end|> = 248046). Some configs (Qwen3.5-4B)

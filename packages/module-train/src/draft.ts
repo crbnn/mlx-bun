@@ -120,7 +120,7 @@ async function loadTarget(modelDir: string): Promise<DraftTarget> {
   try {
     const model = models.createModel(weights, config);
     return { model, tokenizer: await input.loadTokenizer(modelDir), template: await input.ChatTemplate.load(modelDir),
-      dispose() { if ("dispose" in model && typeof model.dispose === "function") (model as { dispose(): void }).dispose(); weights.dispose(); } };
+      dispose() { try { model.dispose(); } finally { weights.dispose(); } } };
   } catch (error) { weights.dispose(); throw error; }
 }
 

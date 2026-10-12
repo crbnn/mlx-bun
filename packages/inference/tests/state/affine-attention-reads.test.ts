@@ -1,13 +1,13 @@
-// B1b bit-identity gate: every affine cache's named reads against what the
-// graphs compute today for the same cache and phase. "Old" is the graph's call
-// copied verbatim: `makeMask` before the append, `updateAndFetchQuantized`, then
-// `quantizedSdpa` with that mask, frozen below as it was before B1b (its
-// MLX_BUN_NO_FUSED_SDPA read becomes the `noFused` argument, and the M4 Pro
-// grouped-heads case keeps its device check). The committed read's old call is
-// the independent-rows branch; the M4 Pro graph's is its `decodeCore` or
-// `foldedCore`. "New" is the phase-named append and `attend`. Same random
-// q/k/v. Each step names the kernel the old dispatch took and the one the new
-// read takes: the same kernel must give maxDiff 0; a different one is a
+// Every affine cache's named reads against the kernel call a graph made on the
+// same storage before the cache owned its read: `makeMask` before the append,
+// `updateAndFetchQuantized`, then the kernel the composition names with that
+// mask (the tiled port while the mask is plain causal or a causal-equivalent
+// array and the configuration tiles, the unfused port otherwise; `noFused` is
+// the unfused composition). The committed read's call is the quantized append
+// for independent positions; the M4 Pro composition's is the KV4 decode kernel
+// or the folded window kernel. "New" is the phase-named append and `attend`.
+// Same random q/k/v. Each step names the kernel the call took and the one the
+// new read takes: the same kernel must give maxDiff 0; a different one is a
 // recorded divergence, named in the report and bounded at bf16 level: outputs
 // lie in [-2, 2], where a bf16 step is 2^-6, and the bound is four steps (the
 // tiled port normalizes after its value matmul, so it rounds differently from
@@ -18,7 +18,7 @@ import { Dtype, deviceArchitecture } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { AttentionCache, AttentionRead, Cache, CommittedAttentionCache, Mask } from "../../src/contracts/mlx/cache";
 import {
-  FINFO_MIN, foldedQuantizedSdpa, quantizedSdpaTiled, quantizedSdpaUnfused,
+  foldedQuantizedSdpa, fusedSdpaConfigSupported, quantizedSdpaTiled, quantizedSdpaUnfused,
 } from "../../src/layers/quantized-attention";
 import { quantizedAppendAttention } from "../../src/layers/quantized-append-attention";
 import { kv4DecodeAttention } from "../../src/layers/kv4-decode-attention";
@@ -39,113 +39,13 @@ import { kvStorage } from "../../src/state/kv-storage";
 const HKV = 2, HQ = 8, D = 128, SCALE = 0.088, WINDOW = 32, TOLERANCE = 4 * 2 ** -6;
 const M4PRO = deviceArchitecture() === "applegpu_g16s";
 
-// --- The dispatch before B1b, frozen ------------------------------------------------------------
+// --- The kernel a call names ----------------------------------------------------------------------
 
-/** `quantizedSdpaUnfused` before B1b, verbatim (the grouped-heads case with
- * its device check included). */
-function oldUnfused(
-  q: MlxArray, kq: ops.QuantizedTensor, vq: ops.QuantizedTensor,
-  scale: number, mask: Mask, groupSize: number, bits: number,
-): MlxArray {
-  const [B, H, L, D] = q.shape as [number, number, number, number];
-  const KV = kq.packed.shape[1]!;
-  const nRep = H / KV;
-  const N = kq.packed.shape[2]!;
-
-  // scale is 1.0 for Gemma4 (q/k are RMS-normed) — skip the identity multiply.
-  let queries = q;
-  const owned: MlxArray[] = [];
-  if (scale !== 1.0) { queries = ops.mulScalar(q, scale); owned.push(queries); }
-
-  let kT = kq;
-  let vT = vq;
-  if (nRep > 1) {
-    const qr = ops.reshape(queries, [B, KV, nRep, L, D]);
-    owned.push(qr);
-    queries = qr;
-    const expand = (t: ops.QuantizedTensor): ops.QuantizedTensor => {
-      const e = (a: MlxArray): MlxArray => {
-        // expand_dims(axis=-3) like the reference — view-preserving;
-        // reshape would copy the strided slice and change kernel paths
-        const r = ops.expandDims(a, -3);
-        owned.push(r);
-        return r;
-      };
-      return { packed: e(t.packed), scales: e(t.scales), biases: e(t.biases) };
-    };
-    kT = expand(kq);
-    vT = expand(vq);
-  }
-
-  // M4 Pro's native key matvec retains exact arithmetic when three GQA
-  // heads share a batch. Restore score geometry before softmax/value work.
-  const groupHeads = oldGroupsHeads(q, kq, groupSize, bits);
-  let keyQueries = queries;
-  if (groupHeads) {
-    keyQueries = ops.reshape(queries, [B, KV, 2, 9, D]);
-    owned.push(keyQueries);
-  }
-  let scores = ops.quantizedMatmulQT(keyQueries, kT, true, groupSize, bits);
-  owned.push(scores);
-  if (groupHeads) {
-    scores = ops.reshape(scores, [B, KV, nRep, L, N]);
-    owned.push(scores);
-  }
-
-  let maskArr: MlxArray | null = null;
-  let ownsMask = false;
-  if (mask.mode === "causal") {
-    const qIdx = ops.arange(N - L, N, 1, Dtype.int32);
-    const kIdx = ops.arange(0, N, 1, Dtype.int32);
-    const qCol = ops.reshape(qIdx, [L, 1]);
-    const kRow = ops.reshape(kIdx, [1, N]);
-    maskArr = ops.greaterEqual(qCol, kRow);
-    ownsMask = true;
-    for (const a of [qIdx, kIdx, qCol, kRow]) a.dispose();
-  } else if (mask.mode === "array") {
-    maskArr = mask.arr;
-    if (maskArr && maskArr.ndim === 4 && nRep > 1) {
-      maskArr = ops.expandDims(maskArr, 1);
-      ownsMask = true;
-    }
-  }
-  if (maskArr) {
-    let masked: MlxArray;
-    if (maskArr.dtype === Dtype.bool) {
-      using ninf = ops.scalarLike(FINFO_MIN[scores.dtype] ?? -3.4e38, scores);
-      masked = ops.where(maskArr, scores, ninf);
-    } else masked = ops.add(scores, maskArr);
-    if (ownsMask) maskArr.dispose();
-    owned.push(masked);
-    scores = masked;
-  }
-
-  const probs = ops.softmaxAxis(scores, -1, true);
-  owned.push(probs);
-  let out = ops.quantizedMatmulQT(probs, vT, false, groupSize, bits);
-  if (nRep > 1) {
-    const r = ops.reshape(out, [B, H, L, D]);
-    out.dispose();
-    out = r;
-  }
-  for (const a of owned) a.dispose();
-  return out;
-}
-
-function oldGroupsHeads(q: MlxArray, kq: ops.QuantizedTensor, groupSize: number, bits: number): boolean {
-  const [B, H, L, D] = q.shape as [number, number, number, number];
-  return B <= 2 && H === 24 && kq.packed.shape[1] === 4 && L === 3 && D === 256 &&
-    kq.packed.shape[2]! >= 8192 && groupSize === 64 && bits === 4 &&
-    (q.dtype === Dtype.bfloat16 || q.dtype === Dtype.float32) &&
-    deviceArchitecture() === "applegpu_g16s";
-}
-
-/** `fusedSdpaSupported` before B1b; `noFused` is its env read. */
-function oldFusedSupported(q: MlxArray, mask: Mask, groupSize: number, bits: number, noFused: boolean): boolean {
-  if (noFused) return false;
-  if (bits !== 4 && bits !== 8) return false;
-  if (groupSize !== 32 && groupSize !== 64 && groupSize !== 128) return false;
-  if (q.dtype !== Dtype.bfloat16 && q.dtype !== Dtype.float16) return false;
+/** Whether a window takes the tiled port: the configuration tiles, the activations
+ * are half precision, and the mask is plain causal (or none, or an array the cache
+ * marks causal-equivalent); `noFused` is the unfused composition. */
+function tiles(q: MlxArray, mask: Mask, groupSize: number, bits: number, noFused: boolean): boolean {
+  if (noFused || !fusedSdpaConfigSupported(groupSize, bits, q.dtype)) return false;
   if (mask.mode === "causal" || mask.mode === "") return true;
   if (mask.mode === "array")
     return mask.causalEquivalent === true && mask.arr !== null &&
@@ -153,19 +53,17 @@ function oldFusedSupported(q: MlxArray, mask: Mask, groupSize: number, bits: num
   return false;
 }
 
-/** The old output, the kernel the dispatch took, and whether the cache handed
- * it an array mask (its own state made the mask other than plain causal). */
+/** The call's output, the kernel it took, and whether the cache handed it an
+ * array mask (its own state made the mask other than plain causal). */
 interface Result { out: MlxArray; kernel: string; masked?: boolean }
 
-/** `quantizedSdpa` before B1b, naming the kernel it took. The tiled port is
- * unchanged by B1b and imported. */
-function oldQuantizedSdpa(q: MlxArray, kq: ops.QuantizedTensor, vq: ops.QuantizedTensor, scale: number, mask: Mask,
+/** The kernel a window or a decode names, called directly on the storage. */
+function kernelCall(q: MlxArray, kq: ops.QuantizedTensor, vq: ops.QuantizedTensor, scale: number, mask: Mask,
   groupSize: number, bits: number, noFused: boolean): Result {
-  if (q.shape[2]! > 1 && oldFusedSupported(q, mask, groupSize, bits, noFused))
+  if (q.shape[2]! > 1 && tiles(q, mask, groupSize, bits, noFused))
     return { out: quantizedSdpaTiled(q, kq, vq, scale, mask, groupSize, bits), kernel: "tiled" };
-  return { out: oldUnfused(q, kq, vq, scale, mask, groupSize, bits), kernel: oldGroupsHeads(q, kq, groupSize, bits) ? "grouped" : "unfused" };
+  return { out: quantizedSdpaUnfused(q, kq, vq, scale, mask, groupSize, bits), kernel: "unfused" };
 }
-
 // --- The graphs' calls ----------------------------------------------------------------------------
 
 /** Qwen3Attention / Gemma 4 / MiniCPM 5 today: the mask before the append, the
@@ -175,7 +73,7 @@ function oldRead(cache: Cache, window: number | null, k: MlxArray, v: MlxArray, 
   const mask = kvStorage(cache).makeMask(k.shape[2]!, window);
   const quantized = kvStorage(cache).quantizedAttention!;
   const [keys, values] = quantized.updateAndFetchQuantized(k, v);
-  try { return { ...oldQuantizedSdpa(q, keys, values, scale, mask, quantized.groupSize, quantized.bits, noFused), masked: mask.mode === "array" }; }
+  try { return { ...kernelCall(q, keys, values, scale, mask, quantized.groupSize, quantized.bits, noFused), masked: mask.mode === "array" }; }
   finally { disposeTriple(keys); disposeTriple(values); mask.arr?.dispose(); }
 }
 
@@ -187,7 +85,7 @@ function oldCommittedRead(cache: Cache, k: MlxArray, v: MlxArray, q: MlxArray): 
   const [keys, values] = quantized.updateAndFetchQuantized(k, v);
   try {
     if (L > 1) return { out: quantizedAppendAttention(q, keys, values, SCALE, quantized.groupSize, quantized.bits), kernel: "append" };
-    return oldQuantizedSdpa(q, keys, values, SCALE, mask, quantized.groupSize, quantized.bits, false);
+    return kernelCall(q, keys, values, SCALE, mask, quantized.groupSize, quantized.bits, false);
   } finally { disposeTriple(keys); disposeTriple(values); mask.arr?.dispose(); }
 }
 
@@ -306,12 +204,12 @@ function advance(pair: [Cache, Cache], B: number, steps: readonly Step[], g: Geo
   }
 }
 
-/** One composition of the generic caches and the old dispatch it is compared
+/** One composition of the generic caches and the kernel call it is compared
  * with. `tiled-causal`: `tiledCausalAffineKernels` (`--kv-quant config`, OptiQ
- * parity) against the dispatch with fused SDPA on. `unfused`:
- * `unfusedAffineKernels` (uniform `--kv-quant N`, mlx-lm parity) against it
- * with MLX_BUN_NO_FUSED_SDPA=1. `tiled`: `tiledAffineKernels` (always tiled, no
- * oracle) against the fused-on dispatch, recorded. */
+ * parity) against the tiled window kernel the rule names. `unfused`:
+ * `unfusedAffineKernels` (uniform `--kv-quant N`, mlx-lm parity) against the
+ * unfused kernel. `tiled`: `tiledAffineKernels` (always tiled, no
+ * oracle) against the tiled-causal rule's kernel, recorded. */
 interface Variant { name: "tiled-causal" | "unfused" | "tiled"; noFused: boolean; kernels(groupSize: number, bits: number): AffineKernels }
 const VARIANTS: Variant[] = [
   { name: "tiled-causal", noFused: false, kernels: (groupSize, bits) => tiledCausalAffineKernels(bits, groupSize, Dtype.bfloat16) },
@@ -594,7 +492,7 @@ test.skipIf(!M4PRO)("GroupedHeadsKv4Cache: the grouped-heads kernel at depth-2 v
     const pair: [BatchedQuantizedKVCache, GroupedHeadsKv4Cache] = [new BatchedQuantizedKVCache(64, 4, unfusedAffineKernels(4, 64, Dtype.bfloat16)), new GroupedHeadsKv4Cache()];
     try {
       pair[0].mergeRows(a); pair[1].mergeRows(b);
-      // Its own kernel is what the unfused dispatch ran at these shapes.
+      // Its grouped kernel against the plain unfused kernel at these shapes (B1b: equal at every size tried).
       failures.push(...compareSteps(`GroupedHeadsKv4Cache [${lengths}]`, pair, lengths.length, [3, "D", 3, 3, "D", 3],
         (c, k, v, q) => oldRead(c, null, k, v, q, true, QWEN38.scale), kernel, QWEN38));
     } finally { disposeResources([...pair, ...a, ...b]); }
@@ -617,27 +515,7 @@ test.skipIf(!M4PRO)("GroupedHeadsKv4Cache below 8192 keys: grouped where the old
   expect(failures).toEqual([]);
 }, 60_000);
 
-// --- The deprecated dispatch for today's callers -------------------------------------------------
-
-test.skipIf(!M4PRO)("quantizedSdpaUnfused without the device check, at the grouped-heads shape (recorded)", () => {
-  const failures: string[] = [];
-  for (const [B, N] of [[1, 8200], [2, 9000]] as const) {
-    const [k, v] = kv(B, N, QWEN38);
-    using q = query(B, 3, QWEN38);
-    const kq = ops.quantize(k, 64, 4), vq = ops.quantize(v, 64, 4);
-    k.dispose(); v.dispose();
-    try {
-      const mask: Mask = { mode: "causal", arr: null };
-      using before = oldUnfused(q, kq, vq, QWEN38.scale, mask, 64, 4);
-      using after = quantizedSdpaUnfused(q, kq, vq, QWEN38.scale, mask, 64, 4);
-      const failure = record(`quantizedSdpaUnfused B${B} N${N} window 3 (current callers)`, maxDiff(after, before), "grouped", "unfused");
-      if (failure) failures.push(failure);
-    } finally { disposeTriple(kq); disposeTriple(vq); }
-  }
-  expect(failures).toEqual([]);
-}, 60_000);
-
-test("composedAffineKernels: `--fused-sdpa on` and `off` compute what the flag's dispatch did, unset and set", () => {
+test("composedAffineKernels: `--fused-sdpa on` and `off` compute the kernel each composition names", () => {
   const failures: string[] = [];
   for (const noFused of [false, true]) for (const [bits, groupSize] of [[4, 64], [8, 64]])
     for (const [L, N] of [[1, 300], [3, 300], [37, 600], [200, 1200]] as const) {
@@ -647,7 +525,7 @@ test("composedAffineKernels: `--fused-sdpa on` and `off` compute what the flag's
       k.dispose(); v.dispose();
       try {
         const mask: Mask = { mode: "causal", arr: null };
-        const before = oldQuantizedSdpa(q, kq, vq, SCALE, mask, groupSize!, bits!, noFused);
+        const before = kernelCall(q, kq, vq, SCALE, mask, groupSize!, bits!, noFused);
         using reference = before.out;
         const kernels = composedAffineKernels(noFused ? "unfused" : "tiled-causal")(bits!, groupSize!, Dtype.bfloat16);
         using after = (L === 1 ? kernels.decode : kernels.window)(q, kq, vq, SCALE, mask);

@@ -90,7 +90,7 @@ class StubModel {
   };
   readonly weightsBytes = 1;
   readonly graphCapabilities = declareGraph();
-  /** Every id sequence pushed through forwardHidden, in order. */
+  /** Every id sequence pushed through forwardStub, in order. */
   readonly forwards: number[][] = [];
   readonly headInputs: number[][] = [];
 
@@ -99,7 +99,7 @@ class StubModel {
   }
 
   /** Every phase runs the stub's one forward (late-bound, so a subclass's override serves them all) and its head. */
-  readonly #phases = stubPhases((ids, cache) => this.forwardHidden(ids, cache), hidden => this.logitsFromHidden(hidden));
+  readonly #phases = stubPhases((ids, cache) => this.forwardStub(ids, cache), hidden => this.logitsFromHidden(hidden));
   readonly prefillChunk = this.#phases.prefillChunk;
   readonly prefillTail = this.#phases.prefillTail;
   readonly decode = this.#phases.decode;
@@ -108,7 +108,7 @@ class StubModel {
   #committed = false;
   readonly appendKnown = stubPhases((ids, cache) => {
     this.#committed = true;
-    try { return this.forwardHidden(ids, cache); } finally { this.#committed = false; }
+    try { return this.forwardStub(ids, cache); } finally { this.#committed = false; }
   }, hidden => this.logitsFromHidden(hidden)).appendKnown;
   readonly logits = this.#phases.logits;
 
@@ -117,7 +117,7 @@ class StubModel {
     return { maxChunkSize: () => 32 };
   }
 
-  forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray {
+  forwardStub(ids: MlxArray, cache: Cache[]): MlxArray {
     const list = ids.toIntTokens();
     this.forwards.push(list);
     const L = list.length;
@@ -218,8 +218,8 @@ describe("generate(): cancellation", () => {
       override dispose(): void { disposals++; super.dispose(); }
     }
     class CancellingModel extends StubModel {
-      override forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray {
-        const hidden = super.forwardHidden(ids, cache);
+      override forwardStub(ids: MlxArray, cache: Cache[]): MlxArray {
+        const hidden = super.forwardStub(ids, cache);
         abort.abort(new DOMException("cancelled during prefill", "AbortError"));
         return hidden;
       }
@@ -438,8 +438,8 @@ describe("generate(): chunked assert append lifecycle", () => {
     const abort = new AbortController();
     const cache = new KVCache();
     class CancellingModel extends StubModel {
-      override forwardHidden(ids: MlxArray, caches: Cache[]): MlxArray {
-        const hidden = super.forwardHidden(ids, caches);
+      override forwardStub(ids: MlxArray, caches: Cache[]): MlxArray {
+        const hidden = super.forwardStub(ids, caches);
         if (ids.toIntTokens()[0] === 11) abort.abort();
         return hidden;
       }
@@ -462,10 +462,10 @@ describe("generate(): chunked assert append lifecycle", () => {
       override dispose(): void { cacheDisposals++; super.dispose(); }
     }
     class FailingModel extends StubModel {
-      override forwardHidden(ids: MlxArray, caches: Cache[]): MlxArray {
+      override forwardStub(ids: MlxArray, caches: Cache[]): MlxArray {
         const first = ids.toIntTokens()[0];
         if (first === 15) throw new Error("failed append chunk");
-        const hidden = super.forwardHidden(ids, caches);
+        const hidden = super.forwardStub(ids, caches);
         if (first === 11) {
           const dispose = hidden.dispose.bind(hidden);
           hidden.dispose = () => { hiddenDisposals++; dispose(); };

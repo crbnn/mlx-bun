@@ -22,6 +22,7 @@ import { standaloneDraftGroups } from "../bindings/two-model-rows";
 import { bindMlxAutoregressiveGraph } from "../../bindings/autoregressive";
 import { artifactIdentity } from "../../../artifacts/identity";
 import { configFingerprint } from "../../../artifacts/fingerprint";
+import { cleanupFailure, disposeResources } from "../../../runtime/resources";
 
 export class TwoModelProvider implements DraftProvider {
   readonly id: string;
@@ -48,8 +49,9 @@ export class TwoModelProvider implements DraftProvider {
   static async load(modelDir: string, targetVocabSize?: number): Promise<TwoModelProvider> {
     const config = await loadModelConfig(modelDir);
     const weights = await Weights.open(modelDir);
+    let model: RuntimeModel | null = null;
     try {
-      const model = createModel(weights, config);
+      model = createModel(weights, config);
       if (
         targetVocabSize !== undefined &&
         config.text.vocabSize !== targetVocabSize
@@ -62,10 +64,12 @@ export class TwoModelProvider implements DraftProvider {
         [...weights.shards.files].map(([name, shard]) => ({ name, path: shard.path })));
       return new TwoModelProvider(model, weights, modelDir.split("/").filter(Boolean).at(-1)!,
         `standalone-draft-v1:${identity}`);
-    } catch (error) { weights.dispose(); throw error; }
+    } catch (error) { return cleanupFailure(error, () => disposeResources([...(model ? [model] : []), weights])); }
   }
 
+  /** The draft graph releases what it built (constants, Neural Engine programs),
+   *  then its weights go. */
   dispose(): void {
-    this.weights.dispose();
+    disposeResources([this.model, this.weights]);
   }
 }

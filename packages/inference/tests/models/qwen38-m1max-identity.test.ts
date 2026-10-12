@@ -1,41 +1,36 @@
-// D2 bit-identity gate. The generated M1 Max graph (src/models/qwen/qwen38-27b-trellis-m1max.ts, an entire graph
-// built from the composition) against the frozen hand-written TQ graph (qwen38-27b-trellis-tq-reference.ts, deleted
-// with this test after the merge), on small synthetic weights laid out by the generated quant table: 48 DeltaNet and
-// 16 attention layers with the artifact's 3- and 4-bit affine projections, Trellis gate/up at the artifact's widths
-// (mixed in its ten layers) and its 3-bit block-interleaved and row-major downs, scaled down in width. For bf16,
-// affine 4- and 8-bit and TurboQuant KV (each graph's own makeCache), every phase operation and width class the TQ
-// graph served is held to the bit, hidden, logits and every cache tensor: prefillChunk.gpu; prefillTail at every
-// class; decode at one row and at two, four, six and nine sequences; verify at 2, 3, 4, 5, 8 and 12 rows with capture
-// and at several sequences; appendKnown and sequenceHidden at every class; the head at every width; the capturing
-// mixed forward (decode, prompt and verify groups, packed and not); media positions and the vision prefill phases.
-// The composition facts (capabilities, LoRA targets, no committed spans, the residual basis) equal the TQ graph's; only
-// the generated graph declares verify costs, its composition's measured numbers (data, no numerical path).
-// The real artifact runs the same phases opt-in on the M1 Max (MLX_BUN_TEST_QWEN38_ARTIFACT=<snapshot>), where the
-// reduce and scatter kernels take the representations that GPU family qualifies; elsewhere it skips, which is not a pass.
+// The generated M1 Max graph (src/models/qwen/qwen38-27b-trellis-m1max.ts, an entire graph built from the
+// composition) on small synthetic weights laid out by the generated quant table: 48 DeltaNet and 16 attention layers
+// with the artifact's 3- and 4-bit affine projections, Trellis gate/up at the artifact's widths (mixed in its ten
+// layers) and its 3-bit block-interleaved and row-major downs, scaled down in width. The composition facts it
+// declares (LoRA targets, no committed spans, no Neural Engine operation, its measured verify costs, the residual
+// basis its fold record names, the caches of each KV scheme). From five rows the graph runs the generic blocks: there
+// it is held to the generic Qwen 3.5 graph of its family over the same weights under bf16, affine 4- and 8-bit and
+// TurboQuant KV, hidden, logits and every cache tensor, at maxDiff 0. Its reduce and scatter layers at one to four
+// rows have no generic counterpart: the generator's drift test (qwen38-generated-sync), the real-artifact parity suite
+// on the M1 Max (tests/parity/qwen-trellis-parity.test.ts) and the app digests are their gates. No model, no download.
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MlxArray } from "@mlx-bun/mlx/array";
-import { Dtype, deviceArchitecture } from "@mlx-bun/mlx/ffi";
+import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { parseQuantization, type ModelConfig } from "../../src/artifacts/config";
 import { TURBOQUANT_FOLD_FILE } from "../../src/artifacts/turboquant-fold";
 import type { Weights } from "../../src/artifacts/weights";
 import type { BatchableCache, Cache } from "../../src/contracts/mlx/cache";
-import { widthClass, type MlxLayerCapture, type MlxPhaseGroup, type MlxTokenPhases, type MlxWidthClass } from "../../src/contracts/mlx/graph";
+import type { MlxWidthClass } from "../../src/contracts/mlx/graph";
 import type { Composition, KvStorageScheme } from "../../src/contracts/portable/composition";
 import { LAYERS, Qwen38TrellisM1Max } from "../../src/models/qwen/qwen38-27b-trellis-m1max";
+import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
 import { QWEN38_COMPOSITIONS } from "../../scripts/gen-qwen38";
-import { targetCacheLayout } from "../../src/state/layout";
-import { Qwen38TrellisTQ as FrozenTQ } from "./qwen38-27b-trellis-tq-reference";
 
 const HIDDEN = 512, INTER = 256, VOCAB = 256, HEADS = 4, KV_HEADS = 2, HEAD_DIM = 256;
 const HK = 4, HV = 8, DK = 64, DV = 64, KERNEL = 4;
 const KEY_DIM = HK * DK, VALUE_DIM = HV * DV, CONV_DIM = 2 * KEY_DIM + VALUE_DIM;
 const PREFIX = "language_model.model";
 const CHUNK = 40;
-const g13s = deviceArchitecture() === "applegpu_g13s";
+
 
 const owned: MlxArray[] = [];
 afterAll(() => { for (const array of owned) array.dispose(); });
@@ -138,7 +133,7 @@ const composition = (overrides: Partial<Composition> = {}): Composition => Objec
   device: "applegpu_g13s", aneBridge: false, kv: { kind: "bf16" }, pagedKv: null, draftDepth: { adaptive: true, max: 7 },
   prefillChunkTokens: CHUNK, adapters: false, maxRows: 8, packedMixedMlp: true,
   vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
-  grammarJump: false, greedyDraft: false, compiledGeglu: true, ...overrides,
+  grammarJump: false, greedyDraft: false, compiledGeglu: true, compiledSwiglu: true, ...overrides,
 });
 
 /** The KV schemes the composition serves, as `--kv-quant` composes them (fused SDPA unset). */
@@ -148,7 +143,6 @@ const SCHEMES: Readonly<Record<string, KvStorageScheme>> = Object.freeze({
   kv8: { kind: "affine", bits: 8, groupSize: 64, kernels: "unfused" },
   turbo: { kind: "turbo", kBits: 8, vBits: 3 },
 });
-
 // ── Comparison ──────────────────────────────────────────────────────────────
 
 const results = new Map<string, { worst: number; tensors: number }>();
@@ -214,27 +208,7 @@ function outputDiff(label: string, actual: MlxArray, expected: MlxArray, actualH
   } finally { actual.dispose(); expected.dispose(); }
 }
 
-function tapsDiff(label: string, actual: MlxArray[], expected: MlxArray[]): void {
-  try {
-    expect(actual.length, label).toBe(LAYERS.length + 1);
-    expect(expected.length, label).toBe(LAYERS.length + 1);
-    for (let i = 0; i < expected.length; i++) maxDiff(actual[i]!, expected[i]!, `${label} layer ${i}`);
-    record(`${label} captured layers`, 0, expected.length);
-  } finally { for (const array of [...actual, ...expected]) array.dispose(); }
-}
-
-/** A capture that copies every layer it is handed. */
-function collecting(): { capture: MlxLayerCapture; taps: MlxArray[] } {
-  const taps: MlxArray[] = [];
-  return { taps, capture: (_layer, hidden) => { taps.push(ops.contiguous(hidden)); } };
-}
-
-// ── The two graphs ──────────────────────────────────────────────────────────
-
-/** Both graphs' phase tables, called alike: every operation the TQ graph served runs synchronously. */
-type Graph = MlxTokenPhases & Pick<Qwen38TrellisM1Max, "makeCache" | "sequenceHidden" | "prefillEmbeddings" |
-  "prefillEmbeddingsAtPositions" | "prefillAtPositions" | "decodeAtPositions" | "embed" | "mixed">;
-interface Pair { old: Graph; current: Graph; oldGraph: FrozenTQ; currentGraph: Qwen38TrellisM1Max }
+// ── The graphs ──────────────────────────────────────────────────────────────
 
 const prompt = (n: number, salt: number) => Array.from({ length: n }, (_, i) => (i * 37 + salt * 11 + 5) % VOCAB);
 const ids = (rows: number[][]) => ops.fromInt32(rows.flat(), [rows.length, rows[0]!.length]);
@@ -242,67 +216,36 @@ const disposeAll = (...sets: Cache[][]) => { for (const set of sets) for (const 
 
 let synthetic: { weights: Weights; config: ModelConfig } | null = null;
 const source = () => synthetic ??= artifact();
-const pairs = new Map<string, Pair>();
-function pair(scheme: string, overrides: Partial<Composition> = {}): Pair {
+const built = new Map<string, { current: Qwen38TrellisM1Max; generic: Qwen35Model }>();
+function graphs(scheme: string, overrides: Partial<Composition> = {}): { current: Qwen38TrellisM1Max; generic: Qwen35Model } {
   const key = `${scheme} ${JSON.stringify(overrides)}`;
-  let found = pairs.get(key);
+  let found = built.get(key);
   if (!found) {
     const { weights, config } = source();
     const facts = composition({ kv: SCHEMES[scheme]!, ...overrides });
-    const oldGraph = new FrozenTQ(weights, config, facts), currentGraph = new Qwen38TrellisM1Max(weights, config, facts);
-    found = { old: oldGraph as unknown as Graph, current: currentGraph as unknown as Graph, oldGraph, currentGraph };
-    pairs.set(key, found);
+    found = { current: new Qwen38TrellisM1Max(weights, config, facts), generic: new Qwen35Model(weights, config, facts) };
+    built.set(key, found);
   }
   return found;
 }
-afterAll(() => { for (const { currentGraph } of pairs.values()) currentGraph.dispose(); });
-
-/** The storage a composed lego hands the row layouts (bf16 before its conversion, quantized or encoded after). */
-const storage = (cache: Cache) => cache.composed?.storage() ?? cache;
-/** Verification row layouts holding `sources` (one serial cache list per row), over each layer's storage. */
-const rowsOf = (sources: Cache[][]): Cache[] => sources[0]!.map((cache, layer) => {
-  const layout = targetCacheLayout(storage(cache)) as unknown as BatchableCache;
-  layout.mergeRows(sources.map(rows => storage(rows[layer]!)));
-  return layout;
-});
-
-/** Runs one operation on both graphs over their caches and compares hidden, the head of `width` and every cache;
- *  with `capture`, every captured layer too. */
-function step(label: string, pairOf: Pair, caches: { old: Cache[]; current: Cache[] }, width: MlxWidthClass,
-  run: (graph: Graph, state: Cache[], capture: MlxLayerCapture | null) => MlxArray | Promise<MlxArray>,
-  options: { capture?: boolean; last?: boolean } = {}): void {
-  const before = options.capture ? collecting() : null, after = options.capture ? collecting() : null;
-  const expected = run(pairOf.old, caches.old, before?.capture ?? null) as MlxArray;
-  const actual = run(pairOf.current, caches.current, after?.capture ?? null) as MlxArray;
-  if (before && after) tapsDiff(label, after.taps, before.taps);
-  outputDiff(label, actual, expected, pairOf.current.logits[width], pairOf.old.logits[width], options.last);
-  stateDiff(label, caches.current, caches.old);
-}
-
-const input = (rows: number[][]) => keep(ids(rows));
+afterAll(() => { for (const { current } of built.values()) current.dispose(); });
 
 describe("the composition the generated graph declares", () => {
-  test("capabilities, LoRA targets, caches, no committed spans, no Neural Engine operation: the TQ graph's; verify costs its composition's", () => {
+  test("LoRA targets, caches, no committed spans, no Neural Engine operation, the verify costs its composition measured", () => {
     for (const scheme of Object.keys(SCHEMES)) {
-      const { oldGraph, currentGraph } = pair(scheme);
-      expect(currentGraph.graphCapabilities).toEqual(oldGraph.graphCapabilities);
-      expect([...currentGraph.loraTargets().keys()].sort()).toEqual([...oldGraph.loraTargets().keys()].sort());
-      expect(currentGraph.loraTargets().size).toBe(48 * 5 + 16 * 4);
-      expect((currentGraph as { knownSpans?: unknown }).knownSpans).toBeUndefined();
-      expect(oldGraph.knownSpans).toBeUndefined();
-      // Declared data, measured for the composition on the M1 Max; the TQ graph declared none.
-      expect([...currentGraph.verifyRoundCosts]).toEqual(QWEN38_COMPOSITIONS["qwen38-27b-trellis-m1max"]!.verifyRoundCosts!.costs.map(([rows, cost]) => [rows, cost]));
-      expect((oldGraph as { verifyRoundCosts?: unknown }).verifyRoundCosts).toBeUndefined();
-      expect(currentGraph.prefillChunk.ane).toBeUndefined();
-      const a = currentGraph.makeCache(), b = oldGraph.makeCache();
+      const { current, generic } = graphs(scheme);
+      expect([...current.loraTargets().keys()].sort()).toEqual([...generic.loraTargets().keys()].sort());
+      expect(current.loraTargets().size).toBe(48 * 5 + 16 * 4);
+      expect((current as { knownSpans?: unknown }).knownSpans).toBeUndefined();
+      expect([...current.verifyRoundCosts]).toEqual(QWEN38_COMPOSITIONS["qwen38-27b-trellis-m1max"]!.verifyRoundCosts!.costs.map(([rows, cost]) => [rows, cost]));
+      expect(current.prefillChunk.ane).toBeUndefined();
+      const a = current.makeCache(), b = generic.makeCache();
       try { expect(a.map(cache => `${cache.constructor.name} ${cache.signature()}`)).toEqual(b.map(cache => `${cache.constructor.name} ${cache.signature()}`)); }
       finally { disposeAll(a, b); }
     }
-    const adapted = pair("bf16", { adapters: true });
-    expect(adapted.currentGraph.graphCapabilities).toEqual(adapted.oldGraph.graphCapabilities);
   });
 
-  test("the residual basis its fold record declares, read once at construction, as the TQ graph read it", () => {
+  test("the residual basis its fold record declares, read once at construction", () => {
     const { weights, config } = source();
     const dir = mkdtempSync(join(tmpdir(), "qwen38-m1max-fold-"));
     const quiet = console.error;
@@ -310,11 +253,12 @@ describe("the composition the generated graph declares", () => {
     try {
       const at = { ...config, modelDir: dir } as ModelConfig;
       const declared = (graph: { draftTarget(caches: Cache[]): { residualBasis?: unknown } }) => graph.draftTarget([]).residualBasis;
-      expect(declared(new Qwen38TrellisM1Max(weights, at, composition()))).toBeUndefined();
+      const without = new Qwen38TrellisM1Max(weights, at, composition());
+      expect(declared(without)).toBeUndefined();
+      without.dispose();
       writeFileSync(join(dir, TURBOQUANT_FOLD_FILE), JSON.stringify({ seed: 7, r1: true, hiddenSize: HIDDEN,
         final_gain: Array.from({ length: HIDDEN }, (_, i) => 1 + i / HIDDEN) }));
-      const current = new Qwen38TrellisM1Max(weights, at, composition()), old = new FrozenTQ(weights, at, composition());
-      expect(declared(current)).toEqual(declared(old));
+      const current = new Qwen38TrellisM1Max(weights, at, composition());
       expect(declared(current)).toEqual({ r1Seed: 7, finalGain: Float32Array.from({ length: HIDDEN }, (_, i) => 1 + i / HIDDEN) });
       current.dispose();
     } finally { console.error = quiet; rmSync(dir, { recursive: true, force: true }); }
@@ -322,165 +266,22 @@ describe("the composition the generated graph declares", () => {
 });
 
 for (const scheme of Object.keys(SCHEMES)) {
-  describe(`Qwen3.8 M1 Max graph against the TQ graph, ${scheme} KV`, () => {
-    test(`${scheme}: one sequence through every phase and width class`, () => {
-      const p = pair(scheme);
-      const caches = { old: p.old.makeCache(), current: p.current.makeCache() };
-      try {
-        step(`${scheme} prefillChunk.gpu ${CHUNK}`, p, caches, "wider", (g, s, c) => g.prefillChunk.gpu(input([prompt(CHUNK, 1)]), s, c), { capture: true });
-        for (const rows of [13, 6, 4, 3, 2, 1])
-          step(`${scheme} prefillTail ${rows}`, p, caches, widthClass(rows), (g, s, c) => g.prefillTail[widthClass(rows)](input([prompt(rows, 2 + rows)]), s, c), { capture: true });
-        for (let n = 0; n < 3; n++) step(`${scheme} decode.one`, p, caches, "one", (g, s, c) => g.decode.one(input([[100 + n]]), s, c));
-        for (const rows of [2, 3, 4, 5, 8, 12])
-          step(`${scheme} verify ${rows}`, p, caches, widthClass(rows), (g, s, c) => g.verify[widthClass(rows)](input([prompt(rows, 20 + rows)]), s, c), { capture: true });
-        for (const rows of [1, 2, 4, 6, 9])
-          step(`${scheme} appendKnown ${rows}`, p, caches, widthClass(rows), (g, s) => g.appendKnown[widthClass(rows)](input([prompt(rows, 40 + rows)]), s));
-        for (const rows of [3, 6, 10])
-          step(`${scheme} sequenceHidden ${rows}`, p, caches, widthClass(rows), (g, s) => g.sequenceHidden(input([prompt(rows, 50 + rows)]), s, widthClass(rows)));
-        for (const rows of [3, 6])
-          step(`${scheme} prefillEmbeddings ${rows}`, p, caches, widthClass(rows), (g, s) => {
-            using embeds = p.old.embed.encode(input([prompt(rows, 60 + rows)]));
-            return g.prefillEmbeddings!(embeds, s, null, null, null, widthClass(rows));
-          });
-        // Media positions: [3, rows, tokens] request positions continuing the cache's text positions.
-        const grid = (start: number, rows: number) =>
-          keep(ops.fromInt32(Array.from({ length: 3 * rows }, (_, i) => start + (i % rows) + Math.floor(i / rows)), [3, 1, rows]));
-        for (const rows of [6, 1]) {
-          const start = caches.old[0]!.offset;
-          const positions = grid(start, rows);
-          step(`${scheme} media positions ${rows}`, p, caches, widthClass(rows), (g, s) => rows === 1
-            ? g.decodeAtPositions(input([prompt(1, 70)]), s, positions, "one")
-            : g.prefillAtPositions(input([prompt(rows, 71)]), s, positions, widthClass(rows)));
-          if (rows === 1) continue;
-          const next = grid(start + rows, rows);
-          step(`${scheme} vision prefill ${rows}`, p, caches, widthClass(rows), (g, s) => {
-            using embeds = p.old.embed.encode(input([prompt(rows, 72)]));
-            return g.prefillEmbeddingsAtPositions(embeds, s, next, widthClass(rows));
-          });
-        }
-        step(`${scheme} decode after every phase`, p, caches, "one", (g, s, c) => g.decode.one(input([[7]]), s, c), { capture: true });
-        // The head alone at every width, on one hidden.
-        for (const rows of [1, 2, 3, 4, 5, 8, 12]) {
-          using hidden = p.old.embed.encode(input([prompt(rows, 80 + rows)]));
-          using expected = p.old.logits[widthClass(rows)](hidden);
-          using actual = p.current.logits[widthClass(rows)](hidden);
-          maxDiff(actual, expected, `${scheme} head ${rows}`);
-          record(`${scheme} logits[${widthClass(rows)}] ${rows} rows`, 0, 1);
-        }
-      } finally { disposeAll(caches.old, caches.current); }
-    }, 600_000);
-
-    test(`${scheme}: several sequences: decode at 2, 4, 6 and 9 rows, verify windows of several sequences, mixed rows`, () => {
-      const p = pair(scheme);
-      for (const sequences of [2, 4, 6, 9]) {
-        const old: Cache[][] = [], current: Cache[][] = [];
-        let oldRows: Cache[] = [], newRows: Cache[] = [];
-        try {
-          for (let row = 0; row < sequences; row++) {
-            const length = 5 + 2 * row, single = { old: p.old.makeCache(), current: p.current.makeCache() };
-            old.push(single.old); current.push(single.current);
-            step(`${scheme} ${sequences} sequences prefill`, p, single, widthClass(length),
-              (g, s) => g.prefillTail[widthClass(length)](input([prompt(length, 90 + row)]), s, null));
-          }
-          oldRows = rowsOf(old); newRows = rowsOf(current);
-          const rows = { old: oldRows, current: newRows };
-          const tokens = Array.from({ length: sequences }, (_, row) => [110 + row]);
-          step(`${scheme} decode ${sequences} sequences`, p, rows, widthClass(sequences), (g, s, c) => g.decode[widthClass(sequences)](input(tokens), s, c), { capture: true });
-          const depth = sequences <= 2 ? 2 : 3;
-          const window = Array.from({ length: sequences }, (_, row) => prompt(depth, 120 + row));
-          step(`${scheme} verify ${sequences}x${depth}`, p, rows, widthClass(sequences * depth),
-            (g, s, c) => g.verify[widthClass(sequences * depth)](input(window), s, c), { capture: true });
-        } finally { disposeAll(...old, ...current, oldRows, newRows); }
-      }
-      // Mixed rows: a decode group, a prompt group and a capturing verify group, each over its own caches, packed and not.
-      for (const packedMixedMlp of [true, false]) {
-        const q = pair(scheme, { packedMixedMlp });
-        const sets = [0, 1, 2].map(() => ({ old: q.old.makeCache(), current: q.current.makeCache() }));
-        try {
-          for (const [row, set] of sets.entries())
-            step(`${scheme} mixed prefill`, q, set, "fiveToEight", (g, s) => g.prefillTail.fiveToEight(input([prompt(7, 130 + row)]), s, null));
-          const work = (graph: "old" | "current", taps: MlxLayerCapture): MlxPhaseGroup[] => [
-            { phase: "decode", width: "one", ids: input([[140]]), state: sets[0]![graph], capture: null },
-            { phase: "window", width: "fiveToEight", ids: input([prompt(5, 141)]), state: sets[1]![graph], capture: null },
-            { phase: "verify", width: "twoToThree", ids: input([prompt(3, 142)]), state: sets[2]![graph], capture: taps },
-          ];
-          const before = collecting(), after = collecting();
-          const expected = q.old.mixed!(work("old", before.capture), "wider");
-          const actual = q.current.mixed!(work("current", after.capture), "wider");
-          tapsDiff(`${scheme} mixed (packed ${packedMixedMlp}) verify group`, after.taps, before.taps);
-          for (const [row, width] of (["one", "fiveToEight", "twoToThree"] as const).entries())
-            outputDiff(`${scheme} mixed (packed ${packedMixedMlp}) group ${row}`, actual[row]!, expected[row]!, q.current.logits[width], q.old.logits[width]);
-          for (const [row, set] of sets.entries()) stateDiff(`${scheme} mixed (packed ${packedMixedMlp}) group ${row}`, set.current, set.old);
-        } finally { for (const set of sets) disposeAll(set.old, set.current); }
-      }
-    }, 600_000);
-  });
+  test(`${scheme} KV: from five rows, the M1 Max graph equals the generic Qwen 3.5 graph (prompt chunk, tails, verify, decode of several sequences)`, () => {
+    const { current, generic } = graphs(scheme);
+    const mine = current.makeCache(), theirs = generic.makeCache();
+    const step = (label: string, width: MlxWidthClass, rows: number[][],
+      run: (graph: Qwen38TrellisM1Max | Qwen35Model, input: MlxArray, caches: Cache[]) => MlxArray | Promise<MlxArray>) => {
+      using input = ids(rows);
+      outputDiff(`${scheme} ${label}`, run(current, input, mine) as MlxArray, run(generic, input, theirs) as MlxArray,
+        current.logits[width], generic.logits[width]);
+      stateDiff(`${scheme} ${label}`, mine, theirs);
+    };
+    try {
+      step(`prefillChunk.gpu ${CHUNK}`, "wider", [prompt(CHUNK, 1)], (g, input, caches) => g.prefillChunk.gpu(input, caches, null));
+      step("prefillTail.fiveToEight 6", "fiveToEight", [prompt(6, 2)], (g, input, caches) => g.prefillTail.fiveToEight(input, caches, null));
+      step("prefillTail.wider 13", "wider", [prompt(13, 3)], (g, input, caches) => g.prefillTail.wider(input, caches, null));
+      step("verify.fiveToEight 8", "fiveToEight", [prompt(8, 4)], (g, input, caches) => g.verify.fiveToEight(input, caches, null));
+      step("verify.wider 12", "wider", [prompt(12, 5)], (g, input, caches) => g.verify.wider(input, caches, null));
+    } finally { disposeAll(mine, theirs); }
+  }, 180_000);
 }
-
-// ── The real artifact (opt-in on the M1 Max: MLX_BUN_TEST_QWEN38_ARTIFACT=<mlx-bun/Qwen3.8-27B-Trellis-3.2bpw
-// snapshot>, about 12 GB resident). Both graphs share one Weights. ──────────────────────────────────────────────
-
-const ARTIFACT = process.env.MLX_BUN_TEST_QWEN38_ARTIFACT;
-
-describe("Qwen3.8 M1 Max graph on the real artifact", () => {
-  let shared: { weights: Weights; config: ModelConfig; view: Weights } | null = null;
-  const open = async () => {
-    if (shared) return shared;
-    const { Weights } = await import("../../src/artifacts/weights");
-    const { loadModelConfig } = await import("../../src/artifacts/config");
-    const { qwen35WeightsView } = await import("../../src/models/qwen/checkpoint");
-    const config = await loadModelConfig(ARTIFACT!);
-    const weights = await Weights.open(ARTIFACT!);
-    // The checkpoint view both graphs install, installed once here; every graph reads through it and installs nothing.
-    const installed = qwen35WeightsView(weights);
-    if (installed) weights.setView(installed);
-    const view = {
-      tensor: (name: string) => weights.tensor(name), has: (name: string) => weights.has(name), info: (name: string) => weights.info(name),
-      get tensorNames() { return weights.tensorNames; }, shards: weights.shards, setView: () => {},
-    } as unknown as Weights;
-    return shared = { weights, config, view };
-  };
-  afterAll(() => shared?.weights.dispose());
-  const real = (n: number, salt: number) => Array.from({ length: n }, (_, i) => (i * 7919 + salt * 104729) % 151_000 + 1000);
-
-  for (const scheme of Object.keys(SCHEMES))
-    test.skipIf(!ARTIFACT || !g13s)(`${scheme}: 2048-token chunk, tails, decodes, verify 2 to 12 with capture, known tokens, two and four sequences`, async () => {
-      const { config, view } = await open();
-      const facts = composition({ kv: SCHEMES[scheme]!, prefillChunkTokens: 2048 });
-      const currentGraph = new Qwen38TrellisM1Max(view, config, facts);
-      const oldGraph = new FrozenTQ(view, config, facts);
-      const p: Pair = { old: oldGraph as unknown as Graph, current: currentGraph as unknown as Graph, oldGraph, currentGraph };
-      const caches = { old: p.old.makeCache(), current: p.current.makeCache() };
-      try {
-        step(`real ${scheme} prefillChunk.gpu 2048`, p, caches, "one", (g, s, c) => g.prefillChunk.gpu(input([real(2048, 1)]), s, c), { capture: true, last: true });
-        for (const rows of [37, 6, 4, 3])
-          step(`real ${scheme} prefillTail ${rows}`, p, caches, "one", (g, s, c) => g.prefillTail[widthClass(rows)](input([real(rows, 2 + rows)]), s, c), { last: true });
-        for (let n = 0; n < 6; n++) step(`real ${scheme} decode.one`, p, caches, "one", (g, s, c) => g.decode.one(input([real(1, 10 + n)]), s, c), { capture: n === 0 });
-        for (const rows of [2, 3, 4, 5, 8, 12])
-          step(`real ${scheme} verify ${rows}`, p, caches, widthClass(rows), (g, s, c) => g.verify[widthClass(rows)](input([real(rows, 20 + rows)]), s, c), { capture: true });
-        for (const rows of [1, 3, 6])
-          step(`real ${scheme} appendKnown ${rows}`, p, caches, widthClass(rows), (g, s) => g.appendKnown[widthClass(rows)](input([real(rows, 40 + rows)]), s));
-      } finally { disposeAll(caches.old, caches.current); }
-      for (const sequences of [2, 4]) {
-        const old: Cache[][] = [], current: Cache[][] = [];
-        let oldRows: Cache[] = [], newRows: Cache[] = [];
-        try {
-          for (let row = 0; row < sequences; row++) {
-            const length = 11 + 4 * row, single = { old: p.old.makeCache(), current: p.current.makeCache() };
-            old.push(single.old); current.push(single.current);
-            step(`real ${scheme} ${sequences} sequences prefill`, p, single, "one",
-              (g, s) => g.prefillTail[widthClass(length)](input([real(length, 50 + row)]), s, null), { last: true });
-          }
-          oldRows = rowsOf(old); newRows = rowsOf(current);
-          const rows = { old: oldRows, current: newRows };
-          for (let n = 0; n < 2; n++)
-            step(`real ${scheme} decode ${sequences} sequences`, p, rows, widthClass(sequences),
-              (g, s, c) => g.decode[widthClass(sequences)](input(Array.from({ length: sequences }, (_, row) => real(1, 60 + 7 * n + row))), s, c));
-          const window = Array.from({ length: sequences }, (_, row) => real(3, 70 + row));
-          step(`real ${scheme} verify ${sequences}x3`, p, rows, widthClass(3 * sequences),
-            (g, s, c) => g.verify[widthClass(3 * sequences)](input(window), s, c), { capture: true });
-        } finally { disposeAll(...old, ...current, oldRows, newRows); }
-      }
-      currentGraph.dispose();
-    }, 1_800_000);
-});

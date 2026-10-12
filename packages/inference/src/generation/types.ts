@@ -156,8 +156,8 @@ export interface GenerateStats {
      *  relies on, so the sum is not production round time). */
     phaseMs?: SpecPhaseMs;
   };
-  /** Token fast-forwarding telemetry (serial lane, MLX_BUN_FILL=strict).
-   *  Present only when a fill table was actually armed for this generation. */
+  /** Token fast-forwarding telemetry (MLX_BUN_FILL=strict). Present only when
+   *  a fill table was actually armed for this generation. */
   fill?: FillStats;
 }
 

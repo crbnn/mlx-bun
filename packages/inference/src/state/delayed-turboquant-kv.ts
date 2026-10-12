@@ -75,15 +75,12 @@ export class DelayedTurboQuantKVCache extends FullTransitioningKvRows<BatchedTur
 
   appendDecode(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v); }
   appendWindow(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v); }
-  /** The window read over the deprecated fetches, like the other two:
-   * Qwen 3.5's committed append read this layout through `updateAndFetch` and
-   * the fused SDPA under the mask its `makeMask` builds, the same call as its
-   * window.
-   * TODO(B1c): the TurboQuant layout's own reads replace these fetches, one
-   * call per phase. */
+  /** The committed read is the window read: a committed span reads this layout
+   * through the kernel set's fetch and the fused SDPA under the mask the layout
+   * builds, as a window does. */
   appendCommitted(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v); }
-  /** The graph's read today: the mask from this layout before the append (no
-   * sliding window), then the kernel set's fetch and attention. */
+  /** The read: the mask from this layout before the append (no sliding
+   * window), then the kernel set's fetch and attention. */
   #read(k: MlxArray, v: MlxArray): AttentionRead {
     const mask = this.makeMask(k.shape[2]!, null);
     return this.turboQuantKernels.read({

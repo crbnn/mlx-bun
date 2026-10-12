@@ -62,8 +62,8 @@ function generic(id: string, create: GraphEntry<Weights, RuntimeModel>["create"]
 }
 
 /** Every resident family's graphs, keyed by the graph its family declares. Each
- * table lists the compositions its specialized graphs were built and qualified
- * for, plus the family's generic graph; see {@link GraphTable} for how one is
+ * table lists its graphs built for particular compositions (each with the
+ * composition it was built and qualified for) and the family's generic graph; see {@link GraphTable} for how one is
  * selected. Adding a graph means adding an entry here (or to the list a table
  * spreads in). */
 export const MLX_GRAPH_TABLES: Readonly<Record<ModelGraph, GraphTable<Weights, RuntimeModel>>> = Object.freeze({

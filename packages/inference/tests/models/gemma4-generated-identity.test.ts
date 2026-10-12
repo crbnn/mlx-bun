@@ -1,34 +1,17 @@
-// D2 Gemma 4 bit-identity gate. Each generated graph as scripts/gen-gemma4.ts
-// now emits it (src/models/gemma4/generated/*.ts: an entire graph, composed from
-// blocks.ts, reading every cache through its own read) against the class the
-// generator emitted before D2 (gemma4-generated-reference/*.ts: it extends
-// Gemma4Model, checks its caches against the per-layer KV literals it folded,
-// attends their quantized storage itself on a match and runs the generic forward
-// otherwise; frozen as the oracle and deleted with this test after the merge).
-// Synthetic weights in each composition's shape, read from its committed fixture
-// (tests/fixtures/gemma4-graphs): the layer types, the KV-sharing layers, the
-// per-layer inputs (e4b), keys equal to values (12B, 26B), the routed experts
-// (26B), a layer scalar on every layer and the artifact's per-layer kv_config;
-// small widths and a 16-position sliding window, so prompts of 37 and 200 wrap
-// the rings. Every hidden output, logit row, captured layer and cache tensor must
-// agree to the bit under bf16 caches and under the composition's kv_config
-// (converted after the first forward as the served path does, and before it as
-// the real-weight parity test does), with MLX_BUN_NO_FUSED_SDPA unset (the
-// tiled-causal kernel set the conversion composes; the oracle's tiled dispatch)
-// and set to 1 (unfused): prefill 37 and 200, decodes, windows across the sliding
-// boundary and the 256-position step, verify with layer capture (the verify
-// phase operation, the mixed verify group's capture, and the binding's capture of a prompt tail against
-// the deprecated hidden tap), a
-// speculative rollback, fill spans of 1 to 4 on solo caches and target rows, two
-// rows in one forward, two groups in one mixed forward, aligned batched rows,
-// vision prefill, the phase operations against the oracle's deprecated forward,
-// the compiled decode step (e4b whole-graph, 12B segmented; the 26B declares
-// none) and the assistant drafter's donor read. Under kv_config the oracle's
-// unrolled path must have run. Since E3 both graphs are built for the bf16
-// composition and the test converts their plain caches itself, in the
-// convert-after order the bf16-first legos keep inside their appends, reading
-// with the kernel set the flag names; the flag itself now steers only the
-// oracle's frozen dispatch (quantized-sdpa-reference.ts). No model, no download.
+// Each generated Gemma 4 graph (src/models/gemma4/generated/*.ts, an entire graph
+// scripts/gen-gemma4.ts emits for one composition) against the generic Gemma 4
+// graph of its family over the same synthetic weights, where both serve the
+// composition: the artifact's kv_config scheme the generated graph is built for,
+// each graph composing its own bf16-first legos. Synthetic weights in each
+// composition's shape, read from its committed fixture (tests/fixtures/
+// gemma4-graphs): the layer types, the KV-sharing layers, the per-layer inputs
+// (e4b), keys equal to values (12B, 26B), the routed experts (26B), a layer
+// scalar on every layer and the artifact's per-layer kv_config; small widths and a
+// 16-position sliding window, so prompts of 37 and 200 wrap the rings. Prompts,
+// decodes, windows across the sliding boundary and the 256-position step, verify
+// windows and two rows in one forward: hidden, logits and every cache tensor at
+// maxDiff 0. The same graphs on real weights are tests/parity/gemma4-generated.test.ts.
+// No model, no download.
 import { afterAll, describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { readdirSync } from "node:fs";
@@ -38,49 +21,20 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { loadModelConfig, parseQuantization, type ModelConfig } from "../../src/artifacts/config";
 import type { Weights } from "../../src/artifacts/weights";
 import type { BatchableCache, Cache } from "../../src/contracts/mlx/cache";
-import type { Composition as CompositionRecord } from "../../src/contracts/portable/composition";
-import { widthClass, type MlxCompiledDecodeStep, type MlxLayerCapture } from "../../src/contracts/mlx/graph";
-import type { DeprecatedGemma4Base } from "./gemma4-generated-reference/deprecated-base";
-import type { TokenGroup } from "./frozen-token-groups";
+import type { MlxTokenPhases } from "../../src/contracts/mlx/graph";
+import type { KvStorageScheme } from "../../src/contracts/portable/composition";
+import type { ServedComposition } from "../../src/models/implementation";
+import { Gemma4Model } from "../../src/models/gemma4/model";
 import { phaseHidden } from "./phase-forward";
-import { createRuntimeConfig, runtimeConfig, withRuntimeConfig } from "../../src/runtime/config";
-import { composedAffineKernels, type AffineKernelSet } from "../../src/state/affine-attention";
-import { convertToAffine, transitionDue } from "../../src/state/bf16-first-kv";
-import { targetCacheLayout } from "../../src/state/layout";
 import { testComposition } from "./test-composition";
-import { CompiledDecode } from "../../src/models/gemma4/compiled-decode";
 import * as current12b from "../../src/models/gemma4/generated/gemma4-12b";
 import * as current26b from "../../src/models/gemma4/generated/gemma4-26b";
 import * as currentE4b from "../../src/models/gemma4/generated/gemma4-e4b";
-import * as oracle12b from "./gemma4-generated-reference/gemma4-12b";
-import * as oracle26b from "./gemma4-generated-reference/gemma4-26b";
-import * as oracleE4b from "./gemma4-generated-reference/gemma4-e4b";
 
 const HIDDEN = 256, INTER = 512, EXPERT_INTER = 128, VOCAB = 256, HEADS = 4, KV_HEADS = 2;
 const HEAD_DIM = 256, GLOBAL_HEAD_DIM = 512, WINDOW = 16, PER_LAYER = 64, EXPERTS = 4, TOP_K = 2;
 const PREFIX = "language_model.model";
 const FIXTURES = join(import.meta.dir, "../fixtures/gemma4-graphs");
-
-/** Every oracle class extends the generic graph, through the deprecated entry points frozen for it. */
-type OracleGraph = DeprecatedGemma4Base;
-/** What the gate calls on a generated graph (the 26B declares no compiled decode step). */
-type CurrentGraph = Pick<InstanceType<typeof currentE4b.GeneratedGemma4>, "makeCache" | "prefillEmbeddings" |
-  "mixed" | "prefillChunk" | "prefillTail" | "decode" | "verify" | "logits" | "draftTarget"> &
-  { compiledDecodeStep?(): MlxCompiledDecodeStep };
-type Graph = OracleGraph | CurrentGraph;
-interface Composition {
-  readonly stem: string;
-  readonly repo: string;
-  readonly oracle: { readonly GeneratedGemma4: new (weights: Weights, config: ModelConfig, composition: CompositionRecord) => OracleGraph;
-    readonly generatedForwardUses: number };
-  readonly current: { readonly GeneratedGemma4: new (weights: Weights, config: ModelConfig, composition: CompositionRecord) => CurrentGraph };
-}
-const COMPOSITIONS: readonly Composition[] = [
-  { stem: "gemma4-e4b", repo: "gemma-4-e4b-it-OptiQ-4bit", oracle: oracleE4b, current: currentE4b },
-  { stem: "gemma4-12b", repo: "gemma-4-12B-it-OptiQ-4bit", oracle: oracle12b, current: current12b },
-  { stem: "gemma4-26b", repo: "gemma-4-26B-A4B-it-OptiQ-4bit", oracle: oracle26b, current: current26b },
-];
-
 const owned: MlxArray[] = [];
 afterAll(() => { for (const array of owned) array.dispose(); });
 const keep = (array: MlxArray) => { owned.push(array); return array; };
@@ -230,12 +184,31 @@ function stateDiff(label: string, actual: readonly Cache[], expected: readonly C
   record(`${label} cache`, worst, count);
 }
 
-/** Hidden rows and their logits (both owned by the caller and disposed here). */
-function outputDiff(label: string, model: CurrentGraph, oracle: OracleGraph, actual: MlxArray, expected: MlxArray): void {
+
+// ── The graphs ──────────────────────────────────────────────────────────────
+
+type Graph = MlxTokenPhases & { makeCache(): Cache[] };
+interface Generated {
+  readonly COMPOSITION: ServedComposition;
+  readonly GeneratedGemma4: { new (...args: ConstructorParameters<typeof Gemma4Model>): Graph; readonly prototype: object };
+}
+const COMPOSITIONS: readonly { stem: string; repo: string; module: Generated }[] = [
+  { stem: "gemma4-e4b", repo: "gemma-4-e4b-it-OptiQ-4bit", module: currentE4b as unknown as Generated },
+  { stem: "gemma4-12b", repo: "gemma-4-12B-it-OptiQ-4bit", module: current12b as unknown as Generated },
+  { stem: "gemma4-26b", repo: "gemma-4-26B-A4B-it-OptiQ-4bit", module: current26b as unknown as Generated },
+];
+
+const prompt = (n: number, salt: number) => Array.from({ length: n }, (_, i) => (i * 37 + salt * 11 + 5) % VOCAB);
+const ids = (rows: number[][]) => ops.fromInt32(rows.flat(), [rows.length, rows[0]!.length]);
+const disposeAll = (...sets: Cache[][]) => { for (const set of sets) for (const cache of set) cache.dispose(); };
+
+/** Hidden rows and their logits through each graph's head at the class of those rows (owned, disposed here). */
+function outputDiff(label: string, model: Graph, generic: Graph, actual: MlxArray, expected: MlxArray, rows: number): void {
   try {
+    const width = rows === 1 ? "one" : rows <= 3 ? "twoToThree" : rows === 4 ? "four" : rows <= 8 ? "fiveToEight" : "wider";
     const hidden = maxDiff(actual, expected, `${label} hidden`);
-    using la = model.logits.one(actual);
-    using lb = oracle.logitsFromHidden(expected);
+    using la = model.logits[width](actual);
+    using lb = generic.logits[width](expected);
     const logits = maxDiff(la, lb, `${label} logits`);
     using wide = lb.astype(Dtype.float32);
     expect(wide.toFloat32().every(Number.isFinite), `${label} logits finite`).toBe(true);
@@ -243,401 +216,51 @@ function outputDiff(label: string, model: CurrentGraph, oracle: OracleGraph, act
   } finally { actual.dispose(); expected.dispose(); }
 }
 
-function tapsDiff(label: string, actual: MlxArray[], expected: MlxArray[]): void {
-  try {
-    expect(actual.length, label).toBe(expected.length);
-    expect(actual.length, label).toBeGreaterThan(0);
-    let worst = 0;
-    for (let i = 0; i < expected.length; i++) worst = Math.max(worst, maxDiff(actual[i]!, expected[i]!, `${label} tap ${i}`));
-    record(`${label} captured layers`, worst, expected.length);
-  } finally { for (const array of [...actual, ...expected]) array.dispose(); }
-}
-
-// ── Running both graphs ─────────────────────────────────────────────────────
-
-const prompt = (n: number, salt: number) => Array.from({ length: n }, (_, i) => (i * 37 + salt * 11 + 5) % VOCAB);
-const ids = (rows: number[][]) => ops.fromInt32(rows.flat(), [rows.length, rows[0]!.length]);
-const disposeAll = (...sets: Cache[][]) => { for (const set of sets) for (const cache of set) cache.dispose(); };
-
-interface Pair { c: Composition; config: ModelConfig; old: OracleGraph; current: CurrentGraph }
-const pairs = new Map<string, Pair>();
-async function pair(c: Composition): Promise<Pair> {
-  let found = pairs.get(c.stem);
-  if (!found) {
-    const real = await fixtureConfig(c.repo);
-    const { weights, config } = artifact(real, 100 * (COMPOSITIONS.indexOf(c) + 1));
-    // Both built for the bf16 composition, so each makeCache holds plain caches the test converts after the first forward.
-    found = { c, config, old: new c.oracle.GeneratedGemma4(weights, config, testComposition()),
-      current: new c.current.GeneratedGemma4(weights, config, testComposition()) };
-    pairs.set(c.stem, found);
-  }
-  return found;
-}
-
-type Scheme = { name: string; kvConfig: boolean; flag: string | undefined };
-const SCHEMES: Scheme[] = [
-  { name: "bf16", kvConfig: false, flag: undefined },
-  { name: "kv_config flag=unset", kvConfig: true, flag: undefined },
-  { name: "kv_config flag=1", kvConfig: true, flag: "1" },
-];
-/** The flag as the oracle reads it (its frozen dispatch, `quantized-sdpa-reference.ts`); the current
- * graph reads through its caches, whose kernels the test composes from the same flag (`flagKernels`). */
-const withFlag = <T>(flag: string | undefined, run: () => T): T =>
-  withRuntimeConfig(createRuntimeConfig({ ...runtimeConfig().values, MLX_BUN_NO_FUSED_SDPA: flag }), run);
-/** The affine read kernels the flag named before E3: unset, the tiled-causal set (`--fused-sdpa on`); 1, unfused. */
-const flagKernels = (flag: string | undefined): AffineKernelSet => composedAffineKernels(flag === "1" ? "unfused" : "tiled-causal");
-
-/** Convert after a forward, as the served path did before E3 (quantized_kv_start 0; the bf16-first legos keep
- *  this order inside their appends): every plain cache the kv_config lists converts, reading with the flag's kernels. */
-function convert(p: Pair, scheme: Scheme, ...sets: Cache[][]): void {
-  if (!scheme.kvConfig) return;
-  for (const caches of sets) caches.forEach((cache, layer) => {
-    const entry = p.config.kvQuant!.find(item => item.layerIdx === layer);
-    if (entry && transitionDue(cache.offset, 0))
-      caches[layer] = convertToAffine(cache as unknown as { offset: number; toQuantized(g: number, b: number, k: AffineKernelSet): Cache },
-        entry.groupSize, entry.bits, 0, flagKernels(scheme.flag));
-  });
-}
-
-/** Caches converted to the kv_config before any forward (the parity test's serve scenario), reading with the flag's kernels. */
-function preconverted(p: Pair, model: Graph, flag: string | undefined): Cache[] {
-  const caches = model.makeCache();
-  for (let layer = 0; layer < caches.length; layer++) {
-    const entry = p.config.kvQuant!.find(item => item.layerIdx === layer);
-    if (entry) caches[layer] = (caches[layer] as unknown as { toQuantized(g: number, b: number, k: AffineKernelSet): Cache })
-      .toQuantized(entry.groupSize, entry.bits, flagKernels(flag));
-  }
-  return caches;
-}
-
-/** The oracle's and the current graph's call on the same input. */
-function both(label: string, p: Pair, oldCaches: Cache[], newCaches: Cache[],
-  run: (model: Graph, caches: Cache[]) => MlxArray, current?: (caches: Cache[]) => MlxArray): void {
-  const expected = run(p.old, oldCaches);
-  const actual = current ? current(newCaches) : run(p.current, newCaches);
-  outputDiff(label, p.current, p.old, actual, expected);
-  stateDiff(label, newCaches, oldCaches);
-}
-
-/** The oracle's deprecated forward, which reads the phase from the input's shape, against the
- *  current graph's named phase for the same tokens (`phaseHidden`: one per sequence a decode, more a tail). */
-const forwardHidden = (rows: number[][]) => (model: Graph, caches: Cache[]) => {
+/** The same tokens through the phase a scheduler names for them, on both graphs. */
+function both(label: string, model: Graph, generic: Graph, mine: Cache[], theirs: Cache[], rows: number[][]): void {
   using input = ids(rows);
-  return "forwardHidden" in model ? model.forwardHidden(input, caches) : phaseHidden(model, input, caches);
-};
-const operation = (rows: number[][], run: (input: MlxArray, caches: Cache[]) => MlxArray) => (caches: Cache[]) => {
-  using input = ids(rows);
-  return run(input, caches);
-};
-
-/** A capturing forward; returns the final hidden and every captured layer (copies). */
-function captured(run: (capture: MlxLayerCapture) => MlxArray): { hidden: MlxArray; taps: MlxArray[] } {
-  const taps: MlxArray[] = [];
-  const hidden = run((_layer, h) => { taps.push(ops.contiguous(h)); });
-  return { hidden, taps };
-}
-/** A capturing verify group of a mixed forward: the oracle's geometry-preserving token group against the
- *  current graph's verify group at the class of its rows. */
-const mixedVerify = (model: Graph, caches: Cache[], rows: number[][]) => captured(capture => {
-  using input = ids(rows);
-  if ("forwardHiddenMixed" in model) {
-    const group: TokenGroup = { ids: input, cache: caches, preserveTokenGeometry: true, captureLayer: capture };
-    return model.forwardHiddenMixed([group])[0]!;
-  }
-  const width = widthClass(rows.length * rows[0]!.length);
-  return model.mixed([{ phase: "verify", width, ids: input, state: caches, capture }], width)[0]!;
-});
-
-/** Target row layouts holding `sources` (one serial cache list per row), the fill and speculative paths' storage. */
-function rowsOf(sources: Cache[][]): Cache[] {
-  return sources[0]!.map((cache, layer) => {
-    const layout = targetCacheLayout(cache) as unknown as BatchableCache;
-    layout.mergeRows(sources.map(source => source[layer]!));
-    return layout;
-  });
-}
-
-/** The assistant drafter's donor read over each graph's caches: its positions,
- *  embedding and both donor reads attended with one query each. */
-function donorReadDiff(label: string, p: Pair, oldCaches: Cache[], newCaches: Cache[]): void {
-  const read = (model: Graph, caches: Cache[]) => {
-    const rows = model.draftTarget(caches).assistantRows!;
-    using token = ids([[17]]);
-    const embedded = rows.embed(token);
-    const donors = rows.readDonors();
-    try {
-      using qs = tensor(noise(HEADS * HEAD_DIM, 3, 0.5), [1, HEADS, 1, HEAD_DIM]);
-      using qf = tensor(noise(HEADS * GLOBAL_HEAD_DIM, 4, 0.5), [1, HEADS, 1, GLOBAL_HEAD_DIM]);
-      return { positions: donors.positions, outs: [embedded, donors.sliding.attend(qs, 1, WINDOW), donors.full.attend(qf, 1, null)] };
-    } finally { donors.dispose(); }
-  };
-  const expected = read(p.old, oldCaches), actual = read(p.current, newCaches);
-  expect(actual.positions, label).toEqual(expected.positions);
-  let worst = 0;
-  try { actual.outs.forEach((out, i) => { worst = Math.max(worst, maxDiff(out, expected.outs[i]!, `${label} donor ${i}`)); }); }
-  finally { for (const out of [...actual.outs, ...expected.outs]) out.dispose(); }
-  record(`${label} assistant donor read`, worst, actual.outs.length);
-}
-
-/** Image prompt: merged embeddings, the image-position mask (positions 5 to 24, across the sliding window) and the spliced ids. */
-function visionPrefill(model: Graph, caches: Cache[], length: number, salt: number): MlxArray {
-  using input = ids([prompt(length, salt)]);
-  using wide = MlxArray.fromFloat32(noise(length * HIDDEN, salt, 0.04), [1, length, HIDDEN]);
-  using embeddings = wide.astype(Dtype.bfloat16);
-  using flags = MlxArray.fromInt32(Int32Array.from({ length }, (_, i) => i >= 5 && i < 25 ? 1 : 0), [length]);
-  using image = flags.astype(Dtype.bool);
-  return "forwardEmbeddings" in model ? model.forwardEmbeddings(embeddings, caches, image, input, image)
-    : model.prefillEmbeddings(embeddings, caches, image, input, image);
-}
-
-/** Runs `body`, then checks the oracle's unrolled path ran under the kv_config and never under bf16. */
-function expectOraclePath(p: Pair, scheme: Scheme, body: () => void): void {
-  const before = p.c.oracle.generatedForwardUses;
-  body();
-  const used = p.c.oracle.generatedForwardUses - before;
-  if (scheme.kvConfig) expect(used).toBeGreaterThan(0);
-  else expect(used).toBe(0);
+  outputDiff(label, model, generic, phaseHidden(model, input, mine), phaseHidden(generic, input, theirs), rows.length * rows[0]!.length);
+  stateDiff(label, mine, theirs);
 }
 
 test("the generated graphs extend nothing", () => {
-  for (const c of COMPOSITIONS) expect(Object.getPrototypeOf(c.current.GeneratedGemma4.prototype)).toBe(Object.prototype);
+  for (const c of COMPOSITIONS) expect(Object.getPrototypeOf(c.module.GeneratedGemma4.prototype)).toBe(Object.prototype);
 });
 
 for (const c of COMPOSITIONS) {
-  describe(`${c.stem}: the entire generated graph against the pre-D2 generated class`, () => {
-    for (const scheme of SCHEMES) {
-      const tag = `${c.stem} ${scheme.name}`;
+  describe(`${c.stem}: the generated graph against the generic Gemma 4 graph, kv_config composition`, () => {
+    let graphs: { model: Graph; generic: Graph } | null = null;
+    const pair = async () => {
+      if (graphs) return graphs;
+      const { weights, config } = artifact(await fixtureConfig(c.repo), 1);
+      const served = c.module.COMPOSITION.kv![0]!;
+      if (served.kind !== "affine-layers") throw new Error(`${c.stem}: the generated graph serves ${served.kind}`);
+      const kv: KvStorageScheme = { kind: "affine-layers", layers: served.layers, kernels: "tiled-causal" };
+      const composition = testComposition(kv);
+      return graphs = { model: new c.module.GeneratedGemma4(weights, config, composition), generic: new Gemma4Model(weights, config, composition) };
+    };
 
-      test(`${tag}: prefill 37, decodes, window, verify with capture, rollback, fill 1-4, phase operations, donor read`, async () => {
-        const p = await pair(c);
-        withFlag(scheme.flag, () => expectOraclePath(p, scheme, () => {
-          const layers = p.config.text.numHiddenLayers;
-          const oldCaches = p.old.makeCache(), newCaches = p.current.makeCache();
-          // The phase operations run their own cache set against the oracle's deprecated forward on a reference set.
-          const refCaches = p.old.makeCache(), phaseCaches = p.current.makeCache();
-          const phased = (label: string, rows: number[][], run: (input: MlxArray, caches: Cache[]) => MlxArray) =>
-            both(`${label} (phase operation)`, p, refCaches, phaseCaches, forwardHidden(rows), operation(rows, run));
-          try {
-            const prefill = prompt(37, 1);
-            both(`${tag} prefill37`, p, oldCaches, newCaches, forwardHidden([prefill]));
-            phased(`${tag} prefillChunk37`, [prefill], (input, caches) => p.current.prefillChunk.gpu(input, caches, null) as MlxArray);
-            convert(p, scheme, oldCaches, newCaches, refCaches, phaseCaches);
-            stateDiff(`${tag} converted`, newCaches, oldCaches);
-            stateDiff(`${tag} converted (phase operation)`, phaseCaches, refCaches);
-            for (let step = 0; step < 3; step++) {
-              const token = [[(200 + step) % VOCAB]];
-              both(`${tag} decode`, p, oldCaches, newCaches, forwardHidden(token));
-              phased(`${tag} decode`, token, (input, caches) => p.current.decode.one(input, caches, null));
-            }
-            both(`${tag} window5`, p, oldCaches, newCaches, forwardHidden([prompt(5, 2)]));
-            phased(`${tag} prefillTail5`, [prompt(5, 2)], (input, caches) => p.current.prefillTail.fiveToEight(input, caches, null) as MlxArray);
-            donorReadDiff(tag, p, oldCaches, newCaches);
-            {
-              // The verify phase with its capture against the oracle's verify (its inherited generic forward).
-              const rows = [prompt(4, 3)];
-              using input = ids(rows);
-              const expected = captured(capture => p.old.verify.four(input, oldCaches, capture) as MlxArray);
-              const actual = captured(capture => p.current.verify.four(input, newCaches, capture) as MlxArray);
-              expect(actual.taps.length).toBe(layers + 1);
-              tapsDiff(`${tag} verify4`, actual.taps, expected.taps);
-              outputDiff(`${tag} verify4`, p.current, p.old, actual.hidden, expected.hidden);
-              stateDiff(`${tag} verify4`, newCaches, oldCaches);
-              // The same window through the verify phase without a capture against the oracle's deprecated forward.
-              phased(`${tag} verify4`, rows, (window, caches) => p.current.verify.four(window, caches, null) as MlxArray);
-            }
-            {
-              // The mixed lane's capturing verify of 5, rolled back to 2 right after its write, then a decode.
-              const rows = [prompt(5, 4)];
-              const expected = mixedVerify(p.old, oldCaches, rows);
-              const actual = mixedVerify(p.current, newCaches, rows);
-              expect(actual.taps.length).toBe(layers + 1);
-              tapsDiff(`${tag} spec verify5 (mixed capture)`, actual.taps, expected.taps);
-              outputDiff(`${tag} spec verify5 (mixed capture)`, p.current, p.old, actual.hidden, expected.hidden);
-            }
-            for (const set of [oldCaches, newCaches]) for (const cache of set) cache.trim(3, true);
-            stateDiff(`${tag} spec rollback keep 2`, newCaches, oldCaches);
-            both(`${tag} decode after rollback`, p, oldCaches, newCaches, forwardHidden([[77]]));
-            {
-              // The one capture path E2 keeps (the binding's copy of each tapped layer from the phase's
-              // capture, here a prompt tail of 3) against the deprecated hidden tap (DSpark's binding).
-              const tapped = new Set([0, 3, layers - 1, layers]);
-              const tap = (model: Graph, caches: Cache[]) => {
-                const captures = new Map<number, MlxArray>();
-                using input = ids([prompt(3, 6)]);
-                const sorted = () => [...captures.entries()].sort(([a], [b]) => a - b).map(([, a]) => a);
-                if ("hiddenTap" in model) {
-                  model.hiddenTap = { layers: tapped, captured: captures };
-                  try { return { hidden: model.forwardHidden(input, caches), taps: sorted() }; }
-                  finally { model.hiddenTap = null; }
-                }
-                const hidden = model.prefillTail.twoToThree(input, caches, (layer, h) => {
-                  if (tapped.has(layer)) captures.set(layer, ops.contiguous(h));
-                });
-                return { hidden, taps: sorted() };
-              };
-              const expected = tap(p.old, oldCaches), actual = tap(p.current, newCaches);
-              expect(actual.taps.length).toBe(4);
-              tapsDiff(`${tag} hidden tap`, actual.taps, expected.taps);
-              outputDiff(`${tag} hidden tap`, p.current, p.old, actual.hidden, expected.hidden);
-              stateDiff(`${tag} hidden tap`, newCaches, oldCaches);
-            }
-            for (const span of [1, 2, 3, 4])
-              both(`${tag} fill${span}`, p, oldCaches, newCaches, forwardHidden([prompt(span, 5 + span)]));
-            both(`${tag} decode after fill`, p, oldCaches, newCaches, forwardHidden([[91]]));
-            const oldRows = rowsOf([oldCaches]), newRows = rowsOf([newCaches]);
-            try {
-              stateDiff(`${tag} target rows`, newRows, oldRows);
-              for (const span of [1, 2, 3, 4])
-                both(`${tag} fill${span} (target rows)`, p, oldRows, newRows, forwardHidden([prompt(span, 9 + span)]));
-              both(`${tag} decode (target rows)`, p, oldRows, newRows, forwardHidden([[33]]));
-            } finally { disposeAll(oldRows, newRows); }
-          } finally { disposeAll(oldCaches, newCaches, refCaches, phaseCaches); }
-        }));
-      }, 300_000);
+    test(`${c.stem}: prefill 37, decodes, a window across the sliding boundary, verify 4, decodes`, async () => {
+      const { model, generic } = await pair();
+      const mine = model.makeCache(), theirs = generic.makeCache();
+      try {
+        both("prefill 37", model, generic, mine, theirs, [prompt(37, 1)]);
+        for (let step = 0; step < 3; step++) both(`decode ${step}`, model, generic, mine, theirs, [[200 + step]]);
+        both("window 8", model, generic, mine, theirs, [prompt(8, 2)]);
+        both("verify 4", model, generic, mine, theirs, [prompt(4, 3)]);
+        for (let step = 0; step < 2; step++) both(`decode after ${step}`, model, generic, mine, theirs, [[90 + step]]);
+      } finally { disposeAll(mine, theirs); }
+    }, 120_000);
 
-      test(`${tag}: prefill 200, decodes, a window across the 256-position step`, async () => {
-        const p = await pair(c);
-        withFlag(scheme.flag, () => expectOraclePath(p, scheme, () => {
-          const oldCaches = p.old.makeCache(), newCaches = p.current.makeCache();
-          try {
-            both(`${tag} prefill200`, p, oldCaches, newCaches, forwardHidden([prompt(200, 6)]));
-            convert(p, scheme, oldCaches, newCaches);
-            for (let step = 0; step < 2; step++) both(`${tag} decode`, p, oldCaches, newCaches, forwardHidden([[11 + step]]));
-            both(`${tag} window60 across 256`, p, oldCaches, newCaches, forwardHidden([prompt(60, 7)]));
-            both(`${tag} decode`, p, oldCaches, newCaches, forwardHidden([[19]]));
-          } finally { disposeAll(oldCaches, newCaches); }
-        }));
-      }, 300_000);
-
-      test(`${tag}: prefill 12, a window of 8 across the sliding boundary, decodes`, async () => {
-        const p = await pair(c);
-        withFlag(scheme.flag, () => expectOraclePath(p, scheme, () => {
-          const oldCaches = p.old.makeCache(), newCaches = p.current.makeCache();
-          try {
-            both(`${tag} prefill12`, p, oldCaches, newCaches, forwardHidden([prompt(12, 8)]));
-            convert(p, scheme, oldCaches, newCaches);
-            both(`${tag} window8 across the sliding boundary`, p, oldCaches, newCaches, forwardHidden([prompt(8, 9)]));
-            for (let step = 0; step < 2; step++) both(`${tag} decode`, p, oldCaches, newCaches, forwardHidden([[23 + step]]));
-          } finally { disposeAll(oldCaches, newCaches); }
-        }));
-      }, 300_000);
-
-      test(`${tag}: vision prefill with a bidirectional image mask, then decodes`, async () => {
-        const p = await pair(c);
-        withFlag(scheme.flag, () => {
-          const oldCaches = p.old.makeCache(), newCaches = p.current.makeCache();
-          try {
-            both(`${tag} vision prefill37`, p, oldCaches, newCaches, (model, caches) => visionPrefill(model, caches, 37, 21));
-            convert(p, scheme, oldCaches, newCaches);
-            for (let step = 0; step < 2; step++) both(`${tag} decode after vision`, p, oldCaches, newCaches, forwardHidden([[41 + step]]));
-            both(`${tag} window3 after vision`, p, oldCaches, newCaches, forwardHidden([prompt(3, 22)]));
-          } finally { disposeAll(oldCaches, newCaches); }
-        });
-      }, 300_000);
-
-      test(`${tag}: two groups packed in one mixed forward`, async () => {
-        const p = await pair(c);
-        withFlag(scheme.flag, () => {
-          const oldA = p.old.makeCache(), newA = p.current.makeCache(), oldB = p.old.makeCache(), newB = p.current.makeCache();
-          try {
-            both(`${tag} group A prefill`, p, oldA, newA, forwardHidden([prompt(13, 8)]));
-            both(`${tag} group B prefill`, p, oldB, newB, forwardHidden([prompt(21, 9)]));
-            convert(p, scheme, oldA, newA, oldB, newB);
-            const run = (model: Graph, a: Cache[], b: Cache[]) => {
-              using first = ids([[23]]);
-              using second = ids([prompt(3, 10)]);
-              return "forwardHiddenMixed" in model ? model.forwardHiddenMixed([{ ids: first, cache: a }, { ids: second, cache: b }])
-                : model.mixed([{ phase: "decode", width: "one", ids: first, state: a, capture: null },
-                  { phase: "window", width: "twoToThree", ids: second, state: b, capture: null }], "four");
-            };
-            const expected = run(p.old, oldA, oldB), actual = run(p.current, newA, newB);
-            outputDiff(`${tag} mixed group A (decode)`, p.current, p.old, actual[0]!, expected[0]!);
-            outputDiff(`${tag} mixed group B (window)`, p.current, p.old, actual[1]!, expected[1]!);
-            stateDiff(`${tag} mixed group A`, newA, oldA);
-            stateDiff(`${tag} mixed group B`, newB, oldB);
-          } finally { disposeAll(oldA, newA, oldB, newB); }
-        });
-      }, 300_000);
-
-      test(`${tag}: aligned rows of one prompt: batched decode, verify with capture, rollback`, async () => {
-        const p = await pair(c);
-        withFlag(scheme.flag, () => {
-          const layers = p.config.text.numHiddenLayers;
-          const oldSources = [0, 1, 2].map(() => p.old.makeCache()), newSources = [0, 1, 2].map(() => p.current.makeCache());
-          let oldRows: Cache[] = [], newRows: Cache[] = [];
-          try {
-            for (let row = 0; row < 3; row++)
-              both(`${tag} aligned row ${row} prefill`, p, oldSources[row]!, newSources[row]!, forwardHidden([prompt(21, 3)]));
-            convert(p, scheme, ...oldSources, ...newSources);
-            oldRows = rowsOf(oldSources); newRows = rowsOf(newSources);
-            for (let step = 0; step < 2; step++)
-              both(`${tag} aligned batched decode`, p, oldRows, newRows, forwardHidden([[40 + step], [40 + step], [40 + step]]));
-            for (const set of [oldRows, newRows]) for (const cache of set) cache.specRoundBegin?.();
-            const rows = [prompt(3, 20), prompt(3, 20), prompt(3, 21)];
-            {
-              const expected = mixedVerify(p.old, oldRows, rows), actual = mixedVerify(p.current, newRows, rows);
-              expect(actual.taps.length).toBe(layers + 1);
-              tapsDiff(`${tag} aligned batched verify3`, actual.taps, expected.taps);
-              outputDiff(`${tag} aligned batched verify3`, p.current, p.old, actual.hidden, expected.hidden);
-            }
-            for (const set of [oldRows, newRows]) for (const cache of set)
-              (cache as unknown as { specRoundRollback(keep: readonly number[]): void }).specRoundRollback([3, 3, 1]);
-            stateDiff(`${tag} aligned batched rollback keep 3/3/1`, newRows, oldRows);
-            both(`${tag} aligned batched decode after rollback`, p, oldRows, newRows, forwardHidden([[70], [71], [72]]));
-          } finally { disposeAll(...oldSources, ...newSources, oldRows, newRows); }
-        });
-      }, 300_000);
-
-      if ("compiledDecodeStep" in c.current.GeneratedGemma4.prototype)
-        test(`${tag}: compiled decode step, growing and ring phases`, async () => {
-          const p = await pair(c);
-          withFlag(scheme.flag, () => {
-            const label = `${tag} compiled`;
-            const oldCaches = p.old.makeCache(), newCaches = p.current.makeCache();
-            const before = CompiledDecode.stepsExecuted;
-            try {
-              both(`${label} prefill10`, p, oldCaches, newCaches, forwardHidden([prompt(10, 61)]));
-              convert(p, scheme, oldCaches, newCaches);
-              for (let step = 0; step < 9; step++) {
-                using signed = ops.fromInt32([(100 + 7 * step) % VOCAB], [1]);
-                using token = signed.astype(Dtype.uint32);
-                const expected = p.old.compiledDecodeStep().step(token, oldCaches);
-                const actual = p.current.compiledDecodeStep!().step(token, newCaches);
-                ops.evalAll([expected.logits, ...expected.evalWith, actual.logits, ...actual.evalWith]);
-                try { record(`${label} logits`, maxDiff(actual.logits, expected.logits, `${label} step ${step} logits`), 1); }
-                finally { expected.logits.dispose(); actual.logits.dispose(); }
-                stateDiff(`${label} step`, newCaches, oldCaches);
-              }
-              expect(CompiledDecode.stepsExecuted - before).toBe(18);
-              expect(CompiledDecode.unexpectedRetraces).toBe(0);
-              both(`${label} decode after compiled`, p, oldCaches, newCaches, forwardHidden([[17]]));
-            } finally {
-              disposeAll(oldCaches, newCaches);
-              CompiledDecode.release(p.old);
-              CompiledDecode.release(p.current);
-            }
-          });
-        }, 300_000);
-    }
-
-    // The real-weight parity test's serve scenario: every kv_config cache converted
-    // before the first forward, so the oracle's unrolled path runs the prefill too.
-    for (const flag of [undefined, "1"])
-      test(`${c.stem} kv_config converted before the first forward, flag=${flag ?? "unset"}: prefill 37, decodes, two rows in one forward`, async () => {
-        const p = await pair(c);
-        const tag = `${c.stem} preconverted flag=${flag ?? "unset"}`;
-        withFlag(flag, () => expectOraclePath(p, { name: "", kvConfig: true, flag }, () => {
-          const oldCaches = preconverted(p, p.old, flag), newCaches = preconverted(p, p.current, flag);
-          const oldPair = preconverted(p, p.old, flag), newPair = preconverted(p, p.current, flag);
-          try {
-            const before = p.c.oracle.generatedForwardUses;
-            both(`${tag} prefill37`, p, oldCaches, newCaches, forwardHidden([prompt(37, 31)]));
-            expect(p.c.oracle.generatedForwardUses - before).toBe(1);
-            for (let step = 0; step < 3; step++) both(`${tag} decode`, p, oldCaches, newCaches, forwardHidden([[50 + step]]));
-            both(`${tag} window6`, p, oldCaches, newCaches, forwardHidden([prompt(6, 32)]));
-            both(`${tag} two rows in one forward`, p, oldPair, newPair, forwardHidden([prompt(16, 33), prompt(16, 34)]));
-          } finally { disposeAll(oldCaches, newCaches, oldPair, newPair); }
-        }));
-      }, 300_000);
+    test(`${c.stem}: prefill 200, decodes, a window across the 256-position step`, async () => {
+      const { model, generic } = await pair();
+      const mine = model.makeCache(), theirs = generic.makeCache();
+      try {
+        both("prefill 200", model, generic, mine, theirs, [prompt(200, 6)]);
+        for (let step = 0; step < 2; step++) both(`decode ${step}`, model, generic, mine, theirs, [[11 + step]]);
+        both("window 60 across 256", model, generic, mine, theirs, [prompt(60, 7)]);
+        both("decode after", model, generic, mine, theirs, [[19]]);
+      } finally { disposeAll(mine, theirs); }
+    }, 120_000);
   });
 }

@@ -88,6 +88,15 @@ export interface AttentionCache extends Cache {
   appendWindow(k: MlxArray, v: MlxArray): AttentionRead;
 }
 
+/** A training pass's cache: it stores nothing and owns the positions its pass
+ * reads at, the uniform positions from its offset or, for a prefix-shared
+ * concat [prompt; chosen; rejected], each response restarted after the prompt. */
+export interface TrainingAttentionCache extends AttentionCache {
+  /** `x` [B, H, T, D] rotated at this pass's positions: `rope` rotates one
+   * contiguous block of positions from a scalar offset. The caller owns `x`. */
+  ropePositions(x: MlxArray, rope: (block: MlxArray, offset: number) => MlxArray): MlxArray;
+}
+
 /** A cache composed for committed-token appends (token fill), where every
  * position of the span is already decided. */
 export interface CommittedAttentionCache extends AttentionCache {

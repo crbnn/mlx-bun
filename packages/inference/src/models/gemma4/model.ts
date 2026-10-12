@@ -42,17 +42,16 @@ import type { MediaEncoders, MediaSidecarProbes, MlxPromptInput, Vision } from "
 import { declareGraph } from "../capabilities";
 import { atEveryWidth } from "../graph";
 import { bindGemma4MediaInput, gemma4DraftTarget, gemma4MediaEncoders } from "./media";
-import type { AttentionCache, AttentionRead, Cache, SharedKv } from "../../contracts/mlx/cache";
+import type { AttentionRead, Cache, SharedKv, TrainingAttentionCache } from "../../contracts/mlx/cache";
 import { isCompiledTrace } from "../../runtime/compiled-trace";
 import { mapPackedTokens } from "../../input/token-groups";
 import { disposing } from "../../layers/helpers";
-import { activePrefixLayout, ropeBlocks } from "../../layers/prefix-layout";
 import { RMSNorm } from "../../layers/normalization";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import type { QuantizedLinear } from "../../layers/quantized-linear";
 import { logitSoftcap } from "../../kernels/logits";
 import { compiledLogitSoftcap } from "../../kernels/softcap";
-import { AttentionMasks, captureRopeOffsets } from "../../state/attention-read";
+import { AttentionMasks } from "../../state/attention-read";
 import { composedFullAttentionCache, composedSlidingAttentionCache } from "../../state/bf16-first-kv";
 import type { Composition } from "../../contracts/portable/composition";
 import { deferredTurboQuantKernels } from "../../state/turboquant-attention";
@@ -78,7 +77,7 @@ type PlainSharedKv = Extract<SharedKv, { kind: "plain" }>;
  *  sharer returns `sharedIn`); the caller owns those of a donor and disposes
  *  them after the pass. */
 function attentionTraining(
-  attn: Attention, x: MlxArray, cache: AttentionCache, sharedIn: PlainSharedKv | null,
+  attn: Attention, x: MlxArray, cache: TrainingAttentionCache, sharedIn: PlainSharedKv | null,
 ): { out: MlxArray; shared: PlainSharedKv } {
   const [B, L] = x.shape as [number, number, number];
 
@@ -103,20 +102,10 @@ function attentionTraining(
       v = k; // attention_k_eq_v: shared projection; norms differ below
     }
 
-    const offset = cache.offset;
-    // Own the pre-write positions through every query and shared-KV
-    // consumer. Advancing a row cache may replace and release its borrowed
-    // offset array before Q's RoPE is built. The fetched shared state owns
-    // this retained handle and releases it with K/V at the end of the pass.
-    const offsetArr = captureRopeOffsets(cache);
-
     const kNormed = attn.kNorm!.forward(k);
     const kT = ops.transposeAxes(kNormed, [0, 2, 1, 3]);
     kNormed.dispose();
-    const prefixLayout = activePrefixLayout();
-    const kRoped = prefixLayout
-      ? ropeBlocks(kT, prefixLayout, (block, offset) => attn.rope(block, offset))
-      : attn.rope(kT, offsetArr ?? offset);
+    const kRoped = cache.ropePositions(kT, (block, offset) => attn.rope(block, offset));
     kT.dispose();
 
     const vNormed = attn.vNorm!.forward(v);
@@ -126,17 +115,14 @@ function attentionTraining(
     k.dispose();
 
     try { read = cache.appendWindow(kRoped, vT); }
-    catch (error) { kRoped.dispose(); vT.dispose(); offsetArr?.dispose(); throw error; }
-    shared = { kind: "plain", keys: kRoped, values: vT, offset, offsetArr };
+    catch (error) { kRoped.dispose(); vT.dispose(); throw error; }
+    shared = { kind: "plain", keys: kRoped, values: vT, offset: cache.offset };
   }
 
   let out: MlxArray;
   try {
     q = disposing(q, ops.transposeAxes(q, [0, 2, 1, 3]));
-    const prefixLayoutQ = activePrefixLayout();
-    q = disposing(q, prefixLayoutQ
-      ? ropeBlocks(q, prefixLayoutQ, (block, offset) => attn.rope(block, offset))
-      : attn.rope(q, shared.offsetArr ?? shared.offset));
+    q = disposing(q, cache.ropePositions(q, (block, offset) => attn.rope(block, offset)));
     out = read.attend(q, 1.0);
   } finally { read.dispose(); }
   q.dispose();
@@ -151,7 +137,7 @@ function attentionTraining(
  *  `DecoderLayer.forwardAttn`): inputNorm → `attentionTraining` → postAttnNorm →
  *  residual add. */
 function layerAttnTraining(
-  layer: DecoderLayer, x: MlxArray, cache: AttentionCache, sharedIn: PlainSharedKv | null,
+  layer: DecoderLayer, x: MlxArray, cache: TrainingAttentionCache, sharedIn: PlainSharedKv | null,
 ): { h: MlxArray; shared: PlainSharedKv } {
   let h = layer.inputNorm.forward(x);
   const { out, shared } = attentionTraining(layer.attn, h, cache, sharedIn);
@@ -166,7 +152,7 @@ function layerAttnTraining(
  *  sub-blocks lets the checkpoint path rematerialize attention and MLP
  *  separately (peak attn+MLP → max(attn,MLP)+hMid). */
 function layerTraining(
-  layer: DecoderLayer, x: MlxArray, cache: AttentionCache,
+  layer: DecoderLayer, x: MlxArray, cache: TrainingAttentionCache,
   sharedIn: PlainSharedKv | null, perLayerInput: MlxArray | null,
 ): { h: MlxArray; shared: PlainSharedKv } {
   const { h: hMid, shared } = layerAttnTraining(layer, x, cache, sharedIn);
@@ -313,8 +299,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    * layers compose a ring of the sliding window, whose reads own the window
    * mask, and stay bf16 under TurboQuant. The full-attention caches' TurboQuant
    * read is deferred (`deferredTurboQuantKernels`): values stay rotated through
-   * the fused SDPA and the read un-rotates the output, the sequence this graph
-   * ran after `updateAndFetchDeferredV` before its blocks read through the cache. */
+   * the fused SDPA and the read un-rotates the output. */
   makeCache(): Cache[] {
     const masks = new AttentionMasks(), kv = this.composition.kv;
     return this.layers.slice(0, this.numDonors).map((l, layer) =>
@@ -502,9 +487,9 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
 
   /** The training cache layer `i` reads: its own, or its donor's for a
    *  KV-sharing layer (`cache` holds the donors' training caches). */
-  #trainingCache(cache: Cache[], i: number): AttentionCache {
+  #trainingCache(cache: Cache[], i: number): TrainingAttentionCache {
     const ci = this.cacheIndex[i]!;
-    return cache[ci === -1 ? this.cacheIndex[this.previousKvs[i]!]! : ci] as AttentionCache;
+    return cache[ci === -1 ? this.cacheIndex[this.previousKvs[i]!]! : ci] as TrainingAttentionCache;
   }
 
   /** The training forward's decoder over `h0` (consumed). */
@@ -711,7 +696,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    *  (retained, small) tensors reach the sharer layers downstream. */
   private runCheckpointedLayer(
     i: number, layer: DecoderLayer, h: MlxArray,
-    layerCache: AttentionCache, sharedIn: PlainSharedKv | null, pls: MlxArray | null,
+    layerCache: TrainingAttentionCache, sharedIn: PlainSharedKv | null, pls: MlxArray | null,
   ): { h: MlxArray; shared: PlainSharedKv | null } {
     const ctx = this.gradCkpt!;
     const ll = ctx.byLayer.get(i) ?? { attn: [], mlp: [] };
@@ -723,7 +708,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
   /** One Checkpoint over the whole layer (the original path). */
   private runSingleCheckpointedLayer(
     layer: DecoderLayer, h: MlxArray,
-    layerCache: AttentionCache, sharedIn: PlainSharedKv | null, pls: MlxArray | null,
+    layerCache: TrainingAttentionCache, sharedIn: PlainSharedKv | null, pls: MlxArray | null,
     ll: LayerLoras, ctx: GradCheckpointCtx,
   ): { h: MlxArray; shared: PlainSharedKv | null } {
     const lws = [...ll.attn, ...ll.mlp];
@@ -774,7 +759,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    *  LoRA to the MLP ck. */
   private runSplitCheckpointedLayer(
     layer: DecoderLayer, h: MlxArray,
-    layerCache: AttentionCache, sharedIn: PlainSharedKv | null, pls: MlxArray | null,
+    layerCache: TrainingAttentionCache, sharedIn: PlainSharedKv | null, pls: MlxArray | null,
     ll: LayerLoras, ctx: GradCheckpointCtx,
   ): { h: MlxArray; shared: PlainSharedKv | null } {
     const isSharer = !layer.attn.hasKv;

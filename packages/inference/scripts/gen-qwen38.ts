@@ -15,8 +15,9 @@
 // `--describe` prints for one. A change to the blocks, layers, kernels or this
 // template is a regeneration, never a hand edit: tests/models/qwen38-generated-sync.test.ts
 // regenerates every composition from tests/fixtures/qwen38-graphs and fails when a
-// committed file differs. Whether a regenerated graph computes the same bits is
-// tests/models/qwen38-m4pro-identity.test.ts and tests/models/qwen38-m1max-identity.test.ts.
+// committed file differs. Where a regenerated graph runs the generic blocks, its identity test holds it to the
+// generic Qwen 3.5 graph (tests/models/qwen38-m4pro-identity.test.ts, qwen38-m1max-identity.test.ts); its row
+// kernels are the real-artifact parity suite's (tests/parity/qwen-trellis-parity.test.ts) and the app digests'.
 
 import { parseArgs } from "node:util";
 import { loadModelConfig, quantFor } from "../src/artifacts/config";
@@ -54,9 +55,9 @@ export interface Qwen38Composition {
   readonly maxRows: number | null;
   readonly aneBridge: boolean;
   /** Layers whose gate and up widths differ, at one to four rows, on the reduce kernels. `"split"`, the default and
-   *  measured best: `ReduceMixedGateUp` with
-   *  MLX's compiled-SwiGLU tail, bit-identical to the two projections plus a separate SwiGLU and one kernel instead of
-   *  three (about 1 ms less per verify forward on the M1 Max over the artifact's ten such layers). `"fused"`:
+   *  measured best: `ReduceMixedGateUp` with MLX's compiled-SwiGLU tail, bit-identical to the two projections plus a
+   *  separate SwiGLU and one kernel instead of three (about 1 ms less per verify forward on the M1 Max over the
+   *  artifact's ten such layers). `"fused"`:
    *  the same kernel with the same-width kernel's float32 sigmoid (last bits differ). `"off"`: those layers keep the
    *  generic blocks' two projections and separate SwiGLU, the A/B control. Only a device whose table names
    *  `ReduceMixedGateUp` reads it. */

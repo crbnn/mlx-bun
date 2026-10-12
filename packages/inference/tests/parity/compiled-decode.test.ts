@@ -22,8 +22,7 @@ for (const [family, checkpoint] of [
     let weights: import("@mlx-bun/inference/artifacts").Weights | undefined;
     let model: import("@mlx-bun/inference/models/gemma4").Gemma4Model;
     /** The graph composed with a KV scheme: one per scheme, built on first use.
-     * Affine reads take the tiled-causal set this test read before E3 (its
-     * environment left MLX_BUN_NO_FUSED_SDPA unset). */
+     * Affine reads take the tiled-causal set (OptiQ's wrapper rule). */
     let modelFor: (kv: KvOptions) => import("@mlx-bun/inference/models/gemma4").Gemma4Model;
     let initialRetraces: number;
     let growingPrompt: number[];

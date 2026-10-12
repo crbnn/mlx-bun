@@ -575,6 +575,11 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
     catch (error) { cleanupFailure(error, () => disposeResources(cache)); }
   }
 
+  /** Releases the rope frequency tables its layers built; the weights are its owner's. */
+  dispose(): void {
+    disposeResources(this.layers.flatMap(layer => layer.attn.ropeFreqs ? [layer.attn.ropeFreqs] : []));
+  }
+
   /** One cache per layer, the lego the composition's KV scheme names for it
    *  (bf16, bf16-first affine, per listed layer under a per-layer scheme, or
    *  TurboQuant on full-attention layers, read deferred as Gemma 4 reads it), a

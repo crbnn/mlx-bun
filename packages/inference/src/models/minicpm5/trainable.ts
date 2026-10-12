@@ -1,7 +1,6 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { Cache, SharedKv } from "../../contracts/mlx/cache";
 import type { HeadQuant, PrefixLayout, SegmentedPass, TrainableGraph } from "../../contracts/mlx/trainable";
-import { setActivePrefixLayout } from "../../layers/prefix-layout";
 import { AttentionMasks } from "../../state/attention-read";
 import { prefixSharedCaches, selectedTrainingAttention, TrainingCache } from "../../state/training-cache";
 import type { RMSNorm } from "../../layers/normalization";
@@ -36,9 +35,8 @@ class MiniCpmSegmentedPass implements SegmentedPass {
   readonly input: MlxArray;
   private readonly caches: Cache[];
 
-  constructor(private readonly model: MiniCpmTraining, ids: MlxArray, private readonly prefix?: PrefixLayout) {
+  constructor(private readonly model: MiniCpmTraining, ids: MlxArray, prefix?: PrefixLayout) {
     this.caches = trainingCaches(model, prefix);
-    if (prefix) setActivePrefixLayout(prefix);
     try {
       this.input = model.embed.encode(ids); // [1, T, hidden]
     } catch (error) {
@@ -48,7 +46,6 @@ class MiniCpmSegmentedPass implements SegmentedPass {
   }
 
   private releaseCaches(): void {
-    if (this.prefix) setActivePrefixLayout(null);
     for (const c of this.caches) c.dispose();
   }
 
@@ -76,17 +73,15 @@ export function miniCpmTrainable(model: MiniCpmTraining): TrainableGraph {
     prefixShared: {
       /** The training forward (`runLayerRange`) over the whole concat, whose
        *  prefix-shared caches read under the block-sparse mask and whose
-       *  queries and keys take the block-wise RoPE of the active layout. */
+       *  queries and keys take the block-wise RoPE those caches own. */
       prefixSharedHidden(ids: MlxArray, layout: PrefixLayout): MlxArray {
         const caches = trainingCaches(model, layout);
-        setActivePrefixLayout(layout);
         try {
           const h0 = model.embed.encode(ids);
           let h: MlxArray;
           try { h = model.runLayerRange(h0, 0, model.layers.length, caches); } finally { h0.dispose(); }
           try { return model.finalNorm.forward(h); } finally { h.dispose(); } // [1, T, hidden], post-finalNorm
         } finally {
-          setActivePrefixLayout(null);
           for (const c of caches) c.dispose();
         }
       },

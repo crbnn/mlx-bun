@@ -21,11 +21,11 @@
 //
 // This module is STATELESS server-lifetime weights. Per-request context
 // K/V (the incremental cache DeepSpec threads through consecutive draft
-// rounds via a DynamicCache) is NOT stored here — see `projectContext` /
-// `draftBlock` below for the seam.
+// rounds via a DynamicCache) is NOT stored here — see `projectContextKVRows` /
+// `draftRows` below for the seam.
 
 import { Weights } from "../../artifacts/weights";
-import type { ContextKV, DeepspecContextAttention, DeepspecDraftBlock, DeepspecDraftRows, DeepspecDrafterModel } from "../../contracts/mlx/drafter";
+import type { ContextKV, DeepspecContextAttention, DeepspecDraftRows, DeepspecDrafterModel } from "../../contracts/mlx/drafter";
 import { isDeepspecArchitecture } from "./deepspec-artifact";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
@@ -209,13 +209,6 @@ interface Layer {
   layerScalar: MlxArray; // [1]
 }
 
-export function plainDeepspecContext(context: readonly ContextKV[]): DeepspecContextAttention {
-  return { attend(layer, query, blockKeys, blockValues) {
-    using keys = ops.concatAxis([context[layer]!.k, blockKeys], 2);
-    using values = ops.concatAxis([context[layer]!.v, blockValues], 2);
-    return ops.sdpa(query, keys, values, 1, "", null);
-  } };
-}
 export class DeepspecDrafter implements DeepspecDrafterModel {
   readonly cfg: DeepspecConfig;
   /** === config.target_layer_ids, alias for the ground-truth term. */
@@ -408,7 +401,7 @@ export class DeepspecDrafter implements DeepspecDrafterModel {
    *
    * Returns the projected+normed context hidden [1, L, hidden] (still needs
    * per-layer k_proj + k_norm + rope to become cacheable ContextKV — see
-   * projectContextKV).
+   * projectContextKVRows).
    */
   projectContext(targetHiddens: MlxArray): MlxArray {
     const proj = matmulW(targetHiddens, this.#fc); // [1,L,hidden]
@@ -442,14 +435,9 @@ export class DeepspecDrafter implements DeepspecDrafterModel {
    *
    * v ≡ k when attention_k_eq_v (v_proj is absent; v_norm is the SAME
    * concat-then-scale-less-norm, over k_proj's output — v gets NO rope).
+   * `position` is the first context row's absolute position (per row as an
+   * array when the rows start at different positions).
    */
-  projectContextKV(contextHidden: MlxArray, positions: number[]): ContextKV[] {
-    if (positions.length !== contextHidden.shape[1])
-      throw new Error(`projectContextKV: ${positions.length} positions for ${contextHidden.shape[1]} context rows`);
-    assertContiguous(positions);
-    return this.projectContextKVRows(contextHidden, positions[0]!);
-  }
-
   projectContextKVRows(contextHidden: MlxArray, position: number | MlxArray): ContextKV[] {
     const B = contextHidden.shape[0]!, L = contextHidden.shape[1]!;
     const out: ContextKV[] = [];
@@ -524,7 +512,7 @@ export class DeepspecDrafter implements DeepspecDrafterModel {
 
       // k_noise = k_proj(x); norm+rope IDENTICALLY to the cached context
       // rows (concat-then-norm == norm-then-concat per the RMSNorm argument
-      // in projectContextKV's doc comment).
+      // in projectContextKVRows's doc comment).
       const kNoiseFlat = matmulW(x, layer.kProj);
       const kNoise4 = ops.reshape(kNoiseFlat, [B, G, this.nKvHeads, this.headDim]);
       kNoiseFlat.dispose();
@@ -671,18 +659,13 @@ export class DeepspecDrafter implements DeepspecDrafterModel {
    *   if not below.any(): return block_size
    *   return first index where below is True         # ℓ can be 0 (EMPTY proposal)
    *
-   * ctxKV: this round's cached context K/V (see projectContextKV/crop notes
-   * on the class doc — caller owns cache lifetime and crop-after-round).
-   * anchorTok: the just-verified/bonus token starting this block.
-   * anchorPos: its absolute sequence position (blockPositions[0]).
+   * Here the graph and the sequential proposal head run at the active row
+   * count, one block per anchor (the just-verified or bonus token starting
+   * it); confidence selects each row's length after the full device chain.
+   * `context` reads the rows' cached context K/V (projectContextKVRows; the
+   * caller owns its lifetime and the crop after the round); `position` is
+   * each block's first absolute position.
    */
-  draftBlock(ctxKV: ContextKV[], anchorTok: number, anchorPos: number): DeepspecDraftBlock {
-    const result = this.draftRows(plainDeepspecContext(ctxKV), [anchorTok], anchorPos, true);
-    return { tokens: result.tokens[0]!, conf: result.conf[0]!, baseLogits: result.baseLogits! };
-  }
-
-  /** The graph and sequential proposal head run at the active row count.
-   * Confidence selects each row's length after the full device chain. */
   draftRows(context: DeepspecContextAttention, anchors: readonly number[], position: number | MlxArray,
     collectLogits = false): DeepspecDraftRows {
     const B = anchors.length, G = this.gamma, V = this.cfg.vocab_size;
@@ -743,9 +726,3 @@ export class DeepspecDrafter implements DeepspecDrafterModel {
   }
 }
 
-function assertContiguous(positions: number[]): void {
-  for (let i = 1; i < positions.length; i++) {
-    if (positions[i] !== positions[i - 1]! + 1)
-      throw new Error(`DeepspecDrafter: expected contiguous positions, got ${JSON.stringify(positions)}`);
-  }
-}

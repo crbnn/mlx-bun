@@ -1,7 +1,7 @@
 // UniversalDense — the Tier-0 config-driven dense llama-family module
 // (`02d723a:docs/design/generic-model-support.md` §4.1). One module, shaped exactly
 // like qwen3.ts, with every arch delta selected by the UniversalArgs
-// descriptor (archs.ts). Monolith path only: no compiled
+// descriptor (archs.ts). No compiled
 // decode. Each attention block reads its cache for the phase its caller names
 // (`ReadPhase`) with the read the descriptor composes at construction: the
 // cache's own read, or the score-softcapped read over dense KV
@@ -182,8 +182,8 @@ class UniversalAttention {
     // Batched decode: the scheduler's mask wrapper exposes each row's REAL
     // position as ropeOffsetArr (rows have different prompt lengths under
     // left-padding; the scalar offset would mis-position every padded row by
-    // its pad amount — the 2026-07-03 uneven-batch bug). Serial lane: scalar
-    // offset, byte-identical to before (the S1b.1 pattern, cf. qwen3_5.ts).
+    // its pad amount — the 2026-07-03 uneven-batch bug). One row: the scalar
+    // offset.
     const offArr = (cache as { ropeOffsetArr?: MlxArray }).ropeOffsetArr;
     q = disposing(q, offArr
       ? this.rope.applyDynamic(q, offArr)
@@ -538,11 +538,13 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
     return out;
   }
 
+  /** Releases the rope frequency table it built (a scaled rope's); the weights are its owner's. */
+  dispose(): void { this.sharedRope.dispose(); }
+
   /** One cache per layer (a ring on a sliding layer with a window), sharing
    * one mask memo. The full-attention caches' TurboQuant read is dense
-   * (`denseTurboQuantKernels`): this graph read TurboQuant storage decoded,
-   * through `updateAndFetch`, before its blocks read through the cache (the
-   * softcapped read still fetches it that way). */
+   * (`denseTurboQuantKernels`): the read decodes keys and values first (the
+   * softcapped read attends the decoded window). */
   makeCache(): Cache[] {
     const masks = new AttentionMasks();
     const kv = this.composition.kv;

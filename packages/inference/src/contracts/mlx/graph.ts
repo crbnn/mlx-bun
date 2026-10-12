@@ -183,6 +183,12 @@ export interface MlxDenoisingOperations {
  * when it binds (`declaredGraph`), so execution never probes for them. */
 export interface MlxDeclaredGraph {
   readonly graphCapabilities: GraphCapabilities;
+  /** Release what the graph built at construction (computed constants, Neural
+   *  Engine programs, its own weight source where it opened one) once every
+   *  execution and compiled runner has stopped. A graph that built nothing
+   *  releases nothing. Its owner (the host, a draft provider) calls it before
+   *  releasing the weights it supplied. */
+  dispose(): void;
   /** Unscaled token embeddings, for media prompts that splice embeddings. */
   readonly embed?: TextEmbeddingModel["embed"];
   /** media `embeddings`/`embeddings+positions`: bind one request's prepared

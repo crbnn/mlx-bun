@@ -67,10 +67,9 @@ export function composedAffineKernels(choice: AffineKernelChoice): AffineKernelS
  * affine keys and values (`captureKvAttention`, `quantizedDonorAttention`):
  * one query reads with `kernels.decode`; a window under a plain causal mask, or
  * a causal-equivalent bool matrix, with `kernels.window`; under any other array
- * mask with `kernels.maskedWindow`: the deprecated `quantizedSdpa` dispatch,
- * with the composition's kernel set where that dispatch read a process flag.
- * @deprecated These views go with the attention-state read paths they serve
- * (B2's layouts, B1's donor-read contract); the named reads choose by phase. */
+ * mask with `kernels.maskedWindow`. The views choose by query count because the
+ * row layouts' attention views and the donor reads receive their queries
+ * without a phase; the caches' named reads choose by phase. */
 export function viewAffineKernel(kernels: AffineKernels, queries: number, mask: Mask): AffineKernel {
   if (queries === 1) return kernels.decode;
   const causal = mask.mode === "causal" || mask.mode === "" ||

@@ -4,7 +4,8 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { createCausalMask } from "../kernels/attention/masks";
 import { flashAttention, flashSupported, getTrainingAttn } from "../kernels/attention/flash";
 import { gatedDeltaUpdate } from "../kernels/delta/gated";
-import type { AttentionCache, AttentionRead, Cache, GatedDeltaCache, GatedDeltaParameters, Mask } from "../contracts/mlx/cache";
+import type { AttentionRead, Cache, GatedDeltaCache, GatedDeltaParameters, Mask, TrainingAttentionCache } from "../contracts/mlx/cache";
+import { ropeBlocks } from "../layers/prefix-layout";
 import { AttentionMasks, causalLease, unmaskedLease, withLease, type MaskLease } from "./attention-read";
 import type { PrefixLayout } from "../contracts/mlx/trainable";
 import { isRecurrentCache } from "./capabilities";
@@ -85,11 +86,8 @@ export function paddedTrainingMask(B: number, L: number, lengths: readonly numbe
  *  real positions), both reads take the padded-batch mask
  *  (`paddedTrainingMask`) for the cache's window, so no real query sees a
  *  padded key. A layer with a sliding window gets a cache composed with it; the
- *  caches of one forward share `masks`, so its layers build each mask once.
- *
- *  `updateAndFetch` and `makeMask` are the fetch and mask the frozen
- *  pre-refactor graphs in the tests read; no graph here calls them. */
-export class TrainingCache implements AttentionCache {
+ *  caches of one forward share `masks`, so its layers build each mask once. */
+export class TrainingCache implements TrainingAttentionCache {
   constructor(
     /** The layer's sliding window; null for full attention. */
     readonly window: number | null = null,
@@ -103,6 +101,8 @@ export class TrainingCache implements AttentionCache {
   /** Training-only adapter; never admitted, merged, or persisted. */
   signature(): string { return "train:training"; }
   offset = 0;
+  /** Uniform positions from the pinned offset. */
+  ropePositions(x: MlxArray, rope: (block: MlxArray, offset: number) => MlxArray): MlxArray { return rope(x, this.offset); }
   appendDecode(k: MlxArray, v: MlxArray): AttentionRead {
     return trainingRead(k, v, this.rowLengths ? this.#padded(k.shape[2]!) : unmaskedLease, this.attention, this.window);
   }
@@ -119,6 +119,8 @@ export class TrainingCache implements AttentionCache {
     return this.masks.lease(`training-padded:${this.window}`, `${L}|${lengths.join(",")}`,
       () => ({ mode: "array", arr: paddedTrainingMask(lengths.length, L, lengths, this.window) }));
   }
+  /** The dense fetch and mask the softcapped read (`state/softcap-attention.ts`)
+   *  attends through: pass-through views and the mask the window read takes. */
   updateAndFetch(k: MlxArray, v: MlxArray): [MlxArray, MlxArray] {
     return [k.slice([0, 0, 0, 0], k.shape), v.slice([0, 0, 0, 0], v.shape)];
   }
@@ -154,29 +156,23 @@ export class TrainingCache implements AttentionCache {
  *
  *  Its `recurDecode` and `recurWindow` run the recurrence with a backward
  *  attached (`gatedDeltaUpdate`'s `differentiable`), since the inference
- *  kernel has no gradient. Until C1 moves the block onto those calls,
- *  GatedDeltaNet.forward still reads the slots below and detects this class to
- *  choose the differentiable recurrence. */
+ *  kernel has no gradient; the DeltaNet block hands them its projections as it
+ *  does to any recurrent cache. */
 export class TrainingSSMCache implements GatedDeltaCache {
   /** Training-only adapter; never admitted, merged, or persisted. */
   signature(): string { return "train:training-ssm"; }
   offset = 0;
   specRound: null = null;
-  get conv(): MlxArray | null { return null; }
-  set conv(v: MlxArray | null) { v?.dispose(); }
-  get recurrent(): MlxArray | null { return null; }
-  set recurrent(v: MlxArray | null) { v?.dispose(); }
   recurDecode(qkv: MlxArray, a: MlxArray, b: MlxArray, layer: GatedDeltaParameters): MlxArray {
     return this.#recur(qkv, a, b, layer);
   }
   recurWindow(qkv: MlxArray, a: MlxArray, b: MlxArray, layer: GatedDeltaParameters): MlxArray {
     return this.#recur(qkv, a, b, layer);
   }
-  /** GatedDeltaNet.forward's training case, copied: a zero conv state, the
+  /** The training recurrence: a zero conv state, the
    *  causal convolution, the block's glue, and the differentiable recurrence
    *  from a zero recurrent state. Nothing is stored, so the new recurrent
-   *  state is disposed at once and the conv tail the block builds for its
-   *  setter to dispose is not built here. */
+   *  state is disposed at once and no conv tail is kept. */
   #recur(qkv: MlxArray, a: MlxArray, b: MlxArray, layer: GatedDeltaParameters): MlxArray {
     const [B, , D] = qkv.shape as [number, number, number];
     const convState = ops.zeros([B, layer.convWeight.shape[1]! - 1, D], qkv.dtype);
@@ -193,12 +189,6 @@ export class TrainingSSMCache implements GatedDeltaCache {
   }
   advance(_n: number): void { /* offset pinned at 0 */ }
   rowOffset(_i: number): number { return 0; }
-  updateAndFetch(): [MlxArray, MlxArray] {
-    throw new Error("TrainingSSMCache: DeltaNet layers do not use the KV path");
-  }
-  makeMask(_N: number, _w: number | null): Mask {
-    return { mode: "", arr: null }; // ssm_mask is None at B=1 (SSMCache parity)
-  }
   state(): MlxArray[] { return []; }
   isTrimmable(): boolean { return true; }
   trim(_n: number): void { /* stateless */ }
@@ -257,19 +247,13 @@ export function blockSparsePrefixMask(layout: PrefixLayout, window: number | nul
  *  attended with `attention`. The caches of one pass share `masks`, so each
  *  window's mask is built once per pass, across its layers, segments and
  *  backward recomputes. A decode read is not defined over a concat; it reads as
- *  the window does and refuses anything but the whole concat.
- *
- *  `updateAndFetch` and `makeMask` are the fetch and mask the frozen
- *  pre-refactor graphs in the tests read (`memo`, shared by
- *  `prefixSharedCaches`, hands them the unwindowed mask as slice views); no
- *  graph here calls them. */
-export class PrefixSharedCache implements AttentionCache {
+ *  the window does and refuses anything but the whole concat. */
+export class PrefixSharedCache implements TrainingAttentionCache {
   /** Training-only adapter; never admitted, merged, or persisted. */
   signature(): string { return "train:prefix-shared"; }
   offset = 0;
   constructor(
     private readonly layout: PrefixLayout,
-    private readonly memo?: { mask: MlxArray | null },
     /** The layer's sliding window, on logical positions; null for full attention. */
     readonly window: number | null = null,
     /** The per-pass masks of the model this cache belongs to. */
@@ -277,6 +261,10 @@ export class PrefixSharedCache implements AttentionCache {
     /** The kernel this cache's reads attend with. */
     readonly attention: TrainingAttention = "sdpa",
   ) {}
+  /** The concat's block positions: the prompt from 0, each response restarted at P. */
+  ropePositions(x: MlxArray, rope: (block: MlxArray, offset: number) => MlxArray): MlxArray {
+    return ropeBlocks(x, this.layout, rope);
+  }
   appendDecode(k: MlxArray, v: MlxArray): AttentionRead { return this.appendWindow(k, v); }
   appendWindow(k: MlxArray, v: MlxArray): AttentionRead {
     const { P, Rc, Rr } = this.layout, N = k.shape[2]!;
@@ -285,33 +273,19 @@ export class PrefixSharedCache implements AttentionCache {
       () => ({ mode: "array", arr: blockSparsePrefixMask(this.layout, this.window) }));
     return trainingRead(k, v, mask, this.attention, this.window);
   }
-  updateAndFetch(k: MlxArray, v: MlxArray): [MlxArray, MlxArray] {
-    return [k.slice([0, 0, 0, 0], k.shape), v.slice([0, 0, 0, 0], v.shape)];
-  }
-  makeMask(N: number, windowSize: number | null): Mask {
-    const { P, Rc, Rr } = this.layout;
-    if (N !== P + Rc + Rr) throw new Error(`PrefixSharedCache: N=${N} != P+Rc+Rr=${P + Rc + Rr}`);
-    if (!this.memo || windowSize !== null) return { mode: "array", arr: blockSparsePrefixMask(this.layout, windowSize) };
-    if (!this.memo.mask) this.memo.mask = blockSparsePrefixMask(this.layout, null);
-    const m = this.memo.mask;
-    return { mode: "array", arr: m.slice([0, 0], m.shape) };
-  }
   state(): MlxArray[] { return []; }
   isTrimmable(): boolean { return true; }
   trim(_n: number): void { /* offset pinned at 0 */ }
-  dispose(): void {
-    if (this.memo?.mask) { this.memo.mask.dispose(); this.memo.mask = null; }
-    this.masks.clear();
-  }
+  dispose(): void { this.masks.clear(); }
 }
 
 /** Prefix-shared caches for one pass, one per entry of `windows` (each layer's
- *  sliding window, or null), sharing one mask memo and attending with
+ *  sliding window, or null), sharing one set of masks and attending with
  *  `attention`. */
 export function prefixSharedCaches(layout: PrefixLayout, windows: readonly (number | null)[],
   attention: TrainingAttention = "sdpa"): Cache[] {
-  const memo: { mask: MlxArray | null } = { mask: null }, masks = new AttentionMasks();
-  return windows.map(window => new PrefixSharedCache(layout, memo, window, masks, attention));
+  const masks = new AttentionMasks();
+  return windows.map(window => new PrefixSharedCache(layout, window, masks, attention));
 }
 
 /** The stateless stand-in a training or scoring forward runs in place of one

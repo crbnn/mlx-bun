@@ -44,14 +44,14 @@ test("a loaded model records the composition resolved before its graph was built
       kv: { kind: "affine", bits: 8, groupSize: 64, kernels: "unfused" }, pagedKv: null,
       draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 3, packedMixedMlp: true,
       vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
-      grammarJump: false, greedyDraft: false, compiledGeglu: true });
+      grammarJump: false, greedyDraft: false, compiledGeglu: true, compiledSwiglu: true });
     expect(typeof aneBridge).toBe("boolean");
     const binding = await modelServingBinding(context);
     expect(binding.diagnostics()).toEqual({ composition: { device: deviceArchitecture(), ane_bridge: aneBridge,
       kv: { kind: "affine", bits: 8, group_size: 64, kernels: "unfused" }, paged_kv: null, draft_depth: 0, prefill_chunk_tokens: 2048,
       adapters: false, max_rows: 3, packed_mixed_mlp: true, vector_greedy_sampling: true,
       compiled_decode: true, mixed_prefill: false, mixed_token_budget: 256, prefill_tail_split: true, grammar_jump: false,
-      greedy_draft: false, compiled_geglu: true } });
+      greedy_draft: false, compiled_geglu: true, compiled_swiglu: true } });
     // The graph's caches are the composition's: the KV8 legos it names.
     const caches = (context.model as { makeCache(): { signature(): string; dispose(): void }[] }).makeCache();
     try { expect(caches.every(cache => cache.signature() === "kv:bf16-first:kv:plain")).toBe(true); }

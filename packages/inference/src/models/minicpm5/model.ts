@@ -14,14 +14,12 @@ import type {
   MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward, MlxWidthClass,
 } from "../../contracts/mlx/graph";
 import type { TrainableGraph } from "../../contracts/mlx/trainable";
-import { activePrefixLayout, ropeBlocks } from "../../layers/prefix-layout";
 import { miniCpmTrainable } from "./trainable";
 import { declareGraph } from "../capabilities";
 import { atEveryWidth, type ReadPhase } from "../graph";
 import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
-import type { AttentionCache, Cache } from "../../contracts/mlx/cache";
-import { runtimeValue } from "../../runtime/config";
+import type { Cache, TrainingAttentionCache } from "../../contracts/mlx/cache";
 import { disposing } from "../../layers/helpers";
 import { RMSNorm } from "../../layers/normalization";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
@@ -84,22 +82,15 @@ export class LlamaAttention {
   }
 
   /** The training forward over a training cache (`TrainingCache`,
-   *  `PrefixSharedCache`), with the prefix-shared block RoPE while a layout is
-   *  active: the cache's window read, which owns the mask (causal, padded or
+   *  `PrefixSharedCache`), roped at the positions the cache owns (block-wise
+   *  for a prefix-shared concat), read through its window read, which owns the mask (causal, padded or
    *  block-sparse) and the kernel the run composed (the SDPA, or the validated
    *  flash kernel). */
-  forwardTraining(x: MlxArray, cache: AttentionCache): MlxArray {
+  forwardTraining(x: MlxArray, cache: TrainingAttentionCache): MlxArray {
     const [B, L] = x.shape as [number, number, number];
     let [q, k, v] = this.#heads(x, B, L);
-    const offsetArr = cache.ropeOffsetArr;
-    const ropeStep = (x: MlxArray): MlxArray => {
-      const prefixLayout = activePrefixLayout();
-      return prefixLayout
-        ? ropeBlocks(x, prefixLayout, (block, offset) => ops.rope(block, this.headDim, this.ropeBase, offset, null))
-        : offsetArr
-          ? ops.ropeDynamic(x, this.headDim, this.ropeBase, offsetArr, null)
-          : ops.rope(x, this.headDim, this.ropeBase, cache.offset, null);
-    };
+    const ropeStep = (x: MlxArray): MlxArray =>
+      cache.ropePositions(x, (block, offset) => ops.rope(block, this.headDim, this.ropeBase, offset, null));
     q = disposing(q, ropeStep(q));
     k = disposing(k, ropeStep(k));
     const read = cache.appendWindow(k, v);
@@ -166,7 +157,7 @@ export class LlamaMLP {
 }
 
 /** The MLP with the swiglu as separate silu and multiply kernels: the explicit
- *  opt-out (`MLX_BUN_COMPILED_SWIGLU=0`), chosen when the graph is built. */
+ *  composition with `compiledSwiglu` off, chosen when the graph is built. */
 export class LlamaUnfusedMLP {
   readonly kind = "unfused";
   readonly gate: QuantizedLinear;
@@ -226,7 +217,7 @@ export class LlamaLayer {
   }
 
   /** The training forward (`LlamaAttention.forwardTraining`). */
-  forwardTraining(x: MlxArray, cache: AttentionCache): MlxArray {
+  forwardTraining(x: MlxArray, cache: TrainingAttentionCache): MlxArray {
     const xn = this.inputNorm.forward(x);
     const a = this.attn.forwardTraining(xn, cache);
     xn.dispose();
@@ -271,8 +262,7 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
     this.weightsBytes = [...weights.shards.files.values()]
       .reduce((a, f) => a + f.mmap.size, 0);
     this.embed = QuantizedEmbedding.load(weights, "model.embed_tokens", config);
-    // E3: the swiglu opt-out becomes a composition choice; read once, here.
-    const Mlp = runtimeValue("MLX_BUN_COMPILED_SWIGLU") === "0" ? LlamaUnfusedMLP : LlamaMLP;
+    const Mlp = composition.compiledSwiglu ? LlamaMLP : LlamaUnfusedMLP;
     this.layers = Array.from(
       { length: config.text.numHiddenLayers },
       (_, i) => new LlamaLayer(weights, config, `model.layers.${i}`, Mlp),
@@ -297,9 +287,12 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
     return out;
   }
 
+  /** Builds no constants and opens no weights: nothing to release. */
+  dispose(): void {}
+
   /** One cache per layer, sharing one mask memo. Their TurboQuant read is
-   * deferred (`deferredTurboQuantKernels`), the rotated-value sequence this
-   * graph ran after `updateAndFetchDeferredV` before it read through the cache. */
+   * deferred (`deferredTurboQuantKernels`): attention runs on the rotated
+   * values and the read un-rotates its output. */
   makeCache(): Cache[] {
     const masks = new AttentionMasks();
     return this.layers.map((_, layer) => composedFullAttentionCache(this.composition.kv, layer, masks, deferredTurboQuantKernels));
@@ -361,7 +354,7 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
     if (aIdx >= bIdx) return h;
     let cur = h;
     for (let i = aIdx; i < bIdx; i++) {
-      const next = this.layers[i]!.forwardTraining(cur, cache[i] as AttentionCache);
+      const next = this.layers[i]!.forwardTraining(cur, cache[i] as TrainingAttentionCache);
       if (i > aIdx) cur.dispose(); // keep the input boundary leaf; drop interiors
       cur = next;
     }
