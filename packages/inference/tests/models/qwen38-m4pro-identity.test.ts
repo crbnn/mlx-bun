@@ -19,7 +19,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { parseQuantization, type ModelConfig } from "../../src/artifacts/config";
 import type { Weights } from "../../src/artifacts/weights";
 import type { BatchableCache, Cache } from "../../src/contracts/mlx/cache";
-import type { MlxLayerCapture, MlxWidthTable } from "../../src/contracts/mlx/graph";
+import { widthClass, type MlxLayerCapture, type MlxWidthTable } from "../../src/contracts/mlx/graph";
 import type { Composition, KvStorageScheme } from "../../src/contracts/portable/composition";
 import { LAYERS, Qwen38TrellisM4Pro } from "../../src/models/qwen/qwen38-27b-trellis-m4pro";
 import { unfusedAffineKernels } from "../../src/state/affine-attention";
@@ -30,6 +30,7 @@ import { Kv4Head256Cache } from "../../src/state/kv4-head256-cache";
 import { targetCacheLayout } from "../../src/state/layout";
 import { SSMCache } from "../../src/state/ssm";
 import { Qwen38TrellisM4Pro as FrozenM4Pro } from "./qwen38-27b-trellis-m4pro-reference";
+import { phaseHidden } from "./phase-forward";
 
 const HIDDEN = 512, INTER = 256, VOCAB = 256, HEADS = 4, KV_HEADS = 2, HEAD_DIM = 256;
 const HK = 4, HV = 8, DK = 64, DV = 64, KERNEL = 4;
@@ -137,7 +138,8 @@ function artifact(): { weights: Weights; config: ModelConfig } {
 
 const composition = (overrides: Partial<Composition> = {}): Composition => Object.freeze<Composition>({
   device: "applegpu_g16s", aneBridge: false, kv: { kind: "bf16" }, draftDepth: { adaptive: true, max: 7 },
-  prefillChunkTokens: CHUNK, adapters: false, maxRows: 8, speculativeAffineKv: true, packedMixedMlp: true, ...overrides,
+  prefillChunkTokens: CHUNK, adapters: false, maxRows: 8, speculativeAffineKv: true, packedMixedMlp: true,
+  vectorGreedySampling: true, ...overrides,
 });
 /** The M4 Pro composition's KV scheme (`--kv-quant 4`, fused SDPA unset). */
 const KV4: KvStorageScheme = Object.freeze({ kind: "affine", bits: 4, groupSize: 64, kernels: "unfused" });
@@ -328,7 +330,7 @@ for (const scheme of SCHEMES) {
         for (let step = 0; step < 3; step++) {
           using input = ids([[100 + step]]);
           const expected = old.forwardHidden(input, set.old);
-          outputDiff(`${scheme} decode.one`, current.decode.one(input, set.current) as MlxArray, expected, current.logits.one, oldHead);
+          outputDiff(`${scheme} decode.one`, current.decode.one(input, set.current, null), expected, current.logits.one, oldHead);
           stateDiff(`${scheme} decode.one`, set.current, set.old);
         }
         for (const width of [2, 3, 4, 5, 8]) {
@@ -361,70 +363,82 @@ for (const scheme of SCHEMES) {
       } finally { disposeAll(set.old, set.current); }
     }, 180_000);
 
-    test(`${scheme}: the deprecated entry points reach the same blocks as the old graph`, () => {
+    test(`${scheme}: the phases a scheduler names reach the same blocks as the old graph's deprecated entry points`, () => {
       const { old, current } = graphs();
       const set = caches(scheme);
+      /** The head for a hidden's rows, as the scheduler indexes `logits`. */
+      const headFor = (h: MlxArray) => current.logits[widthClass(h.size / h.shape.at(-1)!)](h);
+      // One sequence: a decode for one token, a prompt tail for more (`phaseHidden`), against the old shape-read forward.
       const both = (label: string, rows: number[][]) => {
         using input = ids(rows);
         const expected = old.forwardHidden(input, set.old);
-        outputDiff(label, current.forwardHidden(input, set.current), expected, h => current.logitsFromHidden(h), oldHead);
+        outputDiff(label, phaseHidden(current, input, set.current), expected, headFor, oldHead);
         stateDiff(label, set.current, set.old);
       };
       try {
-        both(`${scheme} forwardHidden 37`, [prompt(37, 5)]);
-        for (const width of [1, 2, 3, 4, 5, 8, 13]) both(`${scheme} forwardHidden ${width}`, [prompt(width, 6 + width)]);
-        // The capturing mixed forward (the speculative binding's work path).
+        both(`${scheme} prompt tail 37`, [prompt(37, 5)]);
+        for (const width of [1, 2, 3, 4, 5, 8, 13]) both(`${scheme} phase ${width}`, [prompt(width, 6 + width)]);
+        // The capturing mixed forward (the speculative binding's work path): a verify group of three rows.
         {
           using input = ids([prompt(3, 40)]);
           const before = collecting(), after = collecting();
           const [expected] = old.forwardHiddenMixed([{ ids: input, cache: set.old, captureLayer: before.capture, preserveTokenGeometry: true }]);
-          const [actual] = current.forwardHiddenMixed([{ ids: input, cache: set.current, captureLayer: after.capture, preserveTokenGeometry: true }]);
-          tapsDiff(`${scheme} forwardHiddenMixed 3 (capture)`, after.taps, before.taps);
-          outputDiff(`${scheme} forwardHiddenMixed 3 (capture)`, actual!, expected!, h => current.logitsFromHidden(h), oldHead);
-          stateDiff(`${scheme} forwardHiddenMixed 3 (capture)`, set.current, set.old);
+          const [actual] = current.mixed([{ phase: "verify", width: "twoToThree", ids: input, state: set.current, capture: after.capture }],
+            "twoToThree");
+          tapsDiff(`${scheme} mixed verify 3 (capture)`, after.taps, before.taps);
+          outputDiff(`${scheme} mixed verify 3 (capture)`, actual!, expected!, headFor, oldHead);
+          stateDiff(`${scheme} mixed verify 3 (capture)`, set.current, set.old);
         }
-        // The speculative binding's layer tap around a deprecated forward.
+        // The one capture path E2 keeps (the binding's copy of each tapped layer from a prompt tail's capture)
+        // against the speculative binding's layer tap around a deprecated forward.
         {
           using input = ids([prompt(3, 41)]);
-          const tapOld = { layers: new Set([0, 31, 63]), captured: new Map<number, MlxArray>() };
-          const tapNew = { layers: new Set([0, 31, 63]), captured: new Map<number, MlxArray>() };
-          old.hiddenTap = tapOld; current.hiddenTap = tapNew;
+          const layers = new Set([0, 31, 63]);
+          const tapOld = { layers, captured: new Map<number, MlxArray>() };
+          const captured = new Map<number, MlxArray>();
+          old.hiddenTap = tapOld;
           const expected = old.forwardHidden(input, set.old);
-          const actual = current.forwardHidden(input, set.current);
-          old.hiddenTap = null; current.hiddenTap = null;
+          old.hiddenTap = null;
+          const actual = current.prefillTail.twoToThree(input, set.current, (layer, h) => {
+            if (layers.has(layer)) captured.set(layer, ops.contiguous(h));
+          });
           try {
-            expect([...tapNew.captured.keys()].sort()).toEqual([...tapOld.captured.keys()].sort());
+            expect([...captured.keys()].sort()).toEqual([...tapOld.captured.keys()].sort());
             let worst = 0;
-            for (const [layer, copy] of tapOld.captured) worst = Math.max(worst, maxDiff(tapNew.captured.get(layer)!, copy, `${scheme} hiddenTap layer ${layer}`));
-            record(`${scheme} hiddenTap captured layers`, worst, tapOld.captured.size);
-          } finally { for (const copy of [...tapOld.captured.values(), ...tapNew.captured.values()]) copy.dispose(); }
-          outputDiff(`${scheme} hiddenTap forward`, actual, expected, h => current.logitsFromHidden(h), oldHead);
-          stateDiff(`${scheme} hiddenTap forward`, set.current, set.old);
+            for (const [layer, copy] of tapOld.captured) worst = Math.max(worst, maxDiff(captured.get(layer)!, copy, `${scheme} capture layer ${layer}`));
+            record(`${scheme} capture against hiddenTap, captured layers`, worst, tapOld.captured.size);
+          } finally { for (const copy of [...tapOld.captured.values(), ...captured.values()]) copy.dispose(); }
+          outputDiff(`${scheme} capture against hiddenTap, forward`, actual, expected, headFor, oldHead);
+          stateDiff(`${scheme} capture against hiddenTap, forward`, set.current, set.old);
         }
-        // Media positions: [3, rows, tokens] request positions, continuing the cache's text positions.
+        // Media positions: [3, rows, tokens] request positions, continuing the cache's text positions. The continuation
+        // takes the decode read at one position and the window read above, as the old shape-read forward did.
         for (const width of [6, 1]) {
           using input = ids([prompt(width, 50 + width)]);
           const start = set.old[0]!.offset;
           using positions = ops.fromInt32(Array.from({ length: 3 * width }, (_, i) => start + (i % width) + Math.floor(i / width)), [3, 1, width]);
           const expected = old.forwardHiddenAtPositions(input, set.old, positions);
-          const actual = current.forwardHiddenAtPositions(input, set.current, positions);
-          outputDiff(`${scheme} forwardHiddenAtPositions ${width}`, actual, expected, h => current.logitsFromHidden(h), oldHead);
-          stateDiff(`${scheme} forwardHiddenAtPositions ${width}`, set.current, set.old);
+          const actual = width === 1 ? current.decodeAtPositions(input, set.current, positions, "one")
+            : current.prefillAtPositions(input, set.current, positions, widthClass(width));
+          outputDiff(`${scheme} media continuation ${width}`, actual, expected, headFor, oldHead);
+          stateDiff(`${scheme} media continuation ${width}`, set.current, set.old);
+          // The vision prefill phase over embeddings is a window (a prompt of one position carries no image).
+          if (width === 1) continue;
           using embeds = old.embed.encode(input);
           const e2 = old.forwardEmbeddingsAtPositions(embeds, set.old, positions);
-          const a2 = current.forwardEmbeddingsAtPositions(embeds, set.current, positions);
-          outputDiff(`${scheme} forwardEmbeddingsAtPositions ${width}`, a2, e2, h => current.logitsFromHidden(h), oldHead);
-          stateDiff(`${scheme} forwardEmbeddingsAtPositions ${width}`, set.current, set.old);
+          const a2 = current.prefillEmbeddingsAtPositions(embeds, set.current, positions, widthClass(width));
+          outputDiff(`${scheme} vision prefill ${width}`, a2, e2, headFor, oldHead);
+          stateDiff(`${scheme} vision prefill ${width}`, set.current, set.old);
         }
-        // Committed fills through createAppend (the old graph's needs the M4 Pro device).
+        // Known tokens through appendKnown (committed spans) against the old graph's createAppend (which needs the M4 Pro device).
         if (g16s) for (const span of [1, 2, 3, 4]) {
           using input = ids([prompt(span, 60 + span)]);
           const expected = old.createAppend({ hasAdapters: false, pagedKv: false })!.forwardHidden(input, set.old) as MlxArray;
-          const actual = current.createAppend({ hasAdapters: false, pagedKv: false })!.forwardHidden(input, set.current) as MlxArray;
-          outputDiff(`${scheme} createAppend fill ${span}`, actual, expected, h => current.logitsFromHidden(h), oldHead);
-          stateDiff(`${scheme} createAppend fill ${span}`, set.current, set.old);
+          const actual = current.appendKnown[widthClass(span)](input, set.current) as MlxArray;
+          outputDiff(`${scheme} appendKnown ${span}`, actual, expected, headFor, oldHead);
+          stateDiff(`${scheme} appendKnown ${span}`, set.current, set.old);
         }
-        both(`${scheme} forwardHidden after fills`, [[91]]);
+        both(`${scheme} decode after known tokens`, [[91]]);
       } finally { disposeAll(set.old, set.current); }
     }, 180_000);
   });
@@ -438,40 +452,35 @@ describe("Qwen3.8 M4 Pro graph, several sequences (bf16 KV)", () => {
     return layout;
   });
 
-  test("two sequences: the deprecated forward takes the generic blocks as the old graph did; the width tables run them", () => {
+  test("two sequences: each prefill as the old graph ran it; the width tables run the row kernels for both sequences' rows", () => {
     const { old, current } = graphs();
     const oldSources = [caches("bf16").old, caches("bf16").old], newSources = [caches("bf16").current, caches("bf16").current];
-    let oldRows: Cache[] = [], newRows: Cache[] = [];
+    let newRows: Cache[] = [];
     try {
       for (const [row, length] of [9, 14].entries()) {
         using input = ids([prompt(length, 80 + row)]);
-        outputDiff(`two sequences prefill ${row}`, current.forwardHidden(input, newSources[row]!), old.forwardHidden(input, oldSources[row]!),
-          h => current.logitsFromHidden(h), oldHead);
+        outputDiff(`two sequences prefill ${row}`, phaseHidden(current, input, newSources[row]!), old.forwardHidden(input, oldSources[row]!),
+          current.logits.wider, oldHead);
+        stateDiff(`two sequences prefill ${row}`, newSources[row]!, oldSources[row]!);
       }
-      oldRows = rowsOf(oldSources); newRows = rowsOf(newSources);
-      for (const rows of [[[40], [50]], [prompt(3, 82), prompt(3, 83)]]) {
-        using input = ids(rows);
-        const expected = old.forwardHidden(input, oldRows);
-        outputDiff(`two sequences forwardHidden ${rows[0]!.length}`, current.forwardHidden(input, newRows), expected,
-          h => current.logitsFromHidden(h), oldHead);
-        stateDiff(`two sequences forwardHidden ${rows[0]!.length}`, newRows, oldRows);
-      }
-      // No old graph served these: the one-kernel layers take two sequences' rows.
+      newRows = rowsOf(newSources);
+      // No old graph served these (its deprecated forward took the generic blocks for several sequences): the
+      // one-kernel layers take both sequences' rows, decode at two rows and a window of six.
       {
         using input = ids([[60], [61]]);
-        using hidden = current.decode.twoToThree(input, newRows) as MlxArray;
+        using hidden = current.decode.twoToThree(input, newRows, null);
         using logits = current.logits.twoToThree(hidden);
         using wide = logits.astype(Dtype.float32);
         expect(wide.toFloat32().every(Number.isFinite)).toBe(true);
       }
       {
         using input = ids([prompt(3, 84), prompt(3, 85)]);
-        using hidden = current.verify.fiveToEight(input, newRows, null) as MlxArray;
+        using hidden = current.verify.fiveToEight(input, newRows, null);
         using logits = current.logits.fiveToEight(hidden);
         using wide = logits.astype(Dtype.float32);
         expect(wide.toFloat32().every(Number.isFinite)).toBe(true);
       }
-    } finally { disposeAll(...oldSources, ...newSources, oldRows, newRows); }
+    } finally { disposeAll(...oldSources, ...newSources, newRows); }
   }, 180_000);
 });
 
@@ -493,7 +502,7 @@ describe("Qwen3.8 M4 Pro graph, adapters composition", () => {
     try {
       const steps: [string, number[][], (input: MlxArray) => MlxArray][] = [
         ["prefillChunk.gpu", [prompt(CHUNK, 90)], input => adapted.prefillChunk.gpu(input, newCaches, null) as MlxArray],
-        ["decode.one", [[7]], input => adapted.decode.one(input, newCaches) as MlxArray],
+        ["decode.one", [[7]], input => adapted.decode.one(input, newCaches, null)],
         ["verify.twoToThree 3", [prompt(3, 91)], input => adapted.verify.twoToThree(input, newCaches, null) as MlxArray],
         ["verify.four 4", [prompt(4, 93)], input => adapted.verify.four(input, newCaches, null) as MlxArray],
         ["verify.fiveToEight 6", [prompt(6, 92)], input => adapted.verify.fiveToEight(input, newCaches, null) as MlxArray],
@@ -550,7 +559,7 @@ describe("Qwen3.8 M4 Pro graph on the real artifact", () => {
         for (let step = 0; step < 8; step++) {
           using input = ids([[real(1, 10 + step)[0]!]]);
           const expected = old.forwardHidden(input, oldCaches);
-          outputDiff("real decode.one", current.decode.one(input, newCaches) as MlxArray, expected, current.logits.one, head);
+          outputDiff("real decode.one", current.decode.one(input, newCaches, null), expected, current.logits.one, head);
           stateDiff("real decode.one", newCaches, oldCaches);
         }
         // Verify 4 runs last, on the input and cache state where the 2-to-4 class measured 0.078 against the old plan.
@@ -623,7 +632,7 @@ describe("Qwen3.8 M4 Pro graph on the real artifact", () => {
         for (let step = 0; step < 4; step++) {
           using input = ids([[real(1, 10 + step)[0]!]]);
           const expected = old.forwardHidden(input, oldCaches);
-          outputDiff("composed kv4 decode.one", current.decode.one(input, newCaches) as MlxArray, expected, current.logits.one, head);
+          outputDiff("composed kv4 decode.one", current.decode.one(input, newCaches, null), expected, current.logits.one, head);
           stateDiff("composed kv4 decode.one", storage(newCaches), oldCaches);
         }
         for (const [width, salt] of [[3, 23], [8, 28]] as const) {
@@ -659,7 +668,7 @@ describe("Qwen3.8 M4 Pro graph, Neural Engine chunk operation (MLX_BUN_TEST_ANE=
       stateDiff(`${scheme} prefillChunk.gpu 2048`, sets[3]!, sets[2]!);
       // Decode after the Neural Engine chunk, as after the old one.
       using next = ids([[5]]);
-      outputDiff(`${scheme} decode.one after the ANE chunk`, current.decode.one(next, sets[1]!) as MlxArray, oldAne.forwardHidden(next, sets[0]!),
+      outputDiff(`${scheme} decode.one after the ANE chunk`, current.decode.one(next, sets[1]!, null), oldAne.forwardHidden(next, sets[0]!),
         current.logits.one, oldHead);
     } finally { disposeAll(...sets); }
   }, 600_000);

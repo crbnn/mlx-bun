@@ -1,5 +1,4 @@
 import { expect, test } from "bun:test";
-import { bindMlxGraph } from "../../src/models/graph";
 import { bindCacheRollback } from "../../src/state/rollback";
 import type { MlxSpeculativeBinding } from "../../src/generation/speculative/bindings/binding";
 import { MlxArray } from "@mlx-bun/mlx/array";
@@ -11,29 +10,31 @@ import { specRun } from "../../src/generation/speculative/run";
 // the real verifier and sampler without weights or an external model.
 function fixture(drafts: "accepted" | "rejected" | "none", fallback = false) {
   let disposed = 0;
-  const graph = bindMlxGraph({
-    forwardHidden(ids: MlxArray, caches: Cache[]) {
-      const tokens = ids.toIntTokens();
-      using kv = MlxArray.fromFloat32(new Float32Array(tokens.length), [1, 1, tokens.length, 1]);
-      for (const view of caches[0]!.updateAndFetch(kv, kv)) view.dispose();
-      return MlxArray.fromFloat32(Float32Array.from(tokens), [1, tokens.length, 1]);
-    },
-    logitsFromHidden(hidden) {
-      const tokens = hidden.toFloat32Host(), values = new Float32Array(tokens.length * 8);
-      tokens.forEach((token, i) => { values[i * 8 + ((token + 1) % 8)] = 10; });
-      return MlxArray.fromFloat32(values, [1, tokens.length, 8]);
-    },
-  }, { id: "eos-count", artifact: "synthetic", stateAbi: "legacy-cache-array-v1" });
+  // The graph's one forward serves every phase the binding names; its head predicts the next token.
+  const forward = (ids: MlxArray, caches: Cache[]) => {
+    const tokens = ids.toIntTokens();
+    using kv = MlxArray.fromFloat32(new Float32Array(tokens.length), [1, 1, tokens.length, 1]);
+    for (const view of caches[0]!.updateAndFetch(kv, kv)) view.dispose();
+    return MlxArray.fromFloat32(Float32Array.from(tokens), [1, tokens.length, 1]);
+  };
+  const head = (hidden: MlxArray) => {
+    const tokens = hidden.toFloat32Host(), values = new Float32Array(tokens.length * 8);
+    tokens.forEach((token, i) => { values[i * 8 + ((token + 1) % 8)] = 10; });
+    return MlxArray.fromFloat32(values, [1, tokens.length, 8]);
+  };
   const binding: MlxSpeculativeBinding = {
-    descriptor: graph.descriptor, eosTokenIds: [7], prefillTailSplit: true,
+    descriptor: { id: "eos-count", backend: "mlx", graphAbi: "mlx-hidden-bsh-v1", stateAbi: "legacy-cache-array-v1", artifact: "synthetic" },
+    eosTokenIds: [7], prefillTailSplit: true,
     makeCache: () => [new KVCache()],
     bindRollback(caches) {
       const transaction = bindCacheRollback(caches);
       return fallback ? { ...transaction, canBegin: () => false } : transaction;
     },
-    async forward(ids, caches) { return { hidden: await graph.forwardHidden(ids, caches), ctxML: null }; },
+    async prefill(ids, caches) { return { hidden: forward(ids, caches), ctxML: null }; },
+    async verify(ids, caches) { return { hidden: forward(ids, caches), ctxML: null }; },
+    async decode(ids, caches) { return forward(ids, caches); },
     supportsTapLayers: layers => !layers.length,
-    projectLogits: hidden => graph.projectLogits(hidden, { type: "all" }),
+    projectLogits: hidden => head(hidden),
     openDraft() {
       return { weightsBytes: 0, prefill() {}, commit() {}, dispose() { disposed++; },
         draft(feed, n) {

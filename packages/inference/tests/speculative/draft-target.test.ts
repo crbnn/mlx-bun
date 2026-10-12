@@ -9,6 +9,7 @@ import { deepspecGroups } from "../../src/generation/speculative/bindings/deepsp
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { bindSpeculativeTargetModel } from "../../src/generation/speculative/bindings/binding";
 import { declareGraph } from "../../src/models/capabilities";
+import { stubPhases } from "../models/phase-forward";
 
 test("an assistant uses an independent target's ports and releases each borrowed view", () => {
   const released: number[] = [];
@@ -76,29 +77,25 @@ test("projected draft providers declare the immutable target tap list their rows
 test("the target binding taps its graph's layers and supplies an uncaptured post-norm sentinel from the forward output", async () => {
   const H = 2, L = 3, created: MlxArray[] = [];
   const filled = (value: number) => { const array = MlxArray.fromFloat32(new Float32Array(L * H).fill(value), [1, L, H]); created.push(array); return array; };
-  // A graph like Qwen3.5's ordinary forward: its hidden tap covers layers 0..N-1
-  // and it returns the post-final-norm output without tapping it.
+  // A graph whose prompt phase hands its capture layers 0..N-1 and returns the
+  // post-final-norm output without handing it over.
   const model = { config: { modelType: "fixture", eosTokenIds: [], text: { enableMoeBlock: false, numHiddenLayers: 2 } },
-    hiddenTap: null as { layers: Set<number>; captured: Map<number, MlxArray> } | null, graphCapabilities: declareGraph({ hiddenLayerTaps: true }),
-    makeCache: () => [], logitsFromHidden: (hidden: MlxArray) => hidden,
-    forwardHidden(this: { hiddenTap: { layers: Set<number>; captured: Map<number, MlxArray> } | null }) {
-      for (let layer = 0; layer < 2; layer++)
-        if (this.hiddenTap?.layers.has(layer)) this.hiddenTap.captured.set(layer, ops.contiguous(filled(layer + 1)));
+    graphCapabilities: declareGraph({ hiddenLayerTaps: true }), makeCache: () => [], logitsFromHidden: (hidden: MlxArray) => hidden,
+    ...stubPhases((_ids, _caches, capture) => {
+      for (let layer = 0; layer < 2; layer++) capture?.(layer, filled(layer + 1));
       return ops.contiguous(filled(9));
-    } };
+    }, hidden => hidden) };
   const binding = bindSpeculativeTargetModel(model as never);
   expect([binding.supportsTapLayers([]), binding.supportsTapLayers([1, 2]), binding.supportsTapLayers([3]),
     binding.supportsTapLayers([-1])]).toEqual([true, true, false, false]);
   using ids = ops.fromInt32([1, 2, 3], [1, 3]);
-  const { hidden, ctxML } = await binding.forward(ids, [], [1, 2]);
+  const { hidden, ctxML } = await binding.prefill(ids, [], { phase: "tail", sequences: 1, tokens: L }, [1, 2]);
   try {
     expect(ctxML!.shape).toEqual([1, L, 2 * H]);
     expect([...ctxML!.toFloat32()]).toEqual(Array.from({ length: L }, () => [2, 2, 9, 9]).flat());
     expect([...hidden.toFloat32()]).toEqual(new Array(L * H).fill(9)); // the caller keeps the forward output
-    expect(model.hiddenTap).toBeNull();
   } finally { hidden.dispose(); ctxML?.dispose(); for (const array of created) array.dispose(); }
   // A graph that declares no hidden-layer taps supports only an empty declaration.
-  const { hiddenTap: _absent, ...untapped } = model;
-  const plain = bindSpeculativeTargetModel({ ...untapped, graphCapabilities: declareGraph() } as never);
+  const plain = bindSpeculativeTargetModel({ ...model, graphCapabilities: declareGraph() } as never);
   expect([plain.supportsTapLayers([]), plain.supportsTapLayers([0])]).toEqual([true, false]);
 });

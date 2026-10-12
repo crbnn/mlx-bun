@@ -32,7 +32,7 @@ function fake(options: { submit?: MlxBatchGroup["submit"]; plan?: MlxGatewayBind
         onToken, dispose() { samplingDisposed++; } };
     },
     createBatchGroup(opts) { created++; capacity = opts.maxBatch!; return group; },
-    mediaInput() { return { forward() { throw new Error("CPU fake never forwards"); } }; },
+    mediaInput() { return { prefill() { throw new Error("CPU fake never forwards"); } }; },
   } as MlxGatewayBinding;
   return { binding, group, get samplingDisposed() { return samplingDisposed; },
     get created() { return created; }, get capacity() { return capacity; }, get closed() { return closed; } };

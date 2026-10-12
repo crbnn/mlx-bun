@@ -10,6 +10,7 @@ import type { MlxTokenGraph } from "../../src/models/graph";
 import { createRuntimeConfig } from "../../src/runtime/config";
 import { KVCache } from "../../src/state/kv";
 import type { Cache } from "../../src/contracts/mlx/cache";
+import { stubPhases } from "../models/phase-forward";
 
 // A graph that is none of the model classes and declares its own compiled step:
 // the scheduler and the autoregressive binding reach it only through that
@@ -27,17 +28,16 @@ function graph(declared: Parameters<typeof declareGraph>[0], extra: Partial<MlxT
     config: { modelType: "fixture", eosTokenIds: [], text: { numHiddenLayers: 1, layerTypes: ["full_attention"],
       numGlobalKeyValueHeads: 1, globalHeadDim: 4, slidingWindow: 0 } } as never,
     makeCache: () => [new KVCache()], requiredDenseKvLayers: [], graphCapabilities: declareGraph(declared),
-    forwardHidden(ids, caches) { forwards.push(ids.shape[1]!); append(caches, ids.shape[1]!); return ops.zeros([1, ids.shape[1]!, VOCAB], Dtype.float32); },
-    logitsFromHidden: hidden => ops.copyOf(hidden),
+    ...stubPhases((ids, caches) => { forwards.push(ids.shape[1]!); append(caches, ids.shape[1]!); return ops.zeros([1, ids.shape[1]!, VOCAB], Dtype.float32); },
+      hidden => ops.copyOf(hidden)),
     ...extra,
   };
   return { model, forwards, append };
 }
 
-function countingStep(model: { append: (caches: Cache[], width: number) => void }, options: { accepts?: boolean; failAt?: number } = {}) {
-  const calls = { accepts: 0, steps: 0 };
+function countingStep(model: { append: (caches: Cache[], width: number) => void }, options: { failAt?: number } = {}) {
+  const calls = { steps: 0 };
   const step: MlxCompiledDecodeStep = {
-    accepts() { calls.accepts++; return options.accepts ?? true; },
     step(_token: MlxArray, caches: Cache[]) {
       if (calls.steps++ === options.failAt) throw new Error("compiled step failed");
       model.append(caches, 1);
@@ -48,9 +48,9 @@ function countingStep(model: { append: (caches: Cache[], width: number) => void 
   return { step, calls };
 }
 
-async function decode(model: MlxTokenGraph, options: { compiledDecode?: boolean; env?: Record<string, string> } = {}) {
+async function decode(model: MlxTokenGraph, options: { compiledDecode?: boolean; env?: Record<string, string> } = {},
+  tokens: number[] = []) {
   const group = new MlxBatchExecutionGroup(model, { maxBatch: 2, runtime: createRuntimeConfig(options.env ?? {}) });
-  const tokens: number[] = [];
   try {
     await group.submit({ promptIds: [1, 2, 3], maxTokens: 6, eosTokenIds: [], sample: logits => ops.argmaxAxis(logits, -1),
       ...(options.compiledDecode === undefined ? {} : { compiledDecode: options.compiledDecode }),
@@ -58,6 +58,9 @@ async function decode(model: MlxTokenGraph, options: { compiledDecode?: boolean;
   } finally { await group.close(); }
   return tokens;
 }
+
+/** A cache the compiled step cannot drive: it declares no decode slots. */
+const unreplayable = () => [Object.assign(new KVCache(), { prepareDecodeStep: undefined }) as unknown as Cache];
 
 test("a lone row decodes through the step its graph declares, and other graphs never get one", async () => {
   const fixture = graph({ compiledDecode: true });
@@ -73,29 +76,32 @@ test("a lone row decodes through the step its graph declares, and other graphs n
   const undeclared = graph({});
   const unused = countingStep(undeclared);
   expect(await decode({ ...undeclared.model, compiledDecodeStep: () => unused.step })).toEqual(Array(6).fill(0));
-  expect(unused.calls).toEqual({ accepts: 0, steps: 0 });
+  expect(unused.calls).toEqual({ steps: 0 });
   expect(undeclared.forwards.length).toBeGreaterThan(1);
 });
 
-test("the request, the kill switch and the step's own acceptance keep decoding on the ordinary forward", async () => {
-  for (const [name, options, accepts] of [
-    ["request opt-out", { compiledDecode: false }, true],
-    ["kill switch", { env: { MLX_BUN_COMPILED_DECODE: "0" } }, true],
-    ["state not accepted", {}, false],
+test("the request, the kill switch and caches the step cannot drive keep decoding on the decode operation", async () => {
+  for (const [name, options, makeCache] of [
+    ["request opt-out", { compiledDecode: false }, undefined],
+    ["kill switch", { env: { MLX_BUN_COMPILED_DECODE: "0" } }, undefined],
+    ["caches without decode slots", {}, unreplayable],
   ] as const) {
-    const fixture = graph({ compiledDecode: true });
-    const declared = countingStep(fixture, { accepts });
+    const fixture = graph({ compiledDecode: true }, makeCache ? { makeCache } : {});
+    const declared = countingStep(fixture);
     expect(await decode({ ...fixture.model, compiledDecodeStep: () => declared.step }, options), name).toEqual(Array(6).fill(0));
     expect(declared.calls.steps, name).toBe(0);
   }
 });
 
-test("a step that fails is retired and the same token continues on the ordinary forward", async () => {
+test("a step that fails fails its request: the compiled step has no fallback", async () => {
   const fixture = graph({ compiledDecode: true });
   const declared = countingStep(fixture, { failAt: 2 });
-  const tokens = await decode({ ...fixture.model, compiledDecodeStep: () => declared.step });
-  expect(tokens).toEqual([0, COMPILED_TOKEN, COMPILED_TOKEN, 0, 0, 0]);
+  const tokens: number[] = [];
+  await expect(decode({ ...fixture.model, compiledDecodeStep: () => declared.step }, {}, tokens)).rejects.toThrow("compiled step failed");
+  // Decode is pipelined: the second step's token is read only after the third step dispatches, which fails.
+  expect(tokens).toEqual([0, COMPILED_TOKEN]);
   expect(declared.calls.steps).toBe(3);
+  expect(fixture.forwards).toEqual([2, 1]); // no decode forward replayed the token
 });
 
 test("a graph that promises a compiled step and provides none is refused where it binds", () => {
@@ -105,22 +111,26 @@ test("a graph that promises a compiled step and provides none is refused where i
   expect(compiledDecodeStepOf(graph({}).model)).toBeNull();
 });
 
-test("the autoregressive binding offers the declared step unless adapters or paging rule replay out", () => {
+test("the autoregressive binding offers the declared step for a run whose caches it drives, unless adapters or paging rule replay out", () => {
   const fixture = graph({ compiledDecode: true });
   const declared = countingStep(fixture);
   const binding = bindMlxAutoregressiveGraph({ ...fixture.model, compiledDecodeStep: () => declared.step });
-  expect(binding.createDecode!({ hasAdapters: true, pagedKv: false })).toBeNull();
-  expect(binding.createDecode!({ hasAdapters: false, pagedKv: true })).toBeNull();
-  const decoder = binding.createDecode!({ hasAdapters: false, pagedKv: false })!;
   const caches = fixture.model.makeCache();
   try {
-    using token = MlxArray.fromFloat32(new Float32Array([0]), [1]);
-    const result = decoder.tryStep(token, caches)!;
-    expect(result.logits.shape).toEqual([1, 1, VOCAB]);
-    result.logits.dispose();
-    expect(caches[0]!.offset).toBe(1);
-    expect(declared.calls.steps).toBe(1);
-  } finally { for (const cache of caches) cache.dispose(); void decoder.close(); }
+    expect(binding.createDecode!({ hasAdapters: true, pagedKv: false }, caches)).toBeNull();
+    expect(binding.createDecode!({ hasAdapters: false, pagedKv: true }, caches)).toBeNull();
+    expect(binding.createDecode!({ hasAdapters: false, pagedKv: false }, unreplayable())).toBeNull();
+    const decoder = binding.createDecode!({ hasAdapters: false, pagedKv: false }, caches)!;
+    try {
+      using token = MlxArray.fromFloat32(new Float32Array([0]), [1]);
+      const result = decoder.step(token, caches);
+      expect(result.logits.shape).toEqual([1, 1, VOCAB]);
+      result.logits.dispose();
+      expect(caches[0]!.offset).toBe(1);
+      expect(declared.calls.steps).toBe(1);
+    } finally { void decoder.close(); }
+  } finally { for (const cache of caches) cache.dispose(); }
   // A graph declaring nothing has no decoder, whatever methods it carries.
-  expect(bindMlxAutoregressiveGraph({ ...graph({}).model, compiledDecodeStep: () => declared.step }).createDecode!({ hasAdapters: false, pagedKv: false })).toBeNull();
+  expect(bindMlxAutoregressiveGraph({ ...graph({}).model, compiledDecodeStep: () => declared.step })
+    .createDecode!({ hasAdapters: false, pagedKv: false }, caches)).toBeNull();
 });

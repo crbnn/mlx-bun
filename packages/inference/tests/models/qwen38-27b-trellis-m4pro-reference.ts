@@ -4,7 +4,9 @@
 // Changes from the source file: import paths; the constructor's third argument
 // `ane`, which replaces the aneAvailable() probe so a test builds the Neural
 // Engine plan only when it opts in (MLX_BUN_TEST_ANE=1); and quantizedCoreRead,
-// moved here verbatim from blocks.ts.
+// moved here verbatim from blocks.ts; since E2, the deprecated entry points it
+// inherited come from qwen35-deprecated-base.ts, and the ANE plan follows `ane`
+// alone (the probe it also asked went with E2).
 //
 // Qwen3.8-27B Trellis 3.2bpw (mlx-bun/Qwen3.8-27B-Trellis-3.2bpw) on the
 // M4 Pro GPU (applegpu_g16s) — the graph for this exact artifact on this exact
@@ -42,7 +44,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import type { Weights } from "../../src/artifacts/weights";
 import type { ModelConfig } from "../../src/artifacts/config";
 import type { Cache, GatedDeltaCache } from "../../src/contracts/mlx/cache";
-import type { TokenGroup } from "../../src/contracts/mlx/token-work";
+import type { TokenGroup } from "./frozen-token-groups";
 import { QuantizedLinear } from "../../src/layers/quantized-linear";
 import { qwenAppendChunkSize } from "../../src/layers/qwen-append";
 import type { TrellisLinear } from "../../src/layers/trellis-linear";
@@ -52,11 +54,11 @@ import { FactoredDownK3iRow, FactoredDownK3iRows, FactoredDownRow, FactoredDownR
 import { Affine3MmaLinear, Affine3RowsLinear, Affine4MmaLinear, Affine4RowsLinear } from "../../src/layers/affine-verify-linear";
 import { kv4DecodeAttention } from "../../src/layers/kv4-decode-attention";
 import { foldedQuantizedSdpa } from "../../src/layers/quantized-attention";
-import { AneAffineSplit, AneTrellisMlpSplit, AneTrellisMlpSplitK3i, aneAvailable, type AneMlpSplit }
+import { AneAffineSplit, AneTrellisMlpSplit, AneTrellisMlpSplitK3i, type AneMlpSplit }
   from "../../src/layers/ane-prefill-split";
-import { deprecatedPhase, type ReadPhase } from "../../src/models/graph";
+import type { ReadPhase } from "../../src/models/graph";
 import { widthClass, type MlxWidthClass } from "../../src/contracts/mlx/graph";
-import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
+import { DeprecatedQwen35Base, deprecatedPhase } from "./qwen35-deprecated-base";
 import {
   GatedDeltaNet, Qwen3Attention, cacheRead, type AttentionLinear, type AttentionLinearLoader, type AttentionReadStrategy, type Qwen3Layer,
 } from "../../src/models/qwen/blocks";
@@ -125,7 +127,7 @@ const decodeCore: QuantizedAttentionCore = (q, keys, values, scale, groupSize, b
 const foldedCore: QuantizedAttentionCore = (q, keys, values, scale, groupSize, bits) =>
   foldedQuantizedSdpa(q, keys, values, scale, groupSize, bits);
 
-export class Qwen38TrellisM4Pro extends Qwen35Model {
+export class Qwen38TrellisM4Pro extends DeprecatedQwen35Base {
   readonly graph = QWEN38_TRELLIS_M4PRO_GRAPH;
   /** Verify forward cost by rows relative to one decode step (M4 Pro 24 GB). */
   readonly verifyRoundCosts: ReadonlyMap<number, number> = new Map([
@@ -208,7 +210,7 @@ export class Qwen38TrellisM4Pro extends Qwen35Model {
    *  program for the ANE chunk here; the system ANE cache keeps the compiled
    *  programs across processes. Projections of one shape share buffers. */
   #buildAnePlan(weights: Weights, config: ModelConfig): Step[] | null {
-    if (!this.#ane || !aneAvailable()) return null;
+    if (!this.#ane) return null;
     const started = performance.now();
     try {
       const affineShares = new Map<string, AneAffineSplit>();
@@ -273,7 +275,7 @@ export class Qwen38TrellisM4Pro extends Qwen35Model {
    *  Several groups keep the generic token packing. */
   /** Qwen35Model's committed append as the pre-D1 graph inherited it (frozen here since E2 moved the base's
    *  qualification to construction): the 27B geometry and the M4 Pro device read when it is asked. */
-  override createAppend(policy: { hasAdapters: boolean; pagedKv: boolean }) {
+  createAppend(policy: { hasAdapters: boolean; pagedKv: boolean }) {
     const t = this.config.text;
     if (policy.hasAdapters || policy.pagedKv || this.loraState.active.length || this.mrope ||
         t.hiddenSize !== 5120 || t.intermediateSize !== 17408 || this.layers.length !== 64 ||

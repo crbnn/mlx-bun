@@ -3,7 +3,9 @@
 // per-call row switch left matmulW, copied verbatim from
 // `packages/inference/src/models/speculative/dflash2.ts` at d3e4465c. Only the
 // import paths, the class name, the basis type and r1Signs (copied from the
-// provider of the same revision) differ. Numerics must not be edited; delete
+// provider of the same revision) differ, and, since E2, the head comes from the
+// projection's width table at the rows it projects (the target's logitsFromHidden
+// picked the same entry by those rows). Numerics must not be edited; delete
 // this file with the gate once the change is merged.
 //
 // DFlash 2 drafter for Qwen3.8-27B (incoai/Qwen3.8-27B-DFlash2, Apache-2.0).
@@ -39,6 +41,7 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { Weights } from "../../src/artifacts/weights";
 import type { DraftProjection } from "../../src/contracts/mlx/draft-projection";
+import { widthClass } from "../../src/contracts/mlx/width";
 import type { Dflash2ContextAttention } from "../../src/contracts/mlx/drafter";
 import { isDflash2Architecture } from "../../src/models/speculative/dflash2-artifact";
 import { QuantizedLinear } from "../../src/layers/quantized-linear";
@@ -394,7 +397,7 @@ export class FrozenDflash2Drafter {
       using rows = x.slice([0, 1, 0], [B, G, H]);
       using h = this.#rms(rows, this.#norm);
       using headInput = this.#toTargetHead(h);
-      using logits = projection.logitsFromHidden(headInput);
+      using logits = projection.logits[widthClass(headInput.size / headInput.shape.at(-1)!)](headInput);
       using z = matmulW(h, this.#selProj);
       using columns = this.#select(logits, z, anchors, G - 1); // [steps, B]
       using rowsMajor = ops.transposeAxes(columns, [1, 0]);

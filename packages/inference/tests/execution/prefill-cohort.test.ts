@@ -113,7 +113,7 @@ test("prepared inputs keep their whole attention span and project only the final
 test("cancelled prepared input never forwards and releases its fresh row", async () => {
   const f = fixture(), abort = new AbortController(), request = row(1, 270, 5, abort.signal);
   let calls = 0;
-  request.req.promptInput = { forward() { calls++; throw new Error("unexpected forward"); } };
+  request.req.promptInput = { prefill() { calls++; throw new Error("unexpected forward"); } };
   try {
     f.cohort.admit(request); abort.abort(new Error("cancelled before prepared prefill"));
     expect(await f.cohort.advance()).toBe(true);
@@ -200,7 +200,7 @@ test("a restored late arrival releases its backing lease after admission and pre
   const f = fixture(), restored = composedCaches({}), request = row(2, 13, 3);
   let releases = 0;
   using ids = ops.fromInt32(request.req.promptIds.slice(0, 3), [1, 3]);
-  const hidden = await f.cohort.host.forward(ids, restored); hidden.dispose();
+  const hidden = await f.cohort.host.forward(ids, restored, { phase: "tail", sequences: 1, tokens: 3 }); hidden.dispose();
   f.cohort.host.promptCache!.take = tokens => tokens[0] === 2000
     ? { tokens: request.req.promptIds.slice(0, 3), caches: restored, retain: () => { releases++; } } : null;
   try {
@@ -231,7 +231,7 @@ test.each(schemes.filter(([name]) => name.endsWith("delayed")))(
     try {
       let stored: string[] = [];
       if (restore) {
-        { using ids = ops.fromInt32(prefix, [1, prefix.length]); (await f.cohort.host.forward(ids, caches)).dispose(); }
+        { using ids = ops.fromInt32(prefix, [1, prefix.length]); (await f.cohort.host.forward(ids, caches, { phase: "tail", sequences: 1, tokens: prefix.length })).dispose(); }
         stored = caches.map(cache => (cache.composed?.storage() ?? cache).constructor.name);
         f.cohort.host.promptCache!.take = tokens => {
           if (tokens[0] !== 2000 || !owned) return null;

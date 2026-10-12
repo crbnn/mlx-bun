@@ -13,13 +13,14 @@
 // two-model draft to adapter rows. The provider cannot serve adapters, so the
 // row must decode ordinarily with checkpoints, never open draft rows, and match
 // a draftless adapter control token for token and checkpoint for checkpoint.
-import { expect, test, spyOn } from "bun:test";
+import { expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { KvOptions } from "../models/test-composition";
 import type { Cache } from "@mlx-bun/inference/contracts/mlx";
 import { applyDescriptor, descriptorFor } from "./real-weight-inputs";
+import type { PhaseObserver } from "../models/phase-forward";
 const target = Bun.env.MLX_BUN_TEST_CONTINUATION_MODEL;
 const adapter = Bun.env.MLX_BUN_TEST_CONTINUATION_ADAPTER;
 if (target && !existsSync(`${target}/config.json`)) throw new Error(`unavailable model: ${target}`);
@@ -66,6 +67,7 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
   const ops = await import("@mlx-bun/mlx/ops");
   const { leaseCacheState, minimumReusableOffset, PromptCache, cloneKvCaches } = await import("@mlx-bun/inference/state");
   const { clearCache } = await import("@mlx-bun/mlx/ffi");
+  const { observedPhases, phaseLogits } = await import("../models/phase-forward");
   const directory = phase === "child" ? childDirectory! : mkdtempSync(join(tmpdir(), "ordinary-continuation-"));
   const weights = await Weights.open(target!);
   let released = false;
@@ -99,6 +101,7 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
     const kv = await continuationKv(prompt.length);
     const model = await composedModel(weights, config, kv);
     checkDescriptor(model as never, config);
+    const observer: PhaseObserver = {}, view = observedPhases(model, observer);
     if (!("loraState" in model) || !model.loraState) throw new Error("continuation test requires adapter state");
     manager = new AdapterManager(model);
     const adapters = manager;
@@ -197,11 +200,11 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
       });
     };
     const widths: number[] = [];
-    const forward = model.forwardHidden.bind(model);
+
     const probe = (active: string[]) => {
       const previous = model.loraState!.active, caches = model.makeCache();
       model.loraState!.active = active;
-      try { using logits = model.forward(prompt, caches); using exact = ops.contiguous(logits); return Buffer.from(exact.rawBytes()); }
+      try { using logits = phaseLogits(model as never, prompt, caches); using exact = ops.contiguous(logits); return Buffer.from(exact.rawBytes()); }
       finally { model.loraState!.active = previous; for (const cache of caches) cache.dispose(); }
     };
     const baseLogits = adapter ? probe([]) : undefined;
@@ -216,15 +219,13 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
         useDraft = ignoredDraft && useAdapter) => {
         let held = true;
         const unexpected = () => { throw new Error("an ignored draft opened rows"); };
-        const binding = bindMlxGateway(model, useDraft ? { numDraftTokens: 3, provider: Object.assign(
+        const binding = bindMlxGateway(view, useDraft ? { numDraftTokens: 3, provider: Object.assign(
           Object.create(TwoModelProvider.prototype), { id: "ignored-draft", weightsBytes: 0,
             grouped: { checkpointNamespace: () => "ignored-draft", open: unexpected, openPrefill: unexpected } }) } : undefined);
         const context = useAdapter ? binding.bindAdapterContext!(["upper"], "adapters:upper") : undefined;
         const namespace = useAdapter ? adapterNamespace : "";
         const activeContexts: string[][] = [];
-        const contextGraph = spyOn(model, "forwardHidden").mockImplementation((ids, caches) => {
-          widths.push(ids.shape[0]!); activeContexts.push([...model.loraState!.active]); return forward(ids, caches);
-        });
+        observer.forward = ids => { widths.push(ids.shape[0]!); activeContexts.push([...model.loraState!.active]); };
         const group = binding.createBatchGroup({ maxBatch: batch, kvScheme: kv.scheme, admissionHeld: () => held });
         const aborts = Array.from({ length: batch }, () => new AbortController());
         const captured = new Map<string, string>(), restored: number[] = [];
@@ -309,7 +310,7 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
           for (const abort of aborts) abort.abort(new Error("continuation test cleanup"));
           try { await group.close(); }
           finally {
-            contextGraph.mockRestore(); idle();
+            observer.forward = undefined; idle();
             try { await persistence.flush(); }
             finally { requests.forEach(request => request.dispose()); prefix.clear(); clearCache(); }
           }
@@ -416,6 +417,7 @@ test.skipIf(!target || !adapter || !Bun.env.MLX_BUN_TEST_CONTINUATION_KV_START |
   const { bindMlxGateway, createRowSampling } = await import("@mlx-bun/inference/execution");
   const { makeStepSampler } = await import("@mlx-bun/inference/sampling");
   const { leaseCacheState, isBatchableCache } = await import("@mlx-bun/inference/state");
+  const { observedPhases } = await import("../models/phase-forward");
   const ops = await import("@mlx-bun/mlx/ops");
   const weights = await Weights.open(target!);
   let manager: InstanceType<typeof AdapterManager> | undefined;
@@ -425,11 +427,12 @@ test.skipIf(!target || !adapter || !Bun.env.MLX_BUN_TEST_CONTINUATION_KV_START |
     const kv = await continuationKv(prompt.length);
     const model = await composedModel(weights, config, kv);
     checkDescriptor(model as never, config);
+    const observer: PhaseObserver = {}, view = observedPhases(model, observer);
     manager = new AdapterManager(model);
     const adapters = manager;
     if (!["4", "8", "per-layer"].includes(kv.mode) || kv.start <= 0 || kv.start >= prompt.length + 16)
       throw new Error("adapter lifecycle requires delayed affine conversion inside the generated sequence");
-    const binding = bindMlxGateway(model);
+    const binding = bindMlxGateway(view);
     const hash = (array: import("@mlx-bun/mlx/array").MlxArray) => {
       using exact = ops.contiguous(array);
       return [array.shape, array.dtype, new Bun.CryptoHasher("sha256").update(exact.rawBytes()).digest("hex")];
@@ -485,24 +488,15 @@ test.skipIf(!target || !adapter || !Bun.env.MLX_BUN_TEST_CONTINUATION_KV_START |
       type JobResult = { status: "fulfilled"; stats: Awaited<ReturnType<typeof group.submit>> } | { status: "rejected"; error: unknown };
       const jobs: Promise<JobResult>[] = [], samplers: { dispose(): void }[] = [];
       const aborts: AbortController[] = [];
-      let hidden: { mockRestore(): void } | undefined, logits: { mockRestore(): void } | undefined;
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
-        const forward = model.forwardHidden.bind(model), project = model.logitsFromHidden.bind(model);
         const context = () => model.loraState!.active.join(",");
-        hidden = spyOn(model, "forwardHidden").mockImplementation((ids, caches) => {
-          const value = forward(ids, caches);
-          try {
-            const planes = caches.map(validCache);
-            calls.push(["forward", context(), hash(ids), planes]); widths.push(ids.shape[0]!); active.push(context());
-          } catch (error) { value.dispose(); throw error; }
-          return value;
-        });
-        logits = spyOn(model, "logitsFromHidden").mockImplementation(value => {
-          const result = project(value);
-          try { calls.push(["logits", context(), hash(result)]); } catch (error) { result.dispose(); throw error; }
-          return result;
-        });
+        // Every forward the scheduler names, observed after it appends, and every head projection.
+        observer.forwarded = (ids, caches) => {
+          const planes = caches.map(validCache);
+          calls.push(["forward", context(), hash(ids), planes]); widths.push(ids.shape[0]!); active.push(context());
+        };
+        observer.head = (_hidden, result) => { calls.push(["logits", context(), hash(result)]); };
         const enqueue = (row: number, adapted: boolean) => {
           const tokens: number[] = []; outputs[row] = tokens;
           const abort = new AbortController(); aborts.push(abort);
@@ -583,7 +577,7 @@ test.skipIf(!target || !adapter || !Bun.env.MLX_BUN_TEST_CONTINUATION_KV_START |
         finally {
           try { await Promise.all(jobs.filter(Boolean)); }
           finally {
-            hidden?.mockRestore(); logits?.mockRestore();
+            observer.forwarded = undefined; observer.head = undefined;
             try { for (const sampler of samplers) sampler.dispose(); }
             finally { expect(model.loraState!.active).toEqual([]); }
           }

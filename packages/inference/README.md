@@ -38,7 +38,7 @@ refused. The gateway plans from the declarations, the request and dynamic state
 `MlxGatewayBinding.capabilities` reports what it resolved. Supporting a new graph
 means declaring and implementing; `execution/` and the app engine need no edit.
 The batch group and the autoregressive binding take the structural `MlxTokenGraph`
-(`models/graph`: config, caches, forward and projection, and the declared ports), not
+(`models/graph`: config, caches, the named phases, and the declared ports), not
 the registry's `RuntimeModel` union. A graph's compiled decode step lives with that
 graph (`models/gemma4/compiled-decode`) and reaches them through `compiledDecodeStep`;
 it drives caches through the `CompiledDecodeCache` protocol (`contracts/mlx/cache`,
@@ -424,8 +424,9 @@ reference data is downloaded.
 
 The test compares native full-logit bytes for identical fixed tokens with plain
 and artifact-configured KV, both before and after the sliding window fills.
-Greedy trajectories and dense Gemma's mid-segment failure recovery use main's
-original tokenizer-rendered prompts (12B targets 600/1100 tokens; e4b targets 700).
+Greedy trajectories and a dense Gemma mid-segment failure (which ends its generation:
+the compiled step has no fallback) use main's original tokenizer-rendered prompts
+(12B targets 600/1100 tokens; e4b targets 700).
 Those checks require actual compiled-step activation and zero unexpected retraces.
 The forced-token full-logit matrix uses deterministic IDs independently of EOS. These are
 compiled-versus-ordinary checks, not an external-oracle or performance claim.
@@ -940,19 +941,22 @@ that carries its own draft head declares it (`GraphCapabilities.nativeDraft`), a
 `models/qwen38-27b-trellis-m4pro` is the graph for
 `mlx-bun/Qwen3.8-27B-Trellis-3.2bpw` on M4 Pro GPUs (`applegpu_g16s`); the model
 factory selects it for that artifact on that device and the TQ graph elsewhere.
-It resolves one plan per request shape at load: one row, 2..3, 4 and 5..8 rows
-(speculative verify), prompt chunks, and 2048-row chunks split between the
-Neural Engine and the GPU when the ANE bridge loads. Requests outside those plans
-(several sequences, independent-row appends, vision positions, array masks,
-mounted adapters, KV caches other than BF16 or 4-bit group-64) take the generic
-Qwen 3.5 forward. It declares `verifyRoundCosts`, its measured verify cost by
-row count, which adaptive draft depth reads.
+It resolves one block set per width class at load: one row, 2..3, 4 and 5..8
+rows (decode, speculative verify and prompt tails, of one sequence or several),
+prompt chunks, and 2048-row chunks split between the Neural Engine and the GPU
+when the composition names the bridge (`aneBridge`, on by default; a bridge that
+does not load fails the load with `AneBridgeError`). Requests outside those sets
+(wider windows, vision positions, known-token spans, mounted adapters, KV caches
+other than BF16 or 4-bit group-64) take the graph's generic blocks. It declares
+`verifyRoundCosts`, its measured verify cost by row count, which adaptive draft
+depth reads.
 
-For explicit state and tensor operations, use `graph.makeCache()`,
-`graph.forwardHidden(ids, state)`, and `graph.logitsFromHidden(hidden)`.
-Release state with each cache's `dispose()` and release returned arrays when
-finished. `bindMlxGraph` from `models/graph` adapts caller-supplied operations to
-an explicit graph descriptor and logits selection contract without owning weights.
+For explicit state and tensor operations, use `graph.makeCache()`, the graph's
+named phases (`prefillChunk.gpu`, `prefillTail[width]`, `decode[width]`,
+`verify[width]`, `appendKnown[width]`) and its head (`logits[width]`), each
+indexed by the class of the rows passed (`widthClass` from `contracts/mlx`);
+`examples/qwen3-forward.ts` runs a prompt tail and a decode. Release state with
+each cache's `dispose()` and release returned arrays when finished.
 
 Shared dense/quantized layers, activations, normalization, and RoPE live under
 `layers/`; architecture assembly lives under `models/<family>/`. DeltaNet

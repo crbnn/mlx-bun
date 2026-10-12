@@ -88,6 +88,9 @@ test.skipIf(!artifact || !reportPath)("padded prompt batches and continuation ma
   const { Dtype, clearCache, MLX_VERSION } = await import("@mlx-bun/mlx/ffi");
   expect(report.runtime).toBe(MLX_VERSION);
   const weights = await Weights.open(artifact!), model = createModel(weights, await loadModelConfig(artifact!));
+  // The test names each phase as the scheduler would: a prompt chunk of `count` tokens per row is a tail, a token per row a decode.
+  const { phaseHidden } = await import("../models/phase-forward"), { widthClass } = await import("../../src/contracts/mlx/graph");
+  const graph = model as unknown as import("../../src/contracts/mlx/graph").MlxTokenPhases;
   try {
     for (const expected of reference) {
       const prompts=expected.prompts, B=prompts.length, width=Math.max(...prompts.map(p=>p.length)), pads=prompts.map(p=>width-p.length);
@@ -115,7 +118,7 @@ test.skipIf(!artifact || !reportPath)("padded prompt batches and continuation ma
         };
         for(const [chunk,count] of expected.counts.entries()) {
           using ids=MlxArray.fromInt32(Int32Array.from(inputs.flatMap(row=>row.slice(start,start+count))),[B,count]);
-          using hidden=model.forwardHidden(ids,caches), logits=model.logitsFromHidden(hidden);
+          using hidden=phaseHidden(graph,ids,caches), logits=graph.logits[widthClass(ids.size)](hidden);
           for(let row=0;row<B;row++)if(start<=last[row]! && last[row]!<start+count)check(logits,row,last[row]!-start,0);
           evalCacheState(caches);
           for (const [layer,c] of caches.entries()) if (c instanceof SSMCache) {
@@ -132,7 +135,7 @@ test.skipIf(!artifact || !reportPath)("padded prompt batches and continuation ma
         expect(caches.map(c=>c.rowOffsets)).toEqual(expected.offsets);
         for(let step=1;step<4;step++) {
           using ids=MlxArray.fromInt32(Int32Array.from(prompts.map((_,row)=>70+step+row)),[B,1]);
-          using hidden=model.forwardHidden(ids,caches), logits=model.logitsFromHidden(hidden);
+          using hidden=phaseHidden(graph,ids,caches), logits=graph.logits[widthClass(ids.size)](hidden);
           for(let row=0;row<B;row++)check(logits,row,0,step);
           for(const c of caches)if('releaseRopeArr' in c)c.releaseRopeArr();
         }

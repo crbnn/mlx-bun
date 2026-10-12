@@ -2,6 +2,8 @@ import { expect, test } from "bun:test";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { KVCache } from "../../src/state/kv";
 import { QwenMtpSource } from "../../src/generation/speculative/sources/qwen-mtp-source";
+import { atEveryWidth } from "../../src/models/graph";
+import { mtpModule } from "../models/phase-forward";
 import { PromptCache } from "../../src/state/prefix-cache";
 import { cloneKvCaches } from "../../src/state/persistence";
 import { disposeAttachments } from "../../src/state/checkpoint";
@@ -16,14 +18,14 @@ test("restored MTP joins the next token to the saved preceding hidden at the cor
   const target = {
     hiddenSize: 1, layerCount: 1,
     embed(ids: MlxArray) { return array(ids.toIntTokens()); },
-    logitsFromHidden() { return MlxArray.fromFloat32(new Float32Array(8), [1, 1, 8]); },
+    logits: atEveryWidth(() => MlxArray.fromFloat32(new Float32Array(8), [1, 1, 8])),
   };
-  const module = { forward(embeds: MlxArray, hidden: MlxArray, cache: KVCache) {
+  const module = mtpModule((embeds: MlxArray, hidden: MlxArray, cache: KVCache) => {
     const tokens = [...embeds.toFloat32Host()], hiddens = [...hidden.toFloat32Host()];
     calls.push({ offset: cache.offset, tokens, hiddens });
     append(cache, tokens);
     return array(tokens);
-  } } as unknown as ConstructorParameters<typeof QwenMtpSource>[1];
+  }) as unknown as ConstructorParameters<typeof QwenMtpSource>[1];
   const store = new PromptCache(100000);
   const make = () => new QwenMtpSource(target, module,
     () => MlxArray.fromInt32(new Int32Array([1]), [1]));

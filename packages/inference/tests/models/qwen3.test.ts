@@ -12,7 +12,7 @@ import { forwardSequence, klPerToken, evalPpl } from "@mlx-bun/inference/scoring
 import { createInferenceEngine, createAutoregressiveMethod } from "@mlx-bun/inference/execution";
 import { bindMlxAutoregressiveGraph } from "@mlx-bun/inference/generation/bindings/autoregressive";
 import { generate } from "@mlx-bun/inference";
-import { bindMlxGraph } from "@mlx-bun/inference/models/graph";
+import { phaseGreedy } from "./phase-forward";
 import { testComposition } from "./test-composition";
 
 /** A tiny checkpoint generated in memory; no model download or stored fixture. */
@@ -56,7 +56,7 @@ async function checkpoint(dir: string): Promise<void> {
   await Bun.write(join(dir, "config.json"), JSON.stringify({ model_type: "qwen3", hidden_size: 64, num_hidden_layers: 1, num_attention_heads: 2, num_key_value_heads: 1, head_dim: 32, intermediate_size: 64, vocab_size: 64, eos_token_id: [], rms_norm_eps: 1e-6, max_position_embeddings: 128, tie_word_embeddings: true, quantization: { group_size: 64, bits: 4 } }));
 }
 
-test("a caller loads a graph, owns its state, selects logits and generates directly", async () => {
+test("a caller loads a graph, owns its state, names each phase, selects logits and generates directly", async () => {
   const dir = mkdtempSync(join(tmpdir(), "mlx-qwen3-"));
   try {
     await checkpoint(dir);
@@ -64,13 +64,12 @@ test("a caller loads a graph, owns its state, selects logits and generates direc
     try {
       const model = new Qwen3Model(weights, config, testComposition()), state = model.makeCache();
       try {
-        const graph = bindMlxGraph(model, { id: "tiny-qwen3", artifact: "synthetic", stateAbi: "kv" });
+        // A prompt of three tokens is a prompt tail of three rows; its head is the entry for those rows.
         using ids = ops.fromInt32([1, 2, 3], [1, 3]);
-        using hidden = await graph.forwardHidden(ids, state);
+        using hidden = await model.prefillTail.twoToThree(ids, state, null);
         expect(hidden.shape).toEqual([1, 3, 64]);
         expect(state[0]!.offset).toBe(3);
-        using all = graph.projectLogits(hidden, { type: "all" });
-        using last = graph.projectLogits(hidden, { type: "last" });
+        using all = model.logits.twoToThree(hidden);
         expect(all.shape).toEqual([1, 3, 64]);
         using scored = forwardSequence(model, ids);
         expect(Buffer.from(scored.rawBytes())).toEqual(Buffer.from(all.rawBytes()));
@@ -79,14 +78,14 @@ test("a caller loads a graph, owns its state, selects logits and generates direc
         expect(ppl.tokens).toBe(3);
         expect(Number.isFinite(ppl.ppl)).toBe(true);
         using selected = hidden.slice([0, 2, 0], [1, 3, 64]);
+        using last = model.logits.one(selected);
         using expected = model.logitsFromHidden(selected);
         expect(last.shape).toEqual([1, 1, 64]);
         expect(Buffer.from(last.rawBytes())).toEqual(Buffer.from(expected.rawBytes()));
-        expect(() => graph.projectLogits(hidden, { type: "range", start: 3, end: 4 })).toThrow("selection");
-        const tokens = model.generate([1, 2, 3], 4);
+        const tokens = phaseGreedy(model, [1, 2, 3], 4);
         expect(tokens).toHaveLength(4);
         expect(tokens.every(token => token >= 0 && token < 64)).toBe(true);
-        expect(model.generate([1, 2, 3], 4)).toEqual(tokens);
+        expect(phaseGreedy(model, [1, 2, 3], 4)).toEqual(tokens);
         const generation = generate(model, [1, 2, 3], { temperature: 0, maxTokens: 4, eosTokenIds: [] });
         const streamed: number[] = [];
         for await (const value of generation) streamed.push(value.token);

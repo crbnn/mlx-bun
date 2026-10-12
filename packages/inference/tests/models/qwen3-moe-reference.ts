@@ -7,7 +7,7 @@
 // Delete this file and the identity test once the D3 PR has merged.
 //
 // Changes from b3db6b09: import paths only (the attention comes from the
-// frozen qwen3-reference.ts).
+// frozen qwen3-reference.ts), and E2's scoring-forward name (sequenceHidden).
 
 // Concrete model graph for Qwen3-MoE (model_type `qwen3_moe`,
 // Qwen3MoeForCausalLM). A STRAIGHT op-for-op transcription of the oracle
@@ -294,6 +294,9 @@ export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
   makeCache(): Cache[] {
     return this.layers.map(() => new KVCache());
   }
+
+  /** E2's name for the scoring forward (`MlxSequenceForward`), so scoring reaches the frozen forward itself. */
+  sequenceHidden(ids: MlxArray, cache: Cache[], _width: unknown): MlxArray { return this.forwardHidden(ids, cache); }
 
   forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray {
     const h = this.embed.encode(ids);                               // self.embed_tokens(inputs)

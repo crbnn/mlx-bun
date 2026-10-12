@@ -7,7 +7,7 @@
 // test the layer class, none of which this codebase allows any more. Delete
 // this file and the identity test once the D3 PR has merged.
 //
-// Changes from b3db6b09: import paths only.
+// Changes from b3db6b09: import paths only, and E2's scoring-forward name (sequenceHidden).
 
 import { referenceKvAttention as captureKvAttention } from "./quantized-sdpa-reference";
 // UniversalDense — the Tier-0 config-driven dense llama-family module
@@ -556,6 +556,9 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
   makeCache(): Cache[] {
     return this.#cacheWindows.map(window => window ? new RotatingKVCache(window) : new KVCache());
   }
+
+  /** E2's name for the scoring forward (`MlxSequenceForward`), so scoring reaches the frozen forward itself. */
+  sequenceHidden(ids: MlxArray, cache: Cache[], _width: unknown): MlxArray { return this.forwardHidden(ids, cache); }
 
   forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray {
     let h = this.embed.encode(ids);

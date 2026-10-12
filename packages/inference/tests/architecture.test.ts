@@ -612,7 +612,7 @@ const flagReaders = new Set(["runtimeFlag", "runtimeValue", "runtimeNumber", "ru
 const snapshotReaders = new Set(["flag", "value", "number"]);
 /** Development profiling hooks a hot path may still read, listed by name. */
 const profilingHooks = new Set(["__deltaProf", "__opCount", "MLX_BUN_SPEC_PHASE_TIMING", "MLX_BUN_SPEC_LAYER_PROFILE",
-  "MLX_BUN_SPEC_OP_INVENTORY", "MLX_BUN_SPEC_DEVICE_ROUND"]);
+  "MLX_BUN_SPEC_OP_INVENTORY", "MLX_BUN_SPEC_DEVICE_ROUND", "MLX_BUN_GRAMMAR_DEBUG"]);
 /** Where composition facts are read: the loader (inference-relative) and the app's engine load path (app-relative). */
 const loaderFiles = new Set(["models/factory.ts", "models/implementation.ts", "models/runtime.ts"]);
 const engineLoadPath = new Set(["engine/model-host.ts", "engine/cache-services.ts"]);
@@ -843,8 +843,6 @@ const seamRatchet: RatchetTable = {
     "packages/inference/src/models/qwen/qwen38-27b-trellis-tq.ts": 2, // D2
   },
   "hot-path-read": {
-    "packages/inference/src/execution/batch-group.ts": 2, // no item yet: MLX_BUN_BATCH_VEC_SAMPLE, MLX_BUN_GRAMMAR_DEBUG
-    "packages/inference/src/generation/speculative/sources/two-model.ts": 1, // E2 (prefill tail split)
     "packages/inference/src/layers/geglu.ts": 1, // C2
     "packages/inference/src/models/glm52/model.ts": 2, // no item yet: B1 defers GLM-5.2 MLA
     "packages/inference/src/state/layout.ts": 3, // no item yet: prefillCacheLayout dispatches on cache class
@@ -856,15 +854,7 @@ const seamRatchet: RatchetTable = {
     "packages/inference/src/models/minicpm5/model.ts": 2, // no item yet: the training flash path and prefix-shared caches (B1 lists them out of its step)
     "packages/inference/src/scoring/full-sequence.ts": 3, // D3 (B1e reads over the deprecated members)
   },
-  "phase-by-shape": {
-    "packages/inference/src/execution/batch-group.ts": 4, // E2
-    "packages/inference/src/execution/fill-group.ts": 3, // E2
-    "packages/inference/src/execution/grammar-group.ts": 2, // E2
-    "packages/inference/src/generation/autoregressive.ts": 6, // E2
-    "packages/inference/src/generation/grammar-step.ts": 1, // E2
-    "packages/inference/src/generation/speculative/bindings/autoregressive-rows.ts": 1, // E2
-    "packages/inference/src/generation/speculative/bindings/binding.ts": 2, // E2
-  },
+  "phase-by-shape": {},
 };
 
 test("the seam ratchet: no new violation, no file above its allowlisted count", async () => {

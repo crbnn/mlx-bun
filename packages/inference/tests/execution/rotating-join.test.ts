@@ -23,6 +23,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { Cache } from "../../src/contracts/mlx/cache";
+import type { MlxTokenPhases } from "../../src/contracts/mlx/graph";
+import { observedPhases, phaseHidden } from "../models/phase-forward";
 import { applyDescriptor, descriptorFor, releaseAll, storedFloatDtype } from "../parity/real-weight-inputs";
 import { rotatingRowReader, type Layer, type Tensor } from "../parity/rotating-rows";
 
@@ -162,8 +164,8 @@ test.skipIf(!inputs)("rotating rows keep their newest window through late joins 
     try {
       kinds = probe.map(c => c instanceof RotatingKVCache ? "rotating" as const : "full" as const);
       using ids = ops.fromInt32([prompts.A![0]!], [1, 1]);
-      using h = model.forwardHidden(ids, probe);
-      using logits = model.logitsFromHidden(h);
+      using h = phaseHidden(model as unknown as MlxTokenPhases, ids, probe);
+      using logits = (model as unknown as MlxTokenPhases).logits.one(h);
       projectionDtype = logits.dtypeName;
     } finally { releaseAll(probe.map(c => () => c.dispose())); }
     const pins: Pins = { layers: kinds, window, vocab, projectionDtype, kv: inputs!.kv };
@@ -172,32 +174,30 @@ test.skipIf(!inputs)("rotating rows keep their newest window through late joins 
       const finished = new Set<string>(), tokens: Record<string, number[]> = Object.fromEntries(scenario.rows.map(r => [r, []]));
       const cursor: Record<string, number> = {};
       let current: Forward | null = null, joinedAfter: number | null = null;
-      const forwardHidden = model.forwardHidden, logitsFromHidden = model.logitsFromHidden;
-      model.forwardHidden = function (this: typeof model, ids: MlxArray, caches: Cache[]) {
-        const [B, L] = ids.shape as [number, number];
-        let labels = labelsOf.get(caches[0]!);
-        if (!labels) {
-          const running = scenario.rows.filter(r => admitted.has(r) && !finished.has(r));
-          labels = L > 1 || B !== running.length ? scenario.rows.filter(r => !assigned.has(r)).slice(0, B) : running;
-          for (const l of labels) assigned.add(l);
-          labelsOf.set(caches[0]!, labels);
-        } else if (labels.length !== B) labels = labels.filter(l => !finished.has(l));
-        const flat = ids.toIntTokens(), rows = Array.from({ length: B }, (_, r) => flat.slice(r * L, (r + 1) * L));
-        const decode = labels.length === B && labels.every(l => (cursor[l] ?? 0) >= prompts[l]!.length);
-        const states = decode ? rowStates(caches, B) : null;
-        labels.forEach((l, r) => {
-          const from = cursor[l] ?? 0, row = rows[r]!, prompt = prompts[l]!;
-          let pad = 0;
-          if (from < prompt.length) while (pad < row.length && JSON.stringify(row.slice(pad)) !== JSON.stringify(prompt.slice(from, from + row.length - pad))) pad++;
-          cursor[l] = from + row.length - pad;
-        });
-        current = { B, L, labels, ids: rows, states, projections: [] };
+      // The scheduler binds to a view of the graph whose phases report each forward and each head projection.
+      const view = observedPhases(model, {
+        forward(ids: MlxArray, caches: Cache[]) {
+          const [B, L] = ids.shape as [number, number];
+          let labels = labelsOf.get(caches[0]!);
+          if (!labels) {
+            const running = scenario.rows.filter(r => admitted.has(r) && !finished.has(r));
+            labels = L > 1 || B !== running.length ? scenario.rows.filter(r => !assigned.has(r)).slice(0, B) : running;
+            for (const l of labels) assigned.add(l);
+            labelsOf.set(caches[0]!, labels);
+          } else if (labels.length !== B) labels = labels.filter(l => !finished.has(l));
+          const flat = ids.toIntTokens(), rows = Array.from({ length: B }, (_, r) => flat.slice(r * L, (r + 1) * L));
+          const decode = labels.length === B && labels.every(l => (cursor[l] ?? 0) >= prompts[l]!.length);
+          const states = decode ? rowStates(caches, B) : null;
+          labels.forEach((l, r) => {
+            const from = cursor[l] ?? 0, row = rows[r]!, prompt = prompts[l]!;
+            let pad = 0;
+            if (from < prompt.length) while (pad < row.length && JSON.stringify(row.slice(pad)) !== JSON.stringify(prompt.slice(from, from + row.length - pad))) pad++;
+            cursor[l] = from + row.length - pad;
+          });
+          current = { B, L, labels, ids: rows, states, projections: [] };
         forwards.push(current);
-        return forwardHidden.call(this, ids, caches);
-      };
-      model.logitsFromHidden = function (this: typeof model, hidden: MlxArray) {
-        const out = logitsFromHidden.call(this, hidden);
-        try {
+        },
+        head(_hidden: MlxArray, out: MlxArray) {
           const [B, L, V] = out.shape as [number, number, number];
           assert(current && current.B === B, "a projection without its forward");
           for (let r = 0; r < B; r++) {
@@ -205,11 +205,10 @@ test.skipIf(!inputs)("rotating rows keep their newest window through late joins 
             current.projections.push({ shape: [...row.shape], dtype: row.dtypeName, sha: hash(row), finite: [...row.toFloat32()].every(Number.isFinite) });
           }
           current = null;
-          return out;
-        } catch (error) { out.dispose(); throw error; }
-      };
+        },
+      });
       const runtime = createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: String(scenario.tailSplit), MLX_BUN_COMPILED_DECODE: "0" });
-      const group = bindMlxGateway(model).createBatchGroup({ maxBatch: scenario.mode === "b1" ? 1 : 2, prefillChunkSize: 2048, runtime });
+      const group = bindMlxGateway(view).createBatchGroup({ maxBatch: scenario.mode === "b1" ? 1 : 2, prefillChunkSize: 2048, runtime });
       const finish: Record<string, string> = {}, pending: Promise<unknown>[] = [];
       const submit = (i: number) => {
         const row = scenario.rows[i]!; admitted.add(row);
@@ -226,7 +225,7 @@ test.skipIf(!inputs)("rotating rows keep their newest window through late joins 
         submit(0);
         if (scenario.mode === "initial") submit(1);
         for (let seen = 0; seen !== pending.length;) { seen = pending.length; await Promise.all(pending); }
-      } finally { model.forwardHidden = forwardHidden; model.logitsFromHidden = logitsFromHidden; await group.close(); }
+      } finally { await group.close(); }
       return { forwards, tokens, finish, joinedAfter };
     };
     // The caller owns the returned views; a failed read releases what it made.

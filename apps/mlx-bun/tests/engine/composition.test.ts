@@ -42,12 +42,13 @@ test("a loaded model records the composition resolved before its graph was built
     const aneBridge = context.composition!.aneBridge;
     expect(context.composition).toEqual({ device: deviceArchitecture(), aneBridge,
       kv: { kind: "affine", bits: 8, groupSize: 64, kernels: "unfused" },
-      draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 3, speculativeAffineKv: true, packedMixedMlp: true });
+      draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 3, speculativeAffineKv: true, packedMixedMlp: true,
+      vectorGreedySampling: true });
     expect(typeof aneBridge).toBe("boolean");
     const binding = await modelServingBinding(context);
     expect(binding.diagnostics()).toEqual({ composition: { device: deviceArchitecture(), ane_bridge: aneBridge,
       kv: { kind: "affine", bits: 8, group_size: 64, kernels: "unfused" }, draft_depth: 0, prefill_chunk_tokens: 2048,
-      adapters: false, max_rows: 3, speculative_affine_kv: true, packed_mixed_mlp: true } });
+      adapters: false, max_rows: 3, speculative_affine_kv: true, packed_mixed_mlp: true, vector_greedy_sampling: true } });
     // The graph's caches are the composition's: the KV8 legos it names.
     const caches = (context.model as { makeCache(): { signature(): string; dispose(): void }[] }).makeCache();
     try { expect(caches.every(cache => cache.signature() === "kv:bf16-first:kv:plain")).toBe(true); }

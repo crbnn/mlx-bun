@@ -95,6 +95,7 @@ const { captureKvAttention } = await import("../../../src/state/kv-attention-vie
 const { unfusedAffineKernels } = await import("../../../src/state/affine-attention");
 const { softcapAttention } = await import("../../../src/state/softcap-attention");
 const { testComposition } = await import("../test-composition");
+const { observedPhases, phaseHidden, phaseLogits } = await import("../phase-forward");
 /** The storage class a cache holds: a composed lego's storage, else the cache itself. */
 const storageKind = (cache: Cache) => (cache.composed?.storage() ?? cache).constructor.name;
 function fixture() {
@@ -232,7 +233,7 @@ describe.skipIf(!native)("Gemma2 manual attention native masks", () => {
     const current = actual.makeCache(), reference = legacy.makeCache();
     try {
       for (const tokens of [[2, 4, 7], [8, 3], [6], [5, 9]]) {
-        using a = actual.forward(tokens, current), b = legacy.forward(tokens, reference);
+        using a = phaseLogits(actual, tokens, current), b = phaseLogits(legacy, tokens, reference);
         expect(a.rawBytes()).toEqual(b.rawBytes());
       }
     } finally { dispose(current); dispose(reference); f.dispose(); }
@@ -242,7 +243,7 @@ describe.skipIf(!native)("Gemma2 manual attention native masks", () => {
     const f = fixture(), model = f.make();
     const solos = [2, 5, 3, 7].slice(0, batch).map(length => {
       const cache = model.makeCache();
-      using logits = model.forward(Array.from({ length }, (_, index) => index + 2), cache);
+      using logits = phaseLogits(model, Array.from({ length }, (_, index) => index + 2), cache);
       logits.eval(); return cache;
     });
     const actual = new BatchedKVCache(), reference = new BatchedKVCache();
@@ -273,13 +274,13 @@ describe.skipIf(!native)("Gemma2 manual attention native masks", () => {
       };
       for (const length of [2, 1]) {
         using ids = ops.fromInt32(Array.from({ length: batch * length }, (_, index) => index + 10), [batch, length]);
-        using a = model.forward(ids, [actual]), b = model.forward(ids, [reference]);
+        using a = phaseLogits(model, ids, [actual]), b = phaseLogits(model, ids, [reference]);
         expect(a.shape).toEqual([batch, length, 96]);
         expect(a.rawBytes()).toEqual(b.rawBytes());
       }
       expect(maskCalls).toBe(2);
       actual.filterRows([0]); reference.filterRows([0]);
-      using a = model.forward([25], [actual]), b = model.forward([25], [reference]);
+      using a = phaseLogits(model, [25], [actual]), b = phaseLogits(model, [25], [reference]);
       expect(a.rawBytes()).toEqual(b.rawBytes());
     } finally { actual.dispose(); reference.dispose(); solos.forEach(dispose); f.dispose(); }
   });
@@ -384,12 +385,12 @@ describe.skipIf(!native)("Universal mixed full/sliding masks", () => {
       try {
         expect(caches[0]!.map(cache => cache instanceof RotatingKVCache)).toEqual(types.map(type => type === S));
         for (const tokens of CHUNKS) {
-          using a = actual.forward(tokens, caches[0]!), b = reference.forward(tokens, caches[1]!);
+          using a = phaseLogits(actual, tokens, caches[0]!), b = phaseLogits(reference, tokens, caches[1]!);
           expect(a.shape).toEqual([1, tokens.length, 96]);
           expect(a.rawBytes()).toEqual(b.rawBytes());
           // The replaced selection gives sliding layers a full-width mask; past the window it cannot run.
           if (!previousFailed) {
-            try { using c = previous.forward(tokens, caches[2]!); c.eval(); if (c.rawBytes().join() !== a.rawBytes().join()) previousFailed = true; }
+            try { using c = phaseLogits(previous, tokens, caches[2]!); c.eval(); if (c.rawBytes().join() !== a.rawBytes().join()) previousFailed = true; }
             catch { previousFailed = true; }
           }
         }
@@ -403,7 +404,7 @@ describe.skipIf(!native)("Universal mixed full/sliding masks", () => {
       const caches = [actual.makeCache(), previous.makeCache()];
       try {
         for (const tokens of CHUNKS) {
-          using a = actual.forward(tokens, caches[0]!), b = previous.forward(tokens, caches[1]!);
+          using a = phaseLogits(actual, tokens, caches[0]!), b = phaseLogits(previous, tokens, caches[1]!);
           expect(a.rawBytes()).toEqual(b.rawBytes());
         }
       } finally { caches.forEach(dispose); f.dispose(); }
@@ -413,7 +414,7 @@ describe.skipIf(!native)("Universal mixed full/sliding masks", () => {
       const f = mixedFixture(types, true), model = f.make();
       const solos = lengths.map((length, row) => {
         const cache = model.makeCache();
-        using logits = model.forward(Array.from({ length }, (_, index) => 2 + index + row * 7), cache);
+        using logits = phaseLogits(model, Array.from({ length }, (_, index) => 2 + index + row * 7), cache);
         logits.eval(); return cache;
       });
       /** B2 caches from the solo rows; `poison` fills every padding column with large values. */
@@ -448,7 +449,7 @@ describe.skipIf(!native)("Universal mixed full/sliding masks", () => {
         expect(poisoned.some(cache => (cache as unknown as { leftPad: number[] }).leftPad.some(pad => pad > 0))).toBe(true);
         for (const length of [2, 1, 3]) {
           using ids = ops.fromInt32(Array.from({ length: 2 * length }, (_, index) => 20 + index), [2, length]);
-          using a = model.forward(ids, clean), b = model.forward(ids, poisoned);
+          using a = phaseLogits(model, ids, clean), b = phaseLogits(model, ids, poisoned);
           expect(a.shape).toEqual([2, length, 96]);
           expect(a.rawBytes()).toEqual(b.rawBytes());
         }
@@ -471,7 +472,7 @@ describe.skipIf(!native)("Universal construction binding", () => {
       expect(layout(caches[0]!)).toEqual(expected);
       expect(expected).toEqual(types.map(type => type === S ? W : "full"));
       for (const tokens of CHUNKS) {
-        using a = edited.forward(tokens, caches[0]!), b = fresh.forward(tokens, caches[1]!);
+        using a = phaseLogits(edited, tokens, caches[0]!), b = phaseLogits(fresh, tokens, caches[1]!);
         expect(a.rawBytes()).toEqual(b.rawBytes());
       }
     } finally { caches.forEach(dispose); f.dispose(); g.dispose(); }
@@ -491,7 +492,7 @@ describe.skipIf(!native)("Universal attention bound at construction", () => {
       // Affine KV is admitted through certified plain reads; attention still reads plain.
       expect([bindMlxGateway(edited).kvBatchable(immediate()), bindMlxGateway(edited).kvBatchable(delayed())]).toEqual([true, true]);
       for (const tokens of [[2, 4, 7], [8, 3], [6]]) {
-        using a = edited.forward(tokens, caches[0]!), b = fresh.forward(tokens, caches[1]!);
+        using a = phaseLogits(edited, tokens, caches[0]!), b = phaseLogits(fresh, tokens, caches[1]!);
         expect(a.rawBytes()).toEqual(b.rawBytes());
       }
     } finally { caches.forEach(dispose); f.dispose(); }
@@ -507,7 +508,7 @@ describe.skipIf(!native)("Universal attention bound at construction", () => {
       expect(edited.encodedKvAttention).toBe(true);
       expect([bindMlxGateway(edited).kvBatchable(immediate()), bindMlxGateway(edited).kvBatchable(delayed())]).toEqual([true, true]);
       for (const tokens of CHUNKS) {
-        using a = edited.forward(tokens, caches[0]!), b = fresh.forward(tokens, caches[1]!);
+        using a = phaseLogits(edited, tokens, caches[0]!), b = phaseLogits(fresh, tokens, caches[1]!);
         expect(a.rawBytes()).toEqual(b.rawBytes());
       }
     } finally { caches.forEach(dispose); f.dispose(); g.dispose(); }
@@ -549,7 +550,7 @@ describe.skipIf(!native)("Universal forward ownership", () => {
       counting(count => {
         const seen = instrument(model, caches);
         using ids = tokens();
-        const out = model.forwardHidden(ids, caches);
+        const out = phaseHidden(model, ids, caches);
         try {
           expect(seen.masks.length).toBe(4); // one per layer's read
           for (const array of [...seen.hidden, ...seen.masks]) expect(count(array)).toBe(1);
@@ -565,7 +566,7 @@ describe.skipIf(!native)("Universal forward ownership", () => {
       counting(count => {
         const seen = instrument(model, caches, 2);
         using ids = tokens();
-        expect(() => model.forwardHidden(ids, caches)).toThrow("layer 2 failed");
+        expect(() => phaseHidden(model, ids, caches)).toThrow("layer 2 failed");
         expect(seen.hidden.length).toBe(3); // the input and two layer outputs
         expect(seen.masks.length).toBe(2);
         for (const array of [...seen.hidden, ...seen.masks]) expect(count(array)).toBe(1);
@@ -581,7 +582,7 @@ describe.skipIf(!native)("Universal forward ownership", () => {
         const seen = instrument(model, caches);
         caches[1]!.makeMask = () => { throw new Error("full mask failed"); };
         using ids = tokens();
-        expect(() => model.forwardHidden(ids, caches)).toThrow("full mask failed");
+        expect(() => phaseHidden(model, ids, caches)).toThrow("full mask failed");
         expect(seen.masks.length).toBe(1);
         expect(seen.hidden.length).toBe(2); // the input and layer 0's output
         for (const array of [...seen.hidden, ...seen.masks]) expect(count(array)).toBe(1);
@@ -604,7 +605,7 @@ describe.skipIf(!native)("Universal forward ownership", () => {
             return { mode: "array", arr };
           };
           using ids = tokens();
-          expect(() => model.forwardHidden(ids, caches)).toThrow("mask release failed");
+          expect(() => phaseHidden(model, ids, caches)).toThrow("mask release failed");
           expect(failing).not.toBeNull();
           for (const array of [...seen.hidden, ...seen.masks]) expect(count(array)).toBe(1);
           expect(count(failing!)).toBe(1);
@@ -624,7 +625,7 @@ describe.skipIf(!native)("Universal forward ownership", () => {
           const norm = model.finalNorm.forward.bind(model.finalNorm);
           model.finalNorm.forward = ((x: MlxArray) => normalized = norm(x)) as never;
           using ids = tokens();
-          expect(() => model.forwardHidden(ids, caches)).toThrow("hidden release failed");
+          expect(() => phaseHidden(model, ids, caches)).toThrow("hidden release failed");
           expect(count(normalized!)).toBe(1);
         });
       } finally { dispose(caches); }
@@ -655,9 +656,9 @@ test.skipIf(!native || !artifact)("cached Gemma2 preserves B1 and serves ragged 
       const caches = model.makeCache(), logits: Float32Array[] = [];
       try {
         // Default prefill tail split: head first, then token zero at L=1.
-        using prefix = model.forward(prompt.slice(0, -1), caches); prefix.eval();
+        using prefix = phaseLogits(model, prompt.slice(0, -1), caches); prefix.eval();
         for (let step = 0; step < steps; step++) {
-          using result = model.forward([step ? forced[step - 1]! : prompt.at(-1)!], caches);
+          using result = phaseLogits(model, [step ? forced[step - 1]! : prompt.at(-1)!], caches);
           logits.push(result.toFloat32());
         }
         return logits;
@@ -753,7 +754,7 @@ test.skipIf(!native || !artifact || !referencePath)("real Gemma2 ragged B2/B4 lo
       expect(expected.steps).toHaveLength(3);
       const solos = lengths.map(length => {
         const caches = model.makeCache();
-        using logits = model.forward(Array.from({ length }, (_, i) => i + 2), caches); logits.eval();
+        using logits = phaseLogits(model, Array.from({ length }, (_, i) => i + 2), caches); logits.eval();
         return caches;
       });
       const caches = model.layers.map((_, layer) => {
@@ -766,7 +767,7 @@ test.skipIf(!native || !artifact || !referencePath)("real Gemma2 ragged B2/B4 lo
           const tokens = step === 2 ? [25] : Array.from({ length: rows * length }, (_, i) => i + 10);
           expect(expected.steps[step].ids).toEqual(Array.from({ length: rows }, (_, row) => tokens.slice(row * length, (row + 1) * length)));
           using ids = ops.fromInt32(tokens, [rows, length]);
-          using logits = model.forward(ids, caches);
+          using logits = phaseLogits(model, ids, caches);
           expect(encoded(logits), `B${batch} step ${step} logits`).toEqual(expected.steps[step].logits);
           const state = caches.map(cache => {
             const view = cache.captureDonorRows();
@@ -815,7 +816,7 @@ test.skipIf(!native || !artifact)("cached Gemma2 plain fill matches main's seria
     // append), one forward per verify span, and a trim after a rejection.
     const serial = (prompt: number[], fill: Session | null) => {
       const caches = model.makeCache(), logits: string[] = [], tokens: number[] = [];
-      const forward = (ids: number[]) => { using input = ops.fromInt32(ids, [1, ids.length]); return model.forwardHidden(input, caches); };
+      const forward = (ids: number[]) => { using input = ops.fromInt32(ids, [1, ids.length]); return phaseHidden(model, input, caches); };
       const project = (hidden: MlxArray) => { const out = model.logitsFromHidden(hidden); logits.push(...hashRows(out)); return out; };
       try {
         { using head = forward(prompt.slice(0, -1)); head.eval(); }
@@ -969,9 +970,8 @@ test.skipIf(!native || !artifact)("cached Gemma2 two-model speculation keeps B1 
       prompt("List four facts about the Moon, one per line.")];
     // Target forward geometry, measured (the draft instance is separate).
     const widths: number[] = [];
-    const forwardHidden = model.forwardHidden.bind(model);
-    model.forwardHidden = (ids: MlxArray, caches: Cache[]) => { widths.push(ids.shape[0]!); return forwardHidden(ids, caches); };
-    const binding = bindMlxGateway(model, { provider: draft!, numDraftTokens: 3 });
+    const view = observedPhases(model, { forward(ids: MlxArray) { widths.push(ids.shape[0]!); } });
+    const binding = bindMlxGateway(view, { provider: draft!, numDraftTokens: 3 });
     const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
       hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true };
     const options = { maxTokens: 32, temperature: 0 };
@@ -1104,20 +1104,15 @@ test.skipIf(!native || !artifact)("cached Gemma2 n-gram speculation mixes empty 
     // the hooks go in first.
     const forwards: string[] = [], rounds: number[][] = [], rowZero: string[] = [];
     let capture = false;
-    const forwardHidden = model.forwardHidden.bind(model), logitsFromHidden = model.logitsFromHidden.bind(model);
-    model.forwardHidden = (...args: Parameters<typeof forwardHidden>) => {
-      forwards.push(`${args[0].shape[0]}x${args[0].shape[1]}`);
-      return forwardHidden(...args);
-    };
-    model.logitsFromHidden = (...args: Parameters<typeof logitsFromHidden>) => {
-      const out = logitsFromHidden(...args);
-      if (capture) {
+    const view = observedPhases(model, {
+      forward(ids: MlxArray) { forwards.push(`${ids.shape[0]}x${ids.shape[1]}`); },
+      head(_hidden: MlxArray, out: MlxArray) {
+        if (!capture) return;
         using row = out.slice([0, 0, 0], [1, out.shape[1]!, out.shape[2]!]);
         using flat = ops.contiguous(row);
         rowZero.push(createHash("sha256").update(flat.rawBytes()).digest("hex"));
-      }
-      return out;
-    };
+      },
+    });
     const recorded = (policy?: { max: number; min: number }) => {
       const provider = new NgramProvider(policy), open = provider.grouped.open.bind(provider.grouped);
       Object.assign(provider.grouped, { open: (options: Parameters<typeof open>[0]) => {
@@ -1135,8 +1130,8 @@ test.skipIf(!native || !artifact)("cached Gemma2 n-gram speculation mixes empty 
     // Lookup policies are served knobs: the default (3..1), and a 4-gram policy
     // under which novel-text peers propose nothing. Ten draft tokens is the
     // served n-gram default.
-    const lookup = bindMlxGateway(model, { provider: recorded(), numDraftTokens: 10 });
-    const strict = bindMlxGateway(model, { provider: recorded({ max: 4, min: 4 }), numDraftTokens: 10 });
+    const lookup = bindMlxGateway(view, { provider: recorded(), numDraftTokens: 10 });
+    const strict = bindMlxGateway(view, { provider: recorded({ max: 4, min: 4 }), numDraftTokens: 10 });
     const runtime = createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1", MLX_BUN_COMPILED_DECODE: "0" });
     const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
       hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true };
@@ -1328,14 +1323,13 @@ test.skipIf(!native || !artifact)("a structurally equivalent delegating provider
       prompt("Explain step by step how bread dough rises overnight in a bakery.")];
     // Every target forward's geometry and every projection's exact bytes.
     const forwards: string[] = [], logits: string[] = [];
-    const forwardHidden = model.forwardHidden.bind(model), logitsFromHidden = model.logitsFromHidden.bind(model);
-    model.forwardHidden = (...args: Parameters<typeof forwardHidden>) => { forwards.push(args[0].shape.join("x")); return forwardHidden(...args); };
-    model.logitsFromHidden = (...args: Parameters<typeof logitsFromHidden>) => {
-      const out = logitsFromHidden(...args);
-      using flat = ops.contiguous(out);
-      logits.push(createHash("sha256").update(flat.rawBytes()).digest("hex"));
-      return out;
-    };
+    const view = observedPhases(model, {
+      forward(ids: MlxArray) { forwards.push(ids.shape.join("x")); },
+      head(_hidden: MlxArray, out: MlxArray) {
+        using flat = ops.contiguous(out);
+        logits.push(createHash("sha256").update(flat.rawBytes()).digest("hex"));
+      },
+    });
     /** The n-gram provider's operations behind a plain object: no class identity, same contracts. */
     const delegating = (): DraftProvider => {
       const inner = new NgramProvider(), grouped = inner.grouped;
@@ -1351,7 +1345,7 @@ test.skipIf(!native || !artifact)("a structurally equivalent delegating provider
     // row 1 joins at its first token and row 2 at row 1's first token, cancelled
     // at its third; the group drains, and row 0 reruns alone (the recovery).
     const run = async (provider: DraftProvider) => {
-      const binding = bindMlxGateway(model, { provider, numDraftTokens: 10 });
+      const binding = bindMlxGateway(view, { provider, numDraftTokens: 10 });
       const plan = binding.plan(shape, options, { continuous: binding.cachesBatchable(), quantizedBatch: false, checkpoints: false });
       expect(plan).toMatchObject({ method: "speculative", mechanism: "continuous" });
       const group = binding.createBatchGroup({ maxBatch: 4, prefillChunkSize: 512, runtime });
@@ -1438,9 +1432,16 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
       ? resolveKvScheme({ turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: start })
       : resolveKvScheme({ override: 4, quantizedKvStart: start }));
     const f = await build(testComposition(kvScheme?.storage)), model = f.model;
+    // The scheduler binds to a view of the graph whose phases call the hooks a test adds (`forwardHooks`
+    // before each forward, `headHooks` after each head projection); methods bind on first submission.
+    const forwardHooks: ((ids: MlxArray, caches: Cache[]) => void)[] = [], headHooks: ((logits: MlxArray) => void)[] = [];
+    const view = observedPhases(model, {
+      forward(ids, caches) { for (const hook of forwardHooks) hook(ids, caches); },
+      head(_hidden, logits) { for (const hook of headHooks) hook(logits); },
+    });
     const binding = options.grammarJump
-      ? withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }), () => bindMlxGateway(model))
-      : bindMlxGateway(model);
+      ? withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }), () => bindMlxGateway(view))
+      : bindMlxGateway(view);
     let held = false;
     const groupOptions = { maxBatch: 2, prefillChunkSize: options.chunk ?? 64, admissionHeld: () => held,
       ...(options.promptCache ? { promptCache: options.promptCache } : {}),
@@ -1451,7 +1452,7 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
     // Composed directly, the group binds the graph's own declaration; only
     // the delayed-affine capability is the composer's to state.
     const group = options.direct
-      ? new MlxBatchExecutionGroup(model, { ...groupOptions, kvBatchCapabilities: { delayedAffine: true } })
+      ? new MlxBatchExecutionGroup(view, { ...groupOptions, kvBatchCapabilities: { delayedAffine: true } })
       : binding.createBatchGroup(groupOptions);
     const submit = (prompt: number[], maxTokens: number, end: End = {}, grammar?: import("../../../src/sampling").GrammarController) => {
       const tokens: number[] = [], abort = new AbortController();
@@ -1475,16 +1476,24 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
       held = false; group.kick();
       return Promise.all(pending);
     };
-    return { binding, model, kvScheme, group, submit, together,
+    return { binding, model, view, kvScheme, group, submit, together, forwardHooks, headHooks,
       async close() { try { await group.close(); expect(group.activeRows + group.pendingRows).toBe(0); } finally { f.dispose(); } } };
   };
   const A = [2, 4, 7, 9, 3], B = [5, 8];
   /** Every projection's complete logits, in order: shape, dtype and bytes, so
    * matching geometry is asserted along with the values. */
   /** What the span helpers read from a test environment. */
-  type SpanEnv = Pick<Awaited<ReturnType<typeof setup>>, "binding" | "kvScheme" | "group"> & {
+  type SpanEnv = Pick<Awaited<ReturnType<typeof setup>>, "binding" | "kvScheme" | "group" | "forwardHooks"> & {
+    /** The graph the scheduler binds: a view whose phases call the hooks (`forwardHooks`). */
+    view: object;
     model: SpanGraph & import("../../../src/models/factory").RuntimeModel };
-  type SpanGraph = Pick<UniversalDenseModel, "forwardHidden" | "logitsFromHidden">;
+  type SpanGraph = Pick<import("../../../src/contracts/mlx/graph").MlxTokenPhases, "prefillTail" | "decode" | "logits"> &
+    { logitsFromHidden(hidden: MlxArray): MlxArray };
+  /** A view of `model` for the scheduler whose phases call the hooks a test adds before each forward. */
+  const hooked = <M extends object>(model: M) => {
+    const forwardHooks: ((ids: MlxArray, caches: Cache[]) => void)[] = [];
+    return { view: observedPhases(model, { forward(ids, caches) { for (const hook of forwardHooks) hook(ids, caches); } }), forwardHooks };
+  };
   const projections = (env: SpanEnv) => {
     const seen: { shape: number[]; dtype: string; sha256: string }[] = [], project = env.model.logitsFromHidden.bind(env.model);
     env.model.logitsFromHidden = (hidden: MlxArray) => {
@@ -1559,10 +1568,10 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
         if (!readable()) { refused = true; break run; }
         if (prompt.length - 1 > cached) {
           using ids = ops.fromInt32(prompt.slice(cached, -1), [1, prompt.length - 1 - cached]);
-          using head = model.forwardHidden(ids, caches); head.eval();
+          using head = phaseHidden(model, ids, caches); head.eval();
         }
         if (!readable()) { refused = true; break run; }
-        { using ids = ops.fromInt32([prompt.at(-1)!], [1, 1]); using hidden = model.forwardHidden(ids, caches);
+        { using ids = ops.fromInt32([prompt.at(-1)!], [1, 1]); using hidden = phaseHidden(model, ids, caches);
           using logits = project(hidden); pending = draw(logits, 0); }
         while (pending) {
           using current = pending;
@@ -1575,12 +1584,12 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
             sampler.commitNumbers(forced);
             const after = step + 1 + forced.length;
             using ids = ops.fromInt32([token, ...forced], [1, forced.length + 1]);
-            using hidden = model.forwardHidden(ids, caches);
+            using hidden = phaseHidden(model, ids, caches);
             if (after < maxTokens) { using logits = project(hidden); pending = draw(logits, after); }
           } else if (step + 1 < maxTokens) {
             sampler.commitDevice(current);
             using ids = ops.fromInt32([token], [1, 1]);
-            using hidden = model.forwardHidden(ids, caches);
+            using hidden = phaseHidden(model, ids, caches);
             using logits = project(hidden); pending = draw(logits, step + 1);
           }
           tokens.push(token, ...(forced ?? []));
@@ -1609,7 +1618,7 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
     const options = { temperature: 0, maxTokens, ...extra, grammar };
     const failure = new Error("consumer failed");
     const outcome = await env.group.submit({ promptIds: prompt, maxTokens, eosTokenIds: [], grammar, signal: abort.signal,
-      method: (method ?? bindGrammarGroupRequests(env.model, LAYERS, LAYERS.length))(options),
+      method: (method ?? bindGrammarGroupRequests(env.view as typeof env.model, LAYERS, LAYERS.length))(options),
       onToken(token: number) {
         tokens.push(token); onPublish?.(tokens.length);
         if (tokens.length === end.cancelAfter) abort.abort(new DOMException("client left", "AbortError"));
@@ -1962,10 +1971,10 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
       const caches = model.makeCache();
       const seen: { shape: number[]; dtype: string; sha256: string }[] = [], tokens: number[] = [];
       try {
-        { using head = model.forward(prompt.slice(0, -1), caches); head.eval(); }
+        { using head = phaseLogits(model, prompt.slice(0, -1), caches); head.eval(); }
         let next = prompt.at(-1)!;
         for (let step = 0; step < maxTokens; step++) {
-          using logits = model.forward([next], caches);
+          using logits = phaseLogits(model, [next], caches);
           seen.push({ shape: [...logits.shape], dtype: logits.dtypeName,
             sha256: createHash("sha256").update(logits.rawBytes()).digest("hex") });
           // Main samples normalized scores in the logits dtype. BF16 rounding
@@ -2124,14 +2133,12 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
         let reference: ReturnType<typeof prefix.take> = null, composed: Cache[] | null = null;
         let recordSuffix = false;
         const forwards: { ids: number[]; kinds: string[]; offsets: number[] }[] = [];
-        const originalForward = env.model.forwardHidden.bind(env.model);
         // The grammar method binds model operations on its first submission and
         // survives between requests. Install observers before that first bind.
-        env.model.forwardHidden = (ids, caches) => {
+        env.forwardHooks.push((ids, caches) => {
           if (recordSuffix) forwards.push({ ids: ids.toIntTokens(), kinds: caches.map(storageKind),
             offsets: caches.map(cache => cache.offset) });
-          return originalForward(ids, caches);
-        };
+        });
         const seen = projections(env);
         try {
           expect(A).toHaveLength(5);
@@ -2174,7 +2181,7 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
           try {
             await grammar.ready();
             using ids = ops.fromInt32([suffix], [1, 1]);
-            using hidden = env.model.forwardHidden(ids, composed);
+            using hidden = phaseHidden(env.model, ids, composed);
             using logits = env.model.logitsFromHidden(hidden);
             expectedProjection = record(logits);
             using sampled = sampler.sample(logits, 0).token;
@@ -2241,8 +2248,8 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
     /** Record each forward's input offsets; the span method binds model
      * operations on its first submission, so observers are installed first. */
     const offsets = (env: Awaited<ReturnType<typeof setup>>) => {
-      const forwards: number[][] = [], forward = env.model.forwardHidden.bind(env.model);
-      env.model.forwardHidden = (ids, caches) => { forwards.push(caches.map(cache => cache.offset)); return forward(ids, caches); };
+      const forwards: number[][] = [];
+      env.forwardHooks.push((_ids, caches) => { forwards.push(caches.map(cache => cache.offset)); });
       return forwards;
     };
 
@@ -2393,11 +2400,10 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
     /** Each forward's input ids and cache classes; the span method binds model
      * operations on its first submission, so observers are installed first. */
     const observe = (env: SpanEnv) => {
-      const forwards: { ids: number[]; kinds: string[] }[] = [], forward = env.model.forwardHidden.bind(env.model);
-      env.model.forwardHidden = (ids, caches) => {
+      const forwards: { ids: number[]; kinds: string[] }[] = [];
+      env.forwardHooks.push((ids, caches) => {
         forwards.push({ ids: [...ids.toIntTokens()], kinds: caches.map(storageKind) });
-        return forward(ids, caches);
-      };
+      });
       return forwards;
     };
 
@@ -2536,10 +2542,11 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
       expect(reference.tokens.slice(1, 3)).toEqual([11, 12]);
       expect(reference.tokens[4]).toBe(13);
       expect(reference.kinds).toEqual(convertedMini);
-      const binding = withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }), () => bindMlxGateway(graph.model));
+      const { view, forwardHooks } = hooked(graph.model);
+      const binding = withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }), () => bindMlxGateway(view));
       const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: 64,
         runtime: createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1" }), kvScheme });
-      const env: SpanEnv = { binding, model: graph.model, kvScheme, group };
+      const env: SpanEnv = { binding, model: graph.model, view, kvScheme, group, forwardHooks };
       const forwards = observe(env);
       try {
         const seen = projections(env);
@@ -2560,10 +2567,11 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
       promptCache?: import("../../../src/execution/batch-types").RowPromptCache) => {
       const { bindMlxGateway, createRuntimeConfig, withRuntimeConfig } = await import("../../../src/execution");
       const graph = await miniCpm(kvScheme);
-      const binding = withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }), () => bindMlxGateway(graph.model));
+      const { view, forwardHooks } = hooked(graph.model);
+      const binding = withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }), () => bindMlxGateway(view));
       const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: 64, ...(promptCache ? { promptCache } : {}),
         runtime: createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1" }), kvScheme });
-      return { binding, model: graph.model, kvScheme, group, async close() {
+      return { binding, model: graph.model, view, kvScheme, group, forwardHooks, async close() {
         try { await group.close(); expect(group.activeRows + group.pendingRows).toBe(0); } finally { graph.dispose(); }
       } };
     };

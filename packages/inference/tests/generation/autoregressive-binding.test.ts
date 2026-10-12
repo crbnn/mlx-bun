@@ -2,8 +2,9 @@ import { expect, spyOn, test } from "bun:test";
 import * as ops from "@mlx-bun/mlx/ops";
 import { appendGrammarSpan } from "../../src/generation/grammar-step";
 import { generateAutoregressive } from "../../src/generation/index";
-import type { MlxAutoregressiveBinding } from "../../src/generation/bindings/autoregressive";
-import { bindMlxGraph } from "../../src/models/graph";
+import type { MlxAutoregressiveBinding, MlxDecodeStep } from "../../src/generation/bindings/autoregressive";
+import { MlxPhaseDispatch } from "../../src/generation/phase-dispatch";
+import { stubPhases } from "../models/phase-forward";
 import { KVCache } from "../../src/state/kv";
 import { type Cache } from "../../src/contracts/mlx/cache";
 import { MlxArray } from "@mlx-bun/mlx/array";
@@ -23,16 +24,24 @@ function fixture() {
     ids.forEach((id, index) => { data[index * 8 + (id + 1) % 8] = 10; });
     return MlxArray.fromFloat32(data, [1, ids.length, 8]);
   }
+  // The graph's one forward serves every phase the loop names; its head predicts id + 1.
+  const forward = (ids: MlxArray, state: Cache[]): MlxArray | Promise<MlxArray> => {
+    seen.forwards++;
+    const tokens = ids.toIntTokens();
+    advance(state, tokens.length);
+    return MlxArray.fromFloat32(Float32Array.from(tokens), [1, tokens.length, 1]);
+  };
+  const head = (hidden: MlxArray) => logits([...hidden.toFloat32Host()]);
+  const phased = (run: typeof forward, project: typeof head = head) => new MlxPhaseDispatch(stubPhases(run, project));
+  /** A fused decoder that advances state one position and predicts like the graph. */
+  const stepping = (onStep: () => void = () => {}): MlxDecodeStep["step"] => (token, state) => {
+    seen.steps++; onStep();
+    advance(state, 1);
+    return { logits: logits(token.toIntTokens()), evalWith: [] };
+  };
   const binding: MlxAutoregressiveBinding = {
-    graph: bindMlxGraph({
-      forwardHidden(ids, state: Cache[]) {
-        seen.forwards++;
-        const tokens = ids.toIntTokens();
-        advance(state, tokens.length);
-        return MlxArray.fromFloat32(Float32Array.from(tokens), [1, tokens.length, 1]);
-      },
-      logitsFromHidden(hidden) { return logits([...hidden.toFloat32Host()]); },
-    }, { id: "independent-fixture", artifact: "fixture", stateAbi: "legacy-cache-array-v1" }),
+    descriptor: { id: "independent-fixture", backend: "mlx", graphAbi: "mlx-hidden-bsh-v1", stateAbi: "legacy-cache-array-v1", artifact: "fixture" },
+    phases: phased(forward),
     memory: { weightsBytes: 0 }, eosTokenIds: [7],
     makeCache() {
       seen.allocations++;
@@ -42,7 +51,7 @@ function fixture() {
       return [new OwnedCache()];
     },
   };
-  return { binding, seen, advance, logits };
+  return { binding, seen, advance, logits, forward, head, phased, stepping };
 }
 
 async function run(binding: MlxAutoregressiveBinding) {
@@ -132,17 +141,16 @@ test("an aborted early consumer return does not advance caller-owned caches", as
 });
 
 test("retained-cache alignment failures close the decoder and publish no final stats", async () => {
-  const { binding, seen } = fixture();
+  const { binding, seen, forward, phased, stepping } = fixture();
   const cache = binding.makeCache();
   let closed = 0;
-  const forward = binding.graph.forwardHidden.bind(binding.graph);
   try {
     const generation = generateAutoregressive({ ...binding,
-      graph: { ...binding.graph, async forwardHidden(...args) {
+      phases: phased(async (ids, state) => {
         if (seen.forwards === 2) throw new Error("alignment forward failed");
-        return forward(...args);
-      } },
-      createDecode: () => ({ tryStep: () => null, close() { closed++; } }),
+        return forward(ids, state);
+      }),
+      createDecode: () => ({ step: stepping(), close() { closed++; } }),
       runtime: createRuntimeConfig({ MLX_BUN_EARLY_FIRST_TOKEN: "1" }),
     }, [0, 1], { cache, temperature: 0, maxTokens: 5, prefillChunkSize: 1 });
     const iter = generation[Symbol.asyncIterator]();
@@ -185,17 +193,12 @@ test("cancellation after an early first yield starts no further forward", async 
 });
 
 test("an early first token precedes cancellation inside the following decode", async () => {
-  const { binding, seen, advance, logits } = fixture();
+  const { binding, seen, stepping } = fixture();
   const abort = new AbortController();
   let closed = 0;
   const generation = generateAutoregressive({ ...binding,
     runtime: createRuntimeConfig({ MLX_BUN_EARLY_FIRST_TOKEN: "1" }),
-    createDecode: () => ({ close() { closed++; }, tryStep(token, state) {
-      seen.steps++;
-      advance(state, 1);
-      abort.abort(new Error("cancelled in next decode"));
-      return { logits: logits(token.toIntTokens()), evalWith: [] };
-    } }),
+    createDecode: () => ({ close() { closed++; }, step: stepping(() => abort.abort(new Error("cancelled in next decode"))) }),
   }, [0, 1], { temperature: 0, maxTokens: 5, prefillChunkSize: 1, signal: abort.signal });
   const iter = generation[Symbol.asyncIterator]();
   expect((await iter.next()).value).toMatchObject({ token: 2, index: 0 });
@@ -220,20 +223,19 @@ test("an initial EOS remains invisible and counted with early first-token schedu
 });
 
 test("bound kernels and early-close cleanup retain runtime settings across consumer awaits", async () => {
-  const { binding, seen } = fixture();
+  const { binding, seen, forward, phased } = fixture();
   const observed: string[] = [];
-  const forward = binding.graph.forwardHidden.bind(binding.graph);
   const generation = generateAutoregressive({ ...binding,
     runtime: createRuntimeConfig({ MLX_BUN_GRAMMAR: "bound" }),
     memory: { weightsBytes: 0, expertRuntime: { plan: { plannedBytes: 0 }, flushUsage() {
       observed.push(`cleanup:${runtimeValue("MLX_BUN_GRAMMAR")}`);
     } } },
-    graph: { ...binding.graph, async forwardHidden(ids, state) {
+    phases: phased(async (ids, state) => {
       observed.push(`forward:${runtimeValue("MLX_BUN_GRAMMAR")}`);
       await Promise.resolve();
       observed.push(`await:${runtimeValue("MLX_BUN_GRAMMAR")}`);
       return forward(ids, state);
-    } },
+    }),
   }, [0, 1], { temperature: 0, maxTokens: 5, prefillChunkSize: 1 });
   const restore = configureRuntime({ MLX_BUN_GRAMMAR: "host" });
   try {
@@ -249,32 +251,22 @@ test("bound kernels and early-close cleanup retain runtime settings across consu
   } finally { restore(); }
 });
 
-test("a replacement binding supplies its own fused decoder to the same loop", async () => {
-  const { binding, seen, advance, logits } = fixture();
+test("a replacement binding supplies its own fused decoder to the same loop, chosen once after prefill", async () => {
+  const { binding, seen, stepping } = fixture();
   let setup = 0;
   const replacement: MlxAutoregressiveBinding = {
     ...binding,
-    createDecode(policy) {
+    createDecode(policy, state) {
       setup++;
       expect(seen.forwards).toBe(2); // only after prefill
       expect(policy).toEqual({ hasAdapters: false, pagedKv: false });
-      return { close() {}, tryStep(token, state) {
-        seen.steps++;
-        advance(state, 1);
-        return { logits: logits(token.toIntTokens()), evalWith: [] };
-      } };
+      expect(state[0]!.offset).toBe(2); // the run's own caches, after the prompt
+      return { close() {}, step: stepping() };
     },
   };
   expect(await run(replacement)).toEqual({ tokens: [2, 3, 4], cacheTokens: [0, 1, 2, 3] });
   expect(setup).toBe(1);
   expect(seen).toEqual({ forwards: 2, steps: 2, allocations: 1, disposals: 1 });
-});
-
-test("a decoder can decline a step without advancing state", async () => {
-  const { binding, seen } = fixture();
-  const result = await run({ ...binding, createDecode: () => ({ close() {}, tryStep: () => null }) });
-  expect(result.cacheTokens).toEqual([0, 1, 2, 3]);
-  expect(seen.forwards).toBe(4);
 });
 
 test("a resolved disabled plan never constructs the bound compiled decoder", async () => {
@@ -300,33 +292,25 @@ test("cancellation before execution allocates no cache", async () => {
 });
 
 test("cancellation after a prefill chunk prevents the next chunk and releases its state", async () => {
-  const { binding, seen } = fixture();
+  const { binding, seen, forward, phased } = fixture();
   const abort = new AbortController();
-  const forward = binding.graph.forwardHidden.bind(binding.graph);
-  const generation = generateAutoregressive({ ...binding, graph: { ...binding.graph,
-    async forwardHidden(ids, state) {
-      const hidden = await forward(ids, state);
-      abort.abort(new Error("cancelled during prefill"));
-      return hidden;
-    },
-  } }, [0, 1, 2, 3], { signal: abort.signal, prefillChunkSize: 1 });
+  const generation = generateAutoregressive({ ...binding, phases: phased(async (ids, state) => {
+    const hidden = await forward(ids, state);
+    abort.abort(new Error("cancelled during prefill"));
+    return hidden;
+  }) }, [0, 1, 2, 3], { signal: abort.signal, prefillChunkSize: 1 });
   await expect(generation[Symbol.asyncIterator]().next()).rejects.toThrow("cancelled during prefill");
   expect(seen.forwards).toBe(1);
   expect(seen.disposals).toBe(1);
 });
 
 test("pipeline cancellation after decode dispatch emits no token and closes the decoder before state", async () => {
-  const { binding, seen, advance, logits } = fixture();
+  const { binding, seen, stepping } = fixture();
   const abort = new AbortController();
   let closed = false;
   const generation = generateAutoregressive({ ...binding,
     runtime: createRuntimeConfig({ MLX_BUN_EARLY_FIRST_TOKEN: "0" }), createDecode: () => ({
-    tryStep(token, state) {
-      advance(state, 1);
-      const result = { logits: logits(token.toIntTokens()), evalWith: [] };
-      abort.abort(new Error("cancelled after dispatch"));
-      return result;
-    },
+    step: stepping(() => abort.abort(new Error("cancelled after dispatch"))),
     close() { expect(seen.disposals).toBe(0); closed = true; },
   }) }, [0, 1], { signal: abort.signal, temperature: 0, maxTokens: 3, logprobs: true, topLogprobs: 2 });
   await expect(generation[Symbol.asyncIterator]().next()).rejects.toThrow("cancelled after dispatch");
@@ -364,7 +348,7 @@ test("cancellation during checkpoint persistence waits for its borrowed state be
 test("a replacement decoder's error is not retried through an unrelated graph", async () => {
   const { binding, seen } = fixture();
   const failure = new Error("decode failed after a native write");
-  await expect(run({ ...binding, createDecode: () => ({ close() {}, tryStep: () => { throw failure; } }) }))
+  await expect(run({ ...binding, createDecode: () => ({ close() {}, step: () => { throw failure; } }) }))
     .rejects.toThrow(failure);
   expect(seen.forwards).toBe(2);
   expect(seen.disposals).toBe(1);
@@ -373,9 +357,9 @@ test("a replacement decoder's error is not retried through an unrelated graph", 
 test("incompatible backend/graph/state ABIs fail before cache construction", async () => {
   for (const mismatch of [{ backend: "other" }, { graphAbi: "other" }, { stateAbi: "other" }]) {
     const { binding, seen } = fixture();
-    await expect(run({ ...binding, graph: { ...binding.graph,
-      descriptor: { ...binding.graph.descriptor, ...mismatch },
-    } })).rejects.toThrow(/incompatible.*ABI/);
+    await expect(run({ ...binding,
+      descriptor: { ...binding.descriptor, ...mismatch },
+    })).rejects.toThrow(/incompatible.*ABI/);
     expect(seen.allocations).toBe(0);
   }
 });
@@ -409,14 +393,14 @@ test("rejected initial state releases owned caches and preserves borrowed caches
 });
 
 test("early return waits for decoder cleanup before releasing cache state", async () => {
-  const { binding, seen } = fixture();
+  const { binding, seen, stepping } = fixture();
   let closes = 0;
   let release!: () => void;
   let started!: () => void;
   const closing = new Promise<void>((resolve) => { started = resolve; });
   const wait = new Promise<void>((resolve) => { release = resolve; });
   const generation = generateAutoregressive({ ...binding, createDecode: () => ({
-    tryStep: () => null,
+    step: stepping(),
     async close() { closes++; started(); await wait; },
   }) }, [0, 1], { maxTokens: 4, temperature: 0 });
   const iterator = generation[Symbol.asyncIterator]();
@@ -435,7 +419,7 @@ test("decoder cleanup failure retains the execution error and still frees caches
   const execution = new Error("execution failed");
   const cleanup = new Error("cleanup failed");
   const outcome = await run({ ...binding, createDecode: () => ({
-    tryStep() { throw execution; }, close() { throw cleanup; },
+    step() { throw execution; }, close() { throw cleanup; },
   }) }).catch((error: unknown) => error);
   expect(outcome).toBeInstanceOf(AggregateError);
   expect((outcome as AggregateError).cause).toBe(execution);
@@ -468,11 +452,10 @@ for (const mode of ["terminal", "continue", "budget-one", "budget-span", "stop-i
   test(`direct grammar retains committed-span ordering: ${mode}`, async () => {
     const f = fixture(), g = committedGrammar(mode === "terminal");
     const forwards: number[][] = [], projections: number[][] = [], emitted: number[] = [];
-    const original = f.binding.graph;
-    const generation = generateAutoregressive({ ...f.binding, graph: { ...original,
-      forwardHidden(ids, caches) { forwards.push(ids.toIntTokens()); return original.forwardHidden(ids, caches); },
-      projectLogits(hidden, selection) { projections.push([...hidden.shape]); return original.projectLogits(hidden, selection); },
-    } }, [0, 1], { temperature: 0, maxTokens: mode === "budget-one" ? 1 : mode === "budget-span" ? 3 : 5,
+    const generation = generateAutoregressive({ ...f.binding, phases: f.phased(
+      (ids, caches) => { forwards.push(ids.toIntTokens()); return f.forward(ids, caches); },
+      hidden => { projections.push([...hidden.shape]); return f.head(hidden); },
+    ) }, [0, 1], { temperature: 0, maxTokens: mode === "budget-one" ? 1 : mode === "budget-span" ? 3 : 5,
       prefillChunkSize: 1, grammar: g.grammar, decodePolicy: { compiledDecode: false, grammarJump: true } });
     for await (const { token } of generation) {
       if (!emitted.length && mode !== "budget-one") expect(forwards.at(-1)).toEqual([2, 3, 4]);
@@ -509,7 +492,7 @@ test("grammar append retains the original failure when temporary cleanup also fa
     return array;
   });
   try {
-    const graph = { forwardHidden() { throw primary; } } as unknown as MlxAutoregressiveBinding["graph"];
+    const graph = new MlxPhaseDispatch(stubPhases(() => { throw primary; }, () => { throw primary; }));
     const error = await appendGrammarSpan(graph, [], [2, 3, 4], () => { throw new Error("failed forward committed"); })
       .then(() => null, error => error);
     expect(error).toBeInstanceOf(AggregateError);
@@ -524,7 +507,7 @@ test("grammar append transfers sampled-token ownership before logits cleanup can
   const selected = { dispose() { released++; } } as unknown as MlxArray;
   const hidden = { shape: [1, 3, 1], slice: () => selected, dispose() { released++; } } as unknown as MlxArray;
   const logits = { dispose() { released++; throw cleanup; } } as unknown as MlxArray;
-  const graph = { forwardHidden: () => hidden, projectLogits: () => logits } as unknown as MlxAutoregressiveBinding["graph"];
+  const graph = new MlxPhaseDispatch(stubPhases(() => hidden, () => logits));
   const committed: number[] = [];
   try {
     await expect(appendGrammarSpan(graph, [], [2, 3, 4], ids => committed.push(...ids), () => {

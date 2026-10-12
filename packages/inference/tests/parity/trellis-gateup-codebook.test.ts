@@ -14,6 +14,7 @@ import { createRuntimeConfig, runtimeConfig, withRuntimeConfig } from "../../src
 import { deviceArchitecture, clearCache } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { MlxArray } from "@mlx-bun/mlx/array";
+import { phaseLogits } from "../models/phase-forward";
 
 const artifact = process.env.MLX_BUN_TEST_TRELLIS_MODEL;
 const digest = (a: MlxArray) => createHash("sha256").update(a.rawBytesView()).digest("hex");
@@ -76,7 +77,7 @@ test.skipIf(!artifact || deviceArchitecture() !== "applegpu_g13s")(
       let input = prompt;
       try {
         for (let step = 0; step < 17; step++) {
-          using logits = model.forward(input, caches);
+          using logits = phaseLogits(model, input, caches);
           ops.evalAll([logits, ...caches.flatMap(c => c.state())]);
           expect([Dtype.bfloat16, Dtype.float32]).toContain(logits.dtype);
           const bytes = logits.rawBytesView(), view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);

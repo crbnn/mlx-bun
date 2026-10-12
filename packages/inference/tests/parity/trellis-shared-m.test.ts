@@ -28,6 +28,7 @@ test.skipIf(!artifact)("shared-M kernels preserve full Qwen logits, recurrent st
   const { cloneKvCaches } = await import("@mlx-bun/inference/state");
   const { clearCache } = await import("@mlx-bun/mlx/ffi");
   const ops = await import("@mlx-bun/mlx/ops");
+  const { phaseHidden, phaseLogits } = await import("../models/phase-forward");
   type Trellis = InstanceType<typeof TrellisLinear>;
 
   /** TrellisLinear.forward before it fixed variant 13, with the variant explicit. */
@@ -106,13 +107,13 @@ test.skipIf(!artifact)("shared-M kernels preserve full Qwen logits, recurrent st
       ops.evalAll(caches.flatMap((cache) => cache.state()));
       install(variant);
       const logits = (() => {
-        if (!lastOnly) return model.forward(tokens, caches);
+        if (!lastOnly) return phaseLogits(model, tokens, caches);
         const ids = ops.fromInt32(tokens, [1, tokens.length]);
         let hidden;
-        try { hidden = model.forwardHidden(ids, caches); }
+        try { hidden = phaseHidden(model, ids, caches); }
         finally { ids.dispose(); }
         const last = hidden.slice([0, tokens.length - 1, 0], [1, tokens.length, hidden.shape[2]!]);
-        try { return model.logitsFromHidden(last); }
+        try { return model.logits.one(last); }
         finally { last.dispose(); hidden.dispose(); }
       })();
       try {
@@ -120,7 +121,7 @@ test.skipIf(!artifact)("shared-M kernels preserve full Qwen logits, recurrent st
         const hashes = { logits: digest(logits.rawBytesView()), state: stateHashes(caches) };
         let continuation: string | undefined;
         if (follow) {
-          const next = model.forward([911], caches);
+          const next = phaseLogits(model, [911], caches);
           try { continuation = digest(next.rawBytesView()); }
           finally { next.dispose(); }
         }
@@ -136,7 +137,7 @@ test.skipIf(!artifact)("shared-M kernels preserve full Qwen logits, recurrent st
     install(6);
     const ids = ops.fromInt32(Array.from({ length: 32 }, (_, i) => 100 + i * 7), [1, 32]);
     try {
-      const hidden = model.forwardHidden(ids, prefix);
+      const hidden = phaseHidden(model, ids, prefix);
       try { ops.evalAll([hidden, ...prefix.flatMap((cache) => cache.state())]); }
       finally { hidden.dispose(); }
     } finally { ids.dispose(); }

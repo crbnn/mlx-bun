@@ -9,7 +9,9 @@
 // file, gemma4-compiled-decode-reference.ts, gemma4-trainable-reference.ts and
 // their identity test once the D3 Gemma 4 PR has merged.
 //
-// Changes from b3db6b09: import paths only.
+// Changes from b3db6b09: import paths only, the mixed-forward groups from
+// frozen-token-groups.ts, no media or draft binding (E2 changed those contracts), and
+// E2's scoring-forward name (sequenceHidden).
 
 // Gemma 4 text model — line-for-line port of mlx-lm's gemma4_text.py
 // (oracle venv site-packages), covering the paths our target models
@@ -57,12 +59,11 @@ import { gemma4Trainable, type GradCheckpointCtx, type LayerLoras } from "./gemm
 import type { MediaEncoders, MediaSidecarProbes, MlxPromptInput, Vision } from "../../src/contracts/mlx/media";
 import { declareGraph } from "../../src/models/capabilities";
 import { atEveryWidth } from "../../src/models/graph";
-import { bindGemma4MediaInput, gemma4DraftTarget, gemma4MediaEncoders } from "../../src/models/gemma4/media";
 import { type Cache,type Mask,type SharedKv } from "../../src/contracts/mlx/cache";
 import { isCompiledTrace } from "../../src/runtime/compiled-trace";
 import { runtimeFlag } from "../../src/runtime/config";
 import { mapPackedTokens } from "../../src/input/token-groups";
-import { type TokenGroup } from "../../src/contracts/mlx/token-work";
+import { type TokenGroup } from "./frozen-token-groups";
 import { flashAttention,flashSupported,getTrainingAttn } from "../../src/kernels/attention/flash";
 import { unrotateValues as tqUnrotateValues } from "../../src/kernels/turboquant/ops";
 import { compiledGegluActive,geglu,GegluMLP } from "../../src/layers/geglu";
@@ -610,11 +611,12 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    * gradient checkpointing, and the quantized tied head. Flash training
    * attention is refused: e4b crashes natively on it at long sequences. */
   get trainable(): TrainableGraph { return this.#trainable ??= gemma4Trainable(this); }
-  bindMediaInput(input: Vision): MlxPromptInput { return bindGemma4MediaInput(this, input); }
-  mediaEncoders(modelDir: string, probes: MediaSidecarProbes): Promise<MediaEncoders> {
-    return gemma4MediaEncoders(this, modelDir, probes);
+  /** E2 changed the media graph contract; the identity tests compare the vision prefill phase directly. */
+  bindMediaInput(_input: Vision): MlxPromptInput { throw new Error("the frozen reference binds no media input"); }
+  mediaEncoders(_modelDir: string, _probes: MediaSidecarProbes): Promise<MediaEncoders> {
+    throw new Error("the frozen reference builds no media encoders");
   }
-  draftTarget(caches: Cache[]): TargetView { return gemma4DraftTarget(this, caches); }
+  draftTarget(_caches: Cache[]): TargetView { throw new Error("the frozen reference exposes no draft target"); }
   /** The compiled decode step declared above: the step records this graph's own
    * forward, so it shares the graph's weights and constants. */
   compiledDecodeStep(): MlxCompiledDecodeStep { return CompiledDecode.for(this); }
@@ -757,6 +759,9 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
   }
 
   /** ids [1, L] → final-norm hidden states [1, L, hidden]. */
+  /** E2's name for the scoring forward (`MlxSequenceForward`), so scoring reaches the frozen forward itself. */
+  sequenceHidden(ids: MlxArray, cache: Cache[], _width: unknown): MlxArray { return this.forwardHidden(ids, cache); }
+
   forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray {
     let h = this.embed.encode(ids);
     h = disposing(h, ops.mulScalar(h, this.embedScale));

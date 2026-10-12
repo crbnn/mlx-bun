@@ -17,7 +17,8 @@
 // tiled-causal kernel set the conversion composes; the oracle's tiled dispatch)
 // and set to 1 (unfused): prefill 37 and 200, decodes, windows across the sliding
 // boundary and the 256-position step, verify with layer capture (the verify
-// phase operation, the mixed lane's capture and the deprecated hidden tap), a
+// phase operation, the mixed verify group's capture, and the binding's capture of a prompt tail against
+// the deprecated hidden tap), a
 // speculative rollback, fill spans of 1 to 4 on solo caches and target rows, two
 // rows in one forward, two groups in one mixed forward, aligned batched rows,
 // vision prefill, the phase operations against the oracle's deprecated forward,
@@ -38,9 +39,10 @@ import { loadModelConfig, parseQuantization, type ModelConfig } from "../../src/
 import type { Weights } from "../../src/artifacts/weights";
 import type { BatchableCache, Cache } from "../../src/contracts/mlx/cache";
 import type { Composition as CompositionRecord } from "../../src/contracts/portable/composition";
-import type { MlxCompiledDecodeStep, MlxLayerCapture } from "../../src/contracts/mlx/graph";
-import type { Gemma4Model } from "../../src/models/gemma4/model";
-import type { TokenGroup } from "../../src/contracts/mlx/token-work";
+import { widthClass, type MlxCompiledDecodeStep, type MlxLayerCapture } from "../../src/contracts/mlx/graph";
+import type { DeprecatedGemma4Base } from "./gemma4-generated-reference/deprecated-base";
+import type { TokenGroup } from "./frozen-token-groups";
+import { phaseHidden } from "./phase-forward";
 import { createRuntimeConfig, runtimeConfig, withRuntimeConfig } from "../../src/runtime/config";
 import { composedAffineKernels, type AffineKernelSet } from "../../src/state/affine-attention";
 import { convertToAffine, transitionDue } from "../../src/state/bf16-first-kv";
@@ -59,11 +61,11 @@ const HEAD_DIM = 256, GLOBAL_HEAD_DIM = 512, WINDOW = 16, PER_LAYER = 64, EXPERT
 const PREFIX = "language_model.model";
 const FIXTURES = join(import.meta.dir, "../fixtures/gemma4-graphs");
 
-/** Every oracle class extends the generic graph. */
-type OracleGraph = Gemma4Model;
+/** Every oracle class extends the generic graph, through the deprecated entry points frozen for it. */
+type OracleGraph = DeprecatedGemma4Base;
 /** What the gate calls on a generated graph (the 26B declares no compiled decode step). */
-type CurrentGraph = Pick<InstanceType<typeof currentE4b.GeneratedGemma4>, "makeCache" | "forwardHidden" | "forwardEmbeddings" |
-  "forwardHiddenMixed" | "prefillChunk" | "prefillTail" | "decode" | "verify" | "logits" | "draftTarget" | "hiddenTap"> &
+type CurrentGraph = Pick<InstanceType<typeof currentE4b.GeneratedGemma4>, "makeCache" | "prefillEmbeddings" |
+  "mixed" | "prefillChunk" | "prefillTail" | "decode" | "verify" | "logits" | "draftTarget"> &
   { compiledDecodeStep?(): MlxCompiledDecodeStep };
 type Graph = OracleGraph | CurrentGraph;
 interface Composition {
@@ -317,9 +319,11 @@ function both(label: string, p: Pair, oldCaches: Cache[], newCaches: Cache[],
   stateDiff(label, newCaches, oldCaches);
 }
 
+/** The oracle's deprecated forward, which reads the phase from the input's shape, against the
+ *  current graph's named phase for the same tokens (`phaseHidden`: one per sequence a decode, more a tail). */
 const forwardHidden = (rows: number[][]) => (model: Graph, caches: Cache[]) => {
   using input = ids(rows);
-  return model.forwardHidden(input, caches);
+  return "forwardHidden" in model ? model.forwardHidden(input, caches) : phaseHidden(model, input, caches);
 };
 const operation = (rows: number[][], run: (input: MlxArray, caches: Cache[]) => MlxArray) => (caches: Cache[]) => {
   using input = ids(rows);
@@ -332,10 +336,16 @@ function captured(run: (capture: MlxLayerCapture) => MlxArray): { hidden: MlxArr
   const hidden = run((_layer, h) => { taps.push(ops.contiguous(h)); });
   return { hidden, taps };
 }
+/** A capturing verify group of a mixed forward: the oracle's geometry-preserving token group against the
+ *  current graph's verify group at the class of its rows. */
 const mixedVerify = (model: Graph, caches: Cache[], rows: number[][]) => captured(capture => {
   using input = ids(rows);
-  const group: TokenGroup = { ids: input, cache: caches, preserveTokenGeometry: true, captureLayer: capture };
-  return model.forwardHiddenMixed([group])[0]!;
+  if ("forwardHiddenMixed" in model) {
+    const group: TokenGroup = { ids: input, cache: caches, preserveTokenGeometry: true, captureLayer: capture };
+    return model.forwardHiddenMixed([group])[0]!;
+  }
+  const width = widthClass(rows.length * rows[0]!.length);
+  return model.mixed([{ phase: "verify", width, ids: input, state: caches, capture }], width)[0]!;
 });
 
 /** Target row layouts holding `sources` (one serial cache list per row), the fill and speculative paths' storage. */
@@ -376,7 +386,8 @@ function visionPrefill(model: Graph, caches: Cache[], length: number, salt: numb
   using embeddings = wide.astype(Dtype.bfloat16);
   using flags = MlxArray.fromInt32(Int32Array.from({ length }, (_, i) => i >= 5 && i < 25 ? 1 : 0), [length]);
   using image = flags.astype(Dtype.bool);
-  return model.forwardEmbeddings(embeddings, caches, image, input, image);
+  return "forwardEmbeddings" in model ? model.forwardEmbeddings(embeddings, caches, image, input, image)
+    : model.prefillEmbeddings(embeddings, caches, image, input, image);
 }
 
 /** Runs `body`, then checks the oracle's unrolled path ran under the kv_config and never under bf16. */
@@ -416,7 +427,7 @@ for (const c of COMPOSITIONS) {
             for (let step = 0; step < 3; step++) {
               const token = [[(200 + step) % VOCAB]];
               both(`${tag} decode`, p, oldCaches, newCaches, forwardHidden(token));
-              phased(`${tag} decode`, token, (input, caches) => p.current.decode.one(input, caches) as MlxArray);
+              phased(`${tag} decode`, token, (input, caches) => p.current.decode.one(input, caches, null));
             }
             both(`${tag} window5`, p, oldCaches, newCaches, forwardHidden([prompt(5, 2)]));
             phased(`${tag} prefillTail5`, [prompt(5, 2)], (input, caches) => p.current.prefillTail.fiveToEight(input, caches, null) as MlxArray);
@@ -447,14 +458,22 @@ for (const c of COMPOSITIONS) {
             stateDiff(`${tag} spec rollback keep 2`, newCaches, oldCaches);
             both(`${tag} decode after rollback`, p, oldCaches, newCaches, forwardHidden([[77]]));
             {
-              // The deprecated hidden tap (DSpark's binding) on a window.
+              // The one capture path E2 keeps (the binding's copy of each tapped layer from the phase's
+              // capture, here a prompt tail of 3) against the deprecated hidden tap (DSpark's binding).
+              const tapped = new Set([0, 3, layers - 1, layers]);
               const tap = (model: Graph, caches: Cache[]) => {
                 const captures = new Map<number, MlxArray>();
-                model.hiddenTap = { layers: new Set([0, 3, layers - 1, layers]), captured: captures };
-                try {
-                  using input = ids([prompt(3, 6)]);
-                  return { hidden: model.forwardHidden(input, caches), taps: [...captures.entries()].sort(([a], [b]) => a - b).map(([, a]) => a) };
-                } finally { model.hiddenTap = null; }
+                using input = ids([prompt(3, 6)]);
+                const sorted = () => [...captures.entries()].sort(([a], [b]) => a - b).map(([, a]) => a);
+                if ("hiddenTap" in model) {
+                  model.hiddenTap = { layers: tapped, captured: captures };
+                  try { return { hidden: model.forwardHidden(input, caches), taps: sorted() }; }
+                  finally { model.hiddenTap = null; }
+                }
+                const hidden = model.prefillTail.twoToThree(input, caches, (layer, h) => {
+                  if (tapped.has(layer)) captures.set(layer, ops.contiguous(h));
+                });
+                return { hidden, taps: sorted() };
               };
               const expected = tap(p.old, oldCaches), actual = tap(p.current, newCaches);
               expect(actual.taps.length).toBe(4);
@@ -527,7 +546,9 @@ for (const c of COMPOSITIONS) {
             const run = (model: Graph, a: Cache[], b: Cache[]) => {
               using first = ids([[23]]);
               using second = ids([prompt(3, 10)]);
-              return model.forwardHiddenMixed([{ ids: first, cache: a }, { ids: second, cache: b }]);
+              return "forwardHiddenMixed" in model ? model.forwardHiddenMixed([{ ids: first, cache: a }, { ids: second, cache: b }])
+                : model.mixed([{ phase: "decode", width: "one", ids: first, state: a, capture: null },
+                  { phase: "window", width: "twoToThree", ids: second, state: b, capture: null }], "four");
             };
             const expected = run(p.old, oldA, oldB), actual = run(p.current, newA, newB);
             outputDiff(`${tag} mixed group A (decode)`, p.current, p.old, actual[0]!, expected[0]!);

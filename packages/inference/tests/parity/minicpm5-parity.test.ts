@@ -135,6 +135,7 @@ test.skipIf(!inputs)("MiniCPM5: 100 greedy steps match the external reference bi
   checkRuntime(manifest, { mlxVersion: ffi.MLX_VERSION, architecture: ffi.deviceArchitecture() });
   const { loadModelConfig, loadTokenizer, Weights, resolveComposition } = await import("@mlx-bun/inference");
   const { MiniCPM5Model } = await import("@mlx-bun/inference/models/minicpm5");
+  const { phaseLogits } = await import("../models/phase-forward");
   const { argmaxLastPosition, lastPositionLogits } = await import("@mlx-bun/inference/scoring");
   const { KVCache } = await import("../../src/state/kv");
 
@@ -155,7 +156,7 @@ test.skipIf(!inputs)("MiniCPM5: 100 greedy steps match the external reference bi
     // The prompt once, then each selected token on the same live cache; no EOS exit.
     let tokens = manifest.prompt_ids;
     for (let step = 0; step < STEPS; step++) {
-      const logits = model.forward(tokens, layers);
+      const logits = phaseLogits(model, tokens, layers);
       let next: number;
       try {
         const actual = lastPositionLogits(logits);

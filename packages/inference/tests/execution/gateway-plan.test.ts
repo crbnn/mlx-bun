@@ -24,6 +24,7 @@ import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
 import { resolveKvScheme } from "../../src/state/kv-scheme";
 import { BF16_KV } from "../../src/contracts/portable/composition";
 import type { Composition, KvStorageScheme } from "../../src/contracts/portable/composition";
+import { stubPhases } from "../models/phase-forward";
 
 // Placement only: bound graphs are prototype stand-ins and no tensors are created.
 const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
@@ -57,10 +58,14 @@ const grammar = { ...shape, hasGrammar: true };
 const schedule = { continuous: true, quantizedBatch: true, checkpoints: false };
 const environments: Record<string, string>[] = [{}, { MLX_BUN_GRAMMAR_BATCH: "0" }, { MLX_BUN_GRAMMAR_BATCH: "1" }];
 
+/** Placement never forwards: every phase a stand-in graph declares throws. */
+const placementPhases = stubPhases(() => { throw new Error("placement never forwards"); },
+  () => { throw new Error("placement never projects"); });
+
 function gemma4(): Gemma4Model {
   return Object.assign(Object.create(Gemma4Model.prototype), {
     config: { modelType: "gemma4", text: { enableMoeBlock: false }, eosTokenIds: [] },
-    makeCache: () => [new KVCache()], loraState: { active: [] }, requiredDenseKvLayers: [],
+    makeCache: () => [new KVCache()], loraState: { active: [] }, ...placementPhases, requiredDenseKvLayers: [],
   });
 }
 
@@ -68,7 +73,7 @@ function softcapUniversal(): UniversalDenseModel {
   return Object.assign(Object.create(UniversalDenseModel.prototype), {
     args: { modelType: "gemma2", maskArray: true, attnLogitSoftcap: 50, layerTypes: null }, encodedKvAttention: false,
     config: { modelType: "gemma2", text: { enableMoeBlock: false }, eosTokenIds: [] },
-    makeCache: () => [new KVCache()], loraState: { active: [] }, requiredDenseKvLayers: [0],
+    makeCache: () => [new KVCache()], loraState: { active: [] }, ...placementPhases, requiredDenseKvLayers: [0],
   });
 }
 
@@ -78,7 +83,7 @@ const planUnder = (env: Record<string, string>, model: Gemma4Model | UniversalDe
 const standIn = (prototype: object, modelType: string, extra: object = {}): RuntimeModel =>
   Object.assign(Object.create(prototype), {
     config: { modelType, text: { enableMoeBlock: false }, eosTokenIds: [] },
-    makeCache: () => [new KVCache()], loraState: { active: [] }, composition: composition(), ...extra,
+    makeCache: () => [new KVCache()], loraState: { active: [] }, ...placementPhases, composition: composition(), ...extra,
   });
 
 // Every autoregressive class the binding distinguishes. Stand-ins share plain
@@ -378,7 +383,7 @@ describe("DiffusionGemma interleaved denoising binding", () => {
 function minicpm5(layers = 4): MiniCPM5Model {
   return Object.assign(Object.create(MiniCPM5Model.prototype), {
     config: { modelType: "minicpm5", text: { enableMoeBlock: false, numHiddenLayers: layers, layerTypes: Array(layers).fill("full_attention") }, eosTokenIds: [] },
-    makeCache: () => Array.from({ length: layers }, () => new KVCache()), loraState: { active: [] }, requiredDenseKvLayers: [],
+    makeCache: () => Array.from({ length: layers }, () => new KVCache()), loraState: { active: [] }, ...placementPhases, requiredDenseKvLayers: [],
   });
 }
 
@@ -386,7 +391,7 @@ function dense(layers = 4): UniversalDenseModel {
   return Object.assign(Object.create(UniversalDenseModel.prototype), {
     args: { modelType: "llama", maskArray: false, attnLogitSoftcap: null, layerTypes: null }, encodedKvAttention: true,
     config: { modelType: "llama", text: { enableMoeBlock: false, numHiddenLayers: layers, layerTypes: Array(layers).fill("full_attention") }, eosTokenIds: [] },
-    makeCache: () => Array.from({ length: layers }, () => new KVCache()), loraState: { active: [] }, requiredDenseKvLayers: [],
+    makeCache: () => Array.from({ length: layers }, () => new KVCache()), loraState: { active: [] }, ...placementPhases, requiredDenseKvLayers: [],
   });
 }
 
@@ -472,7 +477,7 @@ function universal(args: Record<string, unknown> = {}, layers = 4): UniversalDen
       .map(window => window ? new RotatingKVCache(window) : new KVCache()),
     config: { modelType: descriptor.modelType, text: { enableMoeBlock: false, numHiddenLayers: layers,
       layerTypes: (descriptor.layerTypes as string[] | null) ?? Array(layers).fill("full_attention") }, eosTokenIds: [] },
-    loraState: { active: [] },
+    loraState: { active: [] }, ...placementPhases,
   });
 }
 
@@ -802,16 +807,14 @@ test("a provider that taps target layers binds only where the forward captures t
   // Graphs without a hidden-tap operation, softcap or not, refuse it rather than decode ordinarily.
   refused(bindMlxGateway(softcapUniversal(), { provider: tapper([2, 5]), numDraftTokens: 3 }));
   refused(bindMlxGateway(qualifiedFamilies[0]![1](), { provider: tapper([2, 5]), numDraftTokens: 3 }));
-  // The Gemma4 graph fields its legacy target view reads, with and without the hidden-tap operation.
-  const graph = (tap: boolean) => Object.assign(gemma4(), { numDonors: 8,
-    layers: Array.from({ length: 8 }, () => ({ layerType: "full_attention" })), ...(tap ? { hiddenTap: null } : {}),
+  // The Gemma4 graph fields its legacy target view reads. Its phases take the drafter's capture, so it
+  // binds taps within its layer range, the post-final-norm sentinel included, and refuses layers beyond it.
+  const graph = () => Object.assign(gemma4(), { numDonors: 8,
+    layers: Array.from({ length: 8 }, () => ({ layerType: "full_attention" })),
     config: { modelType: "gemma4", text: { enableMoeBlock: false, numHiddenLayers: 8 }, eosTokenIds: [] } });
-  refused(bindMlxGateway(graph(false), { provider: tapper([2]), numDraftTokens: 3 }));
-  // A graph whose forward captures hidden layers binds it within its layer range,
-  // the post-final-norm sentinel included, and refuses layers beyond it.
-  expect(bindMlxGateway(graph(true), { provider: tapper([2, 8]), numDraftTokens: 3 }).plan(request, {}, schedule))
+  expect(bindMlxGateway(graph(), { provider: tapper([2, 8]), numDraftTokens: 3 }).plan(request, {}, schedule))
     .toMatchObject({ method: "speculative", mechanism: "continuous" });
-  refused(bindMlxGateway(graph(true), { provider: tapper([9]), numDraftTokens: 3 }));
+  refused(bindMlxGateway(graph(), { provider: tapper([9]), numDraftTokens: 3 }));
   // Declaring no taps needs no tap operation.
   for (const model of [softcapUniversal(), qualifiedFamilies[0]![1]()])
     expect(bindMlxGateway(model, { provider: tapper([]), numDraftTokens: 3 }).plan(request, {}, { ...schedule, continuous: true }))

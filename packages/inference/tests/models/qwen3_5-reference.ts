@@ -9,7 +9,9 @@
 // file, its identity test and the gated-delta-cache test's import of it once
 // the C1 PR has merged.
 //
-// Changes from da6da5aa: import paths only.
+// Changes from da6da5aa: import paths only, the mixed-forward groups from
+// frozen-token-groups.ts, no media or draft binding (E2 changed those contracts), and
+// E2's scoring-forward name (sequenceHidden).
 
 // Concrete model graph for Qwen3.5 hybrid models (e.g. Qwen3.6-27B-OptiQ-4bit).
 // Port target: mlx_lm.models.qwen3_5 (+ qwen3_next Attention/MLP/RMSNormGated,
@@ -27,8 +29,7 @@ import { quantizedAppendAttention } from "../../src/layers/quantized-append-atte
 import { gatedDeltaState } from "../../src/kernels/delta/state";
 import type { Weights } from "../../src/artifacts/weights";
 import { runtimeFlag } from "../../src/runtime/config";
-import { mapTokenGroups } from "../../src/input/token-groups";
-import { type TokenGroup } from "../../src/contracts/mlx/token-work";
+import { mapTokenGroups, type TokenGroup } from "./frozen-token-groups";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype, deviceArchitecture } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
@@ -52,7 +53,6 @@ import type { MlxDeclaredGraph } from "../../src/contracts/mlx/graph";
 import type { TargetView } from "../../src/contracts/mlx/draft-target";
 import type { MediaEncoders, MlxPromptInput, Vision } from "../../src/contracts/mlx/media";
 import { declareGraph } from "../../src/models/capabilities";
-import { bindQwenMediaInput, qwenDraftTarget, qwenMediaEncoders } from "../../src/models/qwen/media-input";
 import { materializeCopy } from "@mlx-bun/mlx/materialize";
 import { gatedDeltaUpdate } from "../../src/kernels/delta/gated";
 import { SSMCache } from "../../src/state/ssm";
@@ -645,9 +645,10 @@ export class Qwen35Model implements MlxDeclaredGraph {
       speculation: { affineKv: runtimeFlag("MLX_BUN_QWEN_SPEC_KV4", true), immediateAffine4: true },
     });
   }
-  bindMediaInput(input: Vision): MlxPromptInput { return bindQwenMediaInput(this, input.embeddings, input.mrope!); }
-  mediaEncoders(modelDir: string): Promise<MediaEncoders> { return qwenMediaEncoders(this, modelDir); }
-  draftTarget(_caches: Cache[]): TargetView { return qwenDraftTarget(this); }
+  /** E2 changed the media graph contract; the identity tests compare the vision prefill phase directly. */
+  bindMediaInput(_input: Vision): MlxPromptInput { throw new Error("the frozen reference binds no media input"); }
+  mediaEncoders(_modelDir: string): Promise<MediaEncoders> { throw new Error("the frozen reference builds no media encoders"); }
+  draftTarget(_caches: Cache[]): TargetView { throw new Error("the frozen reference exposes no draft target"); }
   readonly embed: QuantizedEmbedding;
   readonly layers: Qwen3Layer[];
   readonly finalNorm: RMSNorm;
@@ -747,6 +748,9 @@ export class Qwen35Model implements MlxDeclaredGraph {
       },
     };
   }
+
+  /** E2's name for the scoring forward (`MlxSequenceForward`), so scoring reaches the frozen forward itself. */
+  sequenceHidden(ids: MlxArray, cache: Cache[], _width: unknown): MlxArray { return this.forwardHidden(ids, cache); }
 
   forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray {
     const h = this.embed.encode(ids);

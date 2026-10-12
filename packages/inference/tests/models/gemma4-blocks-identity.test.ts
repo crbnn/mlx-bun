@@ -13,7 +13,7 @@
 // (tiled-causal kernel set) and set to 1 (unfused set), and TurboQuant k8v3
 // (the deferred set Gemma4Model.makeCache composes): decodes, windows across
 // the sliding boundary and the 256-position step, verify windows with layer
-// capture through forwardHiddenMixed and the verify phase operation, fill spans
+// capture through the mixed verify group and the verify phase operation, fill spans
 // of 1 to 4 on solo caches and target rows, vision prefill with a
 // bidirectional image mask, two groups in one packed mixed forward, padded
 // batched prefill with batched decode and per-row rollback, the delayed
@@ -29,7 +29,9 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { parseQuantization, type ModelConfig } from "../../src/artifacts/config";
 import type { Weights } from "../../src/artifacts/weights";
 import type { BatchableCache, Cache, PaddedPrefillCache, SharedKv } from "../../src/contracts/mlx/cache";
-import type { TokenGroup } from "../../src/contracts/mlx/token-work";
+import type { TokenGroup } from "./frozen-token-groups";
+import { phaseHidden } from "./phase-forward";
+import { widthClass } from "../../src/contracts/mlx/graph";
 import type { RuntimeModel } from "../../src/models/factory";
 import { createRuntimeConfig, runtimeConfig, withRuntimeConfig } from "../../src/runtime/config";
 import { trainForward } from "../../src/scoring/full-sequence";
@@ -269,19 +271,27 @@ function both(label: string, p: Pair, oldCaches: Cache[], newCaches: Cache[], ru
   stateDiff(label, newCaches, oldCaches);
 }
 
+/** The old graph's deprecated forward, which reads the phase from the input's shape, against the
+ *  current graph's named phase for the same tokens (`phaseHidden`: one per sequence a decode, more a tail). */
 const forwardHidden = (rows: number[][]) => (model: Graph, caches: Cache[]) => {
   using input = ids(rows);
-  return model.forwardHidden(input, caches);
+  return model instanceof FrozenGemma4Model ? model.forwardHidden(input, caches) : phaseHidden(model, input, caches);
 };
 
-/** A capturing verify forward through `forwardHiddenMixed`; returns the final
- *  hidden and every captured layer (copies). */
+/** A capturing verify forward through a mixed forward (the old graph's
+ *  geometry-preserving token group, the current graph's verify group); returns
+ *  the final hidden and every captured layer (copies). */
 function mixedVerify(model: Graph, caches: Cache[], rows: number[][]): { hidden: MlxArray; taps: MlxArray[] } {
   using input = ids(rows);
   const taps: MlxArray[] = [];
-  const group: TokenGroup = { ids: input, cache: caches, preserveTokenGeometry: true,
-    captureLayer: (_layer, hidden) => { taps.push(ops.contiguous(hidden)); } };
-  const [hidden] = model.forwardHiddenMixed([group]);
+  const capture = (_layer: number, hidden: MlxArray) => { taps.push(ops.contiguous(hidden)); };
+  if (model instanceof FrozenGemma4Model) {
+    const group: TokenGroup = { ids: input, cache: caches, preserveTokenGeometry: true, captureLayer: capture };
+    const [hidden] = model.forwardHiddenMixed([group]);
+    return { hidden: hidden!, taps };
+  }
+  const width = widthClass(rows.length * rows[0]!.length);
+  const [hidden] = model.mixed([{ phase: "verify", width, ids: input, state: caches, capture }], width);
   return { hidden: hidden!, taps };
 }
 
@@ -314,7 +324,8 @@ function visionPrefill(model: Graph, caches: Cache[], length: number, salt: numb
   using embeddings = wide.astype(Dtype.bfloat16);
   using flags = MlxArray.fromInt32(Int32Array.from({ length }, (_, i) => i >= 5 && i < 25 ? 1 : 0), [length]);
   using image = flags.astype(Dtype.bool);
-  return model.forwardEmbeddings(embeddings, caches, image, input, image);
+  return model instanceof FrozenGemma4Model ? model.forwardEmbeddings(embeddings, caches, image, input, image)
+    : model.prefillEmbeddings(embeddings, caches, image, input, image);
 }
 
 const disposeAll = (...sets: Cache[][]) => { for (const set of sets) for (const cache of set) cache.dispose(); };
@@ -350,7 +361,7 @@ for (const kind of ["dense", "shared"] as const) {
           for (let step = 0; step < 3; step++) {
             const token = [[(200 + step) % VOCAB]];
             both(`${tag} decode`, p, oldCaches, newCaches, forwardHidden(token));
-            phased(`${tag} decode`, token, (input, caches) => p.current.decode.one(input, caches) as MlxArray);
+            phased(`${tag} decode`, token, (input, caches) => p.current.decode.one(input, caches, null));
           }
 
           both(`${tag} window5`, p, oldCaches, newCaches, forwardHidden([prompt(5, 2)]));
@@ -437,7 +448,9 @@ for (const kind of ["dense", "shared"] as const) {
           const run = (model: Graph, a: Cache[], b: Cache[]) => {
             using first = ids([[23]]);
             using second = ids([prompt(3, 10)]);
-            return model.forwardHiddenMixed([{ ids: first, cache: a }, { ids: second, cache: b }]);
+            return model instanceof FrozenGemma4Model ? model.forwardHiddenMixed([{ ids: first, cache: a }, { ids: second, cache: b }])
+              : model.mixed([{ phase: "decode", width: "one", ids: first, state: a, capture: null },
+                { phase: "window", width: "twoToThree", ids: second, state: b, capture: null }], "four");
           };
           const expected = run(p.old, oldA, oldB);
           const actual = run(p.current, newA, newB);
@@ -655,8 +668,7 @@ for (const kind of ["dense", "shared"] as const) {
           cache.dispose();
           return new PagedKVCache(1024, PagedKVCache.DEFAULT_BLOCK_SIZE, false);
         });
-        using input = ids([prompt(length, 81 + row)]);
-        model.forwardHidden(input, caches).dispose();
+        forwardHidden([prompt(length, 81 + row)])(model, caches).dispose();
         return caches;
       });
       const lengths = [90, 300, 37];
@@ -741,8 +753,8 @@ for (const kind of ["dense", "shared"] as const) {
       {
         // Prompt 20, chosen 17, rejected 12: 49 positions, past the window.
         const layout = { P: 20, Rc: 17, Rr: 12 };
-        using expected = p.old.trainable.prefixShared!.forwardHidden(input, layout);
-        using actual = p.current.trainable.prefixShared!.forwardHidden(input, layout);
+        using expected = p.old.trainable.prefixShared!.prefixSharedHidden(input, layout);
+        using actual = p.current.trainable.prefixShared!.prefixSharedHidden(input, layout);
         record(`${tag} prefix-shared hidden`, maxDiff(actual, expected, `${tag} prefix-shared hidden`), 1);
       }
       {

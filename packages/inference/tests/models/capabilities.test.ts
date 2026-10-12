@@ -18,24 +18,22 @@ const plainCaps = declareGraph();
 
 describe("every graph declares its capabilities", () => {
   test("Gemma4: paged attention, prepared image/audio embeddings, taps, compiled decode except through experts", () => {
-    const text = (enableMoeBlock: boolean, modelType = "gemma4") => ({ config: { modelType, text: { enableMoeBlock } }, hiddenTap: null });
+    // Taps are every phase's capture parameter, so the graph always declares them.
+    const text = (enableMoeBlock: boolean, modelType = "gemma4") => ({ config: { modelType, text: { enableMoeBlock } } });
     expect(graph(Gemma4Model.prototype, text(false)).graphCapabilities).toEqual(declareGraph({
       media: { input: "embeddings", video: false }, pagedAttention: true, hiddenLayerTaps: true, compiledDecode: true,
       kv: { delayedAffine: "all" } }));
     expect(graph(Gemma4Model.prototype, text(true)).graphCapabilities.compiledDecode).toBe(false);
     expect(graph(Gemma4Model.prototype, text(false, "gemma3n")).graphCapabilities.compiledDecode).toBe(false);
-    // The tap is the graph's own operation: without it there is nothing to declare.
-    expect(graph(Gemma4Model.prototype, { config: { modelType: "gemma4", text: { enableMoeBlock: false } } })
-      .graphCapabilities.hiddenLayerTaps).toBe(false);
   });
 
   test("Qwen3.5 and its Trellis specialization: prepared embeddings with positions, video, speculation over affine KV as its own option", () => {
     // Speculation over affine KV is the composition's field (`MLX_BUN_QWEN_SPEC_KV4`, read when it resolves).
     for (const prototype of [Qwen35Model.prototype, Qwen38TrellisTQ.prototype]) {
-      const declared = graph(prototype, { hiddenTap: null, composition: testComposition() }).graphCapabilities;
+      const declared = graph(prototype, { composition: testComposition() }).graphCapabilities;
       expect(declared).toEqual(declareGraph({ media: { input: "embeddings+positions", video: true }, hiddenLayerTaps: true,
         kv: { delayedAffine: "all" }, prefill: { boundedWorkspace: true }, speculation: { immediateAffine4: true } }));
-      const off = graph(prototype, { hiddenTap: null, composition: testComposition(undefined, { speculativeAffineKv: false }) })
+      const off = graph(prototype, { composition: testComposition(undefined, { speculativeAffineKv: false }) })
         .graphCapabilities;
       expect(off.speculation).toEqual({ ...declared.speculation, affineKv: false });
     }
@@ -82,7 +80,7 @@ describe("a graph's operations match what it declares", () => {
   test("the class that declares media supplies the operations that serve it", () => {
     for (const [prototype, input] of [[Gemma4Model.prototype, "embeddings"], [Qwen35Model.prototype, "embeddings+positions"]] as const) {
       expect(typeof (prototype as { bindMediaInput?: unknown }).bindMediaInput).toBe("function");
-      expect(graph(prototype, { hiddenTap: null, composition: testComposition() }).graphCapabilities.media?.input).toBe(input);
+      expect(graph(prototype, { composition: testComposition() }).graphCapabilities.media?.input).toBe(input);
     }
     expect(typeof (DiffusionGemmaModel.prototype as { pixelInput?: unknown }).pixelInput).toBe("function");
   });

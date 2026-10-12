@@ -32,6 +32,7 @@ import { createKvMaintenance } from "../../src/state/kv-maintenance";
 import { composedAffineKernels } from "../../src/state/affine-attention";
 import { settleAffine, settleTurbo } from "../state/convert-after-reference";
 import { testComposition } from "./test-composition";
+import { phaseHidden } from "./phase-forward";
 import { ownedCacheLayout, prefillCacheLayout, targetCacheLayout } from "../../src/state/layout";
 import { denseTurboQuantKernels, deferredTurboQuantKernels } from "../../src/state/turboquant-attention";
 import type { KVCache } from "../../src/state/kv";
@@ -130,12 +131,14 @@ const denseMlp = (t: Tensors) => (_layer: number, prefix: string) => {
 
 // ── The graphs ──────────────────────────────────────────────────────────────
 
-/** What the gate drives on either graph: the deprecated entry point, the head
- * and the caches. */
+/** What the gate drives on either graph: the head and the caches. */
 interface Graph {
   makeCache(): Cache[];
-  forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray;
   logitsFromHidden(h: MlxArray): MlxArray;
+}
+/** The old graph's deprecated entry point, which reads the phase from the input's shape. */
+interface OldGraph extends Graph {
+  forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray;
 }
 /** The current graph's named phases. */
 interface PhasedGraph extends Graph {
@@ -144,7 +147,7 @@ interface PhasedGraph extends Graph {
   readonly decode: MlxWidthTable<MlxPhaseForward>;
   readonly verify: MlxWidthTable<MlxVerifyForward>;
 }
-interface Pair { old: Graph; current: PhasedGraph }
+interface Pair { old: OldGraph; current: PhasedGraph }
 
 type Scheme = { name: string; kvBits?: number; flag?: string; turbo?: { kBits: number; vBits: number } };
 const BF16: Scheme = { name: "bf16" };
@@ -334,11 +337,11 @@ function convert(scheme: Scheme, ...sets: Cache[][]): void {
   }
 }
 
-/** The old graph's and the current graph's deprecated entry point on the same input. */
+/** The old graph's deprecated entry point and the phase a scheduler names for the same tokens on the current graph. */
 function both(label: string, p: Pair, oldCaches: Cache[], newCaches: Cache[], rows: number[][]): void {
   using input = ids(rows);
   const expected = p.old.forwardHidden(input, oldCaches);
-  const actual = p.current.forwardHidden(input, newCaches);
+  const actual = phaseHidden(p.current, input, newCaches);
   outputDiff(label, p.current, actual, expected);
   stateDiff(label, newCaches, oldCaches);
 }
@@ -618,8 +621,8 @@ describe("D3 dense family: MiniCPM5 construction choices and training forwards",
       const layout = { P: 20, Rc: 9, Rr: 11 };
       {
         using input = ids([prompt(layout.P + layout.Rc + layout.Rr, 95)]);
-        using expected = old.trainable.prefixShared!.forwardHidden(input, layout);
-        using actual = current.trainable.prefixShared!.forwardHidden(input, layout);
+        using expected = old.trainable.prefixShared!.prefixSharedHidden(input, layout);
+        using actual = current.trainable.prefixShared!.prefixSharedHidden(input, layout);
         record(`${tag} prefix-shared hidden`, maxDiff(actual, expected, `${tag} prefix-shared hidden`), 1);
       }
       for (const prefix of [undefined, layout]) {
