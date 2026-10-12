@@ -23,9 +23,13 @@
 //   session records the injected and accepted tokens, and echo proposals reach
 //   verify forwards.
 // - For each of those three shapes, a B2 group in which one row is cancelled at
-//   its third token: it emits exactly those three tokens and rejects with the
-//   cancellation; its peer runs to its end equal to its B1 output; the drained
-//   group then serves the cancelled request again, equal to its B1 run (direct
+//   its third token, against the same pair run uncancelled (formed, admitted and
+//   started the same way): the cancelled row emits exactly the uncancelled
+//   row's first three tokens and rejects with the cancellation; its peer runs to
+//   its end equal to the uncancelled pair's peer (a pair's rows are compared
+//   with a pair, not with B1: under the bit-stability decision a row's last bits
+//   may depend on how many rows were batched with it); the drained group then
+//   serves the cancelled request again alone, equal to its B1 run (direct
 //   generation for grammar, a fresh group for proposals and fill) in tokens,
 //   forwards and projections.
 // Compiled decode is off and the prompt tail is split on both paths, so every
@@ -508,7 +512,7 @@ describe.skipIf(!inputs)("sliding-window Universal grammar, grammar proposals an
       { together: false, rows: [{ prompt: "other", fill: "echo" }, { prompt: "short", fill: "strict" }] }]);
   }, 900_000);
 
-  test("a cancelled row leaves its peer equal to its B1 output, and the drained group serves the request again", async () => {
+  test("a cancelled row leaves its peer equal to the same pair uncancelled, and the drained group serves the request again", async () => {
     const cases: [Shape, Request, Request][] = [
       ["grammar", { prompt: "long", grammar: "json" }, { prompt: "short", grammar: "json" }],
       ["jump", { prompt: "long", grammar: "json" }, { prompt: "short", grammar: "json" }],
@@ -516,8 +520,26 @@ describe.skipIf(!inputs)("sliding-window Universal grammar, grammar proposals an
     ];
     for (const [shape, survivor, cancelled] of cases) {
       const label = `${shape} cancellation`;
-      const kept = await env.single(shape, survivor), left = await env.single(shape, cancelled);
+      const left = await env.single(shape, cancelled);
       assert(left.tokens.length > CANCEL_AT, `${label}: the cancelled request ends within ${CANCEL_AT} tokens`);
+      // The same pair, formed, admitted and started as below, with no cancellation.
+      const [kept, whole] = await env.gateway(shape, fillMode([survivor, cancelled]), 2, async lane => {
+        const peer = await lane.prepare(survivor), other = await lane.prepare(cancelled);
+        const { value, forwards } = await env.traced(false, async () => {
+          lane.hold(true);
+          const outcomes = [peer.start(), other.start()];
+          lane.hold(false);
+          return Promise.all(outcomes);
+        });
+        expect(forwards.some(forward => forward.B === 2), `${label}: the uncancelled rows never shared a forward`).toBe(true);
+        value.forEach((outcome, index) => {
+          expect({ label, index, status: outcome.status, error: String(outcome.error ?? "") })
+            .toEqual({ label, index, status: "fulfilled", error: "" });
+          env.checkFillApplied(`${label} uncancelled row ${index}`, outcome.fill);
+        });
+        return value;
+      });
+      assert(whole!.tokens.length > CANCEL_AT, `${label}: the uncancelled second row ends within ${CANCEL_AT} tokens`);
       const reused = await env.gateway(shape, fillMode([survivor, cancelled]), 2, async lane => {
         const peer = await lane.prepare(survivor), gone = await lane.prepare(cancelled, { cancelAt: CANCEL_AT });
         const { value: [kept2, left2], forwards } = await env.traced(false, async () => {
@@ -528,9 +550,9 @@ describe.skipIf(!inputs)("sliding-window Universal grammar, grammar proposals an
         });
         expect(forwards.some(forward => forward.B === 2), `${label}: the rows never shared a forward`).toBe(true);
         expect({ label, status: left2!.status, error: String(left2!.error), tokens: left2!.tokens })
-          .toEqual({ label, status: "rejected", error: "Error: client left", tokens: left.tokens.slice(0, CANCEL_AT) });
+          .toEqual({ label, status: "rejected", error: "Error: client left", tokens: whole!.tokens.slice(0, CANCEL_AT) });
         expect({ label, status: kept2!.status, error: String(kept2!.error ?? ""), tokens: kept2!.tokens, spans: kept2!.spans })
-          .toEqual({ label, status: "fulfilled", error: "", tokens: kept.tokens, spans: kept.spans });
+          .toEqual({ label, status: "fulfilled", error: "", tokens: kept!.tokens, spans: kept!.spans });
         env.checkFillApplied(`${label} peer`, kept2!.fill);
         await lane.drained();
         // The same group serves the cancelled request again, alone.
