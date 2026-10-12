@@ -37,6 +37,43 @@
      ["chunk 6 caches", 8, "99a53c53b30a937f"]
     ]
    }
+  },
+  "applegpu_g13s": {
+   "mlx": "0.32.2",
+   "cases": {
+    "ordinary masks, full first: every chunk's logits and caches at W-1, W, W+1 and across chunks": [
+     ["chunk 0 logits", 1, "a5dc5cd446fe3504"],
+     ["chunk 0 caches", 8, "e070d530a143e59e"],
+     ["chunk 1 logits", 1, "9e007c21aa0977e4"],
+     ["chunk 1 caches", 8, "e42a6bcb9bdc721e"],
+     ["chunk 2 logits", 1, "d84a39f95f3c1bbf"],
+     ["chunk 2 caches", 8, "8456d67a5b9573b2"],
+     ["chunk 3 logits", 1, "9913c412d1ba4c7b"],
+     ["chunk 3 caches", 8, "9b889f05445f556c"],
+     ["chunk 4 logits", 1, "e3fd03858ad4bfc0"],
+     ["chunk 4 caches", 8, "1168bca87a01ce73"],
+     ["chunk 5 logits", 1, "9af0df8b55440076"],
+     ["chunk 5 caches", 8, "d37f09a589c152fd"],
+     ["chunk 6 logits", 1, "1c3fccfeea8d363b"],
+     ["chunk 6 caches", 8, "05a8abcefdd734d4"]
+    ],
+    "ordinary masks, sliding first: every chunk's logits and caches at W-1, W, W+1 and across chunks": [
+     ["chunk 0 logits", 1, "a5dc5cd446fe3504"],
+     ["chunk 0 caches", 8, "cc3a301711c808d5"],
+     ["chunk 1 logits", 1, "9e007c21aa0977e4"],
+     ["chunk 1 caches", 8, "24f2ad28824eebda"],
+     ["chunk 2 logits", 1, "09d91526d61f7cb1"],
+     ["chunk 2 caches", 8, "df214c6f8127b4d7"],
+     ["chunk 3 logits", 1, "230b56af13a65fee"],
+     ["chunk 3 caches", 8, "94867a1a8b974e9c"],
+     ["chunk 4 logits", 1, "3b7a1b20056fd4d2"],
+     ["chunk 4 caches", 8, "425042421f4a8d2e"],
+     ["chunk 5 logits", 1, "013877c0388c7a40"],
+     ["chunk 5 caches", 8, "db37538f28c524aa"],
+     ["chunk 6 logits", 1, "1b724754a032e1f5"],
+     ["chunk 6 caches", 8, "99a53c53b30a937f"]
+    ]
+   }
   }
  }
 }
