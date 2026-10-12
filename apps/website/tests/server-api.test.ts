@@ -104,7 +104,7 @@ test("string-keyed request reads route like property reads; a computed key on th
   const cache = serverApiReference(mutate("server/cache-routes.ts", "${request.method} ${new URL(request.url).pathname}", '${request["method"]} ${new URL(request["url"]).pathname}'));
   expect(cache.modes.map(mode => rows(cache, mode.id))).toEqual(baseline.modes.map(mode => rows(baseline, mode.id)));
   expect(() => serverApiReference(mutate("server/status-routes.ts", 'if (request.method !== "GET") return null;', 'const key = "method"; if (request[key] !== "GET") return null;')))
-    .toThrow(/^server\/status-routes\.ts:50: unsupported routing predicate `request\[key\] !== "GET"`/);
+    .toThrow(/^server\/status-routes\.ts:44: unsupported routing predicate `request\[key\] !== "GET"`/);
   expect(() => serverApiReference(mutate("server/publishing-routes.ts", "const path = new URL(request.url).pathname;", 'const key = "url"; const path = new URL(request[key]).pathname;')))
     .toThrow(/^server\/publishing-routes\.ts:\d+: unsupported routing predicate `request\[key\]`/);
 });
