@@ -480,6 +480,20 @@ Exit: no graph reads `quantizedAttention`; bit-identical generic forwards.
       `models/profile.ts` still labels the generated-fingerprint Gemma artifacts
       `gemma4-generated` regardless of composition (make the label the selected graph's), and
       two README sentences describe the old selection (F2).
+- [x] Merged with D2 and E3 (`refactor/composition-merge`, c691ba23). One list of generated
+      graphs (`GENERATED_GRAPHS`, each entry's composition from its file); D2's transitional map
+      gone; generated classes in `RuntimeModel`; the table keys KV on `ServedKv` (storage kind
+      and widths only: read kernels and the conversion start are the cache's); the profile names
+      the family and the table labels the graph (`gemma4-generated` profile, its specialization
+      and the `generated-graph` capability deleted; family-registry goldens for e4b and 26B
+      change to the family's labels; saved generation checkpoints for those artifacts miss once
+      because their identity's specialization changed). Found: on the Trellis artifact the
+      table builds the generic Qwen 3.5 graph for `--kv-quant 8` and TurboQuant, where the old
+      M4 Pro graph ran its own internal fallback; the app-path digests differ for those two
+      schemes (every other artifact and scheme equals base). The generic graph is the loader's
+      selection by design; the old fallback was the path this refactor deletes, and the generic
+      graph's numbers are what main served before the M4 Pro graph existed. Owed: a
+      teacher-forced KL of merged vs base on the artifact under kv8 and turbo, recorded here.
 
 Exit: selection is data; `qwen38TrellisM4ProAccepts` and the nested ternary are gone.
 
@@ -583,6 +597,16 @@ paired batched-lane benchmark records the gain at one and four rows.
       assistant-drafter item). Real-weight tests E3 ported but did not run are the merge's to
       run: `gemma4-generated`, `compiled-decode`, `ordinary-continuation`,
       `affine-grammar-spans`, `gemma4-parity`, `minicpm5-parity`, the Trellis parity tests.
+      Merged (c691ba23): all of those ran on both trees and match line for line, except
+      `affine-grammar-spans` on e4b, which fails identically on base (the plan routes e4b's
+      grammar jump through the speculative method, so e4b is not a model that test accepts).
+      Under `--kv-quant 4` the Trellis app-path digests differ from base: base served the
+      generic read (D1's regression, logits 0.028), merged serves the composed KV4 lego, which
+      E3's gate proved equal to the old graph's injected cores. Owed: the app-path digest on
+      `main` (9593d881) for the artifact under kv4 equals merged's, closing the loop through the
+      scheduler. The generated Gemma graphs needed no new read: with D2 merged they have no
+      run-time match, the template builds the bf16-first lego on every listed cache, and the
+      gate records every cache read (bf16 first, quantized after) with digests equal to base.
 
 Exit: `serve-cli.test.ts` and the draft-flags test pass; the CLI inventory regenerates with no
 new flag.
