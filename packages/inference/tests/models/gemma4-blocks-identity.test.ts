@@ -35,6 +35,7 @@ import { widthClass } from "../../src/contracts/mlx/graph";
 import type { RuntimeModel } from "../../src/models/factory";
 import { createRuntimeConfig, runtimeConfig, withRuntimeConfig } from "../../src/runtime/config";
 import { trainForward } from "../../src/scoring/full-sequence";
+import { trainForward as frozenTrainForward } from "./full-sequence-reference";
 import { createKvMaintenance } from "../../src/state/kv-maintenance";
 import { composedAffineKernels } from "../../src/state/affine-attention";
 import { settleAffine, settleTurbo } from "../state/convert-after-reference";
@@ -739,14 +740,14 @@ for (const kind of ["dense", "shared"] as const) {
       const tokens = prompt(49, 91);
       using input = ids([tokens]);
       {
-        using expected = trainForward(p.old as unknown as RuntimeModel, input);
+        using expected = frozenTrainForward(p.old as unknown as RuntimeModel, input);
         using actual = trainForward(p.current as unknown as RuntimeModel, input);
         record(`${tag} full-sequence logits`, maxDiff(actual, expected, `${tag} full-sequence logits`), 1);
       }
       {
         const valid = [24, 19, 15];
         using padded = ids(valid.map((n, row) => [...prompt(n, 92 + row), ...Array(24 - n).fill(0)]));
-        using expected = trainForward(p.old as unknown as RuntimeModel, padded, valid);
+        using expected = frozenTrainForward(p.old as unknown as RuntimeModel, padded, valid);
         using actual = trainForward(p.current as unknown as RuntimeModel, padded, valid);
         record(`${tag} padded batch logits`, maxDiff(actual, expected, `${tag} padded batch logits`), 1);
       }
@@ -778,13 +779,13 @@ for (const kind of ["dense", "shared"] as const) {
         record(`${tag} segmented hidden`, maxDiff(actual, expected, `${tag} segmented hidden`), 1);
       }
       for (const splitMlp of [false, true]) {
-        const run = (model: Graph) => {
+        const run = (model: Graph, forward: typeof trainForward) => {
           const checkpoint = model.trainable.gradCheckpoint!.enable([], splitMlp);
-          try { return trainForward(model as unknown as RuntimeModel, input); }
+          try { return forward(model as unknown as RuntimeModel, input); }
           finally { checkpoint.end(); }
         };
-        using expected = run(p.old);
-        using actual = run(p.current);
+        using expected = run(p.old, frozenTrainForward);
+        using actual = run(p.current, trainForward);
         record(`${tag} checkpointed logits (split MLP ${splitMlp})`, maxDiff(actual, expected, `${tag} checkpointed logits`), 1);
       }
     }, 120_000);

@@ -31,6 +31,7 @@ import { widthClass, type MlxWidthClass } from "../../src/contracts/mlx/graph";
 import type { RuntimeModel } from "../../src/models/factory";
 import { createRuntimeConfig, runtimeConfig, withRuntimeConfig } from "../../src/runtime/config";
 import { trainForward } from "../../src/scoring/full-sequence";
+import { trainForward as frozenTrainForward } from "./full-sequence-reference";
 import { evalPpl } from "../../src/scoring/perplexity";
 import { composedAffineKernels, unfusedAffineKernels } from "../../src/state/affine-attention";
 import { DelayedRotatingQuantizedKVCache } from "../../src/state/delayed-rotating-quantized-kv";
@@ -658,7 +659,7 @@ for (const kind of ["trellis", "affine"] as const) {
         const perToken = ops.sub(lse, flat);
         return [perToken, ops.meanAxis(perToken, 1, false)];
       };
-      using expected = trainForward(p.old as unknown as RuntimeModel, input);
+      using expected = frozenTrainForward(p.old as unknown as RuntimeModel, input);
       using actual = trainForward(p.current as unknown as RuntimeModel, input);
       const [expectedTokens, expectedMean] = loss(expected), [actualTokens, actualMean] = loss(actual);
       try {
@@ -681,7 +682,7 @@ for (const kind of ["trellis", "affine"] as const) {
       // Rows of 24, 19 and 15 real tokens in one batch: BatchedMaskCache.
       const valid = [24, 19, 15];
       using input = ids(valid.map((n, row) => [...prompt(n, 66 + row), ...Array(24 - n).fill(0)]));
-      using expectedLogits = trainForward(p.old as unknown as RuntimeModel, input, valid);
+      using expectedLogits = frozenTrainForward(p.old as unknown as RuntimeModel, input, valid);
       using actualLogits = trainForward(p.current as unknown as RuntimeModel, input, valid);
       record(`${tag} padded batch logits`, maxDiff(actualLogits, expectedLogits, `${tag} padded batch logits`), 1);
     }, 120_000);
