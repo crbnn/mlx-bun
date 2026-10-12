@@ -17,8 +17,10 @@ Decisions that govern all work:
 
 ## Composition refactor
 
-Status: draft, 2026-10-10; Josh approved this plan. One PR per numbered item, targeting `main`,
-not merged without Josh's instruction. Delete a block when its exit criteria are met.
+Status: in progress since 2026-10-10; Josh approved this plan. Every item lands as a sub-branch merged
+into `refactor/composition` after its gates match the base; the one PR to `main` is #323 (Josh,
+2026-10-12: one branch, one PR; the integration branch is folded in and the per-item PRs closed).
+Delete a block when its exit criteria are met.
 
 ### Target
 
@@ -29,8 +31,9 @@ runs the layers it was built with and never inspects its input or its cache. The
 storage, the read, prefix reuse, paging, SSD offload and eviction behind one interface. Each piece
 implements its contract and never checks what another piece is doing, because nothing below the
 scheduler decides anything at run time. Vision, adapters and KV scheme are compositions, never
-refusals. A generic graph for a family is a complete structure the loader may select when no
-specialized one matches; a specialized graph never contains a path back to it.
+refusals. Every graph is an entire graph built for a composition. A family's generic graph is one of
+them: the table entry the loader selects when no more constrained entry matches, never a path
+another graph falls back to.
 
 Batching is not a mode. The scheduler is the one engine and a single request is a batch of one,
 as the first refactor established. One request or four requests run the same composition: the
@@ -58,6 +61,12 @@ those read per-sequence state the cache owns.
 - The cache contract has no representation-specific escape hatch (`updateAndFetch`,
   `quantizedAttention`, `rotatedValueAttention`, `affineConversion`, `turboConversion`).
 - The graph contract names its phases; the scheduler calls them by name.
+- Legos compose additively, never multiplicatively (Josh, 2026-10-11): five modules with three
+  configurations each are fifteen implementations against five contracts, not 243 plans. No
+  module names another module's configuration: a graph's declared capabilities say what it
+  computes, never which cache, drafter, sampler or batch width it tolerates; a cache lego
+  implements the whole cache contract for every model; the user never hears "you can't use
+  that cache with this model". The served-surface inventory lists no cross-module exclusion.
 - Existing violators ride the seam ratchet in `packages/inference/tests/architecture.test.ts`:
   counts only fall. The ratchet is a transition device, not a resting state: every entry is
   owned by a numbered item in this plan, and when the plan closes no example of a banned pattern
@@ -89,9 +98,8 @@ Closed by Josh, 2026-10-10:
   M` extends the bf16 span to M tokens), which preserves today's numbers and mlx-lm parity with
   no check outside the cache. A cache quantized from token zero is a different composition with
   different first-chunk numbers (up to 0.125 at 4 bits on a test tensor), no mlx-lm oracle, and
-  a cheaper first chunk; it exists as its own lego, opt-in, gated by KL. Provisional until Josh
-  confirms which the default `--kv-quant N` should compose; the parity-preserving one is
-  recorded here as the default.
+  a cheaper first chunk; it exists as its own lego, opt-in, gated by KL. Confirmed by Josh
+  2026-10-11: the parity-preserving lego is the default `--kv-quant N` composes.
 - **KV scheme is a serve flag.** `--kv-quant` composes the cache lego at load. The per-request
   `kvBits`, `kvConfig` and `quantizedKvStart` options are removed; mlx-lm's server takes these as
   server flags too.
@@ -99,14 +107,12 @@ Closed by Josh, 2026-10-10:
   and the file is deleted when the M1 Max composition is generated.
 - **`--batch-size`** is the cap on rows per forward the scheduler may batch. Nothing else.
 
-Open:
-
-- [ ] **Bit-stability across batch width.** The factored row kernels (1 row, 2 to 4) and the
-      matrix-unit kernels (5 to 8) reassociate differently, so a request's last bits can depend on
-      how many rows were batched with it. Either require every width class of a phase to be
-      bit-identical per row (one kernel family across widths), or accept bf16-level variation by
-      batch width, documented and gated by KL. "One request or four, it works" is true either way;
-      "identical to the bit either way" needs the first.
+- **Bit-stability across batch width** (closed by Josh, 2026-10-11): keep the measured-best
+  kernels per width class (factored for 1 to 4 rows, matrix-unit for 5 to 8), so a request's last
+  bits can depend on how many rows were batched with it; this is what the old graph served and it
+  is documented and KL-gated. There is no separate switch: choosing `--batch-size N` above one opts
+  into batching, and batching may move the last bits; `--batch-size 1` says nothing can be batched,
+  so nothing can change. The batched paged read follows the same rule (joined rows, as served today).
 
 ### Phase A: contracts (no behavior change)
 
@@ -276,10 +282,167 @@ cache class against its pre-refactor read on the existing parity inputs; `grep` 
 - [ ] The scheduler's surface is acquire(request) returning state plus reused-token count, or a
       miss, and release(request). The scheduler never learns what is resident or when it was
       evicted.
-- [ ] Delete `state/kv-maintenance.ts`; its batch preparation moves to `state/layout.ts`.
+- [x] Delete `state/kv-maintenance.ts`; its batch preparation moves to `state/layout.ts`.
+- [x] Landed (PR #343 into `refactor/composition`, c7d39b5a). `state/cache-service.ts`:
+      `createKvCacheService(graph, options)` builds one service with the prompt-cache bytes, the
+      KV budget, the saved-state directory and its byte budget, write-behind, prefetch and the
+      checkpoint interval; the paging block size comes from the composition. Scheduler side
+      (`RequestStateCache`): `admit`, `fits`, `keeps`, `acquire` (caches plus reused-token
+      count, a resumed continuation, or fresh state), `publish`, `checkpoint`, `release`,
+      `boundary`, `codecs`; residency, eviction, SSD, paging and continuation persistence stay
+      inside. App side: `report()`, `stats()`, `prefetch`, `savedPrefixes()`, `flush`, `close`.
+      Moved into `state/`: `kv-budget.ts`, continuation persistence; deleted:
+      `namespaced-cache.ts`, `execution/continuation.ts`, `bindRequestState`,
+      `configureContinuation`, `kv-maintenance.ts` (batch preparation verbatim into
+      `layout.ts`; `decodesCompiled` parked there for B4 to delete). Every scheduler caller
+      (batch group, prefill cohort, speculative, grammar and fill groups) goes through the
+      service; the gateway exposes `reusesPrefix`; `/stats`, the cache routes and telemetry
+      read `report()`. Gates against e436ccf5: typecheck clean; architecture 21, ratchet
+      empty; cache-contract 196/196; state + execution 1152 pass; root test exit 0 (inference
+      2369 pass); 12 digest cells identical; SSD save and fresh-process restore over HTTP
+      identical on e4b, MiniCPM5 and Llama 1B under five schemes and on the Trellis artifact
+      under kv4 (435 cached tokens on the repeat and on the restore); cache routes identical;
+      the real-weight suites at the head's lines; inventories: routes and CLI identical, the
+      library API +13 symbols (the service types) −6 (the continuation bindings). Behaviour
+      notes: the `prefill.batch_setup` trace span is gone; an admission probe adds one
+      `makeCache` per group; the speculative group's probe caches are disposed right after
+      `openPrefill`. Not run: the isolate test's memory-synthesis case (loads a second model),
+      the Gemma 2 natives (no weights), `qwen-mtp-group-prefix` (Trellis kept for the SSD run).
 
 Exit: saved KV under `MLX_BUN_HOME/kv` round-trips as before; prefix hit rate on the existing
 warm-reuse test is unchanged; no `toQuantized` caller outside `state/`.
+
+#### B3. The cache is swappable: nothing else knows or cares
+
+Josh, 2026-10-11: "I can swap between paged KV, quantized KV, regular KV, TurboQuant KV; nothing
+else should know or care." Today the planner and the gateway do know: `execution/plan.ts` refuses
+speculation when the composition is paged (`!features.pagedKv`) and gates it on
+`speculativeKvQuant` / `speculativeTurboQuant`; batching is gated on `quantizedBatch`,
+`turboQuantBatch` and `pagedBatch`; shared fill is off under paging; `gateway-binding.ts` derives
+`kvBatchCapabilities`, `delayedAffine`, `affineKv` and `cachesBatchable()` from the cache format
+and `state/capabilities.ts` answers `isPlainKvCache` / `isRotatingPlainCache` / `isRecurrentCache`
+to callers outside `state/`. Every one of these is a method learning the representation.
+
+- [ ] Every cache lego implements the whole contract: append and `attend` for each phase, the
+      row layout for batching, the speculative transaction (`specRoundCommit` /
+      `specRoundRollback` to the accepted length, and the known-token append), the prefix
+      snapshot and restore, and the SSD form. The paged lego and the TurboQuant legos implement
+      the transaction and the batched layout they lack today; a lego that cannot implement an
+      operation is a bug in the lego, not a capability flag.
+- [ ] Delete the cache-format terms from the planner and the gateway: `pagedKv`, `kvQuant` and
+      `turboQuant` conditions in `plan.ts`; `quantizedBatch`, `turboQuantBatch`, `pagedBatch`,
+      `speculativeKvQuant`, `speculativeTurboQuant` from `GraphCapabilities`; `kvBatchCapabilities`,
+      `delayedAffine`, `affineKv`, `cachesBatchable` from `gateway-binding.ts`; the `state/capabilities.ts`
+      predicates have no caller outside `state/`. Media and adapter rows no longer bypass paging
+      (`paged-kv-bypassed-for-media-or-adapters`); the adapter namespace is the cache's.
+- [ ] Order: after the merge of E1 + D2 + E3. The lego work (state/) runs beside E2; the planner
+      and gateway deletions share E2's files and land with it.
+- [x] Lego side landed (`refactor/composition-b3-legos`, 33c7f5be, integration branch
+      fast-forwarded). One model-free conformance suite (`tests/state/cache-contract.test.ts`)
+      runs every lego through append, attend per phase, decode/prefill/verification rows, the
+      speculative transaction, the committed, bidirectional, encoder-window and block reads,
+      donor rows, snapshot and SSD: 190 of 190 cells, against 135 on d71467c4. Each storage now
+      declares its three row layouts in one table in `state/layout.ts` (three `instanceof`
+      chains gone; the file's ratchet entry deleted); `SpeculativeRowLayout` is the transaction
+      as a contract. The paged lego gained the transaction, verification rows, the committed,
+      bidirectional, encoder and block reads and donor rows; ring legos a committed read; the
+      quantized and TurboQuant legos the encoder-window and block reads; KV4 verification rows
+      read donors with their own kernels. Correction to the brief: TurboQuant already had the
+      transaction and the batched layout. Every served path is bit-identical to the head
+      (gemma4-paged, speculative-group under four schemes, continuation under six, 20 app-path
+      digests, SSD digests). Newly served paths, planner bypassed, on e4b: speculation over
+      paged bf16 gives the bf16 lego's tokens at one and four rows; teacher-forced rounds under
+      paged 4 / paged 8 / TurboQuant 8/3 sit at KL 0.016 / 0.010 / 0.016 (max 0.17 / 0.064 /
+      0.18) against the tiled null's 0.10 / 1.31. Not whole and not in the suite: the
+      grouped-heads KV4 cache, a verification-rows form whose window kernel serves exactly 6
+      query heads per KV head at 3 queries (a verify lego built for one width; its conformance
+      is at its width, or the kernel generalizes in `layers/quantized-attention.ts`). Still
+      owed on the lego side: compiled decode on the paged and TurboQuant legos; DiffusionGemma's
+      `makeCache` ignores the scheme (models/); pages under turbo or a per-layer config are
+      still bf16. The planner side's callers, for the item that lands with E2:
+      `gateway-binding.ts` (`convertible`, `isRecurrentCache`, `batchable`/`targetRows`,
+      `kvBatchCapabilities`, `delayedAffine`, `affineKv`, `cachesBatchable`, `kvBatchable`),
+      `batch-group.ts` (`isPlainKvCache`, `isRotatingPlainCache`, `isBatchableCache`),
+      `plan.ts` (paged, kvQuant, turbo terms), `generation/autoregressive.ts`
+      (`isRotatingPlainCache`), `models/gemma4/compiled-decode.ts` (`isCompiledDecodeCache`),
+      `scoring/full-sequence.ts` (`isRecurrentCache`), and `state/kv-scheme.ts`'s `batchable`.
+- [x] Planner side landed (`refactor/composition-b3-planner`, 8508f16b, eight commits on
+      832ac8b1; merging onto the integration head with E5 and the ratchet item). Deleted: the
+      planner's paged / kvQuant / turbo conditions and reasons; `ExecutionCapabilities.
+      quantizedBatch / turboQuantBatch / pagedBatch / speculativeKvQuant / speculativeTurboQuant
+      / continuous`; `GraphCapabilities.pagedAttention / kv / speculation.affineKv / turboKv /
+      immediateAffine4` and with them `Composition.speculativeAffineKv`; the gateway's
+      `convertible`, `kvBatchCapabilities`, `delayedAffine`, `affineKv`, `cachesBatchable`,
+      `kvBatchable`, `delayedAffineOrdinaryOnly`, `isRecurrentCache`, the `MLX_BUN_BATCH_SSM`
+      read, the ignored-draft affine branch (a draft is ignored only for adapter rows whose
+      verifier cannot serve adapters) and the `kvScheme` option with its startup refusal; the
+      batch group's cache-class reads (behind `state/layout`) and both compiled-decode probes;
+      `state/kv-scheme`'s `batchable`, `captureRopeOffsets`, `isCompiledDecodeCache`;
+      `state/capabilities` is no longer exported from state. Composition fields, defaults:
+      `compiledDecode` on, `mixedPrefill` off, `mixedTokenBudget` 256, `prefillTailSplit` on,
+      `grammarJump` off, `greedyDraft` off, `pagedKv` null (`--paged-kv` sets the block size);
+      media and adapter rows page like every row. Compiled decode is settled once in
+      `resolveComposition`: on for bf16 and affine from token 0, off for TurboQuant, a delayed
+      start and paging, because those legos have no compiled form yet (owed below). Gates:
+      every served path bit-identical to 832ac8b1 (20 digest cells at one and four rows with
+      compiled-step counts, speculative-group under five schemes, gemma4-paged, continuation,
+      spans, compiled-decode, gemma4-generated, gemma4-assistant); Gemma 2 native suite 58
+      pass (a gateway test that failed on base passes). Newly served through the server path
+      on e4b: speculation over paged bf16/4/8, TurboQuant and affine from token 40; grammar,
+      fill and image rows on paged storage; paged bf16 equals the bf16 lego token for token
+      for plain, grammar, fill, media and single drafted rows. Teacher-forced verification
+      rows, KL mean/max vs bf16 at one row: paged 4 0.016/0.17, paged 8 0.010/0.064,
+      TurboQuant 8/3 0.016/0.18, affine 4 from 32 0/0, against the tiled null 0.102/1.31.
+      Behaviour change, accepted: grammar jump over delayed affine KV on encoded-read graphs
+      is planned as verified proposals rather than committed spans (not measured on real
+      weights); library `generate()` with delayed affine on Gemma 4 runs eager (logits
+      bit-exact). Not run: compiled-decode on 12B, any Qwen3-MoE cell (no weights here).
+      Still owed under the additive rule, each a lego form or a graph fix, none a flag:
+      compiled decode on the TurboQuant, delayed and paged legos; pages under a per-layer
+      scheme or TurboQuant (refused at load today); the graphs that build their own caches
+      (GLM-5.2's MLA storage, DiffusionGemma's `makeCache`) composing the KV scheme and paging
+      (refused at load today); Gemma 2's softcap read over affine storage after the
+      conversion point (`DenseKvReadError`, HTTP 501, on ordinary and grammar rows; no Gemma
+      2 weights here); fill choosing committed spans or single tokens by
+      `MlxKnownSpans.affineKvBits / turboQuantFormats`, a capability naming KV formats, which
+      goes when `appendKnown` works over every lego. These are the last "not with that cache"
+      answers in the tree. Decided by Josh, 2026-10-12: build all five, with synthetic-weight
+      identity gates against a frozen oracle where no artifact exists (Gemma 2, GLM-5.2);
+      nothing is scoped out, because scoping a cache out of a model is the multiplicative
+      answer this refactor deletes. Item B4 below.
+
+#### B4. The last lego forms
+
+The cache layer is independent of the model and the method (Josh, 2026-10-12): a refusal that
+names a cache is not a rule broken, it is a cache lego that has not been built yet. Each bullet
+below is a missing lego; the refusals disappear because the legos exist, not the other way round.
+
+- [ ] Compiled decode on the TurboQuant, delayed-start and paged legos, so `compiledDecode`
+      resolves from the composition alone and `decodesCompiled` in `state/kv-maintenance` goes.
+- [ ] Pages under a per-layer affine scheme and under TurboQuant (paged pages are bf16, 4 or 8
+      today); the load-time refusal goes.
+- [ ] The graphs that build their own caches compose the KV scheme and paging: DiffusionGemma's
+      `makeCache` takes the scheme; GLM-5.2's MLA storage gains its affine, TurboQuant and paged
+      forms as legos of the latent-attention contract; the load-time refusal goes.
+- [ ] Gemma 2's softcap read over affine storage after the conversion point, on every row kind;
+      `DenseKvReadError` and its HTTP 501 go.
+- [ ] `appendKnown` over every lego, so fill no longer chooses committed spans or single tokens
+      by `MlxKnownSpans.affineKvBits / turboQuantFormats`; that capability goes.
+- [ ] Order: after the merge of E5, the B3 planner side and the ratchet item, which own the
+      contract and the legos these build on.
+
+Exit: every lego the composition can name serves every model and method, so nothing in the tree
+has a reason to name a cache together with a model, method or row kind; the conformance suite
+covers each new form; where the artifact exists (e4b, MiniCPM5, Llama, the Trellis artifact) the forms are gated
+by digest or KL against the tiled null as B3 did, and elsewhere by a frozen oracle over synthetic
+weights at maxDiff 0.
+
+Exit: on e4b, speculative-group (assistant drafter), grammar-group, fill, prefix reuse and the SSD
+round-trip each run under every lego the composition can name (bf16, affine uniform, affine
+config, TurboQuant, paged, bf16-first KV4 on the M4 Pro composition) with per-line output
+identical to the same lego on `30412523` where that lego served the method today, and KL-gated
+against bf16 where it did not; `plan.ts` and `gateway-binding.ts` contain no cache-format term;
+the served-surface inventory lists no cache × method exclusion.
 
 ### Phase C: layers
 
@@ -329,21 +492,64 @@ the default variant on the M4 Pro and the M1 Max; paired serve benchmark shows n
 
 #### C3. The ANE split owns its programs
 
-- [ ] `layers/ane-prefill-split.ts`: programs are instance-owned and disposed with the layer; no
+- [x] `layers/ane-prefill-split.ts`: programs are instance-owned and disposed with the layer; no
       module-level maps.
-- [ ] Programs are built for exactly the chunk size; no buckets, no minimum-row floor. The
+- [x] Programs are built for exactly the chunk size; no buckets, no minimum-row floor. The
       leftover chunk is `prefillTail` on the GPU.
-- [ ] ANE programs compile at install, the way Apple's own pipeline compiles a model for the
+- [x] ANE programs compile at install, the way Apple's own pipeline compiles a model for the
       Neural Engine on the device and caches it (Josh, 2026-10-10). The installer, or the app's
       first launch, compiles every program the shipped compositions need and leaves them in the
       framework's cache, so no prompt ever pays the compile and the serving process never
       compiles. The MIL source ships in the bundle as the compiler's input. Shipping the compiled
       form itself, one per Neural Engine generation built on a host of that generation, stays
-      possible later; it is not required.
+      possible later; it is not required. Landed (`refactor/composition-c3-install`, aed03a64,
+      integration branch fast-forwarded). The bridge separates compile from load; creating a
+      program only loads it and refuses one the cache lacks (and no longer writes the MIL to
+      disk, which made loads compile silently). A graph table entry declares
+      `anePrograms(composition)`; the M4 Pro graph exports its widths (recorded by the
+      generator's description) and lists three programs, the MLP slice and two projections at
+      the chunk size, identical programs counted once. `mlx-bun compile-ane` compiles what
+      this Mac's compositions need for the flag-free composition (no model download), with
+      `--check` and `--quiet`; `scripts/install.sh` runs it with the installed executable and
+      warns and keeps the installation where the Neural Engine cannot compile; before every
+      model load the app runs it quietly as a child of the same executable (the isolated
+      parent loads no native library), so a program macOS purged comes back before the load
+      (about 70 ms per launch when everything is cached, no record kept); the worker never
+      compiles and a missing program at its load is `AneBridgeError` naming the verb, which
+      only a library host that bypassed the step can hit. Measured on the real artifact at an
+      uncompiled chunk size: compile 4.9 s + 661 ms + 572 ms once; loads from the cache 18.6,
+      2.4 and 2.2 ms; a cache check 0.2 ms; the machine-wide client count unchanged by the
+      compile. Found: the cache is per code-signing identity (the verb runs under the
+      executable that serves); macOS can garbage-collect entries, which the per-launch check
+      covers. Not done: a Homebrew `post_install` hook (the first launch covers it).
+
+- [x] Program creation blocked (D1's merge gate, 2026-10-11, over 20 minutes). Cause found on
+      `refactor/composition-c3-hang` (e3cc7f29, merged into the integration branch at
+      d71467c4 with the ANE, drift and architecture gates passing on the merged tree): every
+      loaded ANE model holds one direct-path client of the ANE driver, the driver serves about
+      a thousand across the whole machine, and the M4 Pro graph loaded 176 programs per graph,
+      one per layer, all identical MIL and weights because the weights stream through the
+      buffers. Past the cap the client open inside the load fails and the framework retries
+      every 15 s for as long as the clients are held, in our process and in every other ANE
+      user's (`mediaanalysisd` restarted every 120 s during the gate). The earlier suspects
+      (aned's reply, client state, buffer release order) were not involved and the 2048-row
+      shape did not matter, only the count. Fix in the bridge: a program created with `share`
+      whose MIL and weights are identical to the shared program's holds that same loaded model
+      (holder count; the last `mbane_free` unloads), so a graph holds 3 loaded models instead
+      of 176. Outputs bit-identical to the old bridge; the real-artifact gate passes at maxDiff
+      0 holding 6 clients. Regression tests opt in with `MLX_BUN_TEST_ANE=1`: a child process
+      creates 2288 programs of four chunk sizes then one more, killed at 240 s; splits of two
+      chunk sizes coexist and dispose in either order. Found: the identity test and the frozen
+      reference graph never dispose their graphs (3 leaked clients per graph now; dispose them
+      when the frozen files go). Found: `mbane_available()` / `aneAvailable()` is a soft
+      runtime check for whether the framework loaded; under the composition the bridge is a
+      load-time fact (`aneBridge`), so the loader composes it or fails the load with a typed
+      error and the predicate goes (E2).
 
 Exit: two graphs can coexist in one process without evicting each other's programs; KL gate on
 ANE prefill unchanged; after install, the first ANE prefill on a fresh machine loads from the
-cache and compiles nothing, measured by the bridge's own `compiledModelExists`.
+cache and compiles nothing, measured by the bridge's own `compiledModelExists`; a process that
+runs several ANE programs of different shapes in sequence never blocks in program creation.
 
 ### Phase D: graphs
 
@@ -368,19 +574,52 @@ same phase; the Qwen generator (D2) produces it.
 
 #### D2. Generators are the asset
 
-- [ ] Fix the template in `packages/inference/scripts/gen-gemma4.ts`: no `extends`, no
+- [x] Fix the template in `packages/inference/scripts/gen-gemma4.ts`: no `extends`, no
       `#matches`, named phases. Regenerate `gemma4-e4b.ts`, `gemma4-12b.ts`, `gemma4-26b.ts`.
+      Landed (`refactor/composition-d2`): the blocks live in `models/gemma4/blocks.ts`; each
+      generated class extends nothing, folds its per-layer KV scheme as literals, declares
+      `COMPOSITION`, and is checked for drift by `gemma4-generated-sync.test.ts`; 840
+      comparisons at maxDiff 0 and the e4b and 12B digests identical. Seams for the E1 merge:
+      the generated classes join the `RuntimeModel` union (then the transitional `GENERATED`
+      map and its cast go), and training on those three fingerprints must load the generic
+      graph, since a generated graph declares no `trainable` (a composition field the train
+      verbs set, or the train module selecting the generic entry explicitly).
 - [ ] Write `packages/inference/scripts/gen-qwen38.ts` taking the composition as input; the M4 Pro
       graph and the M1 Max graph are its outputs. The hand-written TQ graph is broken into its
       reusable pieces and deleted. D1 landed the generator and the M4 Pro output (`--describe`
       reads a snapshot's config and shard headers; the committed file regenerates with an empty
       diff). The M1 Max output needs, first: layer classes for the fused gate/up reduce kernels
       and the packed down (today functions), the TQ graph's three env A/B flags turned into
-      composition facts or separate kernels, and an identity gate run on that host.
+      composition facts or separate kernels, and an identity gate run on that host. Landed
+      (`refactor/composition-d2-m1max`, da549488, nine commits on 832ac8b1; merged onto the
+      integration head with the install-time compile at 6fe59e7c, both generators regenerating
+      with no diff, every gate repeated on both machines). The generator takes the composition
+      `qwen38-27b-trellis-m1max` (fingerprint `cfa205c8f5af046a`, device `applegpu_g13s`,
+      every KV scheme, any row count, no bridge) and emits `Qwen38TrellisM1Max`, an entire
+      graph over the shared blocks; its device table is the LUT the width-table idea
+      describes, as data: reduce and scatter layers at one to four rows, the generic blocks
+      from five, `QuantizedLinear` for every projection and the head, lazy verify, known
+      tokens as windows. New layers, one kernel each: `ReduceGateUpRow(s)`,
+      `ReduceMixedGateUp` (tail chosen at construction), `ScatterDownRow(s)`,
+      `ScatterDownK3iRow(s)`, each reading its decode variant (`TrellisLinear.variant`), the
+      GPU family's representations and the shared codebook in its constructor. The flags:
+      `MLX_BUN_QWEN38_TQ_MIXED_GATEUP` is the composition field `mixedGateUp` (default
+      `split`; `fused` and `off` still generate and the drift test checks each);
+      `MLX_BUN_QWEN38_TQ_FOLD_QK_SCALE` is unconditional in the template (bit-identical; the
+      generic graph is the unfolded control); `MLX_BUN_QWEN38_TQ_GRAPH` had gone with E1. The
+      hand-written TQ graph is deleted and the `graph-extends` ratchet is empty. Gates on the
+      M1 Max: 14 identity tests, 708 lines, 80,556 tensors at maxDiff 0 (synthetic weights
+      under four schemes at every phase and width; the real artifact under each scheme), a
+      sensitivity check (the `fused` tail breaks the gate at layer 15, maxDiff 0.03125), the
+      layers at the real 17408×5120 geometry against the frozen pre-C2 layer, Trellis parity
+      4/4 bit-exact, 20 of 20 digests identical; on the M4 Pro its identity test and digests
+      unchanged. Not exercised: prefill chunks of four tokens or fewer, where the TQ graph
+      picked kernels by actual row count and the generated graph sends whole chunks to the
+      generic blocks as the M4 Pro graph does.
 
 Exit: `git diff` of a regenerated file against its committed version is empty; the generated Gemma
 parity test passes on e4b and 12B; no generated graph extends a graph; no hand-written
-specialized graph remains, so the only example of a specialized graph an agent can read is a
+graph for one composition remains, so the only example of such a graph an agent can read is a
 generated one.
 
 #### D3. Generic graphs
@@ -398,12 +637,43 @@ Exit: no graph reads `quantizedAttention`; bit-identical generic forwards.
 
 - [ ] The `qwen3.5` entry in `models/factory.ts` becomes a table keyed by fingerprint, device,
       bridge, KV scheme, depth, chunk size, adapters and max rows. The generic graph is the entry
-      yielded when nothing specialized matches. The same shape for Gemma's `GENERATED` map.
+      yielded when no more constrained entry matches. The same shape for Gemma's `GENERATED` map.
 
 - [ ] The key includes the KV scheme and max rows because the M4 Pro composition serves bf16 and
       affine 4-bit group 64 only (D1: the old graph went generic for 8-bit and per-layer config;
       the new one would run its width sets over whatever cache it is handed) and its
       `Kv4Head256Cache` lego serves one sequence until E3's batched form lands.
+
+- [x] Landed (`refactor/composition-e1`): `GraphTable` in `models/implementation.ts`, one table
+      per resident family in `MLX_GRAPH_TABLES`; building a table fails unless it has exactly
+      one generic entry and no two equally constrained entries can both match. The generated
+      Gemma graphs serve their kv_config scheme, so the default bf16 composition selects the
+      generic Gemma 4 graph, which is what the old `#matches` guard fell back to. Loose ends:
+      `models/profile.ts` still labels the generated-fingerprint Gemma artifacts
+      `gemma4-generated` regardless of composition (make the label the selected graph's), and
+      two README sentences describe the old selection (F2).
+- [x] Merged with D2 and E3 (`refactor/composition-merge`, c691ba23). One list of generated
+      graphs (`GENERATED_GRAPHS`, each entry's composition from its file); D2's transitional map
+      gone; generated classes in `RuntimeModel`; the table keys KV on `ServedKv` (storage kind
+      and widths only: read kernels and the conversion start are the cache's); the profile names
+      the family and the table labels the graph (`gemma4-generated` profile, its specialization
+      and the `generated-graph` capability deleted; family-registry goldens for e4b and 26B
+      change to the family's labels; saved generation checkpoints for those artifacts miss once
+      because their identity's specialization changed). Found: on the Trellis artifact the
+      table builds the generic Qwen 3.5 graph for `--kv-quant 8` and TurboQuant, where the old
+      M4 Pro graph ran its own internal fallback; the app-path digests differ for those two
+      schemes (every other artifact and scheme equals base). The generic graph is the loader's
+      selection by design; the old fallback was the path this refactor deletes, and the generic
+      graph's numbers are what main served before the M4 Pro graph existed. Measured
+      (teacher-forced decode KL, 16 default prompts cut to 256 tokens, last 32 teacher-forced,
+      487 positions, base 30412523 → d71467c4): kv8 mean 9.4e-4 (median 5.8e-4, p95 2.4e-3,
+      argmax agrees 476/487), turbo mean 1.7e-3 (median 1.2e-3, p95 5.5e-3, 473/487); bf16
+      control byte-identical. Scale: kv8's own cost over bf16 on base is 9.8e-4 and turbo's
+      6.1e-3, so the graph change costs about one kv8 quantization and a quarter of a turbo
+      one. The tiled null is 0 at the method's own settings (no multi-query read ever touches
+      a quantized cache for prompts under one chunk); with a 2-token chunk it is 1.6e-4 (the
+      four prompts that get such reads: null 6.6e-4 vs 7.2e-4 for the change). Limit: the
+      default prompts give contexts of at most about 48 tokens. Accepted.
 
 Exit: selection is data; `qwen38TrellisM4ProAccepts` and the nested ternary are gone.
 
@@ -459,15 +729,94 @@ Exit: selection is data; `qwen38TrellisM4ProAccepts` and the nested ternary are 
       - A verify window that crosses a lego's start converts even if its tail is rejected; the
         lego converts on commit while a speculative round is armed (the cache's own state).
 - [ ] Delete `forwardHiddenMixed` and `forwardHidden` from the contract.
+- [x] Landed (`refactor/composition-e2`, 24dce86d, twelve commits on d71467c4; merging onto the
+      integration head with B3). The five scheduler files dispatch through the phase table
+      indexed by the rows they batched; verify width is rows × (depth+1); `AdaptiveDraftGate`
+      chooses among the built verify widths. The ANE is the scheduler's: a chunk runs on
+      `prefillChunk.ane` only when the composition built it, the forward holds one sequence
+      and the chunk is exactly the composition's chunk size; `aneAvailable()` and
+      `mbane_available` are deleted (the dylib no longer exports the symbol) and a bridge that
+      does not load or a program that does not compile fails the load with `AneBridgeError`.
+      One capture path (`withCapture`, bit-identical to `hiddenTap`); mixed iteration is the
+      composition-declared `mixed`; compiled decode is chosen at bind with no run-time
+      fallback; the media prefill phase takes embeddings and positions; known tokens go
+      through `appendKnown` over the committed read; planner steps map to chunk, tail and
+      decode and a planned chunk is never split; GLM verify is pinned at load; the DFlash 2
+      and MTP draft operations are width tables. Deleted: `forwardHidden`,
+      `forwardHiddenMixed`, `deprecatedPhase`, `hiddenTap`, `createAppend`, `MlxTokenAppend`,
+      `bindMlxGraph`, the `accepts` probe; `MLX_BUN_BATCH_VEC_SAMPLE` is the composition fact
+      `vectorGreedySampling`. Ratchet: `phase-by-shape` empty, the `hot-path-read` entries for
+      batch-group and two-model gone, nothing added. Exit criterion met: on the M4 Pro
+      composition no TrellisLinear or generic block in `decode.one`, `decode.twoToThree` or
+      `decode.four` (factored row kernels at 1–3, the matrix-unit down at 4), where the head
+      ran the generic blocks at four rows; the identity tests at maxDiff 0 with and without
+      the ANE and on the real artifact; every real-weight suite at the head's counts and lines.
+      Digests: 44 of 50 cells identical to the head; the rest are the two accepted classes of
+      change, whole chunks of one sequence on the ANE under the 128-token override (fp16, the
+      C3 KL gate; with the bridge off every one-row digest equals the head) and the row
+      kernels at 2–8 rows where the head fell to generic (the bit-stability decision). Found:
+      the remaining bind-time env reads, `MLX_BUN_COMPILED_DECODE`, `MLX_BUN_MIXED_PREFILL`,
+      `MLX_BUN_MIXED_TOKEN_BUDGET`, `MLX_BUN_PREFILL_TAIL_SPLIT` and `MLX_BUN_GRAMMAR_JUMP`,
+      are allowed by the rules but belong in the composition record the way E3 placed
+      `speculativeAffineKv` (owner: the B3 planner-side item). Owed: a teacher-forced KL of a
+      request at four rows against the same request at one row on the M4 Pro composition, the
+      number the bit-stability decision promised to record; the paired benchmark, which E2
+      could not run on a busy machine, runs on the merge.
+- [x] Merged with B3 onto the integration branch (832ac8b1): no textual conflict; B3 had kept
+      the layout function names over its table, so E2's callers bound unchanged; one fix,
+      B3's `cache-lego-methods` test still called the deleted `forwardHidden` /
+      `logitsFromHidden` (typed `any`) and now drives the phases, with its KL numbers
+      unchanged. Both generators produce no diff. Ratchet: both parents' deletions, nothing
+      new (left: geglu 1, glm52 2, flash-cce 9, the TQ graph's `graph-extends` 2, four
+      `cache-escape`). Gates: typecheck clean; architecture 21; drift 7; `cache-contract`
+      190/190; root test exit 0 (inference 2347 pass / 85 skip); every real-weight suite at
+      E2's counts and lines; the 100-cell digest matrix (five artifacts × five schemes × two
+      chunk sizes × one and four rows, 250 row digests) identical to E2; `qwen-trellis-parity`
+      on the M1 Max 4/4 bit-exact. Inventories at 1 / 2 / 4 / 8 rows: factored row kernels,
+      the matrix-unit down at four, the matrix-unit set at five to eight, generic 0 at every
+      width. M1 Max paired check, workflow steps, preflight clear: against main, Trellis TQ
+      decode 14.1 → 14.0 (0.995 [0.989, 1.002]), prefill 1k 120.5 → 121.8, cold TTFT 6284 →
+      6217 ms; e4b decode 63.1 → 63.0, prefill 954 → 961, TTFT 702 → 697 ms; against the
+      previous head within noise everywhere. The workflow's own run on #339 at 832ac8b1 (2026-10-12, preflight clear): no regression outside the band, Trellis TQ decode 0.997 [0.991, 1.003], e4b decode 0.999 [0.998, 1.000], every metric within noise. At 6fe59e7c (the generated M1 Max graph as the candidate, 2026-10-12): Trellis decode 14.2 → 14.1 (0.997 [0.994, 1.000]) and e4b decode 63.1 → 63.0 (0.998 [0.997, 0.999]) both flagged, e4b on a graph that commit did not touch and both intervals touching 1: the within-session band is narrower than session drift, which the alternating-sessions follow-up fixes; prefill and TTFT within noise. Found: Trellis decode RSS on the M1 Max is
+      7614 MB on main and 12050 MB merged (11843 MB already at 918a6afb, so it predates E2
+      and B3). Bisected 2026-10-12, no regression: on main, 30412523, d71467c4, 33c7f5be and
+      832ac8b1 the worker holds 10.71 GB after warm-up and 11.38 GB after three decodes under
+      bf16 and under kv4 alike (MLX active 10.52 → 11.22 GB), `vmmap` identical (10.5 GB of
+      GPU memory in 1796 regions on both), the M4 Pro identical too. The workflow's main
+      readings (5582, 7614, 8156 MB across runs; the head steady at 12.0 GB; main first in
+      every run) are `ps` RSS undercounting: on the M1 Max neither tree pins the model (12 GB
+      is under half the 26.8 GB working set), so the OS drops pages from the process's count
+      without freeing them, and a decode at 14.4 tok/s over 10.5 GB of weights cannot hold
+      5 GB. Follow-up for the perf check: report the worker's MLX active memory (`/stats`) or
+      physical footprint, not `ps` RSS. Also seen on every tree: MLX active grows about
+      180 MB per request (157 under kv4), the prefix cache keeping each request's state. Not
+      run: both M4 Pro benchmarks (its preflight
+      failed 90 times on 4.5 GB of swap; the machine needs a reboot) and the DFlash 2
+      comparison anywhere (the M1 Max's artifact snapshot lacked `final_gain` until
+      2026-10-12, now copied in). Owed on a rebooted M4 Pro: the default and the DFlash 2
+      adaptive paired runs, main against the integration head.
 
 Exit: one request and four concurrent requests on the M4 Pro composition both dispatch the
 Trellis row kernels for their width, shown by the op inventory diagnostic, with no generic path
 entered; a request's output across batch widths satisfies the bit-stability decision above;
 paired batched-lane benchmark records the gain at one and four rows.
 
+Baseline for that benchmark (2026-10-11, M4 Pro, the ladder's command: the Trellis artifact,
+`--kv-quant 4`, the DFlash 2 drafter, `--num-draft-tokens adaptive`; six chat prompts × two
+reps, greedy, 256 tokens, HTTP, medians; main and the integration head alternated, one server
+at a time): decode main 29.16 / 30.54 tok/s, d71467c4 29.40 / 28.95 tok/s (rounds 1 / 2);
+time to first token in the quiet round 183 / 176 ms at about 100-token prompts. Equal within
+the per-prompt spread (20–41 tok/s on both). Two things the reproduction found: on main the
+DFlash 2 provider needs `MLX_BUN_DFLASH2_TARGET_BASIS` pointing at the basis JSON on the M1 Max
+share, otherwise the drafter runs unrotated and decode is plain (10.8 tok/s with the drafter
+bound; the integration head declares the basis from the artifact's sidecar, E4); and the
+repo's paired serve benchmark (`scripts/bench/plan.ts`) has no DFlash 2 / adaptive
+configuration, so this was measured with a harness outside the repo. F's perf item adds that
+configuration so the served composition is what the check measures.
+
 #### E3. App
 
-- [ ] `--kv-quant` composes the cache lego before the model loads. D1 measured why this cannot
+- [x] `--kv-quant` composes the cache lego before the model loads. D1 measured why this cannot
       wait: the scheduler still calls `makeCache()` with no scheme and `kv-maintenance` converts
       to the plain affine cache, so the entire M4 Pro graph (which reads through the cache
       instead of injecting its KV4 and folded kernels) serves `--kv-quant 4` through the generic
@@ -479,10 +828,45 @@ paired batched-lane benchmark records the gain at one and four rows.
       the KV4 cores, several on the generic path); the choice keys on the cache's own layout, as
       the tiled-causal set does. E3's gate: the composed lego against the old graph's injected
       cores at maxDiff 0 on the real artifact.
-- [ ] `MLX_BUN_QWEN_SPEC_KV4` (read once in the M4 Pro constructor since D1) and
+- [x] `MLX_BUN_QWEN_SPEC_KV4` (read once in the M4 Pro constructor since D1) and
       `MLX_BUN_MIXED_PACKED_MLP` become composition facts.
-- [ ] The per-request `kvBits`, `kvConfig` and `quantizedKvStart` options leave `generation/types.ts` and the server request plan; the cache lego is composed at load from `--kv-quant` and `--quantized-kv-start`.
+- [x] The per-request `kvBits`, `kvConfig` and `quantizedKvStart` options leave `generation/types.ts` and the server request plan; the cache lego is composed at load from `--kv-quant` and `--quantized-kv-start`.
 - [ ] `--num-draft-tokens adaptive` is served by the scheduler choosing among the built widths; a number is fixed depth.
+- [x] Landed (`refactor/composition-e3`, five commits on `30412523`). Every graph's `makeCache()`
+      composes from `composition.kv`: plain bf16; bf16-first affine (uniform, or per listed
+      layer under `config`), read kernels from `KvStorageScheme.kernels` (`--fused-sdpa` on =
+      tiled-causal, off = unfused, unset = by scheme); bf16-first TurboQuant dense (Qwen) or
+      deferred (Gemma 4, MiniCPM5); `Bf16FirstKv4Head256Cache` for the M4 Pro composition,
+      reading with the KV4 kernels while its own layout holds one row and with the plain affine
+      kernels when it holds more. Gate (a) passed on the real artifact at maxDiff 0 (chunk,
+      conversion point, tail, decodes, verify 3 and 8); 24 app-path digests on e4b and MiniCPM5
+      unchanged; speculative-group and gemma4-paged lines identical. Deleted: the per-request KV
+      options, kv-maintenance's serial conversion branch, `served-affine-kernels.ts`, every
+      `MLX_BUN_NO_FUSED_SDPA` read and write. `speculativeAffineKv` and `packedMixedMlp` are
+      composition fields, default on, with no env override. Behavior that changed, accepted:
+      prefix and checkpoint entries stored at the conversion start are saved converted (reuse
+      is identical; a request diverging before the start recomputes instead of reusing);
+      speculative prefix namespaces and method keys dropped their KV fields, so entries written
+      before E3 miss once. Found and assigned: under a quantized scheme the generated Gemma 4
+      graphs matched on raw cache signatures and fell to the monolith on every forward (numbers
+      unchanged, fast path lost); the merge of E1 + D2 + E3 deletes that run-time match and the
+      table selects them on the scheme (gate: `gemma4-generated` asserts the generated forward,
+      digests equal `30412523`). The deprecated attention views and the donor reads still pick
+      the decode kernel by query count (E2 deletes the views; the donor reads ride the Gemma
+      assistant-drafter item). Real-weight tests E3 ported but did not run are the merge's to
+      run: `gemma4-generated`, `compiled-decode`, `ordinary-continuation`,
+      `affine-grammar-spans`, `gemma4-parity`, `minicpm5-parity`, the Trellis parity tests.
+      Merged (c691ba23): all of those ran on both trees and match line for line, except
+      `affine-grammar-spans` on e4b, which fails identically on base (the plan routes e4b's
+      grammar jump through the speculative method, so e4b is not a model that test accepts).
+      Under `--kv-quant 4` the Trellis app-path digests differ from base: base served the
+      generic read (D1's regression, logits 0.028), merged serves the composed KV4 lego, which
+      E3's gate proved equal to the old graph's injected cores. Closed: the app-path digests on
+      `main` (9593d881) under kv4 with `--fused-sdpa` unset, on and off, and bf16, equal
+      d71467c4's token for token and logprob for logprob (`69e8cc07…` / `ee58a136…` for kv4),
+      so the loop is closed through the scheduler. The generated Gemma graphs needed no new read: with D2 merged they have no
+      run-time match, the template builds the bf16-first lego on every listed cache, and the
+      gate records every cache read (bf16 first, quantized after) with digests equal to base.
 
 Exit: `serve-cli.test.ts` and the draft-flags test pass; the CLI inventory regenerates with no
 new flag.
@@ -509,6 +893,57 @@ new flag.
 
 Exit: acceptance rate on the paired MTP bench unchanged; no env read in `dflash2-source.ts`.
 
+#### E5. Drafters compose like graphs
+
+Found by review on 2026-10-11 against the integration tree.
+
+- [ ] The MTP draft loop (`generation/speculative/bindings/qwen-mtp-rows.ts`) decides per token
+      whether a listed draft vocabulary exists, tries that projection, falls back to the full
+      head, then chooses greedy or sampled selection. The draft group binds one selection
+      operation at composition (projection over the listed vocabulary or the full head; greedy
+      argmax or the sampler's draw) and the loop calls it on the hidden output; no branch in the
+      loop. The same for the DeepSpec and assistant sources where they repeat the pattern.
+- [ ] `DraftProvider.open()`, the code's per-request draft source, is deleted from the contract.
+      There is one lane and a single request is a batch of one (Josh, 2026-10-11: "we only have
+      batched, and serial should just be a batch of one"); `Dflash2Provider.open()` throwing
+      "runs only in the batched speculative lane" is the evidence that the method is a promise
+      no composition keeps.
+- [ ] The MTP companion's forward calls its named phase, not `deprecatedPhase` (rides E2's
+      deletion); its draft operation is width-classed like the graph's `verify` (the DFlash 2
+      entry under E2 covers both drafters).
+
+- [x] Landed (`refactor/composition-e5`, 2445e2a5, eight commits on 832ac8b1; merging onto the
+      integration head with B3's planner side). The selection operation is a width table of
+      `(output, steps) → ids`, built once in `QwenMtpRows`' constructor from the request's
+      `DraftRowSampling` (`sampled`, `greedy` or `listed` with the provider's declared
+      vocabulary, resolved once per request in `bindSpeculativeGroupRequests`; the selection
+      kind is part of the group key); the loop calls it with no branch. The assistant drafter's
+      rows are a width table with its head bound at construction (centroids per width, or the
+      tied-embedding forms), the DeepSpec step selection bound in its constructor. Deleted:
+      `DraftProvider.open()`, `DraftSource`, all seven per-request sources, the serial runner
+      (`run.ts`: `specRun`, `specServeRun`, `generateSpeculative`), `createSpeculativeMethod`,
+      `bindLegacySpeculativeModel`, the flags `MLX_BUN_MTP_ADAPTIVE_DEPTH_THRESHOLD` and
+      `MLX_BUN_SPEC_TRACE`; `DraftProvider.grouped` is required. Callers: the app's pairing
+      probe opens the grouped prefill; training's `calibrateDrafter` runs each prompt through
+      the gateway's placement at one row; the CLI's direct generate never drafted. Behaviour
+      change, accepted: under a listed vocabulary a curve, HLG or XTC request forms its own
+      group instead of pushing its batch mates onto the full head. Gates: drafts bit-identical
+      on e4b + assistant (speculative-group under bf16/4/config), Trellis + MTP
+      (`qwen-mtp-group-prefix`, same summary line) and Trellis + DFlash 2 (teacher-forced
+      blocks at depth 7 and 3, same digests); `bench-mtp` mtp2/mtp4 acceptance per round
+      identical over 32 samples (timing unqualified: shared machine, no preflight); 12 of 12
+      digest cells identical. Not gated on real weights (no artifact cached): DeepSpec's step
+      selection, the tied-embedding assistant head, `calibrateDrafter` end to end, GLM-5.2
+      MTP. Found: `MLX_BUN_SPEC_GREEDY_DRAFT` is still a bind-time env read (the B3 planner
+      item converts it); DSpark's pruning still branches per call (not the selection
+      pattern); the drafter port's `forwardInfer`, `draftBlock` and `projectContextKV` have no
+      source consumer left (delete with the final cleanup).
+
+Exit: no `sampling!.vocabulary` / `greedy` branch inside a draft loop; no `open()` on
+`DraftProvider`; for fixed inputs under teacher forcing the drafted tokens on e4b (assistant) and
+on the M4 Pro composition (MTP, DFlash 2) equal today's bit for bit; paired MTP bench acceptance
+unchanged.
+
 ### Phase F: gate and documentation
 
 - [ ] Add the rules from the top of this file to `architecture.test.ts`, each proven on the
@@ -528,22 +963,188 @@ Exit: acceptance rate on the paired MTP bench unchanged; no env read in `dflash2
       - `models/qwen/mtp.ts` `makeMask`: D3, the MTP companion reads through `attend`.
       - `packages/training/src/kernels/flash-cce.ts` per-dispatch `runtimeValue`: C2's rule,
         the choice becomes a constructor argument of the training kernel's owner.
+- [x] Ratchet emptied (`refactor/composition-ratchet-zero`, 6b7593e6, thirteen commits on
+      6fe59e7c; merging with E5 and the B3 planner side). `cache-escape`: the DFlash 2 context
+      rows append through `appendWindow`; the Gemma 4 and MiniCPM5 training forwards and the
+      padded scoring batch run on stateless `TrainingCache`s (the KV-sharing layer reads its
+      donor through the donor's training cache; `makeTrainingMasks` gone); the contract's
+      seven hatches and their three interfaces are deleted, their state-internal callers
+      reach storage through `state/kv-storage.ts`. `hot-path-read`: `geglu` takes `compiled`
+      as an argument stored by its owners' constructors; GLM-5.2's MLA block takes its read as
+      a strategy at construction through the new `LatentAttentionCache` contract (six
+      conformance cells; the `instanceof MLACache` reads gone); the training flash-CCE kernel
+      is owned by `FlashCce`, constructed with options the trainer reads once when it composes
+      a run (`MLX_BUN_FLASH_MIN_M` moved there from a per-dispatch read in `loss.ts`). The
+      three `trainDrafter` failures (the synthetic target without the width-classed head
+      since E2) are fixed: training native 64 pass / 0 fail; with MiniCPM5 weights 80/0, with
+      e4b 77/3 (the three refuse e4b by design, as on the head). Gates: synthetic identity at
+      maxDiff 0 against frozen copies for Gemma 4, dense, Qwen 3.5, DiffusionGemma, the
+      generated Gemma graphs (395 cases, every training path, padded scoring, GeGLU off) and
+      GLM-5.2 (84 tensors); training forwards' real-weight digests identical (e4b 7, MiniCPM5
+      10, Llama 2); `perplexity` identical on Llama 1B and e4b; DFlash 2 teacher-forced blocks
+      identical; 30 app-path row digests identical. Left, owed: `MLX_BUN_COMPILED_GEGLU` is
+      read once in the Gemma 4, generated and DiffusionGemma constructors (a composition
+      field, `compiledGeglu`, with B4); the MLA block still chooses absorbed or reconstructed
+      attention by token count ("auto"), a phase the scheduler names (with B4's GLM-5.2
+      legos); `activePrefixLayout()` inside the training forwards' block RoPE and
+      `isCompiledTrace()` in `geglu` are run-time reads the gate does not flag (training and
+      compile-context queries; decide or list by name); the frozen references
+      `tests/models/full-sequence-reference.ts` and `geglu-reference.ts` go with the other
+      oracles after the merge; the preserved bug that the flash path ignores the block-sparse
+      mask under prefix-shared training stays as found.
+- [x] E5, the B3 planner side and the ratchet item merged together (0eb1e42b on 6fe59e7c, then
+      onto the bench tooling at e436ccf5): generators regenerated with both sides (the M1 Max
+      template takes B3's deletions: no `kv`, `speculation` or paged refusal in `declareGraph`);
+      `composition.ts` keeps C3's split with B3's fields and the compiled-decode decision;
+      `full-sequence.ts` runs branch 1's stateless training caches through B3's
+      `trainingStandIn`; E5's selection reads `greedyDraft` and `prefillTailSplit` from the
+      composition (no `MLX_BUN_SPEC_GREEDY_DRAFT` reader left); the per-request sources and
+      the serial runner deleted as E5 intended. Gates: all 50 digest cells identical to
+      6fe59e7c on the M4 Pro (Trellis kv4 `69e8cc07…`), 10 of 10 on the M1 Max; identity at
+      maxDiff 0 on both; every real-weight suite at its branch's lines; training native 64
+      pass / 0 fail (the required check's failure fixed); root test exit 0. Found, pre-existing
+      on 6fe59e7c: `sliding-grammar-fill` with Llama 3B at window 8 fails one case ("a
+      cancelled row leaves its peer equal to its B1 output"), token-identical on every tree;
+      with Llama 1B it passes 9/9; owed to the final gate pass, with its first failing commit.
+      `packages/inference/README.md` still names `MLX_BUN_COMPILED_DECODE=0` three times for
+      the runtime oracle (the final cleanup).
 - [ ] Each new rule's failure message names the paved road, in the style of the existing
       "scheduling reaches storage through the row-layout port" message.
-- [ ] Make the library checks a required status check on `main`, so a PR with a failing gate is
-      not mergeable (#312 merged with its checks still pending).
+- [x] Make the library checks a required status check on `main`, so a PR with a failing gate is
+      not mergeable (#312 merged with its checks still pending). Green on `refactor/composition` at fa811ff2 (2026-10-12) after the job limit went to 90 minutes and the package consumer learned to copy the installed source its test helpers reach through `../../src`.
 - [ ] Automatic performance-regression check. GitHub's runners have no Apple GPU, so this needs
-      a self-hosted runner on a quiet named Mac (the M4 Pro, or the M1 Max over SSH). For a PR
+      a self-hosted runner on a quiet named Mac (the M4 Pro, or the M1 Max over SSH). Runner
+      installed 2026-10-11 on the M1 Max (Josh's go): name `m1max`, labels `self-hosted, macOS,
+      ARM64, m1max, gpu`, a launch agent in the logged-in session under `~/actions-runner`. No
+      prior M1 Max numbers exist (the refactor came before measurement moved there); the check
+      is paired, head against base on the same host in one run, so its first run on the
+      integration PR is the first M1 Max measurement of both. Landed on the integration branch
+      (918a6afb): `.github/workflows/perf.yml` (pull requests to main touching kernels, layers,
+      models, state, execution, mlx or native sources; job-level guard so a fork's PR schedules
+      nothing on the runner; read-only token; one measurement at a time, never cancelled) and
+      `scripts/bench/perf-check.ts` (main's preflight thresholds; the paired delta as the
+      geometric mean of per-request ratios with a 95% Student-t interval; a metric fails only
+      when the whole interval is on the worse side; exit 0 pass / 1 regression / 2 no qualified
+      numbers). First run, 2026-10-12 on #339 (918a6afb vs main 9593d881), preflight clear
+      before and after, default configuration (bf16 KV, no drafter): Trellis 27B on the TQ
+      graph decode 14.4 → 14.3 tok/s (0.994 [0.989, 0.999], flagged), prefill 1k 123.4 →
+      125.5, cold TTFT 1k 6136 → 6032 ms; e4b on the generic graph decode 64.4 → 64.4, prefill
+      993.6 → 1001.1, TTFT 674 → 670 ms, all within noise. The flag is the per-step cost E2
+      removes (the TQ graph still runs through `deprecatedPhase` and the bf16-first wrapper on
+      every decode step); rerun after E2. Follow-ups: each tree runs in one server session, so
+      the interval covers request noise but not session drift; alternate sessions (ABAB) so
+      the band includes it. Add the DFlash 2 adaptive configuration (`--kv-quant 4`,
+      `--num-draft-tokens adaptive`) to `scripts/bench/plan.ts` so the served composition is
+      what the check measures; the drafter is in the M1 Max's hub cache since 2026-10-11. For a PR
       that touches `kernels/`, `layers/` or `models/`, run the existing paired serve benchmark
       against `main` with the preflight gate, and fail on a regression outside the paired noise
       band. Unqualified numbers never gate; the check reports the paired delta and its interval.
 - [ ] Agent briefs for this plan point at the generator and the contract, never at an example
       file to copy; copying the nearest example is how the M4 Pro graph inherited the fallback.
-- [ ] ARCHITECTURE.md: the cache owns the read; phases are named; a specialized graph extends
+- [ ] The app-path digest (token ids plus top-8 logprobs over 32 greedy tokens through
+      `generate`, per KV scheme and `--fused-sdpa` setting) and the teacher-forced decode KL
+      (the 16 default prompts, last 32 tokens forced, `klPerToken`) become
+      `packages/inference/scripts/` tools with `--help`: three agents reconstructed each from
+      earlier transcripts (E3, the merge, the Trellis checks). Their consumer is every gate in
+      this plan and the perf workflow's correctness check. Landed
+      (`refactor/composition-bench-tooling`, ea6c31d9, integration branch fast-forwarded):
+      `digest.ts` (cells as generate flags, rows, prefill-chunk override, one process per
+      cell, `compare`) and `teacher-forced-kl.ts` (`capture` / `compare`, the 16 prompts, the
+      last 32 forced, `klPerToken` statistics), tests under `tests/scripts/`; both reproduce
+      the saved harnesses' hashes and captures byte for byte on Llama 1B. The perf check
+      landed its follow-ups: `--sessions N` alternates main and head (A B A B) and the decision
+      pools the pairs and shows per-session medians; memory is the worker's MLX active memory
+      and physical footprint from `/stats`, not `ps` RSS; `perf.yml` runs two sessions per
+      tree and a report-only numerical check (digests and the kv4 teacher-forced KL) after
+      the decision. First alternating run (ea6c31d9 vs main, M1 Max, preflight clear): Trellis
+      decode 13.8 → 13.8 (1.000 [0.991, 1.009], 10 pairs), prefill 1k 121.3 → 121.7, TTFT
+      6240 → 6226 ms, peak MLX active 15457 → 15457 MB; e4b decode 63.1 → 63.1 (1.000
+      [0.997, 1.003]), prefill 966.7 → 957.2, TTFT 693 → 700 ms, MLX active 7759 → 7871 MB;
+      the earlier 0.997 / 0.998 flags are inside the band. Numerical check: every digest cell
+      identical between main and the head on the M1 Max; kv4 KL 0 at all 487 positions. The
+      DFlash 2 adaptive configuration exists in `plan.ts` (`--dflash2-draft ID=dir[=basis]`,
+      the basis passed to both servers) but cannot run on the M1 Max: `--num-draft-tokens
+      adaptive` needs `verifyRoundCosts` measured on the host, which only the M4 Pro graph
+      declares. Owed: the generated M1 Max graph declares verify costs measured on the M1 Max
+      (a generator input, like the widths), and `perf.yml` measures DFlash 2 there, at fixed
+      depth 7 until then. Landed (merged into `refactor/composition` at 6f27a434). Verify costs
+      are a composition's measured numbers, declared in `QWEN38_COMPOSITIONS` and emitted by
+      the generator (the M4 Pro's had sat in the GPU's kernel table, where another composition
+      on that GPU would have inherited them; moved, the M4 Pro graph byte-identical). The M4
+      Pro's method, recovered from a 2026-10-09 transcript, is now in Git: `bench-mtp.ts`
+      gains a depth-0 arm (plain greedy decode) so each width's round cost is relative to a
+      plain step measured in the same plan. M1 Max measurement (32 GB, preflight clear,
+      generated graph, real artifact and drafter, two prompts × 128 tokens, bf16 KV, four
+      repetitions in fresh alternating processes; plain decode 69.73 ms per token): rows 2 /
+      3 / 4 cost 1.89 / 2.35 / 2.97 plain steps (intervals under 1%); rows 5 / 6 / 7 / 8 cost
+      12.22 / 13.16 / 13.02 / 12.88, because above four rows the generic Trellis MLP takes the
+      prefill kernels. Declared as measured, no flattening. The M1 Max identity gate: 14 tests,
+      80,556 tensors at maxDiff 0 with the costs on the generated graph. `--num-draft-tokens
+      adaptive` now starts there; unqualified sanity decode 14.2 to 18.0 tok/s against plain
+      14.3. The paired benchmark gained `dflash2-d7-baseline` (main refuses adaptive, so main
+      runs depth 7 against the head adaptive, reported as context, never gated); the one
+      completed M1 Max run of it (75f33088 vs main): decode 3.7 → 11.5 tok/s, prefill 1k 102.9
+      → 115.0, cold TTFT 7358 → 6580 ms, aggregate ×4 10.6 → 8.5, peak MLX active 16795 →
+      17768 MB; the decision no longer voids a check for a context configuration's spread.
+      Facts for the M1 Max, recorded, not planned here: DFlash 2 barely pays on that chip
+      (depth 2 beats plain decode by about 12%); the adaptive gate never drafts fewer than one
+      token, so on low-acceptance text it runs 0.9 to 1.0× plain; its per-row costs ignore how
+      many requests are batched, so aggregate ×4 is lower adaptive than at depth 7. The same
+      record flagged Trellis default prefill 1k 122.0 → 121.8 (0.998 [0.996, 0.999]) and cold
+      TTFT 6206 → 6218 ms (1.003 [1.001, 1.004]) with two sessions: the band for prefill and
+      TTFT is still narrower than their drift; the numerical check had every digest identical.
+      Not run: a 4-bit KV sweep in `bench-mtp` (its KV option fails on the first drafted arm
+      with "No target row layout for kv:bf16-first:kv:quant:4:64"; `serve --kv-quant 4`
+      works), owed to the final gate pass.
+- [x] ARCHITECTURE.md: the cache owns the read; phases are named; a graph extends
       nothing; the exemplar sentence points at the regenerated graphs; the loader-level generic
       fallback is stated and the in-graph one forbidden; the one-way-per-pattern list above.
 - [ ] PLAN.md: first decision updated per the off-composition decision; this file's closed phases
       deleted.
+- [ ] Final cleanup, after B2 and B4 land (Josh, 2026-10-12: every allowed document fully
+      correct, no stale information; every comment up to date). The documents, each read in
+      full against the merged tree and corrected: `README.md`, `ARCHITECTURE.md`,
+      `CONTRIBUTING.md`, `AGENTS.md`, `CLAUDE.md`, `PLAN.md` (closed blocks deleted),
+      `apps/mlx-bun/README.md`, `apps/website/README.md`, the website's hand-written pages
+      (`apps/website/src/content/docs/about/correctness.md`, `getting-started/installation.md`,
+      `introduction.md`, `quickstart.md`, `guides/library.md`, `index.md`; the generated
+      reference regenerates), `packages/inference/README.md`, `packages/mlx/README.md`,
+      `packages/hub/README.md`, `packages/quantize/README.md`, `packages/training/README.md`,
+      `packages/web-shell/README.md`, every `packages/module-*/README.md`, and
+      `packages/module-memory/src/skills/memory/SKILL.md`; the `THIRD_PARTY_NOTICES.md` files
+      are generated. Comments: a sweep of every source file for mechanisms this refactor
+      deleted, each hit rewritten or removed, with the grep terms recorded here so the sweep
+      is repeatable: `deprecatedPhase`, `hiddenTap`, `forwardHidden`, `forwardHiddenMixed`,
+      `updateAndFetch`, `makeMask`, `quantizedAttention`, `affineConversion`,
+      `turboConversion`, `serial lane`, `serial path`, `serial source`, `aneAvailable`,
+      `mbane_available`, `kvBits`, `kvConfig`, `quantizedKvStart` (as request options),
+      `#matches`, `TQ graph`, `qwen38-27b-trellis-tq`, `GENERATED` map, `generated-graph`,
+      `legacyForwardWithTaps`, `DraftSource`, `open()` on a provider, `specRun`,
+      `bindMlxGraph`, `createAppend`, `MlxTokenAppend`, every `MLX_BUN_*` key that became a
+      composition field (`NO_FUSED_SDPA`, `QWEN_SPEC_KV4`, `MIXED_PACKED_MLP`,
+      `BATCH_VEC_SAMPLE`, `COMPILED_DECODE`, `MIXED_PREFILL`, `MIXED_TOKEN_BUDGET`,
+      `PREFILL_TAIL_SPLIT`, `GRAMMAR_JUMP`, `SPEC_GREEDY_DRAFT`, `BATCH_SSM`, `COMPILED_GEGLU`,
+      `QWEN38_TQ_*`, `DFLASH2_TARGET_BASIS`), "plan" where it means the M4 Pro graph's old
+      whole-forward plans, "fallback" or "generic" where a graph is described as falling back,
+      "capability" where it names a cache format. "Specialized graph" wherever it appears: there is no such kind; every graph is an entire
+      graph built for a composition, and the word is the old subclass-with-fallback world's
+      (Josh, 2026-10-12); the source comments in `contracts/mlx/width.ts`, `models/factory.ts`
+      and `models/qwen/checkpoint.ts` and the inference README say it today. At e436ccf5 the sweep still finds: `serial
+      lane` 1, `serial path` 4, `quantizedKvStart` 1, `MLX_BUN_COMPILED_DECODE` 3 (the
+      inference README's runtime-oracle commands), `MLX_BUN_SPEC_GREEDY_DRAFT` 1,
+      `generated-graph` 1. Also: the frozen oracle files and test references headed "NOT A
+      PATTERN TO FOLLOW" are deleted with their identity tests' oracle halves (the generator
+      drift tests and the real-weight digests remain the gates); the drafter port's unused
+      `forwardInfer`, `draftBlock` and `projectContextKV`; the `sliding-grammar-fill` Llama 3B
+      case bisected to its first failing commit. From Codex's review of #339, still true on the
+      head: `TwoModelProvider.dispose()` releases only its `Weights`, so a graph used as a
+      two-model draft that owns MLX constants or Neural Engine programs (`#owned`) leaks them
+      on unload; the fix is the graph contract requiring `dispose()` on every graph
+      (generic graphs release nothing), called by every provider and by the host, not an
+      optional-method probe; done here because B4 is editing the graph files now.
+      case bisected to its first failing commit. Exit: the sweep returns nothing but
+      diagnostics and history; every document names only what the tree contains; the
+      architecture gate's documentation generators run clean.
 - [ ] `packages/inference/README.md`: the M4 Pro graph paragraph describes phases, not plans.
 
 Exit: `bun test packages/inference/tests/architecture.test.ts` passes with the ratchet table
@@ -569,7 +1170,7 @@ the DFlash 2 numerics, the bench scripts, modules, web, training.
 - [ ] Establish real-weight parity for Qwen Trellis and Gemma, and extend MiniCPM
   beyond the [verified basic decode path](packages/inference/README.md#external-parity-evidence),
   against the applicable external oracle and main: logits, state continuation and
-  specialized paths under identical artifacts and settings. Python environments and
+  every graph's paths under identical artifacts and settings. Python environments and
   generated references stay outside the repository; reusable runners are in Git
   ([runtime comparison](packages/inference/README.md#repeatable-runtime-comparison)).
   Exit: opt-in comparisons meet the numerical contracts against pinned published
@@ -741,6 +1342,29 @@ on main and the refactor is only useful when investigating a behavior difference
 
 One line per idea: the question and the domains it touches. Picking one up makes it an item
 above with an exit; an answered one moves its finding to the owning documentation and is deleted.
+
+- **Width tables as a LUT keyed by exact row count** (graphs, scheduler; Josh, 2026-10-11). Row
+  count is a property of the work; the class boundaries (`one`, `twoToThree`, `four`,
+  `fiveToEight`, `wider`) are properties of one composition: that model, those kernels, that
+  hardware, measured once (D1, including the separate four-row path that preserved the bits).
+  Exposing them in the shared contract makes every implementation adopt vocabulary derived from
+  that experiment: local optimization results promoted into shared API structure. The durable
+  contract is "perform this named phase for work of this width"; the composition supplies the
+  prepared mapping, binding each width to the operation its kernels were measured best at, with
+  several widths aliasing one bound operation. The scheduler describes the work as N rows wide
+  and indexes, choosing nothing; new kernels change the bindings a generator emits, never what
+  the scheduler understands. The general rule behind it: a measured boundary belongs to the
+  composition, never to a contract. Pick up when a measurement first needs a boundary the named
+  classes cannot express, or when the generated graphs are the only width tables left.
+- **Formal proofs composed along the contracts** (kernels, layers, graphs, cache, scheduler; Josh,
+  2026-10-11): because every piece implements a contract defined between layers and nothing crosses
+  one any other way, correctness can be proven per lego (a kernel against its reference op over the
+  composition's fixed shapes, a cache lego against the conformance obligations, a graph against its
+  phase table) and composed the way the program composes, kernels to layers to graphs. Today's
+  bit-identity gates are the empirical form; the contracts' JSDoc obligations (ownership, disposal,
+  ordering, numerical guarantees) are the statements. Proofs compose over structure and bit-identity
+  under the same kernels, not real-number equality. Strata (https://github.com/strata-org/Strata) might be a useful tool to explore (Josh,
+  2026-10-12).
 
 - **SkillOpt skill optimization** (chat, memory, a new optimization domain; [research](https://github.com/joshuarossi/mlx-bun/pull/247)):
   can SkillOpt's gated skill-edit loop (Microsoft, MIT, arXiv:2605.23904) improve the default

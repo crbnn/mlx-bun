@@ -4,7 +4,7 @@ import type { RequestShape, Vision } from "../../src/engine/completion";
 import { declareGraph } from "@mlx-bun/inference/models";
 import { UnsupportedExecutionError } from "../../src/engine/completion";
 import { runtimeConfig } from "@mlx-bun/inference/runtime/config";
-import type { MlxGatewayBinding, MlxBatchGroup, RowPromptCache } from "@mlx-bun/inference/execution";
+import type { MlxGatewayBinding, MlxBatchGroup } from "@mlx-bun/inference/execution";
 import type { GenerateOptions } from "@mlx-bun/inference/generation";
 import type { KvStorageScheme, ResolvedExecution } from "@mlx-bun/inference/contracts/portable";
 import type { DeviceStepSampler, DeviceStepSamplerConfig } from "@mlx-bun/inference/sampling";
@@ -17,17 +17,21 @@ const execution: ResolvedExecution = { method: "autoregressive", mechanism: "con
   compiledDecode: false, grammarJump: false, reasons: [] };
 const result = { promptTokens: 1, cachedTokens: 0, generatedTokens: 1,
   finishReason: "length" as const, prefillMs: 1, decodeMs: 1 };
+/** The cache service a gateway borrows: here, its checkpoint interval and a saved-prefix read ahead. */
+type GatewayCache = NonNullable<NonNullable<ConstructorParameters<typeof GenerationGateway>[2]>["cache"]>;
+const cacheOf = (fields: { checkpointEveryTokens?: number; prefetch?: GatewayCache["prefetch"] }) =>
+  ({ async prefetch() { return () => {}; }, ...fields }) as unknown as GatewayCache;
 function fake(options: { submit?: MlxBatchGroup["submit"]; plan?: MlxGatewayBinding["plan"]; failSetup?: boolean } = {}) {
   let samplingDisposed = 0, created = 0, capacity = 0, closed = false;
-  const group: MlxBatchGroup = { activeRows: 0, pendingRows: 0, projectedKvBytes: 0,
-    kvBudgetBytes: undefined, kick() {}, async close() { closed = true; },
+  const group: MlxBatchGroup = { activeRows: 0, pendingRows: 0, kick() {}, async close() { closed = true; },
     submit: options.submit ?? (async request => { await request.onToken(7); return result; }),
   };
   const binding = { config: { modelType: "replacement", eosTokenIds: [2] } as MlxGatewayBinding["config"], runtime: runtimeConfig(), capabilities: declareGraph(),
-    plan: options.plan ?? (() => execution), composeState: caches => caches,
+    plan: options.plan ?? (() => execution), reusesPrefix: () => true,
+    graph: { makeCache: () => [], config: { modelType: "replacement", eosTokenIds: [2] } as MlxGatewayBinding["config"] },
     continuationRequest(_execution, _options, _prompt, onToken) {
       if (options.failSetup) throw new Error("sampling setup failed");
-      return { continuation: { interval: 1, restore: () => null, resumeSampling() {}, captureOwned() {}, complete() {} },
+      return { continuation: { interval: 1, key: () => "fixture", seed: 0, seedWasExplicit: false, resumeSampling() {} },
         sample() { throw new Error("CPU fake never samples tensors"); }, plainGreedy: true,
         onToken, dispose() { samplingDisposed++; } };
     },
@@ -89,11 +93,11 @@ for (const [path, message] of [["prefetch failure", "prefetch failed"], ["wrong 
   const controller = grammar(), abort = new AbortController();
   const f = fake({ plan: () => ({ ...execution, method: "denoising", promptCache: false }),
     submit: async () => { submitted++; return result; } });
-  const gateway = new GenerationGateway(f.binding, 1, { promptCache: { async prefetch() {
+  const gateway = new GenerationGateway(f.binding, 1, { cache: cacheOf({ async prefetch() {
     if (path === "prefetch failure") throw new Error("prefetch failed");
     if (path === "abort after reservation") abort.abort(new DOMException("client left", "AbortError"));
     return () => {};
-  } } as unknown as RowPromptCache });
+  } }) });
   const s = shape(), placement = gateway.place(path === "wrong placement" ? shape() : s);
   try {
     await expect(gateway.run([1], { grammar: controller.value, visionPixels: pixels }, () => {}, undefined, s, placement, abort.signal))
@@ -295,7 +299,7 @@ test.skipIf(process.env.MLX_BUN_GEMMA2_NATIVE !== "1")("Gemma2 admits grammar, a
   } finally { await gateway.close(); }
 });
 
-test.skipIf(process.env.MLX_BUN_GEMMA2_NATIVE !== "1")("Gemma2 places shared generation checkpoints only with configured continuation persistence", async () => {
+test.skipIf(process.env.MLX_BUN_GEMMA2_NATIVE !== "1")("Gemma2 places shared generation checkpoints only when its cache service keeps them", async () => {
   const { UniversalDenseModel } = await import("@mlx-bun/inference/models/universal");
   const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
   const { KVCache } = await import("@mlx-bun/inference/state");
@@ -306,12 +310,12 @@ test.skipIf(process.env.MLX_BUN_GEMMA2_NATIVE !== "1")("Gemma2 places shared gen
   });
   const binding = bindMlxGateway(model);
   binding.createBatchGroup = () => { throw new Error("unexpected execution"); };
-  // serve enables gateway checkpoints only with an SSD store and --generation-checkpoint.
-  const gateways = [new GenerationGateway(binding, 4, { checkpoints: true }), new GenerationGateway(binding, 4)];
-  const [enabled, disabled] = gateways;
+  // serve's cache service keeps checkpoints only with an SSD store and --generation-checkpoint.
+  const gateways = [new GenerationGateway(binding, 4, { cache: cacheOf({ checkpointEveryTokens: 4 }) }),
+    new GenerationGateway(binding, 4, { cache: cacheOf({}) }), new GenerationGateway(binding, 4)];
+  const [enabled, ramOnly, disabled] = gateways;
   try {
-    expect(enabled!.place(shape()).execution).toMatchObject({ mechanism: "continuous", checkpoint: false });
-    binding.configureContinuation!({ checkpointPersistence: {}, checkpoints: {}, checkpointEveryTokens: 4 } as never);
+    expect(ramOnly!.place(shape()).execution).toMatchObject({ mechanism: "continuous", checkpoint: false });
     for (const request of [{}, { userSeed: true, hasRepetitionPenalty: true }])
       expect(enabled!.place({ ...shape(), ...request })).toMatchObject({ mechanism: "continuous",
         execution: { method: "autoregressive", promptCache: true, checkpoint: true, fill: false } });
@@ -326,8 +330,7 @@ test.skipIf(process.env.MLX_BUN_GEMMA2_NATIVE !== "1")("Gemma2 places shared gen
     for (const kv of [{ kind: "affine", bits: 4, groupSize: 64, kernels: "unfused" }, { kind: "turbo", kBits: 8, vBits: 3 }] as const) {
       const composed = bindMlxGateway(Object.assign(Object.create(UniversalDenseModel.prototype), { ...model, composition: { kv } }));
       composed.createBatchGroup = () => { throw new Error("unexpected execution"); };
-      composed.configureContinuation!({ checkpointPersistence: {}, checkpoints: {}, checkpointEveryTokens: 4 } as never);
-      const storing = new GenerationGateway(composed, 4, { checkpoints: true });
+      const storing = new GenerationGateway(composed, 4, { cache: cacheOf({ checkpointEveryTokens: 4 }) });
       try {
         expect(storing.place(shape())).toMatchObject({ mechanism: "continuous",
           execution: { method: "autoregressive", promptCache: true, checkpoint: true } });

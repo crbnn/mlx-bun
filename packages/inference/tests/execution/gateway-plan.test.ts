@@ -128,7 +128,6 @@ test.each(families)("%s plans every request identically under every cache lego, 
     const graph = composedWith(model(), kv, pagedKv);
     const binding = bindMlxGateway(jump ? jumpGraph(graph) : graph,
       drafted ? { provider: new NgramProvider(), numDraftTokens: 3 } : undefined);
-    binding.configureContinuation!({ checkpointPersistence: {}, checkpoints: {}, checkpointEveryTokens: 4 } as never);
     return binding;
   };
   const requests: [typeof shape, GenerateOptions][] = [
@@ -312,7 +311,6 @@ test.each([["MiniCPM5", () => minicpm5()], ["plain universal", () => universal()
     for (const kv of [{ kvBits: 4, quantizedKvStart: 8 }, { kvBits: 8 },
       { kvConfig: [{ layerIdx: 0, bits: 4, groupSize: 64 }, { layerIdx: 2, bits: 8, groupSize: 64 }], quantizedKvStart: 8 }]) {
       const binding = bindMlxGateway(jumpGraph(composedWith(make(), kv)), { provider: new NgramProvider(), numDraftTokens: 3 });
-      binding.configureContinuation!({ checkpointPersistence: {} } as never);
       const scheduling = { checkpoints: true };
       expect(binding.plan(shape, {}, scheduling)).toMatchObject({ method: "autoregressive", mechanism: "continuous", checkpoint: true });
       expect(binding.plan({ ...shape, hasDraft: true }, {}, scheduling)).toMatchObject({ method: "speculative", mechanism: "continuous" });
@@ -395,7 +393,6 @@ test.each([["two-model", twoModelDraft, "gemma2-draft"], ["n-gram", () => new Ng
   const draft = { ...shape, hasDraft: true };
   for (const kv of [{}, TURBO, { kvBits: 4, quantizedKvStart: 64 }] as KvOptions[]) {
     const binding = bindMlxGateway(composedWith(softcapUniversal(), kv), { provider: provider(), numDraftTokens: 3 });
-    binding.configureContinuation!({ checkpointPersistence: {}, checkpoints: {}, checkpointEveryTokens: 4 } as never);
     // Grammar is shared sampling: the target's mask rides the verifier's accept walk, as in main.
     for (const [request, options] of [[draft, {}], [{ ...draft, userSeed: true, hasRepetitionPenalty: true }, { seed: 3, repetitionPenalty: 1.1 }],
       [draft, { logitBias: { 5: -100 } }], [{ ...draft, hasGrammar: true }, {}]] as const) {
@@ -481,7 +478,6 @@ test.each([["two-model", twoModelDraft], ["n-gram", () => new NgramProvider()], 
   for (const kv of [{}, AFFINE4, TURBO] as KvOptions[]) {
     const model = composedWith(softcapUniversal(), kv);
     const binding = bindMlxGateway(model, { provider: provider(), numDraftTokens: 3 });
-    binding.configureContinuation!({ checkpointPersistence: {}, checkpoints: {}, checkpointEveryTokens: 4 } as never);
     for (const fill of [undefined, fillOptions(false).fill, fillOptions(true).fill]) {
       for (const extra of [{}, { wantsLogprobs: true }, { userSeed: true }, { hasGrammar: true }]) {
         const options: GenerateOptions = { adapters: ["upper"], fill, ...(extra.userSeed ? { seed: 42 } : {}) };
@@ -514,12 +510,10 @@ test("an adapter request its draft cannot serve decodes ordinarily with ordinary
   const graphs: [string, () => RuntimeModel][] = [...families,
     ["sliding universal", () => universal({ modelType: "llama", layerTypes: SLIDING, slidingWindow: 16 })],
     ["explicit-mask sliding universal", () => universal({ modelType: "llama", maskArray: true, layerTypes: SLIDING, slidingWindow: 16 })]];
-  const services = { checkpointPersistence: {}, checkpoints: {}, checkpointEveryTokens: 4 } as never;
   const request = { ...shape, hasDraft: true, hasAdapters: true };
   const options: GenerateOptions = { adapters: ["upper"] };
   for (const [name, model] of graphs) {
     const binding = bindMlxGateway(model(), { provider: twoModelDraft(), numDraftTokens: 3 });
-    binding.configureContinuation!(services);
     const scheduling = { checkpoints: true };
     const plan = binding.plan(request, options, scheduling);
     expect({ name, plan }).toMatchObject({ name, plan: { method: "autoregressive", mechanism: "continuous", checkpoint: true } });
@@ -534,7 +528,6 @@ test("an adapter request its draft cannot serve decodes ordinarily with ordinary
     // A provider that serves target adapters speculates with them, except on the
     // softcap graph, which serves adapters ordinarily.
     const aware = bindMlxGateway(model(), { provider: new NgramProvider(), numDraftTokens: 3 });
-    aware.configureContinuation!(services);
     const softcap = name === "gemma2 softcap";
     expect({ name, plan: aware.plan(request, options, scheduling) }).toMatchObject({ name,
       plan: { method: softcap ? "autoregressive" : "speculative", mechanism: "continuous", checkpoint: softcap } });

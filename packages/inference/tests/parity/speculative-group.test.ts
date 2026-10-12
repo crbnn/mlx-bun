@@ -190,6 +190,7 @@ type Loaded = Awaited<ReturnType<typeof load>>;
 /** The gateway binding for one provider, its placement and its execution group. */
 async function bindFor(loaded: Loaded, provider: A, depth: number) {
   const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
+  const { KvCacheService } = await import("@mlx-bun/inference/state");
   const binding = bindMlxGateway(loaded.view, provider ? { provider, numDraftTokens: depth } : undefined);
   const place = (options: A, extra: Record<string, boolean> = {}) => binding.plan(loaded.requirements({ ...extra, hasDraft: !!provider }),
     options, { checkpoints: false });
@@ -201,11 +202,12 @@ async function bindFor(loaded: Loaded, provider: A, depth: number) {
     return binding.methodRequest!(plan, options)!;
   };
   /** An execution group. `held` keeps admission closed until `release()`, so
-   * rows submitted meanwhile enter as one cohort. */
+   * rows submitted meanwhile enter as one cohort. `promptCache` is the prefix
+   * store of the group's cache service. */
   const group = (options: { maxBatch?: number; promptCache?: A; held?: boolean } = {}) => {
     let held = options.held ?? false;
     const created: A = binding.createBatchGroup({ maxBatch: options.maxBatch ?? 4, admissionHeld: () => held,
-      ...(options.promptCache ? { promptCache: options.promptCache } : {}) });
+      ...(options.promptCache ? { cache: new KvCacheService(binding.graph, { prefixes: options.promptCache }, { runtime: binding.runtime }) } : {}) });
     return Object.assign(created, { release() { held = false; created.kick(); } });
   };
   return { binding, place, method, group };

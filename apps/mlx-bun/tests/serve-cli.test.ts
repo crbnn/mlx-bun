@@ -426,12 +426,13 @@ for (const [sessionDir, jobPaths, expectedStore] of [
     const context = { modelId: "test", model: { config: { text: { maxPositionEmbeddings: 65536 } } },
       memoryPlan: { contextTokens: 8192, maxGenerationTokens: 2048, totalBytes: 1e9 }, tokenizer: {},
       template: { supportsThinking: false }, genDefaults: {}, dispose() { events.push("model close"); } };
-    const cache = { promptCache: { totalBytes: 0 }, resolvedKvScheme: { mode: "off" }, kvScheme: {}, stateCodecs: {},
-      adapterNamespace() {}, checkpoints: { tokenPrefixes: () => [[1, 2]] }, continuationServices: {},
+    // The loaded model's cache service, as createCacheServices builds it: saved prefixes seed the token history.
+    let onPut;
+    const service = { savedPrefixes: () => [[1, 2]], set onPut(observe) { onPut = observe; },
+      report: () => ({ prefixes: { entries: 0, bytes: 0, maxBytes: 0, hits: 0, misses: 0 }, saved: null, kv: { projectedBytes: 0, budgetBytes: null } }),
       stopIdleDemotion() { events.push("timer stop"); }, async close() { events.push("cache close"); return { durable: true }; } };
-    const binding = { discovery: { embeddings: false }, gateway: { configureContinuation(services) {
-      assert.equal(services, cache.continuationServices); events.push("continuation");
-    } } };
+    const cache = { cache: service, resolvedKvScheme: { mode: "off" }, adapterNamespace() {} };
+    const binding = { discovery: { embeddings: false }, gateway: {} };
     // The host reads two numbers from the native library to size its budget.
     mock.module("@mlx-bun/mlx/ffi", () => ({ maxRecommendedWorkingSetSize: () => 32e9, activeMemory: () => 0 }));
     let engine, listenerInput, memoryCallback;
@@ -439,21 +440,19 @@ for (const [sessionDir, jobPaths, expectedStore] of [
       loadContext: async () => context, modelServingBinding: async () => binding, createCacheServices: async () => cache,
       createAppEngine: async (supplied, options) => {
         assert.equal(supplied, context); assert.equal(options.binding, binding);
-        assert.equal(options.gateway.promptCache, cache.promptCache);
-        assert.equal(options.gateway.stateCodecs, cache.stateCodecs);
+        assert.equal(options.gateway.cache, service);
         assert.equal(options.gateway.adapterNamespace, cache.adapterNamespace);
-        assert.equal(options.gateway.checkpoints, true);
-        assert.deepEqual(events, ["continuation"]); events.push("engine");
-        return engine = { gateway: { activeRows: 0, kvBytes: { projected: 0, budget: null } }, async close() { await options.beforeModelDispose(); context.dispose(); } };
+        assert.deepEqual(events, []); events.push("engine");
+        return engine = { gateway: { activeRows: 0 }, async close() { await options.beforeModelDispose(); context.dispose(); } };
       }
     }));
     mock.module(app + "src/server/generated-token-history.ts", () => ({ GeneratedTokenHistory: class {
       remember(tokens) { remembered.push(tokens); }
     } }));
     mock.module(app + "src/server/routes.ts", () => ({ createCompletionRoutes(supplied, options) {
-      assert.equal(supplied, engine); assert.equal(options.promptCache, cache.promptCache);
+      assert.equal(supplied, engine); assert.equal(options.promptCache, service);
       assert.equal(options.contextLimit, 8192); assert.equal(options.defaultGeneratedTokens, 2048);
-      assert.deepEqual(remembered, [[1, 2]]); cache.promptCache.onPut([3, 4]);
+      assert.deepEqual(remembered, [[1, 2]]); onPut([3, 4]);
       assert.deepEqual(remembered, [[1, 2], [3, 4]]); assert.ok(options.tokenHistory);
       events.push("routes"); return { handle: async () => null, invalidateLibrary() {} };
     } }));
@@ -487,7 +486,7 @@ for (const [sessionDir, jobPaths, expectedStore] of [
     });
     assert.equal(running.port, 1234);
     assert.equal(typeof running.downloads.start, "function");
-    assert.deepEqual(events, ["continuation", "engine", "routes", "listener"]);
+    assert.deepEqual(events, ["engine", "routes", "listener"]);
     // A chat connects through the listener's module sockets.
     await listenerInput.sockets.websocket.open({ data: { path: "/ws/chat", request: new Request("http://127.0.0.1/ws/chat") }, send() {}, close() {} });
     assert.equal(piOptions.readOnly, true);
@@ -571,18 +570,19 @@ test("startup wires the memory budget, runtime context, allocator limit, expert 
     const context = { modelId: "test", model: { config, weightsBytes: 2e9 }, memoryPlan: null, tokenizer: {},
       template: { supportsThinking: false }, genDefaults: {}, dispose() { events.push("model close"); },
       adapters: { async mount(id, dir) { events.push("mount " + id + " " + dir); if (mountFails) throw new Error("adapter_config.json missing"); return { id, mountedLayers: 3 }; } } };
-    const cache = { promptCache: { totalBytes: 0 }, resolvedKvScheme: { mode: "off", fitOptions: undefined, storage: { kind: "bf16" } }, stateCodecs: {},
-      adapterNamespace() {}, checkpoints: null, continuationServices: {},
-      stopIdleDemotion() {}, async close() { return { durable: true }; } };
+    const cache = { cache: { savedPrefixes: () => [], set onPut(_observe) {},
+        report: () => ({ prefixes: { entries: 0, bytes: 0, maxBytes: 0, hits: 0, misses: 0 }, saved: null, kv: { projectedBytes: 0, budgetBytes: null } }),
+        stopIdleDemotion() {}, async close() { return { durable: true }; } },
+      resolvedKvScheme: { mode: "off", fitOptions: undefined, storage: { kind: "bf16" } }, adapterNamespace() {} };
     const expected = fit(config, 2e9, 1, undefined, undefined, 0, 8e9, undefined).maxSafeContext;
     let loadOptions, cacheOptions, statusBudget, contextLimit, defaultAdapter;
     const routes = [];
     const route = seam => routes.push(seam + ":" + runtimeValue("MLX_BUN_NO_FUSED_SDPA"));
     mock.module(app + "src/engine/index.ts", () => ({
       loadContext: async (path, id, options) => { loadOptions = options; route("load"); events.push("load wire=" + runtimeValue("MLX_BUN_FORCE_WIRE") + " media=" + runtimeValue("MLX_BUN_ALLOW_PRIVATE_MEDIA")); return context; },
-      modelServingBinding: async () => { route("binding"); return { discovery: { embeddings: false }, gateway: { configureContinuation() {} } }; },
+      modelServingBinding: async () => { route("binding"); return { discovery: { embeddings: false }, gateway: {} }; },
       createCacheServices: async (_context, _binding, options) => { cacheOptions = options; route("cache"); return cache; },
-      createAppEngine: async () => { route("engine"); return { gateway: { activeRows: 0, kvBytes: { projected: 0, budget: null } }, async close() { route("close"); context.dispose(); } }; },
+      createAppEngine: async () => { route("engine"); return { gateway: { activeRows: 0 }, async close() { route("close"); context.dispose(); } }; },
     }));
     let limit = 77;
     mock.module("@mlx-bun/mlx/ffi", () => ({ setMemoryLimit(bytes) { events.push("allocator " + bytes); const previous = limit; limit = bytes; return previous; } }));
@@ -767,10 +767,12 @@ test("startup composes the lazy Whisper companion with the parsed policy, shares
     let found = null, discovery, listenerInput, drain;
     const context = { modelId: "test", model: { config: { text: { maxPositionEmbeddings: 4096 } }, weightsBytes: 1e9 }, memoryPlan: null, tokenizer: {},
       template: { supportsThinking: false }, genDefaults: {}, dispose() { events.push("model close"); } };
-    const cache = { promptCache: { totalBytes: 0 }, resolvedKvScheme: { mode: "off", fitOptions: undefined, storage: { kind: "bf16" } }, stateCodecs: {},
-      adapterNamespace() {}, checkpoints: null, continuationServices: {}, stopIdleDemotion() {}, async close() { return { durable: true }; } };
+    const cache = { cache: { savedPrefixes: () => [], set onPut(_observe) {},
+        report: () => ({ prefixes: { entries: 0, bytes: 0, maxBytes: 0, hits: 0, misses: 0 }, saved: null, kv: { projectedBytes: 0, budgetBytes: null } }),
+        stopIdleDemotion() {}, async close() { return { durable: true }; } },
+      resolvedKvScheme: { mode: "off", fitOptions: undefined, storage: { kind: "bf16" } }, adapterNamespace() {} };
     // Every decode pauses the resident models, which is each engine's execution lease.
-    const gateway = { activeRows: 0, kvBytes: { projected: 0, budget: null }, async acquireExecutionLease(signal) { events.push("lock"); signal?.throwIfAborted(); return { dispose() {} }; } };
+    const gateway = { activeRows: 0, async acquireExecutionLease(signal) { events.push("lock"); signal?.throwIfAborted(); return { dispose() {} }; } };
     mock.module("@mlx-bun/mlx/ffi", () => ({ maxRecommendedWorkingSetSize: () => 32e9, activeMemory: () => 0 }));
     // The Whisper checkpoint and the local catalog are the only seams behind the model host; everything else is the real composition.
     mock.module(lib + "whisper-backend.ts", () => ({ nativeWhisperBackend: { async load(dir) { events.push("load " + dir); return { promptTokenBudget: 3, encode: () => [],
@@ -780,7 +782,7 @@ test("startup composes the lazy Whisper companion with the parsed policy, shares
       find: async query => { throw new Error("unused " + query); }, resolve: async () => undefined, estimate: async () => undefined, register: async () => {}, download: async () => {} }) }));
     mock.module("@mlx-bun/inference/input/audio", () => ({ isRiffWave: () => true, decodeWav: () => ({ samples: new Float32Array(16000), sampleRate: 16000 }), resampleTo16k: samples => samples }));
     mock.module(app + "src/engine/index.ts", () => ({
-      loadContext: async () => context, modelServingBinding: async () => ({ discovery: { embeddings: false }, gateway: { configureContinuation() {} } }),
+      loadContext: async () => context, modelServingBinding: async () => ({ discovery: { embeddings: false }, gateway: {} }),
       createCacheServices: async () => cache,
       createAppEngine: async () => ({ gateway, async close() { events.push("engine close"); context.dispose(); } }),
     }));

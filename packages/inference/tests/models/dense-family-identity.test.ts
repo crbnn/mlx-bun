@@ -5,7 +5,7 @@
 // deleted with this test after the merge), on small synthetic weights. Every
 // hidden output, every logit row and every cache tensor must agree to the bit:
 // for bf16 KV, for affine 4- and 8-bit KV converted after the first forward by
-// kv-maintenance with MLX_BUN_NO_FUSED_SDPA unset and set to 1, for TurboQuant
+// the batch preparation (state/layout) with MLX_BUN_NO_FUSED_SDPA unset and set to 1, for TurboQuant
 // k8v3 KV, and for delayed affine rows across (or, under the softcap read,
 // below) their transition. The phase operations run their own cache set and are
 // held to the same bits. The universal graph runs a llama descriptor with
@@ -29,7 +29,7 @@ import { createRuntimeConfig, runtimeConfig, withRuntimeConfig } from "../../src
 import { trainForward } from "../../src/scoring/full-sequence";
 import { trainForward as frozenTrainForward } from "./full-sequence-reference";
 import { evalPpl } from "../../src/scoring/perplexity";
-import { createKvMaintenance } from "../../src/state/kv-maintenance";
+import { createKvMaintenance } from "../../src/state/layout";
 import { composedAffineKernels } from "../../src/state/affine-attention";
 import { settleAffine, settleTurbo } from "../state/convert-after-reference";
 import { testComposition } from "./test-composition";

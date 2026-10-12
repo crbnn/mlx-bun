@@ -1,5 +1,7 @@
 import { strict as assert } from "node:assert";
 
+/** `depth` 0 is plain greedy decode with no drafter, one step per token: the step a verify round's cost is relative
+ * to (a graph's `verifyRoundCosts` are each fixed depth's round time over it). */
 export interface MtpVariant { id: string; depth: number; env?: Record<string, string>; /** Draft artifact overriding the plan's. */ draft?: string;
   /** Each round's count up to `depth` from the graph's verify costs (`--num-draft-tokens adaptive`). */ adaptiveDepth?: boolean }
 export interface MtpPlan {
@@ -33,7 +35,9 @@ export function parseMtpPlan(value: unknown): MtpPlan {
   const ids = new Set<string>();
   for (const v of p.variants) {
     assert(/^[a-z0-9_-]+$/.test(v.id) && !ids.has(v.id), "variant IDs must be unique safe names"); ids.add(v.id);
-    assert(Number.isSafeInteger(v.depth) && v.depth >= 1 && v.depth < p.maxTokens, "depth must be >= 1 and < maxTokens");
+    assert(Number.isSafeInteger(v.depth) && v.depth >= 0 && v.depth < p.maxTokens, "depth must be >= 0 and < maxTokens");
+    assert(v.depth > 0 || (v.draft === undefined && !v.adaptiveDepth && p.sampling === undefined),
+      "depth 0 is greedy plain decode: no draft, no adaptive depth, no sampling");
     assert(v.draft === undefined || (typeof v.draft === "string" && v.draft.length), "variant draft must be a path");
     for (const [k, val] of Object.entries(v.env ?? {})) {
       assert(k.startsWith("MLX_BUN_") && typeof val === "string", "variant overrides must be MLX_BUN_* strings");

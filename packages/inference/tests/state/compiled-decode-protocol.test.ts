@@ -17,7 +17,7 @@ import { setCompiledTrace } from "../../src/runtime/compiled-trace";
 import { composedAffineKernels } from "../../src/state/affine-attention";
 import { Bf16FirstQuantizedKVCache, Bf16FirstRotatingQuantizedKVCache, Bf16FirstTurboQuantKVCache } from "../../src/state/bf16-first-kv";
 import { PagedKVCache } from "../../src/state/paged/cache";
-import { createKvMaintenance } from "../../src/state/kv-maintenance";
+import { createKvMaintenance } from "../../src/state/layout";
 import { decodeStepInputs } from "../../src/state/decode-step-inputs";
 import { BatchedKVCache } from "../../src/state/batched-kv";
 import { KVCache } from "../../src/state/kv";

@@ -9,7 +9,7 @@
 // whole-graph compiled step). The sliding window is 16 positions, so prompts
 // of 37 and 200 wrap the rings. Every hidden output, logit row and cache
 // tensor must agree to the bit for bf16 KV, affine 4- and 8-bit KV converted
-// after the first forward by kv-maintenance with MLX_BUN_NO_FUSED_SDPA unset
+// after the first forward by the batch preparation (state/layout) with MLX_BUN_NO_FUSED_SDPA unset
 // (tiled-causal kernel set) and set to 1 (unfused set), and TurboQuant k8v3
 // (the deferred set Gemma4Model.makeCache composes): decodes, windows across
 // the sliding boundary and the 256-position step, verify windows with layer
@@ -36,7 +36,7 @@ import type { RuntimeModel } from "../../src/models/factory";
 import { createRuntimeConfig, runtimeConfig, withRuntimeConfig } from "../../src/runtime/config";
 import { trainForward } from "../../src/scoring/full-sequence";
 import { trainForward as frozenTrainForward } from "./full-sequence-reference";
-import { createKvMaintenance } from "../../src/state/kv-maintenance";
+import { createKvMaintenance } from "../../src/state/layout";
 import { composedAffineKernels } from "../../src/state/affine-attention";
 import { settleAffine, settleTurbo } from "../state/convert-after-reference";
 import { testComposition } from "./test-composition";
@@ -685,7 +685,7 @@ for (const kind of ["dense", "shared"] as const) {
     }, 120_000);
 
     // Rows a prefill cohort converts inside its delayed affine layouts carry
-    // the kernel set the layouts took when kv-maintenance built them
+    // the kernel set the layouts took when the batch preparation built them
     // (servedAffineKernels: tiled-causal with MLX_BUN_NO_FUSED_SDPA unset,
     // unfused with it set to 1), and the decode group's layouts made from those
     // rows keep it. The old graph attended them through quantizedSdpa under the

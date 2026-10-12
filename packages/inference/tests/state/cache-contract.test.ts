@@ -47,7 +47,7 @@ import { BF16_KV, type KvStorageScheme } from "../../src/contracts/portable/comp
 import { composedAffineKernels } from "../../src/state/affine-attention";
 import { AttentionMasks } from "../../src/state/attention-read";
 import { Bf16FirstKv4Head256Cache, composedFullAttentionCache, composedSlidingAttentionCache } from "../../src/state/bf16-first-kv";
-import { createKvMaintenance } from "../../src/state/kv-maintenance";
+import { createKvMaintenance } from "../../src/state/layout";
 import { captureKvDonorAttention } from "../../src/state/kv-attention-view";
 import { ownedCacheLayout, prefillCacheLayout, targetCacheLayout } from "../../src/state/layout";
 import { PagedKVCache, type PagedQuantization } from "../../src/state/paged/cache";

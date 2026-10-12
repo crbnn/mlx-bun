@@ -33,8 +33,6 @@ export async function modelServingBinding(context: LoadedModelContext, supplied?
   return {
     stateCompatibility: `mlx-${MLX_VERSION}-${deviceArchitecture()}`,
     gateway,
-    restore: (store, entry) => store.restore(entry, model),
-    restoreAsync: (store, entry) => store.restoreAsync(entry, model),
     async signal(ids, count, minimum) {
       const caches = model.makeCache();
       try {

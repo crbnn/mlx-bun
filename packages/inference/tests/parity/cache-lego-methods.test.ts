@@ -106,18 +106,20 @@ async function loadTarget() {
   return { config, tokenizer, graph, generate, release };
 }
 
-/** One request's state as the gateway gives it to a row: the binding's request
- * state policy for the planned execution (the composition's paging), else the
- * graph's caches. */
-function requestState(binding: A, model: A, execution: A): A[] {
-  return binding.statePolicy?.(execution, {}, CAPACITY)?.create() ?? model.makeCache();
+/** One request's state as the scheduler gives it to a row: fresh state from the
+ * composition's cache service (`KvCacheService` over the bound graph: its paging
+ * over the graph's caches), for a request of `CAPACITY` tokens. */
+function requestState(cache: A, binding: A, execution: A): A[] {
+  const row = { promptIds: [], maxTokens: CAPACITY, reusesPrefix: binding.reusesPrefix(execution) };
+  try { return cache.acquire(row, "").caches; } finally { cache.release(row, false); }
 }
 
 test.skipIf(!target)("teacher-forced verification rounds on every lego's verification rows", async () => {
   const ops = await import("@mlx-bun/mlx/ops");
   const { clearCache, Dtype } = await import("@mlx-bun/mlx/ffi");
-  const { createKvMaintenance } = await import("../../src/state/kv-maintenance");
+  const { createKvMaintenance } = await import("../../src/state/layout");
   const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
+  const { KvCacheService } = await import("@mlx-bun/inference/state");
   const { targetCacheLayout } = await import("../../src/state/layout");
   const { MlxStateRows } = await import("../../src/state/rows");
   const { bindRowCacheRollback } = await import("../../src/state/rollback");
@@ -151,9 +153,10 @@ test.skipIf(!target)("teacher-forced verification rounds on every lego's verific
         const execution = binding.plan(SHAPE, {}, { checkpoints: false });
         expect(execution.mechanism, lego.name).toBe("continuous");
         const maintain = createKvMaintenance(model.composition?.kv ?? { kind: "bf16" });
+        const cache = new KvCacheService(binding.graph, {}, { runtime: binding.runtime });
         const rows: A[][] = [];
         for (const prompt of used) {
-          const caches = requestState(binding, model, execution);
+          const caches = requestState(cache, binding, execution);
           if (lego.paged) expect(caches.some((cache: A) => cache.signature() === "kv:paged"), lego.name).toBe(true);
           using ids = ops.fromInt32(prompt, [1, prompt.length]);
           phaseHidden(model, ids, caches).dispose();
@@ -221,7 +224,7 @@ test.skipIf(!target)("the speculative group with the assistant drafter on every 
       const tokens = Array.from({ length: count }, () => [] as number[]);
       try {
         const pending = tokens.map((output, row) => group.submit({ method: binding.methodRequest!(plan, options)!,
-          statePolicy: binding.statePolicy?.(plan, options, prompts[row]!.length + options.maxTokens),
+          reusesPrefix: binding.reusesPrefix(plan),
           compiledDecode: plan.compiledDecode,
           promptIds: prompts[row]!, maxTokens: options.maxTokens, eosTokenIds: [], onToken(token: number) { output.push(token); } }));
         held = false; group.kick();

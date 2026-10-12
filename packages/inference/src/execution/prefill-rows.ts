@@ -13,7 +13,7 @@ import { prefillCacheLayout } from "../state/layout";
 import { MlxStateRows } from "../state/rows";
 import type { P2RTracePhase, P2RTraceAttributes } from "../runtime/trace";
 import type { MlxForwardWork, MlxPreparationWork } from "../contracts/mlx/forward-work";
-import type { KvMaintenance } from "../state/kv-maintenance";
+import type { KvMaintenance } from "../contracts/mlx/cache";
 
 // Shared work is recorded on every participating request. workId identifies
 // duplicates when constructing a process timeline; row spans are not additive.
@@ -47,7 +47,8 @@ export type MlxPrefillForward = MlxPromptStep;
  * completion. This driver owns common target batching and work boundaries.
  * Checkpoint factories return owned cache state; close/dispose are idempotent. */
 export interface MlxPrefillRowsHost<State extends MlxPrefillState> {
-  stateCodecs?: CacheCodecProvider;
+  /** The snapshot form of the composition's caches (the cache service's), for a single row's boundary snapshot. */
+  codecs?: CacheCodecProvider;
   maintain?: KvMaintenance;
   open(row: Row): State;
   plan(state: State): MlxPrefillStep;
@@ -219,7 +220,7 @@ export class MlxPrefillRows<State extends MlxPrefillState> implements MlxGroupPr
           if (state.planned!.snapshot) {
             using span = traceRows([state], "prefill.checkpoint", { ...work, row });
             this.operations.checkpoint(state, () =>
-              this.#stateRows ? this.#stateRows.extractRow(row) : cloneKvCaches(state.solo, this.operations.stateCodecs), row);
+              this.#stateRows ? this.#stateRows.extractRow(row) : cloneKvCaches(state.solo, this.operations.codecs), row);
           }
           if (!finals.includes(row)) state.planned = undefined;
         }

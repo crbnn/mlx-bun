@@ -92,9 +92,9 @@ class FillGroup implements MlxGroupedMethod {
   prepare(first: Row): MlxGroupPreparation {
     const ready: { row: Row; caches: Cache[]; retain?: () => void }[] = [];
     const target = new MlxPrefillCohort({
-      model: this.model, chunkSize: this.host.prefillChunkSize,
+      chunkSize: this.host.prefillChunkSize,
       tailSplit: this.host.prefillTailSplit,
-      promptCache: this.host.promptCache, maintain: this.host.kvMaintenance,
+      cache: this.host.cache, maintain: this.host.kvMaintenance,
       forward: async (ids, caches, step) => this.#dispatch.prompt(step.phase, step.sequences, step.tokens)(ids, caches, null),
       project: (hidden, _caches, _completed, step) => this.#dispatch.logits(step.sequences * step.tokens)(hidden),
       complete: async (state, logits) => {
@@ -466,9 +466,8 @@ class FillGroup implements MlxGroupedMethod {
 
   #put(row: Row, caches: Cache[], retain?: () => void): void {
     try {
-      if (this.host.promptCache && !row.fedTainted && !row.req.signal?.aborted) {
-        this.host.promptCache.put([...row.req.promptIds, ...row.fed], caches,
-          row.cacheNamespace, retain, undefined, row.req.cacheSessionId);
+      if (this.host.cache.keeps(row.req) && !row.fedTainted && !row.req.signal?.aborted) {
+        this.host.cache.publish(row.req, row.cacheNamespace ?? "", [...row.req.promptIds, ...row.fed], { caches, retain });
         caches = []; retain = undefined;
       }
     } finally { disposeResources([...caches, { dispose: () => retain?.() }]); }

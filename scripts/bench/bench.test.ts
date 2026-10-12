@@ -175,6 +175,21 @@ test("dflash2 needs a pinned DFlash 2 drafter, serves it at adaptive depth over 
     .toThrow("DFlash 2 drafter is not pinned");
 });
 
+test("dflash2-d7-baseline runs the baseline at depth 7 and the candidate adaptive, both over 4-bit KV with the drafter and basis", () => {
+  const drafter = artifact(), basis = join(fresh("basis"), "target-basis.json");
+  writeFileSync(basis, '{"r1":"fold"}');
+  const trellis = { ...describeModel("qwen27b", artifact({ trellis: true })),
+    dflash2: { path: drafter, files: artifactFiles(drafter), basis: { name: "target-basis.json", path: basis, bytes: 13, sha256: fileSha(basis) } } };
+  const plan = testPlan({}, { configurations: ["default", "dflash2-d7-baseline"], models: [trellis, describeModel("e4b", artifact())] });
+  expect(plan.cells.filter(cell => cell.skipped).map(cell => cell.key)).toEqual(["e4b/dflash2-d7-baseline/baseline", "e4b/dflash2-d7-baseline/candidate"]);
+  const args = (tree: string) => cellArgs(plan, plan.cells.find(c => c.key === `qwen27b/dflash2-d7-baseline/${tree}`)!, 1, "/ssd").slice(-8);
+  expect(args("baseline")).toEqual(["--ssd-cache", "/ssd", "--kv-quant", "4", "--num-draft-tokens", "7", "--draft-model", drafter]);
+  expect(args("candidate")).toEqual(["--ssd-cache", "/ssd", "--kv-quant", "4", "--num-draft-tokens", "adaptive", "--draft-model", drafter]);
+  for (const tree of ["baseline", "candidate"])
+    expect(cellExtraEnvironment(plan, plan.cells.find(c => c.key === `qwen27b/dflash2-d7-baseline/${tree}`)!)).toEqual({ MLX_BUN_DFLASH2_TARGET_BASIS: basis });
+  expect(validatePlan(plan).configurations).toEqual(["default", "dflash2-d7-baseline"]);
+});
+
 test("plan pins a --dflash2-draft drafter and its basis file and records --sessions", () => {
   const baseline = repo(), candidate = repo(), lib = library(), model = artifact({ trellis: true }), drafter = artifact();
   const basis = join(fresh("basis"), "basis.json");

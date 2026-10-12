@@ -1,7 +1,7 @@
 // Gemma4 paged KV through the shared execution group on real weights. Full
 // attention layers live in block pools (`--paged-kv`, the composition's paging);
-// requests enter through the public gateway binding (plan, statePolicy,
-// createBatchGroup), as the app composes them. Two readers: the gathered arm (block gather into stock SDPA;
+// requests enter through the public gateway binding (plan, createBatchGroup)
+// with the composition's cache service, as the app composes them. Two readers: the gathered arm (block gather into stock SDPA;
 // for bf16 pages this is main's bit-exact contract against plain KV) and the
 // direct Metal reader (the composition's `pagedKv.direct`, Lab numerics). Pages store bf16 or
 // affine KV4/KV8, encoded from their first token; sliding layers follow the
@@ -112,7 +112,7 @@ test.skipIf(!inputs)("Gemma4 paged KV: gathered bf16 equals plain KV; direct rea
   const { clearCache } = await import("@mlx-bun/mlx/ffi");
   const { loadModelConfig, Weights, createModel, resolveComposition } = await import("@mlx-bun/inference");
   const { bindMlxGateway, createRuntimeConfig, withRuntimeConfig } = await import("@mlx-bun/inference/execution");
-  const { PromptCache, TieredPromptCache, SsdCacheStore, KVCache, RotatingKVCache, cloneKvCaches, resolveKvScheme } =
+  const { PromptCache, TieredPromptCache, SsdCacheStore, KVCache, RotatingKVCache, KvCacheService, resolveKvScheme } =
     await import("@mlx-bun/inference/state");
   const { PagedKVCache } = await import("@mlx-bun/inference/state/paged");
   const { pagedAttentionView } = await import("@mlx-bun/inference/kernels/attention/paged");
@@ -207,11 +207,15 @@ test.skipIf(!inputs)("Gemma4 paged KV: gathered bf16 equals plain KV; direct rea
         hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false },
       options, { checkpoints: false });
       assert.equal(plan.mechanism, "continuous", `placement: ${plan.reasons.join(", ")}`);
-      // A paged composition gives every request the paged state; an unpaged one, the group's own caches.
-      assert.equal(binding.statePolicy!(plan, options, 1) !== undefined, setup.paged);
-      if (opts.cache) binding.configureContinuation!({ promptCache: opts.cache, checkpoints: null, identity: "gemma4-paged",
-        adapterNamespace: (adapters: string[]) => adapters.join(","), cloneState: (caches: Cache[]) => cloneKvCaches(caches) } as A);
-      const policy = (prompt: number[]) => binding.statePolicy!(plan, options, prompt.length + TOKENS);
+      // The composition's cache service: `opts.cache` is its prefix store. A paged
+      // composition gives every request the paged state; an unpaged one, the graph's caches.
+      const cache = new KvCacheService(binding.graph, opts.cache ? { prefixes: opts.cache } : {}, { runtime: binding.runtime });
+      {
+        const probe = { promptIds: [0], maxTokens: TOKENS, reusesPrefix: false };
+        const fresh = cache.acquire(probe, "");
+        try { assert.equal(fresh.caches.some((state: Cache) => state.signature() === "kv:paged"), setup.paged); }
+        finally { for (const state of fresh.caches) state.dispose(); cache.release(probe, false); }
+      }
       const states = new Map<string, LayerState[]>();
       const put = opts.cache?.put.bind(opts.cache);
       const putSpy = opts.states ? spyOn(opts.cache, "put").mockImplementation((...args: A[]) => {
@@ -220,15 +224,14 @@ test.skipIf(!inputs)("Gemma4 paged KV: gathered bf16 equals plain KV; direct rea
       }) : undefined;
       const prefetched: (() => void)[] = [];
       let held = true;
-      const group = binding.createBatchGroup({ maxBatch: 3, runtime, prefillChunkSize: 2048, admissionHeld: () => held,
-        ...(opts.cache ? { promptCache: opts.cache } : {}) });
+      const group = binding.createBatchGroup({ maxBatch: 3, runtime, prefillChunkSize: 2048, admissionHeld: () => held, cache });
       const submit = (row: RowSpec, index: number): Promise<Outcome> => {
         const out: Outcome = { status: "fulfilled", tokens: [], vectors: [], finite: true, afterRetire: 0 };
         const controller = new AbortController();
         let retired = false;
         return group.submit({ promptIds: row.prompt, maxTokens: TOKENS, eosTokenIds: [], compiledDecode: false,
           ...(opts.states ? { cacheSessionId: `row-${index}`, snapshotAt: 0 } : {}),
-          statePolicy: policy(row.prompt), signal: controller.signal,
+          reusesPrefix: binding.reusesPrefix(plan), signal: controller.signal,
           sample(logits: MlxArray) {
             using exact = ops.contiguous(logits);
             out.vectors.push(sha256(exact.rawBytesView()));
@@ -247,7 +250,7 @@ test.skipIf(!inputs)("Gemma4 paged KV: gathered bf16 equals plain KV; direct rea
           (error: unknown) => Object.assign(out, { status: "rejected" as const, reason: (error as Error)?.message ?? String(error) }));
       };
       try {
-        if (opts.prefetch) for (const row of rows) prefetched.push(await policy(row.prompt)!.promptCache!.prefetch!(row.prompt, ""));
+        if (opts.prefetch) for (const row of rows) prefetched.push(await cache.prefetch(row.prompt, ""));
         const pending = rows.map((row, index) => submit(row, index));
         held = false; group.kick();
         const outcomes = await Promise.all(pending);

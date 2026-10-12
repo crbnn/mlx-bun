@@ -263,7 +263,7 @@ for (const [family, checkpoint] of [
             const group = binding.createBatchGroup({ maxBatch: 1 });
             const before = CompiledDecode.stepsExecuted, out: number[] = [];
             try {
-              await group.submit({ statePolicy: binding.statePolicy?.(plan, options, prompt.length + maxTokens),
+              await group.submit({
                 compiledDecode: plan.compiledDecode, promptIds: prompt, maxTokens, eosTokenIds: [],
                 sample: (logits: MlxArray) => mlx.ops.argmaxAxis(logits, -1),
                 onToken(token: number) { out.push(token); } });

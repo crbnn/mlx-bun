@@ -5,7 +5,7 @@
 // attention), once with Trellis MLPs and once with affine MLPs. Every hidden
 // output, every logit row and every cache tensor must agree to the bit, for
 // bf16 KV, for affine 4- and 8-bit KV converted after the first forward by
-// kv-maintenance with MLX_BUN_NO_FUSED_SDPA unset (tiled kernel set) and set to
+// the batch preparation (state/layout) with MLX_BUN_NO_FUSED_SDPA unset (tiled kernel set) and set to
 // 1 (unfused set), and for TurboQuant k8v3 and k4v4 KV (B1e: the dense
 // TurboQuant read Qwen35Model.makeCache composes). The phase operations
 // (prefillChunk, prefillTail, decode, verify) run a third cache set and are held
@@ -35,7 +35,7 @@ import { trainForward as frozenTrainForward } from "./full-sequence-reference";
 import { evalPpl } from "../../src/scoring/perplexity";
 import { composedAffineKernels, unfusedAffineKernels } from "../../src/state/affine-attention";
 import { DelayedRotatingQuantizedKVCache } from "../../src/state/delayed-rotating-quantized-kv";
-import { createKvMaintenance } from "../../src/state/kv-maintenance";
+import { createKvMaintenance } from "../../src/state/layout";
 import { settleAffine, settleTurbo } from "../state/convert-after-reference";
 import { testComposition } from "./test-composition";
 import { KVCache } from "../../src/state/kv";
@@ -564,7 +564,7 @@ function extractedRows(cache: Cache): Cache[] {
 
 /** The full-attention layers' caches replaced by a delayed row layout (bf16
  * until `DELAYED_START` positions, quantized after): the affine and TurboQuant
- * layouts kv-maintenance's preparePrefill builds for a prefill cohort, and a
+ * layouts the batch preparation's preparePrefill (state/layout) builds for a prefill cohort, and a
  * rotating affine layout over an empty ring. Qwen 3.5 has no sliding layer, so
  * no maintenance builds the rotating one for it; its window never binds here. */
 const DELAYED_START = 40;

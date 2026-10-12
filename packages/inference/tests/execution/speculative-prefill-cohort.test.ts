@@ -12,11 +12,12 @@ import { captureKvAttention } from "../../src/state/kv-attention-view";
 import { NgramProvider } from "../../src/generation/speculative/sources/ngram-source";
 import type { DraftProvider } from "../../src/generation/speculative/source";
 import { PromptCache } from "../../src/state/prefix-cache";
+import { KvCacheService } from "../../src/state/cache-service";
 import { runtimeConfig } from "../../src/runtime/config";
 import { cleanupFailure, disposeResources, withResource } from "../../src/runtime/resources";
 import { leaseCacheStates } from "../../src/state/leases";
 import { disposeAttachments } from "../../src/state/checkpoint";
-import { createKvMaintenance } from "../../src/state/kv-maintenance";
+import { createKvMaintenance } from "../../src/state/layout";
 import type { GenerateOptions } from "../../src/generation/index";
 import { createHash } from "node:crypto";
 import * as ops from "@mlx-bun/mlx/ops";
@@ -60,13 +61,16 @@ function fixture(provider: Pick<DraftProvider, "id" | "grouped"> & { dispose(): 
     ...graph,
   } as unknown as RuntimeModel & { forwardHidden(ids: MlxArray, caches: Cache[]): MlxArray };
   const cache = new PromptCache(1024 ** 2);
-  const host: MlxGroupMethodHost = { rows: joined, runtime: runtimeConfig(), prefillChunkSize: 3, prefillTailSplit: true,
-    kvMaintenance: scheme.kind === "bf16" ? undefined : createKvMaintenance(scheme),
-    promptCache: { take: cache.take.bind(cache), put(tokens, caches, namespace, retain, attachments) {
+  // The cache service's prefix store: the RAM cache, every put observed. A test may replace `take`.
+  const prefixes: Pick<PromptCache, "take" | "put" | "reclaim"> = { take: cache.take.bind(cache), reclaim() {},
+    put(tokens, caches, namespace, retain, attachments) {
       snapshots.push({ tokens: [...tokens], history: attachments![0]!.tensors[0]!.toIntTokens(), offset: caches[0]!.offset });
       puts.push({ tokens: [...tokens], history: attachments![0]!.tensors[0]!.toIntTokens(), state: encoded(caches) });
       cache.put(tokens, caches, namespace, retain, attachments);
-    } },
+    } };
+  const host: MlxGroupMethodHost = { rows: joined, runtime: runtimeConfig(), prefillChunkSize: 3, prefillTailSplit: true,
+    kvMaintenance: scheme.kind === "bf16" ? undefined : createKvMaintenance(scheme),
+    cache: new KvCacheService(model, { prefixes: prefixes as PromptCache }),
     join(row) { joined.push(row); },
     // As the scheduler does: the method filters its state, then membership.
     filterRows(keep) {
@@ -84,7 +88,7 @@ function fixture(provider: Pick<DraftProvider, "id" | "grouped"> & { dispose(): 
       admittedAt: 0, firstTokenAt: 0, fed: [], fedTainted: false, merged: false };
     return request;
   };
-  return { method, model, host, row, shapes, inputs, snapshots, puts, failures, joined,
+  return { method, model, host, prefixes, row, shapes, inputs, snapshots, puts, failures, joined,
     dispose() { method.dispose(); cache.clear(); provider.dispose(); } };
 }
 async function drain(preparation: MlxGroupPreparation) {
@@ -376,7 +380,7 @@ test.each(delayed)("a failed admission after its prefix is reused releases the p
     let released = 0;
     try {
       const stored = await storeConvertedPrefix(f, scheme);
-      const cache = f.host.promptCache!, take = cache.take.bind(cache);
+      const cache = f.prefixes, take = cache.take.bind(cache);
       // Each release of the arrival's owned hit is counted.
       cache.take = (...args) => {
         const hit = take(...args);

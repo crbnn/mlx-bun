@@ -1,23 +1,10 @@
-import type { Cache } from "../contracts/mlx/cache";
-import type { SsdCacheStore } from "../state/ssd-cache";
+import type { ContinuationRequest, ContinuationState } from "../state/cache-service";
 
-export interface OrdinaryContinuationState {
-  caches: Cache[];
-  cacheTokens: number[];
-  generatedTokens: number;
-  pendingToken: number;
-  seed: number;
-}
-
-/** Request-owned policy. Restore and captureOwned transfer cache ownership.
- * No store or key knowledge enters the driver. */
-export interface OrdinaryContinuation {
+/** A replayable ordinary request: what the cache service checkpoints it under
+ * (`ContinuationRequest`), how often the scheduler offers a checkpoint, and
+ * the sampler recovery a resumed generation runs. No store knowledge enters
+ * the driver; the cache service resumes and checkpoints it. */
+export interface OrdinaryContinuation extends ContinuationRequest {
   readonly interval: number;
-  restore(namespace: string): OrdinaryContinuationState | null;
-  resumeSampling(state: Omit<OrdinaryContinuationState, "caches">): void;
-  captureOwned(state: Omit<OrdinaryContinuationState, "seed">): void;
-  complete(): void;
+  resumeSampling(state: Omit<ContinuationState, "caches">): void;
 }
-
-export type ContinuationStore = Pick<SsdCacheStore, "findGenerationCheckpoint" | "restore" |
-  "storeGenerationCheckpoint" | "removeGenerationCheckpoints">;

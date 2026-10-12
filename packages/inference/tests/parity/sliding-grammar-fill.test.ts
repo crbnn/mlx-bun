@@ -379,7 +379,7 @@ async function setup() {
             grammarWait: "external", historyUpdate: "after-sample", initialHistory: prompt }), sink);
           await group.submit({ promptIds: prompt, prefillChunkSize: CHUNK, compiledDecode: execution.compiledDecode,
             maxTokens: options.maxTokens!, eosTokenIds: options.eosTokenIds!, cacheNamespace: "", signal: abort.signal,
-            statePolicy: binding.statePolicy?.(execution, options, prompt.length + options.maxTokens!),
+            reusesPrefix: binding.reusesPrefix(execution),
             ...(method ? { method, onToken: sink } : { sample: sampling!.sample, plainGreedy: sampling!.plainGreedy, onToken: sampling!.onToken }),
             ...(options.grammar ? { grammar: options.grammar } : {}) });
           return { tokens, spans, status: "fulfilled", fill: options.fill };

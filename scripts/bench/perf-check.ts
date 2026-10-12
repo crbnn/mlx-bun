@@ -7,7 +7,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { hostname, release } from "node:os";
 import { parseArgs } from "node:util";
-import { CONFIGURATIONS, type Configuration } from "./plan";
+import { CONFIGURATIONS, isContext, type Configuration } from "./plan";
 import { pooledComparison, qualification, type MetricComparison, type RunRecord } from "./report";
 
 // ---- preflight (main's src/preflight.ts, checkMachine) ------------------------------
@@ -173,22 +173,30 @@ export function decide({ before, after, run }: DecideInput): Decision {
   const q = qualification(run);
   if (!q.complete) return none("run incomplete, no numbers", q.problems);
   const notes = [after ? after.ok ? "" : `machine not clear after the run: ${after.problems.join("; ")}` : "no preflight after the run"].filter(Boolean);
+  // What qualification reported, not required, about a context configuration's cells and pairs.
+  const contexts = run.plan.configurations.filter(isContext);
+  notes.push(...q.notes.filter(note => !note.includes(": not applicable") && !note.includes("not observed mapped") &&
+    contexts.some(name => note.includes(`/${name}/`) || note.includes(`/${name} `))).map(note => `context: ${note}`));
   const reasons: string[] = [], compositions: Composition[] = [];
   for (const model of run.plan.models) for (const configuration of run.plan.configurations) {
     const cells = run.cells.filter(cell => cell.kind === "tree" && cell.model === model.id && cell.configuration === configuration);
     if (cells.length && cells.every(cell => cell.skipped)) continue; // not applicable, as the plan predeclared
+    // The trees ran different settings: every metric is shown beside the gate, none in it, and a missing
+    // measurement is a note.
+    const context = isContext(configuration);
+    const missing = context ? notes : reasons;
     const comparison = pooledComparison(run, model.id, configuration);
-    if (!comparison) { reasons.push(`${model.id}/${configuration}: no paired measurement`); continue; }
+    if (!comparison) { missing.push(`${model.id}/${configuration}: no paired measurement`); continue; }
     const deltas = [...GATED, ...CONTEXT].flatMap(name => {
       const metric = comparison.pooled.find(c => c.metric === name);
-      if (!metric) { reasons.push(`${model.id}/${configuration}: no ${name} comparison`); return []; }
+      if (!metric) { missing.push(`${model.id}/${configuration}: no ${name} comparison`); return []; }
       try {
-        return [{ ...pairedDelta(metric, (GATED as readonly string[]).includes(name)),
+        return [{ ...pairedDelta(metric, !context && (GATED as readonly string[]).includes(name)),
           sessions: comparison.sessions.map(({ session, metrics }) => {
             const own = metrics.find(c => c.metric === name);
             return { session, baselineMedian: own?.baselineMedian ?? null, candidateMedian: own?.candidateMedian ?? null };
           }) }];
-      } catch (error) { reasons.push(`${model.id}/${configuration}: ${(error as Error).message}`); return []; }
+      } catch (error) { missing.push(`${model.id}/${configuration}: ${(error as Error).message}`); return []; }
     });
     compositions.push({ model: model.id, configuration, label: model.label, deltas });
   }
@@ -206,8 +214,14 @@ const machineLine = (m: { chip: string; memoryBytes: number; host: string }) => 
 const preflightLine = (label: string, p: PreflightRecord | null) => !p ? `- preflight ${label}: not run` :
   `- preflight ${label}: ${p.ok ? "clear" : "NOT CLEAR"} at ${p.at} (${p.attempts} check${p.attempts === 1 ? "" : "s"} over ` +
   `${Math.round(p.waitedMs / 60_000)} min); swap ${p.swapUsedMB.toFixed(0)} MB, free ${p.freePercent}%, load ${p.loadAvg1m.toFixed(1)}`;
+/** What each tree of a configuration ran: the shared flags, then a tree's own (a context configuration's). */
+const treeFlags = (name: Configuration) => {
+  const spec = CONFIGURATIONS[name];
+  return "treeArgs" in spec ? `; baseline ${spec.treeArgs.baseline.join(" ")}, candidate ${spec.treeArgs.candidate.join(" ")}` : "";
+};
 const configurationLine = (name: Configuration) => `${name} (${[...CONFIGURATIONS[name].args, ...("dflash2" in CONFIGURATIONS[name] ? ["--draft-model <DFlash 2 drafter>"] : []),
-  ...("draftDepth" in CONFIGURATIONS[name] ? [`--draft-kind mtp --num-draft-tokens ${CONFIGURATIONS[name].draftDepth}`] : [])].join(" ") || "CLI defaults"})`;
+  ...("draftDepth" in CONFIGURATIONS[name] ? [`--draft-kind mtp --num-draft-tokens ${CONFIGURATIONS[name].draftDepth}`] : [])].join(" ") || "CLI defaults"}` +
+  `${treeFlags(name)})`;
 
 /** The job summary: headline, provenance, and per model and configuration the paired deltas with their intervals. */
 export function summary(d: Decision, input: DecideInput): string {
@@ -233,7 +247,11 @@ export function summary(d: Decision, input: DecideInput): string {
   for (const note of d.notes) lines.push(`- note: ${note}`);
   if (d.notes.length) lines.push("");
   for (const c of d.compositions) {
-    lines.push(`### ${c.model} · ${c.configuration} · ${c.label}`, "",
+    lines.push(`### ${c.model} · ${c.configuration} · ${c.label}`, "");
+    if (isContext(c.configuration))
+      lines.push(`Context, not gated: the trees ran different settings (${treeFlags(c.configuration).slice(2)}), so no metric here ` +
+        "decides the check.", "");
+    lines.push(
       "| metric | unit | baseline median | candidate median | candidate/baseline | 95% interval | pairs | per-session medians | verdict |",
       "|---|---|---|---|---|---|---|---|---|");
     for (const x of c.deltas) {
@@ -275,8 +293,10 @@ candidate/baseline ratios and its interval the 95% Student-t interval of the mea
 several sessions it covers session-to-session drift. A metric regresses when the whole interval is
 on the worse side of 1. Per-session medians are shown beside the pooled ones. One-pair-per-session
 metrics (${CONTEXT.join(", ")}) are shown, never gated; memory is the worker's MLX allocator from
-/stats and the physical footprint, not ps RSS. The preflight after the run is recorded and shown; as
-on main, the one before the run gates.`;
+/stats and the physical footprint, not ps RSS. A context configuration, whose trees run different
+settings (dflash2-d7-baseline: the baseline at depth 7, the candidate adaptive), is shown and never
+gates; its probes and request pairing are notes. The preflight after the run is recorded and shown;
+as on main, the one before the run gates.`;
 
 const readJson = <T>(path: string | undefined): T | null => path && existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) as T : null;
 

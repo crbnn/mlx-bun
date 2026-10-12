@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { createKvMaintenance, unchangedKv } from "../../src/state/kv-maintenance";
+import { createKvMaintenance, unchangedKv } from "../../src/state/layout";
 import { KVCache } from "../../src/state/kv";
 import { unfusedAffineKernels } from "../../src/state/affine-attention";
 import { AttentionMasks } from "../../src/state/attention-read";
