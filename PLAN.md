@@ -398,13 +398,32 @@ the default variant on the M4 Pro and the M1 Max; paired serve benchmark shows n
       module-level maps.
 - [x] Programs are built for exactly the chunk size; no buckets, no minimum-row floor. The
       leftover chunk is `prefillTail` on the GPU.
-- [ ] ANE programs compile at install, the way Apple's own pipeline compiles a model for the
+- [x] ANE programs compile at install, the way Apple's own pipeline compiles a model for the
       Neural Engine on the device and caches it (Josh, 2026-10-10). The installer, or the app's
       first launch, compiles every program the shipped compositions need and leaves them in the
       framework's cache, so no prompt ever pays the compile and the serving process never
       compiles. The MIL source ships in the bundle as the compiler's input. Shipping the compiled
       form itself, one per Neural Engine generation built on a host of that generation, stays
-      possible later; it is not required.
+      possible later; it is not required. Landed (`refactor/composition-c3-install`, aed03a64,
+      integration branch fast-forwarded). The bridge separates compile from load; creating a
+      program only loads it and refuses one the cache lacks (and no longer writes the MIL to
+      disk, which made loads compile silently). A graph table entry declares
+      `anePrograms(composition)`; the M4 Pro graph exports its widths (recorded by the
+      generator's description) and lists three programs, the MLP slice and two projections at
+      the chunk size, identical programs counted once. `mlx-bun compile-ane` compiles what
+      this Mac's compositions need for the flag-free composition (no model download), with
+      `--check` and `--quiet`; `scripts/install.sh` runs it with the installed executable and
+      warns and keeps the installation where the Neural Engine cannot compile; before every
+      model load the app runs it quietly as a child of the same executable (the isolated
+      parent loads no native library), so a program macOS purged comes back before the load
+      (about 70 ms per launch when everything is cached, no record kept); the worker never
+      compiles and a missing program at its load is `AneBridgeError` naming the verb, which
+      only a library host that bypassed the step can hit. Measured on the real artifact at an
+      uncompiled chunk size: compile 4.9 s + 661 ms + 572 ms once; loads from the cache 18.6,
+      2.4 and 2.2 ms; a cache check 0.2 ms; the machine-wide client count unchanged by the
+      compile. Found: the cache is per code-signing identity (the verb runs under the
+      executable that serves); macOS can garbage-collect entries, which the per-launch check
+      covers. Not done: a Homebrew `post_install` hook (the first launch covers it).
 
 - [x] Program creation blocked (D1's merge gate, 2026-10-11, over 20 minutes). Cause found on
       `refactor/composition-c3-hang` (e3cc7f29, merged into the integration branch at
