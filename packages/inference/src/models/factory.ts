@@ -23,7 +23,7 @@ import { Qwen35Model } from "./qwen/qwen3_5";
 import { Qwen3Model } from "./qwen/qwen3";
 import { Qwen3MoeModel } from "./qwen/qwen3-moe";
 import { DiffusionGemmaModel } from "./diffusion-gemma/model";
-import { Glm52Model } from "./glm52/model";
+import { Glm52Model, type Glm52LatentCaches } from "./glm52/model";
 import {
   GLM52_G5_DEFAULT_CONTEXT_TOKENS,
   GLM52_G5_DEFAULT_MAX_GENERATION_TOKENS,
@@ -35,7 +35,7 @@ import { UniversalDenseModel } from "./universal/dense";
 import { WhisperModel } from "./whisper/model";
 import { genericArgsFor } from "./universal/archs";
 import { familyForGraph } from "./families";
-import { assertComposedCaches, resolveComposition } from "./composition";
+import { resolveComposition } from "./composition";
 import type { Composition } from "../contracts/portable/composition";
 import {
   GraphTable,
@@ -129,6 +129,9 @@ export interface Glm52RuntimeOpenOptions {
   machineBytes?: number;
   /** Native expert-I/O dylib override. Packaged/dev defaults are automatic. */
   libraryPath?: string;
+  /** The composition's KV scheme and paging, which the graph's latent caches
+   * compose (default f32, unpaged). */
+  caches?: Glm52LatentCaches;
 }
 
 /** Open the direct Colibri artifact through the validated bounded expert
@@ -161,6 +164,7 @@ export async function openGlm52RuntimeModel(
     decodeKernel: "metal",
     enableMtp: plan.enableMtp,
     mtpDraftTokens: plan.mtpDraftTokens,
+    ...(options.caches ? { caches: options.caches } : {}),
   });
   if (model.expertRuntime?.plan.plannedBytes !== plan.plannedProcessBytes) {
     const actual = model.expertRuntime?.plan.plannedBytes ?? 0;
@@ -213,7 +217,8 @@ export async function openModel<Model>(
   if (profile.profile.execution.loader === "colibri") {
     if (options.implementations || profile.profile.execution.implementation !== undefined)
       throw new Error("custom Colibri implementations require a streamed loader binding; refusing to fall back");
-    return (await openGlm52RuntimeModel(modelDir, options)).model;
+    return (await openGlm52RuntimeModel(modelDir, options.composition
+      ? { ...options, caches: { kv: options.composition.kv, pagedKv: options.composition.pagedKv } } : options)).model;
   }
   if (profile.profile.execution.loop === "encoder-decoder")
     throw new Error(
@@ -224,7 +229,7 @@ export async function openModel<Model>(
   const implementation = (options.implementations ?? MLX_MODEL_IMPLEMENTATIONS).select(config, profile);
   const composition = options.composition ?? resolveComposition(config);
   const weights = await Weights.open(modelDir);
-  try { return composed(implementation.create(weights, config, profile, composition), composition); }
+  try { return implementation.create(weights, config, profile, composition); }
   catch (error) { weights.dispose(); throw error; }
 }
 
@@ -254,13 +259,5 @@ export function createModel<Model>(
       `${resolved.profile.id} uses the direct Colibri container; construct it with ` +
       "openModel(modelDir) or Glm52Model.open(modelDir)",
     );
-  return composed(implementations.select(config, resolved).create(weights, config, resolved, composition), composition);
-}
-
-/** `model`, once its caches can serve `composition` (`assertComposedCaches`);
- * a refused model is released. */
-function composed<Model>(model: Model, composition: Composition): Model {
-  try { assertComposedCaches(model as object, composition); }
-  catch (error) { (model as { dispose?(): void }).dispose?.(); throw error; }
-  return model;
+  return implementations.select(config, resolved).create(weights, config, resolved, composition);
 }

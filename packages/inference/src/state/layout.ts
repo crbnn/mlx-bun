@@ -13,6 +13,7 @@ import { DelayedQuantizedKVCache } from "./delayed-quantized-kv";
 import { DelayedRotatingQuantizedKVCache } from "./delayed-rotating-quantized-kv";
 import { DelayedTurboQuantKVCache } from "./delayed-turboquant-kv";
 import { MLACache } from "./glm52-cache";
+import { EncodedLatentCache, PagedLatentCache } from "./latent-legos";
 import { KVCache } from "./kv";
 import { PagedKVCache } from "./paged/cache";
 import { PagedKvRows } from "./paged/rows";
@@ -68,6 +69,8 @@ const ROW_LAYOUTS: readonly RowLayoutEntry<Cache>[] = [
   entry(PagedKVCache, { decode: pagedRows, prefill: pagedRows, verify: pagedRows }),
   ownEmptyBatch(PagedKvRows),
   ownEmptyBatch(MLACache),
+  ownEmptyBatch(EncodedLatentCache),
+  ownEmptyBatch(PagedLatentCache),
   entry(DelayedRotatingQuantizedKVCache, {
     decode: cache => cache.makeEmptyBatch(), prefill: cache => cache.makeEmptyBatch(),
     verify: cache => new DelayedRotatingQuantizedKVCache(cache.maxSize, cache.groupSize, cache.bits, cache.start,

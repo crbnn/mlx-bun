@@ -118,15 +118,3 @@ function compose(request: Omit<CompositionRequest, "kv">, kv: Composition["kv"])
     compiledGeglu: request.compiledGeglu ?? COMPOSITION_DEFAULTS.compiledGeglu,
   });
 }
-
-/** Refuse `composition` for a graph that carries no composition record: such a
- * graph composes its own caches (GLM-5.2's compressed MLA), and no lego of a
- * quantized or paged KV scheme exists for them yet, so the record could not be
- * served as named. Serving it as bf16
- * would report an option as implemented when it is not. */
-export function assertComposedCaches(model: object, composition: Composition): void {
-  if ((model as { composition?: Composition }).composition) return;
-  if (composition.kv.kind === "bf16" && !composition.pagedKv) return;
-  const named = composition.pagedKv ? "paged KV" : `${composition.kv.kind} KV`;
-  throw new Error(`this graph composes its own caches, which have no ${named} form yet (--kv-quant, --paged-kv)`);
-}

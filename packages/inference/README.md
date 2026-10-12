@@ -1306,7 +1306,7 @@ after the last row's run closes. Each unit runs with only its row's adapters
 active. An image request passes its pixels as the row's prefill input: only the
 first unit reads them (the vision encoder runs there), and the request owner
 releases them after the row settles. Grammar, draft, logprobs, logits processors,
-fill requests are refused with typed plan reasons; a KV scheme or paging is refused at load, since this graph composes its own denoising state, which has no quantized or paged form yet. `DenoisingKeys` reproduces MLX's
+fill requests are refused with typed plan reasons; its caches are the legos the composition's KV scheme and paging name. `DenoisingKeys` reproduces MLX's
 global key sequence per request, so denoising never reads or reseeds the process
 key. The [denoising tests](tests/generation/denoising-binding.test.ts) take
 `MLX_BUN_DIFFUSION_MODEL=/cached/diffusiongemma` for the real-weight check and

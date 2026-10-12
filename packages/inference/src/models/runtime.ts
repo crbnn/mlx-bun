@@ -4,6 +4,7 @@
 // decided here from the resolved profile, never by the application.
 
 import type { MemoryPlan } from "../contracts/portable/memory-plan";
+import { BF16_KV, type KvStorageScheme } from "../contracts/portable/composition";
 import type { DisposableResource } from "../contracts/portable/resources";
 import { declaredGraph } from "./capabilities";
 import { openGlm52RuntimeModel, type RuntimeModel } from "./factory";
@@ -27,6 +28,10 @@ export interface RuntimeOpenOptions {
   machineBytes?: number;
   /** Native loader library override. */
   libraryPath?: string;
+  /** The composition's KV scheme and paging, which the runtime's caches compose
+   * (unset: unquantized, unpaged). */
+  kv?: KvStorageScheme;
+  pagedKv?: { readonly blockSize: number } | null;
 }
 
 export interface OpenedRuntime {
@@ -48,6 +53,7 @@ export async function openPlannedRuntime(
     memoryBudgetBytes: options.memoryBudgetBytes, contextTokens: options.contextTokens,
     maxGenerationTokens: options.maxGenerationTokens, batchSize: options.batchSize,
     enableMtp: options.nativeDraft, machineBytes: options.machineBytes, libraryPath: options.libraryPath,
+    ...(options.kv || options.pagedKv ? { caches: { kv: options.kv ?? BF16_KV, pagedKv: options.pagedKv ?? null } } : {}),
   });
   const sparse = declaredGraph(model).graphCapabilities.sparseAttention;
   return {

@@ -5,7 +5,7 @@ import { bindRequestState, type MlxRequestStatePolicy } from "../state/request-p
 import type { ExecutionContext } from "../contracts/portable/scheduling";
 import type { ModelConfig } from "../artifacts/config";
 import type { MlxTokenGraph } from "../models/graph";
-import { declaredGraph } from "../models/capabilities";
+import { declaredGraph, stateCodecsOf } from "../models/capabilities";
 import { composeAtLayer } from "../state/persistence";
 import { bindRequiredDenseKvLayers } from "../state/dense-kv-reads";
 import { BF16_KV, COMPOSITION_DEFAULTS, type KvStorageScheme } from "../contracts/portable/composition";
@@ -196,6 +196,7 @@ export function bindMlxGateway(model: MlxTokenGraph,
       try { return caches.map((cache, layer) => composeAtLayer(prototypes[layer]!, cache)); }
       finally { disposeResources(prototypes); }
     },
-    createBatchGroup: (options) => new MlxBatchExecutionGroup(model, options),
+    // The graph's own persistence codecs, where it declares them, unless the caller supplies a set.
+    createBatchGroup: (options) => new MlxBatchExecutionGroup(model, { ...(stateCodecsOf(model) ? { stateCodecs: stateCodecsOf(model) } : {}), ...options }),
   };
 }

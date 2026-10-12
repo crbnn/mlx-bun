@@ -71,19 +71,18 @@ plain run.
 `--paged-kv` (env mirror `MLX_BUN_PAGED_KV=1`) with `--paged-kv-block-size`
 (only alongside paging) composes the paged KV lego when the model loads: every
 request, drafted, grammar, fill, media and adapter rows included, keeps its
-full-attention keys and values in blocks. Pages store bf16 or uniform
-KV4/KV8; startup rejects paging with per-layer KV quantization or TurboQuant,
-whose pages are not implemented.
+full-attention keys and values in blocks. Pages store what `--kv-quant` names
+for each layer: bf16, affine at the scheme's width (per layer under `config`),
+or TurboQuant.
 As main's server did, startup also rejects `--kv-quant turbo` when the model's
 full-attention head dimension is not one the TurboQuant codec encodes
 (`TURBOQUANT_HEAD_DIMS`), before any request, instead of failing each request in
 prefill.
-Startup, and `generate`, also reject a requested KV scheme or paging for a graph
-that composes its own caches, which have no quantized or paged form yet: GLM-5.2's
-MLA cache and DiffusionGemma's denoising state, so `--kv-quant 4|8|turbo` (and
-`config` or `--l2` when a `kv_config.json` exists) or `--paged-kv` is refused
-there; main accepted the option and served GLM-5.2 in bf16 while reporting the
-requested scheme.
+The graphs that compose their own caches take the scheme and paging too:
+GLM-5.2's compressed MLA state (the latent, RoPE key and DSA index key) is stored
+as the scheme names and paged under `--paged-kv`, and DiffusionGemma's denoising
+caches are the scheme's legos; main accepted the option and served GLM-5.2 in
+bf16 while reporting the requested scheme.
 `--kv-quant config` without the model's `kv_config.json` stays bf16.
 The opt-in [paged KV test](tests/engine/paged-kv.test.ts) serves a Gemma4 and
 a model of another family.

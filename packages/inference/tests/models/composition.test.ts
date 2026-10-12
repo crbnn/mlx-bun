@@ -178,16 +178,15 @@ test("paging is a composition fact over every KV scheme, the block size given or
   }
 });
 
-test("a graph that carries no composition record composes its own caches: a KV scheme or paging for it is refused", () => {
-  let released = 0;
+test("every KV scheme and paging compose for every graph: no load refuses one (B4)", () => {
+  const seen: Composition[] = [];
   const registry = new ModelImplementationRegistry<Weights, { weights: Weights; dispose(): void }>([{
     id: "qwen3", graph: "qwen3", loader: "safetensors", loop: "autoregressive",
-    create: weights => ({ weights, dispose() { released++; } }),
+    create: (weights, _config, _profile, composition) => { seen.push(composition); return { weights, dispose() {} }; },
   }]);
   const profile = resolveModelProfile(config);
-  expect(() => createModel({} as Weights, config, resolveComposition(config), profile, registry)).not.toThrow();
-  for (const request of [{ kv: { override: 4 as const } }, { pagedKv: {} }])
-    expect(() => createModel({} as Weights, config, resolveComposition(config, request), profile, registry))
-      .toThrow("this graph composes its own caches");
-  expect(released).toBe(2);
+  for (const request of [{}, { kv: { override: 4 as const } }, { pagedKv: {} }, { kv: { turboQuant: { kBits: 8, vBits: 3 } }, pagedKv: {} }])
+    expect(() => createModel({} as Weights, config, resolveComposition(config, request), profile, registry)).not.toThrow();
+  expect(seen.map(composition => [composition.kv.kind, composition.pagedKv !== null]))
+    .toEqual([["bf16", false], ["affine", false], ["bf16", true], ["turbo", true]]);
 });

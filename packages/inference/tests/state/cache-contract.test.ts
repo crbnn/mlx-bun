@@ -57,7 +57,7 @@ import { bindRowCacheRollback, type RowSpeculativeState } from "../../src/state/
 import { SSMCache } from "../../src/state/ssm";
 import { deferredTurboQuantKernels, denseTurboQuantKernels } from "../../src/state/turboquant-attention";
 import { leaseCacheStates } from "../../src/state/leases";
-import { MLACache } from "../../src/state/glm52-cache";
+import { composedLatentCache, latentLegoCodecs } from "../../src/state/latent-legos";
 import type { LatentAttentionCache, LatentAttentionState } from "../../src/contracts/mlx/cache";
 
 // ---------------------------------------------------------------------------
@@ -673,12 +673,37 @@ describe("recurrent state (SSMCache)", () => {
 
 // ---------------------------------------------------------------------------
 // The latent attention state: GLM-5.2's compressed MLA state
-// (`LatentAttentionCache`), with and without DSA index keys
+// (`LatentAttentionCache`), with and without DSA index keys, under every lego a
+// KV scheme and paging compose for it (`composedLatentCache`): f32 (`MLACache`),
+// encoded f32-first (affine, TurboQuant, a later start) and paged (f32,
+// affine, TurboQuant).
 
-for (const dsa of [false, true]) describe(`latent attention state (MLACache${dsa ? ", DSA index keys" : ""})`, () => {
-  const RANK = 8, ROPE_DIM = 4, INDEX = 6;
-  const make = () => new MLACache({ kvLoraRank: RANK, ropeHeadDim: ROPE_DIM, maxTokens: 64,
-    ...(dsa ? { dsa: { headDim: INDEX } } : {}) });
+interface LatentLego {
+  readonly name: string;
+  readonly scheme: KvStorageScheme;
+  readonly paged: boolean;
+  /** Every read equals the stored f32 inputs bit for bit (f32 storage). */
+  readonly exact: boolean;
+  /** Positions the lego reads in f32 before it converts (encoded f32-first legos). */
+  readonly f32Until: number;
+  /** Bound on a decoded read's difference from its f32 inputs. */
+  readonly tolerance: number;
+}
+const LATENT_LEGOS: readonly LatentLego[] = [
+  { name: "f32 (MLACache)", scheme: BF16_KV, paged: false, exact: true, f32Until: Infinity, tolerance: 0 },
+  { name: "affine 4, f32 first", scheme: affine(4), paged: false, exact: false, f32Until: 0, tolerance: 0.3 },
+  { name: "affine 8, f32 for 6 positions", scheme: affine(8, 6), paged: false, exact: false, f32Until: 6, tolerance: 0.03 },
+  { name: "TurboQuant 8/3, f32 first", scheme: turbo(), paged: false, exact: false, f32Until: 0, tolerance: 1 },
+  { name: "paged f32", scheme: BF16_KV, paged: true, exact: true, f32Until: Infinity, tolerance: 0 },
+  { name: "paged affine 4", scheme: affine(4), paged: true, exact: false, f32Until: -1, tolerance: 0.3 },
+  { name: "paged TurboQuant 8/3", scheme: turbo(), paged: true, exact: false, f32Until: -1, tolerance: 1 },
+];
+
+for (const lego of LATENT_LEGOS) for (const dsa of [false, true])
+describe(`latent attention state: ${lego.name}${dsa ? ", DSA index keys" : ""}`, () => {
+  const RANK = 64, ROPE_DIM = 64, INDEX = 64;
+  const make = (): Cache => composedLatentCache(lego.scheme, lego.paged ? { blockSize: 4 } : null, 0,
+    { kvLoraRank: RANK, ropeHeadDim: ROPE_DIM, maxTokens: 64, ...(dsa ? { indexHeadDim: INDEX } : {}) });
   /** `L` float32 positions of each row's stream (`seeds` name the rows). */
   const inputs = (L: number, seeds: readonly number[]) => {
     const part = (width: number, shift: number) =>
@@ -699,46 +724,54 @@ for (const dsa of [false, true]) describe(`latent attention state (MLACache${dsa
   };
   const row = (length: number, seed: number) => { const cache = make(); release(appendRows(cache, length, [seed])); return cache; };
   const tail = (a: MlxArray, from: number, to: number) => a.slice([0, from, 0], [a.shape[0]!, to, a.shape[2]!]);
+  /** A read of stored f32 positions `want`: bit for bit while the lego reads f32, within its tolerance once it decodes. */
+  const expectRead = (label: string, read: MlxArray, want: MlxArray, f32: boolean) => {
+    const diff = maxDiff(read, want);
+    if (lego.exact || f32) expect(diff, label).toBe(0);
+    else expect(diff, `${label}: ${diff}`).toBeLessThanOrEqual(lego.tolerance);
+  };
 
-  test("phases: window, decode, window; each read returns every stored position", () => {
-    const cache = make() as MLACache & LatentAttentionCache;
+  test("phases: window, decode, window; each read returns every stored position, f32 first where the lego converts", () => {
+    const cache = make() as Cache & LatentAttentionCache;
+    const stored: { latent: MlxArray; rope: MlxArray; indexKeys: MlxArray | null }[] = [];
     try {
       let position = 0;
-      for (const [L, seed] of [[5, 1], [1, 2], [3, 3]] as const) {
-        const stored = cache.storedIndexKeys();
-        const { latent, rope, indexKeys } = inputs(L, [seed]);
+      for (const [L, seed] of [[5, 1], [1, 2], [3, 3], [1, 4]] as const) {
+        const before = cache.storedIndexKeys();
+        const appended = inputs(L, [seed]);
+        stored.push(appended);
+        const state = cache.appendLatent(appended.latent, appended.rope, appended.indexKeys);
         try {
-          const state = cache.appendLatent(latent, rope, indexKeys);
-          try {
-            expect(cache.offset).toBe(position + L);
-            expect(state.latent.shape).toEqual([1, position + L, RANK]);
-            expect(state.rope.shape).toEqual([1, position + L, ROPE_DIM]);
-            using lastLatent = tail(state.latent, position, position + L);
-            using lastRope = tail(state.rope, position, position + L);
-            expect(maxDiff(lastLatent, latent)).toBe(0);
-            expect(maxDiff(lastRope, rope)).toBe(0);
-            if (dsa) {
-              using lastIndex = tail(state.indexKeys!, position, position + L);
-              expect(maxDiff(lastIndex, indexKeys!)).toBe(0);
-              if (position === 0) expect(stored).toBeNull();
-              else { using before = tail(state.indexKeys!, 0, position); expect(maxDiff(before, stored!)).toBe(0); }
-            } else expect([state.indexKeys, stored]).toEqual([null, null]);
-            position += L;
-          } finally { release(state); }
-        } finally { latent.dispose(); rope.dispose(); indexKeys?.dispose(); stored?.dispose(); }
+          expect(cache.offset).toBe(position + L);
+          expect(state.latent.shape).toEqual([1, position + L, RANK]);
+          // The lego reads f32 through the append that leaves it at its start (bf16-first's rule).
+          const f32 = lego.f32Until >= 0 && position < Math.max(1, lego.f32Until);
+          using allLatent = ops.concatAxis(stored.map(part => part.latent), 1);
+          using allRope = ops.concatAxis(stored.map(part => part.rope), 1);
+          expectRead(`latent at ${position}`, state.latent, allLatent, f32);
+          expectRead(`rope at ${position}`, state.rope, allRope, f32);
+          if (dsa) {
+            using allIndex = ops.concatAxis(stored.map(part => part.indexKeys!), 1);
+            expectRead(`index keys at ${position}`, state.indexKeys!, allIndex, f32);
+            if (position === 0) expect(before).toBeNull();
+            else { using prior = tail(state.indexKeys!, 0, position); expectRead("stored index keys", before!, prior, f32); }
+          } else expect([state.indexKeys, before]).toEqual([null, null]);
+          position += L;
+        } finally { release(state); before?.dispose(); }
       }
-    } finally { cache.dispose(); }
+    } finally { cache.dispose(); for (const part of stored) { part.latent.dispose(); part.rope.dispose(); part.indexKeys?.dispose(); } }
   });
 
   test("snapshot and SSD continue as the source", () => {
-    const cache = row(6, 11), path = join(tmp, `mla${dsa ? "-dsa" : ""}.kv`);
-    const [clone] = cloneKvCaches([cache]);
+    const cache = row(6, 11), path = join(tmp, `latent-${lego.name.replace(/\W+/g, "-")}${dsa ? "-dsa" : ""}.kv`);
+    const [clone] = cloneKvCaches([cache], latentLegoCodecs);
     try {
       evaluate([cache]);
-      saveKvCache(path, Array.from({ length: 6 }, (_, i) => i), [cache]);
-      const restored = loadKvCache(path, { makeCache: () => [make()] }).caches[0]!;
+      saveKvCache(path, Array.from({ length: 6 }, (_, i) => i), [cache], {}, latentLegoCodecs);
+      const restored = loadKvCache(path, { makeCache: () => [make()] }, {}, latentLegoCodecs).caches[0]!;
       try {
         expect(restored.offset).toBe(6);
+        expect(restored.signature()).toBe(cache.signature());
         const source = appendRows(cache, 1, [12]);
         try {
           for (const [label, other] of [["clone", clone!], ["restored", restored]] as const) {
@@ -758,12 +791,24 @@ for (const dsa of [false, true]) describe(`latent attention state (MLACache${dsa
       layout = targetCacheLayout(rows[0]!) as unknown as BatchableCache & RowSpeculativeState;
       layout.mergeRows(rows);
       expect([...layout.rowOffsets]).toEqual([5, 9]);
+      // A merged layout reads each row as its serial twin does.
+      {
+        const a = appendRows(layout, 1, [26, 27]);
+        const twinReads = twins.map((twin, index) => appendRows(twin, 1, [26 + index]));
+        try {
+          for (const [index, read] of twinReads.entries()) {
+            const pad = layout.leftPad[index]!, width = layout.offset;
+            using mine = a.latent.slice([index, pad, 0], [index + 1, width, RANK]);
+            expect(maxDiff(mine, read.latent), `merged row ${index}`).toBe(0);
+          }
+        } finally { release(a); for (const read of twinReads) release(read); }
+      }
       // Two drafts: row 0 accepts none (keeps one position), row 1 accepts both (keeps three).
       const transaction = bindRowCacheRollback([layout], 2);
       transaction.begin(2);
       release(appendRows(layout, 3, [23, 24]));
       transaction.resolve([0, 2]);
-      expect([...layout.rowOffsets]).toEqual([6, 12]);
+      expect([...layout.rowOffsets]).toEqual([7, 13]);
       for (const [index, keep] of [1, 3].entries()) {
         const { latent, rope, indexKeys } = inputs(3, [23 + index]);
         try {
@@ -778,6 +823,8 @@ for (const dsa of [false, true]) describe(`latent attention state (MLACache${dsa
         const a = appendRows(cache, 1, [25 + index]), b = appendRows(twins[index]!, 1, [25 + index]);
         try { expectStates(`row ${index}`, a, b); } finally { release(a); release(b); }
       }
+      layout.filterRows([1]);
+      expect([...layout.rowOffsets]).toEqual([13]);
     } finally { dispose(layout, ...extracted, ...rows, ...twins); }
   });
 });

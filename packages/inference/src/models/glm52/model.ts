@@ -25,7 +25,9 @@ import type {
 import { declareGraph } from "../capabilities";
 import { atEveryWidth, byWidth } from "../graph";
 import { type QuantizedLinear } from "../../layers/quantized-linear";
-import { MLACache } from "../../state/glm52-cache";
+import { composedLatentCache, latentLegoCodecs } from "../../state/latent-legos";
+import type { CacheCodecProvider } from "../../state/persistence-types";
+import { BF16_KV, type KvStorageScheme } from "../../contracts/portable/composition";
 import {
 glm52DsaScoresMlx,
 Glm52DsaSelectionState,
@@ -57,8 +59,21 @@ export interface Glm52ModelCapabilities {
   readonly mtpDraftTokens?: number;
 }
 
+/** The composition's KV scheme and paging, which a GLM-5.2 graph's latent
+ * caches compose (`composedLatentCache`): the latent, RoPE key and DSA index
+ * key stored as the scheme names, in pages under paging. */
+export interface Glm52LatentCaches {
+  readonly kv: KvStorageScheme;
+  readonly pagedKv: { readonly blockSize: number } | null;
+}
+
+/** f32 latent state, unpaged: the checkpoint-native storage (`MLACache`). */
+export const GLM52_F32_CACHES: Glm52LatentCaches = Object.freeze({ kv: BF16_KV, pagedKv: null });
+
 export interface Glm52StreamedOpenOptions
 extends Omit<Glm52ExpertRuntimeOptions, "fixedBytes"> {
+  /** The latent caches' scheme and paging (default f32, unpaged). */
+  readonly caches?: Glm52LatentCaches;
   /** KV/transient/allocator/Bun/OS reserve, excluding resident weights. */
   readonly reserveBytes: number;
   /** Internal counterfactual control; indexer weights remain resident. */
@@ -736,6 +751,8 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
     expertRuntime: Glm52ExpertRuntime | null = null,
     dsaPrefillMode: "exact" | "dense-benchmark" = "exact",
     dsaBenchmarkPrefillTokens = 0,
+    /** The composition's KV scheme and paging, which `makeCache` composes. */
+    readonly caches: Glm52LatentCaches = GLM52_F32_CACHES,
   ) {
     if (config.modelType !== "glm_moe_dsa" ||
         glmConfig.modelType !== "glm_moe_dsa") {
@@ -789,7 +806,7 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
     this.finalNorm = weights.tensor("model.norm.weight");
   }
 
-  static async open(modelDir: string): Promise<Glm52Model> {
+  static async open(modelDir: string, caches: Glm52LatentCaches = GLM52_F32_CACHES): Promise<Glm52Model> {
     const glmConfig = await loadGlm52Config(modelDir);
     const config = await loadModelConfig(modelDir);
     const weights = ColibriGlm52Weights.open(modelDir);
@@ -801,7 +818,7 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
       return new Glm52Model(weights, config, glmConfig, {
         dsa: detected.hasDsa,
         mtpMetadata: detected.hasMtp,
-      });
+      }, null, null, "exact", 0, caches);
     } catch (error) {
       weights.dispose();
       throw error;
@@ -827,6 +844,7 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
         enableDsa: _enableDsa,
         dsaPrefillMode,
         dsaBenchmarkPrefillTokens,
+        caches,
         ...runtimeOptions
       } = options;
       runtime = await Glm52ExpertRuntime.open(modelDir, glmConfig, {
@@ -847,6 +865,7 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
         runtime,
         dsaPrefillMode ?? "exact",
         dsaBenchmarkPrefillTokens ?? 0,
+        caches ?? GLM52_F32_CACHES,
       );
     } catch (error) {
       runtime?.close();
@@ -859,15 +878,24 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
     return new Map();
   }
 
-  makeCache(): MLACache[] {
-    return this.layers.map((layer) => new MLACache({
+  /** One latent attention cache per layer, the lego the composition's KV
+   *  scheme and paging name for it (`composedLatentCache`): f32 by default, the
+   *  latent, RoPE key and (on a DSA layer) index key encoded f32-first under a
+   *  quantized scheme, in pages under paging. */
+  makeCache(): Cache[] {
+    const { kv, pagedKv } = this.caches;
+    return this.layers.map((layer, index) => composedLatentCache(kv, pagedKv, index, {
       kvLoraRank: this.glmConfig.kvLoraRank,
       ropeHeadDim: this.glmConfig.qkRopeHeadDim,
       maxTokens: this.glmConfig.maxPositionEmbeddings,
-      ...(this.capabilities.dsa && layer.dsa
-        ? { dsa: { headDim: this.glmConfig.indexHeadDim } }
-        : {}),
+      ...(this.capabilities.dsa && layer.dsa ? { indexHeadDim: this.glmConfig.indexHeadDim } : {}),
     }));
+  }
+
+  /** The persistence codecs of the caches `makeCache` composes: the latent
+   *  legos' beside the default set, where the scheme or paging composes them. */
+  get stateCodecs(): CacheCodecProvider | undefined {
+    return this.caches.kv.kind === "bf16" && !this.caches.pagedKv ? undefined : latentLegoCodecs;
   }
 
   /** Attach probe-only telemetry for selections computed by FULL DSA layers. */

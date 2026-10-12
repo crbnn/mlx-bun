@@ -21,6 +21,7 @@ import { Glm52Model } from "../../../src/models/glm52/model";
 import { Glm52Model as FrozenGlm52Model } from "../glm52-reference/model";
 import { MLACache as FrozenMLACache } from "../glm52-reference/cache";
 import { MLACache } from "../../../src/state/glm52-cache";
+import type { KvStorageScheme } from "../../../src/contracts/portable/composition";
 
 // ---------------------------------------------------------------------------
 // Synthetic geometry and weights
@@ -29,16 +30,20 @@ const HIDDEN = 16, HEADS = 2, Q_RANK = 8, KV_RANK = 8, NOPE = 4, ROPE = 4, VALUE
 const INTER = 16, MOE_INTER = 8, EXPERTS = 4, VOCAB = 48, LAYERS = 3;
 const INDEX_TOPK = 6, INDEX_HEADS = 2, INDEX_DIM = 8;
 
-function glmConfig(dsa: boolean): Glm52Config {
+/** The latent widths: the identity scenarios' small ones, or widths every latent lego encodes (affine groups of 64, TurboQuant's widths). */
+interface LatentWidths { readonly kvRank: number; readonly rope: number; readonly index: number }
+const SMALL: LatentWidths = { kvRank: KV_RANK, rope: ROPE, index: INDEX_DIM };
+
+function glmConfig(dsa: boolean, widths: LatentWidths = SMALL): Glm52Config {
   return parseGlm52Config("/synthetic", {
     model_type: "glm_moe_dsa", architectures: ["GlmMoeDsaForCausalLM"],
     hidden_size: HIDDEN, num_hidden_layers: LAYERS, num_attention_heads: HEADS, num_key_value_heads: HEADS,
-    q_lora_rank: Q_RANK, kv_lora_rank: KV_RANK, qk_nope_head_dim: NOPE, qk_rope_head_dim: ROPE, v_head_dim: VALUE,
+    q_lora_rank: Q_RANK, kv_lora_rank: widths.kvRank, qk_nope_head_dim: NOPE, qk_rope_head_dim: widths.rope, v_head_dim: VALUE,
     first_k_dense_replace: 1, intermediate_size: INTER, moe_intermediate_size: MOE_INTER,
     n_routed_experts: EXPERTS, num_experts_per_tok: 2, n_shared_experts: 1, n_group: 1, topk_group: 1,
     norm_topk_prob: true, routed_scaling_factor: 1.5, rms_norm_eps: 1e-5, rope_theta: 10_000, rope_interleave: true,
     vocab_size: VOCAB, max_position_embeddings: 256,
-    ...(dsa ? { index_topk: INDEX_TOPK, index_n_heads: INDEX_HEADS, index_head_dim: INDEX_DIM,
+    ...(dsa ? { index_topk: INDEX_TOPK, index_n_heads: INDEX_HEADS, index_head_dim: widths.index,
       indexer_types: ["full", "shared", "full"] } : {}),
     num_nextn_predict_layers: 1, eos_token_id: [1], pad_token_id: 0,
   });
@@ -70,16 +75,16 @@ function syntheticTensors(config: Glm52Config): Map<string, { data: Float32Array
     norm(`${p}.post_attention_layernorm.weight`, HIDDEN);
     add(`${p}.self_attn.q_a_proj.weight`, [Q_RANK, HIDDEN]);
     norm(`${p}.self_attn.q_a_layernorm.weight`, Q_RANK);
-    add(`${p}.self_attn.q_b_proj.weight`, [HEADS * (NOPE + ROPE), Q_RANK]);
-    add(`${p}.self_attn.kv_a_proj_with_mqa.weight`, [KV_RANK + ROPE, HIDDEN]);
-    norm(`${p}.self_attn.kv_a_layernorm.weight`, KV_RANK);
-    add(`${p}.self_attn.kv_b_proj.weight`, [HEADS * (NOPE + VALUE), KV_RANK]);
+    add(`${p}.self_attn.q_b_proj.weight`, [HEADS * (NOPE + config.qkRopeHeadDim), Q_RANK]);
+    add(`${p}.self_attn.kv_a_proj_with_mqa.weight`, [config.kvLoraRank + config.qkRopeHeadDim, HIDDEN]);
+    norm(`${p}.self_attn.kv_a_layernorm.weight`, config.kvLoraRank);
+    add(`${p}.self_attn.kv_b_proj.weight`, [HEADS * (NOPE + VALUE), config.kvLoraRank]);
     add(`${p}.self_attn.o_proj.weight`, [HIDDEN, HEADS * VALUE]);
     if (layer < LAYERS && config.indexTopk > 0 && config.indexerTypes[layer] === "full") {
-      add(`${p}.self_attn.indexer.wq_b.weight`, [INDEX_HEADS * INDEX_DIM, Q_RANK]);
-      add(`${p}.self_attn.indexer.wk.weight`, [INDEX_DIM, HIDDEN]);
-      norm(`${p}.self_attn.indexer.k_norm.weight`, INDEX_DIM);
-      add(`${p}.self_attn.indexer.k_norm.bias`, [INDEX_DIM], 0.05);
+      add(`${p}.self_attn.indexer.wq_b.weight`, [INDEX_HEADS * config.indexHeadDim, Q_RANK]);
+      add(`${p}.self_attn.indexer.wk.weight`, [config.indexHeadDim, HIDDEN]);
+      norm(`${p}.self_attn.indexer.k_norm.weight`, config.indexHeadDim);
+      add(`${p}.self_attn.indexer.k_norm.bias`, [config.indexHeadDim], 0.05);
       add(`${p}.self_attn.indexer.weights_proj.weight`, [INDEX_HEADS, HIDDEN]);
     }
     if (layer < config.firstKDenseReplace) swiglu(`${p}.mlp`, INTER);
@@ -307,5 +312,119 @@ for (const dsa of [true, false]) describe(`GLM-5.2 graph identity (DSA ${dsa ? "
       }
       expectCaches(`${scenario} mtp`, scenario, [mtpCache.current], [mtpCache.frozen]);
     } finally { dispose(caches.current, caches.frozen, [mtpCache.current, mtpCache.frozen]); }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The latent legos (B4): the caches GLM-5.2's graph composes for the
+// composition's KV scheme and paging. Latent widths every lego encodes (affine
+// groups of 64; TurboQuant's widths). f32 pages read the f32 lego's bits, so the
+// paged graph equals the frozen f32 graph at maxDiff 0 (hidden and logits; the
+// pages are a different layout, so their tensors are not compared). The encoded
+// forms have no oracle: their logits are compared with the f32 graph's over the
+// same teacher-forced phases, by KL, and reported.
+
+const WIDE: LatentWidths = { kvRank: 64, rope: 64, index: 64 };
+
+/** KL(f32 ‖ form) per position of two logit tensors [.., V], with argmax agreement. */
+function kl(reference: MlxArray, form: MlxArray): { sum: number; max: number; agree: number; positions: number } {
+  const x = host(reference), y = host(form), positions = x.length / VOCAB;
+  let sum = 0, max = 0, agree = 0;
+  for (let p = 0; p < positions; p++) {
+    const a = Array.from(x.subarray(p * VOCAB, (p + 1) * VOCAB)), b = Array.from(y.subarray(p * VOCAB, (p + 1) * VOCAB));
+    const lse = (r: number[]) => { const m = Math.max(...r); return m + Math.log(r.reduce((s, v) => s + Math.exp(v - m), 0)); };
+    const za = lse(a), zb = lse(b);
+    let d = 0;
+    for (let i = 0; i < VOCAB; i++) d += Math.exp(a[i]! - za) * ((a[i]! - za) - (b[i]! - zb));
+    sum += d; max = Math.max(max, d);
+    agree += Number(a.indexOf(Math.max(...a)) === b.indexOf(Math.max(...b)));
+  }
+  return { sum, max, agree, positions };
+}
+
+for (const dsa of [true, false]) describe(`GLM-5.2 latent legos (DSA ${dsa ? "on" : "off"})`, () => {
+  const glm = glmConfig(dsa, WIDE);
+  const config = { modelType: "glm_moe_dsa", text: { numHiddenLayers: LAYERS }, eosTokenIds: [1] } as unknown as ModelConfig;
+  const weights = new SyntheticWeights(glm);
+  const capabilities = { dsa, mtpMetadata: true, mtpEnabled: true, mtpDraftTokens: 3 };
+  const frozen = new FrozenGlm52Model(weights, config, glm, capabilities);
+  const composed = (kv: KvStorageScheme, paged: boolean) => new Glm52Model(weights, config, glm, capabilities, null, null,
+    "exact", 0, { kv, pagedKv: paged ? { blockSize: 4 } : null });
+  const scenario = `latent legos DSA ${dsa ? "on" : "off"}`;
+  afterAll(() => weights.dispose());
+  /** The phases of one sequence, then two merged rows: [phase, rows of ids]. */
+  const sequence: [Phase, number[][]][] = [["chunk", [tokens(12, 1)]], ["tail", [tokens(3, 2)]],
+    ["decode", [tokens(1, 3)]], ["decode", [tokens(1, 4)]], ["decode", [tokens(1, 5)]], ["verify", [tokens(4, 7)]],
+    ["known", [tokens(2, 8)]], ["decode", [tokens(1, 10)]]];
+
+  test("f32 pages: every phase, and two merged rows, equal the frozen f32 graph at maxDiff 0", async () => {
+    const paged = composed({ kind: "bf16" }, true);
+    const caches = { current: paged.makeCache(), frozen: frozen.makeCache() as Cache[] };
+    try {
+      expect(caches.current.every(cache => cache.signature().startsWith("kv:latent-paged:"))).toBe(true);
+      for (const [index, [which, rows]] of sequence.entries()) {
+        using ids = ops.fromInt32(rows.flat(), [rows.length, rows[0]!.length]);
+        using actual = await phase(paged, which, ids, caches.current);
+        using expected = await phase(frozen, which, ids, caches.frozen);
+        expectSame(`${scenario} paged ${which} ${index} hidden`, scenario, actual, expected);
+        using a = paged.logitsFromHidden(actual), b = frozen.logitsFromHidden(expected);
+        expectSame(`${scenario} paged ${which} ${index} logits`, scenario, a, b);
+      }
+    } finally { dispose(caches.current, caches.frozen); }
+    // Two rows of different lengths, merged into each storage's own layout.
+    const rows = { current: [paged.makeCache(), paged.makeCache()], frozen: [frozen.makeCache() as Cache[], frozen.makeCache() as Cache[]] };
+    const batched: { current: Cache[]; frozen: Cache[] } = { current: [], frozen: [] };
+    try {
+      for (const [row, length] of [9, 5].entries()) {
+        using ids = ops.fromInt32(tokens(length, 21 + row), [1, length]);
+        (await phase(paged, "chunk", ids, rows.current[row]!)).dispose();
+        (await phase(frozen, "chunk", ids, rows.frozen[row]!)).dispose();
+      }
+      for (const side of ["current", "frozen"] as const)
+        for (let layer = 0; layer < LAYERS; layer++) {
+          const layout = (rows[side][0]![layer] as Cache & { makeEmptyBatch(): Cache & { mergeRows(rows: readonly Cache[]): void } }).makeEmptyBatch();
+          layout.mergeRows(rows[side].map(list => list[layer]!));
+          batched[side].push(layout);
+        }
+      for (const [which, ids] of [["decode", [tokens(1, 30), tokens(1, 40)]], ["verify", [tokens(3, 50), tokens(3, 51)]]] as const) {
+        using input = ops.fromInt32(ids.flat(), [2, ids[0]!.length]);
+        using actual = await phase(paged, which, input, batched.current);
+        using expected = await phase(frozen, which, input, batched.frozen);
+        expectSame(`${scenario} paged rows ${which} hidden`, scenario, actual, expected);
+      }
+    } finally { dispose(...rows.current, ...rows.frozen, batched.current, batched.frozen); }
+  });
+
+  test("encoded and paged encoded forms serve every phase, reported by KL against the f32 graph", async () => {
+    const reference = composed({ kind: "bf16" }, false);
+    const forms: [string, KvStorageScheme, boolean][] = [
+      ["affine 4", { kind: "affine", bits: 4, groupSize: 64, kernels: "unfused" }, false],
+      ["affine 8", { kind: "affine", bits: 8, groupSize: 64, kernels: "unfused" }, false],
+      ["affine 8 from 16 (converts during decode)", { kind: "affine", bits: 8, groupSize: 64, kernels: "unfused", quantizedKvStart: 16 }, false],
+      ["TurboQuant 8/3", { kind: "turbo", kBits: 8, vBits: 3 }, false],
+      ["paged affine 4", { kind: "affine", bits: 4, groupSize: 64, kernels: "unfused" }, true],
+      ["paged TurboQuant 8/3", { kind: "turbo", kBits: 8, vBits: 3 }, true],
+    ];
+    const report: Record<string, unknown> = {};
+    for (const [name, kv, paged] of forms) {
+      const graph = composed(kv, paged);
+      expect(graph.stateCodecs, name).toBeDefined();
+      const caches = { form: graph.makeCache(), reference: reference.makeCache() };
+      const totals = { sum: 0, max: 0, agree: 0, positions: 0 };
+      try {
+        for (const [which, rows] of sequence) {
+          using ids = ops.fromInt32(rows.flat(), [rows.length, rows[0]!.length]);
+          using x = await phase(reference, which, ids, caches.reference);
+          using y = await phase(graph, which, ids, caches.form);
+          using lx = reference.logitsFromHidden(x), ly = graph.logitsFromHidden(y);
+          const d = kl(lx, ly);
+          expect(Number.isFinite(d.sum), `${name} ${which}`).toBe(true);
+          totals.sum += d.sum; totals.max = Math.max(totals.max, d.max); totals.agree += d.agree; totals.positions += d.positions;
+        }
+      } finally { dispose(caches.form, caches.reference); }
+      report[name] = { positions: totals.positions, klMean: totals.sum / totals.positions, klMax: totals.max,
+        argmaxAgree: totals.agree / totals.positions };
+    }
+    console.log(`glm52 latent legos (synthetic weights, DSA ${dsa ? "on" : "off"}, logits KL vs f32): ${JSON.stringify(report)}`);
   });
 });
