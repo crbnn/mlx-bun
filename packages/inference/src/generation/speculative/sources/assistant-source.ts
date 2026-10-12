@@ -101,7 +101,7 @@ export class AssistantSource implements DraftSource {
       for (let k = 0; k < n; k++) {
         using ids = ops.fromInt32([dTok], [1, 1]);
         emb = this.target.embed(ids);
-        const step = this.drafter.forwardRows(emb, dHid, shared, position + k);
+        const step = this.drafter.forwardRows.one(emb, dHid, shared, position + k);
         ownedHiddens.push(step.nextHidden);
         let token: number;
         try { token = ops.itemUint32(step.tokens); } finally { step.tokens.dispose(); }

@@ -12,10 +12,16 @@ import type { MlxWidthTable } from "./width";
 /** One drafted step of a KV-borrowing assistant: owned token ids and the post-projected hidden. */
 export interface DrafterRowsStep { tokens: MlxArray; nextHidden: MlxArray }
 
+/** One assistant draft step over B rows: the last token's embedding and the hidden it follows [B, 1, H]
+ *  (borrowed), the donors, and the rows' position (one shared, or [B]); owned tokens and next hidden out. */
+export type AssistantDraftStep = (lastTokenEmb: MlxArray, targetHidden: MlxArray, donors: AssistantDonors,
+  position: number | MlxArray) => DrafterRowsStep;
+
 /** The optiq KV-borrowing assistant: no cache of its own, it reads the target's donor attention. */
 export interface AssistantDrafterModel {
-  forwardRows(lastTokenEmb: MlxArray, targetHidden: MlxArray, donors: AssistantDonors,
-    position: number | MlxArray): DrafterRowsStep;
+  /** The draft step per width class of the rows it drafts for, each with the token selection its head
+   *  bound for that class at construction; the caller indexes it by its rows (`widthClass`). */
+  readonly forwardRows: MlxWidthTable<AssistantDraftStep>;
   dispose(): void;
 }
 

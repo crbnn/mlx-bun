@@ -9,6 +9,7 @@ import { deepspecGroups } from "../../src/generation/speculative/bindings/deepsp
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { bindSpeculativeTargetModel } from "../../src/generation/speculative/bindings/binding";
 import { declareGraph } from "../../src/models/capabilities";
+import { atEveryWidth } from "../../src/models/graph";
 import { stubPhases } from "../models/phase-forward";
 
 test("an assistant uses an independent target's ports and releases each borrowed view", () => {
@@ -17,11 +18,11 @@ test("an assistant uses an independent target's ports and releases each borrowed
   const positions: number[] = [];
   let step = 0;
   const source = new AssistantSource({
-    forwardRows(_embedding, _hidden, _donors, position) {
+    forwardRows: atEveryWidth((_embedding: MlxArray, _hidden: MlxArray, _donors: unknown, position: number | MlxArray) => {
       positions.push(position as number);
       const token = 4 + step;
       return { tokens: ops.fromInt32([token], [1]), nextHidden: tensor(20 + step++) };
-    },
+    }),
   }, {
     identity: {},
     assistantRows: {
@@ -40,7 +41,7 @@ test("an assistant uses an independent target's ports and releases each borrowed
 test("assistant draft failure releases retained donors and its current embedding", () => {
   const released: number[] = [];
   const tensor = (id: number) => ({ dispose() { released.push(id); } }) as MlxArray;
-  const source = new AssistantSource({ forwardRows() { throw new Error("draft failed"); } }, {
+  const source = new AssistantSource({ forwardRows: atEveryWidth(() => { throw new Error("draft failed"); }) }, {
     identity: {}, assistantRows: {
       hiddenSize: 1, embed: () => tensor(1),
       readDonors: () => ({ positions: [0], sliding: {} as never, full: {} as never, dispose() { released.push(2, 3, 4, 5); } }),
