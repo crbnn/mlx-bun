@@ -22,7 +22,7 @@ export class AneBridgeError extends Error {
 }
 
 /** What a program missing from the compile cache asks for. */
-const INSTALL_STEP = "run the install step once on this Mac: `mlx-bun compile-ane` " +
+const INSTALL_STEP = "run the install step, `mlx-bun compile-ane`, once " +
   "(a library caller: compileAnePrograms from @mlx-bun/inference/models, under the executable that serves)";
 
 /** One ANE program as the compiler takes it. Programs with the same MIL and

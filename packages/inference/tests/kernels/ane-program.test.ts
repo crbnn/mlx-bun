@@ -26,7 +26,7 @@ test.skipIf(!ANE)("create only loads: a program missing from the compile cache f
   AneProgram.purge(spec);
   expect(AneProgram.cached(spec)).toBe(false);
   expect(() => AneProgram.create(spec)).toThrow(AneBridgeError);
-  expect(() => AneProgram.create(spec)).toThrow(/is not compiled on this Mac; run the install step once on this Mac: `mlx-bun compile-ane`/);
+  expect(() => AneProgram.create(spec)).toThrow(/is not compiled on this Mac; run the install step, `mlx-bun compile-ane`, once/);
   expect(AneProgram.cached(spec)).toBe(false);
   let started = performance.now();
   expect(AneProgram.compile(spec)).toBe("compiled");
