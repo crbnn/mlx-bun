@@ -4,24 +4,60 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { ANE_LIBRARY as LIBRARY } from "../../runtime/native";
 
-// Apple Neural Engine sidecar (native/ane-bridge.m): programs
-// compiled from MIL text through the private AppleNeuralEngine.framework, with
-// IOSurface inputs/outputs the host or the GPU (zero-copy MLX wraps) fill.
-// A graph whose composition names the bridge (`Composition.aneBridge`) builds
-// its programs when it is constructed; a bridge that does not load, or a
-// program that does not compile, fails that load with `AneBridgeError`.
+// Apple Neural Engine sidecar (native/ane-bridge.m): programs compiled from MIL
+// text through the private AppleNeuralEngine.framework, with IOSurface
+// inputs/outputs the host or the GPU (zero-copy MLX wraps) fill. Compiling is
+// the install step (`AneProgram.compile`, run for every shipped composition by
+// `compileAnePrograms` in models/ane-install); it leaves each program in the
+// system compile cache. A graph whose composition names the bridge
+// (`Composition.aneBridge`) loads its programs from that cache when it is
+// constructed and never compiles one: a bridge that does not load, or a program
+// the cache lacks, fails that load with `AneBridgeError`.
 
-/** The Neural Engine bridge did not load, or a program did not compile: the
- *  load of a graph whose composition names the bridge fails with it. */
+/** The Neural Engine bridge did not load, a program is not compiled on this Mac,
+ *  or the compiler refused one: the load of a graph whose composition names the
+ *  bridge fails with it. */
 export class AneBridgeError extends Error {
   override readonly name = "AneBridgeError";
 }
 
+/** What a program missing from the compile cache asks for. */
+const INSTALL_STEP = "run the install step once on this Mac: `mlx-bun compile-ane` " +
+  "(a library caller: compileAnePrograms from @mlx-bun/inference/models, under the executable that serves)";
+
+/** One ANE program as the compiler takes it. Programs with the same MIL and
+ *  weights are one program: one compile, and one loaded model for the layers
+ *  that share it. */
+export interface AneProgramSpec {
+  /** Names the program in messages, e.g. `MLP slice 5120×9600, 2048 rows`. */
+  readonly label: string;
+  readonly mil: string;
+  /** IOSurface bytes of each MIL input, in symbol order (input names sorted). */
+  readonly inputBytes: readonly number[];
+  readonly outputBytes: number;
+  /** BLOBFILE payloads by file name (already in blob format). */
+  readonly weights?: Readonly<Record<string, Uint8Array>>;
+}
+
+/** A key equal for two specs exactly when they are one program (same MIL and weights). */
+export function aneProgramKey(spec: AneProgramSpec): string {
+  const weights = Object.entries(spec.weights ?? {}).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+    .map(([name, data]) => `${name}:${data.byteLength}:${Bun.hash(data).toString(16)}`);
+  return `${Bun.hash(spec.mil).toString(16)}:${spec.mil.length}|${weights.join(",")}`;
+}
+
+/** `compiled`: the compiler ran now; `cached`: the system compile cache already held the program. */
+export type AneCompileStatus = "compiled" | "cached";
+
 type Lib = ReturnType<typeof open>;
 function open() {
+  const source = [FFIType.ptr, FFIType.i32, FFIType.ptr, FFIType.ptr, FFIType.ptr] as const;
   return dlopen(LIBRARY, {
-    mbane_program_create: { args: [FFIType.ptr, FFIType.i32, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.i32, FFIType.ptr,
-      FFIType.u64, FFIType.ptr, FFIType.ptr, FFIType.i32], returns: FFIType.ptr },
+    mbane_program_create: { args: [...source, FFIType.i32, FFIType.ptr, FFIType.u64, FFIType.ptr, FFIType.ptr, FFIType.ptr,
+      FFIType.i32], returns: FFIType.ptr },
+    mbane_program_compile: { args: [...source, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+    mbane_program_cached: { args: [...source, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+    mbane_program_purge: { args: [...source, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
     mbane_input: { args: [FFIType.ptr, FFIType.i32], returns: FFIType.ptr },
     mbane_output: { args: [FFIType.ptr], returns: FFIType.ptr },
     mbane_eval_async: { args: [FFIType.ptr], returns: FFIType.i32 },
@@ -42,7 +78,21 @@ const errorBuffer = new Uint8Array(512);
 const errorText = () => new TextDecoder().decode(errorBuffer.subarray(0, errorBuffer.indexOf(0)));
 const cstring = (text: string) => new TextEncoder().encode(text + "\0");
 
-/** One compiled ANE program. Inputs follow MIL symbol order (input names sorted).
+/** A spec's MIL and weights as the bridge's leading five arguments. The buffers
+ *  live in the returned array, so it must stay reachable for the call. */
+function source(spec: AneProgramSpec): [Pointer, number, Pointer | null, Pointer | null, Pointer | null, ...unknown[]] {
+  const entries = Object.entries(spec.weights ?? {});
+  const names = entries.map(([name]) => cstring(name));
+  const namePtrs = BigUint64Array.from(names.map(n => BigInt(ptr(n))));
+  const dataPtrs = BigUint64Array.from(entries.map(([, data]) => BigInt(ptr(data))));
+  const dataLens = BigUint64Array.from(entries.map(([, data]) => BigInt(data.byteLength)));
+  const text = cstring(spec.mil);
+  const some = entries.length > 0;
+  return [ptr(text), entries.length, some ? ptr(namePtrs) : null, some ? ptr(dataPtrs) : null, some ? ptr(dataLens) : null,
+    text, names, namePtrs, dataPtrs, dataLens];
+}
+
+/** One loaded ANE program. Inputs follow MIL symbol order (input names sorted).
  *  A loaded program holds one of the ANE driver's direct-path clients, about a
  *  thousand on the whole machine, until its last holder is disposed; creating
  *  one while none is free blocks (native/ane-bridge.m). */
@@ -55,28 +105,56 @@ export class AneProgram implements Disposable {
     this.#handle = handle;
   }
 
-  /** `weights`: BLOBFILE payloads by file name (already in blob format).
+  /** Loads `spec` from the system compile cache (about 4 ms); never compiles.
    *  `share`: a program that never runs at the same time as this one. With the
    *  same MIL and weights the result holds that same loaded program; otherwise
    *  a new program loads on its buffers (each at least as large). Either way
    *  the shared resources live until every holder is disposed. Throws
-   *  `AneBridgeError` when the bridge does not load or the program does not compile. */
-  static create(mil: string, inputBytes: readonly number[], outputBytes: number,
-    options: { weights?: Record<string, Uint8Array>; share?: AneProgram } = {}): AneProgram {
-    const l = native();
-    const entries = Object.entries(options.weights ?? {});
-    const names = entries.map(([name]) => cstring(name));
-    const namePtrs = BigUint64Array.from(names.map(n => BigInt(ptr(n))));
-    const dataPtrs = BigUint64Array.from(entries.map(([, data]) => BigInt(ptr(data))));
-    const dataLens = BigUint64Array.from(entries.map(([, data]) => BigInt(data.byteLength)));
-    const sizes = BigUint64Array.from(inputBytes.map(BigInt));
-    const text = cstring(mil);
+   *  `AneBridgeError` when the bridge does not load, when the program is not
+   *  compiled on this Mac (naming the install step, {@link AneProgram.compile}),
+   *  or when it does not load. */
+  static create(spec: AneProgramSpec, share?: AneProgram): AneProgram {
+    const l = native(), args = source(spec), uncompiled = new Int32Array(1);
+    const sizes = BigUint64Array.from(spec.inputBytes.map(BigInt));
     errorBuffer.fill(0);
-    const handle = l.mbane_program_create(ptr(text), entries.length, entries.length ? ptr(namePtrs) : null,
-      entries.length ? ptr(dataPtrs) : null, entries.length ? ptr(dataLens) : null, inputBytes.length, ptr(sizes),
-      outputBytes, options.share ? options.share.#handle : null, ptr(errorBuffer), errorBuffer.length);
-    if (!handle) throw new AneBridgeError(errorText() || "ANE program creation failed");
-    return new AneProgram(l, handle, inputBytes, outputBytes);
+    const handle = l.mbane_program_create(args[0], args[1], args[2], args[3], args[4], spec.inputBytes.length, ptr(sizes),
+      spec.outputBytes, share ? share.#handle : null, ptr(uncompiled), ptr(errorBuffer), errorBuffer.length);
+    if (!handle) throw new AneBridgeError(uncompiled[0]
+      ? `Neural Engine program ${spec.label} is not compiled on this Mac; ${INSTALL_STEP}`
+      : `${spec.label}: ${errorText() || "ANE program creation failed"}`);
+    return new AneProgram(l, handle, spec.inputBytes, spec.outputBytes);
+  }
+
+  /** The install step for one program: compiles `spec` into the system compile
+   *  cache unless it is there already. Loads nothing and holds no ANE driver
+   *  client. The cache is per code-signing identity, so the executable that will
+   *  serve is the one that compiles. Throws `AneBridgeError` when the bridge does
+   *  not load or the compiler refuses the program. */
+  static compile(spec: AneProgramSpec): AneCompileStatus {
+    const args = source(spec);
+    errorBuffer.fill(0);
+    const status = native().mbane_program_compile(args[0], args[1], args[2], args[3], args[4], ptr(errorBuffer), errorBuffer.length);
+    if (status === 0) throw new AneBridgeError(`${spec.label}: ${errorText() || "ANE compile failed"}`);
+    return status === 1 ? "compiled" : "cached";
+  }
+
+  /** Whether the system compile cache holds `spec` for this process (the framework's `compiledModelExists`). */
+  static cached(spec: AneProgramSpec): boolean {
+    const args = source(spec);
+    errorBuffer.fill(0);
+    const status = native().mbane_program_cached(args[0], args[1], args[2], args[3], args[4], ptr(errorBuffer), errorBuffer.length);
+    if (status < 0) throw new AneBridgeError(`${spec.label}: ${errorText()}`);
+    return status === 1;
+  }
+
+  /** Removes `spec` from the system compile cache (the framework's
+   *  `purgeCompiledModel`): `create` refuses it until it is compiled again.
+   *  Programs already loaded keep running. */
+  static purge(spec: AneProgramSpec): void {
+    const args = source(spec);
+    errorBuffer.fill(0);
+    const status = native().mbane_program_purge(args[0], args[1], args[2], args[3], args[4], ptr(errorBuffer), errorBuffer.length);
+    if (status !== 1) throw new AneBridgeError(`${spec.label}: ${status < 0 ? errorText() : "still in the compile cache after the purge"}`);
   }
 
   /** Base address of input i, locked for writes until the next evaluation. */
@@ -144,17 +222,23 @@ function chunkedMatmulT(lines: string[], out: string, a: string, b: string, rows
 }
 
 /** y[S, Cout] = x[S, Cin] · w[Cout, Cin]ᵀ, w streamed (inputs: w=0, x=1). */
-export function streamedMatmulMil(cin: number, cout: number, seq: number): string {
+export function streamedMatmulProgram(cin: number, cout: number, seq: number): AneProgramSpec {
   const lines = [`  func main<ios18>(tensor<fp16, [1, 1, ${seq}, ${cin}]> x, tensor<fp16, [1, 1, ${cout}, ${cin}]> w) {`, ...BOOLS];
   chunkedMatmulT(lines, "y", "x", "w", seq, cout, cin, "m");
-  return MIL_HEADER + lines.join("\n") + `\n  } -> (y);\n}\n`;
+  return { label: `projection ${cin}→${cout}, ${seq} rows`, mil: MIL_HEADER + lines.join("\n") + `\n  } -> (y);\n}\n`,
+    inputBytes: [cout * cin * 2, seq * cin * 2], outputBytes: seq * cout * 2 };
 }
 
 /** One MLP channel slice with streamed weights:
  *  y[S, D] = (silu(x·wgᵀ) ⊙ (x·wuᵀ)) · wd, wg/wu/wd [N, D] (wd: the down
  *  projection's rows for the same N channels). Inputs in symbol order: wd=0,
  *  wg=1, wu=2, x=3. Measured 10.2 TFLOPS (D 5120, N 9600, S 2048). */
-export function mlpSliceMil(D: number, N: number, S: number): string {
+export function mlpSliceProgram(D: number, N: number, S: number): AneProgramSpec {
+  return { label: `MLP slice ${D}×${N}, ${S} rows`, mil: mlpSliceMil(D, N, S),
+    inputBytes: [N * D * 2, N * D * 2, N * D * 2, S * D * 2], outputBytes: S * D * 2 };
+}
+
+function mlpSliceMil(D: number, N: number, S: number): string {
   const lines = [`  func main<ios18>(tensor<fp16, [1, 1, ${N}, ${D}]> wd, tensor<fp16, [1, 1, ${N}, ${D}]> wg, ` +
     `tensor<fp16, [1, 1, ${N}, ${D}]> wu, tensor<fp16, [1, 1, ${S}, ${D}]> x) {`, ...BOOLS];
   chunkedMatmulT(lines, "g", "x", "wg", S, N, D, "G");
@@ -178,8 +262,16 @@ export function mlpSliceMil(D: number, N: number, S: number): string {
   return MIL_HEADER + lines.join("\n") + `\n  } -> (${last});\n}\n`;
 }
 
-/** INT8 const-weight linear over channel-major activations: y[1, Cout, 1, S]. */
-export function int8LinearMil(cin: number, cout: number, seq: number): string {
+/** INT8 const-weight linear over channel-major activations: y[1, Cout, 1, S],
+ *  weights `q` [Cout, Cin] with one fp16 scale (bits) per output row. */
+export function int8LinearProgram(cin: number, cout: number, seq: number, q: Int8Array, scales: Uint16Array): AneProgramSpec {
+  return { label: `INT8 linear ${cin}→${cout}, ${seq} rows`, mil: int8LinearMil(cin, cout, seq),
+    inputBytes: [cin * seq * 2], outputBytes: cout * seq * 2,
+    weights: { "weight_data.bin": weightBlob(new Uint8Array(q.buffer, q.byteOffset, q.byteLength)),
+      "weight_scale.bin": weightBlob(new Uint8Array(scales.buffer, scales.byteOffset, scales.byteLength)) } };
+}
+
+function int8LinearMil(cin: number, cout: number, seq: number): string {
   return MIL_HEADER + [
     `  func main<ios18>(tensor<fp16, [1, ${cin}, 1, ${seq}]> x) {`,
     `    tensor<int8, [${cout}, ${cin}, 1, 1]> wd = const()[name=string("wd"), val=tensor<int8, [${cout}, ${cin}, 1, 1]>(BLOBFILE(path=string("@model_path/weights/weight_data.bin"), offset=uint64(64)))];`,
@@ -199,13 +291,10 @@ export function int8LinearMil(cin: number, cout: number, seq: number): string {
 /** INT8 linear with resident weights; channel-major [C, S] fp16 buffers (S % 32 == 0). */
 export class AneLinear implements Disposable {
   private constructor(readonly program: AneProgram, readonly cin: number, readonly cout: number, readonly seq: number) {}
+  /** Loads `int8LinearProgram(cin, cout, seq, q, scales)`, compiled by the install step. */
   static create(cin: number, cout: number, seq: number, q: Int8Array, scales: Uint16Array, share?: AneLinear): AneLinear {
     if (seq % 32 !== 0) throw new Error(`AneLinear: S=${seq} must be a multiple of 32`);
-    const program = AneProgram.create(int8LinearMil(cin, cout, seq), [cin * seq * 2], cout * seq * 2, {
-      weights: { "weight_data.bin": weightBlob(new Uint8Array(q.buffer, q.byteOffset, q.byteLength)),
-        "weight_scale.bin": weightBlob(new Uint8Array(scales.buffer, scales.byteOffset, scales.byteLength)) },
-      share: share?.program });
-    return new AneLinear(program, cin, cout, seq);
+    return new AneLinear(AneProgram.create(int8LinearProgram(cin, cout, seq, q, scales), share?.program), cin, cout, seq);
   }
   writeInput(bytes: Uint8Array): void { this.program.inputView(0).set(bytes); }
   evalAsync(): void { this.program.evalAsync(); }
@@ -218,10 +307,9 @@ export class AneLinear implements Disposable {
 /** Streamed-weight matmul y[S, Cout] = x[S, Cin] · w[Cout, Cin]ᵀ (row-major fp16). */
 export class AneStreamedMatmul implements Disposable {
   private constructor(readonly program: AneProgram, readonly cin: number, readonly cout: number, readonly seq: number) {}
+  /** Loads `streamedMatmulProgram(cin, cout, seq)`, compiled by the install step. */
   static create(cin: number, cout: number, seq: number, share?: AneStreamedMatmul): AneStreamedMatmul {
-    const program = AneProgram.create(streamedMatmulMil(cin, cout, seq), [cout * cin * 2, seq * cin * 2], seq * cout * 2,
-      { share: share?.program });
-    return new AneStreamedMatmul(program, cin, cout, seq);
+    return new AneStreamedMatmul(AneProgram.create(streamedMatmulProgram(cin, cout, seq), share?.program), cin, cout, seq);
   }
   get weightsPointer(): number { return this.program.input(0); }
   get inputPointer(): number { return this.program.input(1); }

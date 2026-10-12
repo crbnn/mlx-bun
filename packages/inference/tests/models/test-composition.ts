@@ -1,6 +1,6 @@
 // The composition record of a graph built directly in a test: bf16 KV unless a
 // scheme is named, and every other field at its default. It never asks the
-// Neural Engine bridge (no program compiles); graphs read only the fields their
+// Neural Engine bridge (no program loads); graphs read only the fields their
 // family uses.
 import { deviceArchitecture } from "@mlx-bun/mlx/ffi";
 import type { AffineKernelChoice, Composition, KvStorageScheme } from "../../src/contracts/portable/composition";

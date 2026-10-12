@@ -1,18 +1,29 @@
 // ANE prefill channel splits (layers/ane-prefill-split) on small synthetic
 // layers against the GPU-only result: the ANE computes its channels in fp16
 // from weights the GPU writes into its buffers, so the outputs agree to fp16
-// precision. Each layer owns one program built for exactly its chunk size.
+// precision. Each layer owns one program built for exactly its chunk size and
+// loads it from the compile cache, so the file first compiles the programs its
+// layers load (the install step for these synthetic widths).
 // Opt-in: set MLX_BUN_TEST_ANE=1 on a real Apple Silicon machine (every
 // M-series chip has a Neural Engine; a virtual machine such as a hosted CI runner
 // loads the framework but cannot compile). Unset skips, which is not evidence of a pass.
-import { expect, test } from "bun:test";
+import { beforeAll, expect, test } from "bun:test";
 import { Dtype, MlxArray, ops } from "@mlx-bun/mlx";
+import { AneBridgeError, AneProgram } from "../../src/kernels/ane/linear";
 import { QuantizedLinear } from "../../src/layers/quantized-linear";
 import { TrellisLinear } from "../../src/layers/trellis-linear";
-import { AneAffineSplit, AneTrellisMlpSplit, AneTrellisMlpSplitK3i } from "../../src/layers/ane-prefill-split";
+import {
+  AneAffineSplit, AneTrellisMlpSplit, AneTrellisMlpSplitK3i, aneAffineSplitProgram, aneMlpSplitProgram,
+} from "../../src/layers/ane-prefill-split";
 import { compiledSwiglu } from "../../src/layers/swiglu";
 
 const D = 512, R = 1024, M = 96;
+
+beforeAll(() => {
+  if (!process.env.MLX_BUN_TEST_ANE) return;
+  for (const spec of [aneAffineSplitProgram(D, 256, 0.5, M), aneMlpSplitProgram(D, R, 0.5, M), aneMlpSplitProgram(D, R, 0.5, 2 * M),
+    aneMlpSplitProgram(2 * D, 2 * R, 0.5, 2 * M)]) AneProgram.compile(spec);
+});
 
 function relErr(actual: MlxArray, expected: MlxArray): number {
   expect(actual.shape).toEqual(expected.shape);
@@ -47,6 +58,17 @@ function mlp(d: number, r: number, interleave: boolean, seed: number, x: MlxArra
   using mid = compiledSwiglu(g, u);
   return { gate, up, down, expected: down.forward(mid, true) };
 }
+
+test.skipIf(!process.env.MLX_BUN_TEST_ANE)("a split whose program is not compiled on this Mac fails its build naming the install step, and compiles nothing", () => {
+  using x = hidden(64);
+  const { gate, up, down, expected } = mlp(D, R, false, 11, x);
+  const spec = aneMlpSplitProgram(D, R, 0.5, 64);
+  AneProgram.purge(spec);
+  expect(() => AneTrellisMlpSplit.build(gate, up, down, 0.5, 64)).toThrow(AneBridgeError);
+  expect(() => AneTrellisMlpSplit.build(gate, up, down, 0.5, 64)).toThrow(/`mlx-bun compile-ane`/);
+  expect(AneProgram.cached(spec)).toBe(false);
+  expected.dispose();
+}, 120_000);
 
 test.skipIf(!process.env.MLX_BUN_TEST_ANE)("affine projection split matches the GPU projection", () => {
   const lin = affine(256, D, 1);
