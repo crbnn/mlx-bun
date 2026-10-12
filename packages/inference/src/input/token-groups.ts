@@ -1,17 +1,22 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
+import type { MlxPhaseGroup, MlxWidthClass } from "../contracts/mlx/graph";
 
-/** Apply a tokenwise block while respecting each method's numerical policy. */
+/** Apply a tokenwise block over the groups of a mixed forward: the groups that
+ * may share it packed into one call of the class the caller named (`packed`),
+ * a verify group (which keeps its projection geometry) and every group when
+ * `pack` is off on its own rows, at its own class. */
 export function mapTokenGroups(
-  groups: readonly TokenGroup[], inputs: readonly MlxArray[],
-  operation: (hidden: MlxArray) => MlxArray, pack = true,
+  groups: readonly MlxPhaseGroup[], inputs: readonly MlxArray[],
+  operation: (hidden: MlxArray, width: MlxWidthClass) => MlxArray, packed: MlxWidthClass, pack = true,
 ): MlxArray[] {
   const results: MlxArray[] = [];
-  const packedRows = groups.flatMap((group, row) => pack && !group.preserveTokenGeometry ? [row] : []);
+  const packedRows = groups.flatMap((group, row) => pack && group.phase !== "verify" ? [row] : []);
   try {
-    const packed = packedRows.length ? mapPackedTokens(packedRows.map(row => inputs[row]!), operation) : [];
-    for (const [index, row] of packedRows.entries()) results[row] = packed[index]!;
-    for (let row = 0; row < groups.length; row++) results[row] ??= operation(inputs[row]!);
+    const outputs = packedRows.length === 1 ? [operation(inputs[packedRows[0]!]!, groups[packedRows[0]!]!.width)]
+      : packedRows.length ? mapPackedTokens(packedRows.map(row => inputs[row]!), hidden => operation(hidden, packed)) : [];
+    for (const [index, row] of packedRows.entries()) results[row] = outputs[index]!;
+    for (let row = 0; row < groups.length; row++) results[row] ??= operation(inputs[row]!, groups[row]!.width);
     return results;
   } catch (error) { for (const result of results) result?.dispose(); throw error; }
 }
@@ -42,6 +47,3 @@ export function mapPackedTokens(
     return results;
   } catch (error) { for (const result of results) result.dispose(); throw error; }
 }
-
-import { TokenGroup } from "../contracts/mlx/token-work";
-export { type MixedTokenModel,type TokenGroup,type TokenWorkOptions } from "../contracts/mlx/token-work";

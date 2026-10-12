@@ -5,6 +5,9 @@ import type { TargetView } from "./draft-target";
 import type { NativeMtpHead } from "./drafter";
 import type { TrainableGraph } from "./trainable";
 import type { MediaEncoders, MediaSidecarProbes, MlxPromptInput, PixelInput, TextEmbeddingModel, Vision } from "./media";
+import type { MlxWidthClass, MlxWidthTable } from "./width";
+
+export { widthClass, type MlxWidthClass, type MlxWidthTable } from "./width";
 
 /** Weight and expert-residency facts the wired-limit scope reads. */
 export interface MlxModelMemory {
@@ -14,17 +17,6 @@ export interface MlxModelMemory {
     flushUsage?: () => void;
     finishUsage?: () => Promise<void>;
   } | null;
-}
-
-/** Model-owned execution for committed tokens. Recheck the chunk limit after
- * each forward: native arithmetic can change at a cache-length boundary. */
-export interface MlxTokenAppend {
-  /** Affine formats whose committed append retains one-token arithmetic. */
-  readonly affineKvBits?: readonly number[];
-  readonly turboQuantFormats?: readonly { readonly kBits: number; readonly vBits: number }[];
-  /** Maximum positions per row at this cohort size; omitted rows means B=1. */
-  maxChunkSize(state: readonly Cache[], rows?: number): number;
-  forwardHidden(ids: MlxArray, state: Cache[]): MlxArray | Promise<MlxArray>;
 }
 
 /** A verify forward's hidden-layer capture. The graph calls it once per
@@ -64,6 +56,14 @@ export type MlxVerifyForward = MlxCapturingForward;
  * to logits [.., vocabulary] the caller owns, possibly unevaluated. */
 export type MlxHeadForward = (hidden: MlxArray) => MlxArray;
 
+/** The scoring and training forward, not a serving phase: every position of
+ * `ids` [sequences, tokens] as one causal window over the caller's caches
+ * (offset-0 training caches, or a padded batch's mask wrapper), on the kernels
+ * of `width`, the class of its rows. Returns the post-final-norm hidden the
+ * caller owns. The training reads a graph keeps (checkpointing, the training
+ * attention) ride it until B1's out-of-step items give them a contract. */
+export type MlxSequenceForward = (ids: MlxArray, state: Cache[], width: MlxWidthClass) => MlxArray;
+
 /** The prompt-chunk operation for each execution unit the composition built.
  * Both follow `MlxCapturingForward` and append the same positions. The
  * scheduler owns the units: it reads which operations exist once when it binds
@@ -79,38 +79,6 @@ export interface MlxPrefillChunk {
   readonly ane?: MlxCapturingForward;
 }
 
-/** One operation per width class, where a forward's rows are its sequences
- * times its tokens per sequence. The classes are the row-count boundaries the
- * shipped kernels were measured at: one row, two or three rows sharing each
- * decoded weight, four rows (where the matrix-unit down projection takes over
- * from the shared-row one), five to eight rows on the matrix unit, and wider.
- * The caller picks the entry by the rows it is loading (`widthClass`) and hands
- * an entry only rows of its class; an entry never inspects its input to learn
- * its class. A graph with one forward supplies the same operation in every
- * entry; a specialized graph supplies the operation it built for each class. */
-export interface MlxWidthTable<Operation> {
-  /** Exactly one row. */
-  readonly one: Operation;
-  /** Two or three rows. */
-  readonly twoToThree: Operation;
-  /** Exactly four rows. */
-  readonly four: Operation;
-  /** Five to eight rows. */
-  readonly fiveToEight: Operation;
-  /** Nine or more rows. */
-  readonly wider: Operation;
-}
-
-/** The name of one width class. */
-export type MlxWidthClass = keyof MlxWidthTable<unknown>;
-
-/** The width class of a forward of `rows` rows (sequences times tokens per
- * sequence). The caller's choice, made from the rows it is loading; a graph
- * never calls this on its input. */
-export function widthClass(rows: number): MlxWidthClass {
-  if (!Number.isSafeInteger(rows) || rows < 1) throw new Error(`invalid forward row count ${rows}`);
-  return rows === 1 ? "one" : rows <= 3 ? "twoToThree" : rows === 4 ? "four" : rows <= 8 ? "fiveToEight" : "wider";
-}
 
 /** The autoregressive phases, each named by the caller. The graph runs the
  * operation it was asked for and never derives the phase or the width class
@@ -127,8 +95,10 @@ export interface MlxTokenPhases {
    * position per sequence is not a tail: the scheduler appends it with `decode`,
    * the one-position read. */
   readonly prefillTail: MlxWidthTable<MlxCapturingForward>;
-  /** One new token per sequence: `ids` [sequences, 1], so rows are sequences. */
-  readonly decode: MlxWidthTable<MlxPhaseForward>;
+  /** One new token per sequence: `ids` [sequences, 1], so rows are sequences.
+   * A prompt step of one position per sequence appends here too, with the
+   * drafter's capture when it taps the prompt. */
+  readonly decode: MlxWidthTable<MlxCapturingForward>;
   /** A speculative window: each sequence's last accepted token and its drafted
    * tokens, right-padded by the caller to the round's depth, `ids`
    * [sequences, depth + 1], so rows are sequences times (depth + 1). The graph
@@ -184,17 +154,14 @@ export interface MlxPhaseGroup {
 export type MlxMixedForward = (groups: readonly MlxPhaseGroup[], width: MlxWidthClass) => MlxArray[];
 
 /** A graph's compiled single-token decode step: the whole forward replayed from
- * one recorded graph instead of rebuilt per token. The graph decides which
- * state layouts it can express; the caller falls back to the ordinary forward
- * for the rest. */
+ * one recorded graph instead of rebuilt per token. The scheduler chooses it
+ * once, for a row whose caches all declare the compiled-decode capability and
+ * hold no batched layout; it has no fallback. */
 export interface MlxCompiledDecodeStep {
-  /** Cheap and pure: whether `state`, in its current layout, can take a step. */
-  accepts(state: readonly Cache[]): boolean;
   /** Consume one pending uint32 [1] token (unevaluated is fine) and advance
    * every cache one position. The returned logits [1,1,V] belong to the
    * caller; `evalWith` holds cache updates that must ride the same async
-   * evaluation. A step that throws leaves `state` exactly as it was, so the
-   * caller can run the same token through the ordinary graph. */
+   * evaluation. A step that throws leaves `state` exactly as it was. */
   step(token: MlxArray, state: Cache[]): { logits: MlxArray; evalWith: MlxArray[] };
 }
 
