@@ -91,7 +91,9 @@ export class BatchedQuantizedKVCache implements BatchableCache, QuantizedAttenti
         packed: views[0]![name], scales: views[1]![name], biases: views[2]![name],
       });
       const { offsets, starts, ends } = views[0]!;
-      return quantizedDonorAttention(field("keys"), field("values"), { offsets, starts, ends }, this.kernels);
+      // The kernels this layout reads with for its rows (a one-sequence set
+      // reads several rows with its `multiRow` set).
+      return quantizedDonorAttention(field("keys"), field("values"), { offsets, starts, ends }, this.#kernels());
     } catch (error) { disposeResources(views.flatMap(view => [view.keys, view.values])); throw error; }
   }
   signature(): string { return `kv:batched-quant:${this.bits}:${this.groupSize}`; }
