@@ -613,6 +613,15 @@ const snapshotReaders = new Set(["flag", "value", "number"]);
 /** Development profiling hooks a hot path may still read, listed by name. */
 const profilingHooks = new Set(["__deltaProf", "__opCount", "MLX_BUN_SPEC_PHASE_TIMING", "MLX_BUN_SPEC_LAYER_PROFILE",
   "MLX_BUN_SPEC_OP_INVENTORY", "MLX_BUN_SPEC_DEVICE_ROUND", "MLX_BUN_GRAMMAR_DEBUG"]);
+/** Run-time context queries: module state a hot path could consult instead of a fact fixed at construction. A
+ *  training pass's prefix layout is its caches' (`TrainingAttentionCache.ropePositions`), not module state. */
+const contextQueries = new Set(["isCompiledTrace", "isShapelessTracing", "activePrefixLayout"]);
+/** The context queries a hot path may read, listed by name, and why: MLX records a compiled decode step by tracing the
+ *  same layers that run eagerly, and a shapeless trace can hold neither a nested compiled closure nor a Slice replay, so
+ *  a layer records the trace-safe op while it is traced (`setCompiledTrace` around the compiled-decode recorder's trace,
+ *  MLX's own shapeless compile for `isShapelessTracing`). One graph both runs and is recorded, so whether it is being
+ *  traced is not a composition fact. */
+const compileContextQueries = new Set(["isCompiledTrace", "isShapelessTracing"]);
 /** Where composition facts are read: the loader (inference-relative) and the app's engine load path (app-relative). */
 const loaderFiles = new Set(["models/factory.ts", "models/implementation.ts", "models/runtime.ts"]);
 const engineLoadPath = new Set(["engine/model-host.ts", "engine/cache-services.ts"]);
@@ -705,6 +714,7 @@ function hotPathReads(source: ts.SourceFile, scope: { everyFunction: boolean; cl
         else if (callee && snapshotReaders.has(callee) && !fromReader && literal(node.arguments[0])?.startsWith("MLX_BUN_"))
           read(`.${callee}()`, literal(node.arguments[0]), node);
         if (callee === "deviceArchitecture") read("deviceArchitecture()", undefined, node);
+        if (callee && contextQueries.has(callee) && !compileContextQueries.has(callee)) read(`${callee}()`, undefined, node);
       }
       if (ts.isPropertyAccessExpression(node) && node.name.text === "env" && ts.isIdentifier(node.expression) &&
           (node.expression.text === "process" || node.expression.text === "Bun"))
@@ -1031,6 +1041,7 @@ test("the composition rules fire, honor their exemptions, stay silent on the pav
       "x instanceof TrellisLinear": "instanceof TrellisLinear",
       "x instanceof KVCache": "instanceof KVCache",
       "x instanceof Qwen35Model": "instanceof Qwen35Model",
+      "activePrefixLayout()": "activePrefixLayout()",
     };
     const hotBodies = (read: string) => "export class Layer {\n" +
       `  forward(x: unknown) { return ${read}; }\n  #decodeRows(x: unknown) { return ${read}; }\n` +
@@ -1063,6 +1074,12 @@ test("the composition rules fire, honor their exemptions, stay silent on the pav
     write(inference("generation/hot.ts"), "export function forward(x: unknown) {\n  return [(globalThis as Record<string, unknown>).__deltaProf, " +
       'globalThis["__opCount"], runtimeFlag("MLX_BUN_SPEC_PHASE_TIMING", false), process.env.MLX_BUN_SPEC_LAYER_PROFILE,\n' +
       '    runtimeConfig().flag("MLX_BUN_SPEC_OP_INVENTORY", false), runtimeValue("MLX_BUN_SPEC_DEVICE_ROUND"), x instanceof Map, x instanceof Error];\n}');
+    expect(await found(inference("generation/hot.ts"), "hot-path-read")).toEqual([]);
+    // The compile-context queries are exempt by name; any other context query is a read of a fixed fact.
+    write(inference("generation/hot.ts"), "export function forward(x: unknown) {\n" +
+      "  return [isCompiledTrace(), isShapelessTracing(), activePrefixLayout()];\n}");
+    expect(await found(inference("generation/hot.ts"), "hot-path-read")).toEqual(["activePrefixLayout()"]);
+    write(inference("generation/hot.ts"), "export function forward(x: unknown) {\n  return [isCompiledTrace(), isShapelessTracing()];\n}");
     expect(await found(inference("generation/hot.ts"), "hot-path-read")).toEqual([]);
     // In inference kernels/ and layers/ and training kernels/, every function is on the path but construction and
     // acceptance and their closures; module scope runs at load. Elsewhere a neutral name is not on the path.

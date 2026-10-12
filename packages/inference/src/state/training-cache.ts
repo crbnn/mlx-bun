@@ -4,7 +4,8 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { createCausalMask } from "../kernels/attention/masks";
 import { flashAttention, flashSupported, getTrainingAttn } from "../kernels/attention/flash";
 import { gatedDeltaUpdate } from "../kernels/delta/gated";
-import type { AttentionCache, AttentionRead, Cache, GatedDeltaCache, GatedDeltaParameters, Mask } from "../contracts/mlx/cache";
+import type { AttentionRead, Cache, GatedDeltaCache, GatedDeltaParameters, Mask, TrainingAttentionCache } from "../contracts/mlx/cache";
+import { ropeBlocks } from "../layers/prefix-layout";
 import { AttentionMasks, causalLease, unmaskedLease, withLease, type MaskLease } from "./attention-read";
 import type { PrefixLayout } from "../contracts/mlx/trainable";
 import { isRecurrentCache } from "./capabilities";
@@ -86,7 +87,7 @@ export function paddedTrainingMask(B: number, L: number, lengths: readonly numbe
  *  (`paddedTrainingMask`) for the cache's window, so no real query sees a
  *  padded key. A layer with a sliding window gets a cache composed with it; the
  *  caches of one forward share `masks`, so its layers build each mask once. */
-export class TrainingCache implements AttentionCache {
+export class TrainingCache implements TrainingAttentionCache {
   constructor(
     /** The layer's sliding window; null for full attention. */
     readonly window: number | null = null,
@@ -100,6 +101,8 @@ export class TrainingCache implements AttentionCache {
   /** Training-only adapter; never admitted, merged, or persisted. */
   signature(): string { return "train:training"; }
   offset = 0;
+  /** Uniform positions from the pinned offset. */
+  ropePositions(x: MlxArray, rope: (block: MlxArray, offset: number) => MlxArray): MlxArray { return rope(x, this.offset); }
   appendDecode(k: MlxArray, v: MlxArray): AttentionRead {
     return trainingRead(k, v, this.rowLengths ? this.#padded(k.shape[2]!) : unmaskedLease, this.attention, this.window);
   }
@@ -251,7 +254,7 @@ export function blockSparsePrefixMask(layout: PrefixLayout, window: number | nul
  *  window's mask is built once per pass, across its layers, segments and
  *  backward recomputes. A decode read is not defined over a concat; it reads as
  *  the window does and refuses anything but the whole concat. */
-export class PrefixSharedCache implements AttentionCache {
+export class PrefixSharedCache implements TrainingAttentionCache {
   /** Training-only adapter; never admitted, merged, or persisted. */
   signature(): string { return "train:prefix-shared"; }
   offset = 0;
@@ -264,6 +267,10 @@ export class PrefixSharedCache implements AttentionCache {
     /** The kernel this cache's reads attend with. */
     readonly attention: TrainingAttention = "sdpa",
   ) {}
+  /** The concat's block positions: the prompt from 0, each response restarted at P. */
+  ropePositions(x: MlxArray, rope: (block: MlxArray, offset: number) => MlxArray): MlxArray {
+    return ropeBlocks(x, this.layout, rope);
+  }
   appendDecode(k: MlxArray, v: MlxArray): AttentionRead { return this.appendWindow(k, v); }
   appendWindow(k: MlxArray, v: MlxArray): AttentionRead {
     const { P, Rc, Rr } = this.layout, N = k.shape[2]!;

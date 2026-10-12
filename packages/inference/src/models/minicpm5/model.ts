@@ -14,13 +14,12 @@ import type {
   MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward, MlxWidthClass,
 } from "../../contracts/mlx/graph";
 import type { TrainableGraph } from "../../contracts/mlx/trainable";
-import { activePrefixLayout, ropeBlocks } from "../../layers/prefix-layout";
 import { miniCpmTrainable } from "./trainable";
 import { declareGraph } from "../capabilities";
 import { atEveryWidth, type ReadPhase } from "../graph";
 import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
-import type { AttentionCache, Cache } from "../../contracts/mlx/cache";
+import type { Cache, TrainingAttentionCache } from "../../contracts/mlx/cache";
 import { disposing } from "../../layers/helpers";
 import { RMSNorm } from "../../layers/normalization";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
@@ -83,22 +82,15 @@ export class LlamaAttention {
   }
 
   /** The training forward over a training cache (`TrainingCache`,
-   *  `PrefixSharedCache`), with the prefix-shared block RoPE while a layout is
-   *  active: the cache's window read, which owns the mask (causal, padded or
+   *  `PrefixSharedCache`), roped at the positions the cache owns (block-wise
+   *  for a prefix-shared concat), read through its window read, which owns the mask (causal, padded or
    *  block-sparse) and the kernel the run composed (the SDPA, or the validated
    *  flash kernel). */
-  forwardTraining(x: MlxArray, cache: AttentionCache): MlxArray {
+  forwardTraining(x: MlxArray, cache: TrainingAttentionCache): MlxArray {
     const [B, L] = x.shape as [number, number, number];
     let [q, k, v] = this.#heads(x, B, L);
-    const offsetArr = cache.ropeOffsetArr;
-    const ropeStep = (x: MlxArray): MlxArray => {
-      const prefixLayout = activePrefixLayout();
-      return prefixLayout
-        ? ropeBlocks(x, prefixLayout, (block, offset) => ops.rope(block, this.headDim, this.ropeBase, offset, null))
-        : offsetArr
-          ? ops.ropeDynamic(x, this.headDim, this.ropeBase, offsetArr, null)
-          : ops.rope(x, this.headDim, this.ropeBase, cache.offset, null);
-    };
+    const ropeStep = (x: MlxArray): MlxArray =>
+      cache.ropePositions(x, (block, offset) => ops.rope(block, this.headDim, this.ropeBase, offset, null));
     q = disposing(q, ropeStep(q));
     k = disposing(k, ropeStep(k));
     const read = cache.appendWindow(k, v);
@@ -225,7 +217,7 @@ export class LlamaLayer {
   }
 
   /** The training forward (`LlamaAttention.forwardTraining`). */
-  forwardTraining(x: MlxArray, cache: AttentionCache): MlxArray {
+  forwardTraining(x: MlxArray, cache: TrainingAttentionCache): MlxArray {
     const xn = this.inputNorm.forward(x);
     const a = this.attn.forwardTraining(xn, cache);
     xn.dispose();
@@ -362,7 +354,7 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
     if (aIdx >= bIdx) return h;
     let cur = h;
     for (let i = aIdx; i < bIdx; i++) {
-      const next = this.layers[i]!.forwardTraining(cur, cache[i] as AttentionCache);
+      const next = this.layers[i]!.forwardTraining(cur, cache[i] as TrainingAttentionCache);
       if (i > aIdx) cur.dispose(); // keep the input boundary leaf; drop interiors
       cur = next;
     }

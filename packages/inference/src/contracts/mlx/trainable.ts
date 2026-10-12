@@ -27,7 +27,7 @@ export interface SegmentedPass {
    *  (caller-owned). The caller owns and disposes what comes back. */
   runRange(h: MlxArray, lo: number, hi: number, donorKvIn: Map<number, SharedKv>):
     { h: MlxArray; donorKvOut: Map<number, SharedKv> };
-  /** Release the pass's caches and masks and clear any prefix layout it set. */
+  /** Release the pass's caches and masks. */
   dispose(): void;
 }
 
@@ -46,7 +46,7 @@ export interface SegmentedTraining {
   finalNorm(h: MlxArray): MlxArray;
   /** Begin one pass over `ids` [1, T]. With a `prefix` layout the pass ropes and
    *  masks the prefix-shared concat (only for a graph that also declares
-   *  `prefixShared`); the layout stays active until the pass is disposed. */
+   *  `prefixShared`); the pass's caches own the layout (`TrainingAttentionCache.ropePositions`). */
   begin(ids: MlxArray, prefix?: PrefixLayout): SegmentedPass;
 }
 

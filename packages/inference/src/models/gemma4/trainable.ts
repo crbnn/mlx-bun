@@ -5,7 +5,6 @@ import type { Cache, SharedKv } from "../../contracts/mlx/cache";
 import type {
   GradCheckpointRun, HeadQuant, LoraLeaves, PrefixLayout, SegmentedPass, TrainableGraph,
 } from "../../contracts/mlx/trainable";
-import { setActivePrefixLayout } from "../../layers/prefix-layout";
 import { AttentionMasks } from "../../state/attention-read";
 import { prefixSharedCaches, selectedTrainingAttention, TrainingCache } from "../../state/training-cache";
 import type { LoraWeights } from "../../layers/lora";
@@ -90,9 +89,8 @@ class Gemma4SegmentedPass implements SegmentedPass {
   private readonly caches: Cache[];
   private readonly perLayer: MlxArray | null = null;
 
-  constructor(private readonly model: Gemma4Training, ids: MlxArray, private readonly prefix?: PrefixLayout) {
+  constructor(private readonly model: Gemma4Training, ids: MlxArray, prefix?: PrefixLayout) {
     this.caches = trainingCaches(model, prefix);
-    if (prefix) setActivePrefixLayout(prefix);
     let input: MlxArray | null = null;
     let perLayer: MlxArray | null = null;
     try {
@@ -110,7 +108,6 @@ class Gemma4SegmentedPass implements SegmentedPass {
   }
 
   private releaseCaches(): void {
-    if (this.prefix) setActivePrefixLayout(null);
     for (const c of this.caches) c.dispose();
   }
 
@@ -177,11 +174,9 @@ export function gemma4Trainable(model: Gemma4Training): TrainableGraph {
         // One prefix cache per DONOR layer (sharers read donors' K/V through
         // the donors' caches); the caches read under the block-sparse masks.
         const caches = trainingCaches(model, layout);
-        setActivePrefixLayout(layout);
         try {
           return model.forwardTrainingHidden(ids, caches); // [1, T, hidden], post-finalNorm
         } finally {
-          setActivePrefixLayout(null);
           for (const c of caches) c.dispose();
         }
       },
