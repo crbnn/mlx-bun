@@ -378,7 +378,8 @@ the default variant on the M4 Pro and the M1 Max; paired serve benchmark shows n
       possible later; it is not required.
 
 - [x] Program creation blocked (D1's merge gate, 2026-10-11, over 20 minutes). Cause found on
-      `refactor/composition-c3-hang` (e3cc7f29, merges after the E1 + D2 + E3 merge): every
+      `refactor/composition-c3-hang` (e3cc7f29, merged into the integration branch at
+      d71467c4 with the ANE, drift and architecture gates passing on the merged tree): every
       loaded ANE model holds one direct-path client of the ANE driver, the driver serves about
       a thousand across the whole machine, and the M4 Pro graph loaded 176 programs per graph,
       one per layer, all identical MIL and weights because the weights stream through the
