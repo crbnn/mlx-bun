@@ -1,5 +1,4 @@
-// Memory's contribution to chat, until memory becomes a module of its own (PLAN, "Split the app into
-// modules"): its read-only tools (`chat.tool`) and the prompt hint and skill that go with them
+// Memory's contribution to chat: its read-only tools (`chat.tool`) and the prompt hint and skill that go with them
 // (`chat.guidance`), registered through the registry so the chat module never imports memory. Both
 // are offered only while the vault exists, checked when each chat session is built, so a vault
 // created after startup is seen by the next chat.
