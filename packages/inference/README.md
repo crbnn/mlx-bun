@@ -992,9 +992,13 @@ checks below.
 
 - `state/`: storage layout, positions, row membership, precision transitions,
   snapshots, and persistence. `persistence.worker.js` performs CPU disk I/O.
-  Every storage a graph's caches (or their precision maintenance) produce has a row
-  layout implementing the `BatchableCache` port (`state/layout`: `ownedCacheLayout`
-  for ordinary continuous decoding, `targetCacheLayout` for verification rows). The
+  Every storage a graph's caches (or their precision maintenance, or paging) produce
+  declares its three row layouts together in `state/layout`'s table, each implementing
+  the `BatchableCache` port: `ownedCacheLayout` for ordinary continuous decoding,
+  `prefillCacheLayout` for prefill cohorts and `targetCacheLayout` for verification
+  rows, which hold the speculative transaction (`SpeculativeRowLayout`). The
+  [cache contract test](tests/state/cache-contract.test.ts) runs every lego through
+  every read, these layouts, the transaction, snapshots and SSD. The
   batch group only calls `mergeRows`, `filterRows` and `extractRow` on it and names no
   storage family; the gate rejects `execution/` importing a concrete cache module.
   A serial cache is a row source for its layout, not a batch: an adopted lone row is the
