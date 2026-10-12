@@ -58,6 +58,12 @@ those read per-sequence state the cache owns.
 - The cache contract has no representation-specific escape hatch (`updateAndFetch`,
   `quantizedAttention`, `rotatedValueAttention`, `affineConversion`, `turboConversion`).
 - The graph contract names its phases; the scheduler calls them by name.
+- Legos compose additively, never multiplicatively (Josh, 2026-10-11): five modules with three
+  configurations each are fifteen implementations against five contracts, not 243 plans. No
+  module names another module's configuration: a graph's declared capabilities say what it
+  computes, never which cache, drafter, sampler or batch width it tolerates; a cache lego
+  implements the whole cache contract for every model; the user never hears "you can't use
+  that cache with this model". The served-surface inventory lists no cross-module exclusion.
 - Existing violators ride the seam ratchet in `packages/inference/tests/architecture.test.ts`:
   counts only fall. The ratchet is a transition device, not a resting state: every entry is
   owned by a numbered item in this plan, and when the plan closes no example of a banned pattern
@@ -359,9 +365,9 @@ the default variant on the M4 Pro and the M1 Max; paired serve benchmark shows n
 
 #### C3. The ANE split owns its programs
 
-- [ ] `layers/ane-prefill-split.ts`: programs are instance-owned and disposed with the layer; no
+- [x] `layers/ane-prefill-split.ts`: programs are instance-owned and disposed with the layer; no
       module-level maps.
-- [ ] Programs are built for exactly the chunk size; no buckets, no minimum-row floor. The
+- [x] Programs are built for exactly the chunk size; no buckets, no minimum-row floor. The
       leftover chunk is `prefillTail` on the GPU.
 - [ ] ANE programs compile at install, the way Apple's own pipeline compiles a model for the
       Neural Engine on the device and caches it (Josh, 2026-10-10). The installer, or the app's
@@ -371,11 +377,27 @@ the default variant on the M4 Pro and the M1 Max; paired serve benchmark shows n
       form itself, one per Neural Engine generation built on a host of that generation, stays
       possible later; it is not required.
 
-- [ ] Program creation can hang: after the real artifact's 2048-row programs ran, the next
-      synthetic program's `mbane_program_create` blocked for over 20 minutes waiting on aned's
-      `loadModel` reply in the same process (D1's merge gate, 2026-10-11; the real-artifact test
-      alone passes). Reproduce and fix in the bridge (a per-process `_ANEClient` state or the
-      shared-buffer release order are the suspects) before E2 dispatches chunks to the ANE.
+- [x] Program creation blocked (D1's merge gate, 2026-10-11, over 20 minutes). Cause found on
+      `refactor/composition-c3-hang` (e3cc7f29, merges after the E1 + D2 + E3 merge): every
+      loaded ANE model holds one direct-path client of the ANE driver, the driver serves about
+      a thousand across the whole machine, and the M4 Pro graph loaded 176 programs per graph,
+      one per layer, all identical MIL and weights because the weights stream through the
+      buffers. Past the cap the client open inside the load fails and the framework retries
+      every 15 s for as long as the clients are held, in our process and in every other ANE
+      user's (`mediaanalysisd` restarted every 120 s during the gate). The earlier suspects
+      (aned's reply, client state, buffer release order) were not involved and the 2048-row
+      shape did not matter, only the count. Fix in the bridge: a program created with `share`
+      whose MIL and weights are identical to the shared program's holds that same loaded model
+      (holder count; the last `mbane_free` unloads), so a graph holds 3 loaded models instead
+      of 176. Outputs bit-identical to the old bridge; the real-artifact gate passes at maxDiff
+      0 holding 6 clients. Regression tests opt in with `MLX_BUN_TEST_ANE=1`: a child process
+      creates 2288 programs of four chunk sizes then one more, killed at 240 s; splits of two
+      chunk sizes coexist and dispose in either order. Found: the identity test and the frozen
+      reference graph never dispose their graphs (3 leaked clients per graph now; dispose them
+      when the frozen files go). Found: `mbane_available()` / `aneAvailable()` is a soft
+      runtime check for whether the framework loaded; under the composition the bridge is a
+      load-time fact (`aneBridge`), so the loader composes it or fails the load with a typed
+      error and the predicate goes (E2).
 
 Exit: two graphs can coexist in one process without evicting each other's programs; KL gate on
 ANE prefill unchanged; after install, the first ANE prefill on a fresh machine loads from the
@@ -597,10 +619,11 @@ Found by review on 2026-10-11 against the integration tree.
       operation at composition (projection over the listed vocabulary or the full head; greedy
       argmax or the sampler's draw) and the loop calls it on the hidden output; no branch in the
       loop. The same for the DeepSpec and assistant sources where they repeat the pattern.
-- [ ] `DraftProvider.open()` (the serial source) is deleted from the contract. The grouped lane
-      is the only lane and a single request drafts at one row, as the architecture already says
-      for serving; `Dflash2Provider.open()` throwing "runs only in the batched speculative lane"
-      is the evidence that the serial method is a promise no composition keeps.
+- [ ] `DraftProvider.open()`, the code's per-request draft source, is deleted from the contract.
+      There is one lane and a single request is a batch of one (Josh, 2026-10-11: "we only have
+      batched, and serial should just be a batch of one"); `Dflash2Provider.open()` throwing
+      "runs only in the batched speculative lane" is the evidence that the method is a promise
+      no composition keeps.
 - [ ] The MTP companion's forward calls its named phase, not `deprecatedPhase` (rides E2's
       deletion); its draft operation is width-classed like the graph's `verify` (the DFlash 2
       entry under E2 covers both drafters).
