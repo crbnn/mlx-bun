@@ -1194,7 +1194,14 @@ empty; documentation generators run clean.
 - `bun run typecheck`, `bun run test`, and the architecture gate on every PR.
 - Speed only through `mlx-bun serve` in the batched lane with the paired benchmarks, ms per round
   for MTP, on a quiet named machine.
-- One PR per numbered item, targeting `main`, not merged without Josh's instruction.
+- One PR per numbered item, targeting `refactor/composition`, merged there after its gates; the
+  branch merges to `main` once (#323).
+- From the cleanup on (Josh, 2026-10-12): the per-item gates are the model-free ones (typecheck,
+  the architecture gate, the drift tests, the conformance suite, the state and execution
+  directories, the root suite, the training natives, the website build) plus the one small gate
+  a new numerical path needs; the full real-weight matrix (every artifact × scheme × rows × chunk
+  size, the parity suites, the M1 Max identity and parity, the paired runs) runs once on the
+  merged branch at the end, not per piece.
 
 ### Untouched
 
