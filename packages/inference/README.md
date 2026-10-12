@@ -1334,10 +1334,17 @@ configurations. Estimates are advisory, and the entry imports without MLX. See t
 runnable [fit example](examples/fit-model.ts):
 `bun packages/inference/examples/fit-model.ts <checkpoint-directory> [context-tokens]`.
 
-`state` exposes `SsdCacheStore`, `TieredPromptCache`, and
-`SsdDurabilityCoordinator` for caller-configured persistence. Execution continuation
-helpers retain the existing sampler, pending-token, adapter, and cache identities
-when saving or restoring a generation. Applications choose their own storage paths,
+`state/cache-service` composes them into one service per loaded model,
+`createKvCacheService(graph, options)`, constructed with its budget (the RAM cap,
+`kvBudgetBytes`, a saved-state root with its shared byte budget, and the graph's
+paging): the batch group takes it as `cache` and only acquires a request's state
+(the prompt tokens it already covers, 0 for a miss), publishes state back,
+offers continuation checkpoints and releases the request; it never sees what is
+resident, evicted or saved. The service resumes a replayable generation under the
+key its continuation request names, with the request's sampler, pending token,
+adapter and cache identities. `report()` is what it holds. `SsdCacheStore`,
+`TieredPromptCache` and `SsdDurabilityCoordinator` remain for callers composing
+their own parts. Applications choose their own storage paths,
 capacity, scheduler settings, and shutdown lifecycle. A store's directory is
 `<dir>/<configFingerprint>/`; the app's fingerprint joins architecture, KV scheme,
 binding compatibility and the hub's resolved model-directory identity. HF snapshot

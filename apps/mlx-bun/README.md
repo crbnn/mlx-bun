@@ -494,7 +494,9 @@ settles or fails before submission. Requests the method cannot apply (grammar,
 draft, logprobs, logits processors, fill) receive the typed
 capability error; a KV scheme or paging is refused when the model loads.
 
-`engine/cache-services` composes the library prompt cache and persistence. Its
+`engine/cache-services` builds the loaded model's cache service (the library's
+`state/cache-service`) from the serve flags: RAM prefixes, saved state, generation
+checkpoints, `--kv-budget` admission and paging, behind one interface. Its
 default is 8 GB of RAM with plain KV; a caller supplies `ssdCacheDir` for saved state.
 `mlx-bun serve` supplies it by default (`MLX_BUN_HOME/kv`, `--ssd-cache <dir>` moves it,
 `off` disables it): one directory per model identity under the root, and
@@ -506,11 +508,10 @@ after every close. A model that returns finds its directory, and its prefix, int
 The hub's resolved model directory supplies the identity, so startup does not hash
 weight files. Saved KV is disposable; after replacing weights in place, clear it
 when you want fresh state.
-Composition must pass the returned `continuationServices` to
-`binding.gateway.configureContinuation` and supply `promptCache`,
-`resolvedKvScheme`, `stateCodecs`, `adapterNamespace`, and checkpoint availability
-as gateway options. The engine borrows these services; construction alone does
-not attach them. Pass `close` through the owned `beforeModelDispose` hook so shutdown
+Composition passes the returned `cache` and `adapterNamespace` as gateway options;
+`/stats`, the cache routes, telemetry and the model host read the service's own
+`report()`. The engine borrows the service; construction alone does not attach it.
+Pass its `close` through the owned `beforeModelDispose` hook so shutdown
 drains execution, flushes persistence, clears cache state, then frees the model.
 `flush` also supports explicit durability checks while the app is running:
 `server/cache-routes.ts` serves main's `POST /admin/cache/flush` (200 with the
