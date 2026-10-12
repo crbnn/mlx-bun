@@ -24,7 +24,8 @@ import { loadModelConfig, quantFor } from "../src/artifacts/config";
 /** The facts that fix one generated graph. The fingerprint and device choose the
  * layer and kernel tables written into the file; `kv` names the scheme whose
  * cache lego `makeCache` composes, or every scheme; `mixedGateUp` chooses the
- * mixed-width gate/up layer where the device's table names the reduce kernels.
+ * mixed-width gate/up layer where the device's table names the reduce kernels;
+ * `verifyRoundCosts` are the numbers measured for this composition on its host.
  * `draftDepth`, `prefillChunkTokens`, `maxRows` and `aneBridge` record what the
  * file was generated and gated for (the device's table writes the Neural Engine
  * chunk operation, which the constructor builds when the record it is handed has
@@ -60,6 +61,12 @@ export interface Qwen38Composition {
    *  generic blocks' two projections and separate SwiGLU, the A/B control. Only a device whose table names
    *  `ReduceMixedGateUp` reads it. */
   readonly mixedGateUp?: "split" | "fused" | "off";
+  /** A verify round's cost by its rows (draft depth + 1) relative to one plain decode step, measured for this
+   *  composition on `host`: the DFlash 2 drafter's round time at each fixed depth over the plain decode step's time,
+   *  on this graph and artifact (scripts/bench-mtp.ts, greedy). The scheduler's adaptive draft gate weighs them
+   *  against the decayed acceptance rate. Absent: the graph declares none, and `--num-draft-tokens adaptive` is
+   *  refused on it. */
+  readonly verifyRoundCosts?: { readonly host: string; readonly costs: readonly (readonly [number, number])[] };
 }
 
 export const QWEN38_COMPOSITIONS: Readonly<Record<string, Qwen38Composition>> = Object.freeze({
@@ -76,6 +83,7 @@ export const QWEN38_COMPOSITIONS: Readonly<Record<string, Qwen38Composition>> = 
     prefillChunkTokens: 2048,
     maxRows: 8,
     aneBridge: true,
+    verifyRoundCosts: { host: "M4 Pro 24 GB", costs: [[1, 1], [2, 1.3], [3, 1.46], [4, 1.68], [5, 1.82], [6, 1.92], [7, 1.93], [8, 1.94]] },
   },
   // The hand-written TQ graph's served composition until D2: this artifact on the M1 Max GPU, whatever its KV
   // scheme or rows.
@@ -159,8 +167,6 @@ interface DeviceKernels {
   /** Mixed rows: each group on its own phase's operation for its width (`perGroup`), or the generic blocks with the
    *  prompt and decode groups' MLP rows packed into one call (`packed`). */
   readonly mixed: "perGroup" | "packed";
-  /** Verify forward cost by rows relative to one decode step, measured on `host`; `null` declares none. */
-  readonly verifyRoundCosts: { readonly host: string; readonly costs: readonly (readonly [number, number])[] } | null;
   /** The cache lego a composition's affine scheme composes; `null` for compositions serving every scheme. */
   readonly kvLego: string | null;
   readonly ane: { readonly fraction: number; readonly rowMajorMlp: string; readonly k3InterleavedMlp: string;
@@ -199,7 +205,6 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     widerVerify: "bounded",
     knownSpans: true,
     mixed: "perGroup",
-    verifyRoundCosts: { host: "M4 Pro 24 GB", costs: [[1, 1], [2, 1.3], [3, 1.46], [4, 1.68], [5, 1.82], [6, 1.92], [7, 1.93], [8, 1.94]] },
     kvLego: "Bf16FirstKv4Head256Cache",
     ane: { fraction: 0.55, rowMajorMlp: "AneTrellisMlpSplit", k3InterleavedMlp: "AneTrellisMlpSplitK3i", affine: "AneAffineSplit",
       projections: ["in_proj_z", "out_proj", "o_proj"] },
@@ -222,7 +227,6 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     widerVerify: "lazy",
     knownSpans: false,
     mixed: "packed",
-    verifyRoundCosts: null,
     kvLego: null,
     ane: null,
   },
@@ -653,9 +657,9 @@ export class ${c.className} implements MlxDeclaredGraph, MlxTokenPhases {
    *  workspace; adapters ${adapterSafe ? "at every width" : "only when the composition mounts them"}. Speculation over
    *  affine KV is the composition's \`speculativeAffineKv\`. */
   readonly graphCapabilities: GraphCapabilities;
-${k.verifyRoundCosts ? `  /** Verify forward cost by rows relative to one decode step (${k.verifyRoundCosts.host}). */
+${c.verifyRoundCosts ? `  /** Verify forward cost by rows relative to one decode step (${c.verifyRoundCosts.host}). */
   readonly verifyRoundCosts: ReadonlyMap<number, number> = new Map([
-    ${k.verifyRoundCosts.costs.map(([rows, cost]) => `[${rows}, ${cost}]`).join(", ")},
+    ${c.verifyRoundCosts.costs.map(([rows, cost]) => `[${rows}, ${cost}]`).join(", ")},
   ]);
 ` : ""}
   readonly prefillChunk: MlxPrefillChunk;
