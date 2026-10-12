@@ -12,7 +12,8 @@ exists; the installer validates the complete new bundle, including its notices.
 Source links in the authored pages and CLI generator target `main`; the static
 build check covers only local links.
 
-The build generates the CLI inventory from the application's command table.
+The build generates the CLI inventory from the application's command table and the
+verbs its installed modules' manifests declare (`apps/mlx-bun/src/modules.ts`).
 It also copies the canonical app installer to `public/install.sh`. Neither output
 is committed. The coverage test compares the inventory to the real CLI's help,
 including every command and flag. Examples link to executable package examples;
