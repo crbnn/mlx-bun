@@ -90,13 +90,8 @@ jobs:
             bun run --cwd "$tree/packages/module-transcription" build:native
           done
 
-      - name: Preflight
-        id: preflight
-        continue-on-error: true
-        run: bun head/scripts/bench/perf-check.ts preflight --out "$RUNNER_TEMP/perf/preflight-before.json" --wait-minutes 30
-
-      - name: Paired serve benchmark, candidate against baseline
-        if: steps.preflight.outcome == 'success'
+      # Pins the artifacts, trees and runtime and records the candidate's graph; measures nothing.
+      - name: Plan the paired run
         run: |
           W="$RUNNER_TEMP/perf" NATIVE="$RUNNER_TEMP/perf/mlx-native/lib/libmlxc.dylib" BUN="$(command -v bun)"
           snapshot() { # the artifact's snapshot in the hub cache, read in place
@@ -119,7 +114,16 @@ jobs:
             --native "$NATIVE" \
             --model "qwen27b=$QWEN=mlx-bun/Qwen3.8-27B-Trellis-3.2bpw, candidate graph $QWEN_GRAPH" \
             --model "e4b=$E4B=mlx-community/gemma-4-e4b-it-OptiQ-4bit, candidate graph $E4B_GRAPH"
-          bun head/scripts/bench-serve.ts run --plan "$W/plan.json" --out "$W/run" ||
+
+      - name: Preflight
+        id: preflight
+        continue-on-error: true
+        run: bun head/scripts/bench/perf-check.ts preflight --out "$RUNNER_TEMP/perf/preflight-before.json" --wait-minutes 30
+
+      - name: Paired serve benchmark, candidate against baseline
+        if: steps.preflight.outcome == 'success'
+        run: |
+          bun head/scripts/bench-serve.ts run --plan "$RUNNER_TEMP/perf/plan.json" --out "$RUNNER_TEMP/perf/run" ||
             echo "bench-serve run exited $?; the decision reads its saved record"
 
       - name: Preflight after the run
