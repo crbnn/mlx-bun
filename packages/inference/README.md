@@ -1166,19 +1166,30 @@ and all 65,280 finite BF16 bit patterns before measuring projections. Append
 candidate instead of its shared-weight scalar reduction. Both are experiments;
 the current runtime dispatch is unchanged.
 
-`generation/speculative` exposes `generateSpeculative`, `specRun`, and the existing
-assistant, two-model, Qwen/GLM MTP, DFlash, DFlash 2, DeepSpec, and n-gram proposal providers.
-DFlash 2 (`incoai/Qwen3.8-27B-DFlash2`) drafts a whole block in one pass from
-five tapped target layers; it runs only in the batched speculative lane, with
+`generation/speculative` exposes the draft contract and the assistant, two-model,
+Qwen/GLM MTP, DFlash, DFlash 2, DeepSpec, and n-gram proposal providers. A provider
+drafts only through its grouped rows (`DraftProvider.grouped`), in the gateway's
+speculative group; one request is a group of one row, and there is no per-request
+draft source. DFlash 2 (`incoai/Qwen3.8-27B-DFlash2`) drafts a whole block in one pass from
+five tapped target layers, with
 its projections quantized at load to the width the registry passes (4 bits). `bindMlxGateway(model, { provider,
 numDraftTokens, adaptiveDepth })` drafts `numDraftTokens` every round, or with
 `adaptiveDepth` chooses each round's count (up to that) from the decayed
 acceptance rate and the graph's declared `verifyRoundCosts`. A target graph whose residual stream
 carries a TurboQuant R1 fold declares it on its draft target (`residualBasis`: the R1 seed and the
 final-norm gain the fold moved into the head); the drafter loads unrotated and applies it when a draft group binds.
-Supply the target graph, draft provider, token budget, and token callback yourself.
-`specRun` accepts an explicit binding from `generation/speculative/binding`; it does not
-require a concrete model class. The former `specServeRun` name remains available.
+A library caller speculates as the app does: `binding.plan` with `hasDraft`, then
+`binding.methodRequest` and `submit` on `binding.createBatchGroup({ maxBatch: 1 })`
+(`@mlx-bun/training/dspark`'s calibration runs this way).
+`generation/speculative/binding` exports the target operations the groups bind
+(`bindSpeculativeTargetModel`); they do not require a concrete model class.
+Each request's draft selection is resolved when the binding binds the request and
+keys its group: argmax under `MLX_BUN_SPEC_GREEDY_DRAFT=1`, else the draft vocabulary
+the provider declares for the target (`draftVocabulary`, the Qwen MTP companion's
+`draft_vocab.json`) when the request's draft sampler reproduces on it, else each
+row's sampler over the full head. A drafter's rows bind one selection operation
+when they open and their draft loop calls it; the assistant and DeepSpec drafters
+bind their head's selection at construction the same way.
 `generation/speculative/loader` (a file of `models/speculative`) loads a `dspark.json`
 checkpoint (`loadDsparkDrafter`) and also exports the drafter class and its config types,
 which `@mlx-bun/training/dspark` uses to produce those checkpoints.
@@ -1244,8 +1255,7 @@ per-layer KV. It takes `MLX_BUN_TEST_SPEC_TARGET`, `MLX_BUN_TEST_SPEC_KIND`
 (the custom sliding-window graph over a Llama-family target) and
 `MLX_BUN_TEST_SPEC_ADAPTER`. Providers load through `defaultDraftProviders()`, as
 the app's model host loads them. Requests go through placement, `methodRequest` and
-the binding's group: B1 equal to the serial `specServeRun` producer where that
-producer serves the KV settings, B4 cohorts that prefill together and repeat,
+the binding's group: B1 repeating exactly, B4 cohorts that prefill together and repeat,
 stop/failure/abort retirement at exact counts, late and prefill joins, prompt
 snapshots with their draft attachment, generated prefixes restored from RAM and
 a fresh SSD store after a provider reload, and, with an adapter, a live adapter
@@ -1273,9 +1283,9 @@ and checkpoint attachments. The caller owns cache lifetime and reuse namespaces.
 `execution` exposes `createInferenceEngine`, method adapters, cancellation,
 admission, and continuous batching. Supply an execution planner and its graph
 bindings; the engine manages in-process session lifetimes and bounded output.
-It opens no network listener. `createAutoregressiveMethod`,
-`createSpeculativeMethod`, and `createDenoisingMethod` adapt the direct methods
-when a consumer needs sessions. `MlxBatchExecutionGroup` owns batched rows;
+It opens no network listener. `createAutoregressiveMethod` and
+`createDenoisingMethod` adapt the direct methods when a consumer needs sessions;
+speculation runs only in the batch group. `MlxBatchExecutionGroup` owns batched rows;
 `ExecutionCoordinator` and `driveExecutionGroup` coordinate its work.
 
 DiffusionGemma requests share that group through `execution/denoising-group`.
