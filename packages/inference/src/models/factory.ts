@@ -10,8 +10,9 @@ import { Weights } from "../artifacts/weights";
 import { Gemma4Model } from "./gemma4/model";
 import { configFingerprint } from "../artifacts/fingerprint";
 import {
-  COMPOSITION as QWEN38_TRELLIS_TQ_COMPOSITION, QWEN38_TRELLIS_TQ_GRAPH, Qwen38TrellisTQ, qwen38TrellisTqFingerprint,
+  COMPOSITION as QWEN38_TRELLIS_TQ_COMPOSITION, QWEN38_TRELLIS_TQ_GRAPH, Qwen38TrellisTQ,
 } from "./qwen/qwen38-27b-trellis-tq";
+import { qwen35GraphFingerprint } from "./qwen/checkpoint";
 import {
   COMPOSITION as QWEN38_TRELLIS_M4PRO_COMPOSITION, QWEN38_TRELLIS_M4PRO_GRAPH, Qwen38TrellisM4Pro,
 } from "./qwen/qwen38-27b-trellis-m4pro";
@@ -75,7 +76,7 @@ export const MLX_GRAPH_TABLES: Readonly<Record<ModelGraph, GraphTable<Weights, R
     { id: QWEN38_TRELLIS_TQ_GRAPH, serves: QWEN38_TRELLIS_TQ_COMPOSITION,
       create: (weights, config, composition) => new Qwen38TrellisTQ(weights, config, composition) },
     generic("qwen3.5", (weights, config, composition) => new Qwen35Model(weights, config, composition)),
-  ], qwen38TrellisTqFingerprint),
+  ], qwen35GraphFingerprint),
   "qwen3-moe": new GraphTable([generic("qwen3-moe", (weights, config, composition) => new Qwen3MoeModel(weights, config, composition))]),
   "qwen3": new GraphTable([generic("qwen3", (weights, config, composition) => new Qwen3Model(weights, config, composition))]),
   "gemma4": new GraphTable([...GENERATED_GRAPHS, generic("gemma4", (weights, config, composition) => new Gemma4Model(weights, config, composition))],

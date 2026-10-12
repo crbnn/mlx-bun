@@ -31,7 +31,8 @@ import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { Weights } from "../../artifacts/weights";
 import type { Composition } from "../../contracts/portable/composition";
-import { quantFor, type ModelConfig } from "../../artifacts/config";
+import type { ModelConfig } from "../../artifacts/config";
+import { qwen35GraphFingerprint } from "./checkpoint";
 import { runtimeFlag, runtimeValue } from "../../runtime/config";
 import { type Cache, type GatedDeltaCache } from "../../contracts/mlx/cache";
 import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
@@ -57,29 +58,8 @@ export const QWEN38_TRELLIS_TQ_GRAPH = "qwen3.8-27b-trellis-tq";
  *  (`MLX_GRAPH_TABLES` in `models/factory.ts`, its `generic`). */
 export const COMPOSITION: ServedComposition = Object.freeze({ fingerprint: "cfa205c8f5af046a", device: "applegpu_g13s" });
 
-/** Architecture plus the complete language-model quantization table. Two
- *  artifacts share a fingerprint only if every tensor has the same codec. */
-export function qwen38TrellisTqFingerprint(config: ModelConfig): string {
-  const t = config.text;
-  const q = config.quantization as unknown as { bits?: number; groupSize?: number; mode?: string; overrides?: Record<string, unknown> } | null;
-  const roles = ["linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_a", "linear_attn.in_proj_b",
-    "linear_attn.out_proj", "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
-    "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"];
-  const table: unknown[] = [];
-  for (let layer = 0; layer < t.numHiddenLayers; layer++)
-    for (const role of roles) table.push(quantFor(config.quantization, `language_model.model.layers.${layer}.${role}`));
-  table.push(quantFor(config.quantization, "language_model.lm_head"), quantFor(config.quantization, "language_model.model.embed_tokens"));
-  const payload = JSON.stringify({
-    modelType: config.modelType, hiddenSize: t.hiddenSize, intermediateSize: t.intermediateSize,
-    layers: t.numHiddenLayers, fullAttentionInterval: t.fullAttentionInterval,
-    heads: t.numAttentionHeads, kvHeads: t.numKeyValueHeads, headDim: t.headDim,
-    linear: [t.linearNumKeyHeads, t.linearNumValueHeads, t.linearKeyHeadDim, t.linearValueHeadDim, t.linearConvKernelDim],
-    vocabSize: t.vocabSize, tied: t.tieWordEmbeddings, defaults: q ? [q.bits, q.groupSize, q.mode] : null, table,
-  });
-  const hash = new Bun.CryptoHasher("sha256");
-  hash.update(payload);
-  return hash.digest("hex").slice(0, 16);
-}
+/** The table's fingerprint (`qwen35GraphFingerprint`), under the name this graph introduced it. */
+export const qwen38TrellisTqFingerprint = qwen35GraphFingerprint;
 
 /** `MLX_BUN_QWEN38_TQ_MIXED_GATEUP`: unset or `split` = on with the split-exact tail,
  *  `fused` (or the earlier `1`) = on with the float32-sigmoid tail, `0`/`off` = off. */

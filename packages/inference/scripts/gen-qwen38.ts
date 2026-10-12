@@ -161,8 +161,8 @@ async function storedShapes(dir: string, names: readonly string[]): Promise<Map<
 /** Read an artifact snapshot into the description the template consumes. */
 export async function describeArtifact(dir: string): Promise<Qwen38Description> {
   const config = await loadModelConfig(dir);
-  // The fingerprint function lives with the graph that introduced it and loads the native library.
-  const { qwen38TrellisTqFingerprint } = await import("../src/models/qwen/qwen38-27b-trellis-tq");
+  // The table's fingerprint lives beside the Qwen checkpoint view, whose module loads the native library.
+  const { qwen35GraphFingerprint } = await import("../src/models/qwen/checkpoint");
   const t = config.text;
   const downNames = Array.from({ length: t.numHiddenLayers }, (_, i) => [
     `language_model.model.layers.${i}.mlp.down_proj.weight`, `model.language_model.layers.${i}.mlp.down_proj.weight`]).flat();
@@ -183,7 +183,7 @@ export async function describeArtifact(dir: string): Promise<Qwen38Description> 
     return { kind, projections, gate: bits(`${prefix}.mlp.gate_proj`), up: bits(`${prefix}.mlp.up_proj`),
       down: bits(`${prefix}.mlp.down_proj`), downLayout: shape.length === 3 ? "k3Interleaved" : "rowMajor" };
   });
-  return { source: sourceOf(dir), fingerprint: qwen38TrellisTqFingerprint(config), layers };
+  return { source: sourceOf(dir), fingerprint: qwen35GraphFingerprint(config), layers };
 }
 
 export async function readDescription(source: string): Promise<Qwen38Description> {

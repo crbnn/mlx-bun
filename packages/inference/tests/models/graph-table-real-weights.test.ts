@@ -31,7 +31,8 @@ test.skipIf(!inputs)("openModel builds the graph the table selects for the compo
   const { openModel, resolveComposition } = await import("../../src/models");
   const { Gemma4Model } = await import("../../src/models/gemma4/model");
   const { Qwen38TrellisM4Pro } = await import("../../src/models/qwen/qwen38-27b-trellis-m4pro");
-  const { Qwen38TrellisTQ, qwen38TrellisTqFingerprint } = await import("../../src/models/qwen/qwen38-27b-trellis-tq");
+  const { Qwen38TrellisTQ } = await import("../../src/models/qwen/qwen38-27b-trellis-tq");
+  const { qwen35GraphFingerprint } = await import("../../src/models/qwen/checkpoint");
   const generated = await Promise.all([import("../../src/models/gemma4/generated/gemma4-12b"),
     import("../../src/models/gemma4/generated/gemma4-e4b"), import("../../src/models/gemma4/generated/gemma4-26b")]);
   const dir = inputs!.model;
@@ -51,7 +52,7 @@ test.skipIf(!inputs)("openModel builds the graph the table selects for the compo
     console.log(`[graph-table] ${dir}: default composition -> Gemma4Model; kv_config composition -> generated ${gemma.FINGERPRINT}`);
     return;
   }
-  assert(qwen38TrellisTqFingerprint(config) === "cfa205c8f5af046a", `${MODEL}: no selection expectation for ${dir}`);
+  assert(qwen35GraphFingerprint(config) === "cfa205c8f5af046a", `${MODEL}: no selection expectation for ${dir}`);
   assert(device === "applegpu_g16s" || device === "applegpu_g13s", `${MODEL}: the Trellis artifact has a specialized graph on g16s and g13s, not ${device}`);
   const expected = device === "applegpu_g16s" ? Qwen38TrellisM4Pro : Qwen38TrellisTQ;
   expect(await built()).toBe(expected);
