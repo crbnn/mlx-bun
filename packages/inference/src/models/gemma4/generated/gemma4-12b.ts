@@ -63,7 +63,6 @@ import { RMSNorm } from "../../../layers/normalization";
 import { QuantizedEmbedding } from "../../../layers/quantized-embedding";
 import type { QuantizedLinear } from "../../../layers/quantized-linear";
 import { isCompiledTrace } from "../../../runtime/compiled-trace";
-import { runtimeFlag } from "../../../runtime/config";
 import { disposeResources } from "../../../runtime/resources";
 import { AttentionMasks } from "../../../state/attention-read";
 import { composedFullAttentionCache, composedSlidingAttentionCache } from "../../../state/bf16-first-kv";
@@ -223,9 +222,9 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
     this.composition = composition;
     this.weightsBytes = [...weights.shards.files.values()].reduce((a, f) => a + f.mmap.size, 0);
     this.embed = QuantizedEmbedding.load(weights, `${PREFIX}.embed_tokens`, config);
-    // The GeGLU activations and the head's softcap run the compiled closures unless MLX_BUN_COMPILED_GEGLU=0
-    // asked for the spelled-out ops: read once, here.
-    const compiledGeglu = runtimeFlag("MLX_BUN_COMPILED_GEGLU", true);
+    // The GeGLU activations and the head's softcap run the compiled closures unless the
+    // composition's `compiledGeglu` is off: the spelled-out ops.
+    const compiledGeglu = composition.compiledGeglu;
     this.layers = Object.freeze(LAYERS.map((_, i) => new DecoderLayer(weights, config, PREFIX, i, i < CACHES, compiledGeglu)));
     this.finalNorm = new RMSNorm(weights.tensor(`${PREFIX}.norm.weight`), t.rmsNormEps);
     this.embedScale = Math.sqrt(t.hiddenSize);

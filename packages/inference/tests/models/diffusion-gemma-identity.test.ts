@@ -25,6 +25,7 @@ import { bindLegacyDenoisingModel } from "../../src/generation/bindings/denoisin
 import { disposeResources } from "../../src/runtime/resources";
 import { DiffusionGemmaModel } from "../../src/models/diffusion-gemma/model";
 import { DiffusionGemmaModel as FrozenDiffusionGemmaModel } from "./diffusion-gemma-reference";
+import { testComposition } from "./test-composition";
 
 const HIDDEN = 128, VOCAB = 256, HEADS = 4, SLIDING_KV = 2, SLIDING_DIM = 256, FULL_KV = 1, FULL_DIM = 512;
 const INTER = 128, EXPERTS = 8, TOP_K = 2, MOE_INTER = 64, WINDOW = 16, CANVAS = 24;
@@ -201,7 +202,7 @@ function outputDiff(category: string, label: string, actual: MlxArray, expected:
 }
 
 const { weights, config } = artifact();
-const current = new DiffusionGemmaModel(weights, config);
+const current = new DiffusionGemmaModel(weights, config, testComposition());
 const frozen = new FrozenDiffusionGemmaModel(weights, config);
 
 const prompt = (n: number, salt: number) => Array.from({ length: n }, (_, i) => (i * 37 + salt * 11 + 5) % 240);

@@ -67,7 +67,7 @@ function generic(id: string, create: GraphEntry<Weights, RuntimeModel>["create"]
  * selected. Adding a graph means adding an entry here (or to the list a table
  * spreads in). */
 export const MLX_GRAPH_TABLES: Readonly<Record<ModelGraph, GraphTable<Weights, RuntimeModel>>> = Object.freeze({
-  "diffusion-gemma": new GraphTable([generic("diffusion-gemma", (weights, config) => new DiffusionGemmaModel(weights, config))]),
+  "diffusion-gemma": new GraphTable([generic("diffusion-gemma", (weights, config, composition) => new DiffusionGemmaModel(weights, config, composition))]),
   "minicpm5": new GraphTable([generic("minicpm5", (weights, config, composition) => new MiniCPM5Model(weights, config, composition))]),
   // Our published Trellis quant has its generated graphs (scripts/gen-qwen38.ts), keyed by its graph
   // fingerprint (architecture plus the complete quantization table) and the GPU each was built for.

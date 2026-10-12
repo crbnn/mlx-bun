@@ -39,7 +39,7 @@ import type { TrainableGraph } from "../../contracts/mlx/trainable";
 import { declareGraph } from "../capabilities";
 import type { PixelInput } from "../../contracts/mlx/media";
 import { geglu, GegluMLP } from "../../layers/geglu";
-import { runtimeFlag } from "../../runtime/config";
+import type { Composition } from "../../contracts/portable/composition";
 import { logitSoftcap } from "../../kernels/logits";
 import { compiledLogitSoftcap } from "../../kernels/softcap";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
@@ -483,14 +483,14 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
   readonly imageTokenId: number;
 
   /** The GeGLU activations and the head's softcap run the compiled closures
-   * (the reference's mx.compile'd geglu and softcap), unless
-   * `MLX_BUN_COMPILED_GEGLU=0` asked for the spelled-out ops: read once, here. */
+   * (the reference's mx.compile'd geglu and softcap), unless the composition's
+   * `compiledGeglu` is off: the spelled-out ops. */
   readonly #compiledGeglu: boolean;
 
-  constructor(weights: Weights, config: ModelConfig) {
+  constructor(weights: Weights, config: ModelConfig, composition: Composition) {
     const t = config.text;
     this.config = config;
-    this.#compiledGeglu = runtimeFlag("MLX_BUN_COMPILED_GEGLU", true);
+    this.#compiledGeglu = composition.compiledGeglu;
     this.weightsBytes = [...weights.shards.files.values()].reduce((a, f) => a + f.mmap.size, 0);
     this.embed = QuantizedEmbedding.load(weights, "model.decoder.embed_tokens", config);
     this.embedScale = Math.pow(t.hiddenSize, 0.5);

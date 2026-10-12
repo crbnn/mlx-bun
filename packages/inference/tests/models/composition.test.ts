@@ -31,7 +31,7 @@ test("the default record: this machine, bf16, no drafter, the 2048-token chunk, 
   expect(composition).toEqual({ device: deviceArchitecture(), aneBridge: true, kv: { kind: "bf16" }, pagedKv: null,
     draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 8, packedMixedMlp: true,
     vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
-    grammarJump: false, greedyDraft: false });
+    grammarJump: false, greedyDraft: false, compiledGeglu: true });
   // The Neural Engine bridge is composed unless the caller turns it off; nothing probes the machine.
   expect(resolveComposition(config, { aneBridge: false }).aneBridge).toBe(false);
   expect(Object.isFrozen(composition)).toBe(true);
@@ -87,6 +87,11 @@ test("the graph switch is a composition field, on by default; the runtime config
   expect(packed()).toBe(true);
   expect(packed({ packedMixedMlp: false })).toBe(false);
   expect(packed({}, { MLX_BUN_MIXED_PACKED_MLP: "0" })).toBe(true);
+  const geglu = (request: Parameters<typeof resolveComposition>[1] = {}, values: Record<string, string> = {}) =>
+    withRuntimeConfig(createRuntimeConfig(values), () => resolveComposition(config, request).compiledGeglu);
+  expect(geglu()).toBe(true);
+  expect(geglu({ compiledGeglu: false })).toBe(false);
+  expect(geglu({}, { MLX_BUN_COMPILED_GEGLU: "0" })).toBe(true);
   // Speculation over a KV scheme is no composition fact: every cache lego holds the transaction.
   expect(resolveComposition(config)).not.toHaveProperty("speculativeAffineKv");
 });

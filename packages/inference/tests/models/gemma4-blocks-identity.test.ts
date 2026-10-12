@@ -733,12 +733,16 @@ for (const kind of ["dense", "shared"] as const) {
           } finally { disposeAll(oldCohort, newCohort, oldRows, newRows, ...extracted); }
         }), 120_000);
 
-    test(`${kind}: MLX_BUN_COMPILED_GEGLU=0 is read once at construction: spelled-out GeGLU, the same bits as the old per-call read`, () => {
+    test(`${kind}: the composition's compiledGeglu off: spelled-out GeGLU, the same bits as the frozen graph's per-call MLX_BUN_COMPILED_GEGLU=0 read`, () => {
+      // The frozen graph reads the environment on every call; the current graph reads only its composition.
       const spelled = createRuntimeConfig({ ...runtimeConfig().values, MLX_BUN_COMPILED_GEGLU: "0" });
       withRuntimeConfig(spelled, () => {
         const { weights, config } = artifact(kind);
-        const p: Pair = { kind, old: new FrozenGemma4Model(weights, config), current: new Gemma4Model(weights, config, testComposition()) };
+        const p: Pair = { kind, old: new FrozenGemma4Model(weights, config),
+          current: new Gemma4Model(weights, config, testComposition(undefined, { compiledGeglu: false })) };
         expect(p.current.layers.every(layer => !layer.mlp.compiled && (layer.experts?.switchGlu.compiled ?? false) === false)).toBe(true);
+        // The environment key the field replaced reaches no graph.
+        expect(new Gemma4Model(weights, config, testComposition()).layers.every(layer => layer.mlp.compiled)).toBe(true);
         const oldCaches = p.old.makeCache(), newCaches = p.current.makeCache();
         try {
           both(`${kind} spelled-out geglu prefill 37`, p, oldCaches, newCaches, forwardHidden([prompt(37, 71)]));

@@ -136,7 +136,7 @@ const composition = (overrides: Partial<Composition> = {}): Composition => Objec
   device: "applegpu_g13s", aneBridge: false, kv: { kind: "bf16" }, pagedKv: null, draftDepth: { adaptive: true, max: 7 },
   prefillChunkTokens: CHUNK, adapters: false, maxRows: 8, packedMixedMlp: true,
   vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
-  grammarJump: false, greedyDraft: false, ...overrides,
+  grammarJump: false, greedyDraft: false, compiledGeglu: true, ...overrides,
 });
 
 /** The KV schemes the composition serves, as `--kv-quant` composes them (fused SDPA unset). */

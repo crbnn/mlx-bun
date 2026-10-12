@@ -66,6 +66,8 @@ export interface CompositionRequest {
   readonly grammarJump?: boolean;
   /** Speculative rows draft by argmax. Default false. */
   readonly greedyDraft?: boolean;
+  /** The GeGLU activations run the compiled closures. Default true. */
+  readonly compiledGeglu?: boolean;
   /** Compose the Neural Engine bridge where a graph builds a Neural Engine
    * operation. Default true: every Apple-silicon Mac has the unit. */
   readonly aneBridge?: boolean;
@@ -119,6 +121,7 @@ function compose(request: Omit<CompositionRequest, "kv">, kv: Composition["kv"])
     prefillTailSplit: request.prefillTailSplit ?? COMPOSITION_DEFAULTS.prefillTailSplit,
     grammarJump: request.grammarJump ?? COMPOSITION_DEFAULTS.grammarJump,
     greedyDraft: request.greedyDraft ?? COMPOSITION_DEFAULTS.greedyDraft,
+    compiledGeglu: request.compiledGeglu ?? COMPOSITION_DEFAULTS.compiledGeglu,
   });
 }
 

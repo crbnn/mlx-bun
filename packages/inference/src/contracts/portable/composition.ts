@@ -90,6 +90,10 @@ export interface Composition {
    * coupled draw (default off). The draft moves acceptance and draft cost, not
    * the output distribution (see `generation/speculative/draft-policy`). */
   readonly greedyDraft: boolean;
+  /** The GeGLU activations (and a Gemma head's logit softcap) run the compiled
+   * closures, the reference's `mx.compile`d geglu and softcap (default on); off,
+   * the spelled-out ops, which compute the same bits. */
+  readonly compiledGeglu: boolean;
 }
 
 /** The value of each composition fact a caller leaves unstated: what
@@ -104,4 +108,5 @@ export const COMPOSITION_DEFAULTS = Object.freeze({
   prefillTailSplit: true,
   grammarJump: false,
   greedyDraft: false,
+  compiledGeglu: true,
 } satisfies Partial<Composition>);
