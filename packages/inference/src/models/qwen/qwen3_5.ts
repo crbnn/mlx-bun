@@ -143,12 +143,17 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
     return out;
   }
 
+  /** Releases the mRoPE frequencies a vision forward built; the weights are its owner's. */
+  dispose(): void {
+    this.#mropeInvFreq?.dispose();
+    this.#mropeInvFreq = null;
+  }
+
   /** One cache per layer, the full-attention caches sharing one mask memo:
    * the cache the composition's KV scheme names for each attention layer
    * (`composedFullAttentionCache`). Their TurboQuant read is dense
-   * (`denseTurboQuantKernels`): this graph read TurboQuant storage decoded,
-   * through `updateAndFetch` and the fused SDPA, before its blocks read through
-   * the cache, so the TurboQuant lego keeps its served numbers. */
+   * (`denseTurboQuantKernels`): the read decodes keys and values, then runs the
+   * fused SDPA. */
   makeCache(): Cache[] {
     const masks = new AttentionMasks(), kv = this.composition.kv;
     return this.layers.map((l, layer) => (l.isLinear ? new SSMCache() : composedFullAttentionCache(kv, layer, masks, denseTurboQuantKernels)));

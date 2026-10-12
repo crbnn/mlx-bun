@@ -297,9 +297,12 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
     return out;
   }
 
+  /** Builds no constants and opens no weights: nothing to release. */
+  dispose(): void {}
+
   /** One cache per layer, sharing one mask memo. Their TurboQuant read is
-   * deferred (`deferredTurboQuantKernels`), the rotated-value sequence this
-   * graph ran after `updateAndFetchDeferredV` before it read through the cache. */
+   * deferred (`deferredTurboQuantKernels`): attention runs on the rotated
+   * values and the read un-rotates its output. */
   makeCache(): Cache[] {
     const masks = new AttentionMasks();
     return this.layers.map((_, layer) => composedFullAttentionCache(this.composition.kv, layer, masks, deferredTurboQuantKernels));

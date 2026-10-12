@@ -538,11 +538,13 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
     return out;
   }
 
+  /** Releases the rope frequency table it built (a scaled rope's); the weights are its owner's. */
+  dispose(): void { this.sharedRope.dispose(); }
+
   /** One cache per layer (a ring on a sliding layer with a window), sharing
    * one mask memo. The full-attention caches' TurboQuant read is dense
-   * (`denseTurboQuantKernels`): this graph read TurboQuant storage decoded,
-   * through `updateAndFetch`, before its blocks read through the cache (the
-   * softcapped read still fetches it that way). */
+   * (`denseTurboQuantKernels`): the read decodes keys and values first (the
+   * softcapped read attends the decoded window). */
   makeCache(): Cache[] {
     const masks = new AttentionMasks();
     const kv = this.composition.kv;
