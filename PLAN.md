@@ -1235,6 +1235,39 @@ unchanged.
       recorded synthetic hashes beside their script) and the per-lego compiled-decode test's
       timeout (5.4 s on GitHub's runner against bun's 5 s default). Still mine: the closed
       blocks of this file deleted when the final gate reports.
+- [ ] The final gate (branch `refactor/composition-final-gate` on 1aef73d0, 2026-10-12). Found
+      and fixed one defect from B4: on Gemma 4 12B, whose segmented compiled step runs the
+      delayed row caches through their ordinary decode read, a delayed `--quantized-kv-start`
+      converting during decode in the batch group left the packed ring's RoPE positions
+      unrefreshed after a compiled step (the batch group refreshed after an eager step only),
+      so from the first step past the conversion max |Δlogit| was 4.9 and the output looped
+      (affine 4, affine 8 and per-layer config; e4b's whole-graph form unaffected; library
+      `generate` unaffected). One line in `models/gemma4/compiled-decode.ts`: the segmented
+      step makes the same refresh call on the caches its eager-run layers read once the
+      step's graph is built; 12B compiled-decode 10 pass / 0 fail, every lego cell equal to
+      eager in the batch group and in `generate`, digests unchanged. B4 had run the compiled
+      cells on e4b only. Gates on 922128bb: typecheck; architecture 21/21, every rule empty;
+      drift 10/10; synthetic digests 185 on the M4 Pro; cache-contract 298; identity 16/16;
+      state 805, execution 395, models 290, kernels 120; ANE 17; root test exit 0 (inference
+      2348 pass); training natives 64/0; Gemma 2 natives 72/0; website 2777 pages;
+      verify:packages and verify:binary. Digest matrix against main 9593d881, 100 cells:
+      Llama 1B, MiniCPM5, e4b, 12B 20/20 identical each; Trellis 5/20, the 15 others owned:
+      the ANE at the 128-token override (3, equal to main with the bridge off), the four-row
+      kernels (6), turbo's generic graph (4), and 2 kv8 four-row cells where only row 0, the
+      longest prompt admitted first, moves its logprobs (up to 0.25, tokens equal; turbo's
+      four-row cells show the same row-0 pattern): being attributed by bisection across the
+      landed merges. Every parity suite at its recorded outcome (the KL table, the DFlash 2
+      blocks, the paged direct 72/72, the SSD round trip, `perplexity`, the training
+      forwards); inventories at 1/2/4/8 rows with no generic block in any decode phase;
+      `compile-ane --check` all cached. M1 Max: identity 6/6 (3480 tensors at maxDiff 0),
+      `qwen-trellis-parity` 4/4, Trellis digests 8/8 identical to main, 104 synthetic digests
+      recorded for `applegpu_g13s` so those cases check there. `sliding-grammar-fill` Llama 3B:
+      the uncancelled pair's peer equals the cancelled pair's peer only up to the cancel
+      (after it the peer decodes alone, its width class changes and the fp16 tie tips);
+      decided: the case asserts equality up to the cancel and completion after. Not run: the
+      `bench-mtp` 4-bit sweep, the four-row-against-one-row KL E2 owes, real weights for 26B,
+      DiffusionGemma and GLM. Found: the M1 Max's hub cache holds `gemma-2-2b-it-4bit`; the
+      Gemma 2 natives could run there later.
       case bisected to its first failing commit. Exit: the sweep returns nothing but
       diagnostics and history; every document names only what the tree contains; the
       architecture gate's documentation generators run clean.
