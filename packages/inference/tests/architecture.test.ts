@@ -846,7 +846,6 @@ const seamRatchet: RatchetTable = {
     "packages/training/src/kernels/flash-cce.ts": 9, // C2 for now
   },
   "cache-escape": {
-    "packages/inference/src/generation/speculative/bindings/projected-context-rows.ts": 1, // B1 (readBlock)
     "packages/inference/src/models/gemma4/model.ts": 2, // no item yet: B1 defers the segmented backward's donor checkpoints (training forward)
     "packages/inference/src/models/minicpm5/model.ts": 2, // no item yet: the training flash path and prefix-shared caches (B1 lists them out of its step)
     "packages/inference/src/scoring/full-sequence.ts": 3, // D3 (B1e reads over the deprecated members)
