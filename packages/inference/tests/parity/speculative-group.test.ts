@@ -287,6 +287,10 @@ test.skipIf(!inputs)("grouped speculation: placement, the serial producer at B1,
       expect(stats.spec!.drafted).toBeGreaterThanOrEqual(inputs!.kind === "ngram" ? 0 : stats.spec!.rounds!);
     }
     console.log(JSON.stringify({ kind: inputs!.kind, kv: inputs!.kv, start: inputs!.start, single: single.stats, batch: batch.stats }));
+    // The trajectories' digest and draft counts, for comparing trees.
+    console.log(`[spec-digest] ${JSON.stringify({ kv: inputs!.kv, start: inputs!.start, single: Bun.hash(JSON.stringify(single.tokens)).toString(16),
+      batch: Bun.hash(JSON.stringify(batch.tokens)).toString(16),
+      spec: [...single.stats, ...batch.stats].map(stat => stat.spec && [stat.spec.drafted, stat.spec.accepted, stat.spec.rounds]) })}`);
 
     // Retirement: stop, consumer failure and abort inside a four-row cohort.
     const retiring = groupOf({ held: true });
