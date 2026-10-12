@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -13,19 +13,26 @@ import type { ReadPhase } from "../../../src/models/graph";
 import type { DraftProvider } from "../../../src/generation/speculative/source";
 import type { GenerateOptions } from "../../../src/generation/index";
 import { kvStorage } from "../../../src/state/kv-storage";
-import { composeAtLayer } from "../../../src/state/persistence";
-import { KvCacheService } from "../../../src/state/cache-service";
+import type { KvCacheService } from "../../../src/state/cache-service";
 import type { PromptCache } from "../../../src/state/prefix-cache";
 
+/** State values the native suites load first: imported here, they would initialize native before the opt-in probe. */
+let stateValues: { KvCacheService: typeof KvCacheService;
+  composeAtLayer: typeof import("../../../src/state/persistence").composeAtLayer } | undefined;
+async function loadStateValues() {
+  const [{ KvCacheService }, { composeAtLayer }] =
+    await Promise.all([import("../../../src/state/cache-service"), import("../../../src/state/persistence")]);
+  stateValues = { KvCacheService, composeAtLayer };
+}
 /** The prefix store a test hands the cache service: its own take and put. */
 type PrefixStore = Pick<PromptCache, "take" | "put">;
 /** A cache service over `graph` keeping prefixes in `store`. */
 const keepingIn = (graph: ConstructorParameters<typeof KvCacheService>[0], store: PrefixStore) =>
-  new KvCacheService(graph, { prefixes: { take: store.take.bind(store), put: store.put.bind(store), reclaim() {} } as unknown as PromptCache });
+  new stateValues!.KvCacheService(graph, { prefixes: { take: store.take.bind(store), put: store.put.bind(store), reclaim() {} } as unknown as PromptCache });
 /** Stored caches handed back as the caches `graph` composes, as the cache service's clone does. */
 function composedAs(graph: { makeCache(): Cache[] }, caches: Cache[]): Cache[] {
   const prototypes = graph.makeCache();
-  try { return caches.map((cache, layer) => composeAtLayer(prototypes[layer]!, cache)); }
+  try { return caches.map((cache, layer) => stateValues!.composeAtLayer(prototypes[layer]!, cache)); }
   finally { for (const prototype of prototypes) prototype.dispose(); }
 }
 
@@ -1420,6 +1427,7 @@ test.skipIf(!native || !artifact)("a structurally equivalent delegating provider
 // plain. At a row's actual transition its pending output publishes first (it
 // may finish there), then only that row is rejected, before any shared append.
 describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
+  beforeAll(loadStateValues);
   const types = [F, S, F, S];
   // Rows that pass the transition in prefill convert for real: affine
   // quantization needs a head dimension divisible by its group size (64).
