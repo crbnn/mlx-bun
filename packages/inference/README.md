@@ -44,7 +44,7 @@ graph (`models/gemma4/compiled-decode`) and reaches them through `compiledDecode
 it drives caches through the `CompiledDecodeCache` protocol (`contracts/mlx/cache`,
 implemented by the KV caches in `state/`) and names no cache class. The loader
 keeps `Composition.compiledDecode` on only where every serial cache a row holds
-has that form (`decodesCompiled` in `state/kv-maintenance`: not TurboQuant, a
+has that form (`decodesCompiled` in `state/layout`: not TurboQuant, a
 delayed start or paged blocks); nothing asks a cache at run time.
 The architecture gate rejects concrete model imports, model-class `instanceof`,
 model-type and `architectures` checks, family predicates and model-scoped flags there,

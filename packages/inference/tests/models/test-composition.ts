@@ -6,7 +6,7 @@ import { deviceArchitecture } from "@mlx-bun/mlx/ffi";
 import { COMPOSITION_DEFAULTS, type AffineKernelChoice, type Composition, type KvStorageScheme } from "../../src/contracts/portable/composition";
 import { PREFILL_CHUNK_TOKENS } from "../../src/models/composition";
 import { KvScheme } from "../../src/state/kv-scheme";
-import { decodesCompiled } from "../../src/state/kv-maintenance";
+import { decodesCompiled } from "../../src/state/layout";
 
 export function testComposition(kv: KvStorageScheme = { kind: "bf16" }, fields: Partial<Composition> = {}): Composition {
   // Compiled decode resolves as the loader resolves it: off for storage with no compiled form.

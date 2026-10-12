@@ -11,7 +11,7 @@ import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { Cache, CompiledDecodeCache } from "../../src/contracts/mlx/cache";
-import { decodesCompiled } from "../../src/state/kv-maintenance";
+import { decodesCompiled } from "../../src/state/layout";
 import { decodeStepInputs } from "../../src/state/decode-step-inputs";
 import { BatchedKVCache } from "../../src/state/batched-kv";
 import { KVCache } from "../../src/state/kv";

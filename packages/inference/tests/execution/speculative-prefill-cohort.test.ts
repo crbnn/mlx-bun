@@ -17,7 +17,7 @@ import { runtimeConfig } from "../../src/runtime/config";
 import { cleanupFailure, disposeResources, withResource } from "../../src/runtime/resources";
 import { leaseCacheStates } from "../../src/state/leases";
 import { disposeAttachments } from "../../src/state/checkpoint";
-import { createKvMaintenance } from "../../src/state/kv-maintenance";
+import { createKvMaintenance } from "../../src/state/layout";
 import type { GenerateOptions } from "../../src/generation/index";
 import { createHash } from "node:crypto";
 import * as ops from "@mlx-bun/mlx/ops";

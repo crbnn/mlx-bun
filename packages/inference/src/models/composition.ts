@@ -8,7 +8,7 @@ import { runtimeConfig, type RuntimeConfig } from "../runtime/config";
 import { resolveKvScheme, type KvQuantOverride } from "../state/kv-scheme";
 import { PagedKVCache } from "../state/paged/cache";
 import { pagesStore } from "../state/request-policy";
-import { decodesCompiled } from "../state/kv-maintenance";
+import { decodesCompiled } from "../state/layout";
 
 /** Rows per forward when the caller states no cap (the app's `--batch` default). */
 export const DEFAULT_MAX_ROWS = 8;

@@ -3,7 +3,7 @@ import type { MlxArray } from "@mlx-bun/mlx/array";
 import { nextPrefillStep, prefillPhase } from "../contracts/portable/prefill";
 import { disposeResources, cleanupFailure } from "../runtime/resources";
 import type { Row } from "./batch-types";
-import type { KvMaintenance } from "../state/kv-maintenance";
+import type { KvMaintenance } from "../contracts/mlx/cache";
 import type { ContinuationState, RequestStateCache } from "../state/cache-service";
 import { MlxPrefillRows, type MlxPrefillForward, type MlxPrefillState } from "./prefill-rows";
 import { widthClass } from "../contracts/mlx/graph";

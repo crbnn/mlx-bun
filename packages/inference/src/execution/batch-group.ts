@@ -71,7 +71,7 @@ import { compiledDecodeStepOf, tokenPhasesOf } from "../models/capabilities";
 import type { MlxTokenGraph } from "../models/graph";
 import { runtimeConfig,withRuntimeConfig,type RuntimeConfig } from "../runtime/config";
 import { independentGreedySampling } from "../sampling/index";
-import { createKvMaintenance,type KvMaintenance } from "../state/kv-maintenance";
+import { createKvMaintenance,type KvMaintenance } from "../state/layout";
 import { extractSoleRow,filterLayoutRows,ownedCacheLayout,publishRow } from "../state/layout";
 import { leaseCacheStates } from "../state/leases";
 import { cloneSingleRowState } from "../state/views";

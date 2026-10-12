@@ -111,7 +111,7 @@ function requestState(cache: A, binding: A, execution: A): A[] {
 test.skipIf(!target)("teacher-forced verification rounds on every lego's verification rows", async () => {
   const ops = await import("@mlx-bun/mlx/ops");
   const { clearCache, Dtype } = await import("@mlx-bun/mlx/ffi");
-  const { createKvMaintenance } = await import("../../src/state/kv-maintenance");
+  const { createKvMaintenance } = await import("../../src/state/layout");
   const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
   const { KvCacheService } = await import("@mlx-bun/inference/state");
   const { targetCacheLayout } = await import("../../src/state/layout");

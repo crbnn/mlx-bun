@@ -8,7 +8,7 @@ import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import { AttentionMasks } from "../../src/state/attention-read";
 import { composedFullAttentionCache } from "../../src/state/bf16-first-kv";
-import { createKvMaintenance } from "../../src/state/kv-maintenance";
+import { createKvMaintenance } from "../../src/state/layout";
 import { KvCacheService } from "../../src/state/cache-service";
 import type { PromptCache } from "../../src/state/prefix-cache";
 import type { MlxPrefixCache } from "../../src/state/checkpoint";

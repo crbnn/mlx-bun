@@ -15,7 +15,7 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import { RotatingKVCache } from "../../src/state/rotating-kv";
 import { RotatingQuantizedKVCache } from "../../src/state/rotating-quantized-kv";
-import { createKvMaintenance } from "../../src/state/kv-maintenance";
+import { createKvMaintenance } from "../../src/state/layout";
 import { captureKvAttention } from "../../src/state/kv-attention-view";
 import { disposeTriple } from "../../src/state/quantized-tensor";
 import { alignRotatingRows } from "../../src/state/rotating-kv-layout";

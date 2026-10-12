@@ -13,7 +13,7 @@ import { prefillCacheLayout } from "../state/layout";
 import { MlxStateRows } from "../state/rows";
 import type { P2RTracePhase, P2RTraceAttributes } from "../runtime/trace";
 import type { MlxForwardWork, MlxPreparationWork } from "../contracts/mlx/forward-work";
-import type { KvMaintenance } from "../state/kv-maintenance";
+import type { KvMaintenance } from "../contracts/mlx/cache";
 import { DenseKvReadError, unreadableRows } from "../state/dense-kv-reads";
 
 // Shared work is recorded on every participating request. workId identifies
