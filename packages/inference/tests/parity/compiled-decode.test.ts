@@ -259,12 +259,14 @@ for (const [family, checkpoint] of [
             const binding = bindMlxGateway(graph);
             const options = { temperature: 0, maxTokens, eosTokenIds: [] as number[] };
             const plan = binding.plan(shape, options, { checkpoints: false });
+            expect(plan.compiledDecode, name).toBe(graph === graphs[0]);
             const group = binding.createBatchGroup({ maxBatch: 1 });
             const before = CompiledDecode.stepsExecuted, out: number[] = [];
             try {
-              await group.submit({ method: binding.methodRequest!(plan, options)!,
-                statePolicy: binding.statePolicy?.(plan, options, prompt.length + maxTokens), compiledDecode: plan.compiledDecode,
-                promptIds: prompt, maxTokens, eosTokenIds: [], onToken(token: number) { out.push(token); } });
+              await group.submit({ statePolicy: binding.statePolicy?.(plan, options, prompt.length + maxTokens),
+                compiledDecode: plan.compiledDecode, promptIds: prompt, maxTokens, eosTokenIds: [],
+                sample: (logits: MlxArray) => mlx.ops.argmaxAxis(logits, -1),
+                onToken(token: number) { out.push(token); } });
             } finally { await group.close(); }
             if (graph === graphs[0]) groupSteps = CompiledDecode.stepsExecuted - before;
             served.push(out);
