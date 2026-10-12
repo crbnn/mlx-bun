@@ -388,8 +388,8 @@ export async function probeServer(hostname: string, port: number, timeoutMs = 15
 
 export interface ServeDependencies {
   resolve: typeof resolveModelAuto;
-  /** The Neural Engine install step when this version has not run it on this machine (the app's first launch),
-   * before the chat model loads (`ensureAneInstall`). */
+  /** The startup step, every launch before the chat model loads: compile any Neural Engine program the system
+   * cache lacks (`ensureAneInstall`). */
   installAne(): Promise<void>;
   start: typeof startModelServer;
   startTranscription: typeof startTranscriptionServer;

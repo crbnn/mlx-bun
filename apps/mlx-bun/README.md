@@ -1306,7 +1306,11 @@ temporary home, then upgrades once. It checks the actual CLI and managed child p
 web, memory, synthetic registry/fit, native path resolution, microphone helper
 help, and Photon initialization in the relocated, installed, and retained
 previous bundles.
-The default performs no MLX/GPU operation or remote download. Mac CI runs this check.
+The default runs no model and makes no remote download. Each install ends with
+the installed executable's Neural Engine install step (`mlx-bun compile-ane`),
+which the check requires to run: it compiles this Mac's programs or reports none
+to compile, and where the Neural Engine cannot compile (a virtual machine) the
+installer warns and keeps the installation. Mac CI runs this check.
 With exclusive GPU access, `bun run verify:binary --model /path/to/cached-model`
 also starts the actual relocated executable, checks its web assets, `/stats`,
 `/fit`, and a chat completion, then requires a clean SIGTERM exit. It discovers
@@ -1356,7 +1360,7 @@ app-root and `current` ownership), without network access.
 `bun scripts/prepare-release.ts prepare /new/output/directory` builds from staged
 natives, checks the executable against the app manifest version, packs workspace
 packages, and writes unsigned local archives, checksums, and a Homebrew formula.
-It then runs the `verify:binary` acceptance (CPU only) on the unsigned archive
+It then runs the model-free `verify:binary` acceptance on the unsigned archive
 and requires unchanged bundle hashes afterwards; a failure removes `unsigned/`
 and writes no `preparation.json`.
 `preparation.json` records bundle hashes, dependency-first package publication

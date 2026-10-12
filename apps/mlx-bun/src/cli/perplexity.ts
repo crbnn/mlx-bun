@@ -41,7 +41,7 @@ export async function runPerplexity(parsed: CommandArgs): Promise<void> {
   }
   modelDir = resolve(modelDir);
 
-  // The app's first launch of this version runs the Neural Engine install step before the model loads.
+  // The startup step: compile any Neural Engine program the system cache lacks before the model loads.
   await (await import("./ane-install")).ensureAneInstall();
   const { banner, step, box, style } = await import("./terminal");
   banner(pkg.version);

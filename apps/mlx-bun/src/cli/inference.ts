@@ -59,7 +59,7 @@ export interface InferenceDependencies {
 const defaults: InferenceDependencies = {
   resolve: resolveInferenceModel,
   async load(model, maxTokens, composition) {
-    // The app's first launch of this version runs the Neural Engine install step before the model loads.
+    // The startup step: compile any Neural Engine program the system cache lacks before the model loads.
     await (await import("./ane-install")).ensureAneInstall();
     const { loadContext } = await import("../engine/model-host");
     // One-shot commands run one row (the engine below has capacity 1).

@@ -24,7 +24,6 @@ const LAYOUT = {
   skills: "skills",
   logs: "logs",
   credentials: "hf.json",
-  aneInstall: "cache/ane-install.json", // the app version whose Neural Engine install step ran here (cli/ane-install.ts)
 } as const;
 export type StorageEntry = keyof typeof LAYOUT;
 

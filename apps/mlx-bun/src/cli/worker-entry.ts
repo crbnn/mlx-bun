@@ -236,8 +236,8 @@ async function runAppWorker(launch: AppWorkerLaunch, args: CommandArgs, ports: W
     try {
       app = await runServe(args, {
         ...(supplied.resolve ? { resolve: supplied.resolve } : {}), ...(supplied.log ? { log: supplied.log } : {}),
-        // A worker serves: the Neural Engine install step belongs to the launch that installs (`mlx-bun compile-ane`,
-        // which the CLI's first launch runs), never to the serving process.
+        // A worker serves: the Neural Engine install step belongs to the process that launched it (the CLI runs
+        // `mlx-bun compile-ane --quiet` before every model load), never to the serving process.
         installAne: async () => {},
         start: (model, options) => start(model, options, { ...socket(model, true), link }),
         startTranscription: (model, options) => startTranscription(model, options, socket(model, false)),

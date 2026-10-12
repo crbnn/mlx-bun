@@ -315,7 +315,7 @@ test("production CLI composition requests optional templates and a continuous en
     const context = { modelId: "test", model: { config: {} }, template: null, kvConfig: null,
       tokenizer: { encode: (text, special) => { assert.equal(text, "hello"); assert.equal(special, true); return [1]; },
         decode: (ids, special) => { assert.deepEqual(ids, [2]); assert.equal(special, true); return "answer"; } } };
-    // The first launch's Neural Engine install step runs before every model load (it skips itself once recorded).
+    // The Neural Engine startup step runs before every model load.
     mock.module(app + "src/cli/ane-install.ts", () => ({ ensureAneInstall: async () => { installs++; assert.equal(installs, loaded + 1); } }));
     mock.module(app + "src/engine/model-host.ts", () => ({ loadContext: async (path, id, options) => {
       loaded++; assert.equal(path, "/unused"); assert.equal(id, "test");
