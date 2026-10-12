@@ -593,6 +593,19 @@ Trellis row kernels for their width, shown by the op inventory diagnostic, with 
 entered; a request's output across batch widths satisfies the bit-stability decision above;
 paired batched-lane benchmark records the gain at one and four rows.
 
+Baseline for that benchmark (2026-10-11, M4 Pro, the ladder's command: the Trellis artifact,
+`--kv-quant 4`, the DFlash 2 drafter, `--num-draft-tokens adaptive`; six chat prompts × two
+reps, greedy, 256 tokens, HTTP, medians; main and the integration head alternated, one server
+at a time): decode main 29.16 / 30.54 tok/s, d71467c4 29.40 / 28.95 tok/s (rounds 1 / 2);
+time to first token in the quiet round 183 / 176 ms at about 100-token prompts. Equal within
+the per-prompt spread (20–41 tok/s on both). Two things the reproduction found: on main the
+DFlash 2 provider needs `MLX_BUN_DFLASH2_TARGET_BASIS` pointing at the basis JSON on the M1 Max
+share, otherwise the drafter runs unrotated and decode is plain (10.8 tok/s with the drafter
+bound; the integration head declares the basis from the artifact's sidecar, E4); and the
+repo's paired serve benchmark (`scripts/bench/plan.ts`) has no DFlash 2 / adaptive
+configuration, so this was measured with a harness outside the repo. F's perf item adds that
+configuration so the served composition is what the check measures.
+
 #### E3. App
 
 - [x] `--kv-quant` composes the cache lego before the model loads. D1 measured why this cannot
