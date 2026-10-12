@@ -8,7 +8,10 @@ import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import { AttentionMasks } from "../../src/state/attention-read";
 import { composedFullAttentionCache } from "../../src/state/bf16-first-kv";
-import { createKvMaintenance } from "../../src/state/kv-maintenance";
+import { createKvMaintenance } from "../../src/state/layout";
+import { KvCacheService } from "../../src/state/cache-service";
+import type { PromptCache } from "../../src/state/prefix-cache";
+import type { MlxPrefixCache } from "../../src/state/checkpoint";
 import { denseTurboQuantKernels } from "../../src/state/turboquant-attention";
 import { kvOf, type KvOptions } from "../models/test-composition";
 import { leaseCacheStates } from "../../src/state/leases";
@@ -49,12 +52,14 @@ function fixture(options: KvOptions = {}, failId?: number) {
   const completed = new Map<number, ReturnType<typeof encoded>>();
   const snapshots = new Map<number, ReturnType<typeof encoded>>();
   const rejected: unknown[] = [], shapes: number[][] = [], input: number[][][] = [], kinds: string[][] = [];
-  const model = { makeCache: () => composedCaches(options) } as unknown as RuntimeModel;
-  const cohort = new MlxPrefillCohort({ model, chunkSize: 5, tailSplit: true,
+  const model = { makeCache: () => composedCaches(options), config: {} } as unknown as RuntimeModel;
+  // The cache service's prefix store: a test may replace `take`.
+  const prefixes: Required<Pick<MlxPrefixCache, "take" | "put" | "reclaim">> = { take: () => null, reclaim() {}, put(tokens, cache) {
+    snapshots.set(tokens[0]!, encoded(cache)); dispose(cache);
+  } };
+  const cohort = new MlxPrefillCohort({ chunkSize: 5, tailSplit: true,
     maintain: createKvMaintenance(kvOf(options)),
-    promptCache: { take: () => null, put(tokens, cache) {
-      snapshots.set(tokens[0]!, encoded(cache)); dispose(cache);
-    } },
+    cache: new KvCacheService(model, { prefixes: prefixes as unknown as PromptCache }),
     async forward(ids, caches) {
       const [batch, count] = ids.shape as [number, number], tokens = [...ids.toIntTokens()];
       shapes.push([...ids.shape]); kinds.push(caches.map(cache => cache.constructor.name));
@@ -75,7 +80,7 @@ function fixture(options: KvOptions = {}, failId?: number) {
     },
     reject(_row, error) { rejected.push(error); },
   });
-  return { cohort, completed, snapshots, rejected, shapes, input, kinds };
+  return { cohort, prefixes, completed, snapshots, rejected, shapes, input, kinds };
 }
 async function drain(cohort: MlxPrefillCohort) {
   for (let step = 0; step < 100; step++) if (await cohort.advance()) return;
@@ -201,7 +206,7 @@ test("a restored late arrival releases its backing lease after admission and pre
   let releases = 0;
   using ids = ops.fromInt32(request.req.promptIds.slice(0, 3), [1, 3]);
   const hidden = await f.cohort.host.forward(ids, restored, { phase: "tail", sequences: 1, tokens: 3 }); hidden.dispose();
-  f.cohort.host.promptCache!.take = tokens => tokens[0] === 2000
+  f.prefixes.take = tokens => tokens[0] === 2000
     ? { tokens: request.req.promptIds.slice(0, 3), caches: restored, retain: () => { releases++; } } : null;
   try {
     f.cohort.admit(row(1, 18, 5)); expect(await f.cohort.advance()).toBe(false);
@@ -220,8 +225,8 @@ test("a restored late arrival releases its backing lease after admission and pre
 
 test.each(schemes.filter(([name]) => name.endsWith("delayed")))(
   "a restored prefix converted inside the append that reached its start and continues as the uncached request, alone or joining: %s", async (_name, scheme) => {
-  // The prompt cache hands back the graph's composed caches (the binding's
-  // `composeState`): the lego that stored the prefix converted inside the
+  // The cache service hands back the graph's composed caches (its clone
+  // composes them again): the lego that stored the prefix converted inside the
   // append that reached its start, so the reopened row owes no conversion.
   const request = () => row(2, 13, 3), prefix = request().req.promptIds.slice(0, 6);
   const run = async (restore: boolean, joining: boolean) => {
@@ -233,7 +238,7 @@ test.each(schemes.filter(([name]) => name.endsWith("delayed")))(
       if (restore) {
         { using ids = ops.fromInt32(prefix, [1, prefix.length]); (await f.cohort.host.forward(ids, caches, { phase: "tail", sequences: 1, tokens: prefix.length })).dispose(); }
         stored = caches.map(cache => (cache.composed?.storage() ?? cache).constructor.name);
-        f.cohort.host.promptCache!.take = tokens => {
+        f.prefixes.take = tokens => {
           if (tokens[0] !== 2000 || !owned) return null;
           owned = false; return { tokens: prefix, caches };
         };

@@ -7,6 +7,7 @@
 // never waits on a subscriber, and the libraries below the app know nothing of it.
 import type { AppEvent, EventBus } from "@mlx-bun/app-core";
 import type { GenerateStats } from "@mlx-bun/inference/generation";
+import type { KvCacheService } from "@mlx-bun/inference/state";
 import type { CompletionEngine } from "./completion";
 import type { GenerationGateway } from "./generation-gateway";
 
@@ -18,8 +19,9 @@ export interface EngineTelemetryInput {
   capacity: number;
   /** Bytes of resident weights. */
   weightsBytes: number;
-  gateway: Pick<GenerationGateway, "activeRows" | "kvBytes">;
-  promptCache: { readonly totalBytes: number; readonly maxBytes: number; readonly hits: number; readonly misses: number };
+  gateway: Pick<GenerationGateway, "activeRows">;
+  /** The loaded model's cache service: its own report of the KV it admitted and the prefixes it holds. */
+  cache: Pick<KvCacheService, "report">;
   /** Milliseconds between samples of the scheduler and caches. Default 1000. */
   intervalMs?: number;
   /** Test seams. */
@@ -54,17 +56,17 @@ export function createEngineTelemetry(input: EngineTelemetryInput): EngineTeleme
     const tokens = tokensSinceSample;
     tokensSinceSample = 0; lastSampleAt = clock();
     const active = input.gateway.activeRows, queued = Math.max(0, inflight - active);
-    const kv = input.gateway.kvBytes, cache = input.promptCache;
+    const held = input.cache.report(), kv = held.kv, cache = held.prefixes;
     const tokensPerSecond = tokens / seconds;
     // Nothing moving and nothing changed since the last sample: say nothing, so an idle server keeps its subscribers quiet.
-    const signature = [active, queued, kv.projected, kv.budget, cache.totalBytes, cache.hits, cache.misses].join(":");
+    const signature = [active, queued, kv.projectedBytes, kv.budgetBytes, cache.bytes, cache.hits, cache.misses].join(":");
     if (quiet && tokens === 0 && active === 0 && queued === 0 && signature === lastSignature) return;
     lastSignature = signature;
     publish({ type: "scheduler.sample", at, model, active, capacity, queued, tokensPerSecond });
-    publish({ type: "cache.sample", at, model, cache: "kv", bytes: kv.projected, capacityBytes: kv.budget, hits: null, misses: null });
-    publish({ type: "cache.sample", at, model, cache: "prefix", bytes: cache.totalBytes, capacityBytes: Number.isFinite(cache.maxBytes) ? cache.maxBytes : null,
+    publish({ type: "cache.sample", at, model, cache: "kv", bytes: kv.projectedBytes, capacityBytes: kv.budgetBytes, hits: null, misses: null });
+    publish({ type: "cache.sample", at, model, cache: "prefix", bytes: cache.bytes, capacityBytes: Number.isFinite(cache.maxBytes) ? cache.maxBytes : null,
       hits: cache.hits, misses: cache.misses });
-    publish({ type: "model.memory", at, model, weightsBytes: input.weightsBytes, kvBytes: kv.projected, prefixCacheBytes: cache.totalBytes });
+    publish({ type: "model.memory", at, model, weightsBytes: input.weightsBytes, kvBytes: kv.projectedBytes, prefixCacheBytes: cache.bytes });
   };
 
   const timer = timers.setInterval(() => { if (!stopped) sample(true); }, input.intervalMs ?? 1000);

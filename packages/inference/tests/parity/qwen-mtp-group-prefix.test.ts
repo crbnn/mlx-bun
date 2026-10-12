@@ -401,7 +401,7 @@ async function record(inputs: { target: string; draft: string }, directory: stri
   const { QwenMtpProvider } = await import("@mlx-bun/inference/generation/speculative");
   const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
   const { observedPhases } = await import("../models/phase-forward");
-  const { PromptCache, SsdCacheStore, TieredPromptCache, cloneKvCaches, leaseCacheStates, disposeAttachments } = await import("@mlx-bun/inference/state");
+  const { PromptCache, SsdCacheStore, TieredPromptCache, cloneKvCaches, leaseCacheStates, disposeAttachments, KvCacheService } = await import("@mlx-bun/inference/state");
   const { disposeResources } = await import("@mlx-bun/inference/execution");
   const ops = await import("@mlx-bun/mlx/ops");
   const { clearCache } = await import("@mlx-bun/mlx/ffi");
@@ -600,7 +600,9 @@ async function record(inputs: { target: string; draft: string }, directory: stri
       log = events;
       context = { lengths: requests.map(r => r.promptIds.length), prompts: requests.map(r => [...r.promptIds]), sessions: requests.map((r, q) => `${r.name}-${q}`),
         members: [], targetCaches: null, joined: false, arm: null, layouts: null };
-      const group = binding.createBatchGroup({ maxBatch: 2, promptCache: cache });
+      // `cache` is the prefix store of the group's cache service.
+      const group = binding.createBatchGroup({ maxBatch: 2,
+        cache: new KvCacheService(binding.graph, { prefixes: cache }, { runtime: binding.runtime }) });
       let settled: PromiseSettledResult<A>[];
       try {
         settled = await Promise.allSettled(requests.map((request, q) => group.submit({ method: request.method, promptIds: request.promptIds,

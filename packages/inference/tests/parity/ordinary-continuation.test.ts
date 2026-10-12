@@ -61,11 +61,11 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
   const { createModel } = await import("@mlx-bun/inference/models");
   const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
   const { createOrdinaryContinuationRequest } = await import("@mlx-bun/inference/execution");
-  const { ContinuationPersistence } = await import("@mlx-bun/inference/execution");
+  const { ContinuationPersistence, KvCacheService } = await import("@mlx-bun/inference/state");
   const { SsdCacheStore } = await import("@mlx-bun/inference/state");
   const { TwoModelProvider } = await import("../../src/generation/speculative/sources/two-model");
   const ops = await import("@mlx-bun/mlx/ops");
-  const { leaseCacheState, minimumReusableOffset, PromptCache, cloneKvCaches } = await import("@mlx-bun/inference/state");
+  const { leaseCacheState, minimumReusableOffset } = await import("@mlx-bun/inference/state");
   const { clearCache } = await import("@mlx-bun/mlx/ffi");
   const { observedPhases, phaseLogits } = await import("../models/phase-forward");
   const directory = phase === "child" ? childDirectory! : mkdtempSync(join(tmpdir(), "ordinary-continuation-"));
@@ -226,20 +226,21 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
         const namespace = useAdapter ? adapterNamespace : "";
         const activeContexts: string[][] = [];
         observer.forward = ids => { widths.push(ids.shape[0]!); activeContexts.push([...model.loraState!.active]); };
-        const group = binding.createBatchGroup({ maxBatch: batch, admissionHeld: () => held });
         const aborts = Array.from({ length: batch }, () => new AbortController());
         const captured = new Map<string, string>(), restored: number[] = [];
         let idle!: () => void;
         const idleGate = new Promise<void>(resolve => { idle = resolve; });
         const persistence = new ContinuationPersistence(store, { maxBytes: 1024 ** 3,
           runStep: async step => { await idleGate; return step(); } });
+        // The composition's cache service: generation checkpoints in `store` every 4 tokens; no prefix store.
+        const cache = new KvCacheService(binding.graph, { continuations: { store, persistence, everyTokens: 4 } },
+          { identity: "same-B-fixture", runtime: binding.runtime });
+        const group = binding.createBatchGroup({ maxBatch: batch, admissionHeld: () => held, cache });
         const outputs: number[][] = Array.from({ length: batch }, () => []);
-        const prefix = new PromptCache(1024 ** 2, null, null, cloneKvCaches);
         const requests: ReturnType<typeof createOrdinaryContinuationRequest>[] = [];
+        /** A request's row, by the checkpoint key the cache service keys it under. */
+        const rowOfKey = new Map<string, number>();
         try {
-          binding.configureContinuation!({ promptCache: prefix, checkpoints: store, checkpointEveryTokens: 4,
-            checkpointPersistence: persistence, identity: "same-B-fixture", cloneState: cloneKvCaches,
-            adapterNamespace: ids => adapters.cacheNamespace(ids) });
           const options = { ...(useAdapter ? { adapters: ["upper"] } : {}), maxTokens: 16,
             temperature: 0.7, seedWasExplicit: true, repetitionPenalty: 1.1, repetitionContextSize: 32 };
           const execution = binding.plan({ hasVision: false, hasAdapters: useAdapter, hasRepetitionPenalty: true,
@@ -251,27 +252,29 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
             expect(execution.reasons).toContain("draft-incompatible-with-request");
             expect(binding.methodRequest!(execution, options)).toBeUndefined();
           }
+          // Every checkpoint the cache service restores from `store` is checked and logged.
+          const restore = store.restore.bind(store);
+          store.restore = (entry, graph) => {
+            const loaded = restore(entry, graph);
+            if (!loaded) return loaded;
+            const row = rowOfKey.get(entry.generationCheckpoint?.key ?? "");
+            try {
+              checkSaved(loaded.caches, loaded.tokens.length);
+              const planes = loaded.caches.map(cache => { const lease = leaseCacheState(cache); try { return lease.borrow().length; } finally { lease.close(); } });
+              console.log(`[continuation-restore] ${phase} B${batch} row ${row}: ${loaded.tokens.length} tokens, offsets ` +
+                `${[...new Set(loaded.caches.map(cache => cache.offset))]}, minimum ${minimumReusableOffset(loaded.caches)}, ` +
+                `planes ${[...new Set(planes)]} over ${loaded.caches.length} caches`);
+            } catch (error) {
+              // Ownership passes to the caller only on return.
+              for (const cache of loaded.caches) cache.dispose();
+              for (const attachment of loaded.attachments ?? []) for (const tensor of attachment.tensors) tensor.dispose();
+              throw error;
+            }
+            restored.push(loaded.tokens.length);
+            return loaded;
+          };
           for (const [row, tokens] of outputs.entries()) requests.push(createOrdinaryContinuationRequest({
-            store, persistence, interval: 4, prompt,
-            restore: entry => {
-              const loaded = store.restore(entry, model);
-              if (!loaded) return loaded;
-              try {
-                checkSaved(loaded.caches, loaded.tokens.length);
-                const planes = loaded.caches.map(cache => { const lease = leaseCacheState(cache); try { return lease.borrow().length; } finally { lease.close(); } });
-                console.log(`[continuation-restore] ${phase} B${batch} row ${row}: ${loaded.tokens.length} tokens, offsets ` +
-                  `${[...new Set(loaded.caches.map(cache => cache.offset))]}, minimum ${minimumReusableOffset(loaded.caches)}, ` +
-                  `planes ${[...new Set(planes)]} over ${loaded.caches.length} caches`);
-              } catch (error) {
-                // Ownership passes to the caller only on return.
-                for (const cache of loaded.caches) cache.dispose();
-                for (const attachment of loaded.attachments ?? []) for (const tensor of attachment.tensors) tensor.dispose();
-                throw error;
-              }
-              restored.push(loaded.tokens.length);
-              return loaded;
-            },
-            options: { ...options, seed: 42 + row }, execution, identity: "same-B-fixture",
+            interval: 4, prompt, options: { ...options, seed: 42 + row }, execution,
             onToken(token) {
               tokens.push(token);
               if (interrupt && tokens.length === kv.interruptAt) {
@@ -280,9 +283,14 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
               }
             },
           }));
-          for (const [row, request] of requests.entries()) {
-            const enqueue = request.continuation.captureOwned;
-            request.continuation.captureOwned = state => {
+          const cacheNamespace = (row: number) => adapter ? namespace : `row-${row}`;
+          for (const [row, request] of requests.entries())
+            rowOfKey.set(request.continuation.key(cacheNamespace(row), "same-B-fixture"), row);
+          // Every checkpoint the scheduler offers the cache service is digested first.
+          const enqueue = cache.checkpoint.bind(cache);
+          cache.checkpoint = (request, state) => {
+            const row = requests.findIndex(item => item.continuation === request.continuation);
+            {
               const digest = new Bun.CryptoHasher("sha256");
               digest.update(JSON.stringify(state.caches.map(cache => ({ offset: cache.offset, minimum: cache.minimumReusableOffset ?? 0 }))));
               checkSaved(state.caches, state.cacheTokens.length);
@@ -294,11 +302,11 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
                 } } finally { lease.close(); }
               }
               captured.set(`row-${row}:${state.generatedTokens}`, digest.digest("hex"));
-              enqueue(state);
-            };
-          }
+              enqueue(request, state);
+            }
+          };
           const pending = requests.map((request, row) => group.submit({ ...request, promptIds: prompt,
-            cacheNamespace: adapter ? namespace : `row-${row}`, context, signal: aborts[row]!.signal, compiledDecode: false, maxTokens: 16, eosTokenIds: [] }));
+            cacheNamespace: cacheNamespace(row), context, signal: aborts[row]!.signal, compiledDecode: false, maxTokens: 16, eosTokenIds: [] }));
           held = false; group.kick();
           const results = await Promise.allSettled(pending);
           if (!interrupt) for (const result of results) if (result.status === "rejected") throw result.reason;
@@ -312,7 +320,7 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
           finally {
             observer.forward = undefined; idle();
             try { await persistence.flush(); }
-            finally { requests.forEach(request => request.dispose()); prefix.clear(); clearCache(); }
+            finally { requests.forEach(request => request.dispose()); clearCache(); }
           }
           expect(model.loraState!.active).toEqual([]);
         }

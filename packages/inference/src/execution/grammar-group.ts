@@ -55,9 +55,9 @@ class GrammarGroup implements MlxGroupedMethod {
       historyUpdate: "manual", initialHistory: row.req.promptIds });
     this.#requests.set(row, { sampling, caches: [], pending: null });
     const target = new MlxPrefillCohort({
-      model: this.model, chunkSize: this.host.prefillChunkSize,
+      chunkSize: this.host.prefillChunkSize,
       tailSplit: this.host.prefillTailSplit,
-      promptCache: this.host.promptCache, maintain: this.host.kvMaintenance, denseKvReads: this.denseKvReads,
+      cache: this.host.cache, maintain: this.host.kvMaintenance, denseKvReads: this.denseKvReads,
       forward: async (ids, caches, step) => this.#dispatch.prompt(step.phase, step.sequences, step.tokens)(ids, caches, null),
       project: (hidden, _caches, _completed, step) => {
         const [, length, width] = hidden.shape as [number, number, number];
@@ -206,9 +206,8 @@ class GrammarGroup implements MlxGroupedMethod {
       // before a final prefix can become visible to another request.
       this.#retire(row);
       row.req.signal?.throwIfAborted();
-      if (this.host.promptCache && !row.fedTainted) {
-        this.host.promptCache.put([...row.req.promptIds, ...row.fed], caches,
-          row.cacheNamespace, retain, undefined, row.req.cacheSessionId);
+      if (this.host.cache.keeps(row.req) && !row.fedTainted) {
+        this.host.cache.publish(row.req, row.cacheNamespace ?? "", [...row.req.promptIds, ...row.fed], { caches, retain });
         caches = []; retain = undefined;
       }
     } catch (error) { return cleanupFailure(error, release); }

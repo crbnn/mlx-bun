@@ -91,49 +91,49 @@ export async function createServingUnit(context: LoadedModelContext, options: Co
     // The default prompt path renders the context's template; a supplied builder replaces it.
     if (!input.buildPrompt) requireChatTemplate(context);
     const binding = await modelServingBinding(context, input.binding);
+    // The loaded model's cache service, built with its budget (`--kv-budget`, `--ssd-cache-max`).
     const caches = await createCacheServices(context, binding, { ...options.cache,
+      ...(options.kvBudgetBytes !== undefined ? { kvBudgetBytes: options.kvBudgetBytes } : {}),
       ...(shared.allocatorLimitBytes ? { allocatorLimitBytes: shared.allocatorLimitBytes } : {}),
       ...(shared.ssdBudget ? { ssdBudget: shared.ssdBudget } : {}) });
+    const cache = caches.cache;
     // The persistence result of the final flush is the close's evidence.
     let durability: DurabilityFlushResult | undefined;
     const closeCaches = async () => {
-      const result = durability = await caches.close();
+      const result = durability = await cache.close();
       if (!result.durable) console.warn(`[server] cache flush incomplete: ${result.pendingSnapshots} snapshots, ${result.pendingSpills} spills, ${result.failedSpills} failed`);
     };
     cleanup = async () => { try { await closeCaches(); } finally { releaseContext(context, input.ownership); } };
-    binding.gateway.configureContinuation?.(caches.continuationServices);
     // createAppEngine takes ownership even when its constructor rejects.
     cleanup = undefined;
     const engine = await createAppEngine(context, { capacity: options.capacity, binding, ownership: input.ownership,
-      gateway: { kvBudgetBytes: options.kvBudgetBytes,
-        checkpoints: !!(options.cache.generationCheckpointTokens && caches.checkpoints),
-        stateCodecs: caches.stateCodecs,
-        promptCache: caches.promptCache, adapterNamespace: caches.adapterNamespace },
+      gateway: { cache, adapterNamespace: caches.adapterNamespace },
       beforeModelDispose: closeCaches,
     });
     cleanup = () => engine.close();
     // The engine's events (request timings, batch and cache samples) come from one adapter around the completion engine.
     const telemetry = createEngineTelemetry({ events: shared.events, model: context.modelId, capacity: options.capacity,
-      weightsBytes: context.model.weightsBytes, gateway: engine.gateway, promptCache: caches.promptCache });
+      weightsBytes: context.model.weightsBytes, gateway: engine.gateway, cache });
     engine.completion = telemetry.observe(engine.completion);
     telemetry.sample();
     const tokenHistory = new GeneratedTokenHistory(context.tokenizer);
-    if (caches.checkpoints) for (const tokens of caches.checkpoints.tokenPrefixes()) tokenHistory.remember(tokens);
-    caches.promptCache.onPut = tokens => tokenHistory.remember(tokens);
+    for (const tokens of cache.savedPrefixes()) tokenHistory.remember(tokens);
+    cache.onPut = tokens => tokenHistory.remember(tokens);
     const admission = context.memoryPlan ?? fit(context.model.config, context.model.weightsBytes, 1,
       undefined, undefined, 0, options.memoryBudgetBytes, caches.resolvedKvScheme.fitOptions);
     const limits = resolveServingLimits(options, context.memoryPlan, admission);
-    const completions = createCompletionRoutes(engine, { ...options.request, promptCache: caches.promptCache,
+    const completions = createCompletionRoutes(engine, { ...options.request, promptCache: cache,
       ...limits, tokenHistory, responseHistory: shared.responses,
       transcription: shared.transcription,
       ...(input.buildPrompt ? { buildPrompt: input.buildPrompt } : {}),
       ...(input.defaultAdapter ? { defaultAdapter: input.defaultAdapter } : {}) });
-    const status = createStatusRoutes({ ...(input.owner ? { owner: input.owner } : {}), context, caches, gateway: engine.gateway,
+    const status = createStatusRoutes({ ...(input.owner ? { owner: input.owner } : {}), context, cache,
+      resolvedKvScheme: caches.resolvedKvScheme, gateway: engine.gateway,
       diagnostics: () => binding.diagnostics(), responseStats: completions.responseStats,
       artifact: { expertsBytes: input.artifact?.expertsBytes ?? 0, sizeBytes: input.artifact?.sizeBytes ?? null },
       capacity: options.capacity, contextLimit: limits.contextLimit, startedAt: Date.now(),
       ssdCacheDir: options.cache.ssdCacheDir, memoryBudgetBytes: options.memoryBudgetBytes });
-    const cacheAdmin = createCacheRoutes(caches);
+    const cacheAdmin = createCacheRoutes(cache);
     const adapters = createAdapterOperation(context, engine.gateway);
     const routes: RouteGroup = { handle: async request => await status.handle(request) ?? await cacheAdmin.handle(request) ?? await completions.handle(request) };
     const artifactPath = input.artifact?.path ?? context.model.config.modelDir;
@@ -144,18 +144,21 @@ export async function createServingUnit(context: LoadedModelContext, options: Co
     const unit: ServingUnit = {
       id: context.modelId, context, artifactPath, routes, gateway: engine.gateway,
       // Saved state was found for this model: a request can resume from it.
-      resumed: (caches.checkpoints?.entries ?? 0) > 0,
+      resumed: (cache.report().saved?.entries ?? 0) > 0,
       operations: ["generate", ...(binding.discovery.embeddings ? ["embed" as const] : [])],
-      bytes: () => context.memoryPlan ? context.memoryPlan.totalBytes : context.model.weightsBytes + reserve + caches.promptCache.totalBytes,
-      memory: () => ({ weightsBytes: context.model.weightsBytes, kvBytes: engine.gateway.kvBytes.projected, prefixCacheBytes: caches.promptCache.totalBytes }),
+      bytes: () => context.memoryPlan ? context.memoryPlan.totalBytes : context.model.weightsBytes + reserve + cache.report().prefixes.bytes,
+      memory: () => {
+        const held = cache.report();
+        return { weightsBytes: context.model.weightsBytes, kvBytes: held.kv.projectedBytes, prefixCacheBytes: held.prefixes.bytes };
+      },
       operationsFor: () => ({
         generate: async request => await completions.handle(request) ?? Response.json({ error: { message: "Not found" } }, { status: 404 }),
         adapters,
       }),
       pause: signal => engine.gateway.acquireExecutionLease(signal),
-      stopBackground: () => { telemetry.stop(); caches.stopIdleDemotion(); },
-      flush: () => caches.flush(),
-      stats: () => caches.stats(),
+      stopBackground: () => { telemetry.stop(); cache.stopIdleDemotion(); },
+      flush: () => cache.flush(),
+      stats: () => cache.stats(),
       // Closes the engine (admission stops, work in flight drains), then flushes and clears the caches, then releases the context.
       close: () => closing ??= (async () => {
         const started = performance.now();

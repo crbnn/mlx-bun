@@ -143,11 +143,11 @@ test("closing the app drains borrowed execution before disposing the model", asy
     promptCache: false, checkpoint: false, fill: false, compiledDecode: false,
     grammarJump: false, reasons: [] } as const;
   const supplied = { gateway: { runtime: runtimeConfig(), config: { eosTokenIds: [2] },
-    plan: () => execution,
+    plan: () => execution, reusesPrefix: () => true,
     continuationRequest(_plan: unknown, _opts: unknown, _prompt: unknown, onToken: unknown) {
       return { continuation: {}, sample() {}, plainGreedy: true, onToken, dispose() {} };
     },
-    createBatchGroup() { return { activeRows: 0, pendingRows: 0, projectedKvBytes: 0,
+    createBatchGroup() { return { activeRows: 0, pendingRows: 0,
       async submit() { entered.resolve(); await finish.promise; events.push("execution stopped");
         return { promptTokens: 1, cachedTokens: 0, generatedTokens: 1, prefillMs: 0, decodeMs: 0 }; },
       kick() {}, async close() { events.push("group closed"); },

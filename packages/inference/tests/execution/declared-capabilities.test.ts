@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { bindMlxGateway } from "../../src/execution/gateway-binding";
+import { bindMlxGateway, type MlxGatewayBinding } from "../../src/execution/gateway-binding";
+import { KvCacheService } from "../../src/state/cache-service";
 import { declareGraph, ORDINARY_VERIFICATION } from "../../src/models/capabilities";
 import type { RuntimeModel } from "../../src/models/factory";
 import { createRuntimeConfig, withRuntimeConfig } from "../../src/runtime/config";
@@ -54,15 +55,18 @@ describe("placement follows the graph's declarations", () => {
     // Paging is the composition's, not the graph's: any graph's plain full-attention storage pages, and
     // requests are planned exactly as without it.
     const paged = bind(replacement({}, { composition: testComposition(undefined, { pagedKv: { blockSize: 16 } }) }));
+    // The cache service builds every request's state from the composition: paged pages, unpaged plain storage.
+    const fresh = (binding: MlxGatewayBinding, reusesPrefix: boolean) => {
+      const cache = new KvCacheService(binding.graph), row = { promptIds: [1, 2], maxTokens: 62, reusesPrefix };
+      const { caches } = cache.acquire(row, "");
+      try { return caches.map(state => state.signature()); } finally { for (const state of caches) state.dispose(); cache.release(row, false); }
+    };
     for (const request of [shape, { ...shape, hasAdapters: true }, { ...shape, hasGrammar: true }]) {
       const plan = paged.plan(request, {}, schedule);
       expect(placement(plan)).toEqual(placement(bind(replacement()).plan(request, {}, schedule)));
-      const state = paged.statePolicy!(plan, {}, 64)!;
-      const caches = state.create();
-      try { expect(caches.map(cache => cache.signature())).toEqual(["kv:paged"]); }
-      finally { for (const cache of caches) cache.dispose(); }
+      expect(fresh(paged, paged.reusesPrefix(plan))).toEqual(["kv:paged"]);
     }
-    expect(bind(replacement()).statePolicy!(bind(replacement()).plan(shape, {}, schedule), {}, 64)).toBeUndefined();
+    expect(fresh(bind(replacement()), true)).toEqual(["kv:plain"]);
     const unadapted = bind(replacement({ adapters: { batched: false } }));
     expect(refusals(unadapted.plan({ ...shape, hasAdapters: true }, {}, schedule))).toEqual(["adapter-batch-unsupported"]);
     expect(unadapted.bindAdapterContext).toBeUndefined();

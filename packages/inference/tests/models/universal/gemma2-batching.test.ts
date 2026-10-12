@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -13,6 +13,28 @@ import type { ReadPhase } from "../../../src/models/graph";
 import type { DraftProvider } from "../../../src/generation/speculative/source";
 import type { GenerateOptions } from "../../../src/generation/index";
 import { kvStorage } from "../../../src/state/kv-storage";
+import type { KvCacheService } from "../../../src/state/cache-service";
+import type { PromptCache } from "../../../src/state/prefix-cache";
+
+/** State values the native suites load first: imported here, they would initialize native before the opt-in probe. */
+let stateValues: { KvCacheService: typeof KvCacheService;
+  composeAtLayer: typeof import("../../../src/state/persistence").composeAtLayer } | undefined;
+async function loadStateValues() {
+  const [{ KvCacheService }, { composeAtLayer }] =
+    await Promise.all([import("../../../src/state/cache-service"), import("../../../src/state/persistence")]);
+  stateValues = { KvCacheService, composeAtLayer };
+}
+/** The prefix store a test hands the cache service: its own take and put. */
+type PrefixStore = Pick<PromptCache, "take" | "put">;
+/** A cache service over `graph` keeping prefixes in `store`. */
+const keepingIn = (graph: ConstructorParameters<typeof KvCacheService>[0], store: PrefixStore) =>
+  new stateValues!.KvCacheService(graph, { prefixes: { take: store.take.bind(store), put: store.put.bind(store), reclaim() {} } as unknown as PromptCache });
+/** Stored caches handed back as the caches `graph` composes, as the cache service's clone does. */
+function composedAs(graph: { makeCache(): Cache[] }, caches: Cache[]): Cache[] {
+  const prototypes = graph.makeCache();
+  try { return caches.map((cache, layer) => stateValues!.composeAtLayer(prototypes[layer]!, cache)); }
+  finally { for (const prototype of prototypes) prototype.dispose(); }
+}
 
 // Native numerical tests are explicit: CPU-only planning/CI never initializes
 // model tensors. All synthetic weights exist in memory, not tracked fixtures.
@@ -1405,13 +1427,14 @@ test.skipIf(!native || !artifact)("a structurally equivalent delegating provider
 // plain. At a row's actual transition its pending output publishes first (it
 // may finish there), then only that row is rejected, before any shared append.
 describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
+  beforeAll(loadStateValues);
   const types = [F, S, F, S];
   // Rows that pass the transition in prefill convert for real: affine
   // quantization needs a head dimension divisible by its group size (64).
   const HEAD_DIM = 64;
   type End = { stopAfter?: number; cancelAfter?: number; eos?: number[] };
   type SetupOptions = { tailSplit?: boolean; chunk?: number; pipeline?: boolean; turbo?: boolean;
-    promptCache?: import("../../../src/execution/batch-types").RowPromptCache; grammarJump?: boolean;
+    promptCache?: PrefixStore; grammarJump?: boolean;
     kvScheme?: ReturnType<typeof resolveKvScheme>; encoded?: boolean; direct?: boolean };
   /** The Gemma2-style mixed graph; without manual softcap attention it reads encoded KV. */
   const setup = async (start: number | null, options: SetupOptions = {}) => setupWith(composition => {
@@ -1440,7 +1463,7 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
     const binding = bindMlxGateway(view);
     let held = false;
     const groupOptions = { maxBatch: 2, prefillChunkSize: options.chunk ?? 64, admissionHeld: () => held,
-      ...(options.promptCache ? { promptCache: options.promptCache } : {}),
+      ...(options.promptCache ? { cache: keepingIn(view, options.promptCache) } : {}),
       // Compiled decode stays at its default: these graphs bind none (below).
       runtime: createRuntimeConfig(options.pipeline === false ? { MLX_BUN_BATCH_NO_PIPELINE: "1" } : {}) };
     // Composed directly, the group binds the graph's own declaration and composition.
@@ -1824,10 +1847,10 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
   });
 
   test("a checkpoint before the transition restores exactly in a fresh group: alone it repeats the control byte for byte; beside a sibling it equals plain KV resumed the same way", async () => {
-    const { bindMlxGateway, createRuntimeConfig, createOrdinaryContinuationRequest, ContinuationPersistence, createRowSampling } =
+    const { bindMlxGateway, createRuntimeConfig, createOrdinaryContinuationRequest, createRowSampling } =
       await import("../../../src/execution");
     const { makeStepSampler } = await import("../../../src/sampling");
-    const { SsdCacheStore, PromptCache, cloneKvCaches, leaseCacheState } = await import("../../../src/state");
+    const { SsdCacheStore, ContinuationPersistence, KvCacheService, cloneKvCaches, leaseCacheState } = await import("../../../src/state");
     const plain = await setup(null);
     const soloA = await plain.submit(A, 8);
     await plain.close();
@@ -1846,23 +1869,24 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
       // A fresh store indexes the durable records it finds, as a restarted server does.
       const scanned = store.scan();
       const persistence = new ContinuationPersistence(store, { maxBytes: 1 << 30 });
-      const prefix = new PromptCache(1 << 20, null, null, cloneKvCaches);
-      binding.configureContinuation!({ promptCache: prefix, checkpoints: store, checkpointEveryTokens: 2,
-        checkpointPersistence: persistence, identity: "plain-kv", cloneState: cloneKvCaches, adapterNamespace: () => "" });
+      const tokens: number[] = [], restored: number[] = [], captured = new Map<number, string>(), abort = new AbortController();
+      const converted = new Map<number, string>();
+      // Every checkpoint the cache service restores is counted.
+      const restore = store.restore.bind(store);
+      store.restore = (entry, graph) => { const loaded = restore(entry, graph); if (loaded) restored.push(loaded.tokens.length); return loaded; };
+      // The composition's cache service: generation checkpoints in `store` every 2 tokens; no prefix store.
+      const cache = new KvCacheService(binding.graph, { continuations: { store, persistence, everyTokens: 2 } }, { identity: "plain-kv" });
       let held = true;
-      const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: 64, ...(kv ? { kvScheme: kv } : {}), admissionHeld: () => held,
-        runtime: createRuntimeConfig({}) });
+      const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: 64, admissionHeld: () => held,
+        runtime: createRuntimeConfig({}), cache });
       const options = { maxTokens: 8, temperature: 0 };
       const execution = binding.plan(shape, options,
         { checkpoints: true });
       expect(execution).toMatchObject({ method: "autoregressive", mechanism: "continuous", checkpoint: true });
-      const tokens: number[] = [], restored: number[] = [], captured = new Map<number, string>(), abort = new AbortController();
-      const converted = new Map<number, string>();
-      const request = createOrdinaryContinuationRequest({ store, persistence, interval: 2, prompt: A, options, execution, identity: "plain-kv",
-        restore: entry => { const loaded = store.restore(entry, model); if (loaded) restored.push(loaded.tokens.length); return loaded; },
+      const request = createOrdinaryContinuationRequest({ interval: 2, prompt: A, options, execution,
         onToken(token) { tokens.push(token); if (tokens.length === interruptAt) abort.abort(new DOMException("interrupted", "AbortError")); } });
-      const enqueue = request.continuation.captureOwned;
-      request.continuation.captureOwned = state => {
+      const enqueue = cache.checkpoint.bind(cache);
+      cache.checkpoint = (row, state) => {
         const digestOf = (caches: Cache[]) => {
           const digest = new Bun.CryptoHasher("sha256");
           digest.update(JSON.stringify([state.pendingToken, state.cacheTokens]));
@@ -1874,10 +1898,10 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
         };
         captured.set(state.generatedTokens, digestOf(state.caches));
         if (!kv) {
-          const composed = schemeBinding.composeState(cloneKvCaches(state.caches));
+          const composed = composedAs(schemeBinding.graph, cloneKvCaches(state.caches));
           try { converted.set(state.generatedTokens, digestOf(composed)); } finally { dispose(composed); }
         }
-        enqueue(state);
+        enqueue(row, state);
       };
       const siblingTokens: number[] = [];
       const siblingSampling = sibling ? createRowSampling(makeStepSampler({ temperature: 0 }, { tokenRepresentation: "device",
@@ -1894,7 +1918,7 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
           sibling: b ? { tokens: siblingTokens, outcome: siblingOutcome } : undefined };
       } finally {
         try { await group.close(); } finally {
-          try { await persistence.flush(); } finally { request.dispose(); siblingSampling?.dispose(); prefix.clear(); f.dispose(); }
+          try { await persistence.flush(); } finally { request.dispose(); siblingSampling?.dispose(); f.dispose(); }
         }
       }
     };
@@ -2016,9 +2040,9 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
     });
 
     test("a TurboQuant checkpoint restores exactly in a fresh group and repeats the control", async () => {
-      const { bindMlxGateway, createRuntimeConfig, createOrdinaryContinuationRequest, ContinuationPersistence } =
+      const { bindMlxGateway, createRuntimeConfig, createOrdinaryContinuationRequest } =
         await import("../../../src/execution");
-      const { SsdCacheStore, PromptCache, cloneKvCaches, leaseCacheState } = await import("../../../src/state");
+      const { SsdCacheStore, ContinuationPersistence, KvCacheService, leaseCacheState } = await import("../../../src/state");
       const directory = await mkdtemp(join(tmpdir(), "turbo-continuation-"));
       const scheme = resolveKvScheme({ turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: 0 });
       const run = async (name: string, interruptAt?: number) => {
@@ -2028,22 +2052,23 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
           configFingerprint: `turbo-continuation:${scheme.cacheKey}`, tokenizerHash: "fixture", verify: true });
         const scanned = store.scan();
         const persistence = new ContinuationPersistence(store, { maxBytes: 1 << 30 });
-        const prefix = new PromptCache(1 << 20, null, null, cloneKvCaches);
-        binding.configureContinuation!({ promptCache: prefix, checkpoints: store, checkpointEveryTokens: 2,
-          checkpointPersistence: persistence, identity: "turbo", cloneState: cloneKvCaches, adapterNamespace: () => "" });
+        const tokens: number[] = [], restored: number[] = [], captured = new Map<number, string>(), abort = new AbortController();
+        // Every checkpoint the cache service restores is counted.
+        const restore = store.restore.bind(store);
+        store.restore = (entry, graph) => { const loaded = restore(entry, graph); if (loaded) restored.push(loaded.tokens.length); return loaded; };
+        // The composition's cache service: generation checkpoints in `store` every 2 tokens; no prefix store.
+        const cache = new KvCacheService(binding.graph, { continuations: { store, persistence, everyTokens: 2 } }, { identity: "turbo" });
         let held = true;
         const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: 64, admissionHeld: () => held,
-          runtime: createRuntimeConfig({}) });
+          runtime: createRuntimeConfig({}), cache });
         const options = { maxTokens: 8, temperature: 0 };
         const execution = binding.plan(shape, options,
           { checkpoints: true });
         expect(execution).toMatchObject({ method: "autoregressive", mechanism: "continuous", checkpoint: true });
-        const tokens: number[] = [], restored: number[] = [], captured = new Map<number, string>(), abort = new AbortController();
-        const request = createOrdinaryContinuationRequest({ store, persistence, interval: 2, prompt: A, options, execution, identity: "turbo",
-          restore: entry => { const loaded = store.restore(entry, model); if (loaded) restored.push(loaded.tokens.length); return loaded; },
+        const request = createOrdinaryContinuationRequest({ interval: 2, prompt: A, options, execution,
           onToken(token) { tokens.push(token); if (tokens.length === interruptAt) abort.abort(new DOMException("interrupted", "AbortError")); } });
-        const enqueue = request.continuation.captureOwned;
-        request.continuation.captureOwned = state => {
+        const enqueue = cache.checkpoint.bind(cache);
+        cache.checkpoint = (row, state) => {
           const digest = new Bun.CryptoHasher("sha256");
           digest.update(JSON.stringify([state.pendingToken, state.cacheTokens, state.caches.map(storageKind)]));
           for (const cache of state.caches) {
@@ -2051,7 +2076,7 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
             try { for (const plane of lease.borrow()) { using exact = ops.contiguous(plane); digest.update(exact.rawBytes()); } } finally { lease.close(); }
           }
           captured.set(state.generatedTokens, digest.digest("hex"));
-          enqueue(state);
+          enqueue(row, state);
         };
         try {
           const outcome = group.submit({ ...request, promptIds: A, cacheNamespace: "a", signal: abort.signal, maxTokens: 8, eosTokenIds: [] })
@@ -2060,7 +2085,7 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
           return { tokens, outcome: await outcome, scanned, restored, captured };
         } finally {
           try { await group.close(); } finally {
-            try { await persistence.flush(); } finally { request.dispose(); prefix.clear(); f.dispose(); }
+            try { await persistence.flush(); } finally { request.dispose(); f.dispose(); }
           }
         }
       };
@@ -2172,7 +2197,7 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
           expect(reference!.tokens).toEqual(committed);
           const restored = state(reference!.caches);
           // Handed back as the caches the graph composes, as the suffix append reads them.
-          composed = env.binding.composeState(reference!.caches);
+          composed = composedAs(env.binding.graph, reference!.caches);
           const expectedKinds = types.map(type => type === F ? "TurboQuantKVCache" : "RotatingKVCache");
           expect(composed.map(storageKind)).toEqual(expectedKinds);
           let expectedProjection: Projection, expectedToken: number;
@@ -2461,7 +2486,7 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
         expect(reference!.tokens).toEqual(committed);
         expect(reference!.caches.map(storageKind)).toEqual(convertedKinds);
         // Handed back as the caches the graph composes, as the suffix forward reads them.
-        composed = env.binding.composeState(reference!.caches);
+        composed = composedAs(env.binding.graph, reference!.caches);
         const expected = await directSpansFrom(env.model, composed, prompt, committed.length, 6, [[21, 22]],
           { encoded: true, sampling: penalty });
         expect(expected.refused).toBe(false);
@@ -2575,12 +2600,12 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
 
     /** The gateway's span method over a fresh MiniCPM5 graph; the environment owns the graph. */
     const miniCpmEnv = async (kvScheme: ReturnType<typeof resolveKvScheme>,
-      promptCache?: import("../../../src/execution/batch-types").RowPromptCache) => {
+      promptCache?: PrefixStore) => {
       const { bindMlxGateway, createRuntimeConfig } = await import("../../../src/execution");
       const graph = await miniCpm(kvScheme);
       const { view, forwardHooks } = hooked(graph.model);
       const binding = bindMlxGateway(view);
-      const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: 64, ...(promptCache ? { promptCache } : {}),
+      const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: 64, ...(promptCache ? { cache: keepingIn(view, promptCache) } : {}),
         runtime: createRuntimeConfig({}) });
       return { binding, model: graph.model, view, kvScheme, group, forwardHooks, async close() {
         try { await group.close(); expect(group.activeRows + group.pendingRows).toBe(0); } finally { graph.dispose(); }
@@ -2638,7 +2663,7 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
         expect(reference!.tokens).toEqual(committed);
         expect(reference!.caches.map(storageKind)).toEqual(["QuantizedKVCache", "QuantizedKVCache"]);
         // Handed back as the caches the graph composes, as the suffix forward reads them.
-        composed = env.binding.composeState(reference!.caches);
+        composed = composedAs(env.binding.graph, reference!.caches);
         const expected = await directSpansFrom(env.model, composed, prompt, committed.length, 6, [[21, 22]],
           { encoded: true, sampling: penalty });
         expect(expected.refused).toBe(false);

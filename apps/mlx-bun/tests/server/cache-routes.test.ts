@@ -1,14 +1,16 @@
 import { expect, test } from "bun:test";
-import { createCacheRoutes } from "../../src/server/cache-routes";
+import { createCacheRoutes, type CacheRouteServices } from "../../src/server/cache-routes";
 
 const zero = { pendingSnapshots: 0, pendingSpills: 0, pendingSpillBytes: 0, droppedSpills: 0, failedSpills: 0 };
 const durable = { ...zero, durable: true, flushedSnapshots: 1, missingSnapshots: 0, elapsedMs: 3 };
 const post = (path: string, body?: BodyInit) => new Request(`http://local${path}`, { method: "POST", body });
 
+/** The routes over a cache service whose report holds saved state (`disk`) or none. */
 function fixture(flush: () => Promise<typeof durable> = async () => durable, disk = true) {
   const closed: string[] = [];
-  const routes = createCacheRoutes({ promptCache: { closeSession: id => { closed.push(id); } }, flush,
-    checkpoints: disk ? { entries: 2, longestDurablePrefixTokens: 16_384 } : null });
+  const saved = { entries: 2, bytes: 0, maxBytes: Infinity, restores: 0, spills: 0, restoreMsLast: 0, longestDurablePrefixTokens: 16_384 };
+  const routes = createCacheRoutes({ closeSession: id => { closed.push(id); }, flush,
+    report: () => ({ saved: disk ? saved : null }) as ReturnType<CacheRouteServices["report"]> });
   return { routes, closed };
 }
 

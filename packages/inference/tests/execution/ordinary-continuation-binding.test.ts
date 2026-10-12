@@ -7,12 +7,15 @@ import type { GenerateOptions } from "../../src/generation";
 import type { ResolvedExecution } from "../../src/contracts/portable/execution";
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
 import { KVCache } from "../../src/state/kv";
-import type { ContinuationServices, ContinuationStore } from "../../src/execution/continuation";
-import { ContinuationPersistence } from "../../src/execution/continuation-persistence";
+import { KvCacheService } from "../../src/state/cache-service";
+import { ContinuationPersistence, type ContinuationStore } from "../../src/state/continuation-persistence";
+import { pagedPrefixNamespace } from "../../src/state/request-policy";
 import { kvOf, testComposition, type KvOptions } from "../models/test-composition";
 
 const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
   hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
+/** The cache service keeps generation checkpoints, or keeps none. */
+const schedule = { checkpoints: true }, unscheduled = { checkpoints: false };
 
 for (const [name, prototype] of [["gemma4", Gemma4Model.prototype], ["qwen3_5", Qwen35Model.prototype]] as const) {
 test(`ordinary shared continuation binds ${name} through its loaded backend`, () => {
@@ -23,20 +26,17 @@ test(`ordinary shared continuation binds ${name} through its loaded backend`, ()
   }) as Gemma4Model;
   const model = make();
   const binding = bindMlxGateway(model);
-  const unconfigured = bindMlxGateway(model);
-  const schedule = { checkpoints: true };
-  expect(binding.plan(shape, {}, schedule).checkpoint).toBe(false);
-  binding.configureContinuation!({ checkpointPersistence: {}, checkpoints: {}, checkpointEveryTokens: 4 } as ContinuationServices);
+  expect(binding.plan(shape, {}, unscheduled).checkpoint).toBe(false);
   expect(binding.plan(shape, {}, schedule)).toMatchObject({ mechanism: "continuous", checkpoint: true });
   const adapterShape = { ...shape, hasAdapters: true };
   expect(binding.plan(adapterShape, { adapters: ["upper"] }, schedule)).toMatchObject({
     method: "autoregressive", mechanism: "continuous", checkpoint: true,
   });
-  expect(unconfigured.plan(adapterShape, { adapters: ["upper"] }, schedule).checkpoint).toBe(false);
+  expect(binding.plan(adapterShape, { adapters: ["upper"] }, unscheduled).checkpoint).toBe(false);
   for (const excluded of [{ hasDraft: true }, { hasGrammar: true },
     { wantsLogprobs: true }]) {
     const request = { ...shape, ...excluded };
-    const baseline = unconfigured.plan(request, {}, schedule);
+    const baseline = binding.plan(request, {}, unscheduled);
     const plan = binding.plan(request, {}, schedule);
     expect(plan.checkpoint).toBe(false);
     expect(plan.method).toBe(baseline.method);
@@ -47,8 +47,7 @@ test(`ordinary shared continuation binds ${name} through its loaded backend`, ()
     { turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: 14 },
     { kvConfig: [{ layerIdx: 0, bits: 4, groupSize: 64 }], quantizedKvStart: 14 }] as KvOptions[]) {
     const composed = bindMlxGateway(make(options));
-    expect(bindMlxGateway(make(options)).plan(shape, {}, schedule).checkpoint).toBe(false);
-    composed.configureContinuation!({ checkpointPersistence: {}, checkpoints: {}, checkpointEveryTokens: 4 } as ContinuationServices);
+    expect(composed.plan(shape, {}, unscheduled).checkpoint).toBe(false);
     expect(composed.plan(shape, {}, schedule)).toMatchObject({ mechanism: "continuous", checkpoint: true });
   }
 });
@@ -62,10 +61,8 @@ test("Gemma2 softcap plans shared continuation for plain, affine and TurboQuant 
     composition: testComposition(kvOf(kv)),
   }) as UniversalDenseModel;
   const model = make();
-  const binding = bindMlxGateway(model), unconfigured = bindMlxGateway(model);
-  const schedule = { checkpoints: true };
-  expect(binding.plan(shape, {}, schedule)).toMatchObject({ mechanism: "continuous", checkpoint: false });
-  binding.configureContinuation!({ checkpointPersistence: {}, checkpoints: {}, checkpointEveryTokens: 4 } as ContinuationServices);
+  const binding = bindMlxGateway(model);
+  expect(binding.plan(shape, {}, unscheduled)).toMatchObject({ mechanism: "continuous", checkpoint: false });
   // Greedy, seeded and history-dependent sampling, and adapter requests, which Gemma2 already batches.
   const planned: [typeof shape, GenerateOptions][] = [[shape, {}],
     [{ ...shape, userSeed: true, hasRepetitionPenalty: true }, { seed: 42, repetitionPenalty: 1.1, repetitionContextSize: 32 }],
@@ -73,15 +70,14 @@ test("Gemma2 softcap plans shared continuation for plain, affine and TurboQuant 
   for (const [request, options] of planned) {
     expect(binding.plan(request, options, schedule)).toMatchObject({ method: "autoregressive", mechanism: "continuous",
       promptCache: true, checkpoint: true, fill: false });
-    expect(unconfigured.plan(request, options, schedule).checkpoint).toBe(false);
+    expect(binding.plan(request, options, unscheduled).checkpoint).toBe(false);
   }
   // Affine KV (its rows rejected at their transition) and TurboQuant (read
   // decoded) place ordinarily and take continuation checkpoints; their placement
-  // is otherwise the unconfigured binding's.
+  // is otherwise the one without checkpoints.
   for (const kv of [{ kvBits: 4 }, { turboQuant: { kBits: 8, vBits: 3 } }] as KvOptions[]) {
-    const configured = bindMlxGateway(make(kv)), bare = bindMlxGateway(make(kv));
-    configured.configureContinuation!({ checkpointPersistence: {}, checkpoints: {}, checkpointEveryTokens: 4 } as ContinuationServices);
-    const plan = configured.plan(shape, {}, schedule), baseline = bare.plan(shape, {}, schedule);
+    const configured = bindMlxGateway(make(kv));
+    const plan = configured.plan(shape, {}, schedule), baseline = configured.plan(shape, {}, unscheduled);
     const { checkpoint: planned, ...placement } = plan, { checkpoint: unplanned, ...unchanged } = baseline;
     expect({ kv, placement }).toEqual({ kv, placement: unchanged });
     expect({ kv, method: plan.method, mechanism: plan.mechanism, planned, unplanned })
@@ -94,12 +90,12 @@ test("Gemma2 softcap plans shared continuation for plain, affine and TurboQuant 
   for (const [request, options, mechanism] of [[{ ...shape, hasGrammar: true }, {}, "continuous"], [shape, fill, "continuous"],
     [{ ...shape, wantsLogprobs: true }, {}, "continuous"], [{ ...shape, hasDraft: true }, {}, "unsupported"],
     [{ ...shape, hasVision: true }, {}, "unsupported"]] as const) {
-    const plan = binding.plan(request, options, schedule), baseline = unconfigured.plan(request, options, schedule);
+    const plan = binding.plan(request, options, schedule), baseline = binding.plan(request, options, unscheduled);
     const { checkpoint: _planned, ...placement } = plan, { checkpoint: _baseline, ...unchanged } = baseline;
     expect({ request, placement }).toEqual({ request, placement: unchanged });
     expect({ request, mechanism: plan.mechanism, checkpoint: plan.mechanism === "continuous" && plan.checkpoint })
       .toEqual({ request, mechanism, checkpoint: false });
-    expect(binding.continuationRequest!(plan, options, [2, 651], () => {})).toBeUndefined();
+    expect(binding.continuationRequest!(plan, options, [2, 651], () => {}, 4)).toBeUndefined();
   }
 });
 
@@ -111,12 +107,13 @@ test("a paged composition pages plain, adapter and media requests alike and keys
   }) as M;
   const lookups: unknown[][] = [];
   const store = { findGenerationCheckpoint: (...args: unknown[]) => { lookups.push(args); return null; } } as unknown as ContinuationStore;
-  const services = { checkpoints: store, checkpointPersistence: new ContinuationPersistence(store, { maxBytes: 1024 }),
-    checkpointEveryTokens: 4, identity: "fixture" } as unknown as ContinuationServices;
-  const binding = bindMlxGateway(graph(Gemma4Model.prototype, "gemma4", { blockSize: 16 }));
-  const unpaged = bindMlxGateway(graph(Gemma4Model.prototype, "gemma4", null));
-  for (const each of [binding, unpaged]) each.configureContinuation!(services);
-  const schedule = { checkpoints: true };
+  const continuations = { store, persistence: new ContinuationPersistence(store, { maxBytes: 1024 }), everyTokens: 4 };
+  const pagedGraph = graph(Gemma4Model.prototype, "gemma4", { blockSize: 16 }), unpagedGraph = graph(Gemma4Model.prototype, "gemma4", null);
+  const binding = bindMlxGateway(pagedGraph);
+  const unpaged = bindMlxGateway(unpagedGraph);
+  // The cache service owns the request state: the composition's paging over the graph's caches.
+  const pagedCache = new KvCacheService(binding.graph, { continuations }, { identity: "fixture" });
+  const unpagedCache = new KvCacheService(unpaged.graph, { continuations }, { identity: "fixture" });
   const adapters = { adapters: ["upper"] }, adapterShape = { ...shape, hasAdapters: true };
   const prompt = [2, 651, 9];
   const fill = { fill: new FillSession({ rows: [], eos: [], echo: null }, prompt) };
@@ -135,33 +132,42 @@ test("a paged composition pages plain, adapter and media requests alike and keys
   // The adapter row pages; its prefixes and checkpoints live in the paged namespace over its own.
   const plan = binding.plan(adapterShape, adapters, schedule);
   expect(plan).toMatchObject({ method: "autoregressive", mechanism: "continuous", promptCache: true, checkpoint: true });
-  const namespace = binding.prefixNamespace!(plan, adapters, "upper@a")!;
-  expect(JSON.parse(namespace)[0]).toBe("paged-v1");
-  expect(JSON.parse(namespace).at(-1)).toBe("upper@a");
+  // The method's namespace is the composition's alike; the cache service adds its paging.
+  expect(binding.prefixNamespace!(plan, adapters, "upper@a")).toBe("upper@a");
   expect(unpaged.prefixNamespace!(plan, adapters, "upper@a")).toBe("upper@a");
-  const state = binding.statePolicy!(plan, adapters, 64)!;
-  expect(state.key).toBe(binding.prefixNamespace!(plan, {}, "")!);
-  const caches = state.create();
-  try { expect(caches.map(cache => cache.signature())).toEqual(["kv:paged"]); }
-  finally { for (const cache of caches) cache.dispose(); }
-  expect(unpaged.statePolicy!(plan, adapters, 64)).toBeUndefined();
-  const requests = [binding.continuationRequest!(plan, adapters, prompt, () => {})!,
-    unpaged.continuationRequest!(plan, adapters, prompt, () => {})!];
+  const namespace = pagedPrefixNamespace(pagedGraph.composition!.kv, { blockSize: 16 }, "upper@a", false);
+  expect(JSON.parse(namespace)[0]).toBe("paged-v1");
+  expect(binding.reusesPrefix(plan)).toBe(true);
+  const requests = [binding.continuationRequest!(plan, adapters, prompt, () => {}, 4)!,
+    unpaged.continuationRequest!(plan, adapters, prompt, () => {}, 4)!];
   try {
-    for (const request of requests) expect(request.continuation.restore("upper@a")).toBeNull();
+    const [paged, plain] = [pagedCache, unpagedCache].map((cache, index) => {
+      const row = { promptIds: prompt, maxTokens: 61, continuation: requests[index]!.continuation };
+      const acquired = cache.acquire(row, "upper@a");
+      cache.release(row, false);
+      try { return acquired.caches.map(state => state.signature()); } finally { for (const state of acquired.caches) state.dispose(); }
+    });
+    expect(paged).toEqual(["kv:paged"]);
+    expect(plain).toEqual(["kv:plain"]);
     expect(lookups.map(lookup => lookup[2])).toEqual([namespace, "upper@a"]);
   } finally { for (const request of requests) request.dispose(); }
   // An unidentified media prefix takes fresh paged state and reuses nothing.
   const media = binding.plan({ ...shape, hasVision: true }, {}, schedule);
-  const fresh = binding.statePolicy!(media, {}, 64)!;
-  expect(fresh.key.startsWith("uncached-prepared-input:")).toBe(true);
-  expect(fresh.promptCache).toBeUndefined();
+  expect(binding.reusesPrefix(media)).toBe(false);
+  const prepared = { promptIds: prompt, maxTokens: 61, reusesPrefix: false };
+  expect(pagedCache.keeps(prepared)).toBe(false);
+  const fresh = pagedCache.acquire(prepared, "");
+  try { expect({ reused: fresh.reusedTokens, caches: fresh.caches.map(state => state.signature()) }).toEqual({ reused: 0, caches: ["kv:paged"] }); }
+  finally { for (const state of fresh.caches) state.dispose(); pagedCache.release(prepared, false); }
   // Any graph pages: the composition pages Qwen 3.5's plain full-attention storage the same way.
   const qwen = bindMlxGateway(graph(Qwen35Model.prototype, "qwen3_5", { blockSize: 16 }));
-  qwen.configureContinuation!(services);
+  const qwenCache = new KvCacheService(qwen.graph);
   for (const request of [shape, adapterShape]) {
     const placed = qwen.plan(request, adapters, schedule);
     expect(placed).toMatchObject({ mechanism: "continuous", checkpoint: true });
-    expect(qwen.statePolicy!(placed, adapters, 64)).toBeDefined();
+    const row = { promptIds: prompt, maxTokens: 61, reusesPrefix: qwen.reusesPrefix(placed) };
+    const acquired = qwenCache.acquire(row, "upper@a");
+    try { expect(acquired.caches.map(state => state.signature())).toEqual(["kv:paged"]); }
+    finally { for (const state of acquired.caches) state.dispose(); qwenCache.release(row, false); }
   }
 });

@@ -18,7 +18,13 @@ import type { Cache } from "../../src/contracts/mlx/cache";
 import type { MlxMixedForward } from "../../src/contracts/mlx/graph";
 import { stubPhases } from "../models/phase-forward";
 import { kvStorage } from "../../src/state/kv-storage";
+import { KvCacheService } from "../../src/state/cache-service";
+import type { PromptCache } from "../../src/state/prefix-cache";
 import { testComposition } from "../models/test-composition";
+
+/** A cache service over `model` whose prefix store is the test's `take` and `put`. */
+const keeping = (model: StandIn, prefixes: { take: PromptCache["take"] | (() => unknown); put: (tokens: number[], caches: Cache[]) => void }) =>
+  new KvCacheService(model, { prefixes: { reclaim() {}, ...prefixes } as unknown as PromptCache });
 
 /** The fixture graph: its one forward and head, which tests replace, and the mixed forward a test may declare. */
 type StandIn = RuntimeModel & { forward(ids: MlxArray, caches: Cache[]): MlxArray; logitsFromHidden(hidden: MlxArray): MlxArray;
@@ -53,7 +59,8 @@ test("admission callback failure rejects the removed request instead of losing i
     await expect(group.submit({ ...f.request, onAdmitted() { throw new Error("admission failed"); } }))
       .rejects.toThrow("admission failed");
     expect(group.pendingRows).toBe(0);
-    expect(f.calls.allocations).toBe(1); // constructor's empty prototype only
+    // The constructor's empty prototype and the cache service's admission probe only.
+    expect(f.calls.allocations).toBe(2);
   } finally { await group.close(); }
 });
 
@@ -71,23 +78,25 @@ test("lazy batch construction and admission execute under the captured runtime",
       seen.push(runtimeValue("MLX_BUN_GRAMMAR"));
       throw new Error("admission failed");
     } })).rejects.toThrow("admission failed");
-    expect(seen).toEqual(["bound", "bound"]);
+    // The constructor's prototype, the cache service's admission probe, and admission itself.
+    expect(seen).toEqual(["bound", "bound", "bound"]);
     expect(runtimeValue("MLX_BUN_GRAMMAR")).toBe("host");
   } finally { await group.close(); restore(); }
 });
 
 test("failure after prefix acquisition releases both caches and backing retention", async () => {
   const f = fixture();
-  const group = new MlxBatchExecutionGroup(f.model, { maxBatch: 2, promptCache: {
+  const group = new MlxBatchExecutionGroup(f.model, { maxBatch: 2, cache: keeping(f.model, {
     take() { return { tokens: [0], caches: [new f.TrackedCache()], retain: () => { f.calls.retains++; } }; },
     put() { throw new Error("failed state must not be stored"); },
-  } });
+  }) });
+  // The lookup span closes after the cache service handed the prefix over.
   const trace = { begin(phase: string) {
-    return () => { if (phase === "prefill.batch_setup") throw new Error("setup failed"); };
+    return () => { if (phase === "cache.lookup_restore") throw new Error("setup failed"); };
   } } as unknown as PromptResponseTrace;
   try {
     await expect(group.submit({ ...f.request, trace })).rejects.toThrow("setup failed");
-    expect(f.calls.disposals).toBe(2); // prototype plus acquired prefix
+    expect(f.calls.disposals).toBe(3); // prototype, admission probe and acquired prefix
     expect(f.calls.retains).toBe(1);
     expect(group.activeRows + group.pendingRows).toBe(0);
   } finally { await group.close(); }
@@ -112,19 +121,19 @@ test("an uncapped request reaches execution and an actual forward failure releas
   f.model.forward = () => { events.push("forward"); throw new Error("forward failed"); };
   const group = new MlxBatchExecutionGroup(f.model, { maxBatch: 2,
     lock: { async acquire() { locked = true; return () => { locked = false; }; } },
-    promptCache: {
+    cache: keeping(f.model, {
       take() {
         expect(locked).toBe(true);
         events.push("take");
         return { tokens: [0], caches: [new f.TrackedCache()], retain: () => { f.calls.retains++; } };
       },
       put() { throw new Error("failed state must not be stored"); },
-    },
+    }),
   });
   try {
     await expect(group.submit({ ...f.request, maxTokens: Infinity })).rejects.toThrow("forward failed");
     expect(events).toEqual(["take", "forward"]);
-    expect(f.calls.disposals).toBe(2);
+    expect(f.calls.disposals).toBe(3); // prototype, admission probe and acquired prefix
     expect(f.calls.retains).toBe(1);
     expect(group.activeRows + group.pendingRows).toBe(0);
   } finally { await group.close(); }
@@ -546,7 +555,7 @@ for (const cancel of ["none", "callback-false", "abort-false", "abort-last"] as 
     const f = grammarGroupFixture(), first = f.request([3, 4], true), peer = f.request([3, 4, 5], true);
     const stored: { tokens: number[]; caches: import("../../src/contracts/mlx/cache").Cache[] }[] = [];
     const group = new MlxBatchExecutionGroup(f.model, { maxBatch: 2, prefillChunkSize: 1,
-      promptCache: { take: () => null, put(tokens, caches) { stored.push({ tokens: [...tokens], caches }); } } });
+      cache: keeping(f.model, { take: () => null, put(tokens, caches) { stored.push({ tokens: [...tokens], caches }); } }) });
     const abort = new AbortController(), reason = new Error("cancel forced publication");
     let simultaneous = false;
     const matchers = [first.grammar, peer.grammar];
@@ -595,7 +604,7 @@ test("forced-span pending disposal failure rejects without publishing final cach
   const f = grammarGroupFixture(), first = f.request([3, 4]), peer = f.request([3, 4, 5], true);
   const stored: { tokens: number[]; caches: import("../../src/contracts/mlx/cache").Cache[] }[] = [];
   const group = new MlxBatchExecutionGroup(f.model, { maxBatch: 2, prefillChunkSize: 1,
-    promptCache: { take: () => null, put(tokens, caches) { stored.push({ tokens: [...tokens], caches }); } } });
+    cache: keeping(f.model, { take: () => null, put(tokens, caches) { stored.push({ tokens: [...tokens], caches }); } }) });
   const original = ops.asyncEvalAll;
   const failure = new Error("pending dispose failed");
   let injected = false;

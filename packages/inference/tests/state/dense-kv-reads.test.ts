@@ -24,7 +24,7 @@ import { BatchedTurboQuantKVCache } from "../../src/state/batched-turboquant-kv"
 import { DelayedQuantizedKVCache } from "../../src/state/delayed-quantized-kv";
 import { DelayedRotatingQuantizedKVCache } from "../../src/state/delayed-rotating-quantized-kv";
 import { DelayedTurboQuantKVCache } from "../../src/state/delayed-turboquant-kv";
-import { createKvMaintenance } from "../../src/state/kv-maintenance";
+import { createKvMaintenance } from "../../src/state/layout";
 import { turboQuantFusedDecode } from "../../src/state/turboquant-codec";
 import { prefillCacheLayout } from "../../src/state/layout";
 import { AttentionMasks } from "../../src/state/attention-read";

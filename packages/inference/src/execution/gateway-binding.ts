@@ -1,16 +1,13 @@
 import { speculativePrefixNamespace, captureSpeculativeOptions } from "../generation/speculative/cache-identity";
 import { createOrdinaryContinuationRequest } from "./continuation-request";
-import type { ContinuationServices } from "./continuation";
-import { bindRequestState, type MlxRequestStatePolicy } from "../state/request-policy";
 import type { ExecutionContext } from "../contracts/portable/scheduling";
 import type { ModelConfig } from "../artifacts/config";
 import type { MlxTokenGraph } from "../models/graph";
 import { declaredGraph } from "../models/capabilities";
-import { composeAtLayer } from "../state/persistence";
 import { bindRequiredDenseKvLayers } from "../state/dense-kv-reads";
 import { BF16_KV, COMPOSITION_DEFAULTS, type KvStorageScheme } from "../contracts/portable/composition";
-import type { Cache } from "../contracts/mlx/cache";
 import { runtimeConfig, type RuntimeConfig } from "../runtime/config";
+import type { CacheServiceGraph } from "../state/cache-service";
 import { disposeResources } from "../runtime/resources";
 import { MlxBatchExecutionGroup } from "./batch-group";
 import { type MlxBatchExecutionGroupOptions, type MlxGroupMethodRequest } from "./batch-types";
@@ -28,33 +25,40 @@ import { resolveExecution } from "./plan";
 import type { MlxPromptInput, Vision } from "../contracts/mlx/media";
 
 export interface MlxBatchGroup extends Pick<MlxBatchExecutionGroup,
-  "activeRows" | "pendingRows" | "projectedKvBytes" | "kvBudgetBytes" | "submit" | "kick" | "close"> {
+  "activeRows" | "pendingRows" | "submit" | "kick" | "close"> {
   runPreparation?<T>(work: () => Promise<T>, signal?: AbortSignal): Promise<T>;
 }
 
 /** Planning consumes the graph's declared capabilities (`declaredGraph`), the
  * request, and dynamic state; it never inspects a model's class, type, or name,
  * nor how the composition's caches store keys and values: every cache lego
- * serves every method. */
+ * serves every method. Request state, prefix reuse and persistence are the
+ * cache service's (`state/cache-service`), handed to `createBatchGroup`. */
 export interface MlxGatewayBinding {
   mediaInput?(input: Vision): MlxPromptInput;
-  configureContinuation?(services: ContinuationServices): void;
+  /** A replayable ordinary request when the plan qualified one: its sampler
+   * and the key the cache service checkpoints it under every `interval` tokens
+   * (the service's `checkpointEveryTokens`). */
   continuationRequest?(execution: ResolvedExecution | undefined, options: GenerateOptions, prompt: number[],
-    onToken: Parameters<typeof createOrdinaryContinuationRequest>[0]["onToken"]): ReturnType<typeof createOrdinaryContinuationRequest> | undefined;
+    onToken: Parameters<typeof createOrdinaryContinuationRequest>[0]["onToken"],
+    interval: number | undefined): ReturnType<typeof createOrdinaryContinuationRequest> | undefined;
   readonly config: ModelConfig;
   readonly runtime: RuntimeConfig;
+  /** What the composition's cache service builds request state from: the
+   * bound graph's caches, config and composition. */
+  readonly graph: CacheServiceGraph;
   /** What the bound graph declares, as resolved when it was bound. */
   readonly capabilities: GraphCapabilities;
-  /** `scheduling.checkpoints`: the application persists generation checkpoints. */
+  /** `scheduling.checkpoints`: the cache service keeps generation checkpoints. */
   plan(request: ExecutionRequirements, options: GenerateOptions, scheduling: { checkpoints: boolean }): ResolvedExecution;
   bindAdapterContext?(adapters: string[], key: string): ExecutionContext;
-  /** Stored caches (owned; a prompt cache's clones) handed back for serial
-   * use as the caches the graph composes: each layer's storage, composed by the
-   * graph's cache for that layer, so a lego converts it as the lego that stored
-   * it would have. Returns the caches the caller now owns. */
-  composeState(caches: Cache[]): Cache[];
-  statePolicy?(execution: ResolvedExecution | undefined, options: GenerateOptions, capacityTokens: number): MlxRequestStatePolicy | undefined;
-  /** The prefix namespace of a request whose own namespace is `base` (its adapters, a prepared media prefix). */
+  /** Whether a request's prefix may be reused and its state kept (the batch
+   * request's `reusesPrefix`): media token IDs alone do not identify prepared
+   * embeddings, so an unidentified media prefix takes fresh state. */
+  reusesPrefix(execution: ResolvedExecution | undefined): boolean;
+  /** The prefix namespace of a request whose own namespace is `base` (its
+   * adapters, a prepared media prefix): its method's over it. The cache service
+   * adds the composition's paging. Null: the method keeps no prefixes. */
   prefixNamespace?(execution: ResolvedExecution | undefined, options: GenerateOptions, base: string): string | null;
   methodRequest?(execution: ResolvedExecution | undefined, options: GenerateOptions): MlxGroupMethodRequest | undefined;
   createBatchGroup(options: MlxBatchExecutionGroupOptions): MlxBatchGroup;
@@ -72,8 +76,8 @@ function plainReadLayers(model: MlxTokenGraph): { layers: readonly number[]; cou
 /** `adaptiveDepth`: each round drafts up to `numDraftTokens`, chosen from the
  *  decayed acceptance rate and the graph's measured `verifyRoundCosts` (the
  *  graph must declare them); otherwise every round drafts `numDraftTokens`.
- *  The graph's composition names its KV scheme, paging and scheduler switches
- *  (a graph without one runs the defaults): every request's, so the binding
+ *  The graph's composition names its KV scheme and scheduler switches (a
+ *  graph without one runs the defaults): every request's, so the binding
  *  reads them once, here. */
 export function bindMlxGateway(model: MlxTokenGraph,
   draft?: { provider: DraftProvider; numDraftTokens: number; adaptiveDepth?: boolean }): MlxGatewayBinding {
@@ -81,9 +85,6 @@ export function bindMlxGateway(model: MlxTokenGraph,
   // The composition facts this binding plans with: the graph's record, else the defaults.
   const facts = model.composition ?? COMPOSITION_DEFAULTS;
   const runtime = runtimeConfig();
-  // How every request holds its state: the composition's paging over the graph's caches.
-  const requestState = bindRequestState(model, kv, facts.pagedKv ?? null, runtime);
-  let continuationServices: ContinuationServices | undefined;
   // The declarations are resolved once, when the graph is bound; planning reads
   // only these and the request.
   const graph = declaredGraph(model);
@@ -113,31 +114,21 @@ export function bindMlxGateway(model: MlxTokenGraph,
     ? (input: Vision): MlxPromptInput => graph.bindMediaInput!(input) : undefined;
   return {
     mediaInput,
-    config: model.config, runtime, capabilities: caps,
-    configureContinuation: services => { continuationServices = services; },
-    continuationRequest(execution, options, prompt, onToken) {
+    config: model.config, runtime, graph: model, capabilities: caps,
+    continuationRequest(execution, options, prompt, onToken, interval) {
       if (!execution?.checkpoint || execution.mechanism !== "continuous") return undefined;
-      const services = continuationServices;
-      if (!services?.checkpoints || !services.checkpointPersistence)
-        throw new Error("qualified continuation requires bound persistence services");
-      // Checkpoints are keyed in the request state's namespace, as its prefixes are.
-      return createOrdinaryContinuationRequest({ options, prompt, onToken, execution, stateNamespace: requestState.namespace,
-        store: services.checkpoints, persistence: services.checkpointPersistence,
-        // A restored entry takes the caches the graph composes.
-        restore: entry => services.checkpoints!.restore(entry, model),
-        interval: services.checkpointEveryTokens!, identity: services.identity });
+      if (interval === undefined) throw new Error("qualified continuation requires bound persistence services");
+      // The cache service keys checkpoints in the request state's namespace, as its prefixes are.
+      return createOrdinaryContinuationRequest({ options, prompt, onToken, execution, interval });
     },
-    // Every request's state is the composition's (its paging over the graph's
-    // caches). Media token IDs alone do not identify the prepared embeddings,
-    // so an unidentified media prefix takes fresh state and reuses none.
-    statePolicy: (execution, _options, capacity) => requestState.policy(capacity, continuationServices?.promptCache,
-      execution?.method === "autoregressive" && !execution.promptCache),
-    // The method's namespace (the request's base, or the speculative group's over it) in the request state's.
+    // Media token IDs alone do not identify the prepared embeddings, so an
+    // unidentified media prefix takes fresh state and reuses none.
+    reusesPrefix: execution => !(execution?.method === "autoregressive" && !execution.promptCache),
+    // The method's namespace: the request's base, or the speculative group's over it.
     prefixNamespace: (execution, options, base) => {
-      if (execution?.method !== "speculative") return requestState.namespace(base);
+      if (execution?.method !== "speculative") return base;
       const namespace = (execution.grammarJump ? grammarProvider : draft?.provider)?.grouped?.checkpointNamespace?.();
-      return namespace === undefined ? null
-        : requestState.namespace(speculativePrefixNamespace(namespace, base, captureSpeculativeOptions(options)));
+      return namespace === undefined ? null : speculativePrefixNamespace(namespace, base, captureSpeculativeOptions(options));
     },
     methodRequest: (execution, options) => execution?.method === "denoising" ? denoising?.(options)
       : execution?.method === "speculative"
@@ -168,7 +159,7 @@ export function bindMlxGateway(model: MlxTokenGraph,
       const ignoredDraft = request.hasDraft && request.hasAdapters && !sharedSpeculativeAdapters;
       return resolveExecution(request, {
         checkpoints: scheduling.checkpoints,
-        sharedCheckpoints: !!continuationServices?.checkpointPersistence &&
+        sharedCheckpoints: scheduling.checkpoints &&
           (!request.hasDraft || ignoredDraft) && !request.hasVision && !request.hasGrammar &&
           !request.wantsLogprobs && !options.fill,
         adapterBatch: caps.adapters.batched,
@@ -190,11 +181,6 @@ export function bindMlxGateway(model: MlxTokenGraph,
         // them. Denoising samples canvases, which an AR token mask cannot apply to.
         grammarBatch: !denoising,
       }, { fill: !!options.fill, compiledDecode: facts.compiledDecode, grammarJump: facts.grammarJump });
-    },
-    composeState(caches) {
-      const prototypes = model.makeCache();
-      try { return caches.map((cache, layer) => composeAtLayer(prototypes[layer]!, cache)); }
-      finally { disposeResources(prototypes); }
     },
     createBatchGroup: (options) => new MlxBatchExecutionGroup(model, options),
   };

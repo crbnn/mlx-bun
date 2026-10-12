@@ -2,7 +2,7 @@ import { type MlxForwardWork,type MlxPreparationWork } from "../contracts/mlx/fo
 import type { DisposableResource } from "../contracts/portable/resources";
 import type { ExecutionGroup } from "../contracts/portable/scheduling";
 import { cleanupFailure,disposeResources,withResource } from "../runtime/resources";
-import type { MlxRequestStatePolicy } from "../state/request-policy";
+import { KvCacheService, type RequestStateCache } from "../state/cache-service";
 import { AdmissionRejected } from "./admission";
 import { runMixedTokenIteration } from "./mixed-iteration";
 import { MlxPrefillCohort,type PrefillState } from "./prefill-cohort";
@@ -71,13 +71,11 @@ import { compiledDecodeStepOf, tokenPhasesOf } from "../models/capabilities";
 import type { MlxTokenGraph } from "../models/graph";
 import { runtimeConfig,withRuntimeConfig,type RuntimeConfig } from "../runtime/config";
 import { independentGreedySampling } from "../sampling/index";
-import { createKvMaintenance,type KvMaintenance } from "../state/kv-maintenance";
-import { kvSchemeOf,type KvScheme } from "../state/kv-scheme";
-import { extractSoleRow,filterLayoutRows,ownedCacheLayout,publishRow,rowAdmission } from "../state/layout";
+import { createKvMaintenance,type KvMaintenance } from "../state/layout";
+import { extractSoleRow,filterLayoutRows,ownedCacheLayout,publishRow } from "../state/layout";
 import { leaseCacheStates } from "../state/leases";
 import { cloneSingleRowState } from "../state/views";
 import { CancellationSource,GenerationCancelled } from "./cancellation";
-import { batchRowKvBytes } from "./kv-budget";
 import { ExecutionTasks } from "./tasks";
 
 /** Per-step phase timing (MLX_BUN_BATCH_STEP_TRACE=1, debug-only): where a
@@ -102,7 +100,6 @@ export class MlxBatchExecutionGroup {
    *  construction): read each step's tokens synchronously. */
   readonly #noPipeline: boolean;
   readonly #stepTrace: boolean;
-  readonly #stateCodecs: import("../state/persistence-types").CacheCodecProvider | undefined;
   readonly #maxQueued: number;
   #running: Row[] = [];
   /** Per-layer state of the running rows; null when empty. A lone row that
@@ -136,12 +133,10 @@ export class MlxBatchExecutionGroup {
   readonly #prefillPolicy: PrefillPolicy;
   readonly #prefillBatchTokenLimit: number;
   readonly #prefillTailSplit: boolean;
-  readonly #kvBudgetBytes: number | undefined;
-  readonly #defaultPromptCache: RowPromptCache | undefined;
-  #statePolicy?: MlxRequestStatePolicy;
-  get #promptCache(): RowPromptCache | undefined {
-    return this.#statePolicy ? this.#statePolicy.promptCache : this.#defaultPromptCache;
-  }
+  /** The composition's cache service: admission under its KV budget, every row's state in and out. */
+  readonly #cache: RequestStateCache;
+  /** Whether the running rows' prefixes reuse and keep state; a row that differs waits for its own group. */
+  #reusesPrefix: boolean | undefined;
   /** Retain hook of the currently-ADOPTED row's cache entry (at most one:
    *  only a lone adopted row holds un-copied entry caches). Runs after the
    *  adopted caches are disposed, or transfers back on put(). */
@@ -150,10 +145,6 @@ export class MlxBatchExecutionGroup {
   #releaseContext: (() => void) | undefined;
   /** Attention layers a plain-KV graph reads plain, bound once; null otherwise. */
   readonly #denseKvLayers: readonly number[] | null;
-  /** Row admission from the graph's own caches when their storage projects it (`rowAdmission`); null otherwise. */
-  readonly #rowAdmission: ReturnType<typeof rowAdmission>;
-  /** The composition's KV scheme, which admission bills a row by when its caches project nothing. */
-  readonly #kvScheme: KvScheme;
   /** Where a row's composed caches join row layouts under the composition's KV scheme. */
   readonly #maintainKv: KvMaintenance;
   /** The graph's compiled decode step, composed at bind when the graph declares
@@ -183,7 +174,6 @@ export class MlxBatchExecutionGroup {
     this.#stepTrace = this.#runtime.value("MLX_BUN_BATCH_STEP_TRACE") === "1";
     this.#maxQueued = opts.maxQueued ?? 64;
     if (!Number.isSafeInteger(this.#maxQueued) || this.#maxQueued < 1) throw new Error("invalid batch queue limit");
-    this.#stateCodecs = opts.stateCodecs;
     this.#maxBatch = Math.max(1, Math.floor(opts.maxBatch));
     this.#lock = opts.lock;
     this.#admissionHeld = opts.admissionHeld;
@@ -191,10 +181,8 @@ export class MlxBatchExecutionGroup {
     this.#prefillChunkSize = this.#prefillPolicy.chunkSize(0);
     this.#prefillBatchTokenLimit = opts.prefillBatchTokenLimit ?? 2048;
     this.#prefillTailSplit = facts.prefillTailSplit;
-    this.#kvBudgetBytes = opts.kvBudgetBytes;
-    this.#defaultPromptCache = opts.promptCache;
+    this.#cache = opts.cache ?? new KvCacheService(model, {}, { runtime: this.#runtime });
     const kv = model.composition?.kv ?? BF16_KV;
-    this.#kvScheme = kvSchemeOf(kv);
     this.#maintainKv = createKvMaintenance(kv);
     const proto = withRuntimeConfig(this.#runtime, () => model.makeCache()); // fresh caches hold no buffers
     // The graph's declared dense-read layers, bound once: a row whose next
@@ -204,7 +192,6 @@ export class MlxBatchExecutionGroup {
     try { denseKvLayers = bindRequiredDenseKvLayers(model.requiredDenseKvLayers, proto); }
     catch (error) { for (const cache of proto) cache.dispose(); throw error; }
     this.#denseKvLayers = denseKvLayers.length ? denseKvLayers : null;
-    this.#rowAdmission = rowAdmission(proto);
     for (const c of proto) c.dispose();
     // The composition decided at load whether its storage has a compiled form.
     this.#compiled = facts.compiledDecode
@@ -224,59 +211,18 @@ export class MlxBatchExecutionGroup {
     return this.#pending.length + (this.#prefill?.rows.length ?? 0);
   }
 
-  /** Projected KV bytes of one row at its worst case (full prompt + full
-   *  completion; the sliding-window term is window-capped by kvBytesAt). */
-  #rowKvBytes(row: Row): number {
-    return this.#rowAdmission
-      ? this.#rowAdmission.bytes(row.promptTokens + row.req.maxTokens)
-      : batchRowKvBytes(
-          this.model.config,
-          row.promptTokens,
-          row.req.maxTokens,
-          this.#kvScheme,
-        );
-  }
-
-  /** Projected aggregate KV of everything admitted (running + mid-prefill). */
-  get projectedKvBytes(): number {
-    let total = this.#running.reduce((a, r) => a + this.#rowKvBytes(r), 0);
-    if (this.#prefill) for (const row of this.#prefill.rows) total += this.#rowKvBytes(row);
-    return total;
-  }
-
-  get kvBudgetBytes(): number | undefined {
-    return this.#kvBudgetBytes;
-  }
-
-  /** KV-budget admission for the queue head. True = admit now. A candidate
-   *  that cannot fit even alone is rejected here (never deadlocks the
-   *  queue); one that fits alone but not alongside the current batch waits. */
+  /** Admission of the queue head by the cache service's KV budget. True =
+   *  admitted now. A candidate that can never be admitted (past the caches'
+   *  position limit, or over the budget alone) is rejected here, so it never
+   *  deadlocks the queue; one that fits alone but not beside the admitted rows
+   *  waits. */
   #kvAdmits(candidate: Row): boolean {
-    const requestedTokens = candidate.promptTokens + candidate.req.maxTokens;
-    const tokenLimit = this.#rowAdmission?.maxTokens ?? Infinity;
-    if (requestedTokens > tokenLimit) {
+    try { return this.#cache.admit(candidate.req); }
+    catch (error) {
       this.#pending.shift();
-      candidate.reject(new RangeError(
-        `context limit: prompt ${candidate.promptTokens} + max_tokens ` +
-        `${candidate.req.maxTokens} exceeds ${tokenLimit}`,
-      ));
+      candidate.reject(error);
       return false;
     }
-    if (this.#kvBudgetBytes === undefined) return true;
-    const need = this.#rowKvBytes(candidate);
-    if (need > this.#kvBudgetBytes && this.#running.length === 0 && !this.#prefill) {
-      this.#pending.shift();
-      candidate.reject(
-        new Error(
-          `kv budget: request needs ~${(need / 1e9).toFixed(2)} GB KV ` +
-            `(prompt ${candidate.promptTokens} + max_tokens ${candidate.req.maxTokens}), ` +
-            `over --kv-budget ${(this.#kvBudgetBytes / 1e9).toFixed(2)} GB — ` +
-            `lower max_tokens or raise the budget`,
-        ),
-      );
-      return false;
-    }
-    return this.projectedKvBytes + need <= this.#kvBudgetBytes;
   }
 
   /** Submit a request; resolves when its row finishes (EOS, stop, or length). */
@@ -284,17 +230,19 @@ export class MlxBatchExecutionGroup {
     if (this.#closed) return Promise.reject(new Error("scheduler closed"));
     if (req.signal?.aborted) return Promise.reject(req.signal.reason);
     if (this.#pending.length >= this.#maxQueued) return Promise.reject(new AdmissionRejected());
-    req = { ...req, prefillChunkSize: req.prefillChunkSize ?? this.#prefillPolicy.chunkSize(req.promptIds.length) };
+    const request = req = { ...req, prefillChunkSize: req.prefillChunkSize ?? this.#prefillPolicy.chunkSize(req.promptIds.length) };
     return new Promise<BatchStats>((resolve, reject) => {
       let abortListener: (() => void) | null = null;
-      const cleanup = () => {
-        if (abortListener) req.signal?.removeEventListener("abort", abortListener);
+      // A row settles once: its state lease with the cache ends there, completed or not.
+      const cleanup = (completed: boolean) => {
+        if (abortListener) request.signal?.removeEventListener("abort", abortListener);
         abortListener = null;
+        this.#cache.release(request, completed);
       };
       this.#pending.push({
-        req,
-        resolve: (stats) => { cleanup(); resolve(stats); },
-        reject: (error) => { cleanup(); reject(error); },
+        req: request,
+        resolve: (stats) => { cleanup(true); resolve(stats); },
+        reject: (error) => { cleanup(false); reject(error); },
         current: 0, generated: 0, sampled: 0, promptTokens: req.promptIds.length,
         admittedAt: 0, firstTokenAt: 0,
         cachedTokens: 0, fed: [], fedTainted: false, merged: false,
@@ -370,9 +318,7 @@ export class MlxBatchExecutionGroup {
         }
       },
       admitNext: () => this.#admitNext(),
-      canBurst: () => this.#contextCompatible(this.#pending[0]!) &&
-        (this.#kvBudgetBytes === undefined ||
-          this.projectedKvBytes + this.#rowKvBytes(this.#pending[0]!) <= this.#kvBudgetBytes),
+      canBurst: () => this.#contextCompatible(this.#pending[0]!) && this.#cache.fits(this.#pending[0]!.req),
       get mixedPreparation() {
         return scheduler.#mixed && scheduler.#decodeStateKey === undefined && scheduler.#prefill?.supportsMixedWork !== false &&
           (!scheduler.#method || scheduler.#method.runningTokens !== undefined)
@@ -382,7 +328,7 @@ export class MlxBatchExecutionGroup {
       },
       get maxIterationTokens() { return scheduler.#mixedTokenBudget; },
       advanceMixed: async tokenBudget => {
-        this.#promptCache?.reclaim?.();
+        this.#cache.boundary();
         const mixed = this.#mixed!;
         const advanced = await runMixedTokenIteration({
           prepare: forward => this.#advancePreparation({ forward,
@@ -403,11 +349,11 @@ export class MlxBatchExecutionGroup {
         }
       },
       advancePreparation: () => {
-        this.#promptCache?.reclaim?.();
+        this.#cache.boundary();
         return this.#advancePreparation();
       },
       advance: () => {
-        if (this.#cacheMaintenanceSteps++ % 256 === 0) this.#promptCache?.reclaim?.();
+        if (this.#cacheMaintenanceSteps++ % 256 === 0) this.#cache.boundary();
         return this.#method ? this.#method.advance() : this.#step();
       },
       failActive: (error) => {
@@ -436,7 +382,7 @@ export class MlxBatchExecutionGroup {
   }
 
   #contextCompatible(row: Row): boolean {
-    return (!this.#running.length && !this.#prefill) || ((row.req.context?.key ?? "") === this.#contextKey && row.req.method?.key === this.#methodKey && row.req.statePolicy?.key === this.#statePolicy?.key && row.req.promptInput?.decodeState?.key === this.#decodeStateKey);
+    return (!this.#running.length && !this.#prefill) || ((row.req.context?.key ?? "") === this.#contextKey && row.req.method?.key === this.#methodKey && (row.req.reusesPrefix !== false) === this.#reusesPrefix && row.req.promptInput?.decodeState?.key === this.#decodeStateKey);
   }
 
   #leaveContext(): void {
@@ -450,7 +396,7 @@ export class MlxBatchExecutionGroup {
     if (!this.#contextCompatible(this.#pending[0]!) || !this.#kvAdmits(this.#pending[0]!)) return false;
     const row = this.#pending.shift()!;
     try {
-      this.#statePolicy = row.req.statePolicy;
+      this.#reusesPrefix = row.req.reusesPrefix !== false;
       this.#decodeStateKey = row.req.promptInput?.decodeState?.key;
       row.cacheNamespace = typeof row.req.cacheNamespace === "function"
         ? row.req.cacheNamespace() : row.req.cacheNamespace;
@@ -469,7 +415,7 @@ export class MlxBatchExecutionGroup {
           this.#method = row.req.method.open({
             get rows() { return executor.#running; }, runtime: this.#runtime,
             prefillChunkSize: this.#prefillChunkSize, prefillTailSplit: this.#prefillTailSplit,
-            promptCache: this.#promptCache, kvMaintenance: this.#maintainKv,
+            cache: this.#cache, kvMaintenance: this.#maintainKv,
             join: row => { this.#running.push(row); },
             filterRows: keep => this.#applyFilter(keep),
             publish: async (row, token, logprobs) => {
@@ -488,8 +434,8 @@ export class MlxBatchExecutionGroup {
         this.#prefill = this.#method.prepare(row);
       } else {
         const preparation = new MlxPrefillCohort({
-          model: this.model, chunkSize: this.#prefillChunkSize, tailSplit: this.#prefillTailSplit,
-          promptCache: this.#promptCache, stateCodecs: this.#stateCodecs, maintain: this.#maintainKv,
+          chunkSize: this.#prefillChunkSize, tailSplit: this.#prefillTailSplit,
+          cache: this.#cache, maintain: this.#maintainKv,
           ...(this.#denseKvLayers ? { denseKvReads: this.#denseKvLayers } : {}),
           forward: async (ids, caches, step) => this.#dispatch.prompt(step.phase, step.sequences, step.tokens)(ids, caches, null),
           project: (hidden, caches, completed, step) => this.#projectPrefill(hidden, caches, completed, step),
@@ -595,7 +541,7 @@ export class MlxBatchExecutionGroup {
       row.cachedTokens = Math.min(saved.cacheTokens.length, row.promptTokens);
       const stop = await this.#emit(row, saved.pendingToken);
       if (stop !== "continue") {
-        this.#putOrDispose(p.solo, saved.cacheTokens, p.retain, row.cacheNamespace, row.req.cacheSessionId);
+        this.#putOrDispose(row, p.solo, saved.cacheTokens, p.retain);
         p.solo = [];
         this.#finish(row, stop);
         return;
@@ -646,7 +592,7 @@ export class MlxBatchExecutionGroup {
         const stop = await this.#emit(p.row, tok);
         // Token 0 was sampled but never fed — the caches cover exactly the
         // prompt, a clean prompt-only entry (put-or-dispose).
-        this.#putOrDispose(p.solo, p.row.req.promptIds, p.retain, p.row.cacheNamespace, p.row.req.cacheSessionId);
+        this.#putOrDispose(p.row, p.solo, p.row.req.promptIds, p.retain);
         this.#finish(p.row, stop === "continue" ? "stop" : stop);
         return;
       }
@@ -654,7 +600,7 @@ export class MlxBatchExecutionGroup {
 
     const stop = await this.#emit(p.row, tok);
     if (stop !== "continue") {
-      this.#putOrDispose(p.solo, p.row.req.promptIds, p.retain, p.row.cacheNamespace, p.row.req.cacheSessionId);
+      this.#putOrDispose(p.row, p.solo, p.row.req.promptIds, p.retain);
       this.#finish(p.row, stop);
       return;
     }
@@ -917,8 +863,8 @@ export class MlxBatchExecutionGroup {
   }
 
   readonly #checkpointAt = new WeakMap<Row, number>();
-  /** Cache extraction belongs to this existing ordinary numerical driver;
-   * the optional request port owns checkpoint eligibility and persistence. */
+  /** Cache extraction belongs to this existing ordinary numerical driver; the
+   * request's continuation names the cadence and the cache service persists. */
   #captureContinuations(): void {
     if (!this.#pendingToks || !this.#running.some(row => row.req.continuation)) return;
     let pending: number[] | undefined;
@@ -931,11 +877,11 @@ export class MlxBatchExecutionGroup {
       pending ??= this.#pendingToks.toIntTokens();
       const tokens = [...row.req.promptIds, ...row.fed];
       const caches = this.#running.length === 1 && !row.merged
-        ? cloneSingleRowState(this.#inners! as Cache[], this.#stateCodecs)
+        ? cloneSingleRowState(this.#inners! as Cache[], this.#cache.codecs)
         : this.#extractRowCaches(index, tokens.length);
       if (!caches) continue;
       try {
-        policy.captureOwned({ caches, cacheTokens: tokens, generatedTokens: row.generated,
+        this.#cache.checkpoint(row.req, { caches, cacheTokens: tokens, generatedTokens: row.generated,
           pendingToken: pending[index]! });
         this.#checkpointAt.set(row, (Math.floor(row.generated / policy.interval) + 1) * policy.interval);
       } catch (error) { row.reject(error); failed.add(index); }
@@ -1160,8 +1106,9 @@ export class MlxBatchExecutionGroup {
     }
   }
 
+  /** A row completes: resolving it ends its state lease as completed, which
+   *  removes a replayable generation's checkpoints. */
   #finish(row: Row, reason: "stop" | "length"): void {
-    row.req.continuation?.complete();
     const span = row.decodeSpan;
     const now = span?.end ?? performance.now();
     const first = span?.start ?? (row.firstTokenAt || now);
@@ -1177,23 +1124,23 @@ export class MlxBatchExecutionGroup {
     });
   }
 
-  /** Finish-time disposition of serial-class caches covering exactly
-   *  `tokens`: put() into the prompt cache when the hook is present and the
-   *  offset lines up (defensive — a mismatch means the accounting is wrong
-   *  and the entry would corrupt future hits), else dispose. `retain` rides
-   *  along per the PromptCacheEntry contract (runs after dispose). */
-  #putOrDispose(caches: Cache[], tokens: number[], retain?: () => void, namespace = "", sessionId?: string): void {
-    if (this.#promptCache) {
+  /** Finish-time disposition of `row`'s serial-class caches covering exactly
+   *  `tokens`: published to the cache service when it keeps the row's state
+   *  and the offset lines up (defensive — a mismatch means the accounting is
+   *  wrong and the entry would corrupt future hits), else disposed. `retain`
+   *  rides along with the state (runs after dispose). */
+  #putOrDispose(row: Row, caches: Cache[], tokens: number[], retain?: () => void): void {
+    if (this.#cache.keeps(row.req)) {
       // A never-merged row can still own a row layout. Persistence receives
       // its existing serial representation, just like merged-row retirement.
       const extracted: Cache[] = [], replaced: Cache[] = [];
       let persistent: Cache[];
       try {
         persistent = caches.map(cache => {
-          const row = extractSoleRow(cache);
-          if (!row) return cache;
-          extracted.push(row); replaced.push(cache);
-          return row;
+          const sole = extractSoleRow(cache);
+          if (!sole) return cache;
+          extracted.push(sole); replaced.push(cache);
+          return sole;
         });
       } catch (error) { disposeResources(extracted); throw error; }
       try { disposeResources(replaced); }
@@ -1203,7 +1150,7 @@ export class MlxBatchExecutionGroup {
         (c) => typeof (c as { offset?: unknown }).offset === "number",
       ) as { offset: number } | undefined;
       if (withOff && withOff.offset === tokens.length) {
-        this.#promptCache.put(tokens, caches, namespace, retain, undefined, sessionId);
+        this.#cache.publish(row.req, row.cacheNamespace ?? "", tokens, { caches, retain });
         return;
       }
     }
@@ -1211,15 +1158,15 @@ export class MlxBatchExecutionGroup {
     retain?.();
   }
 
-  /** Extract a finishing MERGED row's KV into fresh serial caches and put()
+  /** Extract a finishing MERGED row's KV into fresh serial caches and publish
    *  them keyed by [promptIds + fed] — the batch-lane mirror of mlx-lm
-   *  server.py:872 (extract_cache → prompt_cache.insert_cache). Gates:
-   *  promptTokens >= 256 or an explicit cache session, plus an exact
-   *  coverage key (!fedTainted). Refusal
-   *  (#extractRowCaches null) just disposes-by-omission — the row's KV dies
-   *  with the filter, exactly the pre-extraction behavior. */
+   *  server.py:872 (extract_cache → prompt_cache.insert_cache). Gates: the
+   *  cache keeps the row's state, promptTokens >= 256 or an explicit cache
+   *  session (the extraction copies), plus an exact coverage key
+   *  (!fedTainted). Refusal (#extractRowCaches null) just disposes-by-omission
+   *  — the row's KV dies with the filter, exactly the pre-extraction behavior. */
   #extractAndPut(b: number, row: Row): void {
-    if (!this.#promptCache || !row.merged || row.fedTainted) return;
+    if (!this.#cache.keeps(row.req) || !row.merged || row.fedTainted) return;
     if (row.promptTokens < 256 && !row.req.cacheSessionId) return;
     const tokens = [...row.req.promptIds, ...row.fed];
     const caches = this.#extractRowCaches(b, tokens.length);
@@ -1229,7 +1176,7 @@ export class MlxBatchExecutionGroup {
     // buffers free once the copies land, instead of being pinned by a lazy
     // graph inside an idle cache entry.
     withResource(leaseCacheStates(caches), state => ops.asyncEvalAll([...state]));
-    this.#putOrDispose(caches, tokens, undefined, row.cacheNamespace, row.req.cacheSessionId);
+    this.#putOrDispose(row, caches, tokens);
   }
 
   /** Row `b` of every layer as OWNED serial-class caches, or null when a
@@ -1267,7 +1214,7 @@ export class MlxBatchExecutionGroup {
     }
     const inners = this.#inners!;
     if (keep.length === 0) {
-      // Prompt-cache put: a lone NEVER-MERGED row's inners are
+      // Publication: a lone NEVER-MERGED row's inners are
       // its adopted serial-class caches, covering exactly prompt+fed — hand
       // them back to the cache instead of disposing. dropOnly (the batch-
       // drop error path) and poisoned rows dispose as before; MERGED rows'
@@ -1278,12 +1225,7 @@ export class MlxBatchExecutionGroup {
           ? this.#running[0]!
           : null;
       if (solo) {
-        this.#putOrDispose(
-          inners,
-          [...solo.req.promptIds, ...solo.fed],
-          this.#adoptedRetain ?? undefined,
-          solo.cacheNamespace, solo.req.cacheSessionId,
-        );
+        this.#putOrDispose(solo, inners, [...solo.req.promptIds, ...solo.fed], this.#adoptedRetain ?? undefined);
       } else {
         for (const c of inners) c.dispose();
         this.#adoptedRetain?.();
@@ -1320,6 +1262,6 @@ export class MlxBatchExecutionGroup {
   }
 }
 
-import { BatchRequest,BatchStats,ExclusiveLock,MlxBatchExecutionGroupOptions,MlxGroupedMethod,MlxGroupPreparation,Row,RowPromptCache } from "./batch-types";
+import { BatchRequest,BatchStats,ExclusiveLock,MlxBatchExecutionGroupOptions,MlxGroupedMethod,MlxGroupPreparation,Row } from "./batch-types";
 import { DenseKvReadError, bindRequiredDenseKvLayers, unreadableRows } from "../state/dense-kv-reads";
-export { type BatchRequest,type BatchRequestFields,type BatchStats,type ExclusiveLock,type MlxBatchExecutionGroupOptions,type MlxGroupedMethod,type MlxGroupMethodHost,type MlxGroupMethodRequest,type MlxGroupPreparation,type Row,type RowPromptCache,type RowSampler } from "./batch-types";
+export { type BatchRequest,type BatchRequestFields,type BatchStats,type ExclusiveLock,type MlxBatchExecutionGroupOptions,type MlxGroupedMethod,type MlxGroupMethodHost,type MlxGroupMethodRequest,type MlxGroupPreparation,type Row,type RowSampler } from "./batch-types";
