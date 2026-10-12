@@ -8,7 +8,8 @@
 // class; decode at one row and at two, four, six and nine sequences; verify at 2, 3, 4, 5, 8 and 12 rows with capture
 // and at several sequences; appendKnown and sequenceHidden at every class; the head at every width; the capturing
 // mixed forward (decode, prompt and verify groups, packed and not); media positions and the vision prefill phases.
-// The composition facts (capabilities, LoRA targets, no committed spans, the residual basis) equal the TQ graph's.
+// The composition facts (capabilities, LoRA targets, no committed spans, the residual basis) equal the TQ graph's; only
+// the generated graph declares verify costs, its composition's measured numbers (data, no numerical path).
 // The real artifact runs the same phases opt-in on the M1 Max (MLX_BUN_TEST_QWEN38_ARTIFACT=<snapshot>), where the
 // reduce and scatter kernels take the representations that GPU family qualifies; elsewhere it skips, which is not a pass.
 import { afterAll, describe, expect, test } from "bun:test";
@@ -25,6 +26,7 @@ import type { BatchableCache, Cache } from "../../src/contracts/mlx/cache";
 import { widthClass, type MlxLayerCapture, type MlxPhaseGroup, type MlxTokenPhases, type MlxWidthClass } from "../../src/contracts/mlx/graph";
 import type { Composition, KvStorageScheme } from "../../src/contracts/portable/composition";
 import { LAYERS, Qwen38TrellisM1Max } from "../../src/models/qwen/qwen38-27b-trellis-m1max";
+import { QWEN38_COMPOSITIONS } from "../../scripts/gen-qwen38";
 import { targetCacheLayout } from "../../src/state/layout";
 import { Qwen38TrellisTQ as FrozenTQ } from "./qwen38-27b-trellis-tq-reference";
 
@@ -279,7 +281,7 @@ function step(label: string, pairOf: Pair, caches: { old: Cache[]; current: Cach
 const input = (rows: number[][]) => keep(ids(rows));
 
 describe("the composition the generated graph declares", () => {
-  test("capabilities, LoRA targets, caches, no committed spans or verify costs, no Neural Engine operation: the TQ graph's", () => {
+  test("capabilities, LoRA targets, caches, no committed spans, no Neural Engine operation: the TQ graph's; verify costs its composition's", () => {
     for (const scheme of Object.keys(SCHEMES)) {
       const { oldGraph, currentGraph } = pair(scheme);
       expect(currentGraph.graphCapabilities).toEqual(oldGraph.graphCapabilities);
@@ -287,7 +289,8 @@ describe("the composition the generated graph declares", () => {
       expect(currentGraph.loraTargets().size).toBe(48 * 5 + 16 * 4);
       expect((currentGraph as { knownSpans?: unknown }).knownSpans).toBeUndefined();
       expect(oldGraph.knownSpans).toBeUndefined();
-      expect((currentGraph as { verifyRoundCosts?: unknown }).verifyRoundCosts).toBeUndefined();
+      // Declared data, measured for the composition on the M1 Max; the TQ graph declared none.
+      expect([...currentGraph.verifyRoundCosts]).toEqual(QWEN38_COMPOSITIONS["qwen38-27b-trellis-m1max"]!.verifyRoundCosts!.costs.map(([rows, cost]) => [rows, cost]));
       expect((oldGraph as { verifyRoundCosts?: unknown }).verifyRoundCosts).toBeUndefined();
       expect(currentGraph.prefillChunk.ane).toBeUndefined();
       expect(currentGraph.requiredDenseKvLayers).toEqual(oldGraph.requiredDenseKvLayers);

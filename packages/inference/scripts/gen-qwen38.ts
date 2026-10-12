@@ -83,6 +83,8 @@ export const QWEN38_COMPOSITIONS: Readonly<Record<string, Qwen38Composition>> = 
     prefillChunkTokens: 2048,
     maxRows: 8,
     aneBridge: true,
+    // Measured 2026-10-09 on the pre-refactor tree: DFlash 2 rounds at depths 1..7 over plain decode's 68.5 ms per
+    // token, bf16 KV, greedy; six to eight rows (131.8 to 137.5 ms, not monotone) declared at the depth-7 plateau.
     verifyRoundCosts: { host: "M4 Pro 24 GB", costs: [[1, 1], [2, 1.3], [3, 1.46], [4, 1.68], [5, 1.82], [6, 1.92], [7, 1.93], [8, 1.94]] },
   },
   // The hand-written TQ graph's served composition until D2: this artifact on the M1 Max GPU, whatever its KV
@@ -101,6 +103,11 @@ export const QWEN38_COMPOSITIONS: Readonly<Record<string, Qwen38Composition>> = 
     maxRows: null,
     aneBridge: false,
     mixedGateUp: "split",
+    // Measured 2026-10-12 on this graph and artifact: scripts/bench-mtp.ts, the DFlash 2 drafter at depths 1..7
+    // against the depth-0 plain arm (69.7 ms per token), bf16 KV, greedy, two prompts, 128 tokens, four
+    // repetitions, whose ratios span under 1% at every width. Five to eight rows run the generic blocks, whose
+    // Trellis MLP takes the prefill kernels above four rows.
+    verifyRoundCosts: { host: "M1 Max 32 GB", costs: [[1, 1], [2, 1.89], [3, 2.35], [4, 2.97], [5, 12.22], [6, 13.16], [7, 13.02], [8, 12.88]] },
   },
 });
 

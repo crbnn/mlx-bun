@@ -226,6 +226,10 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
    *  workspace; adapters at every width. Speculation over
    *  affine KV is the composition's `speculativeAffineKv`. */
   readonly graphCapabilities: GraphCapabilities;
+  /** Verify forward cost by rows relative to one decode step (M1 Max 32 GB). */
+  readonly verifyRoundCosts: ReadonlyMap<number, number> = new Map([
+    [1, 1], [2, 1.89], [3, 2.35], [4, 2.97], [5, 12.22], [6, 13.16], [7, 13.02], [8, 12.88],
+  ]);
 
   readonly prefillChunk: MlxPrefillChunk;
   readonly prefillTail: MlxWidthTable<RowsForward>;
