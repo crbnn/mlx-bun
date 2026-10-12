@@ -35,3 +35,18 @@ test("plan requires balanced repetitions and protects timing controls", () => {
   expect(() => parseMtpPlan({ ...p, repetitions: 3 })).toThrow("even");
   expect(() => parseMtpPlan({ ...p, variants: [p.variants[0], { id: "wide", depth: 4, env: { MLX_BUN_SPEC_PHASE_TIMING: "1" } }] })).toThrow("reserved");
 });
+test("depth 0 is greedy plain decode, the step verify costs are relative to: no draft, adaptive depth or sampling", () => {
+  const p = { target: "/target", draft: "/draft", artifactRevision: "rev", prompts: ["hi"],
+    variants: [{ id: "plain", depth: 0 }, { id: "df1", depth: 1 }], maxTokens: 32, repetitions: 2, warmupTokens: 8 };
+  expect(parseMtpPlan(p)).toEqual(p);
+  expect(() => parseMtpPlan({ ...p, variants: [{ id: "plain", depth: 0, draft: "/other" }, p.variants[1]] })).toThrow("depth 0");
+  expect(() => parseMtpPlan({ ...p, variants: [{ id: "plain", depth: 0, adaptiveDepth: true }, p.variants[1]] })).toThrow("depth 0");
+  expect(() => parseMtpPlan({ ...p, sampling: { temperature: 0.6, seed: 1 } })).toThrow("depth 0");
+  expect(() => parseMtpPlan({ ...p, variants: [{ id: "plain", depth: -1 }, p.variants[1]] })).toThrow(">= 0");
+  // One step per token after the prefill's; no drafts.
+  const m = mtpMetrics([sample({ variant: "plain", steps: [{ ms: 70, emitted: 1 }, { ms: 72, emitted: 1 }],
+    spec: { drafted: 0, accepted: 0, rounds: 2 } })]);
+  expect(m.meanStepMs).toBe(71);
+  expect(m.emittedPerRound).toBe(1);
+  expect(m.acceptanceRate).toBe(0);
+});
