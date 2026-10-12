@@ -205,6 +205,51 @@ export interface GatedDeltaCache extends Cache {
   recurWindow(qkv: MlxArray, a: MlxArray, b: MlxArray, layer: GatedDeltaParameters): MlxArray;
 }
 
+/** The compressed state of one latent attention layer after an append, as
+ * caller-owned views of every stored position in order (float32). The caller
+ * disposes all three. Rows follow the cache's row layout: right-justified, row
+ * `b`'s positions starting at `leftPad[b]`. */
+export interface LatentAttentionState {
+  /** [B, T, kvLoraRank]: the normalized compressed content state. */
+  readonly latent: MlxArray;
+  /** [B, T, ropeHeadDim]: the decoupled RoPE key, already rotated. */
+  readonly rope: MlxArray;
+  /** [B, T, indexHeadDim]: the sparse-attention (DSA) index keys, on a cache
+   * composed to store them; null otherwise. */
+  readonly indexKeys: MlxArray | null;
+}
+
+/** State for one multi-head latent attention layer (GLM-5.2's MLA): it stores
+ * the checkpoint-native compressed state per position (the latent and the
+ * decoupled RoPE key, and on a sparse-attention layer the DSA index key), never
+ * per-head keys and values. The attention block projects its queries and that
+ * state, appends the state here and reads back everything stored, from which
+ * it reconstructs or absorbs keys and values itself (the same split as
+ * {@link GatedDeltaCache}: the block keeps its projections, the cache keeps the
+ * state and its row layout). A layer composed with DSA appends an index key
+ * with every position and reads the index keys stored before its append to
+ * select positions.
+ *
+ * Rows: one row for a single sequence; a batch keeps its rows right-justified
+ * along the sequence axis, `rowOffsets[b]` positions in row `b` starting at
+ * `leftPad[b]`. Inputs to an append are borrowed and float32. */
+export interface LatentAttentionCache extends Cache {
+  readonly kvLoraRank: number;
+  readonly ropeHeadDim: number;
+  /** Rows in the layout, or null before the first append. */
+  readonly batchSize: number | null;
+  readonly rowOffsets: readonly number[];
+  readonly leftPad: readonly number[];
+  /** The index keys stored so far, [B, offset, indexHeadDim], owned by the
+   * caller; null when none are stored (a cache without DSA, or an empty one). */
+  storedIndexKeys(): MlxArray | null;
+  /** Appends `L` positions per row (`latent` [B, L, kvLoraRank], `rope`
+   * [B, L, ropeHeadDim], and `indexKeys` [B, L, indexHeadDim] exactly when the
+   * cache stores them), advancing every row by `L`, and returns the state as of
+   * this append. A rejected append leaves the cache unchanged. */
+  appendLatent(latent: MlxArray, rope: MlxArray, indexKeys: MlxArray | null): LatentAttentionState;
+}
+
 /** A captured numerical view supports multiple queries without appending KV
  * again. It owns its tensor handles independently of later cache membership or
  * precision changes. Query/mask inputs are borrowed; outputs are owned. */

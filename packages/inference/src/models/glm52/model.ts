@@ -16,7 +16,7 @@ type Glm52Config,
 import { validateGlm52ContainerLayout } from "../../artifacts/glm52/layout";
 import { ColibriGlm52ResidentWeights } from "../../artifacts/glm52/resident-weights";
 import { ColibriGlm52Weights } from "../../artifacts/glm52/weights";
-import { type Cache } from "../../contracts/mlx/cache";
+import { type Cache, type LatentAttentionCache } from "../../contracts/mlx/cache";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import type {
@@ -128,7 +128,7 @@ class Glm52DsaIndexer {
 
   projectAndSelect(
     input: MlxArray,
-    cache: MLACache,
+    cache: LatentAttentionCache,
     state: Glm52DsaSelectionState,
     forceDense = false,
   ): DsaStep {
@@ -208,8 +208,8 @@ class Glm52DsaIndexer {
     );
 
     let allKeys = key;
-    if (cache.dsa?.offset) {
-      const prior = cache.dsa.fetch();
+    const prior = cache.storedIndexKeys();
+    if (prior) {
       allKeys = ops.concatAxis([prior, key], 1);
       prior.dispose();
     }
@@ -506,7 +506,7 @@ export class Glm52DecoderLayer {
    */
   private attend(
     input: MlxArray,
-    cache: MLACache,
+    cache: LatentAttentionCache,
     dsaState: Glm52DsaSelectionState | null,
   ): MlxArray {
     const normalized = rmsNormF32Mlx(
@@ -619,7 +619,7 @@ export class Glm52DecoderLayer {
 
   forward(
     input: MlxArray,
-    cache: MLACache,
+    cache: LatentAttentionCache,
     dsaState: Glm52DsaSelectionState | null,
   ): MlxArray {
     const attention = this.attend(input, cache, dsaState);
@@ -640,7 +640,7 @@ export class Glm52DecoderLayer {
 
   async forwardAsync(
     input: MlxArray,
-    cache: MLACache,
+    cache: LatentAttentionCache,
     dsaState: Glm52DsaSelectionState | null,
   ): Promise<MlxArray> {
     const attention = this.attend(input, cache, dsaState);
@@ -981,6 +981,9 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
     finally { executor?.setFixedKernelFamily(false); }
   });
 
+  /** The decoder over `embeddings` (borrowed). `cache` holds one latent
+   * attention cache per layer (`makeCache`), which each layer's MLA block reads
+   * through the read it was built with. */
   forwardEmbeddings(
     embeddings: MlxArray,
     cache: Cache[],
@@ -999,12 +1002,9 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
     let current = ops.contiguous(embeddings);
     try {
       for (let layer = 0; layer < this.layers.length; layer++) {
-        const layerCache = cache[layer];
-        if (!(layerCache instanceof MLACache))
-          throw new Error(`GLM layer ${layer} requires MLACache`);
         const next = this.layers[layer]!.forward(
           current,
-          layerCache,
+          cache[layer] as LatentAttentionCache,
           dsaState,
         );
         current.dispose();
@@ -1021,6 +1021,7 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
     }
   }
 
+  /** `forwardEmbeddings` over streamed experts, every layer evaluated before the next. */
   async forwardEmbeddingsAsync(
     embeddings: MlxArray,
     cache: Cache[],
@@ -1037,12 +1038,9 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
     let current = ops.contiguous(embeddings);
     try {
       for (let layer = 0; layer < this.layers.length; layer++) {
-        const layerCache = cache[layer];
-        if (!(layerCache instanceof MLACache))
-          throw new Error(`GLM layer ${layer} requires MLACache`);
         const next = await this.layers[layer]!.forwardAsync(
           current,
-          layerCache,
+          cache[layer] as LatentAttentionCache,
           dsaState,
         );
         // The streamed path is a bounded-residency graph. Detach every layer

@@ -3,7 +3,7 @@ import type { NativeMtpHead } from "../../contracts/mlx/drafter";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { Glm52Config } from "../../artifacts/glm52-config";
 import type { Glm52WeightSource } from "../../contracts/mlx/glm52-weights";
-import type { MLACache } from "../../state/glm52-cache";
+import type { LatentAttentionCache } from "../../contracts/mlx/cache";
 import { rmsNormF32Mlx } from "./mla";
 
 /** What the MTP graph reads of the GLM-5.2 model it shares weights with. */
@@ -15,7 +15,7 @@ export interface Glm52MtpHost {
 
 /** The MTP decoder layer (the layer after the target's last). */
 export interface Glm52MtpLayer {
-  forwardAsync(input: MlxArray, cache: MLACache, dsaState: null): Promise<MlxArray>;
+  forwardAsync(input: MlxArray, cache: LatentAttentionCache, dsaState: null): Promise<MlxArray>;
 }
 
 /** Native MTP numerical graph. Tokens, anchor hidden and compressed state may
@@ -30,7 +30,7 @@ export class Glm52MtpGraph implements NativeMtpHead {
     return { kvLoraRank: config.kvLoraRank, ropeHeadDim: config.qkRopeHeadDim, maxTokens: config.maxPositionEmbeddings };
   }
 
-  async forward(ids: MlxArray, hidden: MlxArray, cache: MLACache): Promise<MlxArray> {
+  async forward(ids: MlxArray, hidden: MlxArray, cache: LatentAttentionCache): Promise<MlxArray> {
     const { glmConfig: config, weights } = this.model;
     const prefix = `model.layers.${config.numHiddenLayers}`;
     using embedded = weights.embedding(ids, "model.embed_tokens.weight", config.vocabSize, config.hiddenSize);

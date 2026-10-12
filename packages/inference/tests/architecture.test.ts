@@ -842,7 +842,6 @@ const seamRatchet: RatchetTable = {
   "graph-extends": {},
   "hot-path-read": {
     "packages/inference/src/layers/geglu.ts": 1, // C2
-    "packages/inference/src/models/glm52/model.ts": 2, // no item yet: B1 defers GLM-5.2 MLA
     "packages/training/src/kernels/flash-cce.ts": 9, // C2 for now
   },
   "cache-escape": {},
