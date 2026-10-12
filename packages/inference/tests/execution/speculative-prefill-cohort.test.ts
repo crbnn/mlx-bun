@@ -1,8 +1,12 @@
 import { expect, test } from "bun:test";
 import { bindSpeculativeGroupRequests } from "../../src/execution/speculative-group";
 import type { MlxGroupMethodHost, MlxGroupPreparation, Row } from "../../src/execution/batch-types";
-import { KVCache } from "../../src/state/kv";
-import { type Cache, type Mask } from "../../src/contracts/mlx/cache";
+import { type AttentionCache, type Cache } from "../../src/contracts/mlx/cache";
+import { AttentionMasks } from "../../src/state/attention-read";
+import { composedFullAttentionCache } from "../../src/state/bf16-first-kv";
+import { unfusedAffineKernels } from "../../src/state/affine-attention";
+import { denseTurboQuantKernels } from "../../src/state/turboquant-attention";
+import { kvOf, type KvOptions } from "../models/test-composition";
 import type { RuntimeModel } from "../../src/models/factory";
 import { captureKvAttention } from "../../src/state/kv-attention-view";
 import { NgramProvider } from "../../src/generation/speculative/sources/ngram-source";
@@ -19,10 +23,11 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { declareGraph } from "../../src/models/capabilities";
+import { stubPhases } from "../models/phase-forward";
 
 /** Owned target state as stored: class, coverage, reuse floor and exact planes. */
 function encoded(caches: readonly Cache[]) {
-  return caches.map(layer => ({ kind: layer.constructor.name, offset: layer.offset,
+  return caches.map(layer => ({ kind: (layer.composed?.storage() ?? layer).constructor.name, offset: layer.offset,
     minimum: layer.minimumReusableOffset ?? 0,
     state: withResource(leaseCacheStates([layer]), arrays => arrays.map(array => {
       const end = [...array.shape]; end[2] = Math.min(end[2]!, layer.offset);
@@ -34,23 +39,29 @@ function encoded(caches: readonly Cache[]) {
 }
 
 function fixture(provider: Pick<DraftProvider, "id" | "grouped"> & { dispose(): void } = new NgramProvider(), graph: object = {},
-  options: Partial<GenerateOptions> = {}) {
+  kv: KvOptions = {}) {
   const shapes: number[][] = [], inputs: number[][] = [];
   const snapshots: { tokens: number[]; history: number[]; offset: number }[] = [];
   const puts: { tokens: number[]; history: number[]; state: ReturnType<typeof encoded> }[] = [];
   const failures: { row: Row; error: unknown }[] = [], joined: Row[] = [];
-  const model = { config: { modelType: "fixture", eosTokenIds: [] }, makeCache: () => [new KVCache()], graphCapabilities: declareGraph(),
+  // The graph composes the scheme's caches; the scheduler routes them into row
+  // layouts with the scheme's maintenance.
+  const scheme = kvOf(kv);
+  const model = { config: { modelType: "fixture", eosTokenIds: [] }, graphCapabilities: declareGraph(),
+    makeCache: () => [composedFullAttentionCache(scheme, 0, new AttentionMasks(), denseTurboQuantKernels)],
     forwardHidden(ids: MlxArray, caches: Cache[]) {
       shapes.push([...ids.shape]); inputs.push([...ids.toIntTokens()]);
       using kv = ops.reshape(ids, [ids.shape[0]!, 1, ids.shape[1]!, 1]);
-      for (const cache of caches) captureKvAttention(cache, kv, kv).dispose();
+      for (const cache of caches) captureKvAttention(cache, kv, kv, unfusedAffineKernels(4, 64, kv.dtype)).dispose();
       return ops.reshape(ids, [ids.shape[0]!, ids.shape[1]!, 1]);
     },
     logitsFromHidden(hidden: MlxArray) { return ops.copyOf(hidden); },
+    ...stubPhases((ids, caches) => model.forwardHidden(ids, caches), hidden => model.logitsFromHidden(hidden)),
     ...graph,
-  } as unknown as RuntimeModel;
+  } as unknown as RuntimeModel & { forwardHidden(ids: MlxArray, caches: Cache[]): MlxArray };
   const cache = new PromptCache(1024 ** 2);
-  const host: MlxGroupMethodHost = { rows: joined, runtime: runtimeConfig(), prefillChunkSize: 3,
+  const host: MlxGroupMethodHost = { rows: joined, runtime: runtimeConfig(), prefillChunkSize: 3, prefillTailSplit: true,
+    kvMaintenance: scheme.kind === "bf16" ? undefined : createKvMaintenance(scheme),
     promptCache: { take: cache.take.bind(cache), put(tokens, caches, namespace, retain, attachments) {
       snapshots.push({ tokens: [...tokens], history: attachments![0]!.tensors[0]!.toIntTokens(), offset: caches[0]!.offset });
       puts.push({ tokens: [...tokens], history: attachments![0]!.tensors[0]!.toIntTokens(), state: encoded(caches) });
@@ -64,7 +75,7 @@ function fixture(provider: Pick<DraftProvider, "id" | "grouped"> & { dispose(): 
     },
     async publish(row, token) { return row.req.onToken(token); }, finish() {},
   };
-  const binding = bindSpeculativeGroupRequests(model, provider, 2)!({ temperature: 0, maxTokens: 2, ...options });
+  const binding = bindSpeculativeGroupRequests(model, provider, 2)!({ temperature: 0, maxTokens: 2 });
   const method = binding.open(host);
   const row = (tokens: number[], signal?: AbortSignal): Row => {
     const request: Row = { req: { method: binding, promptIds: tokens, maxTokens: 2, eosTokenIds: [], signal,
@@ -86,9 +97,9 @@ test("budgeted method prefill retains companion history through an injected mode
   const preparation = f.method.prepare(row);
   let calls = 0;
   try {
-    while (!await preparation.advance({ maxTokens: 2, forward: async (ids, caches) => {
+    while (!await preparation.advance({ maxTokens: 2, forward: async (ids, _caches, step) => {
       expect(ids.shape[0]! * ids.shape[1]!).toBeLessThanOrEqual(2); calls++;
-      return f.model.forwardHidden(ids, caches);
+      return step.own();
     } })) { /* each bounded chunk returns to the scheduler */ }
     expect(calls).toBe(4);
     expect(f.joined).toEqual([row]);
@@ -223,7 +234,7 @@ test("the binding checks its own snapshot of the declared taps: a later change t
 });
 
 const WIDTH = 128, START = 7;
-const delayed: [string, Partial<GenerateOptions>][] = [
+const delayed: [string, KvOptions][] = [
   ["affine", { kvBits: 8, quantizedKvStart: START }],
   ["TurboQuant", { turboQuant: { kBits: 4, vBits: 3 }, quantizedKvStart: START }],
 ];
@@ -235,17 +246,18 @@ function readingGraph() {
   const graph = {
     forwardHidden(ids: MlxArray, caches: Cache[]) {
       const [batch, count] = ids.shape as [number, number], tokens = [...ids.toIntTokens()];
-      kinds.push(caches.map(cache => cache.constructor.name)); inputs.push(tokens);
+      kinds.push(caches.map(cache => (cache.composed?.storage() ?? cache).constructor.name)); inputs.push(tokens);
       using values = MlxArray.fromFloat32(Float32Array.from(tokens.flatMap(token =>
         Array.from({ length: WIDTH }, (_, column) => Math.sin(token + column / 13)))), [batch, 1, count, WIDTH]);
       using kv = values.astype(Dtype.bfloat16);
-      const mask: Mask = { mode: count > 1 ? "causal" : "", arr: null };
       let hidden: MlxArray | null = null;
       try {
         for (const cache of caches) {
-          const view = captureKvAttention(cache, kv, kv);
-          try { const attended = view.attend(kv, WIDTH ** -0.5, mask); hidden?.dispose(); hidden = attended; }
-          finally { view.dispose(); }
+          // The cache's own read for the phase, as the graphs read.
+          const attention = cache as unknown as AttentionCache;
+          const read = count > 1 ? attention.appendWindow(kv, kv) : attention.appendDecode(kv, kv);
+          try { const attended = read.attend(kv, WIDTH ** -0.5); hidden?.dispose(); hidden = attended; }
+          finally { read.dispose(); }
         }
         return ops.reshape(hidden!, [batch, count, WIDTH]);
       } finally { hidden?.dispose(); }
@@ -257,8 +269,9 @@ function readingGraph() {
   return { kinds, inputs, graph };
 }
 
-/** Lookup drafting ignores target context; record the context its prefill receives. */
-function recordingNgram() {
+/** Lookup drafting ignores target context; record the context its prefill
+ * receives. `onMaterialize` runs before the prefix rows settle a reused entry. */
+function recordingNgram(onMaterialize?: () => void) {
   const contexts: { shape: number[]; sha256: string }[] = [];
   const inner = new NgramProvider(), grouped = inner.grouped;
   const provider = { id: inner.id, dispose: () => inner.dispose(), grouped: { ...grouped,
@@ -271,21 +284,31 @@ function recordingNgram() {
         }
         return prefill(tokens, context);
       };
+      if (onMaterialize) {
+        const materialize = rows.materialize.bind(rows);
+        rows.materialize = () => { onMaterialize(); materialize(); };
+      }
       return rows;
     } } };
   return { contexts, provider };
 }
 
-function delayedFixture(scheme: Partial<GenerateOptions>) {
-  const reading = readingGraph(), recording = recordingNgram();
+function delayedFixture(scheme: KvOptions, onMaterialize?: () => void) {
+  const reading = readingGraph(), recording = recordingNgram(onMaterialize);
   const f = fixture(recording.provider, reading.graph, scheme);
   return { ...f, kinds: reading.kinds, forwards: reading.inputs, contexts: recording.contexts,
     reset() { reading.kinds.length = 0; reading.inputs.length = 0; recording.contexts.length = 0; f.puts.length = 0; } };
 }
 
+const convertedKind = (scheme: KvOptions) => scheme.turboQuant ? "TurboQuantKVCache" : "QuantizedKVCache";
+
 /** A finished request stores [1..5, 6, 0]. Its last verify round had no draft,
- * so that round's append reached START with no maintenance after it. */
-async function storeOwedPrefix(f: ReturnType<typeof delayedFixture>): Promise<number[]> {
+ * so that round's append reached START and the row layout had not converted it
+ * at a planned boundary; the row handed back to serial use is the graph's lego
+ * again, which converts storage already holding its start as it adopts it. So
+ * the stored prefix owes no conversion: it is converted at START, its reuse
+ * floor. */
+async function storeConvertedPrefix(f: ReturnType<typeof delayedFixture>, scheme: KvOptions): Promise<number[]> {
   const row = f.row([1, 2, 3, 4, 5, 6]), preparation = f.method.prepare(row);
   try { await drain(preparation); } finally { preparation.dispose(); }
   expect(f.joined).toEqual([row]);
@@ -293,32 +316,16 @@ async function storeOwedPrefix(f: ReturnType<typeof delayedFixture>): Promise<nu
   expect(f.joined).toEqual([]); expect(f.failures).toEqual([]);
   const stored = f.puts.at(-1)!;
   expect(stored.tokens).toEqual([1, 2, 3, 4, 5, 6, 0]);
-  expect(stored.state.map(({ kind, offset }) => ({ kind, offset }))).toEqual([{ kind: "KVCache", offset: START }]);
+  expect(stored.state.map(({ kind, offset, minimum }) => ({ kind, offset, minimum })))
+    .toEqual([{ kind: convertedKind(scheme), offset: START, minimum: START }]);
   return stored.tokens;
 }
 
-/** The control reuses the same prefix maintained after its last append, as
- * mlx-lm leaves a cache; the subject reuses it as stored. */
-function reuseMaintained(f: ReturnType<typeof delayedFixture>, scheme: Partial<GenerateOptions>) {
-  const cache = f.host.promptCache!, take = cache.take.bind(cache);
-  cache.take = (...args) => {
-    const hit = take(...args);
-    if (!hit) return hit;
-    try { createKvMaintenance(scheme)(hit.caches); }
-    catch (error) {
-      cleanupFailure(error, () => disposeResources([...hit.caches,
-        { dispose: () => disposeAttachments(hit.attachments) }, { dispose: () => hit.retain?.() }]));
-    }
-    return hit;
-  };
-}
-
-test.each(delayed)("a reused speculative prefix owing its last append's conversion is maintained before its first suffix forward, alone or joining: %s", async (_name, scheme) => {
-  const run = async (maintained: boolean, joining: boolean) => {
+test.each(delayed)("a reused speculative prefix stored at its start reads its converted storage from the first suffix forward, alone or joining: %s", async (_name, scheme) => {
+  const run = async (joining: boolean) => {
     const f = delayedFixture(scheme);
     try {
-      const stored = await storeOwedPrefix(f);
-      if (maintained) reuseMaintained(f, scheme);
+      const stored = await storeConvertedPrefix(f, scheme);
       f.reset();
       const row = f.row([...stored, 31, 32, 33, 34]), peer = f.row([11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
       const preparation = f.method.prepare(joining ? peer : row);
@@ -328,56 +335,55 @@ test.each(delayed)("a reused speculative prefix owing its last append's conversi
         await drain(preparation);
       } finally { preparation.dispose(); }
       expect(f.failures).toEqual([]);
-      return { kinds: f.kinds, forwards: f.forwards, contexts: f.contexts, puts: f.puts,
-        current: [row.current, peer.current], joined: f.joined.length };
+      return { kinds: f.kinds, contexts: f.contexts, current: row.current,
+        stored: f.puts.filter(put => put.tokens[0] === 1) };
     } finally { f.dispose(); }
   };
-  for (const joining of [false, true]) {
-    const control = await run(true, joining), owed = await run(false, joining);
-    if (!joining) expect(owed.kinds[0]).toEqual([scheme.turboQuant ? "TurboQuantKVCache" : "QuantizedKVCache"]);
-    expect(owed.contexts.length).toBeGreaterThan(0);
-    expect(owed).toEqual(control);
-  }
+  const alone = await run(false), joining = await run(true);
+  expect(alone.kinds[0]).toEqual([convertedKind(scheme)]);
+  for (const result of [alone, joining]) expect(result.contexts.length).toBeGreaterThan(0);
+  // The row's precision and positions are its own, whoever prefills beside it.
+  expect(joining.current).toBe(alone.current);
+  expect(joining.stored).toEqual(alone.stored);
 });
 
-test.each(delayed)("a reused speculative prefix covering the whole prefill runs no target prefill and verifies as the maintained prefix does: %s", async (_name, scheme) => {
-  const run = async (maintained: boolean) => {
-    const f = delayedFixture(scheme);
+test.each(delayed)("a reused speculative prefix covering the whole prefill runs no target prefill and verifies over its converted storage: %s", async (_name, scheme) => {
+  const f = delayedFixture(scheme);
+  try {
+    const stored = await storeConvertedPrefix(f, scheme);
+    f.reset();
+    const row = f.row([...stored, 9]), preparation = f.method.prepare(row);
     try {
-      const stored = await storeOwedPrefix(f);
-      if (maintained) reuseMaintained(f, scheme);
-      f.reset();
-      const row = f.row([...stored, 9]), preparation = f.method.prepare(row);
-      try {
-        expect(row.cachedTokens).toBe(stored.length);
-        await drain(preparation);
-      } finally { preparation.dispose(); }
-      expect(f.forwards).toEqual([]); expect(f.contexts).toEqual([]);
-      expect(f.joined).toEqual([row]);
-      for (let round = 0; round < 2; round++) await f.method.advance();
-      expect(f.joined).toEqual([]); expect(f.failures).toEqual([]);
-      return { kinds: f.kinds, forwards: f.forwards, puts: f.puts };
-    } finally { f.dispose(); }
-  };
-  expect(await run(false)).toEqual(await run(true));
+      expect(row.cachedTokens).toBe(stored.length);
+      await drain(preparation);
+    } finally { preparation.dispose(); }
+    expect(f.forwards).toEqual([]); expect(f.contexts).toEqual([]);
+    expect(f.joined).toEqual([row]);
+    for (let round = 0; round < 2; round++) await f.method.advance();
+    expect(f.joined).toEqual([]); expect(f.failures).toEqual([]);
+    expect(f.forwards.length).toBeGreaterThan(0);
+    const final = f.puts.at(-1)!.state[0]!;
+    expect({ kind: final.kind, minimum: final.minimum }).toEqual({ kind: convertedKind(scheme), minimum: START });
+    expect(final.offset).toBeGreaterThan(START);
+  } finally { f.dispose(); }
 });
 
-test.each(delayed)("a failed initial maintenance releases the reused prefix and its lease once and leaves a prefilling peer unchanged: %s", async (_name, scheme) => {
-  const failure = new Error("injected conversion failure");
+test.each(delayed)("a failed admission after its prefix is reused releases the prefix and its lease once and leaves a prefilling peer unchanged: %s", async (_name, scheme) => {
+  const failure = new Error("injected admission failure");
   const run = async (arrival: boolean) => {
-    const f = delayedFixture(scheme), disposed: number[] = [];
+    let failing = false;
+    const f = delayedFixture(scheme, () => { if (failing) throw failure; }), disposed: number[] = [];
     let released = 0;
     try {
-      const stored = await storeOwedPrefix(f);
+      const stored = await storeConvertedPrefix(f, scheme);
       const cache = f.host.promptCache!, take = cache.take.bind(cache);
-      // The arrival's owned hit cannot convert; each release is counted.
+      // Each release of the arrival's owned hit is counted.
       cache.take = (...args) => {
         const hit = take(...args);
         if (!hit) return hit;
         hit.caches.forEach((layer, index) => {
           const dispose = layer.dispose.bind(layer);
-          Object.assign(layer, { temporalView() { throw failure; }, toQuantized() { throw failure; },
-            dispose() { disposed.push(index); dispose(); } });
+          Object.assign(layer, { dispose() { disposed.push(index); dispose(); } });
         });
         const retain = hit.retain;
         hit.retain = () => { released++; retain?.(); };
@@ -388,7 +394,10 @@ test.each(delayed)("a failed initial maintenance releases the reused prefix and 
       try {
         expect(await preparation.advance()).toBe(false);
         if (arrival) {
+          // The companion rows cannot settle the reused entry, after it was appended.
+          failing = true;
           expect(() => preparation.admit!(f.row([...stored, 41, 42, 43]))).toThrow(failure.message);
+          failing = false;
           expect({ disposed, released }).toEqual({ disposed: [0], released: 1 });
           expect(preparation.rows).toEqual([peer]);
         }

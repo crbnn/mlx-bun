@@ -26,8 +26,7 @@ import { trainForward, trainForwardHidden } from "@mlx-bun/inference/scoring";
 import { setLoraScale, type TrainableLora } from "./lora-params";
 import type { HeadQuant } from "@mlx-bun/inference/contracts/mlx";
 import { lmHeadOf } from "./declared";
-import { flashCceForward, flashCceBackward, type FlashCceHead } from "./kernels/flash-cce";
-import { runtimeValue } from "@mlx-bun/inference/runtime/config";
+import type { FlashCce, FlashCceHead } from "./kernels/flash-cce";
 
 /** Token-chunking context for the ORPO loss head. When `chunkSize > 0`, the B=1
  *  response-only head is computed in token-chunks, each wrapped in a Checkpoint
@@ -47,12 +46,13 @@ export interface ChunkCtx {
    *  directions and is the Liger/CCE structure (the moat). Off → the Checkpoint
    *  token-chunked head (unchanged). */
   fused?: boolean;
-  /** When set (with `fused`), route the head through the flash-CCE Metal kernel
-   *  (`makeFlashCceHeadVjp`): in-kernel quantized logits + online softmax (fwd) and
-   *  `dh` accumulation (bwd), so neither `[M,V]` logits nor a dequantized head touch
-   *  HBM — the lowest-memory head, and the fastest on large vocab (e4b/CPM). The
-   *  Apple-CCE coeff filter is on by default in the backward. */
-  flash?: boolean;
+  /** When set (with `fused`), route the head through these flash-CCE Metal kernels
+   *  (`makeFlashCceHeadVjp`), composed once for the run: in-kernel quantized logits
+   *  + online softmax (fwd) and `dh` accumulation (bwd), so neither `[M,V]` logits
+   *  nor a dequantized head touch HBM — the lowest-memory head, and the fastest on
+   *  large vocab (e4b/CPM). The Apple-CCE coeff filter is on by default in the
+   *  backward. */
+  flash?: FlashCce;
   /** Disposables whose lifetime must extend past the enclosing value_and_grad
    *  backward: the per-chunk `Checkpoint`s / the fused `CustomVjp` (they recompute
    *  in the backward) AND the hidden `h` / chunk slices they read (these
@@ -582,7 +582,7 @@ function branchLogpMean(
   if (ids.length === 1) {
     if (chunk && chunk.chunkSize > 0)
       return chunk.fused
-        ? fusedLogpMeanB1(model, ids[0]!, mask[0]!, validLen[0]!, chunk.chunkSize, chunk.sink, 0, chunk.flash ?? false)
+        ? fusedLogpMeanB1(model, ids[0]!, mask[0]!, validLen[0]!, chunk.chunkSize, chunk.sink, 0, chunk.flash ?? null)
         : chunkedLogpMeanB1(model, ids[0]!, mask[0]!, validLen[0]!, chunk.chunkSize, chunk.sink);
     return branchLogpMeanB1(model, ids[0]!, mask[0]!, validLen[0]!);
   }
@@ -832,7 +832,7 @@ export function fusedLogpMeanB1(
   chunkSize: number,
   sink: Array<{ dispose(): void }>,
   vocabBlock = 0,
-  flash = false,
+  flash: FlashCce | null = null,
 ): MlxArray {
   const L = ids.length;
   const T = L - 1;
@@ -879,7 +879,7 @@ export function fusedLogpMeanFromHidden(
   chunkSize: number,
   sink: Array<{ dispose(): void }>,
   vocabBlock = 0,
-  flash = false,
+  flash: FlashCce | null = null,
   span?: HeadSpan, // override the mask-derived response span (sft_scope:"full" prompt span)
 ): MlxArray {
   const L = ids.length;
@@ -1104,12 +1104,13 @@ function makeVocabBlockedHeadVjp(
 /** flash-CCE head as a CustomVjp: forward runs the Metal kernel → Σ logp (stashing
  *  `lse` for the backward, avoiding a forward recompute); backward runs the kernel's
  *  `dh` for unit cotangent then scales by the scalar cotangent `c` (loss = Σ logp →
- *  ∂loss/∂logp_t = c for all t). The coeff filter + vocab-block skip default ON at
- *  1e-5 (2026-07-02 flip; real-data gates in flash-cce.ts) — set
- *  MLX_BUN_CCE_BWD_{FILTER,BLOCK}_EPS=0 for the EXACT dh. */
+ *  ∂loss/∂logp_t = c for all t). `kernels` carries the run's composed choices: the
+ *  coeff filter + vocab-block skip default ON at 1e-5 (2026-07-02 flip; real-data
+ *  gates in flash-cce.ts), and MLX_BUN_CCE_BWD_{FILTER,BLOCK}_EPS=0 at run start
+ *  gives the EXACT dh. */
 function makeFlashCceHeadVjp(
   head: HeadQuant, targetsHost: Int32Array, M: number,
-  sink: Array<{ dispose(): void }>,
+  sink: Array<{ dispose(): void }>, kernels: FlashCce,
 ): CustomVjp {
   if (!head.biases) throw new Error("flash-CCE head requires affine (biased) quantization");
   const fch: FlashCceHead = {
@@ -1122,7 +1123,7 @@ function makeFlashCceHeadVjp(
   return new CustomVjp(
     (inputs) => {
       const hR = inputs[0]!; // [M, hidden]
-      const { logp, lse, blockMax } = flashCceForward(hR, fch, targets); // logp[M], lse[M], blockMax[M,NBLK]
+      const { logp, lse, blockMax } = kernels.forward(hR, fch, targets); // logp[M], lse[M], blockMax[M,NBLK]
       savedLse = lse; sink.push(lse); // stash lse + blockMax → backward (no recompute;
       savedBlockMax = blockMax; sink.push(blockMax); // blockMax drives the vocab-block skip)
       const logpF = logp.dtype === Dtype.float32 ? logp : logp.astype(Dtype.float32);
@@ -1137,9 +1138,9 @@ function makeFlashCceHeadVjp(
       const c = cots[0]!;      // [1] = ∂loss/∂(Σ logp); uniform over tokens
       // dh for unit cotangent, then × c (avoids a host read of the cotangent).
       const ones = new Array(M).fill(1) as number[];
-      // filter + block-skip default ON at 1e-5 (env-overridable; =0 → exact dh).
+      // filter + block-skip at the run's composed epsilons (default 1e-5; "0" → exact dh).
       // savedBlockMax feeds the ~lossless vocab-block skip.
-      const dhUnit = flashCceBackward(hR, fch, targets, savedLse!, ones, undefined, savedBlockMax!); // [M, hidden] f32
+      const dhUnit = kernels.backward(hR, fch, targets, savedLse!, ones, undefined, savedBlockMax!); // [M, hidden] f32
       const cM = c.dtype === dhUnit.dtype ? c : c.astype(dhUnit.dtype);
       const dh = ops.mul(dhUnit, cM); // broadcast [M,hidden]·[1]
       if (cM !== c) cM.dispose();
@@ -1158,7 +1159,7 @@ export function fusedRespLogpMean(
   chunkSize: number,
   sink: Array<{ dispose(): void }>,
   vocabBlock = 0,
-  flash = false,
+  flash: FlashCce | null = null,
 ): MlxArray {
   const M = hResp.shape[0]!;
   const hidden = hResp.shape[1]!;
@@ -1174,15 +1175,15 @@ export function fusedRespLogpMean(
   // at short M (e4b M=64 1.6×, M=512 1.13×; CPM5 faster at EVERY M) — the
   // flash head's win is residency, plus time at long M on e4b (M≥2048 after
   // the 2026-07-02 filter/blockMax flip; 8K: 10.7 vs 13.2 s). So a
-  // requested-flash batch with M below MLX_BUN_FLASH_MIN_M (default 1024, the
-  // e4b time-tie point where flash's memory win takes over) takes the EXACT
-  // fused head instead — short rows get the faster exact head for free.
-  // MLX_BUN_FLASH_MIN_M=0 always honors flash (the pre-dispatch behavior).
-  const flashMinM = Number(runtimeValue("MLX_BUN_FLASH_MIN_M") ?? "1024");
-  const useFlash = flash && (flashMinM <= 0 || M >= flashMinM);
+  // requested-flash batch with M below the kernels' `minRows` (MLX_BUN_FLASH_MIN_M
+  // at run start, default 1024, the e4b time-tie point where flash's memory win
+  // takes over) takes the EXACT fused head instead — short rows get the faster
+  // exact head for free. `minRows` 0 always honors flash (the pre-dispatch behavior).
+  const flashMinM = flash?.options.minRows ?? 0;
+  const useFlash = flash !== null && (flashMinM <= 0 || M >= flashMinM);
   let op: CustomVjp;
   if (useFlash) {
-    op = makeFlashCceHeadVjp(head, targetsHost, M, sink);
+    op = makeFlashCceHeadVjp(head, targetsHost, M, sink, flash);
   } else if (vb > 0) {
     op = makeVocabBlockedHeadVjp(head, targetsHost, M, hidden, chunk, vb);
   } else {
@@ -1364,9 +1365,9 @@ function chosenLogpMeanAndFullNllB1(
   let pm: MlxArray | null = null; // prompt-span mean logp (positions [0, startT))
   if (useFused) {
     chunk!.sink.push(h); // CustomVjp/flash primal source — alive until post-eval
-    lw = fusedLogpMeanFromHidden(model, h, ids, mask, chunk!.chunkSize, chunk!.sink, 0, chunk!.flash ?? false, { startT, M });
+    lw = fusedLogpMeanFromHidden(model, h, ids, mask, chunk!.chunkSize, chunk!.sink, 0, chunk!.flash ?? null, { startT, M });
     if (startT > 0)
-      pm = fusedLogpMeanFromHidden(model, h, ids, mask, chunk!.chunkSize, chunk!.sink, 0, chunk!.flash ?? false, { startT: 0, M: startT });
+      pm = fusedLogpMeanFromHidden(model, h, ids, mask, chunk!.chunkSize, chunk!.sink, 0, chunk!.flash ?? null, { startT: 0, M: startT });
   } else if (useChunked) {
     chunk!.sink.push(h); // Checkpoint input — alive until post-eval
     lw = chunkedLogpMeanFromHidden(model, h, ids, mask, chunk!.chunkSize, chunk!.sink, { startT, M });

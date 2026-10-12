@@ -6,7 +6,7 @@ import type { RuntimeModel } from "@mlx-bun/inference/models";
 import { bindLegacyDraftTarget } from "@mlx-bun/inference/generation/speculative/binding";
 import { targetLacks, type DraftProjection } from "@mlx-bun/inference/generation/speculative";
 
-/** The target's draft projection: `embed` and `logitsFromHidden`. Borrowed from the model. */
+/** The target's draft projection: `embed` and the head table (`logits`). Borrowed from the model. */
 export function draftProjection(model: RuntimeModel): DraftProjection {
   const taps = bindLegacyDraftTarget(model, []).hiddenLayerTaps;
   if (!taps) throw targetLacks("hiddenLayerTaps");

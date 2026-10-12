@@ -103,13 +103,16 @@ async function checkNotices(directory: string, label: string, sections: string[]
   console.log(`${label} bundle notices: all ${sections.length} sections retained.`);
 }
 
-/** CPU acceptance of a bundle archive, shared by `verify:binary` and release
+/** Model-free acceptance of a bundle archive, shared by `verify:binary` and release
  * preparation. Extracts the archive into its own temporary directory (a path
  * other than the build output), compiles the verification consumer into that
  * copy, runs the actual CLI and consumer, then installs the unchanged archive
  * through scripts/install.sh with a local curl stub and temporary home, and
- * upgrades once. Never writes to the archive's source bundle or the real home.
- * `model` additionally runs real GPU inference through the relocated server. */
+ * upgrades once; each install ends with the installed executable's Neural
+ * Engine install step, which must run (it compiles, reports nothing to compile,
+ * or warns where the Neural Engine cannot compile). Never writes to the
+ * archive's source bundle or the real home. `model` additionally runs real GPU
+ * inference through the relocated server. */
 export async function verifyBundle({ archive, version, model }: { archive: string; version: string; model?: string }) {
   const temporary = await mkdtemp(join(tmpdir(), "mlx-bundle-"));
   try {
@@ -170,7 +173,17 @@ cp "$MLX_BUN_TEST_ARCHIVE" "$output"
     const installEnvironment = { ...env, HOME: installHome,
       PATH: `${transport}:${process.env.PATH}`, MLX_BUN_INSTALL_DIR: join(installHome, ".mlx-bun"),
       MLX_BUN_VERSION: `v${version}`, MLX_BUN_TEST_ARCHIVE: archive };
-    await run(["/bin/sh", join(root, "scripts/install.sh")], installEnvironment);
+    /** The installer, which ends with the installed executable's Neural Engine install step (`mlx-bun compile-ane`):
+     *  it compiles this Mac's programs or reports none to compile, and where the Neural Engine cannot compile (a
+     *  virtual machine) it warns and keeps the installation. */
+    async function install(): Promise<void> {
+      const child = Bun.spawn(["/bin/sh", join(root, "scripts/install.sh")], { cwd: scratch, env: installEnvironment, stdout: "pipe", stderr: "pipe" });
+      const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      assert.equal(code, 0, `install.sh failed: ${out}\n${err}`);
+      assert(out.includes("Neural Engine") || err.includes("Warning: the Neural Engine install step failed"),
+        `install.sh must run the Neural Engine install step:\n${out}\n${err}`);
+    }
+    await install();
     assert.equal(await run([join(installHome, ".local/bin/mlx-bun"), "--version"]), `mlx-bun ${version}\n`);
     await checkAliases(join(installHome, ".local/bin"), "Installed");
     const installed = join(installHome, ".mlx-bun/app-install"), current = join(installed, "current");
@@ -179,20 +192,20 @@ cp "$MLX_BUN_TEST_ARCHIVE" "$output"
     const installedScratch = join(temporary, "installed consumer"); await mkdir(installedScratch);
     console.log(await run([join(current, "verify-consumer"), installedScratch]));
     const previous = join(installed, await readlink(current));
-    await run(["/bin/sh", join(root, "scripts/install.sh")], installEnvironment);
+    await install();
     // Managed jobs from a process started before the upgrade still use its old
     // canonical executable. Exercise that retained bundle's actual reentry.
     await checkNotices(previous, "Installed previous", sections);
     const previousScratch = join(temporary, "previous consumer"); await mkdir(previousScratch);
     console.log(await run([join(previous, "verify-consumer"), previousScratch]));
-    console.log("Local installer: actual compiled app, assets and managed child passed through installed symlinks (CPU only).");
+    console.log("Local installer: actual compiled app, assets and managed child passed through installed symlinks; the installer's Neural Engine install step ran (no model inference).");
     if (model) await verifyModel(executable, model, scratch, env);
   } finally { await rm(temporary, { recursive: true, force: true }); }
 }
 
 if (import.meta.main) {
   if (process.argv.includes("--help")) {
-    console.log("Usage: bun scripts/verify-binary.ts [--model CACHED_DIRECTORY]\nBuild and archive the app bundle, then relocate, install, and exercise it. Default: CPU only.\n--model additionally runs real GPU inference through the relocated product server; uses cached weights and isolated temporary storage.");
+    console.log("Usage: bun scripts/verify-binary.ts [--model CACHED_DIRECTORY]\nBuild and archive the app bundle, then relocate, install, and exercise it. Default: no model inference; the installer\nends with the Neural Engine install step, which compiles this Mac's programs or, where the Neural Engine cannot\ncompile, warns and keeps the installation.\n--model additionally runs real GPU inference through the relocated product server; uses cached weights and isolated temporary storage.");
     process.exit(0);
   }
   const args = process.argv.slice(2);

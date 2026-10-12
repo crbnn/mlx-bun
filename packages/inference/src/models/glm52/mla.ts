@@ -14,7 +14,7 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { Glm52Config } from "../../artifacts/glm52-config";
 import type { ColibriGlm52Weights } from "../../artifacts/glm52/weights";
-import type { MLACache,MLACompressedState } from "../../state/glm52-cache";
+import type { LatentAttentionCache, LatentAttentionState } from "../../contracts/mlx/cache";
 
 export interface Glm52MlaProjection {
   /** [B,T,H,qk_nope_head_dim]. */
@@ -246,18 +246,32 @@ function disposeProjection(projection: Glm52MlaProjection): void {
   projection.rope.dispose();
 }
 
-function disposeState(state: MLACompressedState): void {
+function disposeState(state: LatentAttentionState): void {
   state.latent.dispose();
   state.rope.dispose();
-  state.dsa?.dispose();
+  state.indexKeys?.dispose();
 }
+
+/** How an MLA block reads its compressed cache, fixed when the block is built:
+ * the append of its projected state and the state read back. */
+export interface LatentAttentionReads {
+  append(cache: LatentAttentionCache, latent: MlxArray, rope: MlxArray, indexKeys: MlxArray | null): LatentAttentionState;
+}
+
+/** The cache's own read (`LatentAttentionCache.appendLatent`): the default. */
+export const latentCacheRead: LatentAttentionReads = Object.freeze({
+  append: (cache: LatentAttentionCache, latent: MlxArray, rope: MlxArray, indexKeys: MlxArray | null) =>
+    cache.appendLatent(latent, rope, indexKeys),
+});
 
 /**
  * MLX correctness implementation of GLM-5.2 MLA.
  *
  * This is deliberately independent from the future fused MLA kernel. It loads
  * the existing Colibri artifact directly through ColibriGlm52Weights and pins
- * the mathematical contract used by that optimized path.
+ * the mathematical contract used by that optimized path. `reads` is how the
+ * block reads its compressed cache (`LatentAttentionCache`), fixed when the
+ * block is built.
  */
 export class Glm52Mla {
   readonly config: Glm52Config;
@@ -268,6 +282,7 @@ export class Glm52Mla {
     config: Glm52Config,
     weights: ColibriGlm52Weights | Glm52MlaWeightSource,
     layerIndex: number,
+    readonly reads: LatentAttentionReads = latentCacheRead,
   ) {
     if (!Number.isSafeInteger(layerIndex) || layerIndex < 0 ||
         layerIndex > config.numHiddenLayers) {
@@ -387,7 +402,7 @@ export class Glm52Mla {
    */
   forward(
     input: MlxArray,
-    cache: MLACache,
+    cache: LatentAttentionCache,
     dsa: MlxArray | null = null,
     path: Glm52MlaPath = "auto",
     selectedPositions: Glm52MlaSelectedPositions = null,
@@ -406,11 +421,7 @@ export class Glm52Mla {
           : new Array(batch).fill(0) as number[])
       : cache.offset;
     const projection = this.project(input, positionOffset);
-    const state = cache.appendCompressed(
-      projection.latent,
-      projection.rope,
-      dsa,
-    );
+    const state = this.reads.append(cache, projection.latent, projection.rope, dsa);
     const selectedPath = path === "auto"
       ? (tokens === 1 ? "absorbed" : "reconstructed")
       : path;
@@ -478,7 +489,7 @@ export class Glm52Mla {
   /** Reconstruct no-PE keys and values for the complete cached prefix. */
   attendReconstructed(
     projection: Pick<Glm52MlaProjection, "qNope" | "qRope">,
-    state: Pick<MLACompressedState, "latent" | "rope">,
+    state: Pick<LatentAttentionState, "latent" | "rope">,
     leftPadding: readonly number[] = [],
   ): MlxArray {
     const [batch, tokens] = projection.qNope.shape;
@@ -616,7 +627,7 @@ export class Glm52Mla {
    */
   attendAbsorbed(
     projection: Pick<Glm52MlaProjection, "qNope" | "qRope">,
-    state: Pick<MLACompressedState, "latent" | "rope">,
+    state: Pick<LatentAttentionState, "latent" | "rope">,
     selectedPositions: Glm52MlaSelectedPositions = null,
   ): MlxArray {
     const [batch, tokens] = projection.qNope.shape;

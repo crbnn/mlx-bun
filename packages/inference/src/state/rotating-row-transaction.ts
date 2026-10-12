@@ -22,14 +22,14 @@ export function rollbackRotatingRing(ring: RotatingRing, before: readonly number
     let values: ops.QuantizedTensor;
     try { values = quantizedRowStorage.rollRows(ring.values!, indices); }
     catch (error) { quantizedRowStorage.dispose(keys); throw error; }
-    next = BatchedRotatingQuantCache.adoptPhysical(keys, values, ring.groupSize, ring.bits, plan.position);
+    next = BatchedRotatingQuantCache.adoptPhysical(keys, values, ring.groupSize, ring.bits, ring.kernels, plan.position, ring.masks);
   } else {
     using indices = rowRollIndices(ring.keys!.shape[2]!, plan.shifts);
     const keys = plainRowStorage.rollRows(ring.keys!, indices);
     let values: import("@mlx-bun/mlx/array").MlxArray;
     try { values = plainRowStorage.rollRows(ring.values!, indices); }
     catch (error) { keys.dispose(); throw error; }
-    next = BatchedRotatingCache.adoptPhysical(keys, values, plan.position);
+    next = BatchedRotatingCache.adoptPhysical(keys, values, plan.position, ring.masks);
   }
   ring.dispose(); return next;
 }

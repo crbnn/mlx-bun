@@ -4,7 +4,7 @@ import type { ExecutionContext } from "../contracts/portable/scheduling";
 import { type RuntimeConfig } from "../runtime/config";
 import type { PromptResponseTrace } from "../runtime/trace";
 import type { GrammarController } from "../sampling/grammar";
-import type { KvScheme } from "../state/kv-scheme";
+import type { KvMaintenance } from "../contracts/mlx/cache";
 import type { MlxRequestStatePolicy } from "../state/request-policy";
 import type { OrdinaryContinuation } from "./continuation-types";
 
@@ -40,7 +40,12 @@ export interface MlxGroupMethodHost {
   readonly rows: readonly Row[];
   readonly runtime: RuntimeConfig;
   readonly prefillChunkSize: number;
+  /** The composition's `prefillTailSplit`: a prompt's last token prefills alone. */
+  readonly prefillTailSplit: boolean;
   readonly promptCache: RowPromptCache | undefined;
+  /** The row-layout maintenance of the composition's KV scheme (where a row's
+   * composed caches join row layouts); absent under bf16. */
+  readonly kvMaintenance: KvMaintenance | undefined;
   join(row: Row): void;
   filterRows(keep: number[]): void;
   publish(row: Row, token: number, logprobs?: import("../generation/index").TokenLogprobs): Promise<void | boolean>;
@@ -106,7 +111,7 @@ export interface BatchRequestFields {
    *  log-softmax+argmax over [B,V] instead of B slice/sample/concat graphs)
    *  when EVERY live row qualifies. Numerically identical per row
    *  (row-independent ops, same per-row shapes); the per-row closure path
-   *  is the fallback and the MLX_BUN_BATCH_VEC_SAMPLE=0 kill switch. */
+   *  is the fallback and the composition's `vectorGreedySampling: false`. */
   plainGreedy?: boolean;
   /** Grammar controller for this row (B1: per-row matchers). When set, the
    *  scheduler drives it: `accept()` after each emitted token (fires the async
@@ -222,12 +227,6 @@ export interface MlxBatchExecutionGroupOptions {
    *  evict. A request that can NEVER fit (over budget alone, empty batch)
    *  is rejected instead of deadlocking. Unset = unlimited (v1 behavior). */
   kvBudgetBytes?: number;
-  /** Authoritative server-wide scheme. Each joiner's solo prefill converts at
-   * the same chunk boundaries as the serial path, so a row's quantized bytes
-   * preserve the L2 composition. Unsupported schemes fail at construction. */
-  kvScheme?: KvScheme;
-  /** Model binding owns support for precision transitions. */
-  kvBatchCapabilities?: { delayedAffine?: boolean };
   /** Prompt-cache hook: admission take()s the longest usable
    *  prefix into the joiner's solo caches (suffix-only prefill — the
    *  multi-turn chat TTFT path); rows that finish never-merged put() their

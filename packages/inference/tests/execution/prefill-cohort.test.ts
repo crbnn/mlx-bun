@@ -3,13 +3,14 @@ import { createHash } from "node:crypto";
 import { MlxPrefillCohort, type PrefillState } from "../../src/execution/prefill-cohort";
 import type { Row } from "../../src/execution/batch-types";
 import type { RuntimeModel } from "../../src/models/factory";
-import { KVCache } from "../../src/state/kv";
-import { type Cache } from "../../src/contracts/mlx/cache";
+import { type AttentionCache, type Cache } from "../../src/contracts/mlx/cache";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
-import { captureKvAttention } from "../../src/state/kv-attention-view";
+import { AttentionMasks } from "../../src/state/attention-read";
+import { composedFullAttentionCache } from "../../src/state/bf16-first-kv";
 import { createKvMaintenance } from "../../src/state/kv-maintenance";
-import type { KvSchemeOptions } from "../../src/state/kv-scheme";
+import { denseTurboQuantKernels } from "../../src/state/turboquant-attention";
+import { kvOf, type KvOptions } from "../models/test-composition";
 import { leaseCacheStates } from "../../src/state/leases";
 import { PromptResponseTrace, type P2RTraceRecord } from "../../src/runtime/trace";
 import { withResource } from "../../src/runtime/resources";
@@ -37,13 +38,20 @@ function encoded(cache: Cache[]) {
     })),
   }));
 }
-function fixture(options: KvSchemeOptions = {}, failId?: number) {
+/** One full-attention layer as a graph composed with `kv` builds it. */
+const composedCaches = (kv: KvOptions): Cache[] =>
+  [composedFullAttentionCache(kvOf(kv), 0, new AttentionMasks(), denseTurboQuantKernels)];
+/** Every layer appends `kv` through its window read. */
+const appendAll = (caches: Cache[], kv: MlxArray) => {
+  for (const cache of caches) (cache as unknown as AttentionCache).appendWindow(kv, kv).dispose();
+};
+function fixture(options: KvOptions = {}, failId?: number) {
   const completed = new Map<number, ReturnType<typeof encoded>>();
   const snapshots = new Map<number, ReturnType<typeof encoded>>();
   const rejected: unknown[] = [], shapes: number[][] = [], input: number[][][] = [], kinds: string[][] = [];
-  const model = { makeCache: () => [new KVCache()] } as unknown as RuntimeModel;
+  const model = { makeCache: () => composedCaches(options) } as unknown as RuntimeModel;
   const cohort = new MlxPrefillCohort({ model, chunkSize: 5, tailSplit: true,
-    maintain: createKvMaintenance(options),
+    maintain: createKvMaintenance(kvOf(options)),
     promptCache: { take: () => null, put(tokens, cache) {
       snapshots.set(tokens[0]!, encoded(cache)); dispose(cache);
     } },
@@ -55,7 +63,7 @@ function fixture(options: KvSchemeOptions = {}, failId?: number) {
       // mixing. Precision/positions use the actual native cache layouts.
       using kv = MlxArray.fromFloat32(Float32Array.from(tokens.flatMap(token =>
         Array.from({ length: 128 }, (_, column) => Math.sin(token + column / 13)))), [batch, 1, count, 128]);
-      for (const cache of caches) { const view = cache.attentionState?.appendAndFetch(kv, kv) ?? captureKvAttention(cache, kv, kv); view.dispose(); }
+      appendAll(caches, kv);
       return ops.reshape(ids, [batch, count, 1]);
     },
     project(hidden) { return ops.copyOf(hidden); },
@@ -82,7 +90,7 @@ test("prepared inputs keep their whole attention span and project only the final
     const tokens = [...ids.toIntTokens()];
     using kv = MlxArray.fromFloat32(Float32Array.from(tokens.flatMap(token =>
       Array.from({ length: 128 }, (_, column) => Math.sin(token + column / 13)))), [1, 1, tokens.length, 128]);
-    for (const cache of caches) captureKvAttention(cache, kv, kv).dispose();
+    appendAll(caches, kv);
     return ops.reshape(ids, [1, tokens.length, 1]);
   });
   try {
@@ -105,7 +113,7 @@ test("prepared inputs keep their whole attention span and project only the final
 test("cancelled prepared input never forwards and releases its fresh row", async () => {
   const f = fixture(), abort = new AbortController(), request = row(1, 270, 5, abort.signal);
   let calls = 0;
-  request.req.promptInput = { forward() { calls++; throw new Error("unexpected forward"); } };
+  request.req.promptInput = { prefill() { calls++; throw new Error("unexpected forward"); } };
   try {
     f.cohort.admit(request); abort.abort(new Error("cancelled before prepared prefill"));
     expect(await f.cohort.advance()).toBe(true);
@@ -116,7 +124,7 @@ test("cancelled prepared input never forwards and releases its fresh row", async
   } finally { f.cohort.dispose(); }
 });
 
-const schemes: [string, KvSchemeOptions][] = [
+const schemes: [string, KvOptions][] = [
   ["plain", {}],
   ["affine immediate", { kvBits: 4, quantizedKvStart: 0 }],
   ["affine delayed", { kvBits: 8, quantizedKvStart: 5 }],
@@ -189,10 +197,10 @@ test("a completed-row consumer failure leaves another prefill running", async ()
 });
 
 test("a restored late arrival releases its backing lease after admission and preserves its prefix", async () => {
-  const f = fixture(), restored = [new KVCache()], request = row(2, 13, 3);
+  const f = fixture(), restored = composedCaches({}), request = row(2, 13, 3);
   let releases = 0;
   using ids = ops.fromInt32(request.req.promptIds.slice(0, 3), [1, 3]);
-  const hidden = await f.cohort.host.forward(ids, restored); hidden.dispose();
+  const hidden = await f.cohort.host.forward(ids, restored, { phase: "tail", sequences: 1, tokens: 3 }); hidden.dispose();
   f.cohort.host.promptCache!.take = tokens => tokens[0] === 2000
     ? { tokens: request.req.promptIds.slice(0, 3), caches: restored, retain: () => { releases++; } } : null;
   try {
@@ -211,40 +219,39 @@ test("a restored late arrival releases its backing lease after admission and pre
 });
 
 test.each(schemes.filter(([name]) => name.endsWith("delayed")))(
-  "a restored prefix owing its last append's conversion converts before its suffix, alone or joining: %s", async (_name, scheme) => {
-  // A finished request stores its cache without maintaining its last append.
-  // The control stores the same prefix maintained, as mlx-lm leaves it.
+  "a restored prefix converted inside the append that reached its start and continues as the uncached request, alone or joining: %s", async (_name, scheme) => {
+  // The prompt cache hands back the graph's composed caches (the binding's
+  // `composeState`): the lego that stored the prefix converted inside the
+  // append that reached its start, so the reopened row owes no conversion.
   const request = () => row(2, 13, 3), prefix = request().req.promptIds.slice(0, 6);
-  const run = async (maintained: boolean, joining: boolean) => {
-    const f = fixture(scheme), caches: Cache[] = [new KVCache()];
+  const run = async (restore: boolean, joining: boolean) => {
+    const f = fixture(scheme), caches = composedCaches(scheme);
     // The test owns the prefix until take() transfers it to the cohort.
     let owned = true;
     try {
-      { using ids = ops.fromInt32(prefix, [1, prefix.length]); (await f.cohort.host.forward(ids, caches)).dispose(); }
-      if (maintained) createKvMaintenance(scheme)(caches);
-      const stored = caches.map(cache => cache.constructor.name);
-      f.shapes.length = 0; f.kinds.length = 0;
-      f.cohort.host.promptCache!.take = tokens => {
-        if (tokens[0] !== 2000 || !owned) return null;
-        owned = false; return { tokens: prefix, caches };
-      };
+      let stored: string[] = [];
+      if (restore) {
+        { using ids = ops.fromInt32(prefix, [1, prefix.length]); (await f.cohort.host.forward(ids, caches, { phase: "tail", sequences: 1, tokens: prefix.length })).dispose(); }
+        stored = caches.map(cache => (cache.composed?.storage() ?? cache).constructor.name);
+        f.cohort.host.promptCache!.take = tokens => {
+          if (tokens[0] !== 2000 || !owned) return null;
+          owned = false; return { tokens: prefix, caches };
+        };
+      }
       if (joining) { f.cohort.admit(row(1, 18, 5)); expect(await f.cohort.advance()).toBe(false); }
       f.cohort.admit(request()); await drain(f.cohort);
       expect(f.rejected).toEqual([]);
-      return { stored, kinds: f.kinds, shapes: f.shapes, completed: f.completed };
+      return { stored, completed: f.completed.get(2000) };
     } finally {
       try { f.cohort.dispose(); }
       finally { if (owned) dispose(caches); }
     }
   };
   for (const joining of [false, true]) {
-    const control = await run(true, joining), owed = await run(false, joining);
-    expect(owed.stored).toEqual(["KVCache"]);
-    expect(control.stored).not.toEqual(["KVCache"]);
-    if (!joining) expect(owed.kinds[0]).toEqual(control.stored);
-    expect(owed.kinds).toEqual(control.kinds);
-    expect(owed.shapes).toEqual(control.shapes);
-    expect(owed.completed).toEqual(control.completed);
+    const uncached = await run(false, joining), restored = await run(true, joining);
+    expect(restored.stored).toEqual([scheme.turboQuant ? "TurboQuantKVCache" : "QuantizedKVCache"]);
+    expect(restored.completed).toBeDefined();
+    expect(restored.completed).toEqual(uncached.completed);
   }
 });
 

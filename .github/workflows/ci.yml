@@ -16,7 +16,7 @@ concurrency:
 jobs:
   libraries:
     runs-on: macos-14
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2

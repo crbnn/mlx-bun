@@ -1,9 +1,16 @@
+// NOT A PATTERN TO FOLLOW, deleted after merge. The hand-written TQ graph, frozen
+// verbatim as the bit-identity oracle of tests/models/qwen38-m1max-identity.test.ts
+// (D2 replaced it with the generated src/models/qwen/qwen38-27b-trellis-m1max.ts).
+// Changes from the source file (int head 832ac8b1): import paths; and
+// mixedGateUpEligible and fusedGateUpSwigluMixed, moved here verbatim from
+// src/layers/trellis-linear.ts with the decode variant they read there (13).
+//
 // Qwen3.8-27B packed-Trellis (TurboQuant) — THE graph for this exact quant.
 //
-// One hand-written forward for one model and one quantization map. It is
-// selected at load only when the artifact's graph fingerprint (architecture plus
-// the COMPLETE per-tensor quantization table) is one this file was built for;
-// every other Qwen3.5-family artifact keeps the generic Qwen35Model.
+// One hand-written forward for one model and one quantization map. The loader's
+// table selects it for the composition below: the artifact's graph fingerprint
+// (architecture plus the COMPLETE per-tensor quantization table) on the GPU it was
+// built for; every other composition gets the generic Qwen35Model.
 //
 // What is compile-time here: the 48 DeltaNet + 16 attention layer pattern, the
 // shapes, and the codec and bit width of every tensor. What is NOT: batch rows,
@@ -29,25 +36,50 @@
 
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
-import type { Weights } from "../../artifacts/weights";
-import { quantFor, type ModelConfig } from "../../artifacts/config";
-import { runtimeFlag, runtimeValue } from "../../runtime/config";
-import { QuantizedLinear } from "../../layers/quantized-linear";
-import { type Cache, type Mask } from "../../contracts/mlx/cache";
-import { compiledSwiglu } from "../../layers/swiglu";
-import { Qwen35Model, type Qwen3Layer } from "./qwen3_5";
-import type { SSMCache } from "../../state/ssm";
+import type { Weights } from "../../src/artifacts/weights";
+import type { Composition } from "../../src/contracts/portable/composition";
+import { quantFor, type ModelConfig } from "../../src/artifacts/config";
+import { runtimeFlag, runtimeValue } from "../../src/runtime/config";
+import { type Cache, type GatedDeltaCache } from "../../src/contracts/mlx/cache";
+import type { ResidualBasis, TargetView } from "../../src/contracts/mlx/draft-target";
+import { compiledSwiglu } from "../../src/layers/swiglu";
+import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
+import type { ReadPhase } from "../../src/models/graph";
+import type { MlxWidthClass } from "../../src/contracts/mlx/graph";
+import type { ServedComposition } from "../../src/models/implementation";
+import type { Qwen3Layer } from "../../src/models/qwen/blocks";
+import { qwenDraftTarget, qwenResidualBasis } from "../../src/models/qwen/media-input";
 import {
-  TrellisLinear, TRELLIS_MATVEC_MAX_M, fusedGateUpEligible, fusedGateUpSwiglu,
-  fusedGateUpSwigluMixed, mixedGateUpEligible, type MixedGateUpTail,
-} from "../../layers/trellis-linear";
+  TRELLIS_MATVEC_MAX_M, fusedGateUpEligible, fusedGateUpSwiglu, type MixedGateUpTail, type TrellisLinear,
+} from "../../src/layers/trellis-linear";
+import { fusedGateUpSwigluMixed as mixedGateUpKernel } from "../../src/kernels/trellis/mixed-gate-up";
+
+// Moved here verbatim from src/layers/trellis-linear.ts, where nothing used them once D2 deleted the source file.
+// VARIANT is the decode variant TrellisLinear passes its kernels there (13); mixedGateUpKernel the kernel it called.
+const VARIANT = 13;
+
+/** Gate and up share their axis-1 geometry but NOT their bit width: the case a
+ *  per-tensor bit allocation creates and the same-k fused kernel refuses.
+ *  Geometry only; whether to use it is the owning graph's decision. */
+export function mixedGateUpEligible(gate: TrellisLinear, up: TrellisLinear): boolean {
+  const a = gate.geometry, b = up.geometry;
+  return a.axis === 1 && b.axis === 1 && a.k !== b.k &&
+    a.rows === b.rows && a.cols === b.cols && a.T === b.T && a.L === b.L;
+}
+
+export function fusedGateUpSwigluMixed(x: MlxArray, gate: TrellisLinear, up: TrellisLinear, tail: MixedGateUpTail = "fused"): MlxArray {
+  return mixedGateUpKernel(x, gate, up, VARIANT, tail, gate.representations.mixedExactBits);
+}
 
 export const QWEN38_TRELLIS_TQ_GRAPH = "qwen3.8-27b-trellis-tq";
 
-/** Graph fingerprints this file was built and qualified for. */
-export const QWEN38_TRELLIS_TQ_FINGERPRINTS: ReadonlySet<string> = new Set([
-  "cfa205c8f5af046a", // qwen38-trellis-global-exit5-h39-q4b-v2 (11.99 GB incumbent)
-]);
+/** The composition this file was built and qualified for, its entry in the loader's
+ *  table: this artifact (qwen38-trellis-global-exit5-h39-q4b-v2, the 11.99 GB
+ *  incumbent) on the M1 Max GPU family, with whatever KV scheme the composition
+ *  carries. The A/B control is a different composition, not a flag: a bench
+ *  constructs the generic graph explicitly, through the registry's generic entry
+ *  (`MLX_GRAPH_TABLES` in `models/factory.ts`, its `generic`). */
+export const COMPOSITION: ServedComposition = Object.freeze({ fingerprint: "cfa205c8f5af046a", device: "applegpu_g13s" });
 
 /** Architecture plus the complete language-model quantization table. Two
  *  artifacts share a fingerprint only if every tensor has the same codec. */
@@ -73,14 +105,6 @@ export function qwen38TrellisTqFingerprint(config: ModelConfig): string {
   return hash.digest("hex").slice(0, 16);
 }
 
-/** Is this exactly a quant this graph was built for? `MLX_BUN_QWEN38_TQ_GRAPH=0`
- *  keeps the generic model (the A/B control). */
-export function qwen38TrellisTqAccepts(config: ModelConfig): boolean {
-  if (!runtimeFlag("MLX_BUN_QWEN38_TQ_GRAPH", true)) return false;
-  if (config.modelType !== "qwen3_5" && config.modelType !== "qwen3_5_text") return false;
-  return QWEN38_TRELLIS_TQ_FINGERPRINTS.has(qwen38TrellisTqFingerprint(config));
-}
-
 /** `MLX_BUN_QWEN38_TQ_MIXED_GATEUP`: unset or `split` = on with the split-exact tail,
  *  `fused` (or the earlier `1`) = on with the float32-sigmoid tail, `0`/`off` = off. */
 function mixedGateUpOption(): MixedGateUpTail | "off" {
@@ -89,8 +113,8 @@ function mixedGateUpOption(): MixedGateUpTail | "off" {
   return value === "1" || value === "fused" ? "fused" : "split";
 }
 
-type MlpStep = (hidden: MlxArray, independentRows: boolean) => MlxArray;
-type LayerStep = (x: MlxArray, faMask: Mask, cache: Cache, independentRows: boolean, ssmMask: MlxArray | null) => MlxArray;
+type MlpStep = (hidden: MlxArray, phase: ReadPhase) => MlxArray;
+type LayerStep = (x: MlxArray, cache: Cache, phase: ReadPhase) => MlxArray;
 
 export interface Qwen38TqPlanSummary {
   readonly graph: string;
@@ -104,9 +128,12 @@ export class Qwen38TrellisTQ extends Qwen35Model {
   readonly plan: Qwen38TqPlanSummary;
   readonly #steps: LayerStep[];
   #qkScale: { q: MlxArray; k: MlxArray } | null = null;
+  /** The artifact's R1 basis, from its fold record (read once, here). */
+  readonly #residualBasis: ResidualBasis | undefined;
 
-  constructor(weights: Weights, config: ModelConfig) {
-    super(weights, config);
+  constructor(weights: Weights, config: ModelConfig, composition: Composition) {
+    super(weights, config, composition);
+    this.#residualBasis = qwenResidualBasis(this.graph, config.modelDir);
     const options = {
       // Layers whose gate and up were allocated DIFFERENT bit widths fall off the
       // same-k fused kernel onto two projections plus a separate SwiGLU. One kernel
@@ -134,28 +161,30 @@ export class Qwen38TrellisTQ extends Qwen35Model {
       `split=${counts.split} options=${JSON.stringify(options)}`);
   }
 
+  override draftTarget(_caches: Cache[]): TargetView { return qwenDraftTarget(this, this.#residualBasis); }
+
   /** Resolve one layer into a closure of direct calls. */
   #layerStep(layer: Qwen3Layer, options: { mixedGateUp: MixedGateUpTail | "off" }, counts: Record<string, number>): LayerStep {
     const mlp = this.#mlpStep(layer, options, counts);
     const { inputNorm, postAttnNorm } = layer;
     if (layer.isLinear) {
       const block = layer.linearAttn!;
-      return (x, _faMask, cache, independentRows, ssmMask) => {
+      return (x, cache, phase) => {
         using normed = inputNorm.forward(x);
-        using mixed = block.forward(normed, cache as SSMCache, independentRows, ssmMask);
+        using mixed = block.forward(normed, cache as GatedDeltaCache, phase);
         using hidden = ops.add(x, mixed);
         using post = postAttnNorm.forward(hidden);
-        using out = mlp(post, independentRows);
+        using out = mlp(post, phase);
         return ops.add(hidden, out);
       };
     }
     const block = layer.selfAttn!;
-    return (x, faMask, cache, independentRows) => {
+    return (x, cache, phase) => {
       using normed = inputNorm.forward(x);
-      using mixed = block.forward(normed, faMask, cache, independentRows, null);
+      using mixed = block.forward(normed, cache, phase, null);
       using hidden = ops.add(x, mixed);
       using post = postAttnNorm.forward(hidden);
-      using out = mlp(post, independentRows);
+      using out = mlp(post, phase);
       return ops.add(hidden, out);
     };
   }
@@ -164,17 +193,20 @@ export class Qwen38TrellisTQ extends Qwen35Model {
    *  windows (rows <= TRELLIS_MATVEC_MAX_M) take the packed kernels; wider
    *  inputs (prefill) keep the generic block, which owns tiling and expansion. */
   #mlpStep(layer: Qwen3Layer, options: { mixedGateUp: MixedGateUpTail | "off" }, counts: Record<string, number>): MlpStep {
-    const { gate, up, down } = layer.mlp;
-    const generic: MlpStep = (hidden, independentRows) => layer.mlp.forward(hidden, true, independentRows);
-    if (!(gate instanceof TrellisLinear) || !(up instanceof TrellisLinear) || down instanceof QuantizedLinear) {
+    const mlp = layer.mlp;
+    // Reached above four rows (the packed steps below take fewer), where the
+    // Trellis MLP runs its split projections at either wide class.
+    const generic: MlpStep = (hidden, phase) => mlp.forward(hidden, phase, "wider");
+    if (mlp.kind !== "trellis") {
       counts.split!++;
       return generic;
     }
+    const { gate, up, down } = mlp;
     const rows = (hidden: MlxArray) => hidden.shape.slice(0, -1).reduce((a, b) => a * b, 1);
     if (fusedGateUpEligible(gate, up)) {
       counts.fused!++;
-      return (hidden, independentRows) => {
-        if (rows(hidden) > TRELLIS_MATVEC_MAX_M) return generic(hidden, independentRows);
+      return (hidden, phase) => {
+        if (rows(hidden) > TRELLIS_MATVEC_MAX_M) return generic(hidden, phase);
         using mid = fusedGateUpSwiglu(hidden, gate, up);
         return down.forward(mid);
       };
@@ -182,15 +214,15 @@ export class Qwen38TrellisTQ extends Qwen35Model {
     const tail = options.mixedGateUp;
     if (tail !== "off" && mixedGateUpEligible(gate, up)) {
       counts.mixedFused!++;
-      return (hidden, independentRows) => {
-        if (rows(hidden) > TRELLIS_MATVEC_MAX_M) return generic(hidden, independentRows);
+      return (hidden, phase) => {
+        if (rows(hidden) > TRELLIS_MATVEC_MAX_M) return generic(hidden, phase);
         using mid = fusedGateUpSwigluMixed(hidden, gate, up, tail);
         return down.forward(mid);
       };
     }
     counts.split!++;
-    return (hidden, independentRows) => {
-      if (rows(hidden) > TRELLIS_MATVEC_MAX_M) return generic(hidden, independentRows);
+    return (hidden, phase) => {
+      if (rows(hidden) > TRELLIS_MATVEC_MAX_M) return generic(hidden, phase);
       using g = gate.forward(hidden, true);
       using u = up.forward(hidden, true);
       using mid = compiledSwiglu(g, u);
@@ -201,18 +233,15 @@ export class Qwen38TrellisTQ extends Qwen35Model {
   /** Text forward over the pre-resolved plan. Vision positions, the active
    *  vision mRoPE state and the diagnostic profiler keep the generic loop,
    *  which owns those concerns. Consumes h0, like the generic implementation. */
-  protected override forwardLayers(h0: MlxArray, cache: Cache[], independentRows = false,
-    positions?: MlxArray): MlxArray {
+  protected override forwardLayers(h0: MlxArray, cache: Cache[], phase: ReadPhase,
+    positions: MlxArray | undefined, capture: ((layer: number, hidden: MlxArray) => void) | null,
+    width: MlxWidthClass, bounded: boolean): MlxArray {
     if (positions || this.mrope || (globalThis as Record<string, unknown>).__deltaProf)
-      return super.forwardLayers(h0, cache, independentRows, positions);
-    const L = h0.shape[1]!;
-    const faMask = cache[this.faIdx]!.makeMask(L, null);
-    using ssmMask = (cache[0] as SSMCache).prefillPadding?.makeMask(L) ?? null;
-    const bounded = L > TRELLIS_MATVEC_MAX_M;
+      return super.forwardLayers(h0, cache, phase, positions, capture, width, bounded);
     let h: MlxArray | null = h0;
     try {
       for (let i = 0; i < this.#steps.length; i++) {
-        const next = this.#steps[i]!(h, faMask, cache[i]!, independentRows, ssmMask);
+        const next = this.#steps[i]!(h, cache[i]!, phase);
         h.dispose();
         h = next;
         if (bounded) {
@@ -222,14 +251,13 @@ export class Qwen38TrellisTQ extends Qwen35Model {
           try { ops.evalAll([h, ...state]); }
           finally { if (cache[i]!.stateNeedsDispose) for (const a of state) a.dispose(); }
         }
-        this.captureLayer(i, h);
+        capture?.(i, h);
       }
       const out = this.finalNorm.forward(h);
       h.dispose();
       h = null;
       return out;
     } finally {
-      faMask.arr?.dispose();
       h?.dispose();
     }
   }

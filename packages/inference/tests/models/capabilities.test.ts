@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { declareGraph, declaredGraph, PLAIN_KV_VERIFICATION } from "../../src/models/capabilities";
-import { createRuntimeConfig, withRuntimeConfig } from "../../src/runtime/config";
+import { declareGraph, declaredGraph, ORDINARY_VERIFICATION } from "../../src/models/capabilities";
+import { testComposition } from "./test-composition";
 import { Gemma4Model } from "../../src/models/gemma4/model";
 import { UniversalDenseModel } from "../../src/models/universal/dense";
 import { DiffusionGemmaModel } from "../../src/models/diffusion-gemma/model";
@@ -9,7 +9,6 @@ import { MiniCPM5Model } from "../../src/models/minicpm5/model";
 import { Qwen3Model } from "../../src/models/qwen/qwen3";
 import { Qwen3MoeModel } from "../../src/models/qwen/qwen3-moe";
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
-import { Qwen38TrellisTQ } from "../../src/models/qwen/qwen38-27b-trellis-tq";
 
 // Declarations are read from graphs built without weights: what a graph declares
 // follows from its own construction facts, so prototype stand-ins with those facts suffice.
@@ -17,39 +16,31 @@ const graph = (prototype: object, facts: object = {}) => declaredGraph(Object.as
 const plainCaps = declareGraph();
 
 describe("every graph declares its capabilities", () => {
-  test("Gemma4: paged attention, prepared image/audio embeddings, taps, compiled decode except through experts", () => {
-    const text = (enableMoeBlock: boolean, modelType = "gemma4") => ({ config: { modelType, text: { enableMoeBlock } }, hiddenTap: null });
+  test("Gemma4: prepared image/audio embeddings, taps, compiled decode except through experts", () => {
+    // Taps are every phase's capture parameter, so the graph always declares them.
+    const text = (enableMoeBlock: boolean, modelType = "gemma4") => ({ config: { modelType, text: { enableMoeBlock } } });
     expect(graph(Gemma4Model.prototype, text(false)).graphCapabilities).toEqual(declareGraph({
-      media: { input: "embeddings", video: false }, pagedAttention: true, hiddenLayerTaps: true, compiledDecode: true,
-      kv: { delayedAffine: "all" } }));
+      media: { input: "embeddings", video: false }, hiddenLayerTaps: true, compiledDecode: true }));
     expect(graph(Gemma4Model.prototype, text(true)).graphCapabilities.compiledDecode).toBe(false);
     expect(graph(Gemma4Model.prototype, text(false, "gemma3n")).graphCapabilities.compiledDecode).toBe(false);
-    // The tap is the graph's own operation: without it there is nothing to declare.
-    expect(graph(Gemma4Model.prototype, { config: { modelType: "gemma4", text: { enableMoeBlock: false } } })
-      .graphCapabilities.hiddenLayerTaps).toBe(false);
   });
 
-  test("Qwen3.5 and its Trellis specialization: prepared embeddings with positions, video, speculation over affine KV as its own option", () => {
-    for (const prototype of [Qwen35Model.prototype, Qwen38TrellisTQ.prototype]) {
-      const declared = graph(prototype, { hiddenTap: null }).graphCapabilities;
-      expect(declared).toEqual(declareGraph({ media: { input: "embeddings+positions", video: true }, hiddenLayerTaps: true,
-        kv: { delayedAffine: "all" }, prefill: { boundedWorkspace: true }, speculation: { immediateAffine4: true } }));
-      const off = withRuntimeConfig(createRuntimeConfig({ MLX_BUN_QWEN_SPEC_KV4: "0" }), () => graph(prototype, { hiddenTap: null }).graphCapabilities);
-      expect(off.speculation).toEqual({ ...declared.speculation, affineKv: false });
-    }
+  test("Qwen3.5: prepared embeddings with positions, video, bounded prefill workspace", () => {
+    // The generated M1 Max Trellis graph declares the same (tests/models/qwen38-m1max-identity.test.ts).
+    expect(graph(Qwen35Model.prototype, { composition: testComposition() }).graphCapabilities).toEqual(declareGraph({
+      media: { input: "embeddings+positions", video: true }, hiddenLayerTaps: true, prefill: { boundedWorkspace: true } }));
   });
 
-  test("dense-attention graphs delay affine rows for ordinary decoding only", () => {
-    expect(graph(MiniCPM5Model.prototype).graphCapabilities).toEqual(declareGraph({ kv: { delayedAffine: "ordinary" } }));
-    expect(graph(Qwen3MoeModel.prototype).graphCapabilities).toEqual(declareGraph({ kv: { delayedAffine: "ordinary" } }));
-    expect(graph(Qwen3Model.prototype).graphCapabilities).toEqual(declareGraph({ embeddings: true, kv: { delayedAffine: "ordinary" } }));
+  test("ordinary autoregressive graphs declare the defaults: every method over every cache lego", () => {
+    expect(graph(MiniCPM5Model.prototype).graphCapabilities).toEqual(plainCaps);
+    expect(graph(Qwen3MoeModel.prototype).graphCapabilities).toEqual(plainCaps);
+    expect(graph(Qwen3Model.prototype).graphCapabilities).toEqual(declareGraph({ embeddings: true }));
   });
 
-  test("a universal graph reads its own attention: softcapped layers read dense KV and verify plain-KV rounds only", () => {
-    expect(graph(UniversalDenseModel.prototype, { encodedKvAttention: true }).graphCapabilities)
-      .toEqual(declareGraph({ kv: { delayedAffine: "ordinary" } }));
+  test("a universal graph reads its own attention: softcapped layers verify ordinary rounds only", () => {
+    expect(graph(UniversalDenseModel.prototype, { encodedKvAttention: true }).graphCapabilities).toEqual(plainCaps);
     expect(graph(UniversalDenseModel.prototype, { encodedKvAttention: false }).graphCapabilities)
-      .toEqual(declareGraph({ kv: { denseReads: true }, speculation: PLAIN_KV_VERIFICATION }));
+      .toEqual(declareGraph({ speculation: ORDINARY_VERIFICATION }));
     // Before the attention facts are bound, neither is declared.
     expect(graph(UniversalDenseModel.prototype).graphCapabilities).toEqual(plainCaps);
   });
@@ -80,7 +71,7 @@ describe("a graph's operations match what it declares", () => {
   test("the class that declares media supplies the operations that serve it", () => {
     for (const [prototype, input] of [[Gemma4Model.prototype, "embeddings"], [Qwen35Model.prototype, "embeddings+positions"]] as const) {
       expect(typeof (prototype as { bindMediaInput?: unknown }).bindMediaInput).toBe("function");
-      expect(graph(prototype, { hiddenTap: null }).graphCapabilities.media?.input).toBe(input);
+      expect(graph(prototype, { composition: testComposition() }).graphCapabilities.media?.input).toBe(input);
     }
     expect(typeof (DiffusionGemmaModel.prototype as { pixelInput?: unknown }).pixelInput).toBe("function");
   });

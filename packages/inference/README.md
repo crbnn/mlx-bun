@@ -22,12 +22,12 @@ targets; prompt preparation accepts encoder interfaces. Callers can supply their
 own implementations without subclassing a concrete model or cache.
 
 Each graph declares what it can do (`GraphCapabilities`, portable; a model exposes
-it as `graphCapabilities`): its method, batched adapters, media input, paged
-attention, compiled decode, hidden-layer taps for drafts, a draft head its
-checkpoint carries (`nativeDraft`), which delayed affine KV levels its attention is
-qualified for, dense reads, whether long prompts prefill in workspace-bounded
-chunks, and what its verifier qualifies (adapters, logprobs, affine and TurboQuant
-KV, external tokens, grammar proposals).
+it as `graphCapabilities`): its method, batched adapters, media input, compiled
+decode, hidden-layer taps for drafts, a draft head its
+checkpoint carries (`nativeDraft`), whether long prompts prefill in workspace-bounded
+chunks, and what its verifier qualifies (adapters, logprobs, external tokens,
+grammar proposals). None names a cache format: the composition's caches serve
+every method, and the planner never reads how they store keys and values.
 `MlxDeclaredGraph` names the operations behind those promises (`bindMediaInput`,
 `mediaEncoders`, `pixelInput`, `draftTarget`, `nativeDraftHead`, `compiledDecodeStep` and
 `releaseCompiledDecode`, `trainable`, `expertResidency`), and
@@ -38,11 +38,14 @@ refused. The gateway plans from the declarations, the request and dynamic state
 `MlxGatewayBinding.capabilities` reports what it resolved. Supporting a new graph
 means declaring and implementing; `execution/` and the app engine need no edit.
 The batch group and the autoregressive binding take the structural `MlxTokenGraph`
-(`models/graph`: config, caches, forward and projection, and the declared ports), not
+(`models/graph`: config, caches, the named phases, and the declared ports), not
 the registry's `RuntimeModel` union. A graph's compiled decode step lives with that
 graph (`models/gemma4/compiled-decode`) and reaches them through `compiledDecodeStep`;
 it drives caches through the `CompiledDecodeCache` protocol (`contracts/mlx/cache`,
-implemented by the KV caches in `state/`) and names no cache class.
+implemented by the KV caches in `state/`) and names no cache class. The loader
+keeps `Composition.compiledDecode` on only where every serial cache a row holds
+has that form (`decodesCompiled` in `state/kv-maintenance`: not TurboQuant, a
+delayed start or paged blocks); nothing asks a cache at run time.
 The architecture gate rejects concrete model imports, model-class `instanceof`,
 model-type and `architectures` checks, family predicates and model-scoped flags there,
 in the app's engine, server and CLI, and in `@mlx-bun/training`. What those need to
@@ -66,9 +69,13 @@ out). `trainable`
 `lmHead` for fused linear-CE heads, `segmented` backward (how a range of layers
 runs and which reused K/V crosses segment boundaries), `prefixShared` forwards,
 `gradCheckpoint`, the `flashAttention` constraint, and the `denoising` objective.
-The trainer names the declaration a graph lacks. A model-level option stays
-with its graph: Qwen3.5 reads `MLX_BUN_QWEN_SPEC_KV4` (on by default) where it
-declares speculation over affine KV.
+The trainer names the declaration a graph lacks. A model-level option is a
+composition field, resolved once at load by `resolveComposition` and settable
+through the composition request: the KV scheme and paging (`kv`, `pagedKv`), and
+the scheduler's `compiledDecode` (on), `mixedPrefill` (off), `mixedTokenBudget`
+(256), `prefillTailSplit` (on) and `grammarJump` (off), and the drafter's
+`greedyDraft` (off). Nothing below the loader
+reads them from the environment.
 
 ## Numerical and execution policy
 
@@ -124,10 +131,10 @@ reference is main's `scripts/regen/parity.ts` output: the prompt
 float32 vectors. Through `createModel` it checks the 100-token greedy trajectory
 and those four vectors byte for byte; a separate 12-step control does the same
 through `new Gemma4Model`. Every step must be finite and select the reference
-token. This is not 100-step full-vector parity. For this artifact `createModel`
-selects the generated 12B graph, whose unrolled path serves only the quantized
-`kv_config` cache layout; under plain KV it runs its monolith fallback, and the
-test asserts the unrolled path never ran. Opt in with all of
+token. This is not 100-step full-vector parity. The loader's Gemma 4 table
+builds the generated 12B graph only for the `kv_config` composition it serves, so
+for plain KV (the default composition) `createModel` builds `Gemma4Model` too,
+and the test asserts that. Opt in with all of
 `MLX_BUN_TEST_GEMMA4_MODEL`, `MLX_BUN_TEST_GEMMA4_REFERENCE` (the directory
 holding `gemma4-parity.json`, the producer's unchanged `parity.json` and the four
 step blobs) and `MLX_BUN_TEST_GEMMA4_REFERENCE_SHA256`. Before native libraries
@@ -148,11 +155,14 @@ The [generated-graph test](tests/parity/gemma4-generated.test.ts) is that
 unrolled-path check, ported from `02d723a:tests/parity/generated-parity.test.ts`
 for each registered fingerprint (12B, e4b, 26B-A4B). With
 `MLX_BUN_TEST_GENERATED_MODEL` naming an artifact that ships `kv_config.json`, it
-requires `createModel` to select the generated graph, byte-identical vectors
-against `new Gemma4Model` over caches converted to `kv_config` before a prompt past
-the sliding window, identical 24-token greedy trajectories (stop tokens off, so
-every trajectory is full length) uncompiled and with compiled decode (counting
-generated forwards), and the monolith fallback under plain caches. This is
+requires the `kv_config` composition (`--kv-quant config`) to build the generated
+graph and the default composition `Gemma4Model`; byte-identical vectors against
+`Gemma4Model` over caches converted to `kv_config` before a prompt past the
+sliding window; identical 24-token greedy trajectories under the `kv_config`
+composition, each graph reading its own composed caches (stop tokens off, so
+every trajectory is full length), uncompiled, where from the second forward on
+every listed cache answers from its quantized storage, and with compiled decode;
+and identical vectors over plain caches. This is
 specialization identity within this tree, not an oracle claim. On 2026-09-28 it
 passed on the M1 Max for mlx-community gemma-4-e4b-it-OptiQ-4bit (`98d7dc6a`; 24
 generated forwards uncompiled, 2 compiled) and gemma-4-12B-it-OptiQ-4bit
@@ -421,8 +431,9 @@ reference data is downloaded.
 
 The test compares native full-logit bytes for identical fixed tokens with plain
 and artifact-configured KV, both before and after the sliding window fills.
-Greedy trajectories and dense Gemma's mid-segment failure recovery use main's
-original tokenizer-rendered prompts (12B targets 600/1100 tokens; e4b targets 700).
+Greedy trajectories and a dense Gemma mid-segment failure (which ends its generation:
+the compiled step has no fallback) use main's original tokenizer-rendered prompts
+(12B targets 600/1100 tokens; e4b targets 700).
 Those checks require actual compiled-step activation and zero unexpected retraces.
 The forced-token full-logit matrix uses deterministic IDs independently of EOS. These are
 compiled-versus-ordinary checks, not an external-oracle or performance claim.
@@ -456,16 +467,14 @@ adapter identity and unmount restoration. Separate candidate B2/B4 tests without
 a configured draft passed joins, cancellation, queued adapter/base isolation
 and reuse after drain.
 
-Gemma4 adapter rows also take ordinary generation checkpoints when the server's
-paging option is enabled: the resolved row uses plain KV, so checkpoint identity
-and continuation are the same with paging enabled or disabled. Paired B1 checks
+Gemma4 adapter rows take ordinary generation checkpoints. Paired B1 checks, recorded
+while adapter rows still bypassed paging (so on plain KV),
 on Gemma4 e2b OptiQ-4bit (snapshot `b0162532`, MacBookPro18,2, MLX 0.32.2)
 matched main `02d723a` at capacity 1 against continuous capacity 8 for 16 tokens,
 greedy and seeded sampling, and fresh-process restoration across both settings.
 Full logits and all 15 donor KV states matched; all 35 layer outputs and the
 final norm matched by hash. The nonzero adapter changed logits and unmounting
-restored the base. Actual paged rows remained checkpoint-ineligible. This covers
-one active row within the sliding window, not grouped rows, paged numerics,
+restored the base. This covers one active row within the sliding window, not grouped rows, paged numerics,
 hard-kill durability, external-oracle parity or performance.
 
 An adapter request whose draft cannot serve target adapters (the two-model
@@ -500,9 +509,10 @@ caches of 2 or 5 planes. The main-paired evidence is B1 only; a wrapped sliding
 ring, a delayed TurboQuant start, hard-kill durability, external-oracle parity
 and performance are not claimed.
 
-MiniCPM5 and these universal graphs also ignore a configured draft and supplied
-fill for adapter requests, as main did; requested logprobs remain available.
-Without fill/logprobs/grammar, ordinary checkpoints remain eligible. The fallback
+MiniCPM5 and these universal graphs also ignore a configured draft for adapter
+requests, as main did; requested logprobs remain available. Main also ignored
+supplied fill for them, which the shared fill method now serves (the pairing
+below predates that). Without fill/logprobs/grammar, ordinary checkpoints remain eligible. The fallback
 does not invoke the provider during a request; loading an artifact-backed draft
 still performs its existing compatibility probe. Paired B1 acceptance on cached
 Qwen2.5-0.5B and MiniCPM5-1B compared six scenarios per model, each with a matched
@@ -516,19 +526,21 @@ uninterrupted output after graceful cancellation and fresh-process restoration.
 This does not qualify every combination or multi-row configured-draft requests.
 
 Only the first cold decode/resume token may have signed versus unsigned int32
-metadata; its raw bytes, value and computed state must match exactly. Supplied
-fill also falls back to ordinary decoding without adapters or a configured draft:
-main ignored it on these graphs because no affine append binding exists.
-Paired B1 acceptance on cached MiniCPM5-1B and Qwen2.5-0.5B matched main and
+metadata; its raw bytes, value and computed state must match exactly. Main
+ignored supplied fill on these graphs without adapters or a configured draft
+too, having no affine append binding; the planner then fell back to ordinary
+decoding, which the pairing below qualified, and now serves it through the
+shared fill method. Paired B1 acceptance on cached MiniCPM5-1B and Qwen2.5-0.5B matched main and
 no-fill controls for supplied strict/echo fill, unseeded greedy sampling and
 KV4 starting at token 8. Each request generated 16 tokens across conversion;
 all 17 forward states, 16 full-vocabulary projections and valid cache planes
 matched, and every fill hook stayed unused. Main planned fill and disabled it
-inside generation; the new planner reports `fill-incompatible-with-request`
-and selects ordinary continuous decoding. This pair does not qualify B2 or
+inside generation; the planner of that pairing reported `fill-incompatible-with-request`
+and selected ordinary continuous decoding. This pair does not qualify B2 or
 cancellation.
-Requests that supply fill remain ineligible for generation checkpoints. Actual
-delayed speculation remains excluded. Each graph declares at construction the
+Requests that supply fill remain ineligible for generation checkpoints.
+Speculation, grammar proposals and fill are planned over delayed affine KV as
+over any other scheme. Each graph declares at construction the
 layers its attention reads as plain keys and values (`requiredDenseKvLayers`:
 Gemma2's softcap layers; none for graphs that attend the storage their caches
 hold). The gateway and a directly composed
@@ -541,19 +553,15 @@ scheme when that scheme's own maintenance leaves every layer's storage certified
 for dense reads (`Cache.denseKvReads`, answered by the storage and the
 maintenance that owns it, probed when the binding or group is composed). Affine
 KV serves ordinary continuous decoding, with checkpoints, while each row's
-storage still reads plain; on a softcap graph a drafted request ignores the
-draft. At a row's actual transition its pending token publishes first, and the
+storage still reads plain. At a row's actual transition its pending token publishes first, and the
 row may finish there; otherwise that row alone is rejected with `DenseKvReadError` before any shared append (HTTP 501
 `unsupported_kv_transition`, or the stream's error event once it has opened).
 Main's serial path threw at that forward instead. TurboQuant storage decodes on
 read, so these graphs admit TurboQuant KV for ordinary continuous decoding
-throughout, with checkpoints; a drafted request ignores the draft. Supplied
-fill decodes ordinarily without fill, as in main, whose serial path filled
-only through a committed append declaring the scheme's formats (none for
-TurboQuant on this graph). Direct grammar jump commits its
+throughout, with checkpoints. Direct grammar jump commits its
 spans over it through the shared span method, as main's serial jump did: one
 maintenance call, then one unsplit forward of the pending token and the forced
-span, once the gateway has certified the scheme. Affine KV commits spans the
+span. Affine KV commits spans the
 same way while a row's storage still reads plain: a span whose maintenance ran
 before the transition appends unsplit even across it, and a row whose next
 append would no longer read plain is refused with `DenseKvReadError` before any
@@ -586,9 +594,8 @@ Universal graphs
 with sliding layers take the same ordinary delayed path when their bound
 attention reads encoded KV. Qwen3 and Qwen3-MoE attend affine KV as mlx-lm's
 `scaled_dot_product_attention` does (quantized SDPA over a quantized cache) and
-take the same encoded-read path: immediate affine KV batches and speculates,
-and delayed affine rows serve ordinary decoding, generation checkpoints and
-committed grammar spans across their conversion. On 2026-09-28 UTC (M1 Max,
+take the same encoded-read path: affine KV, immediate or delayed, batches,
+speculates and takes generation checkpoints across its conversion. On 2026-09-28 UTC (M1 Max,
 MLX 0.32.2), cached Qwen3-4B-Instruct-2507-4bit `50d42775` matched mlx-lm
 0.31.3's `generate_step` order bit for bit in six greedy steps' full logits
 through direct generation with KV8 and KV4 at starts 0, 8 and 14 (a one-off
@@ -596,9 +603,10 @@ comparison); the opt-in spans test and the ordinary-continuation test (KV8 from
 0, KV4 from prompt+4, KV8 from prompt+2) passed on it; and a grouped n-gram
 draft over immediate KV8 and KV4 reproduced ordinary greedy output. No
 Qwen3-MoE artifact was run.
-On encoded-read universal graphs and on MiniCPM5, delayed affine
-rows stay ordinary-only, and their direct grammar jump commits spans through the
-same span method with no dense-read requirement, before and after conversion.
+On encoded-read universal graphs, Qwen3 and MiniCPM5, whose verifiers qualify
+grammar proposals, grammar jump is planned as verified proposals over every KV
+scheme; bound directly, the span method commits spans over their delayed affine
+rows with no dense-read requirement, before and after conversion.
 The same opt-in real-weight spans test passed on cached MiniCPM5-1B-OptiQ-4bit
 `664aabae` and Qwen2.5-0.5B-Instruct-4bit `a5339a41` with KV4: B1 spans matched
 direct generation in tokens, matcher history and every projection's bytes, both
@@ -634,7 +642,7 @@ the window:
 - Grammar (JSON schema, choice, EBNF): at B1, tokens, every forward's IDs and
   valid K/V, and every projection's complete logits. At B2, prepared together
   or joining late, each row's tokens.
-- With `MLX_BUN_GRAMMAR_JUMP=1`: the speculative group verifies the matcher's
+- With the composition's `grammarJump` on: the speculative group verifies the matcher's
   forced string instead of committing it. Tokens equal direct token-by-token
   generation at B1 and B2, rejected proposals leave the ring, and proposals are
   both accepted and rejected.
@@ -682,7 +690,7 @@ The app gateway's real Gemma2 placement test uses the same
 that test only checks placement and allocates no tensors. Native-blocked CPU
 runs skip this check; synthetic gateway tests remain CPU-only.
 
-With `MLX_BUN_GRAMMAR_JUMP=1`, Gemma2 plain-KV ordinary requests preserve
+With the composition's `grammarJump` on, Gemma2 plain-KV ordinary requests preserve
 main's direct forced spans through the shared scheduler: one graph append for
 `[pending, ...forced]`, with no sampling of forced IDs. Graphs already using
 verified grammar proposals retain that behavior. Paired greedy Gemma2-2B checks
@@ -748,7 +756,9 @@ The [Trellis specialization test](tests/parity/trellis-shared-m.test.ts) takes
 `MLX_BUN_TEST_TRELLIS_MODEL=/cached/packed-qwen`. It preserves main's variant
 comparison: `MLX_BUN_TRELLIS_AB_VARIANT` (default 7) against
 `MLX_BUN_TRELLIS_AB_BASELINE` (default 6). Use variant 13 against baseline 12
-for the optimized expansion path. M=1–5 compares complete logits, recurrent/KV
+for the optimized expansion path. `TrellisLinear` passes only variant 13, so the
+test runs the generic Qwen3.5 graph with MLPs it builds over the loaded weights,
+each passing its variant explicitly. M=1–5 compares complete logits, recurrent/KV
 state and continuation; variant 13 also checks M=16/128/512 with the last-position
 head. Six alternating-order blocks also screen the last-position head at
 M=1–5/8/9/16, M=32 for variants 11–13, and M=128/512 for variant 13.
@@ -759,25 +769,28 @@ For variant 13, the `applegpu_g13s` single-row bf16 gate/up kernel at
 5120 → 17408, matching 2/3/4-bit widths, T=256 and L=12 shares a 16 KiB
 threadgroup codebook across sixteen output rows. Its values retain the unrefined
 float32 decoder contract, scale multiplication, accumulation order and activation
-tail. `MLX_BUN_TRELLIS_GATEUP_CODEBOOK=0` selects inline decoding for A/B runs.
-At the same qualified single-row bf16 geometry, mixed-width gate/up and the
+tail. At the same qualified single-row bf16 geometry, mixed-width gate/up and the
 2/3/4-bit down kernels construct the decoder's integer value through exact
 float32 mantissa bits before the unchanged reciprocal multiply. This preserves
-scale multiplication and reduction order. These defaults are also limited to
-`applegpu_g13s`; `MLX_BUN_TRELLIS_MIXED_BITS=0`,
-`MLX_BUN_TRELLIS_SCATTER_BITS=0` (balanced 3-bit down) and
-`MLX_BUN_TRELLIS_GENERIC_SCATTER_BITS=0` (2/4-bit down) select their original
-conversions. Other shapes and shared multi-row kernels keep their existing paths.
-The qualified down kernels also generate a 16 KiB float32 threadgroup codebook,
-using 128/512/256 threads for 2/3/4-bit weights respectively. All 128 partial sums
-and their reduction order remain unchanged.
-`MLX_BUN_TRELLIS_SCATTER_FLOAT_CODEBOOK=0` selects the per-value decoder;
-disable this table as well when comparing the down representation controls.
+scale multiplication and reduction order. The qualified down kernels also
+generate a 16 KiB float32 threadgroup codebook, using 128/512/256 threads for
+2/3/4-bit weights respectively. All 128 partial sums and their reduction order
+remain unchanged. Other shapes and shared multi-row kernels keep their existing paths.
+
+These representations are required kernel arguments: `fusedGateUpSwiglu`'s
+`codebook`, `fusedGateUpSwigluMixed`'s `exactBits` and `trellisScatter`'s
+`ScatterRepresentation` (`bits` for the balanced 3-bit down, `genericBits` for
+2/4-bit down, `floatCodebook`). `qualifiedRepresentations(architecture)` turns
+them all on for `applegpu_g13s` and off elsewhere; `TrellisLinear` resolves it
+once at construction and passes the stored result. Passing `false` selects the
+original inline decoding and conversions for A/B runs; disable the float codebook
+as well when comparing the down representations.
 The [kernel test](tests/kernels/trellis-gateup-codebook.test.ts) checks all 4096
 codebook values, all 1021 possible integer decoder values and fused outputs;
 the [artifact test](tests/parity/trellis-gateup-codebook.test.ts)
 uses `MLX_BUN_TEST_TRELLIS_MODEL` to compare complete finite logits, live cache state
-and greedy continuation. The [standard-request benchmark](../../apps/mlx-bun/scripts/bench-trellis-gateup.ts)
+and greedy continuation, running the generic Qwen3.5 graph with MLPs that pass each
+representation explicitly. The [standard-request benchmark](../../apps/mlx-bun/scripts/bench-trellis-gateup.ts)
 provides `--help`, requires local weights and an external output path, and runs
 one fixed prompt with 256 greedy tokens and MTP off.
 
@@ -832,9 +845,9 @@ They borrow input arrays and return an owned, lazy output array.
 | Operation | Input and purpose |
 | --- | --- |
 | `trellisReduce(x, codes, scales, geometry, variant)` | Axis-1 projection; `x` is `[M, inFeatures]`, M=1..4 |
-| `trellisScatter(x, codes, scales, geometry, variant, useSharedScatterCodebook?)` | Axis-0 projection; same input shape and row budget |
-| `fusedGateUpSwiglu(x, gate, up, variant)` | Matching axis-1 gate/up geometry and bit width; preserves leading input dimensions, with 1..4 total rows |
-| `fusedGateUpSwigluMixed(x, gate, up, variant, tail?)` | Matching axis-1 geometry with independent bit widths; `tail` is `"fused"` or `"split"` |
+| `trellisScatter(x, codes, scales, geometry, variant, useSharedScatterCodebook, representation)` | Axis-0 projection; same input shape and row budget |
+| `fusedGateUpSwiglu(x, gate, up, variant, codebook)` | Matching axis-1 gate/up geometry and bit width; preserves leading input dimensions, with 1..4 total rows |
+| `fusedGateUpSwigluMixed(x, gate, up, variant, tail, exactBits)` | Matching axis-1 geometry with independent bit widths; `tail` is `"fused"` or `"split"` |
 | `expandTrellis(codes, scales, geometry, dtype, variant)` | Existing general expansion and variant-13 vector specialization |
 | `tiledTrellisPrefill(x, codes, scales, geometry)` | Axis-1 packed prefill, M=5..32 |
 | `splitKTrellisPrefill(x, codes, scales, geometry)` | Axis-0 packed prefill, M=5..8 |
@@ -848,8 +861,10 @@ the inherited timing-only path and does not compute decoded weights correctly.
 No application environment flags are read by these operations.
 
 For prefill, use the corresponding `*Eligible(geometry, rowCount, dtype)` helper
-to preserve the existing dispatch profile. Wide prefill additionally requires
-caller-proven aligned, row-contiguous input. These profiles and numerical
+to preserve the existing dispatch profile; the wide and tiled helpers also take
+`widePrefill` from `qualifiedRepresentations(architecture)`, which a caller
+resolves once. Wide prefill additionally requires caller-proven aligned,
+row-contiguous input. These profiles and numerical
 contracts are unchanged; they are not universal dispatch rules for every shape.
 
 Single-purpose kernels from the same entry point: each runs one algorithm for
@@ -891,8 +906,9 @@ layer.
 - `@mlx-bun/inference/input`: `loadTokenizer(directory)` consumes the existing
   Hugging Face tokenizer files; `ChatTemplate.load(directory)` loads the template.
 - `@mlx-bun/inference/layers`: quantized linear and embedding layers, RMSNorm,
-  and `TrellisLinear`, which composes the standalone Trellis kernels and retains
-  the existing dispatch and expansion fallback.
+  and `TrellisLinear`, which composes the standalone Trellis kernels at decode
+  variant 13 and retains the existing row-count dispatch and dense expansion.
+  `ExpandedTrellisLinear` is the 8-bit affine carrier a caller constructs explicitly.
 - `@mlx-bun/inference/layers/lora`: inference-time LoRA state and weights.
 - `@mlx-bun/inference/runtime/config`: immutable execution settings and scoped
   overrides. The existing `MLX_BUN_*` defaults are preserved during migration.
@@ -913,7 +929,7 @@ selects a token, continues with the same cache, and disposes cache before weight
 
 The direct graph imports currently include `models/gemma4`,
 `models/gemma4/generated`, `models/minicpm5`, `models/qwen3`, `models/qwen3-moe`,
-`models/qwen3_5`, `models/qwen38-27b-trellis-tq`, `models/qwen38-27b-trellis-m4pro`,
+`models/qwen3_5`, `models/qwen38-27b-trellis-m4pro`, `models/qwen38-27b-trellis-m1max`,
 and `models/universal`.
 `models/glm52`, `models/diffusion-gemma`, and `models/whisper` provide the other
 existing graph families. These retain the dedicated and specialized implementations.
@@ -928,20 +944,26 @@ that carries its own draft head declares it (`GraphCapabilities.nativeDraft`), a
 
 `models/qwen38-27b-trellis-m4pro` is the graph for
 `mlx-bun/Qwen3.8-27B-Trellis-3.2bpw` on M4 Pro GPUs (`applegpu_g16s`); the model
-factory selects it for that artifact on that device and the TQ graph elsewhere.
-It resolves one plan per request shape at load: one row, 2..3, 4 and 5..8 rows
-(speculative verify), prompt chunks, and 640..2048-row chunks split between the
-Neural Engine and the GPU when the ANE bridge loads. Requests outside those plans
-(several sequences, independent-row appends, vision positions, array masks,
-mounted adapters, KV caches other than BF16 or 4-bit group-64) take the generic
-Qwen 3.5 forward. It declares `verifyRoundCosts`, its measured verify cost by
-row count, which adaptive draft depth reads.
+factory selects it for that artifact on that device, `models/qwen38-27b-trellis-m1max`
+(the same artifact on M1 Max GPUs, `applegpu_g13s`, for every KV scheme and row
+count) there, and the generic Qwen 3.5 graph elsewhere. `scripts/gen-qwen38.ts`
+generates both from their compositions.
+It resolves one block set per width class at load: one row, 2..3, 4 and 5..8
+rows (decode, speculative verify and prompt tails, of one sequence or several),
+prompt chunks, and 2048-row chunks split between the Neural Engine and the GPU
+when the composition names the bridge (`aneBridge`, on by default; a bridge that
+does not load fails the load with `AneBridgeError`). Requests outside those sets
+(wider windows, vision positions, known-token spans, mounted adapters, KV caches
+other than BF16 or 4-bit group-64) take the graph's generic blocks. It declares
+`verifyRoundCosts`, its measured verify cost by row count, which adaptive draft
+depth reads.
 
-For explicit state and tensor operations, use `graph.makeCache()`,
-`graph.forwardHidden(ids, state)`, and `graph.logitsFromHidden(hidden)`.
-Release state with each cache's `dispose()` and release returned arrays when
-finished. `bindMlxGraph` from `models/graph` adapts caller-supplied operations to
-an explicit graph descriptor and logits selection contract without owning weights.
+For explicit state and tensor operations, use `graph.makeCache()`, the graph's
+named phases (`prefillChunk.gpu`, `prefillTail[width]`, `decode[width]`,
+`verify[width]`, `appendKnown[width]`) and its head (`logits[width]`), each
+indexed by the class of the rows passed (`widthClass` from `contracts/mlx`);
+`examples/qwen3-forward.ts` runs a prompt tail and a decode. Release state with
+each cache's `dispose()` and release returned arrays when finished.
 
 Shared dense/quantized layers, activations, normalization, and RoPE live under
 `layers/`; architecture assembly lives under `models/<family>/`. DeltaNet
@@ -981,9 +1003,13 @@ checks below.
 
 - `state/`: storage layout, positions, row membership, precision transitions,
   snapshots, and persistence. `persistence.worker.js` performs CPU disk I/O.
-  Every storage a graph's caches (or their precision maintenance) produce has a row
-  layout implementing the `BatchableCache` port (`state/layout`: `ownedCacheLayout`
-  for ordinary continuous decoding, `targetCacheLayout` for verification rows). The
+  Every storage a graph's caches (or their precision maintenance, or paging) produce
+  declares its three row layouts together in `state/layout`'s table, each implementing
+  the `BatchableCache` port: `ownedCacheLayout` for ordinary continuous decoding,
+  `prefillCacheLayout` for prefill cohorts and `targetCacheLayout` for verification
+  rows, which hold the speculative transaction (`SpeculativeRowLayout`). The
+  [cache contract test](tests/state/cache-contract.test.ts) runs every lego through
+  every read, these layouts, the transaction, snapshots and SSD. The
   batch group only calls `mergeRows`, `filterRows` and `extractRow` on it and names no
   storage family; the gate rejects `execution/` importing a concrete cache module.
   A serial cache is a row source for its layout, not a batch: an adopted lone row is the
@@ -1147,18 +1173,30 @@ and all 65,280 finite BF16 bit patterns before measuring projections. Append
 candidate instead of its shared-weight scalar reduction. Both are experiments;
 the current runtime dispatch is unchanged.
 
-`generation/speculative` exposes `generateSpeculative`, `specRun`, and the existing
-assistant, two-model, Qwen/GLM MTP, DFlash, DFlash 2, DeepSpec, and n-gram proposal providers.
-DFlash 2 (`incoai/Qwen3.8-27B-DFlash2`) drafts a whole block in one pass from
-five tapped target layers; it runs only in the batched speculative lane, with
-its projections quantized to 4 bits at load. `bindMlxGateway(model, { provider,
+`generation/speculative` exposes the draft contract and the assistant, two-model,
+Qwen/GLM MTP, DFlash, DFlash 2, DeepSpec, and n-gram proposal providers. A provider
+drafts only through its grouped rows (`DraftProvider.grouped`), in the gateway's
+speculative group; one request is a group of one row, and there is no per-request
+draft source. DFlash 2 (`incoai/Qwen3.8-27B-DFlash2`) drafts a whole block in one pass from
+five tapped target layers, with
+its projections quantized at load to the width the registry passes (4 bits). `bindMlxGateway(model, { provider,
 numDraftTokens, adaptiveDepth })` drafts `numDraftTokens` every round, or with
 `adaptiveDepth` chooses each round's count (up to that) from the decayed
-acceptance rate and the graph's declared `verifyRoundCosts`. A target whose residual stream
-carries a TurboQuant R1 fold names its basis file in `MLX_BUN_DFLASH2_TARGET_BASIS`.
-Supply the target graph, draft provider, token budget, and token callback yourself.
-`specRun` accepts an explicit binding from `generation/speculative/binding`; it does not
-require a concrete model class. The former `specServeRun` name remains available.
+acceptance rate and the graph's declared `verifyRoundCosts`. A target graph whose residual stream
+carries a TurboQuant R1 fold declares it on its draft target (`residualBasis`: the R1 seed and the
+final-norm gain the fold moved into the head); the drafter loads unrotated and applies it when a draft group binds.
+A library caller speculates as the app does: `binding.plan` with `hasDraft`, then
+`binding.methodRequest` and `submit` on `binding.createBatchGroup({ maxBatch: 1 })`
+(`@mlx-bun/training/dspark`'s calibration runs this way).
+`generation/speculative/binding` exports the target operations the groups bind
+(`bindSpeculativeTargetModel`); they do not require a concrete model class.
+Each request's draft selection is resolved when the binding binds the request and
+keys its group: argmax under `MLX_BUN_SPEC_GREEDY_DRAFT=1`, else the draft vocabulary
+the provider declares for the target (`draftVocabulary`, the Qwen MTP companion's
+`draft_vocab.json`) when the request's draft sampler reproduces on it, else each
+row's sampler over the full head. A drafter's rows bind one selection operation
+when they open and their draft loop calls it; the assistant and DeepSpec drafters
+bind their head's selection at construction the same way.
 `generation/speculative/loader` (a file of `models/speculative`) loads a `dspark.json`
 checkpoint (`loadDsparkDrafter`) and also exports the drafter class and its config types,
 which `@mlx-bun/training/dspark` uses to produce those checkpoints.
@@ -1224,8 +1262,7 @@ per-layer KV. It takes `MLX_BUN_TEST_SPEC_TARGET`, `MLX_BUN_TEST_SPEC_KIND`
 (the custom sliding-window graph over a Llama-family target) and
 `MLX_BUN_TEST_SPEC_ADAPTER`. Providers load through `defaultDraftProviders()`, as
 the app's model host loads them. Requests go through placement, `methodRequest` and
-the binding's group: B1 equal to the serial `specServeRun` producer where that
-producer serves the KV settings, B4 cohorts that prefill together and repeat,
+the binding's group: B1 repeating exactly, B4 cohorts that prefill together and repeat,
 stop/failure/abort retirement at exact counts, late and prefill joins, prompt
 snapshots with their draft attachment, generated prefixes restored from RAM and
 a fresh SSD store after a provider reload, and, with an adapter, a live adapter
@@ -1253,9 +1290,9 @@ and checkpoint attachments. The caller owns cache lifetime and reuse namespaces.
 `execution` exposes `createInferenceEngine`, method adapters, cancellation,
 admission, and continuous batching. Supply an execution planner and its graph
 bindings; the engine manages in-process session lifetimes and bounded output.
-It opens no network listener. `createAutoregressiveMethod`,
-`createSpeculativeMethod`, and `createDenoisingMethod` adapt the direct methods
-when a consumer needs sessions. `MlxBatchExecutionGroup` owns batched rows;
+It opens no network listener. `createAutoregressiveMethod` and
+`createDenoisingMethod` adapt the direct methods when a consumer needs sessions;
+speculation runs only in the batch group. `MlxBatchExecutionGroup` owns batched rows;
 `ExecutionCoordinator` and `driveExecutionGroup` coordinate its work.
 
 DiffusionGemma requests share that group through `execution/denoising-group`.
@@ -1269,7 +1306,7 @@ after the last row's run closes. Each unit runs with only its row's adapters
 active. An image request passes its pixels as the row's prefill input: only the
 first unit reads them (the vision encoder runs there), and the request owner
 releases them after the row settles. Grammar, draft, logprobs, logits processors,
-fill, encoded and paged KV requests are refused with typed plan reasons. `DenoisingKeys` reproduces MLX's
+fill requests are refused with typed plan reasons; a KV scheme or paging is refused at load, since this graph composes its own denoising state, which has no quantized or paged form yet. `DenoisingKeys` reproduces MLX's
 global key sequence per request, so denoising never reads or reseeds the process
 key. The [denoising tests](tests/generation/denoising-binding.test.ts) take
 `MLX_BUN_DIFFUSION_MODEL=/cached/diffusiongemma` for the real-weight check and

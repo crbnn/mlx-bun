@@ -37,9 +37,11 @@ export abstract class FullTransitioningKvRows<Layout extends FullLayout>
       },
     }, row, new PrefillPositions());
   }
+  /** The plain row an empty layout starts each prefill row with. */
+  protected plainRow(): KVCache { return new KVCache(); }
   preparePrefill(padding: PrefillPadding): void {
     if (this.packed) { this.packed.preparePrefill(padding); return; }
-    if (!this.rows.length) this.rows = padding.lengths.map(() => new KVCache());
+    if (!this.rows.length) this.rows = padding.lengths.map(() => this.plainRow());
     this.rows = this.rows.map(row => row instanceof FullPrefillRow ? row : new FullPrefillRow(row as KVCache));
     for (const [index, row] of this.rows.entries()) (row as FullPrefillRow).preparePrefill({
       lengths: [padding.lengths[index]!],

@@ -1,11 +1,11 @@
 import { MlxArray } from "@mlx-bun/mlx/array";
-import { Dtype, deviceArchitecture } from "@mlx-bun/mlx/ffi";
-import { runtimeFlag } from "../../runtime/config";
+import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { MetalKernel } from "@mlx-bun/mlx/metal-kernel";
 import type { TrellisGeometry } from "./geometry";
 import { HEADER, lutFor, decoderVariant, wordsPerBlock } from "./codebook";
 import { TRELLIS_THREADS } from "./launch";
+import { qualifiedRepresentations, type ScatterRepresentation } from "./qualified";
 
 const SCATTER_SPLITS = 128;
 
@@ -307,34 +307,89 @@ export function scatterBitsEligible(g: TrellisGeometry, m: number, dtype: Dtype,
 
 /** Keep the generated float table behind the measured M1 geometry. */
 export function scatterFloatCodebookEligible(g: TrellisGeometry, m: number, dtype: Dtype, selected: number,
-  architecture = deviceArchitecture()): boolean {
-  return architecture === "applegpu_g13s" && scatterBitsEligible(g, m, dtype, selected);
+  architecture: string): boolean {
+  return qualifiedRepresentations(architecture).scatter.floatCodebook && scatterBitsEligible(g, m, dtype, selected);
+}
+
+/** Variants 8..13 decode 3-bit codes at T 256, L <= 12 with the balanced kernels. */
+const balancedFor = (g: TrellisGeometry, selected: number) => selected >= 8 && selected <= 13 && g.k === 3 && g.T === 256 && g.L <= 12;
+/** Variants 10..13 share each decoded weight across rows. */
+const sharesRows = (selected: number) => selected >= 10 && selected <= 13;
+/** The shared-row codebook at 3..4 bf16 rows of the 3-bit block interleave (variant 13), where the layer composes it. */
+const sharedCodebookShape = (g: TrellisGeometry, M: number, dtype: Dtype, selected: number) => selected === 13 &&
+  (M === 3 || M === 4) && dtype === Dtype.bfloat16 && g.k === 3 && g.L === 12 && g.T === 256 && g.blockInterleave === 2;
+
+/** One activation row of axis-0 codes the balanced kernels do not take (`scatterRow`'s kernel, `SCATTER_SOURCE`):
+ * borrow [1, inFeatures]; return owned lazy [1, outFeatures]. `representation` applies where
+ * `scatterBitsEligible` holds; layers pass the one they resolved at construction. */
+export function scatterRow(x2: MlxArray, codes: MlxArray, scales: MlxArray, g: TrellisGeometry, selected: number,
+  representation: ScatterRepresentation): MlxArray {
+  if (x2.shape[0] !== 1) throw new Error("scatterRow: expects one activation row");
+  if (balancedFor(g, selected)) throw new Error("scatterRow: 3-bit codes at T 256 take balancedScatterRow");
+  const qualified = scatterBitsEligible(g, 1, x2.dtype, selected);
+  return launch(scatterKernel(), x2, codes, scales, g, selected, false,
+    qualified && (g.k === 2 || g.k === 4) && representation.genericBits, qualified && representation.floatCodebook, false);
+}
+
+/** One activation row of 3-bit axis-0 codes at T 256 (`BALANCED_SCATTER_SOURCE`, variants 8..13). */
+export function balancedScatterRow(x2: MlxArray, codes: MlxArray, scales: MlxArray, g: TrellisGeometry, selected: number,
+  representation: ScatterRepresentation): MlxArray {
+  if (x2.shape[0] !== 1) throw new Error("balancedScatterRow: expects one activation row");
+  if (!balancedFor(g, selected)) throw new Error("balancedScatterRow: needs 3-bit codes at T 256, L <= 12 (variants 8..13)");
+  const qualified = scatterBitsEligible(g, 1, x2.dtype, selected);
+  return launch(balancedScatterKernel(), x2, codes, scales, g, selected, false,
+    qualified && representation.bits, qualified && representation.floatCodebook, false);
+}
+
+/** 2..4 activation rows sharing each decoded weight (variants 10..13) of axis-0 codes the balanced kernels do not take. */
+export function scatterRows(x2: MlxArray, codes: MlxArray, scales: MlxArray, g: TrellisGeometry, selected: number): MlxArray {
+  const M = x2.shape[0]!;
+  if (M < 2 || M > 4) throw new Error(`scatterRows: M=${M} outside 2..4`);
+  if (!sharesRows(selected) || balancedFor(g, selected)) throw new Error("scatterRows: needs a row-sharing variant (10..13) and codes the balanced kernels do not take");
+  return launch(sharedScatterKernelSet().generic, x2, codes, scales, g, selected, true, false, false, false);
+}
+
+/** 2..4 activation rows sharing each decoded weight of 3-bit axis-0 codes at T 256 (variants 10..13);
+ * `sharedCodebook` applies at three and four bf16 rows of the block interleave (layers pass what they composed). */
+export function balancedScatterRows(x2: MlxArray, codes: MlxArray, scales: MlxArray, g: TrellisGeometry, selected: number,
+  sharedCodebook: boolean): MlxArray {
+  const M = x2.shape[0]!;
+  if (M < 2 || M > 4) throw new Error(`balancedScatterRows: M=${M} outside 2..4`);
+  if (!sharesRows(selected) || !balancedFor(g, selected)) throw new Error("balancedScatterRows: needs a row-sharing variant (10..13) and 3-bit codes at T 256");
+  return launch(sharedScatterKernelSet().balanced, x2, codes, scales, g, selected, true, false, false,
+    sharedCodebook && sharedCodebookShape(g, M, x2.dtype, selected));
 }
 
 /** Borrow [M, inFeatures] and axis-0 weights; return owned lazy [M, outFeatures].
- * The caller selects a supported variant and limits M to 1..4. */
-export function trellisScatter(x2: MlxArray, codes: MlxArray, scales: MlxArray, g: TrellisGeometry, selected: number, useSharedScatterCodebook = false): MlxArray {
+ * The caller selects a supported variant and limits M to 1..4. `representation`
+ * applies where `scatterBitsEligible` holds; layers pass the one they resolved
+ * at construction (`qualifiedRepresentations`), benches and tests the one they compare. */
+export function trellisScatter(x2: MlxArray, codes: MlxArray, scales: MlxArray, g: TrellisGeometry, selected: number,
+  useSharedScatterCodebook: boolean, representation: ScatterRepresentation): MlxArray {
+  const M = x2.shape[0]!;
+  const balanced = balancedFor(g, selected);
+  const shared = sharesRows(selected) && M > 1;
+  const qualifiedShape = scatterBitsEligible(g, M, x2.dtype, selected);
+  const bitsY = qualifiedShape && (balanced ? representation.bits
+    : (g.k === 2 || g.k === 4) && representation.genericBits);
+  const floatCodebook = qualifiedShape && representation.floatCodebook;
+  const codebook = useSharedScatterCodebook && sharedCodebookShape(g, M, x2.dtype, selected);
+  const kernel = shared
+    ? balanced ? sharedScatterKernelSet().balanced : sharedScatterKernelSet().generic
+    : balanced ? balancedScatterKernel() : scatterKernel();
+  return launch(kernel, x2, codes, scales, g, selected, shared, bitsY, floatCodebook, codebook);
+}
+
+function launch(kernel: MetalKernel, x2: MlxArray, codes: MlxArray, scales: MlxArray, g: TrellisGeometry, selected: number,
+  shared: boolean, bitsY: boolean, floatCodebook: boolean, codebook: boolean): MlxArray {
   const M = x2.shape[0]!;
   const wpb = wordsPerBlock(g.T, g.k);
   const nb = Math.floor(32 / wpb);
   if (nb < 1) throw new Error(`trellis scatter: block of ${wpb} words exceeds one SIMD group`);
   const groups = Math.ceil((g.cols / g.T) / nb);
   const NP = Math.ceil(32 / g.k);
-  const balanced = selected >= 8 && selected <= 13 && g.k === 3 && g.T === 256 && g.L <= 12;
-  const shared = selected >= 10 && selected <= 13 && M > 1;
-  const bitsY = scatterBitsEligible(g, M, x2.dtype, selected) && (balanced
-    ? runtimeFlag("MLX_BUN_TRELLIS_SCATTER_BITS", deviceArchitecture() === "applegpu_g13s")
-    : (g.k === 2 || g.k === 4) && runtimeFlag("MLX_BUN_TRELLIS_GENERIC_SCATTER_BITS", deviceArchitecture() === "applegpu_g13s"));
-  const floatCodebook = scatterFloatCodebookEligible(g, M, x2.dtype, selected) &&
-    runtimeFlag("MLX_BUN_TRELLIS_SCATTER_FLOAT_CODEBOOK", true);
   const threads = floatCodebook ? (g.k === 3 ? 512 : g.k === 4 ? 256 : 128) : TRELLIS_THREADS;
   const groupsPerThreadgroup = threads / 32;
-  const codebook = useSharedScatterCodebook && selected === 13 &&
-    (M === 3 || M === 4) && x2.dtype === Dtype.bfloat16 &&
-    g.k === 3 && g.L === 12 && g.T === 256 && g.blockInterleave === 2;
-  const kernel = shared
-    ? balanced ? sharedScatterKernelSet().balanced : sharedScatterKernelSet().generic
-    : balanced ? balancedScatterKernel() : scatterKernel();
   const [partial] = kernel.apply([x2, codes, scales, lutFor(g.L)], {
     outputs: [{ shape: [M, SCATTER_SPLITS, g.cols], dtype: Dtype.float32 }],
     grid: [threads, Math.ceil(groups / groupsPerThreadgroup), (shared ? 1 : M) * SCATTER_SPLITS],

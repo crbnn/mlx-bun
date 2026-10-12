@@ -13,6 +13,7 @@ if [ "${1:-}" = "--help" ]; then
   echo "MLX_BUN_VERSION: latest or a release tag such as v0.5.0"
   echo "Installs the complete bundle under app-install/ and links ~/.local/bin/mlx-bun,"
   echo "plus mlx-bun.<cmd> beside it for each mlx-lm command mlx-bun implements ($ALIASES)."
+  echo "Then runs mlx-bun compile-ane, which compiles the Neural Engine programs this Mac's models use."
   exit 0
 fi
 [ "$#" = 0 ] || fail "use --help for usage"
@@ -133,6 +134,11 @@ for old in "$APP_ROOT"/bundle.*; do
     fi
   fi
 done
+# The Neural Engine install step: compile every program this Mac's models use into the system's compile cache, so
+# no model load compiles. It runs the installed executable, because the cache belongs to the executable that
+# compiled it. A failure keeps the installation; a model that needs a missing program names the verb.
+"$APP_ROOT/current/mlx-bun" compile-ane </dev/null ||
+  echo "Warning: the Neural Engine install step failed; run mlx-bun compile-ane before serving a model that uses the Neural Engine." >&2
 echo "Installed $ACTUAL at $BIN_DIR/mlx-bun (and mlx-bun.<cmd> aliases: $ALIASES)"
 RESOLVED="$(command -v mlx-bun || true)"
 if [ "$RESOLVED" = "$BIN_DIR/mlx-bun" ]; then

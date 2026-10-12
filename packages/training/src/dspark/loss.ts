@@ -14,7 +14,7 @@
 // gradient back into the draft distribution (L_tv already drives p^d→p^t).
 //
 // p^t is the FROZEN target's true distribution at each block position; the
-// caller computes targetLogits = model.logitsFromHidden(targetHidden) (same
+// caller computes targetLogits = the target head over targetHidden (same
 // head DSpark drafts with) and passes it as a constant. M = A·γ is small
 // (γ≈5–7), so plain MLX materialization is fine; a fused TV kernel (the
 // flash-cce vocab-blocked pattern) is only worth porting if measurement

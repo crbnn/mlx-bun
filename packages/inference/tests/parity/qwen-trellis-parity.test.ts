@@ -24,7 +24,7 @@
 // Continuation state and append geometry are the runtime-oracle plan's job
 // (README, "Repeatable runtime comparison"). This is not a claim about other
 // artifacts, batching above one, quantized KV, sampling, or speed.
-import { expect, spyOn, test } from "bun:test";
+import { expect, test } from "bun:test";
 import { strict as assert } from "node:assert";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -103,8 +103,9 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis: logits, greedy tokens and MTP spec
   const { QwenMtpProvider } = await import("@mlx-bun/inference/generation/speculative");
   const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
   const { argmaxLastPosition, lastPositionLogits } = await import("@mlx-bun/inference/scoring");
-  const { Qwen38TrellisTQ } = await import("@mlx-bun/inference/models/qwen38-27b-trellis-tq");
+  const { Qwen38TrellisM1Max } = await import("@mlx-bun/inference/models/qwen38-27b-trellis-m1max");
   const { clearCache } = await import("@mlx-bun/mlx/ffi");
+  const { observedPhases, phaseLogits } = await import("../models/phase-forward");
 
   const config = await loadModelConfig(inputs!.target);
   const tokenizer = await loadTokenizer(inputs!.target), template = await ChatTemplate.load(inputs!.target);
@@ -118,8 +119,9 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis: logits, greedy tokens and MTP spec
   const report: Record<string, unknown> = {};
   try {
     const model = createModel(weights, config) as A;
-    // The purpose-built graph main selected must be the one this tree selects too.
-    expect(model).toBeInstanceOf(Qwen38TrellisTQ);
+    // Main selected its purpose-built TQ graph for this artifact on the M1 Max; this tree selects the graph generated
+    // for that composition (the reference runtime's GPU family is checked above).
+    expect(model).toBeInstanceOf(Qwen38TrellisM1Max);
     report.graph = model.constructor.name;
 
     // Greedy trajectories, full logits by hash.
@@ -129,7 +131,7 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis: logits, greedy tokens and MTP spec
       try {
         let tokens = trajectory.promptIds;
         for (let step = 0; step < trajectory.greedy.length; step++) {
-          const out = model.forward(tokens, cache);
+          const out = phaseLogits(model, tokens, cache);
           let next: number;
           try {
             const last: Float32Array = lastPositionLogits(out);
@@ -151,20 +153,16 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis: logits, greedy tokens and MTP spec
     const provider = await QwenMtpProvider.load(inputs!.draft);
     releases.push(() => provider.dispose());
     let forwards: number[][] = [];
-    const forwardHidden = model.forwardHidden.bind(model);
-    const spy = spyOn(model, "forwardHidden").mockImplementation((input: A, caches: A[], ...rest: A[]) => {
-      forwards.push(input.toIntTokens() as number[]);
-      return forwardHidden(input, caches, ...rest);
-    });
-    releases.push(() => spy.mockRestore());
-    const binding = bindMlxGateway(model, { provider, numDraftTokens: reference.mtp.depth });
+    // The scheduler binds to a view whose phases record each target forward's tokens.
+    const view = observedPhases(model, { forward(input: A) { forwards.push(input.toIntTokens() as number[]); } });
+    const binding = bindMlxGateway(view, { provider, numDraftTokens: reference.mtp.depth });
     const options = { temperature: 0, maxTokens: reference.mtp.maxTokens };
     const rounds: unknown[] = [];
     for (const [i, run] of reference.mtp.runs.entries()) {
       forwards = [];
       const plan = binding.plan({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
-        kvQuant: false, turboQuant: false, hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true }, options,
-      { continuous: true, quantizedBatch: false, checkpoints: false });
+        hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true }, options,
+      { checkpoints: false });
       assert.equal(plan.method, "speculative");
       const method = binding.methodRequest!(plan, options);
       assert(method, "the MTP method must bind");

@@ -4,10 +4,10 @@ import { clearCache } from "@mlx-bun/mlx/ffi";
 import type { Cache } from "../contracts/mlx/cache";
 import type { MlxTokenGraph } from "../models/graph";
 import type { GenerateOptions } from "../generation/index";
-import { bindMlxAutoregressiveGraph } from "../generation/bindings/autoregressive";
+import { MlxPhaseDispatch } from "../generation/phase-dispatch";
+import { tokenPhasesOf } from "../models/capabilities";
 import { appendGrammarSpan } from "../generation/grammar-step";
 import { makeStepSampler, type DeviceStepSampler } from "../sampling/index";
-import { createKvMaintenance, type KvMaintenance } from "../state/kv-maintenance";
 import { cleanupFailure, disposeResources } from "../runtime/resources";
 import { snapshotGenerationPolicy } from "./request-policy";
 import { MlxPrefillCohort } from "./prefill-cohort";
@@ -16,7 +16,6 @@ import type { MlxGroupedMethod, MlxGroupMethodHost, MlxGroupMethodRequest, MlxGr
 
 interface RequestState {
   sampling: DeviceStepSampler;
-  maintain: KvMaintenance;
   caches: Cache[];
   retain?: () => void;
   pending: MlxArray | null;
@@ -38,33 +37,32 @@ export function bindGrammarGroupRequests(model: MlxTokenGraph, denseKvReads: rea
 }
 
 class GrammarGroup implements MlxGroupedMethod {
-  readonly #binding;
+  readonly #dispatch: MlxPhaseDispatch;
   readonly #requests = new Map<Row, RequestState>();
   #next = 0;
 
   constructor(readonly host: MlxGroupMethodHost, readonly model: MlxTokenGraph,
     readonly denseKvReads: readonly number[]) {
-    this.#binding = bindMlxAutoregressiveGraph(model);
+    this.#dispatch = new MlxPhaseDispatch(tokenPhasesOf(model));
   }
 
   prepare(row: Row): MlxGroupPreparation {
     const options = row.req.method!.data as GenerateOptions;
     if (!row.req.grammar || options.logprobs || (options.topLogprobs ?? 0) > 0 ||
-        row.req.continuation || row.req.promptInput || options.pagedKv)
-      throw new Error("forced grammar span requires an ordinary grammar request without logprobs, media, paging, or continuation");
+        row.req.continuation || row.req.promptInput)
+      throw new Error("forced grammar span requires an ordinary grammar request without logprobs, media, or continuation");
     const sampling = makeStepSampler(options, { tokenRepresentation: "device", grammarWait: "external",
       historyUpdate: "manual", initialHistory: row.req.promptIds });
-    const maintain = createKvMaintenance(options);
-    this.#requests.set(row, { sampling, maintain, caches: [], pending: null });
+    this.#requests.set(row, { sampling, caches: [], pending: null });
     const target = new MlxPrefillCohort({
       model: this.model, chunkSize: this.host.prefillChunkSize,
-      tailSplit: this.host.runtime.flag("MLX_BUN_PREFILL_TAIL_SPLIT", true),
-      promptCache: this.host.promptCache, maintain, denseKvReads: this.denseKvReads,
-      forward: (ids, caches) => Promise.resolve(this.#binding.graph.forwardHidden(ids, caches)),
-      project: hidden => {
+      tailSplit: this.host.prefillTailSplit,
+      promptCache: this.host.promptCache, maintain: this.host.kvMaintenance, denseKvReads: this.denseKvReads,
+      forward: async (ids, caches, step) => this.#dispatch.prompt(step.phase, step.sequences, step.tokens)(ids, caches, null),
+      project: (hidden, _caches, _completed, step) => {
         const [, length, width] = hidden.shape as [number, number, number];
         using last = hidden.slice([0, length - 1, 0], [1, length, width]);
-        return this.#binding.graph.projectLogits(last, { type: "all" });
+        return this.#dispatch.logits(step.sequences)(last);
       },
       complete: async (state, logits) => {
         const request = this.#requests.get(row)!;
@@ -143,20 +141,20 @@ class GrammarGroup implements MlxGroupedMethod {
     let next: MlxArray | null = null;
     try {
       if (forced) {
-        this.#maintain(state);
+        this.#readable(state);
         state.sampling.commitDevice(current);
         state.sampling.commitNumbers(forced);
         const after = step + 1 + forced.length;
-        await appendGrammarSpan(this.#binding.graph, state.caches, [token, ...forced],
+        await appendGrammarSpan(this.#dispatch, state.caches, [token, ...forced],
           ids => { row.fed.push(...ids); },
           after < row.req.maxTokens && !grammar.isTerminated
             ? logits => { next = state.sampling.sample(logits, after).token; } : undefined);
       } else if (step + 1 < row.req.maxTokens && !grammar.isTerminated) {
-        this.#maintain(state);
+        this.#readable(state);
         state.sampling.commitDevice(current);
         using ids = ops.reshape(current, [1, 1]);
-        using hidden = await this.#binding.graph.forwardHidden(ids, state.caches);
-        using logits = this.#binding.graph.projectLogits(hidden, { type: "all" });
+        using hidden = await this.#dispatch.decode(1)(ids, state.caches, null);
+        using logits = this.#dispatch.logits(1)(hidden);
         next = state.sampling.sample(logits, step + 1).token;
         row.fed.push(token);
       }
@@ -187,11 +185,10 @@ class GrammarGroup implements MlxGroupedMethod {
     } finally { next?.dispose(); }
   }
 
-  /** One maintenance call before the step's forward, then the graph's read
-   * requirement: a row whose next append would not be read plain is refused
-   * with `DenseKvReadError` before any layer appends. */
-  #maintain(state: RequestState): void {
-    state.maintain(state.caches);
+  /** The graph's read requirement before the step's forward: a row whose next
+   * append would not be read plain is refused with `DenseKvReadError` before
+   * any layer appends. */
+  #readable(state: RequestState): void {
     if (unreadableRows(state.caches, this.denseKvReads, 1).length) throw new DenseKvReadError();
   }
 

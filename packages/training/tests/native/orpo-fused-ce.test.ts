@@ -59,12 +59,15 @@ const { encodeDpoRow, encodeSftRow } = enabled ? await import("../../src/dataset
 const { orpoLoss, orpoMetrics, sftLoss, responseOnlyCe } = enabled ? await import("../../src/loss") : {} as typeof import("../../src/loss");
 const { orpoLossPrefixShared, splitPrefixBatch } = enabled ? await import("../../src/prefix-shared") : {} as typeof import("../../src/prefix-shared");
 const { boundedSftCe, SegmentedBackward, SegmentedBackwardOrpo, SegmentedBackwardOrpoPrefix, planSegmentsBySize } = enabled ? await import("../../src/segmented") : {} as typeof import("../../src/segmented");
-const { flashCceForward, flashCceBackward } = enabled ? await import("../../src/kernels/flash-cce") : {} as typeof import("../../src/kernels/flash-cce");
+const { FlashCce, DEFAULT_FLASH_CCE } = enabled ? await import("../../src/kernels/flash-cce") : {} as typeof import("../../src/kernels/flash-cce");
 const { trainLora, DEFAULT_TRAIN_CONFIG } = enabled ? await import("../../src/trainer") : {} as typeof import("../../src/trainer");
 
 // This file's flash cases exist to exercise the flash-CCE head itself, on tiny
 // rows (M ≈ 20) — pin the M-dispatch off (loss.ts fusedRespLogpMean, kernel
-// backlog #3) so `flash: true` always routes to the flash kernel here.
+// backlog #3) so the flash head always runs here: the direct loss calls take
+// kernels composed with minRows 0, and the trainLora runs compose theirs from
+// MLX_BUN_FLASH_MIN_M=0 at run start.
+const flashHead = enabled ? new FlashCce({ ...DEFAULT_FLASH_CCE, minRows: 0 }) : undefined;
 const restoreFlashMin = enabled ? configureRuntime({ MLX_BUN_FLASH_MIN_M: "0" }) : () => {};
 afterAll(() => restoreFlashMin());
 
@@ -158,7 +161,7 @@ describe.skipIf(!enabled)("ORPO fused linear-CE head parity (MiniCPM5-1B)", () =
     // the kernel's bf16-class parity (~0.2% logp → well under 0.05 on an O(1) loss).
     const flashLoss = (() => {
       const sink: Array<{ dispose(): void }> = [];
-      const l = orpoLoss(model, batch, 0.1, { chunkSize: respLen + 8, fused: true, flash: true, sink });
+      const l = orpoLoss(model, batch, 0.1, { chunkSize: respLen + 8, fused: true, flash: flashHead, sink });
       ops.evalAll([l]);
       const v = l.toFloat32()[0]!;
       l.dispose();
@@ -167,25 +170,21 @@ describe.skipIf(!enabled)("ORPO fused linear-CE head parity (MiniCPM5-1B)", () =
     })();
     expect(Math.abs(flashLoss - full)).toBeLessThan(0.05);
 
-    // M-dispatch (kernel backlog #3): a flash request whose M is below
-    // MLX_BUN_FLASH_MIN_M routes to the EXACT fused head — the loss must be
+    // M-dispatch (kernel backlog #3): a flash request whose M is below the
+    // kernels' minRows routes to the EXACT fused head — the loss must be
     // bit-identical to the fused single-chunk loss (which differs from the
     // flash head's bf16-class value at ~1e-3).
-    const restoreDispatch = configureRuntime({ MLX_BUN_FLASH_MIN_M: "8192" });
-    try {
-      const dispatched = (() => {
-        const sink: Array<{ dispose(): void }> = [];
-        const l = orpoLoss(model, batch, 0.1, { chunkSize: respLen + 8, fused: true, flash: true, sink });
-        ops.evalAll([l]);
-        const v = l.toFloat32()[0]!;
-        l.dispose();
-        for (const d of sink) d.dispose();
-        return v;
-      })();
-      expect(dispatched).toBe(lossOf(respLen + 8)); // exact fused value, not flash's
-    } finally {
-      restoreDispatch();
-    }
+    const dispatchHead = new FlashCce({ ...DEFAULT_FLASH_CCE, minRows: 8192 });
+    const dispatched = (() => {
+      const sink: Array<{ dispose(): void }> = [];
+      const l = orpoLoss(model, batch, 0.1, { chunkSize: respLen + 8, fused: true, flash: dispatchHead, sink });
+      ops.evalAll([l]);
+      const v = l.toFloat32()[0]!;
+      l.dispose();
+      for (const d of sink) d.dispose();
+      return v;
+    })();
+    expect(dispatched).toBe(lossOf(respLen + 8)); // exact fused value, not flash's
 
     disposeLora(lora);
     weights.dispose();
@@ -212,7 +211,7 @@ describe.skipIf(!enabled)("ORPO fused linear-CE head parity (MiniCPM5-1B)", () =
     const idData = Array.from({ length: M }, (_, i) => (i * 2659 + 13) % V);
     const ids = ops.fromInt32(idData, [1, M]);
     const cache = model.makeCache();
-    const h3 = model.forwardHidden(ids, cache);
+    const h3 = model.sequenceHidden(ids, cache, "wider");
     const hResp = ops.reshape(h3, [M, H]);
     ops.evalAll([hResp]);
     const targets = idData.map((_, i) => idData[(i + 1) % M]!);
@@ -232,9 +231,9 @@ describe.skipIf(!enabled)("ORPO fused linear-CE head parity (MiniCPM5-1B)", () =
     const fullF = dhFull.toFloat32();
 
     // Flash dh at the production defaults (filter + block skip at their defaults).
-    const fwd = flashCceForward(hResp, head, targets);
+    const fwd = new FlashCce().forward(hResp, head, targets);
     ops.evalAll([fwd.lse, fwd.blockMax]);
-    const dh = flashCceBackward(hResp, head, targets, fwd.lse, new Array(M).fill(1), undefined, fwd.blockMax);
+    const dh = new FlashCce().backward(hResp, head, targets, fwd.lse, new Array(M).fill(1), undefined, fwd.blockMax);
     ops.evalAll([dh]);
     const flashF = dh.toFloat32();
 
@@ -356,7 +355,7 @@ describe.skipIf(!enabled)("ORPO fused linear-CE head parity (MiniCPM5-1B)", () =
     };
     const lambda = 0.1;
 
-    const lossOf = (scope: "full" | "response", chunk?: { chunkSize: number; fused?: boolean; flash?: boolean }): number => {
+    const lossOf = (scope: "full" | "response", chunk?: { chunkSize: number; fused?: boolean; flash?: InstanceType<typeof FlashCce> }): number => {
       const sink: Array<{ dispose(): void }> = [];
       const l = orpoLoss(model, batch, lambda, chunk ? { ...chunk, sink } : undefined, scope);
       ops.evalAll([l]);
@@ -407,7 +406,7 @@ describe.skipIf(!enabled)("ORPO fused linear-CE head parity (MiniCPM5-1B)", () =
     expect(Math.abs(lossOf("full", { chunkSize: 8, fused: true }) - fullNaive)).toBeLessThan(0.05);
     expect(Math.abs(lossOf("full", { chunkSize: 4 }) - fullNaive)).toBeLessThan(0.05); // Checkpoint chunked
     expect(Math.abs(lossOf("full", { chunkSize: 4096, fused: true }) - fullNaive)).toBeLessThan(0.05); // single-chunk fused
-    expect(Math.abs(lossOf("full", { chunkSize: 4096, fused: true, flash: true }) - fullNaive)).toBeLessThan(0.05); // flash-CCE
+    expect(Math.abs(lossOf("full", { chunkSize: 4096, fused: true, flash: flashHead }) - fullNaive)).toBeLessThan(0.05); // flash-CCE
 
     // --- 'full' through prefix-sharing (one concat forward, prompt gathered). ---
     const split = splitPrefixBatch(batch);

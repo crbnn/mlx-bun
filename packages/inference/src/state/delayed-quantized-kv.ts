@@ -1,35 +1,87 @@
 import { captureFullKvDonorAttention } from "./full-kv-row-donor";
 import { appendFullKvRows } from "./full-kv-row-append";
-import { fullRowPadding, fullRowPhysicalLength } from "./full-prefill-row";
+import { FullPrefillRow, fullRowPadding, fullRowPhysicalLength } from "./full-prefill-row";
 import { captureKvAttention } from "./kv-attention-view";
 import type { MlxArray } from "@mlx-bun/mlx/array";
+import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { FullTransitioningKvRows } from "./full-transitioning-kv-rows";
 import { BatchedQuantizedKVCache } from "./batched-quantized-kv";
+import { KVCache, type AffineKernelSet } from "./kv";
 import { QuantizedKVCache } from "./quantized-kv";
-import { type Cache, type Mask, type KvAttentionState, type KvAttentionView, type DenseKvReads, type KvMaintenance } from "../contracts/mlx/cache";
+import { convertToAffine, transitionDue } from "./bf16-first-kv";
+import { type AttentionRead, type Cache, type CommittedAttentionCache, type Mask, type KvAttentionView } from "../contracts/mlx/cache";
+import { kvStorage, type KvAttentionState } from "./kv-storage";
 
-/** Affine storage keeps its native quantized-attention arithmetic while rows
- * cross the conversion boundary independently. Once all rows convert, their
- * packed planes use the existing batched attention implementation. */
-export class DelayedQuantizedKVCache extends FullTransitioningKvRows<BatchedQuantizedKVCache> implements KvAttentionState {
-  /** Plain reads per row, answered by this cache's own maintenance. */
-  readonly denseKvReads: DenseKvReads | undefined;
+/** The bf16 source of a full-attention row: a `KVCache`, or a padded
+ * `FullPrefillRow` over one. Converted rows have none. */
+function affineSource(row: Cache): KVCache | FullPrefillRow | undefined {
+  return row instanceof FullPrefillRow ? row.affineConversion : row instanceof KVCache ? row : undefined;
+}
+
+/** The affine transition of `Bf16FirstQuantizedKVCache` over full-attention
+ * rows: each row converts with its own `toQuantized` once it holds `start`
+ * positions, and attends with `kernelSet` after. */
+function settleAffineRows(rows: Cache[], groupSize: number, bits: number, start: number, kernelSet: AffineKernelSet): void {
+  for (let index = 0; index < rows.length; index++) {
+    const source = affineSource(rows[index]!);
+    if (source && transitionDue(source.offset, start)) rows[index] = convertToAffine<Cache>(source, groupSize, bits, start, kernelSet);
+  }
+}
+
+/** The rows of the affine bf16-first lego (`Bf16FirstQuantizedKVCache`) for
+ * continuous batching. Each row is bf16 until it holds `start` positions and
+ * converts by the same transition; rows cross independently, a converted row
+ * keeps its native quantized-attention arithmetic, and once all rows convert,
+ * their packed planes use the existing batched attention implementation. When
+ * a row converts is described on `TransitioningKvRows`. The reads are the
+ * graph's call today: this layout's mask before the append, then its attention
+ * view. Converted rows, the packed layout and every view attend with
+ * `kernelSet`, taken when the layout is built. A row this layout hands back
+ * to serial use is the lego it came from again (`compose`), or its storage when
+ * it came as storage. */
+export class DelayedQuantizedKVCache extends FullTransitioningKvRows<BatchedQuantizedKVCache> implements KvAttentionState, CommittedAttentionCache {
   constructor(readonly groupSize: number, readonly bits: number, readonly start: number,
-    readonly maintain: KvMaintenance, row?: Cache) {
-    super({ signature: `kv:delayed-quant:${bits}:${groupSize}:${start}`, conversionOffset: start, maintain,
+    /** The affine kernel set converted rows and every read attend with, named
+     * by the composition (`composedAffineKernels`). */
+    readonly kernelSet: AffineKernelSet, row?: Cache,
+    /** How the lego these rows came from composes the rows this layout hands
+     * back to serial use (`ComposedStorage.over`). */
+    readonly compose?: (storage: Cache) => Cache) {
+    super({ signature: `kv:delayed-quant:${bits}:${groupSize}:${start}`, conversionOffset: start,
+      settle: rows => settleAffineRows(rows, groupSize, bits, start, kernelSet),
+      keepsDenseReads: row => { const source = affineSource(row); return !source || !transitionDue(source.offset, start); },
       converted: row => row instanceof QuantizedKVCache,
-      makeLayout: () => new BatchedQuantizedKVCache(groupSize, bits) }, row);
-    this.denseKvReads = this.denseKvReadsOf(maintain);
+      makeLayout: () => new BatchedQuantizedKVCache(groupSize, bits, kernelSet(bits, groupSize, Dtype.bfloat16)),
+      ...(compose ? { compose } : {}) }, row);
   }
   get attentionState(): KvAttentionState { return this; }
   captureDonorAttention() {
     return this.packed?.captureDonorAttention() ?? captureFullKvDonorAttention(this.rows, this.leftPad, this.offset);
   }
-  makeEmptyBatch(): DelayedQuantizedKVCache { return new DelayedQuantizedKVCache(this.groupSize, this.bits, this.start, this.maintain); }
+  makeEmptyBatch(): DelayedQuantizedKVCache {
+    return new DelayedQuantizedKVCache(this.groupSize, this.bits, this.start, this.kernelSet, undefined, this.compose);
+  }
+
+  appendDecode(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v, false); }
+  appendWindow(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v, false); }
+  /** The graph's committed read today (Qwen 3.5's `appendKnown` under `knownSpans`): the same
+   * mask and attention view, attended with independent positions, so a
+   * converted row keeps the single-position reduction order.
+   * TODO(B1b): the affine caches' own reads replace this, one call per phase. */
+  appendCommitted(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v, true); }
+  /** The graph's read today: the mask from this layout before the append (no
+   * sliding window), then the attention view the append returns. */
+  #read(k: MlxArray, v: MlxArray, independentPositions: boolean): AttentionRead {
+    const mask = this.makeMask(k.shape[2]!, null);
+    let view: KvAttentionView;
+    try { view = this.appendAndFetch(k, v); } catch (error) { mask.arr?.dispose(); throw error; }
+    return { attend: (q, scale) => view.attend(q, scale, mask, independentPositions),
+      dispose() { view.dispose(); mask.arr?.dispose(); } };
+  }
   /** Plain keys and values at the model's B while every row is still plain,
    * assembled as the plain attention view does; the caller owns them. Once a
-   * row is converted, or the scheduled maintenance converts one, reading plain
+   * row is converted, or the transition this append runs converts one, reading plain
    * is an error raised before any row appends. */
   updateAndFetch(k: MlxArray, v: MlxArray): [MlxArray, MlxArray] {
     this.advancePlain();
@@ -42,8 +94,9 @@ export class DelayedQuantizedKVCache extends FullTransitioningKvRows<BatchedQuan
   }
   appendAndFetch(k: MlxArray, v: MlxArray): KvAttentionView {
     this.advance();
-    if (this.packed) return captureKvAttention(this.packed, k, v);
-    if (this.rows.every(row => !row.quantizedAttention)) {
+    const kernels = this.kernelSet(this.bits, this.groupSize, k.dtype);
+    if (this.packed) return captureKvAttention(this.packed, k, v, kernels);
+    if (this.rows.every(row => !kvStorage(row).quantizedAttention)) {
       const [keys, values] = this.#appendPlain(k, v);
       return { attend: (q, scale, mask) => ops.sdpa(q, keys, values, scale, mask.mode, mask.arr),
         dispose() { keys.dispose(); values.dispose(); } };
@@ -54,7 +107,7 @@ export class DelayedQuantizedKVCache extends FullTransitioningKvRows<BatchedQuan
       for (const [row, cache] of this.rows.entries()) {
         const slice = (a: MlxArray) => a.slice([row, 0, 0, 0], [row + 1, a.shape[1]!, a.shape[2]!, a.shape[3]!]);
         using kr = slice(k), vr = slice(v);
-        views.push(captureKvAttention(cache, kr, vr));
+        views.push(captureKvAttention(cache, kr, vr, kernels));
       }
       this.syncPositions(true);
     } catch (error) { for (const view of views) view.dispose(); throw error; }

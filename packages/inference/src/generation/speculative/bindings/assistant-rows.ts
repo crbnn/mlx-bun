@@ -3,9 +3,10 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { materializeCopy } from "@mlx-bun/mlx/materialize";
 import { disposeResources, applyStateChanges } from "../../../runtime/resources";
 import type { PreparedStateChange } from "../../../contracts/portable/resources";
-import type { AssistantRowsTarget, DraftPrefillGroup, DraftRowGroup, GroupedDraftProvider } from "../source";
+import { targetLacks, type AssistantRowsTarget, type DraftPrefillGroup, type DraftRowGroup, type GroupedDraftProvider, type TargetView } from "../source";
 import { DRAFT_CHECKPOINT_SCHEMA, type DraftRowCheckpoint } from "../../../contracts/mlx/draft-checkpoint";
 import type { AssistantDrafterModel } from "../../../contracts/mlx/drafter";
+import { widthClass } from "../../../contracts/mlx/width";
 
 /** The assistant owns only its last true target hidden and coverage. Donor
  * attention stays with target storage; checkpoints contain no duplicate KV. */
@@ -61,13 +62,14 @@ class AssistantRows implements DraftPrefillGroup, DraftRowGroup {
     const donors=this.target.readDonors();
     let ids=ops.fromInt32([...pending],[B,1]), hidden=this.#hidden!;
     const tokens: MlxArray[]=[];
+    const forward=this.drafter.forwardRows[widthClass(B)];
     try {
       for(let step=0;step<depth;step++) {
         using emb=this.target.embed(ids);
         const positions=donors.positions.map(position=>position+step);
         const common=positions.every(position=>position===positions[0]);
         using offsets=common ? null : ops.fromInt32(positions,[B]);
-        const next=this.drafter.forwardRows(emb,hidden,donors,offsets ?? positions[0]!);
+        const next=forward(emb,hidden,donors,offsets ?? positions[0]!);
         owned.push(next.nextHidden); tokens.push(next.tokens); hidden=next.nextHidden;
         ids.dispose(); ids=ops.reshape(next.tokens,[B,1]);
       }
@@ -85,10 +87,16 @@ class AssistantRows implements DraftPrefillGroup, DraftRowGroup {
   dispose(): void { this.#hidden?.dispose(); this.#hidden=null; this.#processed=[]; }
 }
 
+/** A target without the donor port refuses the pairing before any row state exists. */
+function assistantTarget(target: TargetView): AssistantRowsTarget {
+  if (!target.assistantRows) throw targetLacks("assistantRows");
+  return target.assistantRows;
+}
+
 export function assistantGroups(drafter: AssistantDrafterModel, namespace: string): GroupedDraftProvider {
   return {
     checkpointNamespace: () => namespace,
-    openPrefill: ({target,checkpoints}) => new AssistantRows(target.assistantRows!,drafter,namespace,checkpoints),
-    open: ({target,checkpoints}) => new AssistantRows(target.assistantRows!,drafter,namespace,checkpoints),
+    openPrefill: ({target,checkpoints}) => new AssistantRows(assistantTarget(target),drafter,namespace,checkpoints),
+    open: ({target,checkpoints}) => new AssistantRows(assistantTarget(target),drafter,namespace,checkpoints),
   };
 }

@@ -4,6 +4,8 @@
 // filterRows, extractRow. The oracle is the solo replay: every row's updates
 // applied to its own serial cache; an extracted row must equal it byte for byte,
 // and a step's mask and RoPE positions must be what each row's padding implies.
+import { Dtype } from "@mlx-bun/mlx/ffi";
+import { unfusedAffineKernels } from "../../src/state/affine-attention";
 import { describe, expect, test } from "bun:test";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
@@ -21,6 +23,7 @@ import { QuantizedKVCache } from "../../src/state/quantized-kv";
 import { RotatingKVCache } from "../../src/state/rotating-kv";
 import { RotatingQuantizedKVCache } from "../../src/state/rotating-quantized-kv";
 import { SSMCache } from "../../src/state/ssm";
+import { kvStorage } from "../../src/state/kv-storage";
 
 const bytes = (a: MlxArray): number[] => { using c = ops.contiguous(a); return [...c.rawBytes()]; };
 const grid = (L: number, D: number, f: (t: number, d: number) => number): MlxArray => {
@@ -44,14 +47,14 @@ function stepAll(layout: Cache, rows: { solo: Cache; id: number; f: (b: number, 
   rows.forEach((row, b) => { for (let d = 0; d < dim; d++) data[b * dim + d] = row.f(row.id, row.solo.offset, d); });
   using batch = MlxArray.fromFloat32(data, [rows.length, 1, 1, dim]);
   if (quantized) {
-    const [k, v] = layout.quantizedAttention!.updateAndFetchQuantized(batch, batch); dispose3(k); dispose3(v);
-  } else { const [k, v] = layout.updateAndFetch(batch, batch); k.dispose(); v.dispose(); }
+    const [k, v] = kvStorage(layout).quantizedAttention!.updateAndFetchQuantized(batch, batch); dispose3(k); dispose3(v);
+  } else { const [k, v] = kvStorage(layout).updateAndFetch(batch, batch); k.dispose(); v.dispose(); }
   (layout as { releaseRopeArr?: () => void }).releaseRopeArr?.();
   for (const row of rows) {
     using one = grid(1, dim, (_t, d) => row.f(row.id, row.solo.offset, d));
     if (quantized) {
-      const [k, v] = row.solo.quantizedAttention!.updateAndFetchQuantized(one, one); dispose3(k); dispose3(v);
-    } else { const [k, v] = row.solo.updateAndFetch(one, one); k.dispose(); v.dispose(); }
+      const [k, v] = kvStorage(row.solo).quantizedAttention!.updateAndFetchQuantized(one, one); dispose3(k); dispose3(v);
+    } else { const [k, v] = kvStorage(row.solo).updateAndFetch(one, one); k.dispose(); v.dispose(); }
   }
 }
 
@@ -148,7 +151,7 @@ describe("padded full-attention rows (plain)", () => {
 describe("padded full-attention rows (affine quantized)", () => {
   const quant = (b: number, L: number) => {
     const c = new KVCache(); using k = grid(L, QD, (t, d) => qval(b, t, d));
-    const [rk, rv] = c.updateAndFetch(k, k); rk.dispose(); rv.dispose(); return c.toQuantized(GS, BITS);
+    const [rk, rv] = c.updateAndFetch(k, k); rk.dispose(); rv.dispose(); return c.toQuantized(GS, BITS, unfusedAffineKernels);
   };
   const same = (extracted: Cache, oracle: QuantizedKVCache) => {
     const ex = extracted as QuantizedKVCache;
@@ -169,14 +172,14 @@ describe("padded full-attention rows (affine quantized)", () => {
     const joiner = quant(1, lens[1]!);
     layout.mergeRows([adopted, joiner]); adopted.dispose(); joiner.dispose();
     expect(layout.rowOffsets).toEqual([5, 3]); expect(layout.leftPad).toEqual([0, 2]);
-    const mask = layout.makeMask(1, null);
+    const mask = kvStorage(layout).makeMask(1, null);
     expect([...mask.arr!.toIntTokens()]).toEqual([1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1]);
     expect([...layout.ropeOffsetArr!.toIntTokens()]).toEqual([5, 3]);
     mask.arr!.dispose(); (layout as PaddedQuantKVRows).releaseRopeArr();
     const rows = (ids: number[]) => ids.map(id => ({ solo: solos[id]!, id, f: qval }));
     let ids = [0, 1];
     stepAll(layout, rows(ids), QD, true); stepAll(layout, rows(ids), QD, true);
-    const third = quant(2, lens[2]!), next = new PaddedQuantKVRows(GS, BITS);
+    const third = quant(2, lens[2]!), next = new PaddedQuantKVRows(GS, BITS, unfusedAffineKernels(BITS, GS, Dtype.bfloat16));
     next.mergeRows([layout, third]); layout.dispose(); third.dispose(); ids = [0, 1, 2];
     stepAll(next, rows(ids), QD, true);
     ids.forEach((id, b) => same(next.extractRow(b), solos[id]!));
@@ -193,7 +196,7 @@ describe("sliding-window rings", () => {
     const c = new RotatingKVCache(W), dim = quantized ? QD : 2, f = quantized ? qval : val;
     using k = grid(L, dim, (t, d) => f(b, t, d));
     const [rk, rv] = c.updateAndFetch(k, k); rk.dispose(); rv.dispose();
-    return quantized ? c.toQuantized(GS, BITS) : c;
+    return quantized ? c.toQuantized(GS, BITS, unfusedAffineKernels) : c;
   };
 
   test("plain: an adopted ring and two joiners decode through wrap; every extracted row equals its solo replay", () => {
@@ -281,8 +284,8 @@ describe("recurrent state", () => {
 describe("which layout a cache's rows are kept in", () => {
   test("every storage family has one; caches that own their layout make it; foreign state has none", () => {
     const layouts: [Cache, Function][] = [
-      [new KVCache(), PaddedKVRows], [new QuantizedKVCache(GS, BITS), PaddedQuantKVRows], [new RotatingKVCache(W_), BatchedRotatingCache],
-      [new RotatingQuantizedKVCache(W_, GS, BITS), BatchedRotatingQuantCache], [new SSMCache(), BatchedSSMCache],
+      [new KVCache(), PaddedKVRows], [new QuantizedKVCache(GS, BITS, unfusedAffineKernels(BITS, GS, Dtype.bfloat16)), PaddedQuantKVRows], [new RotatingKVCache(W_), BatchedRotatingCache],
+      [new RotatingQuantizedKVCache(W_, GS, BITS, unfusedAffineKernels(BITS, GS, Dtype.bfloat16)), BatchedRotatingQuantCache], [new SSMCache(), BatchedSSMCache],
     ];
     for (const [cache, kind] of layouts) {
       const layout = ownedCacheLayout(cache) as BatchableCache;

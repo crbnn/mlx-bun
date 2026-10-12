@@ -19,9 +19,8 @@ import {
   type ModelSpecialization,
   type TrainingDefaults,
 } from "./family";
-import { GENERATED_GEMMA_FINGERPRINTS } from "./gemma4/family";
 
-export { ENGINE_CAPABILITIES, GENERATED_GEMMA_FINGERPRINTS, GENERIC_GENERATION_DEFAULTS, GENERIC_TRAINING_DEFAULTS };
+export { ENGINE_CAPABILITIES, GENERIC_GENERATION_DEFAULTS, GENERIC_TRAINING_DEFAULTS };
 export type {
   EmbeddingDeclaration, EngineCapability, FidelityTarget, FidelityTier, GenerationDefaults, GenerationLoop, ModelGraph, ModelLoader,
   ModelSpecialization, TrainingDefaults,
@@ -140,7 +139,6 @@ function executionCapabilities(execution: ModelExecutionComposition, family: Mod
   const required: EngineCapability[] = [execution.loader === "colibri" ? "colibri-container" : "safetensors"];
   required.push(loopCapability[execution.loop]);
   required.push(...family.capabilities);
-  if (execution.specialization === "generated") required.push("generated-graph");
   return required;
 }
 
@@ -166,19 +164,16 @@ export function externalArtifactFingerprint(modelDir: string): string | null {
   return `hf:${repo}@${match[2]!.toLowerCase()}`;
 }
 
-const FAMILY_PROFILES: ReadonlyMap<ModelGraph, { dedicated: ModelProfile; generated?: ModelProfile }> = new Map(
-  MODEL_FAMILIES.map(family => [family.graph, {
-    dedicated: familyProfile(family, family.specialization, family.profileId),
-    ...(family.generated ? { generated: familyProfile(family, "generated", family.generated.profileId) } : {}),
-  }] as const));
+const FAMILY_PROFILES: ReadonlyMap<ModelGraph, ModelProfile> = new Map(
+  MODEL_FAMILIES.map(family => [family.graph, familyProfile(family, family.specialization, family.profileId)] as const));
 
-/** The profile the config's family declares. A family lists fingerprints of the
- * graphs generated from its configs; those get the generated profile. */
-function selectFamilyProfile(config: ModelConfig, fingerprint: string): ModelProfile {
+/** The profile the config's family declares. It names the family; which of the
+ * family's graphs a load builds for its composition is the graph table's choice
+ * (`MLX_GRAPH_TABLES` in `models/factory.ts`), labeled by the selected entry. */
+function selectFamilyProfile(config: ModelConfig): ModelProfile {
   const family = familyOf(config);
   if (!family) throw new Error(unsupportedModelMessage(config));
-  const profiles = FAMILY_PROFILES.get(family.graph)!;
-  return profiles.generated && family.generated!.fingerprints.includes(fingerprint) ? profiles.generated : profiles.dedicated;
+  return FAMILY_PROFILES.get(family.graph)!;
 }
 
 function declaredBy(resolved: ResolvedModelProfile): ModelFamily | null {
@@ -296,7 +291,7 @@ export function resolveModelProfile(
         );
     }
   }
-  profile ??= selectFamilyProfile(config, fingerprint);
+  profile ??= selectFamilyProfile(config);
   validateProfile(profile);
   profile = snapshotProfile(profile);
 

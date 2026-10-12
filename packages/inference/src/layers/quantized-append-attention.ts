@@ -1,9 +1,10 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
-import { quantizedSdpa } from "./quantized-attention";
+import { quantizedSdpaUnfused } from "./quantized-attention";
 
-/** Committed positions retain single-token attention arithmetic. Projection
- * work can still share the span; each query sees its own causal KV prefix. */
+/** Committed positions retain single-token attention arithmetic (the unfused
+ * port, which one query always takes). Projection work can still share the
+ * span; each query sees its own causal KV prefix. */
 export function quantizedAppendAttention(
   q: MlxArray, keys: ops.QuantizedTensor, values: ops.QuantizedTensor,
   scale: number, groupSize: number, bits: number,
@@ -21,7 +22,7 @@ export function quantizedAppendAttention(
       using queryView = q.slice([0, 0, row, 0], [batch, heads, row + 1, dim]);
       using query = ops.contiguous(queryView);
       const k = trim(keys, prefix + row + 1), v = trim(values, prefix + row + 1);
-      try { outputs.push(quantizedSdpa(query, k, v, scale, { mode: "", arr: null }, groupSize, bits)); }
+      try { outputs.push(quantizedSdpaUnfused(query, k, v, scale, { mode: "", arr: null }, groupSize, bits)); }
       finally {
         for (const t of [k, v]) { t.packed.dispose(); t.scales.dispose(); t.biases.dispose(); }
       }

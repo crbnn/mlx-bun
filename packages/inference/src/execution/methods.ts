@@ -3,9 +3,7 @@ import { snapshotGenerationPolicy } from "./request-policy";
 import type { GenerationOutput, InferenceMethod, MethodResult } from "../contracts/portable/generation";
 import { throwIfCancelled } from "./cancellation";
 import { generateAutoregressive, generateDenoising, type GenerateOptions, type GenerateStats } from "../generation/index";
-import { specRun } from "../generation/speculative/run";
 import type { MlxAutoregressiveBinding } from "../generation/bindings/autoregressive";
-import type { MlxSpeculativeBinding } from "../generation/speculative/bindings/binding";
 import type { MlxDenoisingBinding } from "../generation/bindings/denoising";
 
 /** The native algorithm owns cleanup in its finally. This host adapter owns
@@ -56,19 +54,6 @@ export function createAutoregressiveMethod(
       if (await output.commit([item.token], item.logprobs ? [item.logprobs] : undefined) === false) break;
     const metrics = generation.stats;
     if (!metrics) throw new Error("AR method did not settle its metrics");
-    return { finishReason: metrics.finishReason ?? (metrics.generatedTokens >= (options.maxTokens ?? 512) ? "length" : "stop"), metrics };
-  }, binding.runtime ?? runtimeConfig());
-}
-
-export function createSpeculativeMethod(
-  binding: MlxSpeculativeBinding, numDraftTokens: number,
-  promptIds: readonly number[], options: GenerateOptions,
-): InferenceMethod<GenerateStats> {
-  const prompt = [...promptIds];
-  options = snapshotGenerationPolicy(options);
-  return nativeMethod("mlx-speculative", async (output, signal) => {
-    const metrics = await specRun(binding, numDraftTokens, prompt, { ...options, signal },
-      (token) => output.commit([token]));
     return { finishReason: metrics.finishReason ?? (metrics.generatedTokens >= (options.maxTokens ?? 512) ? "length" : "stop"), metrics };
   }, binding.runtime ?? runtimeConfig());
 }

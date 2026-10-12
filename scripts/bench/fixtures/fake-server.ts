@@ -53,6 +53,9 @@ function stream(tokens: number, perTokenMs: number, prompt: string, route: strin
 Bun.serve({ hostname: "127.0.0.1", port, idleTimeout: 0, async fetch(request) {
   const path = new URL(request.url).pathname;
   if (path === "/v1/models") return mode === "never-ready" ? new Response("loading", { status: 503 }) : Response.json({ data: [{ id: "fake" }] });
+  // An isolated server's /stats: the primary worker's MLX memory (here this process, growing per request).
+  if (path === "/stats") return Response.json({ engine: { isolated: true, workers: [{ id: "fake", role: "primary", pid: process.pid,
+    memory: { active_bytes: (1000 + requests) * 2 ** 20, cache_bytes: 64 * 2 ** 20, peak_bytes: (1200 + requests) * 2 ** 20 } }] } });
   if (path === "/admin/cache/flush")
     return mode === "no-flush" ? Response.json({ durable: false }, { status: 503 })
       : Response.json({ durable: true, pendingSnapshots: 0, pendingSpills: 0, droppedSpills: 0, failedSpills: 0, entries: 1, longest_durable_prefix_tokens: 16 });

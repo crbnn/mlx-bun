@@ -16,7 +16,7 @@ import { createEngineTelemetry } from "../engine/telemetry";
 import type { TranscriptionInfo } from "../server/discovery-routes";
 import type { ModelPromptBuilder } from "../server/prompt-contracts";
 import type { ResponseHistory } from "../server/responses";
-import { resolveServingLimits, validatePagedServingOptions, type ServeOptions } from "./serve-options";
+import { resolveServingLimits, type ServeOptions } from "./serve-options";
 import type { RouteGroup } from "./serve-state";
 
 /** The serving policy one host applies to every unit: serve's options minus the loader's and the CLI process's own. */
@@ -101,14 +101,13 @@ export async function createServingUnit(context: LoadedModelContext, options: Co
       if (!result.durable) console.warn(`[server] cache flush incomplete: ${result.pendingSnapshots} snapshots, ${result.pendingSpills} spills, ${result.failedSpills} failed`);
     };
     cleanup = async () => { try { await closeCaches(); } finally { releaseContext(context, input.ownership); } };
-    validatePagedServingOptions(options.request.pagedKv, caches.kvScheme, !!context.draft);
     binding.gateway.configureContinuation?.(caches.continuationServices);
     // createAppEngine takes ownership even when its constructor rejects.
     cleanup = undefined;
     const engine = await createAppEngine(context, { capacity: options.capacity, binding, ownership: input.ownership,
       gateway: { kvBudgetBytes: options.kvBudgetBytes,
         checkpoints: !!(options.cache.generationCheckpointTokens && caches.checkpoints),
-        stateCodecs: caches.stateCodecs, kvScheme: caches.resolvedKvScheme,
+        stateCodecs: caches.stateCodecs,
         promptCache: caches.promptCache, adapterNamespace: caches.adapterNamespace },
       beforeModelDispose: closeCaches,
     });
@@ -125,7 +124,7 @@ export async function createServingUnit(context: LoadedModelContext, options: Co
       undefined, undefined, 0, options.memoryBudgetBytes, caches.resolvedKvScheme.fitOptions);
     const limits = resolveServingLimits(options, context.memoryPlan, admission);
     const completions = createCompletionRoutes(engine, { ...options.request, promptCache: caches.promptCache,
-      kvScheme: caches.kvScheme, ...limits, tokenHistory, responseHistory: shared.responses,
+      ...limits, tokenHistory, responseHistory: shared.responses,
       transcription: shared.transcription,
       ...(input.buildPrompt ? { buildPrompt: input.buildPrompt } : {}),
       ...(input.defaultAdapter ? { defaultAdapter: input.defaultAdapter } : {}) });

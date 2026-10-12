@@ -16,12 +16,14 @@ type Glm52Config,
 import { validateGlm52ContainerLayout } from "../../artifacts/glm52/layout";
 import { ColibriGlm52ResidentWeights } from "../../artifacts/glm52/resident-weights";
 import { ColibriGlm52Weights } from "../../artifacts/glm52/weights";
-import { type Cache } from "../../contracts/mlx/cache";
-import { argmaxLastPosition } from "../../kernels/logits";
+import { type Cache, type LatentAttentionCache } from "../../contracts/mlx/cache";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
-import type { MlxDeclaredGraph } from "../../contracts/mlx/graph";
+import type {
+  MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward, MlxWidthClass,
+} from "../../contracts/mlx/graph";
 import { declareGraph } from "../capabilities";
+import { atEveryWidth } from "../graph";
 import { type QuantizedLinear } from "../../layers/quantized-linear";
 import { MLACache } from "../../state/glm52-cache";
 import {
@@ -126,7 +128,7 @@ class Glm52DsaIndexer {
 
   projectAndSelect(
     input: MlxArray,
-    cache: MLACache,
+    cache: LatentAttentionCache,
     state: Glm52DsaSelectionState,
     forceDense = false,
   ): DsaStep {
@@ -206,8 +208,8 @@ class Glm52DsaIndexer {
     );
 
     let allKeys = key;
-    if (cache.dsa?.offset) {
-      const prior = cache.dsa.fetch();
+    const prior = cache.storedIndexKeys();
+    if (prior) {
       allKeys = ops.concatAxis([prior, key], 1);
       prior.dispose();
     }
@@ -504,7 +506,7 @@ export class Glm52DecoderLayer {
    */
   private attend(
     input: MlxArray,
-    cache: MLACache,
+    cache: LatentAttentionCache,
     dsaState: Glm52DsaSelectionState | null,
   ): MlxArray {
     const normalized = rmsNormF32Mlx(
@@ -617,7 +619,7 @@ export class Glm52DecoderLayer {
 
   forward(
     input: MlxArray,
-    cache: MLACache,
+    cache: LatentAttentionCache,
     dsaState: Glm52DsaSelectionState | null,
   ): MlxArray {
     const attention = this.attend(input, cache, dsaState);
@@ -638,7 +640,7 @@ export class Glm52DecoderLayer {
 
   async forwardAsync(
     input: MlxArray,
-    cache: MLACache,
+    cache: LatentAttentionCache,
     dsaState: Glm52DsaSelectionState | null,
   ): Promise<MlxArray> {
     const attention = this.attend(input, cache, dsaState);
@@ -662,7 +664,7 @@ export class Glm52DecoderLayer {
   }
 }
 
-export class Glm52Model implements MlxDeclaredGraph {
+export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
   readonly glmConfig: Glm52Config;
   readonly weights: Glm52WeightSource;
@@ -870,15 +872,11 @@ export class Glm52Model implements MlxDeclaredGraph {
     this.#dsaSelectionObserver = observer;
   }
 
-  /** Pin streamed Q4 expert jobs to the row-independent M=1 kernel family.
-   * Native MTP enables this only around the batched target verify forward. */
-  setSpecKernelPinned(enabled: boolean): void {
-    this.expertRuntime?.executor.setFixedKernelFamily(enabled);
-  }
-
-  forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray {
+  /** The scoring forward (`MlxSequenceForward`) of a resident graph; a streamed
+   *  graph's forward is asynchronous, and it refuses this. */
+  sequenceHidden(ids: MlxArray, cache: Cache[], width: MlxWidthClass): MlxArray {
     if (this.expertBackend)
-      throw new Error("streamed GLM model requires forwardHiddenAsync()");
+      throw new Error("a streamed GLM graph has no synchronous scoring forward");
     const tokenCount = ids.shape[1] ?? 1;
     const firstOffset = cache[0]?.offset ?? 0;
     if (
@@ -899,7 +897,7 @@ export class Glm52Model implements MlxDeclaredGraph {
         for (let token = 0; token < tokenCount; token++) {
           const row = ids.slice([0, token], [ids.shape[0]!, token + 1]);
           try {
-            rows.push(this.forwardHidden(row, cache));
+            rows.push(this.sequenceHidden(row, cache, width));
           } finally {
             row.dispose();
           }
@@ -924,7 +922,7 @@ export class Glm52Model implements MlxDeclaredGraph {
     }
   }
 
-  async forwardHiddenAsync(ids: MlxArray, cache: Cache[]): Promise<MlxArray> {
+  async #forward(ids: MlxArray, cache: Cache[]): Promise<MlxArray> {
     const tokenCount = ids.shape[1] ?? 1;
     const firstOffset = cache[0]?.offset ?? 0;
     if (
@@ -942,7 +940,7 @@ export class Glm52Model implements MlxDeclaredGraph {
         for (let token = 0; token < tokenCount; token++) {
           const row = ids.slice([0, token], [ids.shape[0]!, token + 1]);
           try {
-            rows.push(await this.forwardHiddenAsync(row, cache));
+            rows.push(await this.#forward(row, cache));
           } finally {
             row.dispose();
           }
@@ -967,6 +965,25 @@ export class Glm52Model implements MlxDeclaredGraph {
     }
   }
 
+  readonly prefillChunk: MlxPrefillChunk = { gpu: (ids, cache) => this.#forward(ids, cache) };
+  readonly prefillTail = atEveryWidth<MlxCapturingForward>((ids, cache) => this.#forward(ids, cache));
+  readonly appendKnown = atEveryWidth<MlxPhaseForward>((ids, cache) => this.#forward(ids, cache));
+  readonly logits = atEveryWidth<MlxHeadForward>(hidden => this.logitsFromHidden(hidden));
+  readonly decode = atEveryWidth<MlxPhaseForward>((ids, cache) => this.#forward(ids, cache));
+  /** A verify window on the row-independent M=1 streamed-expert kernel family
+   *  (`setFixedKernelFamily`), so a token's experts take the same kernels
+   *  whatever rows verify beside it. Composed into the operation: the scheduler
+   *  never pins or unpins it. */
+  readonly verify = atEveryWidth<MlxVerifyForward>(async (ids, cache) => {
+    const executor = this.expertRuntime?.executor;
+    executor?.setFixedKernelFamily(true);
+    try { return await this.#forward(ids, cache); }
+    finally { executor?.setFixedKernelFamily(false); }
+  });
+
+  /** The decoder over `embeddings` (borrowed). `cache` holds one latent
+   * attention cache per layer (`makeCache`), which each layer's MLA block reads
+   * through the read it was built with. */
   forwardEmbeddings(
     embeddings: MlxArray,
     cache: Cache[],
@@ -985,12 +1002,9 @@ export class Glm52Model implements MlxDeclaredGraph {
     let current = ops.contiguous(embeddings);
     try {
       for (let layer = 0; layer < this.layers.length; layer++) {
-        const layerCache = cache[layer];
-        if (!(layerCache instanceof MLACache))
-          throw new Error(`GLM layer ${layer} requires MLACache`);
         const next = this.layers[layer]!.forward(
           current,
-          layerCache,
+          cache[layer] as LatentAttentionCache,
           dsaState,
         );
         current.dispose();
@@ -1007,6 +1021,7 @@ export class Glm52Model implements MlxDeclaredGraph {
     }
   }
 
+  /** `forwardEmbeddings` over streamed experts, every layer evaluated before the next. */
   async forwardEmbeddingsAsync(
     embeddings: MlxArray,
     cache: Cache[],
@@ -1023,12 +1038,9 @@ export class Glm52Model implements MlxDeclaredGraph {
     let current = ops.contiguous(embeddings);
     try {
       for (let layer = 0; layer < this.layers.length; layer++) {
-        const layerCache = cache[layer];
-        if (!(layerCache instanceof MLACache))
-          throw new Error(`GLM layer ${layer} requires MLACache`);
         const next = await this.layers[layer]!.forwardAsync(
           current,
-          layerCache,
+          cache[layer] as LatentAttentionCache,
           dsaState,
         );
         // The streamed path is a bounded-residency graph. Detach every layer
@@ -1057,103 +1069,6 @@ export class Glm52Model implements MlxDeclaredGraph {
       this.glmConfig.vocabSize,
       this.glmConfig.hiddenSize,
     );
-  }
-
-  forward(tokens: number[] | MlxArray, cache: Cache[]): MlxArray {
-    if (this.expertBackend)
-      throw new Error("streamed GLM model requires forwardAsync()");
-    const ids = Array.isArray(tokens)
-      ? ops.fromInt32(tokens, [1, tokens.length])
-      : tokens;
-    const hidden = this.forwardHidden(ids, cache);
-    if (Array.isArray(tokens)) ids.dispose();
-    const logits = this.logitsFromHidden(hidden);
-    hidden.dispose();
-    return logits;
-  }
-
-  async forwardAsync(
-    tokens: number[] | MlxArray,
-    cache: Cache[],
-  ): Promise<MlxArray> {
-    const offsets = cache.map((layer) => layer.offset);
-    const ids = Array.isArray(tokens)
-      ? ops.fromInt32(tokens, [1, tokens.length])
-      : tokens;
-    let hidden: MlxArray | null = null;
-    try {
-      hidden = await this.forwardHiddenAsync(ids, cache);
-      return this.logitsFromHidden(hidden);
-    } catch (error) {
-      const rollbackErrors: unknown[] = [];
-      for (let layer = 0; layer < cache.length; layer++) {
-        const appended = cache[layer]!.offset - offsets[layer]!;
-        if (appended <= 0) continue;
-        try {
-          cache[layer]!.trim(appended, true);
-        } catch (rollbackError) {
-          rollbackErrors.push(rollbackError);
-        }
-      }
-      if (rollbackErrors.length) {
-        throw new AggregateError(
-          [error, ...rollbackErrors],
-          "streamed GLM forward failed and cache rollback was incomplete",
-        );
-      }
-      throw error;
-    } finally {
-      hidden?.dispose();
-      if (Array.isArray(tokens)) ids.dispose();
-    }
-  }
-
-  generate(
-    promptTokens: number[],
-    maxTokens: number,
-    eosIds: number[] = this.glmConfig.eosTokenIds,
-  ): number[] {
-    const cache = this.makeCache();
-    const output: number[] = [];
-    try {
-      let tokens = promptTokens;
-      for (let step = 0; step < maxTokens; step++) {
-        const logits = this.forward(tokens, cache);
-        const next = argmaxLastPosition(logits);
-        logits.dispose();
-        if (eosIds.includes(next)) break;
-        output.push(next);
-        tokens = [next];
-      }
-      return output;
-    } finally {
-      for (const layer of cache) layer.dispose();
-      this.expertRuntime?.flushUsage();
-    }
-  }
-
-  async generateAsync(
-    promptTokens: number[],
-    maxTokens: number,
-    eosIds: number[] = this.glmConfig.eosTokenIds,
-  ): Promise<number[]> {
-    const cache = this.makeCache();
-    const output: number[] = [];
-    try {
-      let tokens = promptTokens;
-      for (let step = 0; step < maxTokens; step++) {
-        const logits = await this.forwardAsync(tokens, cache);
-        const next = argmaxLastPosition(logits);
-        logits.dispose();
-        if (eosIds.includes(next)) break;
-        output.push(next);
-        tokens = [next];
-      }
-      return output;
-    } finally {
-      for (const layer of cache) layer.dispose();
-      await this.expertRuntime?.finishUsage();
-    }
   }
 
   dispose(): void {

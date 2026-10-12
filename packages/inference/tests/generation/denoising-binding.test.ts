@@ -538,9 +538,9 @@ describe("interleaved shared denoising", () => {
       dequantEmbedWeight: f.graph.dequantEmbedWeight, softEmbeddings: f.graph.softEmbeddings,
     }) as DiffusionGemmaModel;
     const binding = bindMlxGateway(model);
-    const shape = { hasVision: false, hasAdapters: true, hasRepetitionPenalty: false, userSeed: true, kvQuant: false,
-      turboQuant: false, hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
-    const execution = binding.plan(shape, {}, { continuous: binding.cachesBatchable(), quantizedBatch: false, checkpoints: false });
+    const shape = { hasVision: false, hasAdapters: true, hasRepetitionPenalty: false, userSeed: true,
+      hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
+    const execution = binding.plan(shape, {}, { checkpoints: false });
     expect(execution).toMatchObject({ method: "denoising", mechanism: "continuous", promptCache: false });
     const group = binding.createBatchGroup({ maxBatch: 2 });
     try {

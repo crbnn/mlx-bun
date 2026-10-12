@@ -43,8 +43,8 @@ found; offload restore only redirects routing and never unmaps borrowed weights.
 and unfused SDPA; `--l2` selects model-config KV and fused SDPA, and wins if both
 are given. An explicit `--kv-quant` overrides the preset and sets the kernel
 default (fused for `config`, unfused otherwise); `--fused-sdpa on|off` overrides
-that default. The policy is resolved before model loading, including in isolated
-model workers, and restored on shutdown or startup failure.
+that default. The policy is part of the loaded model's composition, resolved before
+its graph is built (including in isolated model workers); no process setting changes.
 
 `--adapter <dir>` (alias `--adapter-path`) mounts a LoRA adapter right after the
 model loads, before any request, under the directory's basename as its id; it
@@ -69,23 +69,24 @@ The opt-in [draft flags test](tests/engine/draft-flags.test.ts) serves with
 ngram drafting and checks the speculation telemetry and exactness against a
 plain run.
 `--paged-kv` (env mirror `MLX_BUN_PAGED_KV=1`) with `--paged-kv-block-size`
-(only alongside paging) sets the paged KV request default; Gemma4-family
-requests use the paged path and other families answer the typed capability
-error, never a hidden serial lane.
-Startup rejects paging combined with a loaded draft, per-layer KV quantization,
-or TurboQuant; bf16 and uniform KV4/KV8 remain supported.
+(only alongside paging) composes the paged KV lego when the model loads: every
+request, drafted, grammar, fill, media and adapter rows included, keeps its
+full-attention keys and values in blocks. Pages store bf16 or uniform
+KV4/KV8; startup rejects paging with per-layer KV quantization or TurboQuant,
+whose pages are not implemented.
 As main's server did, startup also rejects `--kv-quant turbo` when the model's
 full-attention head dimension is not one the TurboQuant codec encodes
 (`TURBOQUANT_HEAD_DIMS`), before any request, instead of failing each request in
 prefill.
-Startup, and `generate`, also reject a requested KV scheme the model's cache
-layers cannot take, since every request carries it: GLM-5.2's MLA cache takes no
-KV scheme, so `--kv-quant 4|8|turbo` (and `config` or `--l2` when a
-`kv_config.json` exists) is refused there; main accepted the option and served GLM-5.2 in bf16
-while reporting the requested scheme.
+Startup, and `generate`, also reject a requested KV scheme or paging for a graph
+that composes its own caches, which have no quantized or paged form yet: GLM-5.2's
+MLA cache and DiffusionGemma's denoising state, so `--kv-quant 4|8|turbo` (and
+`config` or `--l2` when a `kv_config.json` exists) or `--paged-kv` is refused
+there; main accepted the option and served GLM-5.2 in bf16 while reporting the
+requested scheme.
 `--kv-quant config` without the model's `kv_config.json` stays bf16.
-The opt-in [paged KV test](tests/engine/paged-kv.test.ts) covers both family
-outcomes.
+The opt-in [paged KV test](tests/engine/paged-kv.test.ts) serves a Gemma4 and
+a model of another family.
 
 Shutdown stops background cache demotion, closes chat sessions, drains active
 HTTP responses, then flushes caches and releases the engine. The CLI bounds this
@@ -490,8 +491,8 @@ than running a hidden serial path. Diffusion models are served through the same
 scheduler by the library's interleaved denoising method. An image request's pixels
 ride its options, and the gateway releases them exactly once, whether the row
 settles or fails before submission. Requests the method cannot apply (grammar,
-draft, logprobs, logits processors, fill, encoded or paged KV) receive the typed
-capability error.
+draft, logprobs, logits processors, fill) receive the typed
+capability error; a KV scheme or paging is refused when the model loads.
 
 `engine/cache-services` composes the library prompt cache and persistence. Its
 default is 8 GB of RAM with plain KV; a caller supplies `ssdCacheDir` for saved state.
@@ -1306,7 +1307,11 @@ temporary home, then upgrades once. It checks the actual CLI and managed child p
 web, memory, synthetic registry/fit, native path resolution, microphone helper
 help, and Photon initialization in the relocated, installed, and retained
 previous bundles.
-The default performs no MLX/GPU operation or remote download. Mac CI runs this check.
+The default runs no model and makes no remote download. Each install ends with
+the installed executable's Neural Engine install step (`mlx-bun compile-ane`),
+which the check requires to run: it compiles this Mac's programs or reports none
+to compile, and where the Neural Engine cannot compile (a virtual machine) the
+installer warns and keeps the installation. Mac CI runs this check.
 With exclusive GPU access, `bun run verify:binary --model /path/to/cached-model`
 also starts the actual relocated executable, checks its web assets, `/stats`,
 `/fit`, and a chat completion, then requires a clean SIGTERM exit. It discovers
@@ -1321,7 +1326,9 @@ bundle under `${MLX_BUN_INSTALL_DIR:-$HOME/.mlx-bun}/app-install/` and links
 executable; all are refused where a directory stands and switch with the app).
 `MLX_BUN_VERSION` selects `latest` or a pinned tag.
 The installer validates the files and version before switching its `current`
-symlink and retains the old app on failure. Successful updates keep the current
+symlink and retains the old app on failure. After switching it runs the
+installed `mlx-bun compile-ane` (the Neural Engine install step; a failure warns
+and keeps the installation). Successful updates keep the current
 and immediate previous bundles, plus any older bundle used by a running app.
 Other older owned bundles and stale stages are removed on the next install;
 vnode inspection keeps bundles used by apps launched through PATH or symlinks,
@@ -1354,7 +1361,7 @@ app-root and `current` ownership), without network access.
 `bun scripts/prepare-release.ts prepare /new/output/directory` builds from staged
 natives, checks the executable against the app manifest version, packs workspace
 packages, and writes unsigned local archives, checksums, and a Homebrew formula.
-It then runs the `verify:binary` acceptance (CPU only) on the unsigned archive
+It then runs the model-free `verify:binary` acceptance on the unsigned archive
 and requires unchanged bundle hashes afterwards; a failure removes `unsigned/`
 and writes no `preparation.json`.
 `preparation.json` records bundle hashes, dependency-first package publication

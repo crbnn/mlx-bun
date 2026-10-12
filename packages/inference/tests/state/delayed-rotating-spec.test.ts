@@ -5,8 +5,10 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { RotatingKVCache } from "../../src/state/rotating-kv";
 import { RotatingQuantizedKVCache } from "../../src/state/rotating-quantized-kv";
 import { disposeTriple } from "../../src/state/quantized-tensor";
+import { unfusedAffineKernels } from "../../src/state/affine-attention";
 import { DelayedRotatingQuantizedKVCache } from "../../src/state/delayed-rotating-quantized-kv";
-import { createKvMaintenance } from "../../src/state/kv-maintenance";
+import { settleAffine } from "./convert-after-reference";
+import type { Cache } from "../../src/contracts/mlx/cache";
 
 const dimensions = 64, window = 8;
 const data = (rows: readonly number[][]) => MlxArray.fromFloat32(Float32Array.from(rows.flatMap(tokens =>
@@ -20,8 +22,8 @@ const hash = (array: MlxArray) => {
 test("delayed ring transactions retain accepted bytes through row conversion, wrap and retirement", () => {
   for (const bits of [4, 8]) for (const initial of [[0, 0, 0], [0, 5, 11], [9, 15, 21]]) {
     const history = initial.map((n, row) => Array.from({ length: n }, (_, i) => row * 1000 + i));
-    const maintain = createKvMaintenance({kvBits: bits, kvGroupSize: 64, quantizedKvStart: 10});
-    const cache = new DelayedRotatingQuantizedKVCache(window,64,bits,10,maintain,undefined,true);
+    const maintain = (rows: Cache[]) => settleAffine(rows, bits, 10);
+    const cache = new DelayedRotatingQuantizedKVCache(window,64,bits,10,unfusedAffineKernels,undefined,true);
     const sources = history.map(tokens => {
       const source = new RotatingKVCache(window);
       if (tokens.length) {

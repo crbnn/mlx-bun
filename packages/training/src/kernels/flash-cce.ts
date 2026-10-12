@@ -37,7 +37,6 @@ import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { STEEL_QMM_HEADER } from "./steel-qmm-header";
-import { runtimeValue } from "@mlx-bun/inference/runtime/config";
 
 /** The quantized head pieces the kernel needs (packed weight + per-group affine
  *  scale/bias + bits/group_size). Mirrors HeadQuant in loss.ts. */
@@ -49,6 +48,62 @@ export interface FlashCceHead {
   groupSize: number; // 64
   softcap: number | null;
 }
+
+/** The flash-CCE head's kernel choices, fixed when the training run is composed
+ *  (the trainer resolves them once; `FlashCce` takes them at construction) and
+ *  never read while a kernel dispatches. The defaults are the measured production
+ *  kernels; every other value is an A/B or diagnostic override. */
+export interface FlashCceOptions {
+  /** Fewest response rows the flash head serves: a shorter batch takes the
+   *  exact fused head, which is faster there (the e4b time-tie point, 1024);
+   *  0 always takes the flash head. */
+  readonly minRows: number;
+  /** Forward: the steel GEMM kernel (verbatim MLX BlockMMA, 8.4× the old
+   *  simdgroup forward) wherever its tiling holds; off, the older kernels. */
+  readonly forwardSteel: boolean;
+  /** Forward without steel: the simdgroup_matrix kernel (848 ms, the fastest of
+   *  the three; it needs H % 32 == 0 and otherwise falls to the scalar kernel),
+   *  the one-thread-per-row scalar kernel (1097 ms), or the lane-sliced kernel
+   *  (2.6× slower, a recorded dead end; needs whole 32-word rows). */
+  readonly forwardFallback: "simdgroup" | "scalar" | "lane";
+  /** Diagnostic: the simdgroup forward skips its dequantization staging (wrong
+   *  numbers; timing only). */
+  readonly forwardSkipDequant: boolean;
+  /** Backward: the steel kernel for both phases wherever its tiling holds. */
+  readonly backwardSteel: boolean;
+  /** Backward without steel: the simdgroup_matrix phase-2 kernel (1.41× the
+   *  scalar kernel, where the H tiling is clean) or the float4 scalar kernel. */
+  readonly backwardFallback: "simdgroup" | "scalar";
+  /** Diagnostics for the scalar backward: skip phase 2's dequantization, or
+   *  phase 2 altogether (wrong numbers; timing only). */
+  readonly backwardSkipPhase2Dequant: boolean;
+  readonly backwardSkipPhase2: boolean;
+  /** Apple-CCE coeff filter epsilon (phase-2 per-tile skip). On at 1e-5 since
+   *  2026-07-02: the old 0.66%→2.7% dh-accuracy scare was on RANDOM targets
+   *  (flat softmax, the filter's worst case); the real-data gate (M1 Max,
+   *  2026-07-02, chunk-ORPO data) measured CPM5 eps 1e-5 = 0.343% dh for 1.41×,
+   *  e4b = 0.158% dh for 1.70×, far below the flash-vs-full fp-reassociation
+   *  scatter that already exists (CPM5 0.850→0.913% relnorm, e4b 1.207→1.220%,
+   *  cosine ≥0.99993 both). "0" compiles the filter out: exact gradients, the
+   *  pre-flip kernel. */
+  readonly backwardFilterEps: string;
+  /** blockMax vocab-block early-exit epsilon (skips whole cold (token-block,
+   *  vocab-block) programs, attacking both phases). On at 1e-5 since 2026-07-02;
+   *  ~lossless when it fires (it skips only blocks whose max prob < eps and
+   *  which lack the target): alone 1.23× (CPM5) / 2.02× (e4b) at ≤0.004% dh;
+   *  with the coeff filter at 1e-5/1e-5 the backward is 1.71× (CPM5) / 3.16×
+   *  (e4b) vs exact. Fires only when the caller supplies blockMax (the production
+   *  head does); "0" compiles it out. */
+  readonly backwardBlockEps: string;
+}
+
+/** The production kernels: steel both ways, simdgroup fallbacks, both
+ *  backward skips at 1e-5, flash from 1024 response rows. */
+export const DEFAULT_FLASH_CCE: FlashCceOptions = Object.freeze({
+  minRows: 1024, forwardSteel: true, forwardFallback: "simdgroup", forwardSkipDequant: false,
+  backwardSteel: true, backwardFallback: "simdgroup", backwardSkipPhase2Dequant: false, backwardSkipPhase2: false,
+  backwardFilterEps: "1e-5", backwardBlockEps: "1e-5",
+});
 
 const H_MAX = 4096; // covers MiniCPM5 (1536) and e4b (2560) hidden sizes
 const TG = 128; // threads per token-threadgroup
@@ -385,27 +440,28 @@ function fwdLaneKernel(): MetalKernel {
   return _fwdLaneKernel;
 }
 
-let _fwdSgKernel: MetalKernel | null = null;
-function fwdSgKernel(): MetalKernel {
-  if (!_fwdSgKernel) {
-    _fwdSgKernel = new MetalKernel({
-      name: "flash_cce_fwd_sg",
-      inputNames: ["h", "wp", "scales", "biases", "targets", "shape", "capv"],
-      outputNames: ["blockMax_out", "blockSum_out", "blockTgt_out"],
-      source: FWD_SG_SOURCE,
-      header: `#include <metal_simdgroup_matrix>\n#define TG ${TG}\n#define BB ${SG_BB}\n#define BV ${SG_BV}\n#define BD ${SG_BD}\n#define BDX ${SG_BD + 4}\n#define BVX ${SG_BV + 4}\n#define CCE_SG_SKIPDQ ${runtimeValue("MLX_BUN_CCE_SG_SKIPDQ") === "1" ? 1 : 0}\n`,
-      ensureRowContiguous: true,
-    });
-  }
-  return _fwdSgKernel;
-}
-// simdgroup_matrix forward is now the DEFAULT (fastest): the earlier "not faster"
+// simdgroup_matrix forward is the non-steel DEFAULT (fastest): the earlier "not faster"
 // verdict was confounded — the SG path was bound by the Csh dequant STAGING loads
 // (packed weight + per-group scale/bias), not the matmul, so it never reached the
 // compute-bound regime. Removing the staging redundancy (one thread per packed
 // word; scale/bias once per group) cut it 1629→848 ms, beating the scalar
-// kernel's 1097 ms. Fall back to scalar (MLX_BUN_CCE_SCALAR=1) when H % SG_BD != 0.
-const USE_SIMDGROUP_FWD = runtimeValue("MLX_BUN_CCE_SCALAR") !== "1" && runtimeValue("MLX_BUN_CCE_LANE") !== "1";
+// kernel's 1097 ms. Falls back to scalar when H % SG_BD != 0.
+const _fwdSgKernels = new Map<boolean, MetalKernel>();
+function fwdSgKernel(skipDequant: boolean): MetalKernel {
+  let k = _fwdSgKernels.get(skipDequant);
+  if (!k) {
+    k = new MetalKernel({
+      name: "flash_cce_fwd_sg",
+      inputNames: ["h", "wp", "scales", "biases", "targets", "shape", "capv"],
+      outputNames: ["blockMax_out", "blockSum_out", "blockTgt_out"],
+      source: FWD_SG_SOURCE,
+      header: `#include <metal_simdgroup_matrix>\n#define TG ${TG}\n#define BB ${SG_BB}\n#define BV ${SG_BV}\n#define BD ${SG_BD}\n#define BDX ${SG_BD + 4}\n#define BVX ${SG_BV + 4}\n#define CCE_SG_SKIPDQ ${skipDequant ? 1 : 0}\n`,
+      ensureRowContiguous: true,
+    });
+    _fwdSgKernels.set(skipDequant, k);
+  }
+  return k;
+}
 
 // Backward: dh[t,d] = Σ_v coeff_v · dequant(W_v)[d], coeff_v = g_t·(onehot_v −
 // softmax_v)·sech²_v, softmax_v = exp(softcap(logit_v) − lse_t). Two-phase per
@@ -541,20 +597,21 @@ const BWD_SOURCE = String.raw`
 // dacc is sized to the ACTUAL per-thread output dims (ceil(H/TG)) rather than the
 // worst-case DPER_MAX — right-sizing the register footprint raises occupancy (the
 // backward's limiter). Keyed by daccN so a model with a different H rebuilds.
-const _bwdKernels = new Map<number, MetalKernel>();
-function bwdKernel(daccN: number): MetalKernel {
-  let k = _bwdKernels.get(daccN);
+const _bwdKernels = new Map<string, MetalKernel>();
+function bwdKernel(daccN: number, skipPhase2Dequant: boolean, skipPhase2: boolean): MetalKernel {
+  const key = `${daccN}:${skipPhase2Dequant}:${skipPhase2}`;
+  let k = _bwdKernels.get(key);
   if (!k) {
     k = new MetalKernel({
       name: "flash_cce_bwd",
       inputNames: ["h", "wp", "scales", "biases", "targets", "lse", "gv", "shape", "capv"],
       outputNames: ["dh"],
       source: BWD_SOURCE,
-      header: `#define TG ${TG}\n#define BLOCK_B ${BLOCK_B_BWD}\n#define DACC_N ${daccN}\n#define CCE_BWD_SKIP_P2DQ ${runtimeValue("MLX_BUN_CCE_BWD_SKIP_P2DQ") === "1" ? 1 : 0}\n#define CCE_BWD_SKIP_P2 ${runtimeValue("MLX_BUN_CCE_BWD_SKIP_P2") === "1" ? 1 : 0}\n`,
+      header: `#define TG ${TG}\n#define BLOCK_B ${BLOCK_B_BWD}\n#define DACC_N ${daccN}\n#define CCE_BWD_SKIP_P2DQ ${skipPhase2Dequant ? 1 : 0}\n#define CCE_BWD_SKIP_P2 ${skipPhase2 ? 1 : 0}\n`,
       ensureRowContiguous: true,
       atomicOutputs: true, // dh is summed across the NBLK vocab-block programs
     });
-    _bwdKernels.set(daccN, k);
+    _bwdKernels.set(key, k);
   }
   return k;
 }
@@ -724,28 +781,11 @@ const BWD_SG_SOURCE = String.raw`
   }
 `;
 
-// Apple-CCE coeff filter epsilon (phase-2 per-tile skip). DEFAULT ON at 1e-5
-// (flipped 2026-07-02 — the kernel-perf-review backlog #1 flip). The old
-// 0.66%→2.7% dh-accuracy scare was on RANDOM targets (flat softmax, the filter's
-// worst case); the real-data gate
-// (flash-cce-filter-realdata.ts (deleted 2026-08-23; git history)) measured, on REAL chunk-ORPO
-// data (M1 Max, 2026-07-02): CPM5 eps 1e-5 = 0.343% dh for 1.41×; e4b = 0.158% dh
-// for 1.70× — and the teacher-forced full-logits fidelity shows the filter's added
-// error is far below the flash-vs-full fp-reassociation scatter that already
-// exists (CPM5 0.850→0.913% relnorm, e4b 1.207→1.220%, cosine ≥0.99993 both).
-// (The ~3.5× figure floating around older notes was the retired SG kernel, not
-// steel.) MLX_BUN_CCE_BWD_FILTER_EPS=0 restores exact gradients — eps "0"
-// compiles the filter OUT (#if CCE_BWD_FILTER 0), the identical pre-flip kernel.
-const BWD_FILTER_EPS = runtimeValue("MLX_BUN_CCE_BWD_FILTER_EPS") ?? "1e-5";
-// blockMax vocab-block early-exit eps (skip whole cold (token-block,vocab-block) programs
-// — attacks BOTH phases). DEFAULT ON at 1e-5 (flipped 2026-07-02). It is ~LOSSLESS when
-// it fires (only skips blocks whose max prob < eps AND which lack the target → ~0
-// contribution). The M=512 synthetic probe found nothing cold (pure overhead), but the
-// real-data gate proved real text DOES go cold: alone it's 1.23× (CPM5) / 2.02× (e4b)
-// at ≤0.004% dh; COMBINED with the coeff filter at 1e-5/1e-5 the backward is 1.71×
-// (CPM5) / 3.16× (e4b) vs exact. Fires only when the caller supplies blockMax (the
-// production head does); MLX_BUN_CCE_BWD_BLOCK_EPS=0 disables (compiled out).
-const BWD_BLOCK_EPS = runtimeValue("MLX_BUN_CCE_BWD_BLOCK_EPS") ?? "1e-5";
+// The coeff filter and the blockMax vocab-block early exit (FlashCceOptions'
+// backwardFilterEps and backwardBlockEps, the measurements in their notes) compile
+// out at eps "0" (#if CCE_BWD_FILTER 0 / CCE_BWD_BLOCKSKIP 0): the identical
+// pre-flip kernels, exact gradients. (The ~3.5× figure floating around older
+// notes was the retired SG kernel, not steel.)
 const _bwdSgKernels = new Map<string, MetalKernel>();
 function bwdSgKernel(dimTiles: number, filterEps: string, blockEps: string): MetalKernel {
   const filterOn = Number.parseFloat(filterEps) > 0 ? 1 : 0;
@@ -1030,8 +1070,33 @@ function warnSteelFallback(which: "forward" | "backward", detail: string, fallba
   );
 }
 
-export function flashCceForward(
-  hResp: MlxArray, head: FlashCceHead, targets: number[],
+/** The flash-CCE head's kernels, dispatched with the choices its owner composed
+ *  for the training run (`FlashCceOptions`), fixed at construction. */
+export class FlashCce {
+  constructor(readonly options: FlashCceOptions = DEFAULT_FLASH_CCE) {}
+
+  /** Flash-CCE forward over `hResp` [M, hidden]: logp [M], the log-sum-exp [M]
+   *  the backward reuses, and the per-vocab-block maxima [M, NBLK] that drive its
+   *  block skip. The caller owns all three. */
+  forward(hResp: MlxArray, head: FlashCceHead, targets: number[]): { logp: MlxArray; lse: MlxArray; blockMax: MlxArray } {
+    return cceForward(this.options, hResp, head, targets);
+  }
+
+  /** Flash-CCE backward: dh [M, hidden] (f32) = ∂(Σ_t cotangent_t · logp_t)/∂h.
+   *  `lse` is the forward's saved log-sum-exp [M]; `cot` is the per-token cotangent
+   *  ∂loss/∂logp_t [M]. Recomputes logits in-kernel (no [M,V]). `filterEps` and
+   *  `blockEps` default to the composed epsilons; pass "0" for guaranteed-exact
+   *  gradients (the parity gate does). The block skip fires only with the
+   *  forward's `blockMax`. Caller owns the result. */
+  backward(hResp: MlxArray, head: FlashCceHead, targets: number[], lse: MlxArray, cot: number[],
+    filterEps: string = this.options.backwardFilterEps, blockMax?: MlxArray,
+    blockEps: string = this.options.backwardBlockEps): MlxArray {
+    return cceBackward(this.options, hResp, head, targets, lse, cot, filterEps, blockMax, blockEps);
+  }
+}
+
+function cceForward(
+  options: FlashCceOptions, hResp: MlxArray, head: FlashCceHead, targets: number[],
 ): { logp: MlxArray; lse: MlxArray; blockMax: MlxArray } {
   const M = hResp.shape[0]!;
   const H = hResp.shape[1]!;
@@ -1039,8 +1104,8 @@ export function flashCceForward(
   const GR = head.scales.shape[1]!;
   const GS = head.groupSize;
   const WPR = head.w.shape[1]!;
-  if (H > H_MAX) throw new Error(`flashCceForward: hidden ${H} > H_MAX ${H_MAX}`);
-  if (GR * GS !== H) throw new Error(`flashCceForward: GR*GS ${GR * GS} != H ${H}`);
+  if (H > H_MAX) throw new Error(`FlashCce.forward: hidden ${H} > H_MAX ${H_MAX}`);
+  if (GR * GS !== H) throw new Error(`FlashCce.forward: GR*GS ${GR * GS} != H ${H}`);
 
   // Vocab blocks sized so each threadgroup handles a bounded slice (≈ VOCAB_BLOCK
   // rows) — independent of V, so a single threadgroup never runs the whole vocab
@@ -1053,18 +1118,16 @@ export function flashCceForward(
   const shape = u32([M, V, H, GS, head.bits, WPR, GR, NBLK]);
   const capv = MlxArray.fromFloat32(new Float32Array([head.softcap ?? 0]), [1]);
 
-  // DEFAULT = simdgroup_matrix kernel with efficient dequant staging (848 ms, the
-  // fastest measured — matmul throughput once the staging loads stopped bounding
-  // it). MLX_BUN_CCE_SCALAR=1 → one-thread-per-row scalar+coalesced-h (1097 ms;
-  // also the H % SG_BD != 0 fallback). MLX_BUN_CCE_LANE=1 → lane-sliced (2.6×
-  // slower; scatters the h broadcast — recorded dead end).
   // DEFAULT = STEEL (verbatim MLX BlockMMA GEMM, 8.4× the old SG forward) when the
-  // tiling is clean (H,V,blockV all % 32). MLX_BUN_CCE_NOSTEEL=1 falls back to the
-  // old kernels (simdgroup / scalar / lane).
+  // tiling is clean (H,V,blockV all % 32); otherwise, or with `forwardSteel` off,
+  // the composed fallback: simdgroup_matrix with efficient dequant staging (848 ms;
+  // the scalar kernel when H % SG_BD != 0), the one-thread-per-row scalar kernel
+  // with coalesced h (1097 ms), or the lane-sliced kernel (2.6× slower; scatters
+  // the h broadcast — recorded dead end).
   const blockV0 = Math.ceil(V / NBLK);
-  const useSteel = runtimeValue("MLX_BUN_CCE_NOSTEEL") !== "1" && H % 32 === 0 && V % 32 === 0 && blockV0 % 32 === 0;
-  const useSimd = !useSteel && USE_SIMDGROUP_FWD && H % SG_BD === 0;
-  if (!useSteel && runtimeValue("MLX_BUN_CCE_NOSTEEL") !== "1") {
+  const useSteel = options.forwardSteel && H % 32 === 0 && V % 32 === 0 && blockV0 % 32 === 0;
+  const useSimd = !useSteel && options.forwardFallback === "simdgroup" && H % SG_BD === 0;
+  if (!useSteel && options.forwardSteel) {
     // NOTE blockV0 = ceil(V/NBLK) can violate %32 even when V%32==0 (e.g. V=50304)
     const fails = [
       H % 32 !== 0 ? `H%32!=0 (H=${H})` : null,
@@ -1073,8 +1136,9 @@ export function flashCceForward(
     ].filter(Boolean).join(", ");
     warnSteelFallback("forward", fails, useSimd ? "simdgroup kernel" : "scalar/lane kernel");
   }
-  const useLane = !useSteel && !useSimd && runtimeValue("MLX_BUN_CCE_LANE") === "1" && WPR % 32 === 0;
-  const kernel = useSteel ? fwdSteelKernel(GS, head.bits) : useSimd ? fwdSgKernel() : useLane ? fwdLaneKernel() : fwdKernel();
+  const useLane = !useSteel && !useSimd && options.forwardFallback === "lane" && WPR % 32 === 0;
+  const kernel = useSteel ? fwdSteelKernel(GS, head.bits) : useSimd ? fwdSgKernel(options.forwardSkipDequant)
+    : useLane ? fwdLaneKernel() : fwdKernel();
   const tokTile = useSteel ? STEEL_BM : useSimd ? SG_BB : BLOCK_B;
   // steel + simdgroup read h as [M, H] (M on axis 0); lane + scalar read h TRANSPOSED
   // [H, M] (M on axis 1) — they stage E into threadgroup themselves.
@@ -1131,20 +1195,13 @@ export function flashCceForward(
   }
 }
 
-/** Flash-CCE backward: dh [M, hidden] (f32) = ∂(Σ_t cotangent_t · logp_t)/∂h.
- *  `lse` is the forward's saved log-sum-exp [M]; `cot` is the per-token cotangent
- *  ∂loss/∂logp_t [M]. Recomputes logits in-kernel (no [M,V]); writes dh directly
- *  (no atomics). Caller owns the result. */
-export function flashCceBackward(
-  hResp: MlxArray, head: FlashCceHead, targets: number[], lse: MlxArray, cot: number[],
-  // Apple-CCE coeff filter eps. Defaults to BWD_FILTER_EPS — ON at 1e-5 since
-  // 2026-07-02 (real-data gates in BWD_FILTER_EPS's note). Pass "0" explicitly
-  // for guaranteed-exact gradients (the parity gate does).
-  filterEps: string = BWD_FILTER_EPS,
-  // The forward's `blockMax [M, NBLK]` enables the vocab-block early exit (skips
-  // whole cold programs — attacks BOTH phases); ON at 1e-5 by default when
-  // blockMax is supplied. Omit blockMax (or set blockEps "0") for exact.
-  blockMax?: MlxArray, blockEps: string = BWD_BLOCK_EPS,
+/** `FlashCce.backward`'s dispatch. `filterEps` is the Apple-CCE coeff filter eps
+ *  ("0": exact). The forward's `blockMax [M, NBLK]` enables the vocab-block early
+ *  exit (skips whole cold programs — attacks BOTH phases) at `blockEps`; omit
+ *  blockMax (or set blockEps "0") for exact. */
+function cceBackward(
+  options: FlashCceOptions, hResp: MlxArray, head: FlashCceHead, targets: number[], lse: MlxArray, cot: number[],
+  filterEps: string, blockMax: MlxArray | undefined, blockEps: string,
 ): MlxArray {
   const M = hResp.shape[0]!;
   const H = hResp.shape[1]!;
@@ -1152,7 +1209,7 @@ export function flashCceBackward(
   const GR = head.scales.shape[1]!;
   const GS = head.groupSize;
   const WPR = head.w.shape[1]!;
-  if (H > H_MAX) throw new Error(`flashCceBackward: hidden ${H} > H_MAX ${H_MAX}`);
+  if (H > H_MAX) throw new Error(`FlashCce.backward: hidden ${H} > H_MAX ${H_MAX}`);
   // NOTE: H % TG is a LEGACY-SCALAR-kernel requirement only (it owns DPER = H/TG
   // dims per thread — floor division, so a remainder would leave dims silently
   // zero). The steel/simdgroup kernels have their own (weaker) guards below; the
@@ -1169,21 +1226,19 @@ export function flashCceBackward(
   const capv = MlxArray.fromFloat32(new Float32Array([head.softcap ?? 0]), [1]);
 
   // STEEL is the DEFAULT (verbatim MLX BlockMMA GEMM for both phases, [M,V]-free) when
-  // the tiling is clean (H,V,blockV all %32 AND H % HTw for the H-tiled accumulator).
-  // MLX_BUN_CCE_BWD_NOSTEEL=1 falls back to the old kernels. The steel backward carries
+  // the tiling is clean (H,V,blockV all %32 AND H % HTw for the H-tiled accumulator);
+  // `backwardSteel` off falls back to the old kernels. The steel backward carries
   // the SAME Apple-CCE skips as the SG kernel — coeff filter (phase-2 per-tile) +
-  // blockMax vocab-block early exit (whole-program) — both compiled out at eps=0.
-  // BOTH skips default ON at 1e-5 (2026-07-02 flip; measured gates in the
-  // BWD_FILTER_EPS / BWD_BLOCK_EPS notes). MLX_BUN_CCE_BWD_{FILTER,BLOCK}_EPS=0
-  // restores exact gradients (identical pre-flip kernels).
+  // blockMax vocab-block early exit (whole-program) — both compiled out at eps=0
+  // (identical pre-flip kernels, exact gradients).
   const blockV0 = Math.ceil(V / NBLK);
   // HTw == group_size for the phase-2 QuantizedBlockLoader (one group per H-tile); needs
   // H % GS == 0 (always, GR*GS=H) and GS % 32 == 0 (TNv = GS/32 frags per H-tile integral).
-  const useSteel = runtimeValue("MLX_BUN_CCE_BWD_NOSTEEL") !== "1" && H % 32 === 0 && V % 32 === 0 && blockV0 % 32 === 0 && H % GS === 0 && GS % 32 === 0;
+  const useSteel = options.backwardSteel && H % 32 === 0 && V % 32 === 0 && blockV0 % 32 === 0 && H % GS === 0 && GS % 32 === 0;
   // simdgroup_matrix phase-2 GEMM is the next tier (5512→3913 ms, 1.41×) when the H
-  // tiling is clean; MLX_BUN_CCE_BWD_SCALAR=1 forces the float4 scalar kernel.
-  const useSg = !useSteel && runtimeValue("MLX_BUN_CCE_BWD_SCALAR") !== "1" && H % (SGN * 8) === 0 && H % SG_BD === 0;
-  if (!useSteel && runtimeValue("MLX_BUN_CCE_BWD_NOSTEEL") !== "1") {
+  // tiling is clean; a "scalar" fallback forces the float4 scalar kernel.
+  const useSg = !useSteel && options.backwardFallback === "simdgroup" && H % (SGN * 8) === 0 && H % SG_BD === 0;
+  if (!useSteel && options.backwardSteel) {
     // NOTE blockV0 = ceil(V/NBLK) can violate %32 even when V%32==0 (e.g. V=50304)
     const fails = [
       H % 32 !== 0 ? `H%32!=0 (H=${H})` : null,
@@ -1199,7 +1254,7 @@ export function flashCceBackward(
   // Only enforced when dispatch actually lands there (steel/SG have weaker guards).
   if (!useSteel && !useSg && H % TG !== 0)
     throw new Error(
-      `flashCceBackward: hidden ${H} not divisible by TG ${TG} — required by the legacy ` +
+      `FlashCce.backward: hidden ${H} not divisible by TG ${TG} — required by the legacy ` +
         `scalar kernel, which is the selected route because the steel/simdgroup tiling ` +
         `guards also failed for this shape (see the [flash-cce] warning above).`,
     );
@@ -1209,7 +1264,8 @@ export function flashCceBackward(
   const bmF = useBlockSkip ? (blockMax!.dtype === Dtype.float32 ? blockMax! : blockMax!.astype(Dtype.float32)) : null;
   const kernel = useSteel
     ? bwdSteelKernel(GS, head.bits, H, filterEps, useBlockSkip ? blockEps : "0")
-    : useSg ? bwdSgKernel(H / SGN / 8, filterEps, useBlockSkip ? blockEps : "0") : bwdKernel(Math.ceil(H / TG));
+    : useSg ? bwdSgKernel(H / SGN / 8, filterEps, useBlockSkip ? blockEps : "0")
+    : bwdKernel(Math.ceil(H / TG), options.backwardSkipPhase2Dequant, options.backwardSkipPhase2);
   const tokTile = useSteel ? BWD_STEEL_BM : useSg ? BB_BWD_SG : BLOCK_B_BWD;
   const baseInputs = [hF, head.w, scF, biF, tgtArr, lseF, gv, shape, capv];
   try {

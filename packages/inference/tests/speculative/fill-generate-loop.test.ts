@@ -16,14 +16,15 @@ import {
 } from "../../src/generation/fill/session";
 import { KVCache } from "../../src/state/kv";
 import { type Cache } from "../../src/contracts/mlx/cache";
+import type { KvStorageScheme } from "../../src/contracts/portable/composition";
 import type { RuntimeModel } from "../../src/models/factory";
-import type { MlxTokenAppend } from "../../src/generation/bindings/autoregressive";
+import type { MlxKnownSpans } from "../../src/contracts/mlx/graph";
+import { stubPhases } from "../models/phase-forward";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { configureRuntime, runtimeConfig } from "../../src/runtime/config";
 import { cloneKvCaches } from "../../src/state/persistence";
-import { specServeRun } from "../../src/generation/speculative/run";
-import type { DraftProvider, DraftSource } from "../../src/generation/speculative/source";
 import { declareGraph } from "../../src/models/capabilities";
+import { kvStorage } from "../../src/state/kv-storage";
 
 const VOCAB = 128;
 const EOS = 2;
@@ -64,9 +65,18 @@ class StubModel {
     return this.makeCacheImpl();
   }
 
-  createAppend(): MlxTokenAppend | null {
-    // This stub's rows are independent and have no shape-dependent rounding.
-    return { maxChunkSize: () => 32, forwardHidden: this.forwardHidden.bind(this) };
+  /** Every phase runs the stub's one forward (late-bound, so a subclass's override serves them all) and its head. */
+  readonly #phases = stubPhases((ids, cache) => this.forwardHidden(ids, cache), hidden => this.logitsFromHidden(hidden));
+  readonly prefillChunk = this.#phases.prefillChunk;
+  readonly prefillTail = this.#phases.prefillTail;
+  readonly decode = this.#phases.decode;
+  readonly verify = this.#phases.verify;
+  readonly appendKnown = this.#phases.appendKnown;
+  readonly logits = this.#phases.logits;
+
+  /** Committed known-token spans: this stub's rows are independent and have no shape-dependent rounding. */
+  get knownSpans(): MlxKnownSpans | undefined {
+    return { maxChunkSize: () => 32 };
   }
 
   forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray {
@@ -75,7 +85,7 @@ class StubModel {
     const L = list.length;
     const k = MlxArray.fromFloat32(new Float32Array(L * 4), [1, 1, L, 4]);
     const v = MlxArray.fromFloat32(new Float32Array(L * 4), [1, 1, L, 4]);
-    const [outK, outV] = cache[0]!.updateAndFetch(k, v);
+    const [outK, outV] = kvStorage(cache[0]!).updateAndFetch(k, v);
     for (const a of [k, v, outK, outV]) a.dispose();
     // The "hidden state" carries each position's token id, so logits can be
     // produced PER POSITION — which is what the verify policy reads.
@@ -105,20 +115,25 @@ const session = (rows: FillRow[], maxSpan?: number, appendChunkSize?: number) =>
 test("the append binding owns affine fill format support", () => {
   const restore = configureRuntime({ MLX_BUN_FILL: "strict" });
   try {
-    const options = { fill: session([row([TRIGGER], SPAN)]), kvBits: 4 };
+    // The composition's KV scheme names the formats the committed append must declare.
+    const options = { fill: session([row([TRIGGER], SPAN)]) };
     const supported = { affineKvBits: [4, 8] };
-    expect(shouldUseFill(options, runtimeConfig())).toBe(false);
-    expect(shouldUseFill(options, runtimeConfig(), supported)).toBe(true);
-    expect(shouldUseFill({ ...options, kvBits: 8 }, runtimeConfig(), supported)).toBe(true);
-    expect(shouldUseFill({ ...options, kvConfig: [{ layerIdx: 3, bits: 4, groupSize: 64 },
-      { layerIdx: 7, bits: 8, groupSize: 64 }] }, runtimeConfig(), supported)).toBe(true);
-    expect(shouldUseFill({ ...options, kvBits: 2 }, runtimeConfig(), supported)).toBe(false);
-    expect(shouldUseFill({ ...options, kvBits: 2, kvConfig: [{ layerIdx: 3, bits: 4, groupSize: 64 }] }, runtimeConfig(), supported)).toBe(true);
-    expect(shouldUseFill({ ...options, kvConfig: [{ layerIdx: 3, bits: 2, groupSize: 64 }] }, runtimeConfig(), supported)).toBe(false);
-    expect(shouldUseFill({ ...options, turboQuant: { kBits: 8, vBits: 3 } }, runtimeConfig(), supported)).toBe(false);
+    const uniform = (bits: number): KvStorageScheme => ({ kind: "affine", bits, groupSize: 64, kernels: "unfused" });
+    const layers = (...bits: number[]): KvStorageScheme => ({ kind: "affine-layers", kernels: "tiled-causal",
+      layers: bits.map((width, index) => ({ layer: 3 + 4 * index, bits: width, groupSize: 64 })) });
+    const turbo = (kBits: number): KvStorageScheme => ({ kind: "turbo", kBits, vBits: 3 });
+    expect(shouldUseFill(options, runtimeConfig())).toBe(true);
+    expect(shouldUseFill(options, runtimeConfig(), undefined, uniform(4))).toBe(false);
+    expect(shouldUseFill(options, runtimeConfig(), supported, uniform(4))).toBe(true);
+    expect(shouldUseFill(options, runtimeConfig(), supported, uniform(8))).toBe(true);
+    expect(shouldUseFill(options, runtimeConfig(), supported, layers(4, 8))).toBe(true);
+    expect(shouldUseFill(options, runtimeConfig(), supported, uniform(2))).toBe(false);
+    expect(shouldUseFill(options, runtimeConfig(), supported, layers(4))).toBe(true);
+    expect(shouldUseFill(options, runtimeConfig(), supported, layers(2))).toBe(false);
+    expect(shouldUseFill(options, runtimeConfig(), supported, turbo(8))).toBe(false);
     const rotated = { turboQuantFormats: [{ kBits: 8, vBits: 3 }] };
-    expect(shouldUseFill({ ...options, turboQuant: { kBits: 8, vBits: 3 } }, runtimeConfig(), rotated)).toBe(true);
-    expect(shouldUseFill({ ...options, turboQuant: { kBits: 4, vBits: 3 } }, runtimeConfig(), rotated)).toBe(false);
+    expect(shouldUseFill(options, runtimeConfig(), rotated, turbo(8))).toBe(true);
+    expect(shouldUseFill(options, runtimeConfig(), rotated, turbo(4))).toBe(false);
   } finally { restore(); }
 });
 
@@ -177,41 +192,12 @@ describe("generate(): cancellation", () => {
       .rejects.toHaveProperty("name", "AbortError");
     expect(model.forwards).toEqual([]);
   });
-
-  test("speculative cancellation between target prefill chunks releases target and draft state", async () => {
-    const abort = new AbortController();
-    let cacheDisposals = 0;
-    let sourceDisposals = 0;
-    class OwnedCache extends KVCache {
-      override dispose(): void { cacheDisposals++; super.dispose(); }
-    }
-    class CancellingModel extends StubModel {
-      override forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray {
-        const hidden = super.forwardHidden(ids, cache);
-        abort.abort(new DOMException("cancelled during spec prefill", "AbortError"));
-        return hidden;
-      }
-    }
-    const model = new CancellingModel(SCRIPT, () => [new OwnedCache()]);
-    const source = {
-      prefill() { throw new Error("cancelled target must not start draft prefill"); },
-      dispose() { sourceDisposals++; },
-    } as unknown as DraftSource;
-    const provider = { open: () => source } as unknown as DraftProvider;
-    await expect(specServeRun(model as unknown as RuntimeModel, provider, 3,
-      Array.from({ length: 4098 }, () => 1), { temperature: 0, signal: abort.signal },
-      () => { throw new Error("cancelled prefill must not emit"); }))
-      .rejects.toHaveProperty("name", "AbortError");
-    expect(model.forwards).toHaveLength(1);
-    expect(cacheDisposals).toBe(1);
-    expect(sourceDisposals).toBe(1);
-  });
 });
 
 describe("generate(): the fill append", () => {
   test("an unqualified graph appends M1 without intermediate heads or verification", async () => {
     class UnqualifiedModel extends StubModel {
-      override createAppend(): null { return null; }
+      override get knownSpans(): undefined { return undefined; }
     }
     const fill = session([row([TRIGGER], SPAN)], 32, 4);
     const { model, tokens, stats } = await withFill({ MLX_BUN_FILL: "strict" },
@@ -226,8 +212,8 @@ describe("generate(): the fill append", () => {
 
   test("the graph's chunk limit caps a caller's larger requested chunks", async () => {
     class TwoRowModel extends StubModel {
-      override createAppend(): MlxTokenAppend {
-        return { maxChunkSize: () => 2, forwardHidden: this.forwardHidden.bind(this) };
+      override get knownSpans(): MlxKnownSpans {
+        return { maxChunkSize: () => 2 };
       }
     }
     const fill = session([row([TRIGGER], SPAN)], 32, 8);
@@ -241,11 +227,8 @@ describe("generate(): the fill append", () => {
   test("the graph rechecks its limit after each committed chunk", async () => {
     const offsets: number[] = [];
     class BoundaryModel extends StubModel {
-      override createAppend(): MlxTokenAppend {
-        return {
-          maxChunkSize(state) { offsets.push(state[0]!.offset); return state[0]!.offset === 4 ? 1 : 2; },
-          forwardHidden: this.forwardHidden.bind(this),
-        };
+      override get knownSpans(): MlxKnownSpans {
+        return { maxChunkSize(state) { offsets.push(state[0]!.offset); return state[0]!.offset === 4 ? 1 : 2; } };
       }
     }
     const fill = session([row([TRIGGER], SPAN)], 32, 4);

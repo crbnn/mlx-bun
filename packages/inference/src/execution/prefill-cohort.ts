@@ -1,12 +1,14 @@
 import type { Cache } from "../contracts/mlx/cache";
 import type { MlxTokenGraph } from "../models/graph";
 import type { MlxArray } from "@mlx-bun/mlx/array";
-import { nextPrefillStep } from "../contracts/portable/prefill";
+import { nextPrefillStep, prefillPhase } from "../contracts/portable/prefill";
 import type { CacheCodecProvider } from "../state/persistence-types";
 import { disposeResources, cleanupFailure } from "../runtime/resources";
 import type { Row, RowPromptCache } from "./batch-types";
 import type { KvMaintenance } from "../state/kv-maintenance";
-import { MlxPrefillRows, type MlxPrefillState } from "./prefill-rows";
+import { MlxPrefillRows, type MlxPrefillForward, type MlxPrefillState } from "./prefill-rows";
+import { widthClass } from "../contracts/mlx/graph";
+import { promptWorkStep } from "../generation/phase-dispatch";
 
 export interface PrefillState extends MlxPrefillState {
   snapAt: number | null;
@@ -22,9 +24,10 @@ interface PrefillHost {
   stateCodecs?: CacheCodecProvider;
   maintain?: KvMaintenance;
   denseKvReads?: readonly number[];
-  forward(ids: MlxArray, caches: Cache[]): Promise<MlxArray>;
+  /** One cohort forward of `ids` [sequences, tokens] in the phase its planner named. */
+  forward(ids: MlxArray, caches: Cache[], step: MlxPrefillForward): Promise<MlxArray>;
   /** Target projection preserves the forward batch geometry before sampling. */
-  project(hidden: MlxArray, caches: Cache[], completed: readonly PrefillState[]): MlxArray;
+  project(hidden: MlxArray, caches: Cache[], completed: readonly PrefillState[], step: MlxPrefillForward): MlxArray;
   /** Borrows [1,1,V] logits; takes ownership of the completed request caches. */
   complete(state: PrefillState, logits: MlxArray): Promise<void>;
   resume?(state: PrefillState): Promise<void>;
@@ -63,11 +66,9 @@ export class MlxPrefillCohort extends MlxPrefillRows<PrefillState> {
             mechanism: "continuous", promptTokens: row.promptTokens, cachedTokens: row.cachedTokens,
           });
           const closeSetup = row.req.trace?.begin("prefill.batch_setup", { mechanism: "continuous" });
+          // The graph's composed caches, or a stored prefix composed again by
+          // the prompt cache: either converts inside its own appends.
           owned ??= { caches: row.req.statePolicy?.create() ?? host.model.makeCache() }; closeSetup?.();
-          // The first forward must read maintained state. A stored prefix can
-          // still owe the conversion its final append reached, so maintain
-          // every opened cache here.
-          host.maintain?.(owned.caches);
           return { row, solo: owned.caches, pos: hit?.tokens.length ?? 0, retain: owned.retain, snapAt, closePrefill };
         } catch (error) {
           return cleanupFailure(error, () => disposeResources([...(owned?.caches ?? []),
@@ -77,14 +78,18 @@ export class MlxPrefillCohort extends MlxPrefillRows<PrefillState> {
       ready: state => !!state.continuation,
       plan(state) {
         if (state.row.req.promptInput) return { kind: "final", start: state.pos,
-          end: state.row.promptTokens, snapshot: false, batchYield: false, atomic: true };
+          end: state.row.promptTokens, snapshot: false, batchYield: false, atomic: true,
+          phase: prefillPhase(state.pos, state.row.promptTokens, false) };
         return nextPrefillStep({ length: state.row.promptTokens, position: state.pos,
         chunkSize: state.row.req.prefillChunkSize ?? host.chunkSize,
         tailSplit: host.tailSplit, snapshotAt: state.snapAt }); },
-      forward: (ids, caches, states, work) => states[0]?.row.req.promptInput
-        ? Promise.resolve(states[0].row.req.promptInput.forward(ids, caches, states[0].pos))
-        : work ? work(ids, caches) : host.forward(ids, caches),
-      project: host.project.bind(host),
+      forward: (ids, caches, states, step, work) => states[0]?.row.req.promptInput
+        ? Promise.resolve(states[0].row.req.promptInput.prefill(ids, caches, states[0].pos,
+          step.phase === "decode" ? "decode" : "tail", widthClass(step.tokens)))
+        : work ? work(ids, caches, promptWorkStep(step, null, () => host.forward(ids, caches, step))) : host.forward(ids, caches, step),
+      // A media prompt input returns its prompt's last position: one row per sequence to project.
+      project: (hidden, caches, completed, step) => host.project(hidden, caches, completed,
+        completed.some(state => state.row.req.promptInput) ? { ...step, tokens: 1 } : step),
       complete: (state, logits) => state.continuation ? host.resume!(state) : host.complete(state, logits!), reject: host.reject.bind(host),
       checkpoint(state, capture) {
         let snapshot: Cache[] | undefined;

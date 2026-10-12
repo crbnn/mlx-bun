@@ -1,22 +1,20 @@
-import { MlxArray } from "@mlx-bun/mlx/array";
-import * as ops from "@mlx-bun/mlx/ops";
-import type { BatchableCache,Cache,CompiledDecodeCache,RowBatchCache } from "../contracts/mlx/cache";
+// What the state modules ask of a cache's representation. Every caller is in
+// `state/`: the planner, the scheduler and the methods read none of it.
+import type { BatchableCache,Cache,RowBatchCache } from "../contracts/mlx/cache";
 import { KVCache } from "./kv";
 import { QuantizedKVCache } from "./quantized-kv";
 import { RotatingKVCache } from "./rotating-kv";
 import { RotatingQuantizedKVCache } from "./rotating-quantized-kv";
 
-
-/** Retain an independent array handle for positions used across cache writes.
- * The contiguous view preserves the integer values and shares their storage;
- * callers release it with the fetched attention state. */
-export function captureRopeOffsets(cache: Pick<Cache, "ropeOffsetArr">): MlxArray | undefined {
-  const offsets = cache.ropeOffsetArr;
-  return offsets ? ops.contiguous(offsets) : undefined;
-}
-
 export function cacheSignature(cache: Cache | undefined): string {
   return cache ? cache.signature() : "unknown";
+}
+
+/** The storage a cache holds: a composed lego's (`Cache.composed`), else the
+ * cache itself. What the request state reads to learn which layers a fresh
+ * cache list pages. */
+export function composedStorageOf(cache: Cache): Cache {
+  return cache.composed ? cache.composed.storage() : cache;
 }
 
 export function isRowBatchCache(cache: Cache): cache is RowBatchCache {
@@ -43,21 +41,14 @@ export function isRotatingPlainCache(cache: Cache | undefined): cache is Rotatin
   return cacheSignature(cache) === "kv:rotating-plain";
 }
 
+export function isTurboQuantKvCache(cache: Cache | undefined): boolean {
+  return cacheSignature(cache).startsWith("kv:turboquant:");
+}
+
 export function isRotatingQuantizedCache(
   cache: Cache | undefined,
 ): cache is RotatingQuantizedKVCache {
   return cacheSignature(cache).startsWith("kv:rotating-quant:");
-}
-
-/** A cache the compiled decode step can drive (see CompiledDecodeCache). A batched
- * layout that inherits it is a row cache too: callers exclude those separately. */
-export function isCompiledDecodeCache(cache: Cache): cache is CompiledDecodeCache {
-  const candidate = cache as Partial<CompiledDecodeCache>;
-  return typeof candidate.prepareDecodeStep === "function" &&
-    typeof candidate.decodePhase === "function" &&
-    typeof candidate.decodeSlot === "function" &&
-    typeof candidate.decodeInputs === "function" &&
-    typeof candidate.commitDecodeStep === "function";
 }
 
 export function isBatchableCache(cache: Cache): cache is BatchableCache {

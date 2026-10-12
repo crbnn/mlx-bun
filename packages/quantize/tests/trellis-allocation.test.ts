@@ -79,6 +79,7 @@ test("the fold plan folds readers with their preceding γ and writers on the out
   const plan = planQwen35HfFold(source(trunk(types)), { numHiddenLayers: 2, layerTypes: types });
   expect(plan.ops.get(`${LM}embed_tokens.weight`)).toEqual({ kind: "input" });
   expect(plan.ops.get("lm_head.weight")).toEqual({ kind: "input", gamma: `${LM}norm.weight` });
+  expect(plan.headGamma).toBe(`${LM}norm.weight`);
   expect(plan.ops.get(layer(0, "linear_attn.in_proj_qkv.weight"))).toEqual({ kind: "input", gamma: layer(0, "input_layernorm.weight") });
   expect(plan.ops.get(layer(0, "linear_attn.out_proj.weight"))).toEqual({ kind: "output" });
   expect(plan.ops.get(layer(1, "self_attn.k_proj.weight"))).toEqual({ kind: "input", gamma: layer(1, "input_layernorm.weight") });

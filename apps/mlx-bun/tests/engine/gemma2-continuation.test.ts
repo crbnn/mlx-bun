@@ -69,7 +69,7 @@ test.skipIf(!native || !modelDir)("Gemma2 plain-KV generation checkpoints surviv
       const options = (): GenerateOptions => ({ maxTokens, prefillChunkSize: 512, eosTokenIds: [], seed: 42,
         seedWasExplicit: true, ...sampling });
       const requestShape: RequestShape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false,
-        userSeed: true, kvQuant: false, turboQuant: false, hasLogitsExtras: false, hasGrammar: false,
+        userSeed: true, hasLogitsExtras: false, hasGrammar: false,
         wantsLogprobs: false, hasDraft: false, ...shape };
       /** One serve lifetime over `dir`: cache services, continuation, engine, one request, close. */
       const serve = async (dir: string, interrupt: boolean) => {
@@ -94,7 +94,7 @@ test.skipIf(!native || !modelDir)("Gemma2 plain-KV generation checkpoints surviv
         binding.gateway.configureContinuation!(caches.continuationServices);
         let flushed: Awaited<ReturnType<typeof caches.close>> | undefined;
         const engine = await createAppEngine(context, { capacity: 4, binding, ownership: "borrowed",
-          gateway: { checkpoints: true, stateCodecs: caches.stateCodecs, kvScheme: caches.resolvedKvScheme,
+          gateway: { checkpoints: true, stateCodecs: caches.stateCodecs,
             promptCache: caches.promptCache, adapterNamespace: caches.adapterNamespace },
           beforeModelDispose: async () => { flushed = await caches.close(); } });
         const tokens: number[] = [], abort = new AbortController();
@@ -102,7 +102,7 @@ test.skipIf(!native || !modelDir)("Gemma2 plain-KV generation checkpoints surviv
         try {
           const placement = engine.gateway.place(requestShape, options());
           expect(placement.execution).toMatchObject({ method: "autoregressive", mechanism: "continuous",
-            promptCache: true, checkpoint: true, fill: false, pagedKv: false });
+            promptCache: true, checkpoint: true, fill: false });
           outcome = await engine.gateway.run(prompt, options(), token => {
             tokens.push(token);
             if (interrupt && tokens.length === interruptAt) abort.abort(new Error("interrupted by test"));

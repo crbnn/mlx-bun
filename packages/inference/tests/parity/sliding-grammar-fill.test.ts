@@ -9,7 +9,7 @@
 //   before it) and every projection's complete logits; the scheduler may add
 //   one discarded single-token lookahead step. Rows prepared together or
 //   joining late (B2) each equal their B1 direct output.
-// - Grammar with MLX_BUN_GRAMMAR_JUMP=1: the graph binds grammar proposals, so
+// - Grammar with the composition's grammarJump on: the graph binds grammar proposals, so
 //   the gateway places the request on the speculative group, which verifies
 //   the matcher's forced string rather than committing it (no forced span is
 //   taken from the matcher). At B1 and B2 its tokens equal direct
@@ -179,8 +179,8 @@ type Shape = "grammar" | "jump" | "fill";
 type FillMode = "strict" | "echo" | "reject";
 interface Request { prompt: PromptName; grammar?: GrammarName; fill?: FillMode }
 interface Outcome { tokens: number[]; spans: number[][]; status: "fulfilled" | "rejected"; error?: unknown; fill?: FillSession }
-/** The graph operations the recorder wraps. */
-interface Graph { forwardHidden(ids: MlxArray, caches: Cache[]): MlxArray; logitsFromHidden(hidden: MlxArray): MlxArray; args?: WindowDescriptor }
+/** The custom graph's window descriptor. */
+interface Graph { args?: WindowDescriptor }
 /** MLX_BUN_FILL for a set of rows: echo (which a rejected-proposal row also needs) is additive to strict. */
 const fillMode = (rows: readonly Request[]): "strict" | "echo" | undefined =>
   rows.some(row => row.fill === "echo" || row.fill === "reject") ? "echo" : rows.some(row => row.fill === "strict") ? "strict" : undefined;
@@ -193,6 +193,7 @@ async function setup() {
   const { loadTokenizer } = await import("@mlx-bun/inference/input");
   const { FillSession: Session } = await import("@mlx-bun/inference/generation/fill");
   const { clearCache } = await import("@mlx-bun/mlx/ffi");
+  const { observedPhases } = await import("../models/phase-forward");
   const { hash, rowStates } = await rotatingRowReader();
   const { model: dir, window, descriptor } = inputs!;
   const config = await loadModelConfig(dir);
@@ -202,23 +203,24 @@ async function setup() {
     try { weights.dispose(); }
     finally { releaseAll([...weights.shards.files.values()].map(file => () => file.mmap.unmap())); clearCache(); }
   };
-  const { model, graph, tokenizer, prompts } = await (async () => {
+  const { model, tokenizer, prompts } = await (async () => {
     const model = createModel(weights, config), graph = model as unknown as Graph;
     expect({ layerTypes: graph.args?.layerTypes, slidingWindow: graph.args?.slidingWindow }).toEqual(descriptor);
     const tokenizer = await loadTokenizer(dir);
     const prompts = planPrompts(tokenizer.encode("Name one city you like and rate it from 1 to 5 as JSON.", true),
       tokenizer.encode("Answer yes or no, then add one lowercase word.", true), window);
     assert(prompts.long.length > window && prompts.other.length > window && prompts.short.length < window, "prompts do not bracket the window");
-    return { model, graph, tokenizer, prompts };
+    return { model, tokenizer, prompts };
   })().catch(error => { releaseWeights(); throw error; });
 
-  // One recorder for both paths, installed before any binding or group binds
-  // the graph's operations: every forward (IDs; at B1, the row's valid state
-  // before it) and every projection's complete logits, per row and position.
+  // One recorder for both paths: the direct generator and the gateway are bound
+  // to this observed view of the graph's phases. Every forward (IDs; at B1, the
+  // row's valid state before it) and every projection's complete logits, per row
+  // and position.
   let trace: { forwards: Forward[]; projections: Projection[]; states: boolean } | null = null;
-  const forwardHidden = graph.forwardHidden, logitsFromHidden = graph.logitsFromHidden;
-  graph.forwardHidden = function (this: Graph, ids: MlxArray, caches: Cache[]) {
-    if (trace) {
+  const view = observedPhases(model, {
+    forward(ids: MlxArray, caches: Cache[]) {
+      if (!trace) return;
       const [B, L] = ids.shape as [number, number], flat = ids.toIntTokens();
       let state: Forward["state"] = null;
       if (trace.states && B === 1 && caches[0]!.offset > 0) {
@@ -228,18 +230,14 @@ async function setup() {
         catch (error) { state = { unreadable: (error as Error).message }; }
       }
       trace.forwards.push({ B, L, ids: Array.from({ length: B }, (_, r) => flat.slice(r * L, (r + 1) * L)), state });
-    }
-    return forwardHidden.call(this, ids, caches);
-  };
-  graph.logitsFromHidden = function (this: Graph, hidden: MlxArray) {
-    const out = logitsFromHidden.call(this, hidden);
-    if (trace) try {
+    },
+    head(_hidden: MlxArray, out: MlxArray) {
+      if (!trace) return;
       const [B, L, V] = out.shape as [number, number, number], rows: string[] = [];
       for (let b = 0; b < B; b++) for (let l = 0; l < L; l++) { using row = out.slice([b, l, 0], [b + 1, l + 1, V]); rows.push(hash(row)); }
       trace.projections.push({ B, L, dtype: out.dtypeName, rows });
-    } catch (error) { out.dispose(); throw error; }
-    return out;
-  };
+    },
+  });
   const traced = async <T>(states: boolean, run: () => Promise<T>) => {
     trace = { forwards: [], projections: [], states };
     try { const value = await run(); return { value, forwards: trace.forwards, projections: trace.projections }; }
@@ -248,8 +246,7 @@ async function setup() {
 
   /** The scenario's runtime, active while `run` binds and generates. */
   const under = async <T>(shape: Shape, fill: FillMode | undefined, run: () => Promise<T>) => {
-    const restore = configureRuntime({ MLX_BUN_PREFILL_TAIL_SPLIT: "1", MLX_BUN_COMPILED_DECODE: "0", MLX_BUN_GRAMMAR: "1",
-      MLX_BUN_GRAMMAR_JUMP: shape === "jump" ? "1" : "0", MLX_BUN_FILL: fill === "reject" ? "echo" : fill ?? "off" });
+    const restore = configureRuntime({ MLX_BUN_GRAMMAR: "1", MLX_BUN_FILL: fill === "reject" ? "echo" : fill ?? "off" });
     try { return await run(); } finally { restore(); clearCache(); }
   };
   /** A matcher that reports each forced span it commits (none is expected on
@@ -308,7 +305,7 @@ async function setup() {
     try {
       const { value, forwards, projections } = await traced(true, async () => {
         const tokens: number[] = [];
-        const generation = generate(model, prompt, { ...options, decodePolicy: { compiledDecode: false, grammarJump: false } });
+        const generation = generate(view, prompt, { ...options, decodePolicy: { compiledDecode: false, grammarJump: false } });
         for await (const step of generation) tokens.push(step.token);
         return tokens;
       });
@@ -320,7 +317,7 @@ async function setup() {
     const { prompt, options } = await optionsFor(request, []);
     const { value, forwards, projections } = await traced(true, async () => {
       const tokens: number[] = [];
-      for await (const step of generate(model, prompt, { ...options, decodePolicy: { compiledDecode: false, grammarJump: false } }))
+      for await (const step of generate(view, prompt, { ...options, decodePolicy: { compiledDecode: false, grammarJump: false } }))
         tokens.push(step.token);
       return tokens;
     });
@@ -358,18 +355,20 @@ async function setup() {
     hold(held: boolean): void;
     drained(): Promise<void>;
   }) => Promise<T>) => under(shape, fill, async () => {
-    const binding = bindMlxGateway(model);
+    // The jump scenario binds the view under a composition that turns grammar jump on.
+    const binding = bindMlxGateway(shape === "jump"
+      ? Object.create(view, { composition: { value: { ...(view as { composition?: object }).composition, grammarJump: true } } }) as typeof view : view);
     let held = false;
     const group = binding.createBatchGroup({ maxBatch, runtime: binding.runtime, prefillChunkSize: CHUNK, admissionHeld: () => held });
     const prepare = async (request: Request, end: { cancelAt?: number; onToken?: (emitted: number) => void } = {}) => {
       const spans: number[][] = [], tokens: number[] = [], abort = new AbortController();
       const { prompt, options } = await optionsFor(request, spans);
       const start = async (): Promise<Outcome> => {
-        const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false, kvQuant: false,
-          turboQuant: false, hasLogitsExtras: false, hasGrammar: !!options.grammar, wantsLogprobs: false, hasDraft: false };
+        const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
+          hasLogitsExtras: false, hasGrammar: !!options.grammar, wantsLogprobs: false, hasDraft: false };
         let sampling: ReturnType<typeof createRowSampling> | undefined;
         try {
-          const execution = binding.plan(shape, options, { continuous: binding.cachesBatchable(), quantizedBatch: false, checkpoints: false });
+          const execution = binding.plan(shape, options, { checkpoints: false });
           assert.equal(execution.mechanism, "continuous", `placement refused ${JSON.stringify(request)}: ${execution.reasons.join(", ")}`);
           const method = binding.methodRequest?.(execution, options);
           const sink = (token: number) => {
@@ -420,7 +419,6 @@ async function setup() {
   return {
     prompts, reference, single, alone, directFill, gateway, traced, checkFillApplied,
     release() {
-      graph.forwardHidden = forwardHidden; graph.logitsFromHidden = logitsFromHidden;
       releaseWeights();
     },
   };

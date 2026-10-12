@@ -2,6 +2,7 @@ import type { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { BatchedKVCache } from "../../../state/batched-kv";
+import { AttentionMasks } from "../../../state/attention-read";
 import type { Cache } from "../../../contracts/mlx/cache";
 import { MlxStateRows } from "../../../state/rows";
 import { disposeResources } from "../../../runtime/resources";
@@ -12,11 +13,16 @@ export interface ContextProjection {
 }
 
 /** Incremental projected context reuses ordinary full-attention row storage.
- * The projection graph owns numerics; this object owns positions and validity. */
+ * The projection graph owns numerics; this object owns positions and validity.
+ * Context enters through the rows' window read, disposed unattended (the
+ * contract's append without attending); the drafter reads the stored rows as
+ * donor rows (`captureDonorRows`). The layers share one mask memo, so an append
+ * builds its per-row mask once. */
 export class MlxProjectedContextRows {
   readonly state: MlxStateRows<BatchedKVCache>;
   constructor(layers: number, readonly graph: ContextProjection) {
-    this.state = new MlxStateRows(Array.from({ length: layers }, () => new BatchedKVCache()));
+    const masks = new AttentionMasks();
+    this.state = new MlxStateRows(Array.from({ length: layers }, () => new BatchedKVCache(masks)));
   }
   get positions(): readonly number[] { return this.state.caches[0]!.rowOffsets; }
   prepareAppend(rows: readonly (readonly Cache[])[]) { return this.state.prepareAppendMany(rows); }
@@ -28,7 +34,7 @@ export class MlxProjectedContextRows {
     try {
       for (const [layer, cache] of this.state.caches.entries()) {
         cache.specRoundBegin();
-        for (const array of cache.updateAndFetch(projected[layer]!.k, projected[layer]!.v)) array.dispose();
+        cache.appendWindow(projected[layer]!.k, projected[layer]!.v).dispose();
         if (lengths.every(length => length === width)) cache.specRoundCommit();
         else cache.specRoundRollback(lengths);
       }

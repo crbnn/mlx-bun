@@ -18,7 +18,7 @@
 //
 // The forward reuses the existing full-sequence machinery
 // (packages/inference/src/scoring/full-sequence.ts trainForward →
-// model.forwardHidden + logitsFromHidden).
+// the graph's sequenceHidden + logitsFromHidden).
 
 import { clearCache, Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";

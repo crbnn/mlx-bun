@@ -52,16 +52,21 @@ async function worker(plan: MtpPlan, variantIndex: number, mode: MtpSample["mode
   checkTraining();
   const v = plan.variants[variantIndex]!;
   // Imports happen only after the parent has set the arm's environment.
-  const { loadModelConfig, loadTokenizer, ChatTemplate, Weights, createModel } = await import("@mlx-bun/inference");
+  const { loadModelConfig, loadTokenizer, ChatTemplate, Weights, createModel, resolveComposition } = await import("@mlx-bun/inference");
+  const { KvScheme } = await import("@mlx-bun/inference/state");
   const { QwenMtpProvider, Dflash2Provider, detectDraftKind } = await import("@mlx-bun/inference/generation/speculative");
   const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
   const { resetPeakMemory, peakMemory, clearCache, synchronize, deviceArchitecture, MLX_VERSION } = await import("@mlx-bun/mlx/ffi");
   const { gpuStream } = await import("@mlx-bun/mlx/array");
   const weights = await Weights.open(plan.target);
-  const model = createModel(weights, await loadModelConfig(plan.target));
+  // The plan's KV scheme is the graph's composition (a uniform width, a 5000-token start unless the plan names one,
+  // read with the tiled-causal set this screen read before the composition carried it).
+  const config = await loadModelConfig(plan.target);
+  const model = createModel(weights, config, { ...resolveComposition(config),
+    ...(plan.kv ? { kv: new KvScheme("affine-uniform", { ...plan.kv }, "tiled-causal").storage } : {}) });
   const draftDir = v.draft ?? plan.draft;
   const provider = await detectDraftKind(draftDir) === "dflash2"
-    ? await Dflash2Provider.load(draftDir) : await QwenMtpProvider.load(draftDir);
+    ? await Dflash2Provider.load(draftDir, { bits: 4 }) : await QwenMtpProvider.load(draftDir);
   const tokenizer = await loadTokenizer(plan.target), template = await ChatTemplate.load(plan.target);
   const prompts = plan.prompts.map(text => {
     const ids = tokenizer.encode(template.render([{ role: "user", content: text }], { enableThinking: plan.thinking ?? false }));
@@ -69,10 +74,10 @@ async function worker(plan: MtpPlan, variantIndex: number, mode: MtpSample["mode
   });
   const binding = bindMlxGateway(model, { provider, numDraftTokens: v.depth, adaptiveDepth: v.adaptiveDepth ?? false });
   const run = async (prompt: number, maxTokens: number): Promise<MtpSample> => {
-    const options = { ...(plan.sampling ?? { temperature: 0 }), ...(plan.kv ?? {}), maxTokens };
+    const options = { ...(plan.sampling ?? { temperature: 0 }), maxTokens };
     const execution = binding.plan({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: !!plan.sampling,
-      kvQuant: !!plan.kv, turboQuant: false, hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true },
-      options, { continuous: true, quantizedBatch: false, checkpoints: false });
+      hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true },
+      options, { checkpoints: false });
     assert(execution.method === "speculative", "requested MTP did not bind");
     const request = binding.methodRequest!(execution, options)!;
     const tokens: number[] = [], steps: MtpSample["steps"] = [];

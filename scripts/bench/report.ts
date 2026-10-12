@@ -1,10 +1,10 @@
 // Run record, qualification and paired comparison. Pure over the raw record:
 // `bench-serve.ts compare` re-renders any saved run without servers.
-import type { CellResult, RawRequest, ReqResult, StopResult } from "./measure";
+import type { CellResult, MemoryReading, RawRequest, ReqResult, StopResult } from "./measure";
 import { decodeStable, median, probeVerdict, spreadOf } from "./measure";
 import { basename } from "node:path";
 import type { Configuration, Plan, Tree } from "./plan";
-import { planCells, REQUIRED_PHASES, WORKLOAD } from "./plan";
+import { planCells, REQUIRED_PHASES, sessionsOf, WORKLOAD } from "./plan";
 
 export interface CellRecord {
   key: string;
@@ -13,6 +13,8 @@ export interface CellRecord {
   tree?: Tree;
   configuration?: Configuration;
   reference?: string;
+  /** 1-based session of a multi-session plan. */
+  session?: number;
   order: number;
   command: string[] | null;
   /** Intent only: the library the environment asked for. `result.loadedLibraries` is the evidence. */
@@ -40,9 +42,15 @@ export interface RunRecord {
   requests: RawRequest[];
 }
 
-export const PAIRS = (plan: Plan) => plan.models.flatMap(model => plan.configurations.map(configuration => ({ model: model.id, configuration })));
-const cellFor = (run: RunRecord, model: string, tree: Tree, configuration: Configuration) =>
-  run.cells.find(cell => cell.kind === "tree" && cell.model === model && cell.tree === tree && cell.configuration === configuration);
+/** Every baseline/candidate pair: model × configuration × session. */
+export const PAIRS = (plan: Plan) => plan.models.flatMap(model => plan.configurations.flatMap(configuration =>
+  sessionsOf(plan).map(session => ({ model: model.id, configuration, session }))));
+const cellFor = (run: RunRecord, model: string, tree: Tree, configuration: Configuration, session = 1) =>
+  run.cells.find(cell => cell.kind === "tree" && cell.model === model && cell.tree === tree && cell.configuration === configuration &&
+    (cell.session ?? 1) === session);
+/** "model/configuration", with the session when the plan runs several. */
+export const pairLabel = (plan: Plan, model: string, configuration: Configuration, session = 1) =>
+  `${model}/${configuration}${(plan.sessions ?? 1) > 1 ? ` s${session}` : ""}`;
 
 /** Each measured phase must hold its full sample set, backed by the successful
  * requests of its final attempt: a label alone proves nothing. */
@@ -102,7 +110,7 @@ export function qualification(run: RunRecord) {
     if (!seen.length) problems.push(`${cell.key}: planned ${cell.skipped ? "N/A cell" : "cell"} was never recorded`);
     for (const observed of seen) {
       if ((observed.skipped ?? null) !== (cell.skipped ?? null)) problems.push(`${cell.key}: applicability differs from the plan`);
-      if (observed.kind !== cell.kind || (observed.tree ?? null) !== (cell.tree ?? null) ||
+      if (observed.kind !== cell.kind || (observed.tree ?? null) !== (cell.tree ?? null) || (observed.session ?? null) !== (cell.session ?? null) ||
           (observed.configuration ?? null) !== (cell.configuration ?? null) || observed.model !== cell.model)
         problems.push(`${cell.key}: identity differs from the plan`);
     }
@@ -155,9 +163,9 @@ export function qualification(run: RunRecord) {
   }
   // Baseline and candidate must render the same prompts and produce the same greedy text,
   // and every required phase's final accepted attempt must pair completely.
-  for (const { model, configuration } of PAIRS(run.plan)) {
-    const ca = cellFor(run, model, "baseline", configuration), cb = cellFor(run, model, "candidate", configuration);
-    const a = ca?.result, b = cb?.result;
+  for (const { model, configuration, session } of PAIRS(run.plan)) {
+    const ca = cellFor(run, model, "baseline", configuration, session), cb = cellFor(run, model, "candidate", configuration, session);
+    const a = ca?.result, b = cb?.result, label = pairLabel(run.plan, model, configuration, session);
     if (!a || !b) continue;
     const pairs = pairRequests(run, ca!, cb!);
     for (const phase of REQUIRED_PHASES.filter(p => run.plan.workload.withContext || (p !== "ctx" && p !== "restart"))) {
@@ -166,14 +174,14 @@ export function qualification(run: RunRecord) {
       const unpaired = fa.filter(q => !q.result || !valid.has(`${q.phase}|${q.attempt}|${q.index}|${q.requestSha256}`));
       if (!fa.length || fa.length !== fb.length || fb.some(q => !q.result) || unpaired.length) {
         const invalid = pairs.filter(p => p.phase === phase && !p.valid).map(p => p.reason);
-        problems.push(`${model}/${configuration} ${phase}: final attempts do not pair (baseline ${fa.length} requests ` +
+        problems.push(`${label} ${phase}: final attempts do not pair (baseline ${fa.length} requests ` +
           `attempt ${fa[0]?.attempt ?? "-"}, candidate ${fb.length} attempt ${fb[0]?.attempt ?? "-"}` +
           `${invalid.length ? `; ${invalid.join("; ")}` : ""})`);
       }
     }
     for (const probe of ["completion", "chat"] as const) {
-      const verdict = probeVerdict(probe, `${model}/${configuration}`, a.parity?.[probe], b.parity?.[probe]);
-      if (verdict.ok !== true) problems.push(`${model}/${configuration} ${probe} probe: ${verdict.line.replace(/^- /, "")}`);
+      const verdict = probeVerdict(probe, label, a.parity?.[probe], b.parity?.[probe]);
+      if (verdict.ok !== true) problems.push(`${label} ${probe} probe: ${verdict.line.replace(/^- /, "")}`);
     }
   }
   const complete = problems.length === 0;
@@ -235,6 +243,13 @@ const REQUEST_METRICS: RequestMetric[] = [
   { metric: "aggregate stream TTFT", unit: "ms", direction: "lower-is-better", phase: "agg", include: () => true, value: r => r.ttftMs },
   { metric: "aggregate stream decode", unit: "tok/s", direction: "higher-is-better", phase: "agg", include: () => true, value: r => r.decodeTps },
 ];
+/** The largest of a memory field over the cell's readings (idle and every leg); null without one. */
+export function peakMemory(r: CellResult, field: "mlxPeakMB" | "footprintPeakMB"): number | null {
+  const values = [r.memory?.idle, ...(r.memory?.byLeg ?? []).map(([, reading]) => reading)]
+    .flatMap(reading => typeof reading?.[field] === "number" ? [reading[field]!] : []);
+  return values.length ? Math.max(...values) : null;
+}
+const legReading = (r: CellResult, leg: string): MemoryReading | undefined => r.memory?.byLeg.find(([name]) => name === leg)?.[1];
 /** Cell-level measurements, paired only when both cells ran an identical, valid workload. */
 const CELL_METRICS: Array<{ metric: string; unit: string; direction: Direction; get(r: CellResult): number | null }> = [
   { metric: "aggregate ×4", unit: "tok/s", direction: "higher-is-better", get: r => r.agg?.tps ?? null },
@@ -242,8 +257,10 @@ const CELL_METRICS: Array<{ metric: string; unit: string; direction: Direction; 
   { metric: "ready", unit: "ms", direction: "lower-is-better", get: r => r.readyMs },
   { metric: "cold start (ready + first TTFT)", unit: "ms", direction: "lower-is-better", get: r => r.coldStartMs },
   { metric: "restart ready", unit: "ms", direction: "lower-is-better", get: r => r.restart?.readyMs ?? null },
-  { metric: "idle RSS", unit: "MB", direction: "lower-is-better", get: r => r.idleRssMB },
-  { metric: "peak RSS", unit: "MB", direction: "lower-is-better", get: r => r.peakRssMB },
+  { metric: "idle MLX active", unit: "MB", direction: "lower-is-better", get: r => r.memory?.idle.mlxActiveMB ?? null },
+  { metric: "peak MLX active", unit: "MB", direction: "lower-is-better", get: r => peakMemory(r, "mlxPeakMB") },
+  { metric: "idle physical footprint", unit: "MB", direction: "lower-is-better", get: r => r.memory?.idle.footprintMB ?? null },
+  { metric: "peak physical footprint", unit: "MB", direction: "lower-is-better", get: r => peakMemory(r, "footprintPeakMB") },
 ];
 
 function summarize(metric: string, unit: string, direction: Direction, pairs: MetricComparison["pairs"],
@@ -256,8 +273,8 @@ function summarize(metric: string, unit: string, direction: Direction, pairs: Me
     observation: worse ? "candidate worse" : better ? "candidate better" : "equal" };
 }
 
-export function comparePair(run: RunRecord, model: string, configuration: Configuration): MetricComparison[] | null {
-  const a = cellFor(run, model, "baseline", configuration), b = cellFor(run, model, "candidate", configuration);
+export function comparePair(run: RunRecord, model: string, configuration: Configuration, session = 1): MetricComparison[] | null {
+  const a = cellFor(run, model, "baseline", configuration, session), b = cellFor(run, model, "candidate", configuration, session);
   if (!a?.result || !b?.result) return null;
   const pairs = pairRequests(run, a, b), workload = run.plan.workload;
   const successful = (cell: CellRecord) => run.requests.filter(q => q.cell === cell.key && q.result);
@@ -271,9 +288,11 @@ export function comparePair(run: RunRecord, model: string, configuration: Config
   // Identical workload: every successful request on each side is matched by a valid pair.
   const identical = pairs.length > 0 && pairs.every(p => p.valid) &&
     pairs.length === successful(a).length && pairs.length === successful(b).length;
-  const legs = [...new Set([...a.result.rssByLeg, ...b.result.rssByLeg].map(([leg]) => leg))];
-  const cellMetrics = [...CELL_METRICS, ...legs.map(leg => ({ metric: `RSS during ${leg}`, unit: "MB", direction: "lower-is-better" as Direction,
-    get: (r: CellResult) => r.rssByLeg.find(([name]) => name === leg)?.[1] ?? null }))];
+  const legs = [...new Set([...a.result.memory?.byLeg ?? [], ...b.result.memory?.byLeg ?? []].map(([leg]) => leg))];
+  const cellMetrics = [...CELL_METRICS, ...legs.flatMap(leg => [
+    { metric: `MLX active after ${leg}`, unit: "MB", direction: "lower-is-better" as Direction, get: (r: CellResult) => legReading(r, leg)?.mlxActiveMB ?? null },
+    { metric: `physical footprint after ${leg}`, unit: "MB", direction: "lower-is-better" as Direction, get: (r: CellResult) => legReading(r, leg)?.footprintMB ?? null },
+  ])];
   const byCell = cellMetrics.map(m => {
     const x = m.get(a.result!), y = m.get(b.result!);
     const raw = { baseline: x === null ? [] : [x], candidate: y === null ? [] : [y] };
@@ -281,6 +300,24 @@ export function comparePair(run: RunRecord, model: string, configuration: Config
       raw, identical ? [] : ["workloads differ (retries, failures or count mismatches); cell-level values are raw only"]);
   });
   return [...byRequests, ...byCell];
+}
+
+/** Every session's comparison, and each metric's pairs pooled across the sessions (ids prefixed
+ * by session) with its medians recomputed; null when a session has no paired measurement. */
+export function pooledComparison(run: RunRecord, model: string, configuration: Configuration):
+  { pooled: MetricComparison[]; sessions: Array<{ session: number; metrics: MetricComparison[] }> } | null {
+  const sessions = sessionsOf(run.plan).map(session => ({ session, metrics: comparePair(run, model, configuration, session) }));
+  if (sessions.some(entry => !entry.metrics)) return null;
+  const complete = sessions as Array<{ session: number; metrics: MetricComparison[] }>;
+  const pooled = complete[0]!.metrics.map(first => {
+    const parts = complete.map(({ session, metrics }) => ({ session, metric: metrics.find(m => m.metric === first.metric) }));
+    const pairs = parts.flatMap(({ session, metric }) => (metric?.pairs ?? []).map(pair => ({ ...pair, id: `s${session}|${pair.id}` })));
+    const unpaired = { baseline: parts.flatMap(({ metric }) => metric?.unpaired.baseline ?? []),
+      candidate: parts.flatMap(({ metric }) => metric?.unpaired.candidate ?? []) };
+    const excluded = parts.flatMap(({ session, metric }) => (metric?.excluded ?? []).map(reason => `s${session}: ${reason}`));
+    return summarize(first.metric, first.unit, first.direction, pairs, unpaired, excluded);
+  });
+  return { pooled, sessions: complete };
 }
 
 const fmt = (n: number | null, digits = 1) => n === null ? "—" : n.toFixed(digits);
@@ -308,7 +345,8 @@ export function markdown(run: RunRecord): string {
     ...run.plan.references.map(ref => `reference ${ref.label}${ref.version ? ` ${ref.version}` : ""}: \`${ref.command.join(" ")}\`` +
       (ref.registerCommand ? ` (register: \`${ref.registerCommand.join(" ")}\`)` : "")),
     `pinned native library: ${run.plan.native.library}`,
-    "memory: RSS summed across the server process family, including inference workers; shared pages may be counted more than once.",
+    "memory: the primary worker's MLX allocator (active, peak) from the server's /stats, and the physical footprint (macOS footprint) of the worker (else the server), read idle and after each phase; not ps RSS, which undercounts a model the OS has not pinned.",
+    ...((run.plan.sessions ?? 1) > 1 ? [`sessions: ${run.plan.sessions} per tree for each model and configuration, alternating trees; each session pairs with its counterpart.`] : []),
     `workload seed ${run.plan.seed}; ${run.plan.workload.decodeRuns} decode samples of ${run.plan.workload.decodeTokens} tokens, ` +
       `${run.plan.workload.ttftRuns} cold TTFT samples (nominal 1k-token prompt), ` +
       `${run.plan.workload.withContext ? `nominal context target ${run.plan.workload.contextTokens}` : "context skipped"}, ` +
@@ -321,9 +359,9 @@ export function markdown(run: RunRecord): string {
   for (const problem of q.problems) lines.push(`- problem: ${problem}`);
   for (const note of q.notes) lines.push(`- note: ${note}`);
   lines.push("");
-  for (const { model, configuration } of PAIRS(run.plan)) {
-    const comparison = comparePair(run, model, configuration);
-    lines.push(`## ${model} · ${configuration}`, "");
+  for (const { model, configuration, session } of PAIRS(run.plan)) {
+    const comparison = comparePair(run, model, configuration, session);
+    lines.push(`## ${model} · ${configuration}${(run.plan.sessions ?? 1) > 1 ? ` · session ${session}` : ""}`, "");
     if (!comparison) { lines.push("No paired measurement (see problems and skips).", ""); continue; }
     lines.push("| metric | unit | direction | paired samples (baseline → candidate) | baseline median | candidate median | candidate/baseline | observation |",
       "|---|---|---|---|---|---|---|---|");
@@ -335,16 +373,16 @@ export function markdown(run: RunRecord): string {
           c.observation === "unpaired" ? "unpaired — no conclusion" : c.observation} |`);
     }
     for (const c of comparison) for (const reason of c.excluded) lines.push(`- ${c.metric}: excluded ${reason}`);
-    lines.push("", ...promptTokenRows(run, cellFor(run, model, "baseline", configuration)!, cellFor(run, model, "candidate", configuration)!), "");
+    lines.push("", ...promptTokenRows(run, cellFor(run, model, "baseline", configuration, session)!, cellFor(run, model, "candidate", configuration, session)!), "");
   }
   const references = run.cells.filter(cell => cell.kind === "reference" && cell.result);
   if (references.length) {
     lines.push("## Reference servers (context, not the baseline)", "",
-      "| cell | decode tok/s | TTFT cold ms | prefill (nominal 1k) tok/s | ctx prompt tokens | peak RSS MB |", "|---|---|---|---|---|---|");
+      "| cell | decode tok/s | TTFT cold ms | prefill (nominal 1k) tok/s | ctx prompt tokens | peak physical footprint MB |", "|---|---|---|---|---|---|");
     for (const cell of references) {
       const r = cell.result!;
       lines.push(`| ${cell.key} | ${fmt(r.decodeTps ? median(r.decodeTps) : null)} | ${fmt(r.ttft ? median(r.ttft.coldMs) : null, 0)} | ` +
-        `${fmt(r.ttft ? median(r.ttft.prefill1kTps) : null, 0)} | ${r.ctx?.promptTokens ?? "—"} | ${fmt(r.peakRssMB, 0)} |`);
+        `${fmt(r.ttft ? median(r.ttft.prefill1kTps) : null, 0)} | ${r.ctx?.promptTokens ?? "—"} | ${fmt(peakMemory(r, "footprintPeakMB"), 0)} |`);
     }
     lines.push("");
   }

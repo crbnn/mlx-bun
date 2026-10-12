@@ -1,20 +1,124 @@
-import { TurboQuantKVCache } from "./turboquant-kv";
-import { RotatingKVCache } from "./rotating-kv";
-import { RotatingQuantizedKVCache } from "./rotating-quantized-kv";
-import { isBatchableCache, isPlainKvCache, isQuantizedKvCache, isRecurrentCache, isRotatingPlainCache, isRotatingQuantizedCache } from "./capabilities";
+import type { BatchableCache, Cache, SpeculativeRowLayout } from "../contracts/mlx/cache";
+import { isBatchableCache } from "./capabilities";
+import { unfusedAffineKernels } from "./affine-attention";
 import { PaddedKVRows } from "./batched-mask";
 import { PaddedQuantKVRows } from "./batched-quant";
+import { BatchedKVCache } from "./batched-kv";
+import { BatchedQuantizedKVCache } from "./batched-quantized-kv";
 import { BatchedRotatingCache } from "./batched-rotating";
 import { BatchedRotatingQuantCache } from "./batched-rotating-quant";
 import { BatchedSSMCache } from "./batched-ssm";
-import { type BatchableCache, type Cache } from "../contracts/mlx/cache";
-import { DelayedRotatingQuantizedKVCache } from "./delayed-rotating-quantized-kv";
-import { RotatingAffineLayout } from "./rotating-kv-layout";
 import { BatchedTurboQuantKVCache } from "./batched-turboquant-kv";
-import { targetRowLayoutFactory, type TargetRowLayout } from "./target-layout";
+import { DelayedQuantizedKVCache } from "./delayed-quantized-kv";
+import { DelayedRotatingQuantizedKVCache } from "./delayed-rotating-quantized-kv";
+import { DelayedTurboQuantKVCache } from "./delayed-turboquant-kv";
+import { MLACache } from "./glm52-cache";
+import { KVCache } from "./kv";
 import { PagedKVCache } from "./paged/cache";
 import { PagedKvRows } from "./paged/rows";
-import { unchangedKv } from "./kv-maintenance";
+import { QuantizedKVCache } from "./quantized-kv";
+import { RotatingKVCache } from "./rotating-kv";
+import { RotatingAffineLayout, SpeculativeRotatingAffineLayout } from "./rotating-kv-layout";
+import { RotatingQuantizedKVCache } from "./rotating-quantized-kv";
+import { SpeculativeRotatingKVCache } from "./speculative-rotating-kv";
+import { SSMCache } from "./ssm";
+import { TurboQuantKVCache } from "./turboquant-kv";
+
+/** The row layouts one storage joins, declared together. Each returns a new
+ * empty layout whose `mergeRows` takes this storage (and the layouts the same
+ * call makes):
+ * - `decode`: the layout a running batch keeps the rows in for continuous
+ *   decoding;
+ * - `prefill`: the layout a prefill cohort keeps them in;
+ * - `verify`: the verification rows, which hold the speculative transaction. */
+interface RowLayouts<C extends Cache> {
+  decode(cache: C): BatchableCache;
+  prefill(cache: C): BatchableCache;
+  verify(cache: C): SpeculativeRowLayout;
+}
+
+/** A storage class: what `instanceof` tests (its constructor may be private). */
+type StorageClass<C extends Cache> = Function & { readonly prototype: C };
+interface RowLayoutEntry<C extends Cache> extends RowLayouts<C> {
+  readonly storage: StorageClass<C>;
+}
+const entry = <C extends Cache>(storage: StorageClass<C>, layouts: RowLayouts<NoInfer<C>>): RowLayoutEntry<C> =>
+  ({ storage, ...layouts });
+/** A row layout's own declaration: its decode and prefill siblings are its
+ * empty batch, and so are its verification rows when it holds the transaction. */
+const ownEmptyBatch = <C extends SpeculativeRowLayout>(storage: StorageClass<C>): RowLayoutEntry<C> =>
+  entry(storage, { decode: cache => cache.makeEmptyBatch(), prefill: cache => cache.makeEmptyBatch(), verify: cache => cache.makeEmptyBatch() });
+
+const pagedRows = (cache: PagedKVCache) => new PagedKvRows(cache.capacityTokens, cache.blockSize, cache.direct, cache.quantization);
+const rotatingAffineVerify = (cache: { readonly maxSize: number; readonly groupSize: number; readonly bits: number;
+  readonly kernels: RotatingAffineLayout["kernels"]; readonly masks: RotatingAffineLayout["masks"] }) =>
+  new SpeculativeRotatingAffineLayout(cache.maxSize, cache.groupSize, cache.bits, cache.kernels, cache.masks);
+
+/**
+ * Every storage a cache lego holds and the row layouts it joins: the row-layout
+ * port's one table, as the codec table in `state/persistence.ts` is the SSD
+ * form's. A lego's storage (its graph cache, the storage a bf16-first lego
+ * holds, the delayed rows kv maintenance makes, the paged blocks the request
+ * policy pages a layer with) declares all three layouts here; a storage with no
+ * entry joins no rows and is not a lego. First match wins: a subclass precedes
+ * its base. A row layout reached through an entry is not looked up again: its
+ * sibling is its own empty batch (the `BatchableCache` port).
+ */
+const ROW_LAYOUTS: readonly RowLayoutEntry<Cache>[] = [
+  entry(PagedKVCache, { decode: pagedRows, prefill: pagedRows, verify: pagedRows }),
+  ownEmptyBatch(PagedKvRows),
+  ownEmptyBatch(MLACache),
+  entry(DelayedRotatingQuantizedKVCache, {
+    decode: cache => cache.makeEmptyBatch(), prefill: cache => cache.makeEmptyBatch(),
+    verify: cache => new DelayedRotatingQuantizedKVCache(cache.maxSize, cache.groupSize, cache.bits, cache.start,
+      cache.kernelSet, undefined, true, cache.compose),
+  }),
+  entry(RotatingAffineLayout, { decode: cache => cache.makeEmptyBatch(), prefill: cache => cache.makeEmptyBatch(),
+    verify: rotatingAffineVerify }),
+  entry(BatchedRotatingQuantCache, { decode: cache => cache.makeEmptyBatch(), prefill: cache => cache.makeEmptyBatch(),
+    verify: rotatingAffineVerify }),
+  entry(RotatingQuantizedKVCache, {
+    decode: cache => BatchedRotatingQuantCache.empty(cache.maxSize, cache.groupSize, cache.bits, cache.kernels, [], cache.masks),
+    prefill: cache => new RotatingAffineLayout(cache.maxSize, cache.groupSize, cache.bits, cache.kernels, cache.masks),
+    verify: rotatingAffineVerify,
+  }),
+  ownEmptyBatch(SpeculativeRotatingKVCache),
+  entry(RotatingKVCache, {
+    decode: cache => new BatchedRotatingCache(cache.maxSize, [], cache.masks),
+    // Plain rotating rows never convert here (a start of Infinity), so no read
+    // takes the layout's kernel set; their dense reads say so.
+    prefill: cache => new DelayedRotatingQuantizedKVCache(cache.maxSize, 64, 4, Infinity, unfusedAffineKernels),
+    verify: cache => new SpeculativeRotatingKVCache(cache.maxSize, cache.masks),
+  }),
+  ownEmptyBatch(DelayedTurboQuantKVCache),
+  ownEmptyBatch(DelayedQuantizedKVCache),
+  ownEmptyBatch(BatchedTurboQuantKVCache),
+  ownEmptyBatch(BatchedKVCache),
+  ownEmptyBatch(BatchedQuantizedKVCache),
+  ownEmptyBatch(BatchedSSMCache),
+  entry(TurboQuantKVCache, {
+    decode: cache => new BatchedTurboQuantKVCache(cache.kBits, cache.vBits, cache.turboQuantKernels, cache.fusedDecode, cache.masks),
+    prefill: cache => new BatchedTurboQuantKVCache(cache.kBits, cache.vBits, cache.turboQuantKernels, cache.fusedDecode, cache.masks),
+    verify: cache => new BatchedTurboQuantKVCache(cache.kBits, cache.vBits, cache.turboQuantKernels, cache.fusedDecode, cache.masks),
+  }),
+  entry(SSMCache, { decode: () => new BatchedSSMCache(), prefill: () => new BatchedSSMCache(), verify: () => new BatchedSSMCache() }),
+  entry(QuantizedKVCache, {
+    decode: cache => new PaddedQuantKVRows(cache.groupSize, cache.bits, cache.kernels, cache.masks),
+    prefill: cache => new BatchedQuantizedKVCache(cache.groupSize, cache.bits, cache.kernels, cache.masks),
+    verify: cache => new BatchedQuantizedKVCache(cache.groupSize, cache.bits, cache.kernels, cache.masks),
+  }),
+  entry(KVCache, {
+    decode: cache => new PaddedKVRows(cache.masks),
+    prefill: cache => new BatchedKVCache(cache.masks),
+    verify: cache => new BatchedKVCache(cache.masks),
+  }),
+];
+
+/** The table's entry for `cache`'s storage class; undefined for a storage that
+ * joins no rows. */
+function declaredRowLayouts(cache: Cache): RowLayouts<Cache> | undefined {
+  return ROW_LAYOUTS.find(item => cache instanceof item.storage);
+}
 
 /** The row layout a running batch keeps this cache's rows in, for ordinary
  * continuous decoding: an empty layout whose `mergeRows` accepts the cache (and
@@ -22,15 +126,9 @@ import { unchangedKv } from "./kv-maintenance";
  * maintenance, produce has one; undefined for a cache that cannot batch. Answers
  * without allocating, so a binding can probe support. */
 export function ownedCacheLayoutFactory(cache: Cache): (() => BatchableCache) | undefined {
-  if (cache instanceof PagedKVCache) return () => new PagedKvRows(cache.capacityTokens, cache.blockSize, cache.direct, cache.quantization);
-  if (isBatchableCache(cache)) return () => cache.makeEmptyBatch();
-  if (cache instanceof TurboQuantKVCache) return () => new BatchedTurboQuantKVCache(cache.kBits, cache.vBits, cache.fusedDecode);
-  if (isPlainKvCache(cache)) return () => new PaddedKVRows();
-  if (isQuantizedKvCache(cache)) return () => new PaddedQuantKVRows(cache.groupSize, cache.bits);
-  if (isRotatingPlainCache(cache)) return () => new BatchedRotatingCache(cache.maxSize, []);
-  if (isRotatingQuantizedCache(cache)) return () => BatchedRotatingQuantCache.empty(cache.maxSize, cache.groupSize, cache.bits, []);
-  if (isRecurrentCache(cache)) return () => new BatchedSSMCache();
-  return undefined;
+  const layouts = declaredRowLayouts(cache);
+  if (layouts) return () => layouts.decode(cache);
+  return isBatchableCache(cache) ? () => cache.makeEmptyBatch() : undefined;
 }
 
 /** Bind encoded state to its row layout. Execution owners only move rows. */
@@ -38,19 +136,61 @@ export function ownedCacheLayout(cache: Cache): BatchableCache | undefined {
   return ownedCacheLayoutFactory(cache)?.();
 }
 
-/** Prefill reuses decode's layouts; shape selection belongs to storage. */
+/** The layout a prefill cohort keeps this cache's rows in. */
 export function prefillCacheLayout(cache: Cache): BatchableCache {
-  if (cache instanceof PagedKVCache) return new PagedKvRows(cache.capacityTokens, cache.blockSize, cache.direct, cache.quantization);
+  const layouts = declaredRowLayouts(cache);
+  if (layouts) return layouts.prefill(cache);
   if (isBatchableCache(cache)) return cache.makeEmptyBatch();
-  // Plain rotating rows never convert here; their dense reads say so.
-  if (cache instanceof RotatingKVCache) return new DelayedRotatingQuantizedKVCache(cache.maxSize, 64, 4, Infinity, unchangedKv);
-  if (cache instanceof RotatingQuantizedKVCache) return new RotatingAffineLayout(cache.maxSize, cache.groupSize, cache.bits);
-  return targetCacheLayout(cache);
+  throw new Error(`No prefill row layout for ${cache.signature()}`);
 }
 
-/** Target transaction layouts retain each source cache's numerical codec. */
-export function targetCacheLayout(cache: Cache): TargetRowLayout {
+/** The verification rows of this cache's storage, an empty layout holding the
+ * speculative transaction, built over the cache's own numerical codec;
+ * undefined for a storage that joins no rows. Answers without allocating. */
+export function targetRowLayoutFactory(cache: Cache): (() => SpeculativeRowLayout) | undefined {
+  const layouts = declaredRowLayouts(cache);
+  return layouts ? () => layouts.verify(cache) : undefined;
+}
+
+/** The verification rows of this cache's storage (see `targetRowLayoutFactory`). */
+export function targetCacheLayout(cache: Cache): SpeculativeRowLayout {
   const make = targetRowLayoutFactory(cache);
   if (!make) throw new Error(`No target row layout for ${cache.signature()}`);
   return make();
+}
+
+/** A one-row layout's row in its serial form (owned; the layout keeps its own
+ * state), or null for a cache that is already serial: what persistence takes
+ * for a row that never joined another. */
+export function extractSoleRow(cache: Cache): Cache | null {
+  return isBatchableCache(cache) && cache.batchSize === 1 ? cache.extractRow(0) : null;
+}
+
+/** Row `row` of a running layout in its serial form (owned), or null when the
+ * layout cannot publish that row covering exactly `tokens` positions (a
+ * recurrence that cannot be trimmed to them). */
+export function publishRow(layout: Cache, row: number, tokens: number): Cache | null {
+  return isBatchableCache(layout) && (layout.canPublishRow?.(row, tokens) ?? true) ? layout.extractRow(row) : null;
+}
+
+/** Keep only the rows `keep` (sorted ascending) of a running layout. Serial
+ * state is not row-filtered: a lone adopted row leaves with the whole batch. */
+export function filterLayoutRows(layout: Cache, keep: readonly number[]): void {
+  if (!isBatchableCache(layout)) throw new Error(`applyFilter: adopted ${layout.signature()} state cannot be row-filtered`);
+  layout.filterRows(keep);
+}
+
+/** What a graph's fresh caches say about admitting a row when each one's
+ * storage owns its dynamic-row batching (a layout such as GLM-5.2's compressed
+ * state): its projected KV bytes at a length, and the most positions it holds.
+ * Null otherwise: admission bills the composition's KV scheme by the config.
+ * The projections read geometry only, so the caches may be released after. */
+export function rowAdmission(caches: readonly Cache[]): { bytes(tokens: number): number; readonly maxTokens: number } | null {
+  if (!caches.every(isBatchableCache)) return null;
+  const layouts = caches as readonly BatchableCache[];
+  const projectors = layouts.map(cache => (tokens: number) => cache.projectedBytes(tokens));
+  return Object.freeze({
+    bytes: (tokens: number) => projectors.reduce((sum, project) => sum + project(tokens), 0),
+    maxTokens: Math.min(...layouts.map(cache => cache.maxTokens ?? Infinity)),
+  });
 }

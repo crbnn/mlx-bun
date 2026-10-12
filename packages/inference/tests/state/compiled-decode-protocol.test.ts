@@ -5,27 +5,30 @@
 // exactly the state the real append leaves, in both fetch phases (growing concat,
 // then the rotating ring at steady state). Every plane is compared byte for byte
 // against a twin cache that took the ordinary append.
+import { unfusedAffineKernels } from "../../src/state/affine-attention";
 import { expect, test } from "bun:test";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { Cache, CompiledDecodeCache } from "../../src/contracts/mlx/cache";
-import { isCompiledDecodeCache } from "../../src/state/capabilities";
+import { decodesCompiled } from "../../src/state/kv-maintenance";
 import { decodeStepInputs } from "../../src/state/decode-step-inputs";
 import { BatchedKVCache } from "../../src/state/batched-kv";
 import { KVCache } from "../../src/state/kv";
+import { deferredTurboQuantKernels } from "../../src/state/turboquant-attention";
 import { QuantizedKVCache } from "../../src/state/quantized-kv";
 import { RotatingKVCache } from "../../src/state/rotating-kv";
 import { RotatingQuantizedKVCache } from "../../src/state/rotating-quantized-kv";
 import { TurboQuantKVCache } from "../../src/state/turboquant-kv";
+import { kvStorage } from "../../src/state/kv-storage";
 
 const W = 8, H = 2, D = 64, GROUP = 32, BITS = 4;
 type Kind = { name: string; make: () => CompiledDecodeCache & Cache; quantized: boolean; ring: boolean };
 const KINDS: Kind[] = [
   { name: "KVCache", make: () => new KVCache(), quantized: false, ring: false },
-  { name: "QuantizedKVCache", make: () => new QuantizedKVCache(GROUP, BITS), quantized: true, ring: false },
+  { name: "QuantizedKVCache", make: () => new QuantizedKVCache(GROUP, BITS, unfusedAffineKernels(BITS, GROUP, Dtype.bfloat16)), quantized: true, ring: false },
   { name: "RotatingKVCache", make: () => new RotatingKVCache(W), quantized: false, ring: true },
-  { name: "RotatingQuantizedKVCache", make: () => new RotatingQuantizedKVCache(W, GROUP, BITS), quantized: true, ring: true },
+  { name: "RotatingQuantizedKVCache", make: () => new RotatingQuantizedKVCache(W, GROUP, BITS, unfusedAffineKernels(BITS, GROUP, Dtype.bfloat16)), quantized: true, ring: true },
 ];
 
 /** [1, H, n, D] rows whose values depend on the position tag, head and lane. */
@@ -53,7 +56,7 @@ function append(cache: Cache, quantized: boolean, k: MlxArray, v: MlxArray): Mlx
     const [kq, vq] = (cache as QuantizedKVCache).updateAndFetchQuantized(k, v);
     return [...planes(kq), ...planes(vq)];
   }
-  return cache.updateAndFetch(k, v).slice();
+  return kvStorage(cache).updateAndFetch(k, v).slice();
 }
 
 for (const kind of KINDS) {
@@ -102,11 +105,18 @@ for (const kind of KINDS) {
   }
 }
 
-test("only the caches that implement the protocol answer the compiled-decode probe", () => {
+/** The protocol's members, as the compiled step calls them. */
+const drivesCompiledDecode = (cache: Cache) => (["prepareDecodeStep", "decodePhase", "decodeSlot", "decodeInputs",
+  "commitDecodeStep"] as const).every(name => typeof (cache as Partial<CompiledDecodeCache>)[name] === "function");
+
+test("every storage a compiled-decode composition holds implements the protocol; TurboQuant storage does not yet", () => {
   const caches = KINDS.map(k => k.make());
   try {
-    for (const cache of caches) expect(isCompiledDecodeCache(cache)).toBe(true);
-    expect(isCompiledDecodeCache(new BatchedKVCache())).toBe(false);
-    expect(isCompiledDecodeCache(new TurboQuantKVCache(4, 4, false))).toBe(false);
+    for (const cache of caches) expect(drivesCompiledDecode(cache)).toBe(true);
+    // The loader resolves compiled decode off for these (decodesCompiled): no row of such a composition reaches the step.
+    expect(drivesCompiledDecode(new BatchedKVCache())).toBe(false);
+    expect(drivesCompiledDecode(new TurboQuantKVCache(4, 4, deferredTurboQuantKernels, false))).toBe(false);
+    expect(decodesCompiled({ kind: "turbo", kBits: 4, vBits: 4 }, false)).toBe(false);
+    expect(decodesCompiled({ kind: "affine", bits: 4, groupSize: 64, kernels: "unfused" }, false)).toBe(true);
   } finally { for (const cache of caches) cache.dispose(); }
 });

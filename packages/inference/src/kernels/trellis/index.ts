@@ -1,5 +1,5 @@
 // Packed Trellis projection kernels (QTIP 1MAD code) and the decode-variant
-// semantics the layer (layers/trellis-linear.ts) selects between.
+// semantics their callers pass (layers/trellis-linear.ts passes 13).
 //
 // Format: `.weight` = uint32 bitstream, `.scales` = fp16 [rows], config entry
 // `{mode:"trellis", bits:k, group_size:T, trellis:{L, code:"1mad", axis}}`.
@@ -17,18 +17,23 @@
 //               window shift a compile-time constant); simd_sum.
 //   - scatter  (M <= 4, axis=0): lane-per-WORD of a block, running sums per
 //               position in the word, split-K over input rows (partials folded
-//               by one mlx sum).
+//               by one mlx sum). One kernel each: scatterRow / balancedScatterRow
+//               (one row; balanced = 3-bit codes at T 256) and scatterRows /
+//               balancedScatterRows (2..4 rows sharing each decoded weight);
+//               trellisScatter chooses among them by row count and geometry.
 //   - expand   (M > 4 fallback): decode the whole tensor to bf16, then a stock
 //               matmul; the transient is one tensor.
-//   - gate-up / mixed-gate-up: fused gate+up+SwiGLU for M <= 4 rows. The mixed
+//   - gate-up / mixed-gate-up: fused gate+up+SwiGLU for M <= 4 rows
+//               (gateUpReduceRow one row, gateUpReduceRows 2..4 shared rows;
+//               fusedGateUpSwiglu chooses between them by row count). The mixed
 //               kernel serves layers whose gate and up bit widths differ (one
 //               word layout and bit offset each); TAIL "split" reproduces MLX's
 //               compiled swiglu over two bf16 projections bit for bit (no output
 //               changes vs the two-kernel path), "fused" the float32 sigmoid of
 //               the same-width kernel.
 //
-// Decode VARIANT (`MLX_BUN_TRELLIS_VARIANT`, default 13; `setTrellisVariant`
-// overrides for benches and self-flag KL gates). 0-6 select the decode
+// Decode VARIANT, an explicit argument of each kernel. TrellisLinear passes
+// 13; benches and tests pass the others to compare them. 0-6 select the decode
 // arithmetic (see HEADER in codebook.ts): 0-3 reconstruct bf16(lut[state]*scale);
 // 6 is f32 code*scale in the packed kernels (expansion still stores bf16).
 // Variants 7-13 keep variant 6's decoded values (`decoderVariant`) and add
@@ -54,15 +59,17 @@
 //   - down-k3-interleaved-factored: 3-bit block-interleaved axis-0 codes
 //   - gate-up-mma / down-mma: 1..8 rows on the simdgroup matrix unit
 //
-// `MLX_BUN_TRELLIS=expand` decodes every trellis tensor at LOAD into 8-bit g64
-// affine (the eval-carrier numerics, about -45 dB) and serves it through the
-// stock QuantizedLinear: the fallback when the kernels lose on a machine.
+// ExpandedTrellisLinear (layers/trellis-linear.ts) decodes a trellis tensor at
+// construction into 8-bit g64 affine (the eval-carrier numerics, about -45 dB)
+// and serves it through the stock QuantizedLinear, for a machine where the
+// kernels lose.
 export type { TrellisGeometry, TrellisWeights } from "./geometry";
 export { vectorTrellisExpand, vectorTrellisExpandEligible } from "./vector-expand";
 export { expandTrellis } from "./expand";
 export { trellisReduce, TRELLIS_MATVEC_MAX_M } from "./reduce";
-export { trellisScatter } from "./scatter";
-export { fusedGateUpSwiglu } from "./gate-up";
+export { trellisScatter, scatterRow, scatterRows, balancedScatterRow, balancedScatterRows } from "./scatter";
+export { qualifiedRepresentations, type ScatterRepresentation, type TrellisRepresentations } from "./qualified";
+export { fusedGateUpSwiglu, gateUpReduceRow, gateUpReduceRows } from "./gate-up";
 export { fusedGateUpSwigluMixed, type MixedGateUpTail } from "./mixed-gate-up";
 export { tiledTrellisPrefill, tiledTrellisPrefillEligible } from "./tiled-prefill";
 export { splitKTrellisPrefill, splitKTrellisPrefillEligible } from "./splitk-prefill";

@@ -8,10 +8,10 @@
 //     vectors bit for bit.
 // At every step the whole vector must be finite and its argmax must be the
 // reference token, which is then fed. This is a 100-token trajectory plus four
-// vectors and a separate 12-step control, not 100-step full-vector parity. For
-// this artifact createModel selects the generated 12B graph, whose unrolled path
-// serves only the quantized kv_config cache layout; under plain KV it takes its
-// monolith fallback, and both entry points assert the unrolled path never ran.
+// vectors and a separate 12-step control, not 100-step full-vector parity. The
+// generated 12B graph serves only the kv_config composition, so for plain KV (the
+// default composition) the loader's table selects the generic graph for this
+// artifact, and both entry points build Gemma4Model.
 // The model and reference stay outside this repository; Python never runs.
 // Opt in with all three of
 //   MLX_BUN_TEST_GEMMA4_MODEL=/model/snapshot
@@ -182,12 +182,12 @@ async function runEntry(entry: "createModel" | "Gemma4Model", steps: number) {
   await checkTokenizer(inputs!.model, manifest);
   const ffi = await import("@mlx-bun/mlx/ffi");
   checkRuntime(manifest, { mlxVersion: ffi.MLX_VERSION, architecture: ffi.deviceArchitecture() });
-  const { loadModelConfig, Weights, createModel } = await import("@mlx-bun/inference");
+  const { loadModelConfig, Weights, createModel, resolveComposition } = await import("@mlx-bun/inference");
   const { Gemma4Model } = await import("@mlx-bun/inference/models/gemma4");
+  const { phaseLogits } = await import("../models/phase-forward");
   const { argmaxLastPosition, lastPositionLogits } = await import("@mlx-bun/inference/scoring");
   const { KVCache } = await import("../../src/state/kv");
   const { RotatingKVCache } = await import("../../src/state/rotating-kv");
-  const generated = await import("../../src/models/gemma4/generated/gemma4-12b");
 
   const config = await loadModelConfig(inputs!.model);
   expect([config.text.numHiddenLayers, config.text.numKvSharedLayers, config.text.slidingWindow, config.text.vocabSize])
@@ -196,17 +196,15 @@ async function runEntry(entry: "createModel" | "Gemma4Model", steps: number) {
   let model: InstanceType<typeof Gemma4Model> | null = null, caches: Array<{ dispose(): void }> = [];
   const greedy: number[] = [];
   let vectorsCompared = 0;
-  const unrolledBefore = generated.generatedForwardUses;
   try {
-    model = entry === "createModel" ? createModel(weights, config) as InstanceType<typeof Gemma4Model> : new Gemma4Model(weights, config);
-    if (entry === "createModel") expect(model).toBeInstanceOf(generated.GeneratedGemma4);
-    else expect(model).not.toBeInstanceOf(generated.GeneratedGemma4);
+    model = entry === "createModel" ? createModel(weights, config) as InstanceType<typeof Gemma4Model> : new Gemma4Model(weights, config, resolveComposition(config));
+    expect(model.constructor).toBe(Gemma4Model);
     const layers = model.makeCache();
     caches = layers;
     checkPlainCaches(layers, config.text.layerTypes, { KVCache, RotatingKVCache });
     let tokens = manifest.prompt_ids;
     for (let step = 0; step < steps; step++) {
-      const logits = model.forward(tokens, layers);
+      const logits = phaseLogits(model, tokens, layers);
       let next: number;
       try {
         const actual = lastPositionLogits(logits);
@@ -219,13 +217,11 @@ async function runEntry(entry: "createModel" | "Gemma4Model", steps: number) {
       tokens = [next];
     }
   } finally { releaseEntry(caches, model, weights); }
-  // Plain KV never matches the unrolled graph's cache layout.
-  expect(generated.generatedForwardUses).toBe(unrolledBefore);
   expect(greedy).toHaveLength(steps);
   expect(vectorsCompared).toBe(VECTORS);
   console.log(JSON.stringify({ status: "pass", entry, steps: greedy.length, vectorsCompared, valuesCompared: VECTORS * VOCAB,
     scope: entry === "createModel" ? "100-token greedy trajectory + 4 full vectors" : "12-step dedicated-graph control + 4 full vectors",
-    unrolledForwards: 0, promptTokens: manifest.prompt_ids.length, batch: 1, kv: "plain", greedyIds: greedy,
+    promptTokens: manifest.prompt_ids.length, batch: 1, kv: "plain", greedyIds: greedy,
     manifestSha256: inputs!.manifestSha256, mlx: ffi.MLX_VERSION, architecture: ffi.deviceArchitecture(), bun: Bun.version }));
 }
 

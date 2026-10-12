@@ -10,8 +10,12 @@ import { runtimeFlag } from "../../runtime/config";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
-import { createCausalMask } from "../../kernels/attention/masks";
-import { type Cache, type Mask, type KvAttentionView } from "../../contracts/mlx/cache";
+import { bidirMask, createCausalMask } from "../../kernels/attention/masks";
+import {
+  type AttentionRead, type BidirectionalAttentionCache, type BlockAttentionCache, type CommittedAttentionCache,
+  type EncoderAttentionCache, type KvAttentionView, type KvDonorRows, type Mask,
+} from "../../contracts/mlx/cache";
+import { AttentionMasks, encoderWindowMask, sdpaRead, unmaskedLease, withLease } from "../attention-read";
 
 /** Typed pool-exhaustion error: a generation outgrew its pool. Sizing from
  *  prompt+maxTokens at construction makes this unreachable in practice;
@@ -195,8 +199,23 @@ export class BlockPool {
  *  at every step (parity-gated); only the physical arrangement differs.
  *  The pool allocates lazily on the first write (KVCache's lazy-alloc
  *  shape): head count / head dims / dtype come from the first k/v pair,
- *  so the wiring (maybePageKv) needs no per-model shape plumbing. */
-export class PagedKVCache implements Cache {
+ *  so the wiring (maybePageKv) needs no per-model shape plumbing.
+ *
+ *  Reads: each owns an immutable view of the blocks as of its append
+ *  (`pagedAttentionView`). Decode attends its one query with the kernel `direct`
+ *  fixes at construction: the direct Metal read from the blocks, or the
+ *  gathered blocks through the stock fused SDPA with no mask. A window always
+ *  gathers and runs the fused SDPA with the causal mask, whatever its length;
+ *  the deprecated `attentionState` view still sends a direct cache's windows of
+ *  up to eight queries to the direct kernel instead.
+ *
+ *  The other reads are `KVCache`'s over the gathered blocks, so bf16 pages read
+ *  bit for bit as the bf16 lego they replace: a committed span is the window
+ *  read (as `KVCache` qualifies it); the bidirectional and encoder windows
+ *  append, gather and attend under `KVCache`'s masks; a block read attends the
+ *  gathered positions and the block's own keys with no mask; the donor rows are
+ *  the gathered positions. Affine pages gather dequantized. */
+export class PagedKVCache implements CommittedAttentionCache, BidirectionalAttentionCache, EncoderAttentionCache, BlockAttentionCache {
   /** Distinct storage kind; the row adapter preserves its block pools. */
   signature(): string { return "kv:paged"; }
   /** Matches KVCache.STEP: v1's growth granularity is a permutation of
@@ -217,10 +236,12 @@ export class PagedKVCache implements Cache {
     readonly blockSize: number,
     readonly direct = runtimeFlag("MLX_BUN_PAGED_ATTN", false),
     readonly quantization?: PagedQuantization,
+    /** The masks the bidirectional and encoder reads lease. */
+    readonly masks = new AttentionMasks(),
   ) {}
 
   clone(): PagedKVCache {
-    const copy = new PagedKVCache(this.capacityTokens, this.blockSize, this.direct, this.quantization);
+    const copy = new PagedKVCache(this.capacityTokens, this.blockSize, this.direct, this.quantization, this.masks);
     copy.offset = this.offset;
     copy.blockTable = [...this.blockTable];
     copy.pool = this.pool?.clone() ?? null;
@@ -236,16 +257,83 @@ export class PagedKVCache implements Cache {
     return Math.ceil(n / this.#blockSize);
   }
 
+  appendDecode(k: MlxArray, v: MlxArray): AttentionRead {
+    this.append(k, v);
+    return pagedRead(pagedAttentionView(this.pool!, [...this.blockTable], this.offset, this.direct), { mode: "", arr: null });
+  }
+
+  appendWindow(k: MlxArray, v: MlxArray): AttentionRead {
+    this.append(k, v);
+    return pagedRead(pagedAttentionView(this.pool!, [...this.blockTable], this.offset, false), { mode: "causal", arr: null });
+  }
+
+  /** The window read: `KVCache`'s committed read, over the same positions. */
+  appendCommitted(k: MlxArray, v: MlxArray): AttentionRead {
+    return this.appendWindow(k, v);
+  }
+
+  /** `KVCache`'s vision prefill read: the causal mask OR'd with the image
+   * block overlay, over the gathered first window. */
+  appendBidirectional(k: MlxArray, v: MlxArray, bidirectional: MlxArray): AttentionRead {
+    const L = k.shape[2]!;
+    const mask = this.masks.lease("bidirectional:none", `${L}`, () => bidirMask(L, null, bidirectional), bidirectional);
+    return withLease(mask, held => {
+      const [keys, values] = this.appendAndGather(k, v);
+      return sdpaRead(keys, values, held);
+    });
+  }
+
+  /** `KVCache`'s encoder read: the encoder window's mask over the gathered
+   * first window. */
+  appendEncoderWindow(k: MlxArray, v: MlxArray, bidirectional: MlxArray): AttentionRead {
+    return withLease(encoderWindowMask(this.masks, k.shape[2]!, bidirectional), mask => {
+      const [keys, values] = this.appendAndGather(k, v);
+      return sdpaRead(keys, values, mask);
+    });
+  }
+
+  /** `KVCache`'s block read: the gathered positions in order, then the block's
+   * keys and values, with no mask. Nothing is appended. */
+  readBlock(k: MlxArray, v: MlxArray): AttentionRead {
+    const [storedK, storedV] = this.#gathered();
+    let keys: MlxArray, values: MlxArray;
+    try {
+      keys = ops.concatAxis([storedK, k], 2);
+      try { values = ops.concatAxis([storedV, v], 2); }
+      catch (error) { keys.dispose(); throw error; }
+    } finally { storedK.dispose(); storedV.dispose(); }
+    return sdpaRead(keys, values, unmaskedLease);
+  }
+
+  /** The gathered positions, as `KVCache` hands its donor rows out. */
+  captureDonorRows(): KvDonorRows {
+    const [keys, values] = this.#gathered();
+    return { keys, values, offsets: [this.offset], starts: [0], ends: [this.offset] };
+  }
+
   get attentionState(): this | undefined { return this.direct || this.quantization ? this : undefined; }
   appendAndFetch(k: MlxArray, v: MlxArray): KvAttentionView {
     this.append(k, v);
     return pagedAttentionView(this.pool!, [...this.blockTable], this.offset, this.direct);
   }
 
-  updateAndFetch(k: MlxArray, v: MlxArray): [MlxArray, MlxArray] {
+  updateAndFetch(k: MlxArray, v: MlxArray): [MlxArray, MlxArray] { return this.appendAndGather(k, v); }
+
+  /** Append, then the keys and values gathered from the blocks up to the new
+   * offset (dequantized for affine pages), each [1, H, offset, D]; the caller
+   * owns both. What the joined window read of `PagedKvRows` attends. */
+  appendAndGather(k: MlxArray, v: MlxArray): [MlxArray, MlxArray] {
     this.append(k, v);
-    const H = this.pool!.keys.shape[1]!, kD = this.pool!.headDim, vD = this.pool!.vHeadDim;
-    const [gk, gv] = this.pool!.gather(this.blockTable);
+    return this.#gathered();
+  }
+
+  /** The keys and values gathered from the blocks up to the offset
+   * (dequantized for affine pages), each [1, H, offset, D]; the caller owns
+   * both. */
+  #gathered(): [MlxArray, MlxArray] {
+    if (!this.pool) throw new Error("paged cache is empty");
+    const H = this.pool.keys.shape[1]!, kD = this.pool.headDim, vD = this.pool.vHeadDim;
+    const [gk, gv] = this.pool.gather(this.blockTable);
     const keys = gk.slice([0, 0, 0, 0], [1, H, this.offset, kD]);
     const values = gv.slice([0, 0, 0, 0], [1, H, this.offset, vD]);
     gk.dispose(); gv.dispose();
@@ -327,7 +415,14 @@ export class PagedKVCache implements Cache {
     this.pool = null;
     this.blockTable = [];
     this.offset = 0;
+    this.masks.clear();
   }
+}
+
+/** A read over one block view under a fixed string mask. Takes ownership of
+ * `view`. */
+function pagedRead(view: KvAttentionView, mask: Mask): AttentionRead {
+  return { attend: (q, scale) => view.attend(q, scale, mask), dispose: () => view.dispose() };
 }
 
 /** Size a pool for one request: capacity tokens rounded up to whole

@@ -58,6 +58,7 @@ import { KVCache } from "./kv";
 import { pagedCacheCodec } from "./paged/codec";
 import { kvReader,kvWriter,type KvWriteRequest } from "./persistence-worker";
 import { QuantizedKVCache } from "./quantized-kv";
+import type { AffineKernelSet } from "./affine-attention";
 import { RotatingKVCache } from "./rotating-kv";
 import { RotatingQuantizedKVCache } from "./rotating-quantized-kv";
 import { SSMCache } from "./ssm";
@@ -154,6 +155,16 @@ const loadMla = (entry: CacheHeaderEntry, context: LoadContext): Cache => {
   return cache;
 };
 
+/** The affine kernel set of the cache the restoring graph composed at an
+ *  affine entry's layer (its `makeCache` prototype): a lego's, or affine
+ *  storage's own kernels where the graph composes storage quantized from token
+ *  zero. A prototype with neither is a file written under another KV scheme. */
+const composedKernelSet = (context: LoadContext, entry: CacheHeaderEntry): AffineKernelSet => {
+  const kernelSet = (context.prototype as { readonly kernelSet?: AffineKernelSet }).kernelSet;
+  if (!kernelSet) throw new Error(`${context.path}: affine cache kind ${entry.kind} does not match the model's composed cache`);
+  return kernelSet;
+};
+
 /** One authoritative persistence algebra. Adding a cache storage kind must
  *  define all four operations here; save/clone/load and SSD eligibility
  *  therefore cannot grow independent instanceof/switch chains. */
@@ -169,7 +180,7 @@ const CACHE_CODECS = {
     },
     clone: (cache, context) => {
       const c = cache as KVCache;
-      const clone = new KVCache();
+      const clone = new KVCache(undefined, c.turboQuantKernels);
       if (!c.keys || !c.values) return clone;
       clone.restoreState(
         context.liveView(c.keys, c.offset),
@@ -179,7 +190,9 @@ const CACHE_CODECS = {
       return clone;
     },
     load: (entry, context) => {
-      const cache = new KVCache();
+      // A plain entry saved from the graph's KVCache at this layer: the restored
+      // cache carries the TurboQuant read the graph composed into it.
+      const cache = new KVCache(undefined, (context.prototype as KVCache).turboQuantKernels);
       cache.restoreState(
         context.grownArr(entry.tensors[0]!, entry.offset),
         context.grownArr(entry.tensors[1]!, entry.offset),
@@ -228,7 +241,7 @@ const CACHE_CODECS = {
     },
     clone: (cache, context) => {
       const c = cache as QuantizedKVCache;
-      const clone = new QuantizedKVCache(c.groupSize, c.bits);
+      const clone = new QuantizedKVCache(c.groupSize, c.bits, c.kernels);
       if (!c.keys || !c.values) return clone;
       clone.restoreState(
         context.tripleView(c.keys, c.offset),
@@ -238,10 +251,12 @@ const CACHE_CODECS = {
       return clone;
     },
     load: (entry, context) => {
-      const cache = new QuantizedKVCache(entry.groupSize!, entry.bits!);
-      cache.restoreState(
-        context.triple(entry.tensors, 0), context.triple(entry.tensors, 3), entry.offset,
-      );
+      const keys = context.triple(entry.tensors, 0), values = context.triple(entry.tensors, 3);
+      // Affine storage was saved from the lego the graph composed at this
+      // layer: the restored storage attends with that lego's kernel set.
+      const cache = new QuantizedKVCache(entry.groupSize!, entry.bits!,
+        composedKernelSet(context, entry)(entry.bits!, entry.groupSize!, keys.scales.dtype));
+      cache.restoreState(keys, values, entry.offset);
       return cache;
     },
     headerTrimmable: () => true,
@@ -259,7 +274,7 @@ const CACHE_CODECS = {
     },
     clone: (cache, context) => {
       const c = cache as RotatingQuantizedKVCache;
-      const clone = new RotatingQuantizedKVCache(c.maxSize, c.groupSize, c.bits);
+      const clone = new RotatingQuantizedKVCache(c.maxSize, c.groupSize, c.bits, c.kernels);
       if (!c.keys || !c.values) return clone;
       clone.restoreState(
         context.tripleView(c.keys, null), context.tripleView(c.values, null),
@@ -268,13 +283,14 @@ const CACHE_CODECS = {
       return clone;
     },
     load: (entry, context) => {
+      const keys = context.triple(entry.tensors, 0), values = context.triple(entry.tensors, 3);
+      // Affine storage was saved from the lego the graph composed at this
+      // layer: the restored storage attends with that lego's kernel set.
       const cache = new RotatingQuantizedKVCache(
         entry.maxSize!, entry.groupSize!, entry.bits!,
+        composedKernelSet(context, entry)(entry.bits!, entry.groupSize!, keys.scales.dtype),
       );
-      cache.restoreState(
-        context.triple(entry.tensors, 0), context.triple(entry.tensors, 3),
-        entry.offset, entry.idx!,
-      );
+      cache.restoreState(keys, values, entry.offset, entry.idx!);
       return cache;
     },
     headerTrimmable: (entry) => entry.offset < (entry.maxSize ?? 0),
@@ -322,7 +338,7 @@ const CACHE_CODECS = {
       if (state.length === 0) throw new Error("cannot clone an empty cache");
       try {
         const [kIdx, kScales, kZeros, vPacked, vScales] = state;
-        const clone = new TurboQuantKVCache(c.kBits, c.vBits, c.fusedDecode);
+        const clone = new TurboQuantKVCache(c.kBits, c.vBits, c.turboQuantKernels, c.fusedDecode);
         clone.restoreState({
           kIdx: context.view(kIdx!),
           kScales: context.view(kScales!),
@@ -336,7 +352,11 @@ const CACHE_CODECS = {
       }
     },
     load: (entry, context) => {
-      const cache = new TurboQuantKVCache(entry.kBits!, entry.vBits!);
+      // TurboQuant converts only a graph's full-attention KVCache layers, so the
+      // graph's cache at this layer is that KVCache: the restored cache attends
+      // with the TurboQuant read the graph composed into it (dense for Qwen
+      // 3.5, deferred for Gemma 4 and MiniCPM5).
+      const cache = new TurboQuantKVCache(entry.kBits!, entry.vBits!, (context.prototype as KVCache).turboQuantKernels);
       const tensors: TurboQuantTensor = {
         kIdx: context.arr(entry.tensors[0]!),
         kScales: context.arr(entry.tensors[1]!),
@@ -488,11 +508,13 @@ export function cloneKvCaches(caches: Cache[], codecs: CacheCodecProvider = lega
   });
   const out: Cache[] = [];
   try {
-    for (const c of caches) {
-      const clone = codecs.forCache(c).clone(c, { view, liveView, mlaView, tripleView });
-      if (c.minimumReusableOffset !== undefined) clone.minimumReusableOffset = c.minimumReusableOffset;
-      out.push(clone);
-      pending.length = 0; // transferred to the returned cache
+    for (const cache of caches) {
+      // A composed cache clones as its storage, composed again by the same lego.
+      const c = cache.composed ? cache.composed.storage() : cache;
+      const stored = codecs.forCache(c).clone(c, { view, liveView, mlaView, tripleView });
+      if (c.minimumReusableOffset !== undefined) stored.minimumReusableOffset = c.minimumReusableOffset;
+      pending.length = 0; // transferred to the stored clone
+      out.push(cache.composed ? cache.composed.over(stored) : stored);
     }
   } catch (err) {
     cleanupFailure(err, () => disposeResources([...pending, ...out]));
@@ -507,8 +529,9 @@ function planKvCache(tokens: number[], caches: Cache[], meta: KvSaveMeta, codecs
   const sources: TensorSource[] = [];
   let dataOffset = 0; // relative; rebased after header is sized
   try {
-    for (const c of caches) {
-      const s = snapshotCache(c, dataOffset, codecs);
+    for (const cache of caches) {
+      // A composed cache saves its storage: what the convert-after path saved.
+      const s = snapshotCache(cache.composed ? cache.composed.storage() : cache, dataOffset, codecs);
       entries.push(s.entry);
       sources.push(...s.sources);
       dataOffset = s.next;
@@ -842,8 +865,21 @@ function withStepCapacity(a: MlxArray, offset: number): MlxArray {
   }
 }
 
+/** `stored` (restored or cloned storage) as the cache of a layer whose graph
+ * cache is `layer`: composed again by that layer's lego (`ComposedStorage.over`),
+ * so it converts as the lego that stored it would have. A cache that already is
+ * a lego stays, and so do paged pages, which the paged request state holds in
+ * the lego's place (`state/request-policy.ts`). */
+export function composeAtLayer(layer: Cache, stored: Cache): Cache {
+  const composed = layer.composed;
+  return !composed || stored.composed || cacheSignature(stored) === "kv:paged" ? stored : composed.over(stored);
+}
+
+/** Checks the header against the expectations and the restoring graph's
+ * caches, and returns those caches (`model.makeCache()`, empty) as the
+ * prototypes the codecs load against. The caller disposes them. */
 function validateKvHeader(path: string, header: KvFileHeader, model: { makeCache(): Cache[] },
-  expect: KvLoadExpect, codecs: CacheCodecProvider): void {
+  expect: KvLoadExpect, codecs: CacheCodecProvider): Cache[] {
   if ((header.codecProvider ?? legacyCacheCodecs.id) !== codecs.id)
     throw new Error(`${path}: cache codec provider mismatch`);
   for (const entry of header.caches) codecs.forHeader(entry);
@@ -866,14 +902,16 @@ function validateKvHeader(path: string, header: KvFileHeader, model: { makeCache
     for (let index = 0; index < proto.length; index++) {
       validateGlm52Prototype(path, header.caches[index]!, proto[index]!);
     }
-  } finally {
+  } catch (error) {
     for (const c of proto) c.dispose();
+    throw error;
   }
-
+  return proto;
 }
 
-/** Decode cache layouts independently of the transport supplying arrays. */
-function restoreKvArrays(path: string, header: KvFileHeader, codecs: CacheCodecProvider,
+/** Decode cache layouts independently of the transport supplying arrays.
+ * `prototypes` are the restoring graph's caches, one per header entry. */
+function restoreKvArrays(path: string, header: KvFileHeader, prototypes: readonly Cache[], codecs: CacheCodecProvider,
   readArray: (slot: TensorSlot) => MlxArray): LoadedKvCache {
   // Every tensor materialized for the CURRENT entry, drained on any throw
   // (2026-07-07 review: a hash mismatch under --ssd-cache-verify — or any
@@ -897,15 +935,19 @@ function restoreKvArrays(path: string, header: KvFileHeader, codecs: CacheCodecP
   const caches: Cache[] = [];
   const attachments: CheckpointAttachment[] = [];
   try {
-    for (const e of header.caches) {
+    for (const [index, e] of header.caches.entries()) {
       const codec = codecs.forHeader(e);
       const minimumOffset = cacheHeaderMinimumReusableOffset(e);
-      const cache = codec.load(e, { path, arr, grownArr, triple });
-      cache.minimumReusableOffset = minimumOffset;
-      caches.push(cache);
-      // This entry's tensors are now owned by its cache — stop tracking them
+      const prototype = prototypes[index]!;
+      const stored = codec.load(e, { path, prototype, arr, grownArr, triple });
+      stored.minimumReusableOffset = minimumOffset;
+      // This entry's tensors are now owned by its storage — stop tracking them
       // (the catch must not double-free through both pending AND caches).
       pending.length = 0;
+      caches.push(stored);
+      // The restored storage takes the cache the graph composed at this layer:
+      // a lego converts it as the saved lego would have.
+      caches[caches.length - 1] = composeAtLayer(prototype, stored);
     }
     for (const attachment of header.attachments ?? []) {
       attachments.push({ schema: attachment.schema, metadata: { ...attachment.metadata },
@@ -926,15 +968,18 @@ function restoreKvArrays(path: string, header: KvFileHeader, codecs: CacheCodecP
 export async function loadKvCacheAsync(path: string, model: { makeCache(): Cache[] },
   expect: KvLoadExpect = {}, codecs: CacheCodecProvider = legacyCacheCodecs): Promise<LoadedKvCache> {
   const header = readKvHeader(path);
-  validateKvHeader(path, header, model, expect, codecs);
+  const prototypes = validateKvHeader(path, header, model, expect, codecs);
   const slots = [...header.caches, ...(header.attachments ?? [])].flatMap(e => e.tensors);
   const buffers = new Map<TensorSlot, HostBuffer>();
   try {
     for (const slot of slots) buffers.set(slot, new HostBuffer(slot.bytes));
     await kvReader.read({ path, header, pointers: slots.map(slot => buffers.get(slot)!.pointer), verify: expect.verify });
-    return restoreKvArrays(path, header, codecs, slot =>
+    return restoreKvArrays(path, header, prototypes, codecs, slot =>
       MlxArray.adoptHostBuffer(buffers.get(slot)!, slot.shape, slot.dtype as Dtype));
-  } finally { for (const buffer of buffers.values()) buffer.dispose(); }
+  } finally {
+    for (const buffer of buffers.values()) buffer.dispose();
+    for (const c of prototypes) c.dispose();
+  }
 }
 
 /** Reload by STREAMED COPY (see the header note): every tensor is copied
@@ -943,43 +988,47 @@ export async function loadKvCacheAsync(path: string, model: { makeCache(): Cache
  *  outright (no dtor contract, no pinned mapping, nothing to retain).
  *  `model` is anything with makeCache() — the entry count is validated
  *  against the DONOR cache list (model.layers.length was wrong for
- *  KV-shared models like e4b, whose makeCache() returns donors only). */
+ *  KV-shared models like e4b, whose makeCache() returns donors only), and
+ *  each restored cache takes what the graph composed into its own cache for
+ *  that layer. */
 export function loadKvCache(
   path: string,
   model: { makeCache(): Cache[] },
   expect: KvLoadExpect = {}, codecs: CacheCodecProvider = legacyCacheCodecs,
 ): LoadedKvCache {
   const header = readKvHeader(path);
-  validateKvHeader(path, header, model, expect, codecs);
-  if (header.formatVersion === 5) {
-    return restoreKvArrays(path, header, codecs, slot => {
-      const bytes = new Uint8Array(slot.bytes);
-      let offset = 0;
-      for (const block of slot.blocks ?? []) {
-        if (!/^[a-f0-9]{64}$/.test(block.hash) || block.bytes <= 0 || offset + block.bytes > bytes.length)
-          throw new Error(`${path}: invalid KV block reference`);
-        const part = readFileSync(join(dirname(path), "blocks", block.hash));
-        if (part.length !== block.bytes || (expect.verify && createHash("sha256").update(part).digest("hex") !== block.hash))
-          throw new Error(`${path}: KV block mismatch`);
-        bytes.set(part, offset); offset += part.length;
-      }
-      if (offset !== bytes.length)
-        throw new Error(`${path}: KV tensor mismatch`);
-      return MlxArray.fromBytesCopy(bytes, slot.shape, slot.dtype as Dtype);
-    });
-  }
-  const mmap = MmapFile.open(path, "ro"), dataStart = header.dataStart;
+  const prototypes = validateKvHeader(path, header, model, expect, codecs);
   try {
-    return restoreKvArrays(path, header, codecs, slot => {
-      const view = mmap.view(dataStart + slot.off, slot.bytes);
-      if (expect.verify && hash64(view) !== slot.hash)
-        throw new Error(`${path}: tensor hash mismatch at offset ${slot.off}`);
-      const array = MlxArray.fromBytesCopy(view, slot.shape, slot.dtype as Dtype);
-      const len = Math.min(alignUp(slot.bytes), mmap.size - (dataStart + slot.off));
-      mmap.advise(dataStart + slot.off, len, MADV_DONTNEED);
-      return array;
-    });
-  } finally { mmap.unmap(); }
+    if (header.formatVersion === 5) {
+      return restoreKvArrays(path, header, prototypes, codecs, slot => {
+        const bytes = new Uint8Array(slot.bytes);
+        let offset = 0;
+        for (const block of slot.blocks ?? []) {
+          if (!/^[a-f0-9]{64}$/.test(block.hash) || block.bytes <= 0 || offset + block.bytes > bytes.length)
+            throw new Error(`${path}: invalid KV block reference`);
+          const part = readFileSync(join(dirname(path), "blocks", block.hash));
+          if (part.length !== block.bytes || (expect.verify && createHash("sha256").update(part).digest("hex") !== block.hash))
+            throw new Error(`${path}: KV block mismatch`);
+          bytes.set(part, offset); offset += part.length;
+        }
+        if (offset !== bytes.length)
+          throw new Error(`${path}: KV tensor mismatch`);
+        return MlxArray.fromBytesCopy(bytes, slot.shape, slot.dtype as Dtype);
+      });
+    }
+    const mmap = MmapFile.open(path, "ro"), dataStart = header.dataStart;
+    try {
+      return restoreKvArrays(path, header, prototypes, codecs, slot => {
+        const view = mmap.view(dataStart + slot.off, slot.bytes);
+        if (expect.verify && hash64(view) !== slot.hash)
+          throw new Error(`${path}: tensor hash mismatch at offset ${slot.off}`);
+        const array = MlxArray.fromBytesCopy(view, slot.shape, slot.dtype as Dtype);
+        const len = Math.min(alignUp(slot.bytes), mmap.size - (dataStart + slot.off));
+        mmap.advise(dataStart + slot.off, len, MADV_DONTNEED);
+        return array;
+      });
+    } finally { mmap.unmap(); }
+  } finally { for (const c of prototypes) c.dispose(); }
 }
 
 import { CacheCodec,CacheCodecProvider,CacheHeaderEntry,CacheKind,CloneContext,KvFileHeader,KvLoadExpect,KvSaveMeta,LoadContext,LoadedKvCache,SnapshotContext,SpillItem,TensorSlot } from "./persistence-types";

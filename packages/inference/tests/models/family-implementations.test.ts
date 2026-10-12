@@ -1,10 +1,14 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadModelConfig } from "../../src/artifacts/config";
-import { MLX_MODEL_IMPLEMENTATIONS } from "../../src/models/factory";
+import { configFingerprint } from "../../src/artifacts/fingerprint";
+import { resolveComposition } from "../../src/models/composition";
+import { MLX_GRAPH_TABLES, MLX_MODEL_IMPLEMENTATIONS } from "../../src/models/factory";
 import { MODEL_FAMILIES } from "../../src/models/families";
+import { GENERATED_GRAPHS } from "../../src/models/gemma4/generated";
+import { Gemma4Model } from "../../src/models/gemma4/model";
 import { implementationIdFor } from "../../src/models/implementation";
 import { resolveModelProfile } from "../../src/models/profile";
 
@@ -57,13 +61,27 @@ describe("family implementations", () => {
     expect(MODEL_FAMILIES.filter(family => family.loader !== "safetensors").map(family => family.graph)).toEqual(["glm5.2"]);
   });
 
-  test("a generated Gemma specialization resolves to the implementation registered for it (skips when the snapshot is not downloaded)", async () => {
-    const snapshots = join(homedir(), ".cache/huggingface/hub/models--mlx-community--gemma-4-e4b-it-OptiQ-4bit/snapshots");
-    const revision = existsSync(snapshots) ? readdirSync(snapshots).find(entry => existsSync(join(snapshots, entry, "config.json"))) : undefined;
-    if (!revision) return;
-    const config = await loadModelConfig(join(snapshots, revision));
-    const profile = resolveModelProfile(config);
-    expect(profile.profile.execution.specialization).toBe("generated");
-    expect(MLX_MODEL_IMPLEMENTATIONS.select(config, profile).id).toBe("gemma4-generated");
+  test("a generated Gemma graph's artifact resolves the family's profile; the graph table labels the graph a composition builds", async () => {
+    const fixtures = join(import.meta.dir, "../fixtures/gemma4-graphs");
+    for (const repo of readdirSync(fixtures)) {
+      const snapshots = join(fixtures, repo, "snapshots");
+      const config = await loadModelConfig(join(snapshots, readdirSync(snapshots)[0]!));
+      // The profile names the family, whatever the fingerprint.
+      const profile = resolveModelProfile(config);
+      expect({ repo, id: profile.profile.id, specialization: profile.profile.execution.specialization })
+        .toEqual({ repo, id: "gemma4-dedicated", specialization: "dedicated" });
+      expect(profile.profile.requiredCapabilities).toEqual(["safetensors", "autoregressive", "gemma4-graph"]);
+      expect(MLX_MODEL_IMPLEMENTATIONS.select(config, profile).id).toBe("gemma4");
+      // The table labels the graph: the generated one for the kv_config composition it serves; the generic one for
+      // the default composition, which is what training builds (createModel without a composition), so training
+      // runs the graph that declares training operations.
+      const table = MLX_GRAPH_TABLES.gemma4!;
+      const generated = table.select(config, resolveComposition(config, { kv: { override: "config" } }));
+      expect(generated.id).toBe(GENERATED_GRAPHS.find(entry => entry.serves.fingerprint === configFingerprint(config))!.id);
+      expect(table.select(config, resolveComposition(config))).toBe(table.generic);
+      expect(Object.getOwnPropertyDescriptor(Gemma4Model.prototype, "trainable")?.get).toBeDefined();
+      const module = await import(`../../src/models/gemma4/generated/${generated.id}`);
+      expect("trainable" in module.GeneratedGemma4.prototype).toBe(false);
+    }
   });
 });

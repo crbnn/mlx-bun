@@ -139,11 +139,11 @@ test("closing the app drains borrowed execution before disposing the model", asy
   const events: string[] = [];
   const entered = Promise.withResolvers<void>(); const finish = Promise.withResolvers<void>();
   const host = ownModelContext(context(), [{ dispose() { events.push("model disposed"); } }]);
-  const execution = { method: "autoregressive", mechanism: "continuous", pagedKv: false,
+  const execution = { method: "autoregressive", mechanism: "continuous",
     promptCache: false, checkpoint: false, fill: false, compiledDecode: false,
     grammarJump: false, reasons: [] } as const;
   const supplied = { gateway: { runtime: runtimeConfig(), config: { eosTokenIds: [2] },
-    cachesBatchable: () => true, plan: () => execution,
+    plan: () => execution,
     continuationRequest(_plan: unknown, _opts: unknown, _prompt: unknown, onToken: unknown) {
       return { continuation: {}, sample() {}, plainGreedy: true, onToken, dispose() {} };
     },
@@ -156,7 +156,7 @@ test("closing the app drains borrowed execution before disposing the model", asy
   const engine = await createAppEngine(host, { capacity: 1, binding: supplied,
     beforeModelDispose() { events.push("cache closed"); } });
   const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false,
-    userSeed: false, kvQuant: false, turboQuant: false, hasLogitsExtras: false,
+    userSeed: false, hasLogitsExtras: false,
     hasGrammar: false, wantsLogprobs: false, hasDraft: false };
   const run = engine.completion.run([1], {}, () => {}, undefined, shape, engine.completion.place(shape)).catch(() => {});
   await entered.promise; const closing = engine.close();

@@ -6,14 +6,22 @@ import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { AssistantDonors } from "./attention";
 import type { Cache } from "./cache";
 import type { DraftProjection } from "./draft-projection";
+import type { ResidualBasis } from "./draft-target";
+import type { MlxWidthTable } from "./width";
 
 /** One drafted step of a KV-borrowing assistant: owned token ids and the post-projected hidden. */
 export interface DrafterRowsStep { tokens: MlxArray; nextHidden: MlxArray }
 
+/** One assistant draft step over B rows: the last token's embedding and the hidden it follows [B, 1, H]
+ *  (borrowed), the donors, and the rows' position (one shared, or [B]); owned tokens and next hidden out. */
+export type AssistantDraftStep = (lastTokenEmb: MlxArray, targetHidden: MlxArray, donors: AssistantDonors,
+  position: number | MlxArray) => DrafterRowsStep;
+
 /** The optiq KV-borrowing assistant: no cache of its own, it reads the target's donor attention. */
 export interface AssistantDrafterModel {
-  forwardRows(lastTokenEmb: MlxArray, targetHidden: MlxArray, donors: AssistantDonors,
-    position: number | MlxArray): DrafterRowsStep;
+  /** The draft step per width class of the rows it drafts for, each with the token selection its head
+   *  bound for that class at construction; the caller indexes it by its rows (`widthClass`). */
+  readonly forwardRows: MlxWidthTable<AssistantDraftStep>;
   dispose(): void;
 }
 
@@ -90,10 +98,18 @@ export interface DeepspecDrafterModel {
   dispose(): void;
 }
 
-/** The recurrent multi-token-prediction block split from a Qwen release: token embeddings paired
- * with hiddens in, the module output (post final norm) out; the cache supplies positions and storage. */
+/** One recurrent multi-token-prediction forward: token embeddings [B, S, H] paired with hiddens
+ * [B, S, H] (both borrowed) in, the module output (post final norm) [B, S, H] out, owned; appends S
+ * positions per row to `cache`, which supplies positions and storage. */
+export type RecurrentMtpForward = (tokenEmbeds: MlxArray, hiddens: MlxArray, cache: Cache) => MlxArray;
+
+/** The recurrent multi-token-prediction block split from a Qwen release, its phases named by the
+ * caller like a graph's: the draft step indexed by the rows it drafts for. */
 export interface RecurrentMtpModule {
-  forward(tokenEmbeds: MlxArray, hiddens: MlxArray, cache: Cache): MlxArray;
+  /** One position per row (a draft step, the round's bridge or full-accept row), by the rows' width class. */
+  readonly decode: MlxWidthTable<RecurrentMtpForward>;
+  /** Several positions per row (prompt rows, a verified continuation). */
+  readonly window: RecurrentMtpForward;
 }
 
 /** The checkpoint-native multi-token-prediction row of a graph that declares `nativeDraft`, over
@@ -113,21 +129,28 @@ export interface Dflash2ContextAttention {
   attend(layer: number, query: MlxArray, blockKeys: MlxArray, blockValues: MlxArray, scale?: number): MlxArray;
 }
 
-/** Signs of a target's TurboQuant R1 rotation and its folded final-norm gain (effective, 1+w). */
-export interface Dflash2TargetBasis { seed: number; signs: Float32Array; finalGain: Float32Array }
-
-/** The DFlash 2 block drafter: target taps → projected context K/V; one greedy block per anchor. */
+/** The DFlash 2 block drafter: target taps → projected context K/V; one greedy block per anchor.
+ *  It loads in the basis it was trained on and learns the target's when a draft group binds. */
 export interface Dflash2DrafterModel {
   readonly cfg: { readonly layers: number; readonly numTargetLayers: number };
   readonly tapLayers: number[];
   /** Draft tokens per block (block size minus the anchor). */
   readonly gamma: number;
+  /** Apply the target's declared residual basis (null: the trained basis) before any projection.
+   *  The first call applies it; every later call must pass the same declaration. */
+  bindResidualBasis(basis: ResidualBasis | null): void;
   projectContext(taps: MlxArray): MlxArray;
   projectContextKVRows(context: MlxArray, position: number | MlxArray): { k: MlxArray; v: MlxArray }[];
-  draftRows(context: Dflash2ContextAttention, projection: DraftProjection, anchors: readonly number[],
-    position: number | MlxArray, depth: number): number[][];
-  /** The same proposals left on the device: [B, steps] row-major. */
-  draftRowsDevice(context: Dflash2ContextAttention, projection: DraftProjection, anchors: readonly number[],
-    position: number | MlxArray, depth: number): MlxArray;
+  /** The columns of a block drafting `depth` tokens: its anchor and up to `depth` mask positions, at most the
+   *  trained block size. */
+  blockColumns(depth: number): number;
+  /** The draft block per width class of its rows (anchors times columns), indexed by the scheduler. */
+  readonly draft: MlxWidthTable<Dflash2DraftBlock>;
   dispose(): void;
 }
+
+/** One DFlash 2 draft block: one row per anchor, each the anchor and `columns - 1` mask positions, over the
+ *  projected context; the greedy proposals left on the device, [anchors, columns - 1] uint32 row-major. Every
+ *  projection in the block runs the kernel its width class names. */
+export type Dflash2DraftBlock = (context: Dflash2ContextAttention, projection: DraftProjection, anchors: readonly number[],
+  position: number | MlxArray, columns: number) => MlxArray;

@@ -17,7 +17,6 @@ import { compileStrictFillRows, type StrictRowPlan } from "@mlx-bun/inference/ge
 import type { GenerateOptions } from "@mlx-bun/inference/generation";
 import type { GrammarRequest } from "@mlx-bun/inference/sampling/grammar";
 import { runtimeValue } from "@mlx-bun/inference/runtime/config";
-import type { KvSchemeOptions } from "@mlx-bun/inference/state/kv-scheme";
 import { GENERIC_GENERATION_DEFAULTS } from "@mlx-bun/inference/models/profile";
 import type { HlgConfig } from "@mlx-bun/inference/sampling";
 import {
@@ -40,21 +39,17 @@ export interface RequestPrepOptions {
   defaultTopP?: number;
   defaultTopK?: number;
   hlg?: HlgConfig;
-  pagedKv?: { blockSize?: number };
 }
 
 export function createRequestPrep(input: {
   ctx: ModelContext;
   serverOptions: RequestPrepOptions;
-  /** The server-wide KV scheme (resolveKvScheme(...).generationOptions),
-   *  spread into every request's GenerateOptions. */
-  kvScheme: KvSchemeOptions;
   /** `--max-tokens` / a runtime memory plan's generation cap; undefined = the
    *  surface's own default (chat 65 536, raw completion 512). */
   defaultGeneratedTokens: number | undefined;
   tokenHistory?: PromptTokenHistory;
 }) {
-  const { ctx, serverOptions, kvScheme, defaultGeneratedTokens } = input;
+  const { ctx, serverOptions, defaultGeneratedTokens } = input;
   const generationDefaults = ctx.generationDefaults ?? GENERIC_GENERATION_DEFAULTS;
 
   // XTC never removes EOS or the newline token: mlx_lm.server passes
@@ -127,10 +122,6 @@ export function createRequestPrep(input: {
       // decode layer below and halts the loop via onToken → false.
       stopSequences: (typeof req.stop === "string" ? [req.stop] : req.stop ?? [])
         .filter((s) => typeof s === "string" && s.length > 0),
-      ...kvScheme,
-      // Cache layout is supplied by the application; the execution binding
-      // validates whether the selected method can consume it.
-      ...(serverOptions.pagedKv ? { pagedKv: serverOptions.pagedKv } : {}),
     };
   };
 
@@ -295,7 +286,7 @@ export function createRequestPrep(input: {
    *
    *  Refusals owned here (body-level); the ones only ChatStage can see —
    *  a compiled grammar, media prompts and a mounted draft model — are applied
-   *  there. The execution binding owns cache-format and method support. Strict
+   *  there. The execution binding owns method support (every cache serves it). Strict
    *  shared execution keeps the sampler's absolute token positions, including
    *  known tokens; an explicit seed therefore remains replayable.
    *

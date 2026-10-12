@@ -24,7 +24,11 @@ export type FidelityTarget =
 
 export type ModelLoader = "safetensors" | "colibri";
 export type GenerationLoop = "autoregressive" | "diffusion" | "encoder-decoder";
-export type ModelSpecialization = "artifact" | "dedicated" | "generated" | "generic";
+/** What a profile was declared for: an exact artifact, a family's own graphs, or
+ * the universal graph. Which of a family's graphs a load builds (its generic
+ * graph, or a generated or hand-written one built for the composition) is the
+ * family's graph table's choice (`models/implementation.ts`), not a profile's. */
+export type ModelSpecialization = "artifact" | "dedicated" | "generic";
 
 export const L1: FidelityTarget = Object.freeze({ tier: "l1", oracle: "mlx-lm", claim: "bit-exact" });
 /** L1 for speech: the capability's own reference implementation (mlx-whisper)
@@ -100,8 +104,6 @@ export interface ModelFamily {
   readonly profileId: string;
   /** Capabilities the graph needs of the engine, beyond its loader and loop's own. */
   readonly capabilities: readonly EngineCapability[];
-  /** Configs whose fingerprint is listed here run a graph generated from them (`profileId` names that profile). */
-  readonly generated?: { readonly profileId: string; readonly fingerprints: readonly string[] };
   /** A speech-to-text family, served by the transcription engine. */
   readonly transcribes?: true;
   readonly moe?: (config: ModelConfig) => MoeDeclaration | null;

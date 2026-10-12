@@ -1,7 +1,7 @@
 // Gemma4 paged KV through the shared execution group on real weights. Full
-// attention layers live in block pools (`--paged-kv`); requests enter through
-// the public gateway binding (plan, statePolicy, createBatchGroup), as the app
-// composes them. Two readers: the gathered arm (block gather into stock SDPA;
+// attention layers live in block pools (`--paged-kv`, the composition's paging);
+// requests enter through the public gateway binding (plan, statePolicy,
+// createBatchGroup), as the app composes them. Two readers: the gathered arm (block gather into stock SDPA;
 // for bf16 pages this is main's bit-exact contract against plain KV) and the
 // direct Metal reader (MLX_BUN_PAGED_ATTN=1, Lab numerics). Pages store bf16 or
 // affine KV4/KV8, encoded from their first token; sliding layers follow the
@@ -11,7 +11,7 @@
 //   tokens, every sampled full-vocabulary vector, and each retired row's valid
 //   K/V in every layer (main's paged-kv-parity contract, extended to KV planes);
 // - direct reads at B3 over bf16, KV4 and KV8 pages: the direct kernel actually
-//   serves decode (queries of at most 8 tokens without an array mask), and on
+//   serves decode (the cache's decode read; windows gather), and on
 //   every such call its output equals the gathered reader's over the same query
 //   and pages within DIRECT_TOLERANCE of the output's scale (the two differ only
 //   in reduction order and where dequantized values round); every sampled
@@ -63,7 +63,7 @@ export function optIn(env: Record<string, string | undefined>) {
   if (!model.trim()) throw new Error(`${MODEL} is blank`);
   assert(existsSync(join(model, "config.json")), `${MODEL}: no config.json in ${model}`);
   const raw = JSON.parse(readFileSync(join(model, "config.json"), "utf8"));
-  assert(String(raw.model_type).startsWith("gemma4"), `paged KV binds Gemma4 graphs only, not ${raw.model_type}`);
+  assert(String(raw.model_type).startsWith("gemma4"), `this test's checks are written for Gemma4 graphs, not ${raw.model_type}`);
   const vocab = (raw.text_config ?? raw).vocab_size;
   assert(Number.isSafeInteger(vocab) && vocab > 4000, `${MODEL}: invalid vocab_size ${vocab}`);
   return { model, vocab: vocab as number };
@@ -109,7 +109,7 @@ const inputs = optIn(Bun.env);
 test.skipIf(!inputs)("Gemma4 paged KV: gathered bf16 equals plain KV; direct reads, cancellation and RAM/SSD reuse per encoding", async () => {
   const ops = await import("@mlx-bun/mlx/ops");
   const { clearCache } = await import("@mlx-bun/mlx/ffi");
-  const { loadModelConfig, Weights, createModel } = await import("@mlx-bun/inference");
+  const { loadModelConfig, Weights, createModel, resolveComposition } = await import("@mlx-bun/inference");
   const { bindMlxGateway, createRuntimeConfig, withRuntimeConfig } = await import("@mlx-bun/inference/execution");
   const { PromptCache, TieredPromptCache, SsdCacheStore, KVCache, RotatingKVCache, cloneKvCaches, resolveKvScheme } =
     await import("@mlx-bun/inference/state");
@@ -143,51 +143,65 @@ test.skipIf(!inputs)("Gemma4 paged KV: gathered bf16 equals plain KV; direct rea
   const weights = await Weights.open(path);
   const releases: (() => void)[] = [];
   try {
-    const model = createModel(weights, config) as A;
-    const layers = (() => { const probe: Cache[] = model.makeCache(); try { return probe.length; } finally { releaseAll(probe.map(c => () => c.dispose())); } })();
-    const runtimeFor = (reader: Reader) => createRuntimeConfig({ MLX_BUN_COMPILED_DECODE: "0",
-      MLX_BUN_PAGED_ATTN: reader === "direct" ? "1" : "0" });
-    // Direct dispatch accounting: every call the direct kernel serves is
-    // checked against the gathered reader over the same query and pages.
-    let directCalls = 0, worstRelative = 0;
-    const appendAndFetch = PagedKVCache.prototype.appendAndFetch;
-    PagedKVCache.prototype.appendAndFetch = function (this: A, k: MlxArray, v: MlxArray) {
-      const view = appendAndFetch.call(this, k, v);
-      if (!this.direct) return view;
-      const gathered = pagedAttentionView(this.pool!, [...this.blockTable], this.offset, false);
-      return { attend(q: MlxArray, scale: number, mask: A) {
-        const out = view.attend(q, scale, mask);
-        if (q.shape[2]! <= 8 && mask.mode !== "array") {
-          directCalls++;
-          using expected = gathered.attend(q, scale, mask);
-          const [x, y] = [out.toFloat32(), expected.toFloat32()];
-          let difference = 0, magnitude = 0;
-          for (let i = 0; i < y.length; i++) {
-            difference = Math.max(difference, Math.abs(x[i]! - y[i]!)); magnitude = Math.max(magnitude, Math.abs(y[i]!));
-          }
-          worstRelative = Math.max(worstRelative, difference / magnitude);
-          if (!(difference <= DIRECT_TOLERANCE * magnitude))
-            throw new Error(`direct paged attention differs from the gathered reader by ${difference} (output scale ${magnitude}, q ${q.shape})`);
-        }
-        return out;
-      }, dispose() { view.dispose(); gathered.dispose(); } };
+    // One graph per encoding, composed with that server-wide scheme: the
+    // tiled-causal affine reads this test computed before E3, when its
+    // environment left fused SDPA on (MLX_BUN_NO_FUSED_SDPA unset).
+    const schemeFor = (encoding: Encoding) => encoding === "bf16" ? undefined : resolveKvScheme({ override: encoding, fusedSdpa: true });
+    // One graph per encoding and paging (block size, or null unpaged): the composition pages every request.
+    const models = new Map<string, A>();
+    const modelFor = (encoding: Encoding, blockSize: number | null = null): A => {
+      const key = `${encoding}:${blockSize}`;
+      let built = models.get(key);
+      if (!built) {
+        const scheme = schemeFor(encoding);
+        built = createModel(weights, config, resolveComposition(config, { ...(scheme ? { kv: { override: encoding as 4 | 8, fusedSdpa: true } } : {}),
+          ...(blockSize === null ? {} : { pagedKv: { blockSize } }) }));
+        models.set(key, built);
+      }
+      return built;
     };
-    releases.push(() => { PagedKVCache.prototype.appendAndFetch = appendAndFetch; });
+    const model = modelFor("bf16");
+    const layers = (() => { const probe: Cache[] = model.makeCache(); try { return probe.length; } finally { releaseAll(probe.map(c => () => c.dispose())); } })();
+    const runtimeFor = (reader: Reader) => createRuntimeConfig({ MLX_BUN_PAGED_ATTN: reader === "direct" ? "1" : "0" });
+    // Direct dispatch accounting: the direct kernel serves the decode read
+    // (`appendDecode`, one query, no mask; a window always gathers), and every
+    // such call is checked against the gathered reader over the same query and pages.
+    let directCalls = 0, worstRelative = 0;
+    const appendDecode = PagedKVCache.prototype.appendDecode;
+    PagedKVCache.prototype.appendDecode = function (this: A, k: MlxArray, v: MlxArray) {
+      const read = appendDecode.call(this, k, v);
+      if (!this.direct) return read;
+      const gathered = pagedAttentionView(this.pool!, [...this.blockTable], this.offset, false);
+      return { attend(q: MlxArray, scale: number) {
+        const out = read.attend(q, scale);
+        directCalls++;
+        using expected = gathered.attend(q, scale, { mode: "", arr: null });
+        const [x, y] = [out.toFloat32(), expected.toFloat32()];
+        let difference = 0, magnitude = 0;
+        for (let i = 0; i < y.length; i++) {
+          difference = Math.max(difference, Math.abs(x[i]! - y[i]!)); magnitude = Math.max(magnitude, Math.abs(y[i]!));
+        }
+        worstRelative = Math.max(worstRelative, difference / magnitude);
+        if (!(difference <= DIRECT_TOLERANCE * magnitude))
+          throw new Error(`direct paged attention differs from the gathered reader by ${difference} (output scale ${magnitude}, q ${q.shape})`);
+        return out;
+      }, dispose() { read.dispose(); gathered.dispose(); } };
+    };
+    releases.push(() => { PagedKVCache.prototype.appendDecode = appendDecode; });
 
     /** One execution group per call, bound under the reader's runtime. Rows
      * submit while admission is held, then release together (a real cohort). */
     const runGroup = async (setup: Setup, rows: RowSpec[], opts: RunOptions = {}) => {
       const runtime = runtimeFor(setup.reader);
-      const binding = withRuntimeConfig(runtime, () => bindMlxGateway(model));
-      const scheme = setup.encoding === "bf16" ? undefined : resolveKvScheme({ override: setup.encoding });
-      const options: A = { ...(scheme?.generationOptions ?? {}), ...(setup.paged ? { pagedKv: { blockSize: setup.blockSize } } : {}) };
-      const quantizedBatch = scheme ? binding.kvBatchable(scheme) : false;
-      assert(!scheme || quantizedBatch, `${scheme?.label} must batch on this graph`);
+      const binding = withRuntimeConfig(runtime, () => bindMlxGateway(modelFor(setup.encoding, setup.paged ? setup.blockSize : null)));
+      const scheme = schemeFor(setup.encoding);
+      const options: A = {};
       const plan = binding.plan({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
-        kvQuant: !!scheme, turboQuant: false, hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false },
-      options, { continuous: true, quantizedBatch, checkpoints: false });
+        hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false },
+      options, { checkpoints: false });
       assert.equal(plan.mechanism, "continuous", `placement: ${plan.reasons.join(", ")}`);
-      assert.equal(plan.pagedKv, setup.paged);
+      // A paged composition gives every request the paged state; an unpaged one, the group's own caches.
+      assert.equal(binding.statePolicy!(plan, options, 1) !== undefined, setup.paged);
       if (opts.cache) binding.configureContinuation!({ promptCache: opts.cache, checkpoints: null, identity: "gemma4-paged",
         adapterNamespace: (adapters: string[]) => adapters.join(","), cloneState: (caches: Cache[]) => cloneKvCaches(caches) } as A);
       const policy = (prompt: number[]) => binding.statePolicy!(plan, options, prompt.length + TOKENS);
@@ -200,7 +214,7 @@ test.skipIf(!inputs)("Gemma4 paged KV: gathered bf16 equals plain KV; direct rea
       const prefetched: (() => void)[] = [];
       let held = true;
       const group = binding.createBatchGroup({ maxBatch: 3, runtime, prefillChunkSize: 2048, admissionHeld: () => held,
-        ...(scheme ? { kvScheme: scheme } : {}), ...(opts.cache ? { promptCache: opts.cache } : {}) });
+        ...(opts.cache ? { promptCache: opts.cache } : {}) });
       const submit = (row: RowSpec, index: number): Promise<Outcome> => {
         const out: Outcome = { status: "fulfilled", tokens: [], vectors: [], finite: true, afterRetire: 0 };
         const controller = new AbortController();
@@ -315,8 +329,8 @@ test.skipIf(!inputs)("Gemma4 paged KV: gathered bf16 equals plain KV; direct rea
           tokenizerHash: "gemma4-paged", verify: true, storage: { layout: "blocks" as const } };
         const tier = (store: A, async: boolean) => ({
           find(tokens: number[], ns: string) { const hit = store.find(tokens, ns); return hit ? { prefixLen: hit.prefixLen, handle: hit.entry } : null; },
-          restore(handle: A) { const hit = store.restore(handle, model); return hit ? { ...hit, retain() {} } : null; },
-          ...(async ? { async restoreAsync(handle: A) { const hit = await store.restoreAsync(handle, model); return hit ? { ...hit, retain() {} } : null; } } : {}),
+          restore(handle: A) { const hit = store.restore(handle, modelFor(encoding)); return hit ? { ...hit, retain() {} } : null; },
+          ...(async ? { async restoreAsync(handle: A) { const hit = await store.restoreAsync(handle, modelFor(encoding)); return hit ? { ...hit, retain() {} } : null; } } : {}),
           store: (tokens: number[], caches: Cache[], ns: string, attachments: A) => store.store(tokens, caches, ns, attachments),
         });
         // Each SSD restore's caches, observed as the store hands them over.

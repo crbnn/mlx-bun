@@ -2,15 +2,17 @@ import { test, expect } from "bun:test";
 import { createHash } from "node:crypto";
 import { KVCache } from "../../src/state/kv";
 import { QuantizedKVCache } from "../../src/state/quantized-kv";
-import { quantizedSdpa } from "../../src/layers/quantized-attention";
+import { quantizedSdpa } from "../models/quantized-sdpa-reference";
 import { disposeTriple } from "../../src/state/quantized-tensor";
 import { type Cache } from "../../src/contracts/mlx/cache";
+import { unfusedAffineKernels } from "../../src/state/affine-attention";
 import { DelayedQuantizedKVCache } from "../../src/state/delayed-quantized-kv";
-import { createKvMaintenance } from "../../src/state/kv-maintenance";
+import { settleAffine } from "./convert-after-reference";
 import { cloneKvCaches } from "../../src/state/persistence";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { MlxArray } from "@mlx-bun/mlx/array";
+import { kvStorage } from "../../src/state/kv-storage";
 const digest = (a: MlxArray) => { using contiguous = ops.contiguous(a); return createHash("sha256").update(contiguous.rawBytes()).digest("hex"); };
 const hashes = (cache: Cache) => cache.state().map(a => {
   using view = a.slice([0,0,0,0], [a.shape[0]!,a.shape[1]!,cache.offset,a.shape[3]!]); return digest(view);
@@ -18,15 +20,16 @@ const hashes = (cache: Cache) => cache.state().map(a => {
 const tensor = (b: number, heads: number, n: number, seed: number) => {
   using key = ops.randomKey(BigInt(seed)); return ops.randomNormal([b,heads,n,64], Dtype.bfloat16, 0, 1, key);
 };
+const settle = (rows: Cache[], bits: number) => settleAffine(rows, bits, 5);
 for (const bits of [4,8]) test(`delayed KV${bits} retains independent precision, rollback, padding and immutable checkpoints`, () => {
-  const maintain = createKvMaintenance({ kvBits: bits, kvGroupSize:64, quantizedKvStart:5 });
+  const maintain = (rows: Cache[]) => settle(rows, bits);
   const source: Cache[] = [];
   for (const n of [2,6]) {
     const c = new KVCache(); using k=tensor(1,1,n,n), v=tensor(1,1,n,n+1);
     for (const field of c.updateAndFetch(k,v)) field.dispose(); source.push(c);
   }
   maintain(source);
-  const group = new DelayedQuantizedKVCache(64,bits,5,maintain); group.mergeRows(source);
+  const group = new DelayedQuantizedKVCache(64,bits,5,unfusedAffineKernels); group.mergeRows(source);
   const control = cloneKvCaches(source), held = cloneKvCaches(source);
   const original = held.map(hashes);
   const compare = () => {
@@ -55,7 +58,7 @@ for (const bits of [4,8]) test(`delayed KV${bits} retains independent precision,
             const [keys,values]=cache.updateAndFetchQuantized(kr,vr);
             try {expected=quantizedSdpa(qr,keys,values,0.125,local,64,bits);} finally {disposeTriple(keys);disposeTriple(values);}
           } else {
-            const [keys,values]=cache.updateAndFetch(kr,vr);
+            const [keys,values]=kvStorage(cache).updateAndFetch(kr,vr);
             try {expected=ops.sdpa(qr,keys,values,0.125,"array",arr);} finally {keys.dispose();values.dispose();}
           }
           try {expect(digest(got)).toBe(digest(expected));} finally {expected.dispose();}
@@ -77,7 +80,7 @@ for (const bits of [4,8]) test(`delayed KV${bits} retains independent precision,
 
 
 for (const bits of [4, 8]) test(`captured KV${bits} attention survives multiple consumers, conversion and owner disposal`, () => {
-  const maintain = createKvMaintenance({ kvBits: bits, kvGroupSize: 64, quantizedKvStart: 5 });
+  const maintain = (rows: Cache[]) => settle(rows, bits);
   const source: Cache[] = [];
   for (const length of [2, 6]) {
     const row = new KVCache();
@@ -86,7 +89,7 @@ for (const bits of [4, 8]) test(`captured KV${bits} attention survives multiple 
     source.push(row);
   }
   maintain(source);
-  const group = new DelayedQuantizedKVCache(64, bits, 5, maintain); group.mergeRows(source);
+  const group = new DelayedQuantizedKVCache(64, bits, 5, unfusedAffineKernels); group.mergeRows(source);
   const mask = group.makeMask(1, null);
   using k = tensor(2, 1, 1, 70), v = tensor(2, 1, 1, 71);
   const view = group.appendAndFetch(k, v);
@@ -121,11 +124,10 @@ const zeros = (a: MlxArray) => { using z = ops.zeros(a.shape as number[], a.dtyp
 const maskDigest = (a: MlxArray) => { using bytes = a.astype(Dtype.uint8); return digest(bytes); };
 
 test("plain reads before conversion equal each row's plain cache at B1 and at B2 with unequal offsets", () => {
-  const maintain = createKvMaintenance({ kvBits: 4, kvGroupSize: 64, quantizedKvStart: 64 });
   for (const lengths of [[5], [2, 6]]) {
     const source = plainRows(lengths, 10), control = cloneKvCaches(source);
-    const group = new DelayedQuantizedKVCache(64, 4, 64, maintain); group.mergeRows(source);
-    const twin = new DelayedQuantizedKVCache(64, 4, 64, maintain); twin.mergeRows(source);
+    const group = new DelayedQuantizedKVCache(64, 4, 64, unfusedAffineKernels); group.mergeRows(source);
+    const twin = new DelayedQuantizedKVCache(64, 4, 64, unfusedAffineKernels); twin.mergeRows(source);
     const B = lengths.length;
     try {
       for (const [step, n] of [3, 1, 1, 2].entries()) {
@@ -139,7 +141,7 @@ test("plain reads before conversion equal each row's plain cache at B1 and at B2
             for (let row = 0; row < B; row++) {
               const at = (a: MlxArray, from: number, to: number) => a.slice([row, 0, from, 0], [row + 1, a.shape[1]!, to, a.shape[3]!]);
               using kr = k.slice([row, 0, 0, 0], [row + 1, 1, n, 64]), vr = v.slice([row, 0, 0, 0], [row + 1, 1, n, 64]);
-              const [ck, cv] = control[row]!.updateAndFetch(kr, vr);
+              const [ck, cv] = kvStorage(control[row]!).updateAndFetch(kr, vr);
               try {
                 using gk = at(keys, pads[row]!, pads[row]! + offsets[row]! + n), gv = at(values, pads[row]!, pads[row]! + offsets[row]! + n);
                 expect([digest(gk), digest(gv)], `step ${step} row ${row}`).toEqual([digest(ck), digest(cv)]);
@@ -161,9 +163,8 @@ test("plain reads before conversion equal each row's plain cache at B1 and at B2
 });
 
 test("plain reads are owned by the caller and outlive later appends", () => {
-  const maintain = createKvMaintenance({ kvBits: 4, kvGroupSize: 64, quantizedKvStart: 64 });
   const source = plainRows([2, 6], 30), control = cloneKvCaches(source);
-  const group = new DelayedQuantizedKVCache(64, 4, 64, maintain); group.mergeRows(source);
+  const group = new DelayedQuantizedKVCache(64, 4, 64, unfusedAffineKernels); group.mergeRows(source);
   try {
     using k1 = tensor(2, 1, 1, 31), v1 = tensor(2, 1, 1, 32), k2 = tensor(2, 1, 1, 33), v2 = tensor(2, 1, 1, 34);
     const [held, heldValues] = group.updateAndFetch(k1, v1);
@@ -175,7 +176,7 @@ test("plain reads are owned by the caller and outlive later appends", () => {
     for (let row = 0; row < 2; row++) {
       for (const [k, v] of [[k1, v1], [k2, v2]] as const) {
         using kr = k.slice([row, 0, 0, 0], [row + 1, 1, 1, 64]), vr = v.slice([row, 0, 0, 0], [row + 1, 1, 1, 64]);
-        for (const a of control[row]!.updateAndFetch(kr, vr)) a.dispose();
+        for (const a of kvStorage(control[row]!).updateAndFetch(kr, vr)) a.dispose();
       }
       const state = group.extractRow(row);
       try { expect(hashes(state)).toEqual(hashes(control[row]!)); } finally { state.dispose(); }
@@ -184,14 +185,14 @@ test("plain reads are owned by the caller and outlive later appends", () => {
 });
 
 test("a plain read appends to no row once any row is converted, before or by the scheduled maintenance", () => {
-  const maintain = createKvMaintenance({ kvBits: 4, kvGroupSize: 64, quantizedKvStart: 5 });
+  const maintain = (rows: Cache[]) => settle(rows, 4);
   const snapshot = (group: DelayedQuantizedKVCache) => ({ offsets: [...group.rowOffsets], pads: [...group.leftPad],
     rows: group.rowOffsets.map((_, row) => { const s = group.extractRow(row); try { return [s.constructor.name, ...hashes(s)]; } finally { s.dispose(); } }) });
   using k = tensor(2, 1, 1, 50), v = tensor(2, 1, 1, 51);
   // Mixed and fully converted rows refuse with no change at all.
   for (const lengths of [[2, 6], [6, 7]]) {
     const source = plainRows(lengths, 40); maintain(source);
-    const group = new DelayedQuantizedKVCache(64, 4, 5, maintain); group.mergeRows(source);
+    const group = new DelayedQuantizedKVCache(64, 4, 5, unfusedAffineKernels); group.mergeRows(source);
     try {
       const before = snapshot(group);
       expect(() => group.updateAndFetch(k, v)).toThrow("mixed precision rows use their attention state");
@@ -201,14 +202,14 @@ test("a plain read appends to no row once any row is converted, before or by the
   // Scheduled maintenance converts the second row at its offset; the first,
   // still plain, is not advanced.
   const source = plainRows([2, 4], 60), control = cloneKvCaches(source);
-  const group = new DelayedQuantizedKVCache(64, 4, 5, maintain); group.mergeRows(source);
+  const group = new DelayedQuantizedKVCache(64, 4, 5, unfusedAffineKernels); group.mergeRows(source);
   try {
     for (const a of group.updateAndFetch(k, v)) a.dispose();
     expect(group.rowOffsets).toEqual([3, 5]);
     expect(() => group.updateAndFetch(k, v)).toThrow("mixed precision rows use their attention state");
     expect(group.rowOffsets).toEqual([3, 5]);
     using k0 = k.slice([0, 0, 0, 0], [1, 1, 1, 64]), v0 = v.slice([0, 0, 0, 0], [1, 1, 1, 64]);
-    for (const a of control[0]!.updateAndFetch(k0, v0)) a.dispose();
+    for (const a of kvStorage(control[0]!).updateAndFetch(k0, v0)) a.dispose();
     const first = group.extractRow(0), second = group.extractRow(1);
     try {
       expect([first.constructor.name, ...hashes(first)]).toEqual([control[0]!.constructor.name, ...hashes(control[0]!)]);
@@ -218,9 +219,8 @@ test("a plain read appends to no row once any row is converted, before or by the
 });
 
 test("prefill defers conversion: a plain read past the offset appends while prefilling, and the next one after it refuses", () => {
-  const maintain = createKvMaintenance({ kvBits: 4, kvGroupSize: 64, quantizedKvStart: 5 });
   const source = plainRows([6, 3], 70), control = cloneKvCaches(source);
-  const group = new DelayedQuantizedKVCache(64, 4, 5, maintain); group.mergeRows(source);
+  const group = new DelayedQuantizedKVCache(64, 4, 5, unfusedAffineKernels); group.mergeRows(source);
   try {
     using k = tensor(2, 1, 2, 71), v = tensor(2, 1, 2, 72);
     group.beginPrefill();
@@ -228,7 +228,7 @@ test("prefill defers conversion: a plain read past the offset appends while pref
     try {
       for (let row = 0; row < 2; row++) {
         using kr = k.slice([row, 0, 0, 0], [row + 1, 1, 2, 64]), vr = v.slice([row, 0, 0, 0], [row + 1, 1, 2, 64]);
-        const [ck, cv] = control[row]!.updateAndFetch(kr, vr);
+        const [ck, cv] = kvStorage(control[row]!).updateAndFetch(kr, vr);
         try {
           const pad = group.leftPad[row]!, end = pad + control[row]!.offset;
           using gk = keys.slice([row, 0, pad, 0], [row + 1, 1, end, 64]), gv = values.slice([row, 0, pad, 0], [row + 1, 1, end, 64]);
@@ -245,9 +245,8 @@ test("prefill defers conversion: a plain read past the offset appends while pref
 
 for (const side of ["left", "right"] as const)
 test(`${side}-padded full prefill reads plain, finalizes its positions and decodes as the plain view and serial rows`, () => {
-  const maintain = createKvMaintenance({ kvBits: 4, kvGroupSize: 64, quantizedKvStart: 64 });
   const lengths = [3, 6], L = 6, pads = lengths.map(n => L - n);
-  const group = new DelayedQuantizedKVCache(64, 4, 64, maintain), twin = new DelayedQuantizedKVCache(64, 4, 64, maintain);
+  const group = new DelayedQuantizedKVCache(64, 4, 64, unfusedAffineKernels), twin = new DelayedQuantizedKVCache(64, 4, 64, unfusedAffineKernels);
   const control = lengths.map(() => new KVCache());
   const attentionMatches = (q: MlxArray, k: MlxArray, v: MlxArray, keys: MlxArray, values: MlxArray, mask: ReturnType<typeof group.makeMask>, twinMask: typeof mask, at: string) => {
     expect(twinMask.mode, at).toBe(mask.mode);
