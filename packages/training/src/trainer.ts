@@ -36,6 +36,7 @@ import {
 import { resolveRanks, bitsMapFromModel, readPerLayerKl, DEFAULT_TARGET_MODULES, type RankScaling } from "./rank";
 import { sftLoss, dpoLoss, dpoRefLogps, dpoMetrics, orpoLoss, orpoMetrics, type ChunkCtx, type SftScope } from "./loss";
 import { orpoLossPrefixShared, splitPrefixBatch } from "./prefix-shared";
+import { DEFAULT_FLASH_CCE, FlashCce, type FlashCceOptions } from "./kernels/flash-cce";
 import { AdamW, warmupCosineSchedule } from "./optimizer";
 import { writeFileSync, appendFileSync, mkdirSync } from "node:fs";
 
@@ -201,6 +202,25 @@ export const DEFAULT_TRAIN_CONFIG: TrainConfig = {
   adapterPath: "adapters",
   baseModel: "",
 };
+
+/** The flash-CCE head's kernel choices for one run, read from the environment
+ *  once, when the run is composed (A/B and diagnostic overrides; unset, the
+ *  production kernels, `DEFAULT_FLASH_CCE`). */
+export function flashCceOptions(): FlashCceOptions {
+  const on = (name: `MLX_BUN_${string}`) => runtimeValue(name) === "1";
+  return {
+    minRows: Number(runtimeValue("MLX_BUN_FLASH_MIN_M") ?? String(DEFAULT_FLASH_CCE.minRows)),
+    forwardSteel: !on("MLX_BUN_CCE_NOSTEEL"),
+    forwardFallback: on("MLX_BUN_CCE_LANE") ? "lane" : on("MLX_BUN_CCE_SCALAR") ? "scalar" : "simdgroup",
+    forwardSkipDequant: on("MLX_BUN_CCE_SG_SKIPDQ"),
+    backwardSteel: !on("MLX_BUN_CCE_BWD_NOSTEEL"),
+    backwardFallback: on("MLX_BUN_CCE_BWD_SCALAR") ? "scalar" : "simdgroup",
+    backwardSkipPhase2Dequant: on("MLX_BUN_CCE_BWD_SKIP_P2DQ"),
+    backwardSkipPhase2: on("MLX_BUN_CCE_BWD_SKIP_P2"),
+    backwardFilterEps: runtimeValue("MLX_BUN_CCE_BWD_FILTER_EPS") ?? DEFAULT_FLASH_CCE.backwardFilterEps,
+    backwardBlockEps: runtimeValue("MLX_BUN_CCE_BWD_BLOCK_EPS") ?? DEFAULT_FLASH_CCE.backwardBlockEps,
+  };
+}
 
 /** Build the per-leaf LoRA+ LR multipliers for flatParams' stable
  *  `[...A, ...B]` order. `undefined` keeps AdamW's uniform-LR fast path. */
@@ -892,12 +912,14 @@ async function orpoLoop(
   // full-[M,V] responseOnlyLogpMean, which would reintroduce [M,vocab] on e4b.
   const segUsesFusedHead = cfg.orpoFusedCe || cfg.orpoFlashCe;
   const segFusedChunk = segUsesFusedHead ? (cfg.orpoChunkSize > 0 ? cfg.orpoChunkSize : 512) : 0;
+  // The flash-CCE head's kernels, composed once for the run (`flashCceOptions`).
+  const flash = cfg.orpoFlashCe ? new FlashCce(flashCceOptions()) : undefined;
   // The prefix segmented head gathers response positions then routes per-branch
   // through the [M,V]-free flash/fused head (branchLogpMeanGathered, which takes a
   // ChunkCtx). Its own sink is managed per-step inside the class.
   const segPrefixChunk: ChunkCtx | undefined =
     cfg.orpoFusedCe || cfg.orpoFlashCe
-      ? { chunkSize: cfg.orpoChunkSize > 0 ? cfg.orpoChunkSize : 512, fused: true, flash: cfg.orpoFlashCe, sink: [] }
+      ? { chunkSize: cfg.orpoChunkSize > 0 ? cfg.orpoChunkSize : 512, fused: true, flash, sink: [] }
       : undefined;
   let segmentedOrpo: SegmentedBackwardOrpo | null = null;
   let segmentedOrpoPrefix: SegmentedBackwardOrpoPrefix | null = null;
@@ -928,7 +950,7 @@ async function orpoLoop(
   const chunk: ChunkCtx | undefined = useSegmented
     ? undefined
     : cfg.orpoFusedCe || cfg.orpoFlashCe
-      ? { chunkSize: fusedChunkSize, fused: true, flash: cfg.orpoFlashCe, sink: chunkSink }
+      ? { chunkSize: fusedChunkSize, fused: true, flash, sink: chunkSink }
       : cfg.orpoChunkSize > 0
         ? { chunkSize: cfg.orpoChunkSize, sink: chunkSink }
         : undefined;

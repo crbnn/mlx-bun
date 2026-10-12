@@ -840,9 +840,7 @@ const seamRatchet: RatchetTable = {
   "scheduler-core": {},
   // Composition rules: each entry names the PLAN.md item that removes it.
   "graph-extends": {},
-  "hot-path-read": {
-    "packages/training/src/kernels/flash-cce.ts": 9, // C2 for now
-  },
+  "hot-path-read": {},
   "cache-escape": {},
   "phase-by-shape": {},
 };
