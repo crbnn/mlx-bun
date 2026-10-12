@@ -25,13 +25,17 @@
 // - For each of those three shapes, a B2 group in which one row is cancelled at
 //   its third token, against the same pair run uncancelled (formed, admitted and
 //   started the same way): the cancelled row emits exactly the uncancelled
-//   row's first three tokens and rejects with the cancellation; its peer runs to
-//   its end equal to the uncancelled pair's peer (a pair's rows are compared
-//   with a pair, not with B1: under the bit-stability decision a row's last bits
-//   may depend on how many rows were batched with it); the drained group then
-//   serves the cancelled request again alone, equal to its B1 run (direct
-//   generation for grammar, a fresh group for proposals and fill) in tokens,
-//   forwards and projections.
+//   row's first three tokens and rejects with the cancellation; up to the
+//   cancel its peer equals the uncancelled pair's peer in tokens and forced
+//   spans; after the cancel the peer only completes, with the uncancelled
+//   peer's finish reason and within its request's token budget. Up to the
+//   cancel both pairs decode the same two rows, which is exact. After it the
+//   peer decodes alone while the uncancelled peer keeps decoding beside its
+//   row, so the peer's width class changes and its last bits may move (the
+//   plan's bit-stability decision): an fp16 tie can then tip a token, as it
+//   does on Llama 3.2 3B. The drained group then serves the cancelled request
+//   again alone, equal to its B1 run (direct generation for grammar, a fresh
+//   group for proposals and fill) in tokens, forwards and projections.
 // Compiled decode is off and the prompt tail is split on both paths, so every
 // step is observed and both issue the same calls.
 // Opt in with both of
@@ -182,7 +186,11 @@ const inputs = optIn(Bun.env);
 type Shape = "grammar" | "jump" | "fill";
 type FillMode = "strict" | "echo" | "reject";
 interface Request { prompt: PromptName; grammar?: GrammarName; fill?: FillMode }
-interface Outcome { tokens: number[]; spans: number[][]; status: "fulfilled" | "rejected"; error?: unknown; fill?: FillSession }
+interface Outcome {
+  tokens: number[]; spans: number[][]; status: "fulfilled" | "rejected"; error?: unknown; fill?: FillSession;
+  /** The batch group's finish reason, for a fulfilled row. */
+  finish?: "stop" | "length";
+}
 /** The custom graph's window descriptor. */
 interface Graph { args?: WindowDescriptor }
 /** MLX_BUN_FILL for a set of rows: echo (which a rejected-proposal row also needs) is additive to strict. */
@@ -222,8 +230,11 @@ async function setup() {
   // row's valid state before it) and every projection's complete logits, per row
   // and position.
   let trace: { forwards: Forward[]; projections: Projection[]; states: boolean } | null = null;
+  /** Told each forward's row count as the forward is issued (`watchForwards`). */
+  let forwardWatcher: ((rows: number) => void) | null = null;
   const view = observedPhases(model, {
     forward(ids: MlxArray, caches: Cache[]) {
+      forwardWatcher?.(ids.shape[0]!);
       if (!trace) return;
       const [B, L] = ids.shape as [number, number], flat = ids.toIntTokens();
       let state: Forward["state"] = null;
@@ -355,7 +366,9 @@ async function setup() {
    * `start`, which places, binds and samples it as the app's gateway does and
    * submits it; `hold` holds admission so rows started together prefill together. */
   const gateway = <T>(shape: Shape, fill: FillMode | undefined, maxBatch: number, run: (lane: {
-    prepare(request: Request, end?: { cancelAt?: number; onToken?: (emitted: number) => void }): Promise<{ start(): Promise<Outcome> }>;
+    prepare(request: Request, end?: { cancelAt?: number; onToken?: (emitted: number) => void }): Promise<{
+      start(): Promise<Outcome>; readonly tokens: readonly number[]; readonly spans: readonly (readonly number[])[];
+    }>;
     hold(held: boolean): void;
     drained(): Promise<void>;
   }) => Promise<T>) => under(shape, fill, async () => {
@@ -381,16 +394,17 @@ async function setup() {
           };
           sampling = method ? undefined : createRowSampling(makeStepSampler(options, { tokenRepresentation: "device",
             grammarWait: "external", historyUpdate: "after-sample", initialHistory: prompt }), sink);
-          await group.submit({ promptIds: prompt, prefillChunkSize: CHUNK, compiledDecode: execution.compiledDecode,
+          const stats = await group.submit({ promptIds: prompt, prefillChunkSize: CHUNK, compiledDecode: execution.compiledDecode,
             maxTokens: options.maxTokens!, eosTokenIds: options.eosTokenIds!, cacheNamespace: "", signal: abort.signal,
             reusesPrefix: binding.reusesPrefix(execution),
             ...(method ? { method, onToken: sink } : { sample: sampling!.sample, plainGreedy: sampling!.plainGreedy, onToken: sampling!.onToken }),
             ...(options.grammar ? { grammar: options.grammar } : {}) });
-          return { tokens, spans, status: "fulfilled", fill: options.fill };
+          return { tokens, spans, status: "fulfilled", fill: options.fill, finish: stats.finishReason };
         } catch (error) { return { tokens, spans, status: "rejected", error, fill: options.fill }; }
         finally { sampling?.dispose(); options.grammar?.dispose(); }
       };
-      return { start };
+      // The row's live token and forced-span lists, for a peer read while the row runs.
+      return { start, tokens: tokens as readonly number[], spans: spans as readonly (readonly number[])[] };
     };
     const drained = async () => {
       const deadline = Date.now() + 10_000;
@@ -422,6 +436,8 @@ async function setup() {
   };
   return {
     prompts, reference, single, alone, directFill, gateway, traced, checkFillApplied,
+    /** Call `watcher` with each forward's row count as it is issued; null stops. */
+    watchForwards(watcher: ((rows: number) => void) | null) { forwardWatcher = watcher; },
     release() {
       releaseWeights();
     },
@@ -512,7 +528,7 @@ describe.skipIf(!inputs)("sliding-window Universal grammar, grammar proposals an
       { together: false, rows: [{ prompt: "other", fill: "echo" }, { prompt: "short", fill: "strict" }] }]);
   }, 900_000);
 
-  test("a cancelled row leaves its peer equal to the same pair uncancelled, and the drained group serves the request again", async () => {
+  test("a cancelled row leaves its peer equal to the same pair uncancelled up to the cancel, and the drained group serves the request again", async () => {
     const cases: [Shape, Request, Request][] = [
       ["grammar", { prompt: "long", grammar: "json" }, { prompt: "short", grammar: "json" }],
       ["jump", { prompt: "long", grammar: "json" }, { prompt: "short", grammar: "json" }],
@@ -523,7 +539,7 @@ describe.skipIf(!inputs)("sliding-window Universal grammar, grammar proposals an
       const left = await env.single(shape, cancelled);
       assert(left.tokens.length > CANCEL_AT, `${label}: the cancelled request ends within ${CANCEL_AT} tokens`);
       // The same pair, formed, admitted and started as below, with no cancellation.
-      const [kept, whole] = await env.gateway(shape, fillMode([survivor, cancelled]), 2, async lane => {
+      const uncancelled = await env.gateway(shape, fillMode([survivor, cancelled]), 2, async lane => {
         const peer = await lane.prepare(survivor), other = await lane.prepare(cancelled);
         const { value, forwards } = await env.traced(false, async () => {
           lane.hold(true);
@@ -537,22 +553,45 @@ describe.skipIf(!inputs)("sliding-window Universal grammar, grammar proposals an
             .toEqual({ label, index, status: "fulfilled", error: "" });
           env.checkFillApplied(`${label} uncancelled row ${index}`, outcome.fill);
         });
-        return value;
+        return { outcomes: value, forwards };
       });
+      const [kept, whole] = uncancelled.outcomes;
       assert(whole!.tokens.length > CANCEL_AT, `${label}: the uncancelled second row ends within ${CANCEL_AT} tokens`);
       const reused = await env.gateway(shape, fillMode([survivor, cancelled]), 2, async lane => {
+        // What the peer had emitted as each forward was issued, so the exact part can
+        // be read once the run ends: the tokens it emitted before the first forward in
+        // which the two pairs differ, all of which came from forwards both pairs ran
+        // identically on identical state.
+        const emitted: { tokens: number; spans: number }[] = [];
         const peer = await lane.prepare(survivor), gone = await lane.prepare(cancelled, { cancelAt: CANCEL_AT });
+        env.watchForwards(() => { emitted.push({ tokens: peer.tokens.length, spans: peer.spans.length }); });
         const { value: [kept2, left2], forwards } = await env.traced(false, async () => {
           lane.hold(true);
           const outcomes = [peer.start(), gone.start()];
           lane.hold(false);
           return Promise.all(outcomes);
-        });
+        }).finally(() => env.watchForwards(null));
         expect(forwards.some(forward => forward.B === 2), `${label}: the rows never shared a forward`).toBe(true);
         expect({ label, status: left2!.status, error: String(left2!.error), tokens: left2!.tokens })
           .toEqual({ label, status: "rejected", error: "Error: client left", tokens: whole!.tokens.slice(0, CANCEL_AT) });
-        expect({ label, status: kept2!.status, error: String(kept2!.error ?? ""), tokens: kept2!.tokens, spans: kept2!.spans })
-          .toEqual({ label, status: "fulfilled", error: "", tokens: kept!.tokens, spans: kept!.spans });
+        // Up to the cancel the peer equals the uncancelled pair's peer; after it, it only completes.
+        const same = (a: Forward, b: Forward) => a.B === b.B && a.L === b.L && JSON.stringify(a.ids) === JSON.stringify(b.ids);
+        const split = forwards.findIndex((forward, index) => !uncancelled.forwards[index] || !same(forward, uncancelled.forwards[index]!));
+        assert(split > 0 && forwards.slice(0, split).some(forward => forward.B === 2),
+          `${label}: the pairs differ from forward ${split}, before they shared one`);
+        // The exact part can be empty: with grammar proposals the short row's first
+        // rounds run before the pair shares a verify round, so it is cancelled before
+        // its peer emits a token, and the pairs differ from the peer's first round.
+        const at = emitted[split]!;
+        console.log(`[sliding] ${label}: the pairs' forwards agree through ${split} of ${forwards.length}; the peer equals ` +
+          `the uncancelled pair's for its first ${at.tokens} of ${kept2!.tokens.length} tokens, finish ${kept2!.finish}`);
+        expect({ label, status: kept2!.status, error: String(kept2!.error ?? ""),
+          tokens: kept2!.tokens.slice(0, at.tokens), spans: kept2!.spans.slice(0, at.spans) })
+          .toEqual({ label, status: "fulfilled", error: "", tokens: kept!.tokens.slice(0, at.tokens), spans: kept!.spans.slice(0, at.spans) });
+        const budget = survivor.grammar ? GRAMMARS[survivor.grammar].maxTokens : FILL_TOKENS;
+        expect({ label, finish: kept2!.finish, withinBudget: kept2!.tokens.length <= budget,
+          atBudgetWhenLength: kept2!.finish !== "length" || kept2!.tokens.length === budget })
+          .toEqual({ label, finish: kept!.finish, withinBudget: true, atBudgetWhenLength: true });
         env.checkFillApplied(`${label} peer`, kept2!.fill);
         await lane.drained();
         // The same group serves the cancelled request again, alone.
