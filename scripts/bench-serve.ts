@@ -8,7 +8,7 @@
 //     --candidate-root DIR --candidate-command '["bun","DIR/apps/mlx-bun/bin/mlx-bun.mjs","serve"]'
 //     --native /abs/libmlxc.dylib --model ID=PATH[=LABEL] ...
 //     [--reference 'LABEL={"command":[...],"registerCommand":[...],"version":"..."}' ...]
-//     [--configurations default,serial,mixed,mtp2,mtp3,dflash2] [--draft ID=/abs/mtp-companion]
+//     [--configurations default,serial,mixed,mtp2,mtp3,dflash2,dflash2-d7-baseline] [--draft ID=/abs/mtp-companion]
 //     [--dflash2-draft ID=/abs/drafter[=/abs/target-basis.json]] [--sessions N] [--skip-context]
 //   bun scripts/bench-serve.ts run --plan /abs/plan.json --out /abs/empty-dir
 //   bun scripts/bench-serve.ts compare /abs/run/run.json
@@ -34,7 +34,7 @@ const USAGE = `Paired serve benchmark: baseline tree versus candidate tree over 
       --candidate-root DIR --candidate-command '["bun","DIR/apps/mlx-bun/bin/mlx-bun.mjs","serve"]'
       --native /abs/libmlxc.dylib --model ID=/abs/snapshot[=LABEL] ...
       [--reference 'LABEL={"command":["PY","-m","mlx_lm.server"],"registerCommand":[...],"version":"..."}' ...]
-      [--configurations default,serial,mixed,mtp2,mtp3,dflash2] [--draft ID=/abs/mtp-companion]
+      [--configurations default,serial,mixed,mtp2,mtp3,dflash2,dflash2-d7-baseline] [--draft ID=/abs/mtp-companion]
       [--dflash2-draft ID=/abs/drafter[=/abs/target-basis.json]] [--sessions N] [--skip-context]
   bun scripts/bench-serve.ts run --plan /abs/plan.json --out /abs/empty-dir [--ready-timeout-ms N]
   bun scripts/bench-serve.ts compare /abs/run-dir/run.json
@@ -43,7 +43,9 @@ Profile all must be main's full matrix (cpm5, e4b, 12B, qwen27b × default, seri
 mlx-lm reference), optionally followed by mtp2,mtp3 for models given a --draft MTP companion and dflash2
 for models given a --dflash2-draft drafter (--kv-quant 4 --num-draft-tokens adaptive; the optional basis
 file goes to both servers as MLX_BUN_DFLASH2_TARGET_BASIS, which main reads and the refactor ignores);
-anything narrower is scoped and never full qualification. --sessions N (default 1) runs every tree N
+anything narrower is scoped and never full qualification. dflash2-d7-baseline is the DFlash 2
+configuration against a baseline graph that declares no verify costs: the baseline at
+--num-draft-tokens 7, the candidate adaptive; its trees differ, so its probes and pairing are notes. --sessions N (default 1) runs every tree N
 times per model and configuration, alternating trees (A B A B), each session a fresh server; the report
 pairs each session with its counterpart. Outputs must lie outside
 every tree. run exits 0 only when every applicable cell measured every required phase with stable
