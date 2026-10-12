@@ -21,6 +21,20 @@ export type KvStorageScheme =
   /** Full-attention layers TurboQuant-encoded; sliding-window layers stay bf16. */
   | { readonly kind: "turbo"; readonly kBits: number; readonly vBits: number; readonly quantizedKvStart?: number };
 
+/** Full-attention keys and values held in pages (`--paged-kv`). */
+export interface PagedKvComposition {
+  /** Positions per page. */
+  readonly blockSize: number;
+  /** The pages' read of at most eight queries without an array mask (decode,
+   * and prefill and verification windows that short): the direct Metal kernel
+   * over the blocks (Lab numerics) where true, otherwise the gathered blocks
+   * through the fused SDPA (the numerical control). Pages the kernel does not
+   * read (TurboQuant, affine widths that straddle a 32-bit word) read gathered.
+   * A compiled decode step cannot hold the kernel (its partitions follow the
+   * context length); one that records a paged layer reads it gathered. */
+  readonly direct: boolean;
+}
+
 export interface AffineKvLayer {
   readonly layer: number;
   readonly bits: number;
@@ -50,7 +64,7 @@ export interface Composition {
    * (`--paged-kv`), or null. Every request's state takes the paged lego in place
    * of the plain full-attention storage the graph composes; its pages store
    * what `kv` names. */
-  readonly pagedKv: { readonly blockSize: number } | null;
+  readonly pagedKv: PagedKvComposition | null;
   readonly draftDepth: DraftDepth;
   /** The prefill chunk size, in prompt tokens, the composition is built for.
    * The prefill planner may hand the graph fewer rows than this as a prompt's

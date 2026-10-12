@@ -7,7 +7,6 @@
 
 import { disposeResources } from "../../runtime/resources";
 import { pagedAttentionView } from "../../kernels/attention/paged";
-import { runtimeFlag } from "../../runtime/config";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
@@ -298,12 +297,12 @@ function directReadable(quantization: PagedQuantization | undefined, turbo: Page
  *  so the wiring (maybePageKv) needs no per-model shape plumbing.
  *
  *  Reads: each owns an immutable view of the blocks as of its append
- *  (`pagedAttentionView`). Decode attends its one query with the kernel `direct`
- *  fixes at construction: the direct Metal read from the blocks, or the
- *  gathered blocks through the stock fused SDPA with no mask. A window always
- *  gathers and runs the fused SDPA with the causal mask, whatever its length;
- *  the deprecated `attentionState` view still sends a direct cache's windows of
- *  up to eight queries to the direct kernel instead.
+ *  (`pagedAttentionView`). Decode attends its one query, and a window its
+ *  queries under the causal mask, with the read `direct` (the composition's
+ *  `pagedKv.direct`) fixes at construction: the direct Metal read from the
+ *  blocks for at most eight queries, or the gathered blocks through the stock
+ *  fused SDPA (decode with no mask, a window with the causal mask). A window of
+ *  more than eight queries gathers under either.
  *
  *  The other reads are `KVCache`'s over the gathered blocks, so bf16 pages read
  *  bit for bit as the bf16 lego they replace: a committed span is the window
@@ -318,14 +317,14 @@ function directReadable(quantization: PagedQuantization | undefined, turbo: Page
  *  decode, the causal mask for a window); the other reads take the window
  *  decoded to the values' own domain. The direct read takes bf16 pages and
  *  affine widths that divide 32 bits; other pages read gathered whatever the
- *  flag says.
+ *  composition says.
  *
  *  Compiled decode: a concat slot. The stored positions are gathered (and
  *  dequantized) outside the recorded graph, as the decode read gathers them; in
  *  it the new position is stored as the pages store it (quantized and
  *  dequantized again on affine pages) and joined to them, and the fused SDPA
  *  reads the joined window with no mask, the gathered decode read. The direct
- *  read (`MLX_BUN_PAGED_ATTN`, Lab) is a custom kernel whose partitions follow
+ *  read (`pagedKv.direct`, Lab) is a custom kernel whose partitions follow
  *  the context length, which a shapeless recorded graph cannot hold: a direct
  *  cache decodes through the gathered read (its numerical control) inside a
  *  compiled step. The row leaves the graph as it was appended; the write after
@@ -352,7 +351,7 @@ export class PagedKVCache implements CommittedAttentionCache, BidirectionalAtten
     /** Tokens this cache must be able to hold (prompt + maxTokens). */
     readonly capacityTokens: number,
     readonly blockSize: number,
-    direct = runtimeFlag("MLX_BUN_PAGED_ATTN", false),
+    direct = false,
     /** Affine pages; absent with `turbo` absent: bf16 pages. */
     readonly quantization?: PagedQuantization,
     /** The masks the bidirectional and encoder reads lease. */
@@ -390,7 +389,7 @@ export class PagedKVCache implements CommittedAttentionCache, BidirectionalAtten
   appendWindow(k: MlxArray, v: MlxArray): AttentionRead {
     this.append(k, v);
     if (this.turbo) return this.#turboRead(causalLease);
-    return pagedRead(pagedAttentionView(this.pool!, [...this.blockTable], this.offset, false), { mode: "causal", arr: null });
+    return pagedRead(pagedAttentionView(this.pool!, [...this.blockTable], this.offset, this.direct), { mode: "causal", arr: null });
   }
 
   /** TurboQuant pages: the layer's kernel set over the window it decodes. */

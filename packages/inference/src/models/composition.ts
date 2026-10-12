@@ -37,9 +37,10 @@ export interface CompositionRequest {
     readonly fusedSdpa?: boolean;
   };
   /** Paged KV (`--paged-kv`): full-attention storage in pages of `blockSize`
-   * positions (default 256). Absent or null: unpaged. Pages store what the KV
-   * scheme names for each layer. */
-  readonly pagedKv?: { readonly blockSize?: number } | null;
+   * positions (default 256), read by the direct kernel where `direct` (default
+   * false; see `PagedKvComposition`). Absent or null: unpaged. Pages store what
+   * the KV scheme names for each layer. */
+  readonly pagedKv?: { readonly blockSize?: number; readonly direct?: boolean } | null;
   /** The loaded drafter's tokens per round, and whether the scheduler adapts
    * each round's count up to it. Absent or null: no drafter. */
   readonly draft?: { readonly numDraftTokens: number; readonly adaptive?: boolean } | null;
@@ -94,7 +95,8 @@ function compose(request: Omit<CompositionRequest, "kv">, kv: Composition["kv"])
   const mixedTokenBudget = request.mixedTokenBudget ?? COMPOSITION_DEFAULTS.mixedTokenBudget;
   if (!Number.isSafeInteger(mixedTokenBudget) || mixedTokenBudget < 1)
     throw new Error("composition mixedTokenBudget must be a positive integer");
-  const pagedKv = request.pagedKv ? Object.freeze({ blockSize: request.pagedKv.blockSize ?? PagedKVCache.DEFAULT_BLOCK_SIZE }) : null;
+  const pagedKv = request.pagedKv ? Object.freeze({ blockSize: request.pagedKv.blockSize ?? PagedKVCache.DEFAULT_BLOCK_SIZE,
+    direct: request.pagedKv.direct ?? false }) : null;
   if (pagedKv && (!Number.isSafeInteger(pagedKv.blockSize) || pagedKv.blockSize < 1))
     throw new Error("composition paged KV block size must be a positive integer");
   const runtime = runtimeConfig();

@@ -73,7 +73,8 @@ plain run.
 request, drafted, grammar, fill, media and adapter rows included, keeps its
 full-attention keys and values in blocks. Pages store what `--kv-quant` names
 for each layer: bf16, affine at the scheme's width (per layer under `config`),
-or TurboQuant.
+or TurboQuant. `--paged-kv-direct` reads them with the direct Metal kernel
+(Lab numerics) for decode and windows of up to eight queries.
 As main's server did, startup also rejects `--kv-quant turbo` when the model's
 full-attention head dimension is not one the TurboQuant codec encodes
 (`TURBOQUANT_HEAD_DIMS`), before any request, instead of failing each request in
@@ -581,8 +582,8 @@ lifecycle, numerical parity, or performance.
 
 The opt-in [paged KV test](tests/engine/paged-kv.test.ts) also covers Gemma4
 HTTP cancellation for each paged reader: the gathered reader and the direct
-reader that `MLX_BUN_PAGED_ATTN=1` selects (read, like every `MLX_BUN_` switch,
-into the runtime snapshot from the environment). A client leaves a greedy
+reader that `--paged-kv-direct` composes (the composition's `pagedKv.direct`,
+which `/stats` prints). A client leaves a greedy
 `/v1/completions` stream mid-generation; the server observes the disconnect, the
 row stops storing tokens before its natural end, and the scheduler drains. The
 same server then answers another prompt and the abandoned one exactly as a fresh

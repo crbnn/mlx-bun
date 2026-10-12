@@ -130,11 +130,13 @@ export function parseServeOptions(args: CommandArgs): ServeOptions {
     ? { ...(draftModel !== undefined ? { model: draftModel } : {}), ...(draftKind ? { kind: draftKind } : {}),
       ...(numDraftTokens !== undefined ? { numTokens: numDraftTokens } : {}), ...(adaptiveDepth ? { adaptiveDepth } : {}),
       ...(ngramMax !== undefined ? { ngramMax } : {}), ...(ngramMin !== undefined ? { ngramMin } : {}) } : undefined;
-  // Main's paged KV: the flag or its env mirror; the block size only with paging.
+  // Main's paged KV: the flag or its env mirror; the block size and the direct read only with paging.
   const pagedKv = args.values["paged-kv"] === true || runtimeValue("MLX_BUN_PAGED_KV") === "1";
   const blockSize = number("paged-kv-block-size", 1, Number.MAX_SAFE_INTEGER, true);
+  const direct = args.values["paged-kv-direct"] === true;
   if (blockSize !== undefined && !pagedKv) throw new Error("--paged-kv-block-size requires --paged-kv");
-  if (pagedKv) cache.pagedKv = blockSize !== undefined ? { blockSize } : {};
+  if (direct && !pagedKv) throw new Error("--paged-kv-direct requires --paged-kv");
+  if (pagedKv) cache.pagedKv = { ...(blockSize !== undefined ? { blockSize } : {}), ...(direct ? { direct } : {}) };
   const memoryBudget = number("memory-budget");
   const modelBudget = number("model-budget");
   if (modelBudget !== undefined && modelBudget <= 0) throw new Error("--model-budget expects a number of GB above 0");

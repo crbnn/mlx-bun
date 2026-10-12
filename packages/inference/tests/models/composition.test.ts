@@ -163,18 +163,19 @@ test("openModel, the convenience load, takes the same record and the same defaul
   try { expect(defaulted.composition).toEqual(resolveComposition(config)); } finally { defaulted.weights.dispose(); }
 });
 
-test("paging is a composition fact over every KV scheme, the block size given or 256", () => {
+test("paging is a composition fact over every KV scheme, the block size given or 256, the gathered read unless direct", () => {
   expect(resolveComposition(config).pagedKv).toBeNull();
-  expect(resolveComposition(config, { pagedKv: {} }).pagedKv).toEqual({ blockSize: 256 });
+  expect(resolveComposition(config, { pagedKv: {} }).pagedKv).toEqual({ blockSize: 256, direct: false });
+  expect(resolveComposition(config, { pagedKv: { direct: true } }).pagedKv).toEqual({ blockSize: 256, direct: true });
   expect(resolveComposition(config, { pagedKv: { blockSize: 16 }, kv: { override: 8 } })).toMatchObject({
-    pagedKv: { blockSize: 16 }, kv: { kind: "affine", bits: 8 } });
+    pagedKv: { blockSize: 16, direct: false }, kv: { kind: "affine", bits: 8 } });
   expect(() => resolveComposition(config, { pagedKv: { blockSize: 0 } })).toThrow("composition paged KV block size must be a positive integer");
   // Pages store what the scheme names for each layer: per-layer, any width, TurboQuant.
   const listed = { ...config, kvQuant: [{ layerIdx: 0, bits: 4, groupSize: 64 }] };
   for (const kv of [{ override: "config" as const }, { turboQuant: { kBits: 8, vBits: 3 } }, { override: 3 }]) {
     const composed = resolveComposition(listed, { kv, pagedKv: {} });
     expect(composed.kv).toEqual(resolveComposition(listed, { kv }).kv);
-    expect(composed.pagedKv).toEqual({ blockSize: 256 });
+    expect(composed.pagedKv).toEqual({ blockSize: 256, direct: false });
   }
 });
 

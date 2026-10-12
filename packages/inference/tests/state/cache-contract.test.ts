@@ -186,7 +186,7 @@ const pagedAs = (name: string, scheme: KvStorageScheme, layer: number, tolerance
   make: masks => {
     const held = masks ?? new AttentionMasks();
     const caches = Array.from({ length: layer + 1 }, (_, index) => composedFullAttentionCache(scheme, index, held, kernels));
-    maybePageKv(caches, scheme, { blockSize: 16 }, 256);
+    maybePageKv(caches, scheme, { blockSize: 16, direct: false }, 256);
     for (const cache of caches.slice(0, layer)) cache.dispose();
     expect(caches[layer]).toBeInstanceOf(PagedKVCache);
     return caches[layer]!;

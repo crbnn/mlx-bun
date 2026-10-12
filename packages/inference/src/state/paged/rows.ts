@@ -1,7 +1,6 @@
 import type { AttentionRead, Cache, CommittedAttentionCache, KvAttentionView, KvDonorRows, Mask, SpeculativeRowLayout } from "../../contracts/mlx/cache";
 import { buildBatchedDecodeMask, mergeKVRows } from "../batched-mask";
 import * as ops from "@mlx-bun/mlx/ops";
-import { runtimeFlag } from "../../runtime/config";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { disposeResources } from "../../runtime/resources";
 import { PagedKVCache, poolBlocksFor, type PagedQuantization, type PagedTurboQuant } from "./cache";
@@ -35,7 +34,7 @@ export class PagedKvRows implements CommittedAttentionCache, SpeculativeRowLayou
   readonly #decode: (keys: MlxArray, values: MlxArray) => AttentionRead;
   readonly #window: (keys: MlxArray, values: MlxArray) => AttentionRead;
 
-  constructor(readonly capacityTokens: number, readonly blockSize: number, readonly direct = runtimeFlag("MLX_BUN_PAGED_ATTN", false),
+  constructor(readonly capacityTokens: number, readonly blockSize: number, readonly direct = false,
     readonly quantization?: PagedQuantization, readonly turbo?: PagedTurboQuant) {
     const alone = direct || quantization !== undefined || turbo !== undefined;
     this.#decode = alone ? (keys, values) => this.#rowReads(keys, values, (row, k, v) => row.appendDecode(k, v))

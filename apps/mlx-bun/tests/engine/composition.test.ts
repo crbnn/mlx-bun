@@ -71,3 +71,16 @@ test("the loaded drafter settles the draft depth before the graph is built: its 
     } finally { context.dispose(); }
   }
 });
+
+test("paging and its read are composition fields, and /stats prints them", async () => {
+  const { loadContext } = await import("../../src/engine/model-host");
+  const { modelServingBinding } = await import("../../src/engine/model-serving");
+  for (const [request, wire] of [[{}, { block_size: 256, direct: false }], [{ blockSize: 16, direct: true }, { block_size: 16, direct: true }]] as const) {
+    const context = await loadContext(dir, "tiny", { pagedKv: request });
+    try {
+      expect(context.composition!.pagedKv).toEqual({ blockSize: wire.block_size, direct: wire.direct });
+      const binding = await modelServingBinding(context);
+      expect((binding.diagnostics() as { composition: { paged_kv: unknown } }).composition.paged_kv).toEqual(wire);
+    } finally { context.dispose(); }
+  }
+});

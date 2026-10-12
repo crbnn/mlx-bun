@@ -53,7 +53,7 @@ describe("placement follows the graph's declarations", () => {
   test("a paged composition pages every request's state; adapters and compiled decode are placed from their declarations", () => {
     // Paging is the composition's, not the graph's: any graph's plain full-attention storage pages, and
     // requests are planned exactly as without it.
-    const paged = bind(replacement({}, { composition: testComposition(undefined, { pagedKv: { blockSize: 16 } }) }));
+    const paged = bind(replacement({}, { composition: testComposition(undefined, { pagedKv: { blockSize: 16, direct: false } }) }));
     for (const request of [shape, { ...shape, hasAdapters: true }, { ...shape, hasGrammar: true }]) {
       const plan = paged.plan(request, {}, schedule);
       expect(placement(plan)).toEqual(placement(bind(replacement()).plan(request, {}, schedule)));

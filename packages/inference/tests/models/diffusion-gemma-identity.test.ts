@@ -365,7 +365,7 @@ test("seeded generation: the denoising engine produces identical tokens, step lo
 // weights run here): their canvas logits are compared with the bf16 graph's on
 // the same canvases, by KL, and reported.
 const composedGraph = (kv: KvStorageScheme, paged: boolean) =>
-  new DiffusionGemmaModel(weights, config, testComposition(kv, paged ? { pagedKv: { blockSize: 16 } } : {}));
+  new DiffusionGemmaModel(weights, config, testComposition(kv, paged ? { pagedKv: { blockSize: 16, direct: false } } : {}));
 
 test("the composition's paging: paged bf16 canvas passes equal the frozen bf16 graph's", () => {
   const paged = composedGraph({ kind: "bf16" }, true);

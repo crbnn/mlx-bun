@@ -86,14 +86,17 @@ test("encoded paged checkpoints restore through both SSD transports and grow ind
 
 test("the paged prefix namespace names what the pages store: bf16 and uniform affine as before, per-layer and TurboQuant apart", async () => {
   const { pagedPrefixNamespace } = await import("../../src/state/request-policy");
-  const paged = { blockSize: 16 };
-  const ns = (kv: Parameters<typeof pagedPrefixNamespace>[0]) => pagedPrefixNamespace(kv, paged, "base", false);
+  const paged = { blockSize: 16, direct: false };
+  const ns = (kv: Parameters<typeof pagedPrefixNamespace>[0]) => pagedPrefixNamespace(kv, paged, "base");
   // The namespaces bf16 and uniform pages had before per-layer and TurboQuant pages existed.
   expect(ns({ kind: "bf16" })).toBe(JSON.stringify(["paged-v1", 16, 0, 64, false, "base"]));
   expect(ns({ kind: "affine", bits: 4, groupSize: 64, kernels: "unfused" })).toBe(JSON.stringify(["paged-v1", 16, 4, 64, false, "base"]));
   const names = [ns({ kind: "bf16" }), ns({ kind: "affine", bits: 8, groupSize: 64, kernels: "unfused" }),
     ns({ kind: "affine-layers", layers: [{ layer: 0, bits: 8, groupSize: 64 }], kernels: "tiled-causal" }),
     ns({ kind: "affine-layers", layers: [{ layer: 1, bits: 8, groupSize: 64 }], kernels: "tiled-causal" }),
-    ns({ kind: "turbo", kBits: 8, vBits: 3 }), ns({ kind: "turbo", kBits: 4, vBits: 2 })];
+    ns({ kind: "turbo", kBits: 8, vBits: 3 }), ns({ kind: "turbo", kBits: 4, vBits: 2 }),
+    pagedPrefixNamespace({ kind: "bf16" }, { ...paged, direct: true }, "base")];
   expect(new Set(names).size).toBe(names.length);
+  // The direct read keeps the namespace main's MLX_BUN_PAGED_ATTN=1 gave it.
+  expect(pagedPrefixNamespace({ kind: "bf16" }, { ...paged, direct: true }, "base")).toBe(JSON.stringify(["paged-v1", 16, 0, 64, true, "base"]));
 });

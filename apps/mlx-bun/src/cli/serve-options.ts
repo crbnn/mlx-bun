@@ -95,8 +95,8 @@ export interface ServeKvFlags {
   kvQuant?: KvQuantOverride;
   turboQuant?: TurboQuantScheme;
   quantizedKvStart?: number;
-  /** `--paged-kv` and `--paged-kv-block-size`: the composition's paging. */
-  pagedKv?: { blockSize?: number };
+  /** `--paged-kv`, `--paged-kv-block-size` and `--paged-kv-direct`: the composition's paging. */
+  pagedKv?: { blockSize?: number; direct?: boolean };
 }
 
 /** Main's MLX_BUN_SHUTDOWN_TIMEOUT_MS: any finite value > 0, else 120 s. How long a close may take to drain work and flush saved state. */

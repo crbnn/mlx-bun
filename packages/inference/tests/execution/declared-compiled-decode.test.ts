@@ -99,7 +99,7 @@ test("every KV scheme and paging keeps the compiled step: each cache lego has it
   for (const [name, extra] of [
     ["TurboQuant storage", { composition: testComposition(TURBO) }],
     ["delayed affine storage", { composition: testComposition(DELAYED_AFFINE) }],
-    ["paged storage", { composition: testComposition(undefined, { pagedKv: { blockSize: 16 } }) }],
+    ["paged storage", { composition: testComposition(undefined, { pagedKv: { blockSize: 16, direct: false } }) }],
   ] as const) {
     const fixture = graph({ compiledDecode: true }, extra);
     const declared = countingStep(fixture);

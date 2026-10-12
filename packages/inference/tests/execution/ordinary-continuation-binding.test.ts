@@ -104,7 +104,7 @@ test("Gemma2 softcap plans shared continuation for plain, affine and TurboQuant 
 });
 
 test("a paged composition pages plain, adapter and media requests alike and keys their checkpoints in its namespace", () => {
-  const graph = <M extends object>(prototype: M, modelType: string, pagedKv: { blockSize: number } | null) => Object.assign(Object.create(prototype), {
+  const graph = <M extends object>(prototype: M, modelType: string, pagedKv: { blockSize: number; direct: boolean } | null) => Object.assign(Object.create(prototype), {
     config: { modelType, text: { enableMoeBlock: false }, eosTokenIds: [] },
     makeCache: () => [new KVCache()], loraState: { active: [] }, requiredDenseKvLayers: [],
     composition: testComposition(undefined, { pagedKv }),
@@ -113,7 +113,7 @@ test("a paged composition pages plain, adapter and media requests alike and keys
   const store = { findGenerationCheckpoint: (...args: unknown[]) => { lookups.push(args); return null; } } as unknown as ContinuationStore;
   const services = { checkpoints: store, checkpointPersistence: new ContinuationPersistence(store, { maxBytes: 1024 }),
     checkpointEveryTokens: 4, identity: "fixture" } as unknown as ContinuationServices;
-  const binding = bindMlxGateway(graph(Gemma4Model.prototype, "gemma4", { blockSize: 16 }));
+  const binding = bindMlxGateway(graph(Gemma4Model.prototype, "gemma4", { blockSize: 16, direct: false }));
   const unpaged = bindMlxGateway(graph(Gemma4Model.prototype, "gemma4", null));
   for (const each of [binding, unpaged]) each.configureContinuation!(services);
   const schedule = { checkpoints: true };
@@ -156,7 +156,7 @@ test("a paged composition pages plain, adapter and media requests alike and keys
   expect(fresh.key.startsWith("uncached-prepared-input:")).toBe(true);
   expect(fresh.promptCache).toBeUndefined();
   // Any graph pages: the composition pages Qwen 3.5's plain full-attention storage the same way.
-  const qwen = bindMlxGateway(graph(Qwen35Model.prototype, "qwen3_5", { blockSize: 16 }));
+  const qwen = bindMlxGateway(graph(Qwen35Model.prototype, "qwen3_5", { blockSize: 16, direct: false }));
   qwen.configureContinuation!(services);
   for (const request of [shape, adapterShape]) {
     const placed = qwen.plan(request, adapters, schedule);
