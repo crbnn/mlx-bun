@@ -405,6 +405,13 @@ export class CompiledDecode implements MlxCompiledDecodeStep {
       }
       // every segment and js layer succeeded — commit the staged ring adopts
       for (const { c, slot, bufs } of stagedAdopts) c.commitDecodeStep(slot, bufs);
+      // The js layers read their caches through the ordinary decode read, so
+      // those caches take the post-dispatch hook the scheduler gives them after
+      // the decode operation (batch-group): a row layout's per-row RoPE
+      // positions stay fixed across a step and advance only there
+      // (`BatchedRotatingQuantCache.ropeOffsetArr`), and without it every
+      // later step ropes at the positions of the step that last refreshed them.
+      for (const { c } of committedJs) (c as { releaseRopeArr?: () => void }).releaseRopeArr?.();
     } catch (e) {
       // unwind: free staged (never-adopted) ring buffers and the owned hidden
       // state, and revert the js layers' committed writes, so the caller's
