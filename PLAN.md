@@ -378,7 +378,32 @@ to callers outside `state/`. Every one of these is a method learning the represe
       2 weights here); fill choosing committed spans or single tokens by
       `MlxKnownSpans.affineKvBits / turboQuantFormats`, a capability naming KV formats, which
       goes when `appendKnown` works over every lego. These are the last "not with that cache"
-      answers in the tree; the plan does not close with them unless Josh scopes one out.
+      answers in the tree. Decided by Josh, 2026-10-12: build all five, with synthetic-weight
+      identity gates against a frozen oracle where no artifact exists (Gemma 2, GLM-5.2);
+      nothing is scoped out, because scoping a cache out of a model is the multiplicative
+      answer this refactor deletes. Item B4 below.
+
+#### B4. The last lego forms
+
+- [ ] Compiled decode on the TurboQuant, delayed-start and paged legos, so `compiledDecode`
+      resolves from the composition alone and `decodesCompiled` in `state/kv-maintenance` goes.
+- [ ] Pages under a per-layer affine scheme and under TurboQuant (paged pages are bf16, 4 or 8
+      today); the load-time refusal goes.
+- [ ] The graphs that build their own caches compose the KV scheme and paging: DiffusionGemma's
+      `makeCache` takes the scheme; GLM-5.2's MLA storage gains its affine, TurboQuant and paged
+      forms as legos of the latent-attention contract; the load-time refusal goes.
+- [ ] Gemma 2's softcap read over affine storage after the conversion point, on every row kind;
+      `DenseKvReadError` and its HTTP 501 go.
+- [ ] `appendKnown` over every lego, so fill no longer chooses committed spans or single tokens
+      by `MlxKnownSpans.affineKvBits / turboQuantFormats`; that capability goes.
+- [ ] Order: after the merge of E5, the B3 planner side and the ratchet item, which own the
+      contract and the legos these build on.
+
+Exit: no load-time or run-time error anywhere in the tree whose text names a cache
+representation together with a model, method or row kind; the conformance suite covers each new
+form; where the artifact exists (e4b, MiniCPM5, Llama, the Trellis artifact) the forms are gated
+by digest or KL against the tiled null as B3 did, and elsewhere by a frozen oracle over synthetic
+weights at maxDiff 0.
 
 Exit: on e4b, speculative-group (assistant drafter), grammar-group, fill, prefix reuse and the SSD
 round-trip each run under every lego the composition can name (bf16, affine uniform, affine
