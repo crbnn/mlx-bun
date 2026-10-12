@@ -492,7 +492,31 @@ same phase; the Qwen generator (D2) produces it.
       reads a snapshot's config and shard headers; the committed file regenerates with an empty
       diff). The M1 Max output needs, first: layer classes for the fused gate/up reduce kernels
       and the packed down (today functions), the TQ graph's three env A/B flags turned into
-      composition facts or separate kernels, and an identity gate run on that host.
+      composition facts or separate kernels, and an identity gate run on that host. Landed
+      (`refactor/composition-d2-m1max`, da549488, nine commits on 832ac8b1; merging onto the
+      integration head with the install-time compile). The generator takes the composition
+      `qwen38-27b-trellis-m1max` (fingerprint `cfa205c8f5af046a`, device `applegpu_g13s`,
+      every KV scheme, any row count, no bridge) and emits `Qwen38TrellisM1Max`, an entire
+      graph over the shared blocks; its device table is the LUT the width-table idea
+      describes, as data: reduce and scatter layers at one to four rows, the generic blocks
+      from five, `QuantizedLinear` for every projection and the head, lazy verify, known
+      tokens as windows. New layers, one kernel each: `ReduceGateUpRow(s)`,
+      `ReduceMixedGateUp` (tail chosen at construction), `ScatterDownRow(s)`,
+      `ScatterDownK3iRow(s)`, each reading its decode variant (`TrellisLinear.variant`), the
+      GPU family's representations and the shared codebook in its constructor. The flags:
+      `MLX_BUN_QWEN38_TQ_MIXED_GATEUP` is the composition field `mixedGateUp` (default
+      `split`; `fused` and `off` still generate and the drift test checks each);
+      `MLX_BUN_QWEN38_TQ_FOLD_QK_SCALE` is unconditional in the template (bit-identical; the
+      generic graph is the unfolded control); `MLX_BUN_QWEN38_TQ_GRAPH` had gone with E1. The
+      hand-written TQ graph is deleted and the `graph-extends` ratchet is empty. Gates on the
+      M1 Max: 14 identity tests, 708 lines, 80,556 tensors at maxDiff 0 (synthetic weights
+      under four schemes at every phase and width; the real artifact under each scheme), a
+      sensitivity check (the `fused` tail breaks the gate at layer 15, maxDiff 0.03125), the
+      layers at the real 17408×5120 geometry against the frozen pre-C2 layer, Trellis parity
+      4/4 bit-exact, 20 of 20 digests identical; on the M4 Pro its identity test and digests
+      unchanged. Not exercised: prefill chunks of four tokens or fewer, where the TQ graph
+      picked kernels by actual row count and the generated graph sends whole chunks to the
+      generic blocks as the M4 Pro graph does.
 
 Exit: `git diff` of a regenerated file against its committed version is empty; the generated Gemma
 parity test passes on e4b and 12B; no generated graph extends a graph; no hand-written
