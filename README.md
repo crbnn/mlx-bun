@@ -81,8 +81,9 @@ Start with `bun add @mlx-bun/inference` and the
 [`@mlx-bun/quantize`](packages/quantize/README.md) owns checkpoint quantization: calibration, sensitivity, mixed-precision allocation, rotation, and Trellis packing.
 [`@mlx-bun/training`](packages/training/README.md) owns LoRA and preference training, optimizers, losses, and adapter production.
 [`@mlx-bun/hub`](packages/hub/README.md) owns the local model registry and Hugging Face downloads and uploads.
-`@mlx-bun/app-core` holds the core-service interfaces and module manifest contract, `@mlx-bun/app-host` the host-side module loader, and [`@mlx-bun/web-shell`](packages/web-shell/README.md) the web shell that mounts module panels, for the [modular app](ARCHITECTURE.md#modular-application).
-[`mlx-bun`](apps/mlx-bun/README.md) owns the terminal app, server, and web surfaces.
+`@mlx-bun/app-core` holds the core-service interfaces and module manifest contract, `@mlx-bun/app-host` the host-side module loader, `@mlx-bun/app-services` the core-service implementations hosts share, and [`@mlx-bun/web-shell`](packages/web-shell/README.md) the web shell that mounts module panels, for the [modular app](ARCHITECTURE.md#modular-application).
+The app's features are modules in `packages/module-*`, each with its README: [chat](packages/module-chat/README.md), [models](packages/module-models/README.md), [transcription](packages/module-transcription/README.md), [memory](packages/module-memory/README.md), [quantize](packages/module-quantize/README.md), [train](packages/module-train/README.md), [datasets](packages/module-datasets/README.md), [metrics](packages/module-metrics/README.md) and [benchmarks](packages/module-benchmarks/README.md).
+[`mlx-bun`](apps/mlx-bun/README.md) owns the terminal app, server, and web surfaces; `apps/transcribe` hosts the transcription module alone.
 The [public website](apps/website/README.md) owns user guides and build-only reference pages.
 
 ## Contributing
@@ -101,7 +102,7 @@ bun install
 ```
 
 Follow the [MLX package setup](packages/mlx/README.md#development) to build or
-stage its native libraries. Build the inference package's native expert I/O and video helper with
+stage its native libraries. Build the inference package's native expert I/O, Neural Engine bridge and video helper with
 `bun run --filter @mlx-bun/inference build:native` and the app microphone helper
 with `bun run --filter @mlx-bun/module-transcription build:native` (swiftc). Run `bun run link-cli` to link
 this checkout's `mlx-bun` command into `${BUN_INSTALL:-$HOME/.bun}/bin`;
@@ -114,7 +115,10 @@ Use `bun scripts/verify-packages.ts --help` for options.
 Release preparation, signing, notarization and publication are documented in the
 app's [release instructions](apps/mlx-bun/README.md#release-preparation).
 
-Mac CI runs typechecking, the model-free tests, and this consumer check.
+Mac CI runs typechecking, the website build, the model-free tests, the training
+natives, this consumer check and `bun run verify:binary` (the relocated standalone
+bundle). Pull requests to `main` that touch numerical code also run the paired
+performance check on a self-hosted Mac ([evidence](CONTRIBUTING.md#numerical-and-performance-evidence)).
 Component source, tests, examples, and build configuration live together.
 
 ## License
