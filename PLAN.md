@@ -309,6 +309,35 @@ to callers outside `state/`. Every one of these is a method learning the represe
       (`paged-kv-bypassed-for-media-or-adapters`); the adapter namespace is the cache's.
 - [ ] Order: after the merge of E1 + D2 + E3. The lego work (state/) runs beside E2; the planner
       and gateway deletions share E2's files and land with it.
+- [x] Lego side landed (`refactor/composition-b3-legos`, 33c7f5be, integration branch
+      fast-forwarded). One model-free conformance suite (`tests/state/cache-contract.test.ts`)
+      runs every lego through append, attend per phase, decode/prefill/verification rows, the
+      speculative transaction, the committed, bidirectional, encoder-window and block reads,
+      donor rows, snapshot and SSD: 190 of 190 cells, against 135 on d71467c4. Each storage now
+      declares its three row layouts in one table in `state/layout.ts` (three `instanceof`
+      chains gone; the file's ratchet entry deleted); `SpeculativeRowLayout` is the transaction
+      as a contract. The paged lego gained the transaction, verification rows, the committed,
+      bidirectional, encoder and block reads and donor rows; ring legos a committed read; the
+      quantized and TurboQuant legos the encoder-window and block reads; KV4 verification rows
+      read donors with their own kernels. Correction to the brief: TurboQuant already had the
+      transaction and the batched layout. Every served path is bit-identical to the head
+      (gemma4-paged, speculative-group under four schemes, continuation under six, 20 app-path
+      digests, SSD digests). Newly served paths, planner bypassed, on e4b: speculation over
+      paged bf16 gives the bf16 lego's tokens at one and four rows; teacher-forced rounds under
+      paged 4 / paged 8 / TurboQuant 8/3 sit at KL 0.016 / 0.010 / 0.016 (max 0.17 / 0.064 /
+      0.18) against the tiled null's 0.10 / 1.31. Not whole and not in the suite: the
+      grouped-heads KV4 cache, a verification-rows form whose window kernel serves exactly 6
+      query heads per KV head at 3 queries (a width-specialized verify lego; its conformance
+      is at its width, or the kernel generalizes in `layers/quantized-attention.ts`). Still
+      owed on the lego side: compiled decode on the paged and TurboQuant legos; DiffusionGemma's
+      `makeCache` ignores the scheme (models/); pages under turbo or a per-layer config are
+      still bf16. The planner side's callers, for the item that lands with E2:
+      `gateway-binding.ts` (`convertible`, `isRecurrentCache`, `batchable`/`targetRows`,
+      `kvBatchCapabilities`, `delayedAffine`, `affineKv`, `cachesBatchable`, `kvBatchable`),
+      `batch-group.ts` (`isPlainKvCache`, `isRotatingPlainCache`, `isBatchableCache`),
+      `plan.ts` (paged, kvQuant, turbo terms), `generation/autoregressive.ts`
+      (`isRotatingPlainCache`), `models/gemma4/compiled-decode.ts` (`isCompiledDecodeCache`),
+      `scoring/full-sequence.ts` (`isRecurrentCache`), and `state/kv-scheme.ts`'s `batchable`.
 
 Exit: on e4b, speculative-group (assistant drafter), grammar-group, fill, prefix reuse and the SSD
 round-trip each run under every lego the composition can name (bf16, affine uniform, affine
