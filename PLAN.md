@@ -814,6 +814,33 @@ Found by review on 2026-10-11 against the integration tree.
       deletion); its draft operation is width-classed like the graph's `verify` (the DFlash 2
       entry under E2 covers both drafters).
 
+- [x] Landed (`refactor/composition-e5`, 2445e2a5, eight commits on 832ac8b1; merging onto the
+      integration head with B3's planner side). The selection operation is a width table of
+      `(output, steps) → ids`, built once in `QwenMtpRows`' constructor from the request's
+      `DraftRowSampling` (`sampled`, `greedy` or `listed` with the provider's declared
+      vocabulary, resolved once per request in `bindSpeculativeGroupRequests`; the selection
+      kind is part of the group key); the loop calls it with no branch. The assistant drafter's
+      rows are a width table with its head bound at construction (centroids per width, or the
+      tied-embedding forms), the DeepSpec step selection bound in its constructor. Deleted:
+      `DraftProvider.open()`, `DraftSource`, all seven per-request sources, the serial runner
+      (`run.ts`: `specRun`, `specServeRun`, `generateSpeculative`), `createSpeculativeMethod`,
+      `bindLegacySpeculativeModel`, the flags `MLX_BUN_MTP_ADAPTIVE_DEPTH_THRESHOLD` and
+      `MLX_BUN_SPEC_TRACE`; `DraftProvider.grouped` is required. Callers: the app's pairing
+      probe opens the grouped prefill; training's `calibrateDrafter` runs each prompt through
+      the gateway's placement at one row; the CLI's direct generate never drafted. Behaviour
+      change, accepted: under a listed vocabulary a curve, HLG or XTC request forms its own
+      group instead of pushing its batch mates onto the full head. Gates: drafts bit-identical
+      on e4b + assistant (speculative-group under bf16/4/config), Trellis + MTP
+      (`qwen-mtp-group-prefix`, same summary line) and Trellis + DFlash 2 (teacher-forced
+      blocks at depth 7 and 3, same digests); `bench-mtp` mtp2/mtp4 acceptance per round
+      identical over 32 samples (timing unqualified: shared machine, no preflight); 12 of 12
+      digest cells identical. Not gated on real weights (no artifact cached): DeepSpec's step
+      selection, the tied-embedding assistant head, `calibrateDrafter` end to end, GLM-5.2
+      MTP. Found: `MLX_BUN_SPEC_GREEDY_DRAFT` is still a bind-time env read (the B3 planner
+      item converts it); DSpark's pruning still branches per call (not the selection
+      pattern); the drafter port's `forwardInfer`, `draftBlock` and `projectContextKV` have no
+      source consumer left (delete with the final cleanup).
+
 Exit: no `sampling!.vocabulary` / `greedy` branch inside a draft loop; no `open()` on
 `DraftProvider`; for fixed inputs under teacher forcing the drafted tokens on e4b (assistant) and
 on the M4 Pro composition (MTP, DFlash 2) equal today's bit for bit; paired MTP bench acceptance
