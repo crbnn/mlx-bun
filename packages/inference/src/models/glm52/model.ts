@@ -23,7 +23,7 @@ import type {
   MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward, MlxWidthClass,
 } from "../../contracts/mlx/graph";
 import { declareGraph } from "../capabilities";
-import { atEveryWidth } from "../graph";
+import { atEveryWidth, byWidth } from "../graph";
 import { type QuantizedLinear } from "../../layers/quantized-linear";
 import { MLACache } from "../../state/glm52-cache";
 import {
@@ -32,7 +32,7 @@ Glm52DsaSelectionState,
 type Glm52DsaSelectionObserver,
 } from "./dsa";
 import { Glm52MtpGraph } from "./mtp";
-import { Glm52Mla,partialInterleavedRopeMlx,rmsNormF32Mlx,type Glm52MlaBatchedSelection } from "./mla";
+import { Glm52Mla,partialInterleavedRopeMlx,rmsNormF32Mlx,type Glm52MlaBatchedSelection,GLM52_PHASE_READS,type Glm52PhaseReads } from "./mla";
 import {
 composeGlm52MoeOutputsMlx,
 planGlm52MoeBatchF32,
@@ -508,6 +508,7 @@ export class Glm52DecoderLayer {
     input: MlxArray,
     cache: LatentAttentionCache,
     dsaState: Glm52DsaSelectionState | null,
+    reads: Glm52PhaseReads,
   ): MlxArray {
     const normalized = rmsNormF32Mlx(
       input,
@@ -557,7 +558,7 @@ export class Glm52DecoderLayer {
                 row,
                 cache,
                 dsaKey,
-                "auto",
+                reads.tokenSerial,
                 positions,
               ));
             } finally {
@@ -606,7 +607,7 @@ export class Glm52DecoderLayer {
           normalized,
           cache,
           dsaKey,
-          "auto",
+          reads.window,
           positions,
         );
       } finally {
@@ -621,8 +622,9 @@ export class Glm52DecoderLayer {
     input: MlxArray,
     cache: LatentAttentionCache,
     dsaState: Glm52DsaSelectionState | null,
+    reads: Glm52PhaseReads,
   ): MlxArray {
-    const attention = this.attend(input, cache, dsaState);
+    const attention = this.attend(input, cache, dsaState, reads);
     const residual = ops.add(input, attention);
     attention.dispose();
     const postNorm = rmsNormF32Mlx(
@@ -642,8 +644,9 @@ export class Glm52DecoderLayer {
     input: MlxArray,
     cache: LatentAttentionCache,
     dsaState: Glm52DsaSelectionState | null,
+    reads: Glm52PhaseReads,
   ): Promise<MlxArray> {
-    const attention = this.attend(input, cache, dsaState);
+    const attention = this.attend(input, cache, dsaState, reads);
     const residual = ops.add(input, attention);
     attention.dispose();
     this.mlp.pilot?.predictNext(this.layer, residual);
@@ -877,6 +880,11 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
   sequenceHidden(ids: MlxArray, cache: Cache[], width: MlxWidthClass): MlxArray {
     if (this.expertBackend)
       throw new Error("a streamed GLM graph has no synchronous scoring forward");
+    // One row of one token is a one-query read; every wider scoring forward is a window.
+    return this.#sequence(ids, cache, width === "one" ? GLM52_PHASE_READS.oneToken : GLM52_PHASE_READS.window);
+  }
+
+  #sequence(ids: MlxArray, cache: Cache[], reads: Glm52PhaseReads): MlxArray {
     const tokenCount = ids.shape[1] ?? 1;
     const firstOffset = cache[0]?.offset ?? 0;
     if (
@@ -897,7 +905,7 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
         for (let token = 0; token < tokenCount; token++) {
           const row = ids.slice([0, token], [ids.shape[0]!, token + 1]);
           try {
-            rows.push(this.sequenceHidden(row, cache, width));
+            rows.push(this.#sequence(row, cache, GLM52_PHASE_READS.oneToken));
           } finally {
             row.dispose();
           }
@@ -916,13 +924,13 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
       this.glmConfig.hiddenSize,
     );
     try {
-      return this.forwardEmbeddings(embedded, cache, null);
+      return this.forwardEmbeddings(embedded, cache, reads);
     } finally {
       embedded.dispose();
     }
   }
 
-  async #forward(ids: MlxArray, cache: Cache[]): Promise<MlxArray> {
+  async #forward(ids: MlxArray, cache: Cache[], reads: Glm52PhaseReads): Promise<MlxArray> {
     const tokenCount = ids.shape[1] ?? 1;
     const firstOffset = cache[0]?.offset ?? 0;
     if (
@@ -940,7 +948,7 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
         for (let token = 0; token < tokenCount; token++) {
           const row = ids.slice([0, token], [ids.shape[0]!, token + 1]);
           try {
-            rows.push(await this.#forward(row, cache));
+            rows.push(await this.#forward(row, cache, GLM52_PHASE_READS.oneToken));
           } finally {
             row.dispose();
           }
@@ -959,17 +967,20 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
       this.glmConfig.hiddenSize,
     );
     try {
-      return await this.forwardEmbeddingsAsync(embedded, cache, null);
+      return await this.forwardEmbeddingsAsync(embedded, cache, reads);
     } finally {
       embedded.dispose();
     }
   }
 
-  readonly prefillChunk: MlxPrefillChunk = { gpu: (ids, cache) => this.#forward(ids, cache) };
-  readonly prefillTail = atEveryWidth<MlxCapturingForward>((ids, cache) => this.#forward(ids, cache));
-  readonly appendKnown = atEveryWidth<MlxPhaseForward>((ids, cache) => this.#forward(ids, cache));
+  // Each phase names its MLA reads (`GLM52_PHASE_READS`): windows reconstruct, one token per sequence absorbs.
+  readonly prefillChunk: MlxPrefillChunk = { gpu: (ids, cache) => this.#forward(ids, cache, GLM52_PHASE_READS.window) };
+  readonly prefillTail = atEveryWidth<MlxCapturingForward>((ids, cache) => this.#forward(ids, cache, GLM52_PHASE_READS.window));
+  /** Known tokens: one sequence's tokens are its rows, so the one-row class is one token. */
+  readonly appendKnown = byWidth<MlxPhaseForward>(width => (ids, cache) =>
+    this.#forward(ids, cache, width === "one" ? GLM52_PHASE_READS.oneToken : GLM52_PHASE_READS.window));
   readonly logits = atEveryWidth<MlxHeadForward>(hidden => this.logitsFromHidden(hidden));
-  readonly decode = atEveryWidth<MlxPhaseForward>((ids, cache) => this.#forward(ids, cache));
+  readonly decode = atEveryWidth<MlxPhaseForward>((ids, cache) => this.#forward(ids, cache, GLM52_PHASE_READS.oneToken));
   /** A verify window on the row-independent M=1 streamed-expert kernel family
    *  (`setFixedKernelFamily`), so a token's experts take the same kernels
    *  whatever rows verify beside it. Composed into the operation: the scheduler
@@ -977,17 +988,18 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly verify = atEveryWidth<MlxVerifyForward>(async (ids, cache) => {
     const executor = this.expertRuntime?.executor;
     executor?.setFixedKernelFamily(true);
-    try { return await this.#forward(ids, cache); }
+    try { return await this.#forward(ids, cache, GLM52_PHASE_READS.window); }
     finally { executor?.setFixedKernelFamily(false); }
   });
 
   /** The decoder over `embeddings` (borrowed). `cache` holds one latent
    * attention cache per layer (`makeCache`), which each layer's MLA block reads
-   * through the read it was built with. */
+   * through the read it was built with, attending as the calling phase's
+   * `reads` name. */
   forwardEmbeddings(
     embeddings: MlxArray,
     cache: Cache[],
-    _bidir: MlxArray | null,
+    reads: Glm52PhaseReads,
   ): MlxArray {
     if (cache.length !== this.layers.length)
       throw new Error(`GLM cache has ${cache.length} layers, expected ${this.layers.length}`);
@@ -1006,6 +1018,7 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
           current,
           cache[layer] as LatentAttentionCache,
           dsaState,
+          reads,
         );
         current.dispose();
         current = next;
@@ -1025,7 +1038,7 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
   async forwardEmbeddingsAsync(
     embeddings: MlxArray,
     cache: Cache[],
-    _bidir: MlxArray | null,
+    reads: Glm52PhaseReads,
   ): Promise<MlxArray> {
     if (cache.length !== this.layers.length)
       throw new Error(`GLM cache has ${cache.length} layers, expected ${this.layers.length}`);
@@ -1042,6 +1055,7 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
           current,
           cache[layer] as LatentAttentionCache,
           dsaState,
+          reads,
         );
         // The streamed path is a bounded-residency graph. Detach every layer
         // before advancing so dense-prefix and post-expert compose graphs

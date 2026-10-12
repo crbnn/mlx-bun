@@ -4,7 +4,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import type { Glm52Config } from "../../artifacts/glm52-config";
 import type { Glm52WeightSource } from "../../contracts/mlx/glm52-weights";
 import type { LatentAttentionCache } from "../../contracts/mlx/cache";
-import { rmsNormF32Mlx } from "./mla";
+import { GLM52_PHASE_READS, rmsNormF32Mlx, type Glm52PhaseReads } from "./mla";
 
 /** What the MTP graph reads of the GLM-5.2 model it shares weights with. */
 export interface Glm52MtpHost {
@@ -15,7 +15,7 @@ export interface Glm52MtpHost {
 
 /** The MTP decoder layer (the layer after the target's last). */
 export interface Glm52MtpLayer {
-  forwardAsync(input: MlxArray, cache: LatentAttentionCache, dsaState: null): Promise<MlxArray>;
+  forwardAsync(input: MlxArray, cache: LatentAttentionCache, dsaState: null, reads: Glm52PhaseReads): Promise<MlxArray>;
 }
 
 /** Native MTP numerical graph. Tokens, anchor hidden and compressed state may
@@ -30,7 +30,17 @@ export class Glm52MtpGraph implements NativeMtpHead {
     return { kvLoraRank: config.kvLoraRank, ropeHeadDim: config.qkRopeHeadDim, maxTokens: config.maxPositionEmbeddings };
   }
 
-  async forward(ids: MlxArray, hidden: MlxArray, cache: LatentAttentionCache): Promise<MlxArray> {
+  /** One token per sequence (a draft step): the MTP layer reads its compressed state absorbed. */
+  decode(ids: MlxArray, hidden: MlxArray, cache: LatentAttentionCache): Promise<MlxArray> {
+    return this.#forward(ids, hidden, cache, GLM52_PHASE_READS.oneToken);
+  }
+
+  /** Two or more tokens per sequence (the accepted window a commit replays): reconstructed. */
+  window(ids: MlxArray, hidden: MlxArray, cache: LatentAttentionCache): Promise<MlxArray> {
+    return this.#forward(ids, hidden, cache, GLM52_PHASE_READS.window);
+  }
+
+  async #forward(ids: MlxArray, hidden: MlxArray, cache: LatentAttentionCache, reads: Glm52PhaseReads): Promise<MlxArray> {
     const { glmConfig: config, weights } = this.model;
     const prefix = `model.layers.${config.numHiddenLayers}`;
     using embedded = weights.embedding(ids, "model.embed_tokens.weight", config.vocabSize, config.hiddenSize);
@@ -38,7 +48,7 @@ export class Glm52MtpGraph implements NativeMtpHead {
     using hiddenNorm = rmsNormF32Mlx(hidden, weights.tensor(`${prefix}.hnorm.weight`), config.rmsNormEps);
     using joined = ops.concatAxis([embeddedNorm, hiddenNorm], 2);
     using projected = weights.linear(joined, `${prefix}.eh_proj.weight`, config.hiddenSize, 2 * config.hiddenSize);
-    return await this.layer.forwardAsync(projected, cache, null);
+    return await this.layer.forwardAsync(projected, cache, null, reads);
   }
 
   project(hidden: MlxArray): MlxArray {
