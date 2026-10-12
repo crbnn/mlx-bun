@@ -1,3 +1,10 @@
+// NOT A PATTERN TO FOLLOW, deleted after merge. The hand-written TQ graph, frozen
+// verbatim as the bit-identity oracle of tests/models/qwen38-m1max-identity.test.ts
+// (D2 replaced it with the generated src/models/qwen/qwen38-27b-trellis-m1max.ts).
+// Changes from the source file (int head 832ac8b1): import paths; and
+// mixedGateUpEligible and fusedGateUpSwigluMixed, moved here verbatim from
+// src/layers/trellis-linear.ts with the decode variant they read there (13).
+//
 // Qwen3.8-27B packed-Trellis (TurboQuant) — THE graph for this exact quant.
 //
 // One hand-written forward for one model and one quantization map. The loader's
@@ -29,23 +36,40 @@
 
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
-import type { Weights } from "../../artifacts/weights";
-import type { Composition } from "../../contracts/portable/composition";
-import { quantFor, type ModelConfig } from "../../artifacts/config";
-import { runtimeFlag, runtimeValue } from "../../runtime/config";
-import { type Cache, type GatedDeltaCache } from "../../contracts/mlx/cache";
-import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
-import { compiledSwiglu } from "../../layers/swiglu";
-import { Qwen35Model } from "./qwen3_5";
-import type { ReadPhase } from "../graph";
-import type { MlxWidthClass } from "../../contracts/mlx/graph";
-import type { ServedComposition } from "../implementation";
-import type { Qwen3Layer } from "./blocks";
-import { qwenDraftTarget, qwenResidualBasis } from "./media-input";
+import type { Weights } from "../../src/artifacts/weights";
+import type { Composition } from "../../src/contracts/portable/composition";
+import { quantFor, type ModelConfig } from "../../src/artifacts/config";
+import { runtimeFlag, runtimeValue } from "../../src/runtime/config";
+import { type Cache, type GatedDeltaCache } from "../../src/contracts/mlx/cache";
+import type { ResidualBasis, TargetView } from "../../src/contracts/mlx/draft-target";
+import { compiledSwiglu } from "../../src/layers/swiglu";
+import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
+import type { ReadPhase } from "../../src/models/graph";
+import type { MlxWidthClass } from "../../src/contracts/mlx/graph";
+import type { ServedComposition } from "../../src/models/implementation";
+import type { Qwen3Layer } from "../../src/models/qwen/blocks";
+import { qwenDraftTarget, qwenResidualBasis } from "../../src/models/qwen/media-input";
 import {
-  TRELLIS_MATVEC_MAX_M, fusedGateUpEligible, fusedGateUpSwiglu,
-  fusedGateUpSwigluMixed, mixedGateUpEligible, type MixedGateUpTail,
-} from "../../layers/trellis-linear";
+  TRELLIS_MATVEC_MAX_M, fusedGateUpEligible, fusedGateUpSwiglu, type MixedGateUpTail, type TrellisLinear,
+} from "../../src/layers/trellis-linear";
+import { fusedGateUpSwigluMixed as mixedGateUpKernel } from "../../src/kernels/trellis/mixed-gate-up";
+
+// Moved here verbatim from src/layers/trellis-linear.ts, where nothing used them once D2 deleted the source file.
+// VARIANT is the decode variant TrellisLinear passes its kernels there (13); mixedGateUpKernel the kernel it called.
+const VARIANT = 13;
+
+/** Gate and up share their axis-1 geometry but NOT their bit width: the case a
+ *  per-tensor bit allocation creates and the same-k fused kernel refuses.
+ *  Geometry only; whether to use it is the owning graph's decision. */
+export function mixedGateUpEligible(gate: TrellisLinear, up: TrellisLinear): boolean {
+  const a = gate.geometry, b = up.geometry;
+  return a.axis === 1 && b.axis === 1 && a.k !== b.k &&
+    a.rows === b.rows && a.cols === b.cols && a.T === b.T && a.L === b.L;
+}
+
+export function fusedGateUpSwigluMixed(x: MlxArray, gate: TrellisLinear, up: TrellisLinear, tail: MixedGateUpTail = "fused"): MlxArray {
+  return mixedGateUpKernel(x, gate, up, VARIANT, tail, gate.representations.mixedExactBits);
+}
 
 export const QWEN38_TRELLIS_TQ_GRAPH = "qwen3.8-27b-trellis-tq";
 

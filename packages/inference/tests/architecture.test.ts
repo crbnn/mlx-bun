@@ -839,9 +839,7 @@ const seamRatchet: RatchetTable = {
   "model-env-flag": {},
   "scheduler-core": {},
   // Composition rules: each entry names the PLAN.md item that removes it.
-  "graph-extends": {
-    "packages/inference/src/models/qwen/qwen38-27b-trellis-tq.ts": 2, // D2
-  },
+  "graph-extends": {},
   "hot-path-read": {
     "packages/inference/src/layers/geglu.ts": 1, // C2
     "packages/inference/src/models/glm52/model.ts": 2, // no item yet: B1 defers GLM-5.2 MLA

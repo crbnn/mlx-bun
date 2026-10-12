@@ -9,13 +9,14 @@ import { totalmem } from "node:os";
 import { Weights } from "../artifacts/weights";
 import { Gemma4Model } from "./gemma4/model";
 import { configFingerprint } from "../artifacts/fingerprint";
-import {
-  COMPOSITION as QWEN38_TRELLIS_TQ_COMPOSITION, QWEN38_TRELLIS_TQ_GRAPH, Qwen38TrellisTQ, qwen38TrellisTqFingerprint,
-} from "./qwen/qwen38-27b-trellis-tq";
+import { qwen35GraphFingerprint } from "./qwen/checkpoint";
 import {
   COMPOSITION as QWEN38_TRELLIS_M4PRO_COMPOSITION, QWEN38_TRELLIS_M4PRO_GRAPH, Qwen38TrellisM4Pro,
   anePrograms as qwen38TrellisM4ProAnePrograms,
 } from "./qwen/qwen38-27b-trellis-m4pro";
+import {
+  COMPOSITION as QWEN38_TRELLIS_M1MAX_COMPOSITION, QWEN38_TRELLIS_M1MAX_GRAPH, Qwen38TrellisM1Max,
+} from "./qwen/qwen38-27b-trellis-m1max";
 import { GENERATED_GRAPHS, type GeneratedGemma4Graph } from "./gemma4/generated/index";
 import { MiniCPM5Model } from "./minicpm5/model";
 import { Qwen35Model } from "./qwen/qwen3_5";
@@ -52,7 +53,7 @@ import {
 } from "./profile";
 
 export type RuntimeModel =
-  | Gemma4Model | GeneratedGemma4Graph | MiniCPM5Model | Qwen35Model | Qwen38TrellisM4Pro | Qwen3Model | Qwen3MoeModel
+  | Gemma4Model | GeneratedGemma4Graph | MiniCPM5Model | Qwen35Model | Qwen38TrellisM4Pro | Qwen38TrellisM1Max | Qwen3Model | Qwen3MoeModel
   | DiffusionGemmaModel | Glm52Model | UniversalDenseModel;
 
 /** A family's generic graph: the table entry that constrains nothing. */
@@ -68,16 +69,17 @@ function generic(id: string, create: GraphEntry<Weights, RuntimeModel>["create"]
 export const MLX_GRAPH_TABLES: Readonly<Record<ModelGraph, GraphTable<Weights, RuntimeModel>>> = Object.freeze({
   "diffusion-gemma": new GraphTable([generic("diffusion-gemma", (weights, config) => new DiffusionGemmaModel(weights, config))]),
   "minicpm5": new GraphTable([generic("minicpm5", (weights, config, composition) => new MiniCPM5Model(weights, config, composition))]),
-  // Our published Trellis quant has its purpose-built graphs, keyed by its graph fingerprint
-  // (architecture plus the complete quantization table).
+  // Our published Trellis quant has its generated graphs (scripts/gen-qwen38.ts), keyed by its graph
+  // fingerprint (architecture plus the complete quantization table) and the GPU each was built for.
   "qwen3.5": new GraphTable([
     { id: QWEN38_TRELLIS_M4PRO_GRAPH, serves: QWEN38_TRELLIS_M4PRO_COMPOSITION,
       create: (weights, config, composition) => new Qwen38TrellisM4Pro(weights, config, composition),
       anePrograms: composition => qwen38TrellisM4ProAnePrograms(composition) },
-    { id: QWEN38_TRELLIS_TQ_GRAPH, serves: QWEN38_TRELLIS_TQ_COMPOSITION,
-      create: (weights, config, composition) => new Qwen38TrellisTQ(weights, config, composition) },
+    // The M1 Max composition builds no Neural Engine operation (its device's table has none): no programs to install.
+    { id: QWEN38_TRELLIS_M1MAX_GRAPH, serves: QWEN38_TRELLIS_M1MAX_COMPOSITION,
+      create: (weights, config, composition) => new Qwen38TrellisM1Max(weights, config, composition) },
     generic("qwen3.5", (weights, config, composition) => new Qwen35Model(weights, config, composition)),
-  ], qwen38TrellisTqFingerprint),
+  ], qwen35GraphFingerprint),
   "qwen3-moe": new GraphTable([generic("qwen3-moe", (weights, config, composition) => new Qwen3MoeModel(weights, config, composition))]),
   "qwen3": new GraphTable([generic("qwen3", (weights, config, composition) => new Qwen3Model(weights, config, composition))]),
   "gemma4": new GraphTable([...GENERATED_GRAPHS, generic("gemma4", (weights, config, composition) => new Gemma4Model(weights, config, composition))],

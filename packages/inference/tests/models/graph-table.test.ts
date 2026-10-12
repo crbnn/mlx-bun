@@ -15,7 +15,8 @@ import { resolveComposition, type CompositionRequest } from "../../src/models/co
 import { MLX_GRAPH_TABLES } from "../../src/models/factory";
 import { GraphTable, type GraphEntry, type ServedComposition } from "../../src/models/implementation";
 import { QWEN38_TRELLIS_M4PRO_GRAPH } from "../../src/models/qwen/qwen38-27b-trellis-m4pro";
-import { QWEN38_TRELLIS_TQ_GRAPH, qwen38TrellisTqFingerprint } from "../../src/models/qwen/qwen38-27b-trellis-tq";
+import { qwen35GraphFingerprint } from "../../src/models/qwen/checkpoint";
+import { QWEN38_TRELLIS_M1MAX_GRAPH } from "../../src/models/qwen/qwen38-27b-trellis-m1max";
 
 const TRELLIS = "cfa205c8f5af046a";
 const M4_PRO = "applegpu_g16s", M1_MAX = "applegpu_g13s";
@@ -135,15 +136,16 @@ describe("the Qwen 3.5 table", () => {
     expect(select(on(M4_PRO, qwen, { maxRows: 16 }))).toBe("qwen3.5");
   });
 
-  test("on applegpu_g13s the TQ graph serves the artifact whatever its KV scheme or rows; other GPUs get the generic graph", () => {
-    expect(select(on(M1_MAX, qwen))).toBe(QWEN38_TRELLIS_TQ_GRAPH);
-    expect(select(on(M1_MAX, qwen, { kv: { override: 8 } }))).toBe(QWEN38_TRELLIS_TQ_GRAPH);
-    expect(select(on(M1_MAX, qwen, { kv: { override: 4 }, maxRows: 16 }))).toBe(QWEN38_TRELLIS_TQ_GRAPH);
+  test("on applegpu_g13s the generated M1 Max graph serves the artifact whatever its KV scheme or rows; other GPUs get the generic graph", () => {
+    expect(select(on(M1_MAX, qwen))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
+    expect(select(on(M1_MAX, qwen, { kv: { override: 8 } }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
+    expect(select(on(M1_MAX, qwen, { kv: { override: 4 }, maxRows: 16 }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
+    expect(select(on(M1_MAX, qwen, { kv: { turboQuant: { kBits: 8, vBits: 3 } }, adapters: true }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
     expect(select(on("applegpu_g15s", qwen))).toBe("qwen3.5");
   });
 
   test("another Qwen 3.5 artifact gets the generic graph on every device; the table fingerprints with the Trellis graph fingerprint", () => {
-    const fingerprint = qwen38TrellisTqFingerprint(qwen);
+    const fingerprint = qwen35GraphFingerprint(qwen);
     expect(fingerprint).not.toBe(TRELLIS);
     for (const device of [M4_PRO, M1_MAX]) {
       expect(table.select(qwen, on(device, qwen)).id).toBe("qwen3.5");
@@ -155,9 +157,9 @@ describe("the Qwen 3.5 table", () => {
     const dir = join(homedir(), ".cache/huggingface/hub/models--mlx-bun--Qwen3.8-27B-Trellis-3.2bpw/snapshots/cbb7a58a7222a19a3d02d36540c9cab5d9aadf0d");
     if (!existsSync(join(dir, "config.json"))) return;
     const config = await loadModelConfig(dir);
-    expect(qwen38TrellisTqFingerprint(config)).toBe(TRELLIS);
+    expect(qwen35GraphFingerprint(config)).toBe(TRELLIS);
     expect(table.select(config, on(M4_PRO, config)).id).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
-    expect(table.select(config, on(M1_MAX, config)).id).toBe(QWEN38_TRELLIS_TQ_GRAPH);
+    expect(table.select(config, on(M1_MAX, config)).id).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
     expect(table.select(config, on(M4_PRO, config, { kv: { override: 8 } })).id).toBe("qwen3.5");
   });
 });

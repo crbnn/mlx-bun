@@ -191,21 +191,48 @@ export function gateUpCodebookEligible(g: TrellisGeometry, m: number, dtype: Dty
   return qualifiedRepresentations(architecture).gateUpCodebook && codebookShape(g, m, dtype, selected);
 }
 
+/** Variants 7..13 share each decoded weight across rows (`GATEUP_SHARED_M_SOURCE`). */
+const sharesRows = (selected: number) => selected >= 7 && selected <= 13;
+
+/** silu(gate(x))·up(x) for exactly one activation row, gate and up at the same
+ * width: the per-row kernel. `codebook` applies at the measured shape; layers
+ * pass the choice they resolved at construction (`qualifiedRepresentations`).
+ * Borrows x and the weights; returns owned lazy output with x's leading dimensions. */
+export function gateUpReduceRow(x: MlxArray, gate: TrellisWeights, up: TrellisWeights, selected: number,
+  codebook: boolean): MlxArray {
+  if (x.size !== x.shape.at(-1)) throw new Error("gateUpReduceRow: expects one activation row");
+  return launch(gateUpKernel(), x, gate, up, selected, codebook, 1, false);
+}
+
+/** silu(gate(x))·up(x) for 2..4 activation rows sharing each decoded weight
+ * (variants 7..13), gate and up at the same width. Borrows x and the weights;
+ * returns owned lazy output with x's leading dimensions. */
+export function gateUpReduceRows(x: MlxArray, gate: TrellisWeights, up: TrellisWeights, selected: number): MlxArray {
+  const M = x.size / x.shape.at(-1)!;
+  if (M < 2 || M > MATVEC_MAX_M) throw new Error(`gateUpReduceRows: M=${M} outside 2..${MATVEC_MAX_M}`);
+  if (!sharesRows(selected)) throw new Error(`gateUpReduceRows: variant ${selected} does not share rows (7..13 do)`);
+  return launch(sharedGateUpKernel(), x, gate, up, selected, false, M, true);
+}
+
 /** Borrow matching axis-1 gate/up weights with the same bit width; M must be 1..4.
  * Return owned lazy SwiGLU output, retaining the input's leading dimensions.
  * `codebook` applies at the measured shape: layers pass the choice they resolved
  * at construction (`qualifiedRepresentations`), benches and tests the one they compare. */
 export function fusedGateUpSwiglu(x: MlxArray, gate: TrellisWeights, up: TrellisWeights, selected: number,
   codebook: boolean): MlxArray {
+  const M = x.shape.slice(0, -1).reduce((a, b) => a * b, 1);
+  if (M > MATVEC_MAX_M) throw new Error(`fusedGateUpSwiglu: M=${M} > ${MATVEC_MAX_M}`);
+  const shared = sharesRows(selected) && M > 1;
+  return launch(shared ? sharedGateUpKernel() : gateUpKernel(), x, gate, up, selected, codebook, M, shared);
+}
+
+function launch(kernel: MetalKernel, x: MlxArray, gate: TrellisWeights, up: TrellisWeights, selected: number,
+  codebook: boolean, M: number, shared: boolean): MlxArray {
   const g = gate.geometry;
   const lead = x.shape.slice(0, -1);
-  const M = lead.reduce((a, b) => a * b, 1);
-  if (M > MATVEC_MAX_M) throw new Error(`fusedGateUpSwiglu: M=${M} > ${MATVEC_MAX_M}`);
-  const shared = selected >= 7 && selected <= 13 && M > 1;
   const useCodebook = codebook && codebookShape(g, M, x.dtype, selected);
   const threads = useCodebook ? TRELLIS_CODEBOOK_THREADS : TRELLIS_THREADS;
   const rowsPerGroup = useCodebook ? TRELLIS_CODEBOOK_SG_PER_TG : TRELLIS_SG_PER_TG;
-  const kernel = shared ? sharedGateUpKernel() : gateUpKernel();
   const x2 = ops.reshape(x, [M, g.inFeatures]);
   const [mid] = kernel.apply([x2, gate.codes, gate.scales, up.codes, up.scales, lutFor(g.L)], {
     outputs: [{ shape: [M, g.rows], dtype: x.dtype }],

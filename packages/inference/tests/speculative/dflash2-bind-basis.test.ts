@@ -6,9 +6,12 @@
 // quantized matmul, so a kernel change shows in the logits). Context chunks are
 // 12 and 2×12 rows, plus a commit of 4 or 2×5 rows: outside 5..8 rows, the one
 // range where context projection changed kernel (a later test pins that).
-// E4b: the rotated Trellis graph, built on a synthetic artifact, declares the
-// basis its turboquant_fold.json records, and the drafter bound through that
-// graph proposes exactly what the same basis given directly proposes.
+// E4b: the rotated Trellis graphs' declaration (the basis their constructor reads
+// once from turboquant_fold.json and the ports their draftTarget hands out), over
+// a synthetic artifact's graph, carries the basis the record holds, and the
+// drafter bound through it proposes exactly what the same basis given directly
+// proposes. That the generated Trellis graph declares the record's basis as the
+// hand-written one did is tests/models/qwen38-m1max-identity.test.ts.
 import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -22,7 +25,8 @@ import { TURBOQUANT_FOLD_FILE } from "../../src/artifacts/turboquant-fold";
 import { Weights } from "../../src/artifacts/weights";
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
 import { testComposition } from "../models/test-composition";
-import { QWEN38_TRELLIS_TQ_GRAPH, Qwen38TrellisTQ } from "../../src/models/qwen/qwen38-27b-trellis-tq";
+import { QWEN38_TRELLIS_M1MAX_GRAPH } from "../../src/models/qwen/qwen38-27b-trellis-m1max";
+import { qwenDraftTarget, qwenResidualBasis } from "../../src/models/qwen/media-input";
 import { Affine4MmaLinear } from "../../src/layers/affine-verify-linear";
 import type { DraftProjection } from "../../src/contracts/mlx/draft-projection";
 import { atEveryWidth } from "../../src/models/graph";
@@ -308,7 +312,7 @@ function writeQwenTarget(target: string): void {
   }));
 }
 
-test("the rotated Trellis graph declares the basis its turboquant_fold.json records, and the drafter bound through it proposes exactly what that basis given directly proposes", async () => {
+test("the rotated Trellis graphs' declaration carries the basis its turboquant_fold.json records, and the drafter bound through it proposes exactly what that basis given directly proposes", async () => {
   const target = mkdtempSync(join(tmpdir(), "mlx-bun-dflash2-target-"));
   const foldPath = join(target, TURBOQUANT_FOLD_FILE);
   const record = { source: "synthetic", generatedAt: "2026-10-11T00:00:00.000Z", seed: SEED, r1: true, r2: false,
@@ -322,27 +326,36 @@ test("the rotated Trellis graph declares the basis its turboquant_fold.json reco
     const config = await loadModelConfig(target);
     weights = await Weights.open(target);
 
+    // A Trellis graph's declaration: the basis its constructor reads once from the fold record
+    // (`qwenResidualBasis`) and the ports every draftTarget call hands out over the graph (`qwenDraftTarget`),
+    // here over the Qwen 3.5 graph of the synthetic artifact, whose embedding and head the drafter reads.
+    const trellisTarget = (model: Qwen35Model) => {
+      const residualBasis = qwenResidualBasis(QWEN38_TRELLIS_M1MAX_GRAPH, target);
+      return { draftTarget: (_caches: unknown[]): TargetView => qwenDraftTarget(model, residualBasis) };
+    };
     // A record without final_gain declares nothing and names the file once, at construction; so does a missing record.
     writeFileSync(foldPath, JSON.stringify(record));
-    expect("residualBasis" in new Qwen38TrellisTQ(weights, config, testComposition()).draftTarget([])).toBe(false);
-    expect(fileLines()).toEqual([`[graph] ${QWEN38_TRELLIS_TQ_GRAPH}: ${foldPath} records no final_gain; DFlash 2 drafts ` +
+    const generic = new Qwen35Model(weights, config, testComposition());
+    expect("residualBasis" in trellisTarget(generic).draftTarget([])).toBe(false);
+    expect(fileLines()).toEqual([`[graph] ${QWEN38_TRELLIS_M1MAX_GRAPH}: ${foldPath} records no final_gain; DFlash 2 drafts ` +
       "unrotated (output exact, acceptance collapses) until it records the final-norm gain the fold moved into lm_head"]);
     unlinkSync(foldPath);
-    expect("residualBasis" in new Qwen38TrellisTQ(weights, config, testComposition()).draftTarget([])).toBe(false);
+    expect("residualBasis" in trellisTarget(generic).draftTarget([])).toBe(false);
     expect(fileLines()).toHaveLength(2);
     expect(fileLines()[1]).toContain(`${foldPath} is missing;`);
     // A stream the record says is not rotated has no basis to declare and nothing to report.
     writeFileSync(foldPath, JSON.stringify({ ...record, r1: false, final_gain: Array.from(basis.finalGain) }));
-    expect("residualBasis" in new Qwen38TrellisTQ(weights, config, testComposition()).draftTarget([])).toBe(false);
+    expect("residualBasis" in trellisTarget(generic).draftTarget([])).toBe(false);
 
-    // The record with final_gain: the graph declares it; the generic graph on the same artifact declares nothing.
+    // The record with final_gain: the Trellis declaration carries it; the generic graph on the same artifact declares nothing.
     writeFileSync(foldPath, JSON.stringify({ ...record, final_gain: Array.from(basis.finalGain) }));
-    const graph = new Qwen38TrellisTQ(weights, config, testComposition());
-    expect("residualBasis" in new Qwen35Model(weights, config, testComposition()).draftTarget([])).toBe(false);
+    const model = new Qwen35Model(weights, config, testComposition());
+    const graph = trellisTarget(model);
+    expect("residualBasis" in model.draftTarget([])).toBe(false);
     expect(fileLines()).toHaveLength(2);
     unlinkSync(foldPath); // read once, at construction: the declaration no longer depends on the file
-    const head = graph.logitsFromHidden.bind(graph);
-    spyOn(graph, "logitsFromHidden").mockImplementation(hidden => {
+    const head = model.logitsFromHidden.bind(model);
+    spyOn(model, "logitsFromHidden").mockImplementation(hidden => {
       const logits = head(hidden);
       captured.push(logits.toFloat32());
       return logits;

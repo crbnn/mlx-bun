@@ -925,7 +925,7 @@ selects a token, continues with the same cache, and disposes cache before weight
 
 The direct graph imports currently include `models/gemma4`,
 `models/gemma4/generated`, `models/minicpm5`, `models/qwen3`, `models/qwen3-moe`,
-`models/qwen3_5`, `models/qwen38-27b-trellis-tq`, `models/qwen38-27b-trellis-m4pro`,
+`models/qwen3_5`, `models/qwen38-27b-trellis-m4pro`, `models/qwen38-27b-trellis-m1max`,
 and `models/universal`.
 `models/glm52`, `models/diffusion-gemma`, and `models/whisper` provide the other
 existing graph families. These retain the dedicated and specialized implementations.
@@ -940,7 +940,10 @@ that carries its own draft head declares it (`GraphCapabilities.nativeDraft`), a
 
 `models/qwen38-27b-trellis-m4pro` is the graph for
 `mlx-bun/Qwen3.8-27B-Trellis-3.2bpw` on M4 Pro GPUs (`applegpu_g16s`); the model
-factory selects it for that artifact on that device and the TQ graph elsewhere.
+factory selects it for that artifact on that device, `models/qwen38-27b-trellis-m1max`
+(the same artifact on M1 Max GPUs, `applegpu_g13s`, for every KV scheme and row
+count) there, and the generic Qwen 3.5 graph elsewhere. `scripts/gen-qwen38.ts`
+generates both from their compositions.
 It resolves one block set per width class at load: one row, 2..3, 4 and 5..8
 rows (decode, speculative verify and prompt tails, of one sequence or several),
 prompt chunks, and 2048-row chunks split between the Neural Engine and the GPU
