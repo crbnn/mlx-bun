@@ -17,7 +17,7 @@ needs a separate installation or release boundary.
 - Keep one inference package with enforced internal boundaries. Split a package
   when a consumer needs that boundary, not merely because a directory exists.
 - Preserve behavior during migration; numerical optimization is separate work.
-  A specialized model graph composes layers and kernels; its layers own whether
+  A model graph composes layers and kernels; its layers own whether
   operations compile. Keep this implementation choice out of app options.
 - The app uses continuous batching by default, including a single request: one
   request is a batch of one, and `--batch-size` is only the cap. Choosing a cap
@@ -67,9 +67,10 @@ does not repeatedly interpret the descriptor or rediscover what a particular
 layer does. Nothing below the scheduler decides anything at run time: no flag,
 environment variable, device query or `instanceof` of a layer or cache class
 inside a forward, a read or a kernel dispatch. Constructors, `build`, `load` and
-the loader read those facts. A generic graph for a family is a complete
-structure the loader selects when no specialized graph matches; a specialized
-graph extends nothing and never contains a path back to a generic one.
+the loader read those facts. Every graph is an entire graph built for a
+composition and extends nothing. A family's generic graph is one of them: the
+table entry the loader selects when no more constrained entry matches, never a
+path another graph falls back to.
 
 Here, "compile" means resolving those facts into a concrete implementation;
 it does not require generated source or MLX graph compilation. Layers own MLX
@@ -362,8 +363,8 @@ For example, paged attention accepts numerical storage without knowing its
 allocator; adapter mounting consumes named mount points rather than the model
 union; prompt preparation consumes encoders rather than Gemma or Qwen classes.
 A new implementation must preserve the contract's tensor shapes, ownership,
-state transitions, cancellation, and disposal semantics. Specialized numerical
-paths remain explicit and reusable.
+state transitions, cancellation, and disposal semantics. Every numerical
+path is explicit and reusable: one kernel, bound by one layer.
 
 Composition follows the operations and invariants each component provides.
 Compatible graph, cache, sampling, and generation implementations should compose
@@ -375,7 +376,7 @@ Prefer the smallest existing interface that expresses the requirement.
 One supported way per pattern; a second way is a gate failure, not a style note:
 
 - Add a model by generating its graph from the family's blocks with the
-  generator script; a hand-written specialized graph is not a pattern.
+  generator script; a hand-written graph for one composition is not a pattern.
 - Add a kernel as one file in `kernels/` bound by exactly one layer.
 - Read a cache through `attend`; add a representation as a cache lego, never as
   a read path inside a layer.
@@ -404,7 +405,7 @@ layer.
 Known data flow is part of that construction: which operations produce and consume
 a tensor, its layout, and its ownership and lifetime obligations. Use these facts
 to determine which intermediate state must be materialized, copied, or retained.
-A specialized implementation may avoid that work when it can establish that every
+An implementation may avoid that work when it can establish that every
 bound consumer's contract, including the state required by a selected generation
 method, checkpoint, or exposed output, is still met.
 These are properties of the chosen graph and bindings, not guesses about how a
@@ -414,10 +415,9 @@ or implementation.
 Execution calls the resulting operations without repeatedly interpreting model
 descriptors or rediscovering invariant capabilities in the hot path. Current
 sequence lengths, cache contents, batch membership, request choices, and
-cancellation remain dynamic. A generic graph per family is allowed as the
-loader's selection when nothing specialized matches; a specialized graph never
-falls back inside its forward. No universal model abstraction or compiler
-framework is required. This is
+cancellation remain dynamic. A family's generic graph is the loader's selection
+when no more constrained entry matches; no graph falls back inside its forward.
+No universal model abstraction or compiler framework is required. This is
 the target for refining migrated paths, not a claim that every current path already
 follows it; changes still require the
 [numerical and performance evidence](CONTRIBUTING.md#numerical-and-performance-evidence).

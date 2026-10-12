@@ -31,8 +31,9 @@ runs the layers it was built with and never inspects its input or its cache. The
 storage, the read, prefix reuse, paging, SSD offload and eviction behind one interface. Each piece
 implements its contract and never checks what another piece is doing, because nothing below the
 scheduler decides anything at run time. Vision, adapters and KV scheme are compositions, never
-refusals. A generic graph for a family is a complete structure the loader may select when no
-specialized one matches; a specialized graph never contains a path back to it.
+refusals. Every graph is an entire graph built for a composition. A family's generic graph is one of
+them: the table entry the loader selects when no more constrained entry matches, never a path
+another graph falls back to.
 
 Batching is not a mode. The scheduler is the one engine and a single request is a batch of one,
 as the first refactor established. One request or four requests run the same composition: the
@@ -329,7 +330,7 @@ to callers outside `state/`. Every one of these is a method learning the represe
       paged 4 / paged 8 / TurboQuant 8/3 sit at KL 0.016 / 0.010 / 0.016 (max 0.17 / 0.064 /
       0.18) against the tiled null's 0.10 / 1.31. Not whole and not in the suite: the
       grouped-heads KV4 cache, a verification-rows form whose window kernel serves exactly 6
-      query heads per KV head at 3 queries (a width-specialized verify lego; its conformance
+      query heads per KV head at 3 queries (a verify lego built for one width; its conformance
       is at its width, or the kernel generalizes in `layers/quantized-attention.ts`). Still
       owed on the lego side: compiled decode on the paged and TurboQuant legos; DiffusionGemma's
       `makeCache` ignores the scheme (models/); pages under turbo or a per-layer config are
@@ -593,7 +594,7 @@ same phase; the Qwen generator (D2) produces it.
 
 Exit: `git diff` of a regenerated file against its committed version is empty; the generated Gemma
 parity test passes on e4b and 12B; no generated graph extends a graph; no hand-written
-specialized graph remains, so the only example of a specialized graph an agent can read is a
+graph for one composition remains, so the only example of such a graph an agent can read is a
 generated one.
 
 #### D3. Generic graphs
@@ -611,7 +612,7 @@ Exit: no graph reads `quantizedAttention`; bit-identical generic forwards.
 
 - [ ] The `qwen3.5` entry in `models/factory.ts` becomes a table keyed by fingerprint, device,
       bridge, KV scheme, depth, chunk size, adapters and max rows. The generic graph is the entry
-      yielded when nothing specialized matches. The same shape for Gemma's `GENERATED` map.
+      yielded when no more constrained entry matches. The same shape for Gemma's `GENERATED` map.
 
 - [ ] The key includes the KV scheme and max rows because the M4 Pro composition serves bf16 and
       affine 4-bit group 64 only (D1: the old graph went generic for 8-bit and per-layer config;
@@ -1070,7 +1071,7 @@ unchanged.
       Not run: a 4-bit KV sweep in `bench-mtp` (its KV option fails on the first drafted arm
       with "No target row layout for kv:bf16-first:kv:quant:4:64"; `serve --kv-quant 4`
       works), owed to the final gate pass.
-- [x] ARCHITECTURE.md: the cache owns the read; phases are named; a specialized graph extends
+- [x] ARCHITECTURE.md: the cache owns the read; phases are named; a graph extends
       nothing; the exemplar sentence points at the regenerated graphs; the loader-level generic
       fallback is stated and the in-graph one forbidden; the one-way-per-pattern list above.
 - [ ] PLAN.md: first decision updated per the off-composition decision; this file's closed phases
@@ -1100,7 +1101,10 @@ unchanged.
       `PREFILL_TAIL_SPLIT`, `GRAMMAR_JUMP`, `SPEC_GREEDY_DRAFT`, `BATCH_SSM`, `COMPILED_GEGLU`,
       `QWEN38_TQ_*`, `DFLASH2_TARGET_BASIS`), "plan" where it means the M4 Pro graph's old
       whole-forward plans, "fallback" or "generic" where a graph is described as falling back,
-      "capability" where it names a cache format. At e436ccf5 the sweep still finds: `serial
+      "capability" where it names a cache format. "Specialized graph" wherever it appears: there is no such kind; every graph is an entire
+      graph built for a composition, and the word is the old subclass-with-fallback world's
+      (Josh, 2026-10-12); the source comments in `contracts/mlx/width.ts`, `models/factory.ts`
+      and `models/qwen/checkpoint.ts` and the inference README say it today. At e436ccf5 the sweep still finds: `serial
       lane` 1, `serial path` 4, `quantizedKvStart` 1, `MLX_BUN_COMPILED_DECODE` 3 (the
       inference README's runtime-oracle commands), `MLX_BUN_SPEC_GREEDY_DRAFT` 1,
       `generated-graph` 1. Also: the frozen oracle files and test references headed "NOT A
@@ -1108,9 +1112,9 @@ unchanged.
       drift tests and the real-weight digests remain the gates); the drafter port's unused
       `forwardInfer`, `draftBlock` and `projectContextKV`; the `sliding-grammar-fill` Llama 3B
       case bisected to its first failing commit. From Codex's review of #339, still true on the
-      head: `TwoModelProvider.dispose()` releases only its `Weights`, so a specialized graph used
-      as a two-model draft (one that owns MLX constants or Neural Engine programs in `#owned`)
-      leaks them on unload; the fix is the graph contract requiring `dispose()` on every graph
+      head: `TwoModelProvider.dispose()` releases only its `Weights`, so a graph used as a
+      two-model draft that owns MLX constants or Neural Engine programs (`#owned`) leaks them
+      on unload; the fix is the graph contract requiring `dispose()` on every graph
       (generic graphs release nothing), called by every provider and by the host, not an
       optional-method probe; done here because B4 is editing the graph files now.
       case bisected to its first failing commit. Exit: the sweep returns nothing but
@@ -1141,7 +1145,7 @@ the DFlash 2 numerics, the bench scripts, modules, web, training.
 - [ ] Establish real-weight parity for Qwen Trellis and Gemma, and extend MiniCPM
   beyond the [verified basic decode path](packages/inference/README.md#external-parity-evidence),
   against the applicable external oracle and main: logits, state continuation and
-  specialized paths under identical artifacts and settings. Python environments and
+  every graph's paths under identical artifacts and settings. Python environments and
   generated references stay outside the repository; reusable runners are in Git
   ([runtime comparison](packages/inference/README.md#repeatable-runtime-comparison)).
   Exit: opt-in comparisons meet the numerical contracts against pinned published
