@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { modelIdentity } from "@mlx-bun/hub/registry";
-import { kvSchemeOf, supportsTurboQuantHeadDim, TURBOQUANT_HEAD_DIMS } from "@mlx-bun/inference/state/kv-scheme";
+import { kvSchemeOf } from "@mlx-bun/inference/state/kv-scheme";
 import type { CacheCodecProvider, KvCacheService, KvCacheServiceOptions, CacheServiceGraph } from "@mlx-bun/inference/state";
 import type { LoadedModelContext } from "./model-host";
 import type { ModelBinding } from "./model-binding";
@@ -75,11 +75,6 @@ export async function createCacheServices(context: LoadedModelContext, binding: 
   // state and describes `/stats`. A context an engine-owned implementation built
   // composes none, and stores bf16.
   const resolvedKvScheme = kvSchemeOf(context.composition?.kv ?? { kind: "bf16" });
-  // As main's createServer did, refuse at startup a TurboQuant scheme the codec
-  // cannot encode for this model, instead of failing every request in prefill.
-  if (resolvedKvScheme.kind === "turbo" && !supportsTurboQuantHeadDim(context.model.config))
-    throw new Error(`--kv-quant turbo: this model's full-attention head_dim is ${context.model.config.text.globalHeadDim}; ` +
-      `TurboQuant supports {${TURBOQUANT_HEAD_DIMS.join(",")}} — use --kv-quant config|4|8 or omit it`);
   const deps = supplied ?? await defaultDependencies();
   const runtime = binding.gateway.runtime;
   const stateCodecs = context.stateCodecs ?? deps.defaultStateCodecs;
