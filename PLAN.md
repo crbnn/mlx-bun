@@ -1002,7 +1002,28 @@ unchanged.
       (the 16 default prompts, last 32 tokens forced, `klPerToken`) become
       `packages/inference/scripts/` tools with `--help`: three agents reconstructed each from
       earlier transcripts (E3, the merge, the Trellis checks). Their consumer is every gate in
-      this plan and the perf workflow's correctness check.
+      this plan and the perf workflow's correctness check. Landed
+      (`refactor/composition-bench-tooling`, ea6c31d9, integration branch fast-forwarded):
+      `digest.ts` (cells as generate flags, rows, prefill-chunk override, one process per
+      cell, `compare`) and `teacher-forced-kl.ts` (`capture` / `compare`, the 16 prompts, the
+      last 32 forced, `klPerToken` statistics), tests under `tests/scripts/`; both reproduce
+      the saved harnesses' hashes and captures byte for byte on Llama 1B. The perf check
+      landed its follow-ups: `--sessions N` alternates main and head (A B A B) and the decision
+      pools the pairs and shows per-session medians; memory is the worker's MLX active memory
+      and physical footprint from `/stats`, not `ps` RSS; `perf.yml` runs two sessions per
+      tree and a report-only numerical check (digests and the kv4 teacher-forced KL) after
+      the decision. First alternating run (ea6c31d9 vs main, M1 Max, preflight clear): Trellis
+      decode 13.8 → 13.8 (1.000 [0.991, 1.009], 10 pairs), prefill 1k 121.3 → 121.7, TTFT
+      6240 → 6226 ms, peak MLX active 15457 → 15457 MB; e4b decode 63.1 → 63.1 (1.000
+      [0.997, 1.003]), prefill 966.7 → 957.2, TTFT 693 → 700 ms, MLX active 7759 → 7871 MB;
+      the earlier 0.997 / 0.998 flags are inside the band. Numerical check: every digest cell
+      identical between main and the head on the M1 Max; kv4 KL 0 at all 487 positions. The
+      DFlash 2 adaptive configuration exists in `plan.ts` (`--dflash2-draft ID=dir[=basis]`,
+      the basis passed to both servers) but cannot run on the M1 Max: `--num-draft-tokens
+      adaptive` needs `verifyRoundCosts` measured on the host, which only the M4 Pro graph
+      declares. Owed: the generated M1 Max graph declares verify costs measured on the M1 Max
+      (a generator input, like the widths), and `perf.yml` measures DFlash 2 there, at fixed
+      depth 7 until then.
 - [x] ARCHITECTURE.md: the cache owns the read; phases are named; a specialized graph extends
       nothing; the exemplar sentence points at the regenerated graphs; the loader-level generic
       fallback is stated and the in-graph one forbidden; the one-way-per-pattern list above.
