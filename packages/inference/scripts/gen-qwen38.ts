@@ -99,7 +99,7 @@ export const QWEN38_COMPOSITIONS: Readonly<Record<string, Qwen38Composition>> = 
     draftDepth: { adaptive: true, max: 7 },
     prefillChunkTokens: 2048,
     maxRows: null,
-    aneBridge: false,
+    aneBridge: true,
     mixedGateUp: "split",
     // Measured 2026-10-13 on this graph and artifact: scripts/bench-mtp.ts, the DFlash 2 drafter at depths 1..7
     // against the depth-0 plain arm (59.4 ms per token), bf16 KV, greedy, two prompts, 128 tokens, four
@@ -243,7 +243,7 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
   // submission every 4 layers takes about 4 ms off every width (2 and 8 within noise of it); wider verify windows one
   // lazy graph (1.8% faster than bounded at 12 and 16 rows); mixed rows packed on the generic blocks; known tokens as
   // windows (the committed read's attention boundaries are qualified on the M4 Pro only); prompt pieces with their
-  // projections on the dense GEMM.
+  // projections on the dense GEMM and, from 640 positions, their MLP split with the Neural Engine.
   applegpu_g13s: {
     label: "M1 Max GPU",
     mlp: {
@@ -264,7 +264,13 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     knownSpans: false,
     mixed: "packed",
     kvLego: null,
-    ane: null,
+    // Measured 2026-10-13 on one layer's MLP at 1024 and 2048 rows: the Neural Engine's 34% of the channels (5888,
+    // 23 tiles of 256, which it runs faster than 5760) beside the GPU's 66% in 0.70 of the GPU-only time (fractions
+    // 0.25 to 0.45 swept; the Neural Engine at about 4 TFLOPS against the GPU's 8; 2% faster prompts than 0.31).
+    // Projections stay whole on the dense GEMM (promptProjection): a split there, its GPU share on MLX's quantized
+    // matmul, gains nothing over it.
+    ane: { fraction: 0.34, minRows: 640, rows: [1024, 1536, 2048],
+      rowMajorMlp: "AneTrellisMlpSplit", k3InterleavedMlp: "AneTrellisMlpSplitK3i", affine: null, projections: [] },
     // MLX's quantized matmul bit for bit from 640 rows, 1.27x to 1.38x faster (DequantizedLinear).
     promptProjection: "DequantizedLinear",
   },

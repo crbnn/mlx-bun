@@ -16,6 +16,7 @@ import {
 } from "./qwen/qwen38-27b-trellis-m4pro";
 import {
   COMPOSITION as QWEN38_TRELLIS_M1MAX_COMPOSITION, QWEN38_TRELLIS_M1MAX_GRAPH, Qwen38TrellisM1Max,
+  anePrograms as qwen38TrellisM1MaxAnePrograms,
 } from "./qwen/qwen38-27b-trellis-m1max";
 import { GENERATED_GRAPHS, type GeneratedGemma4Graph } from "./gemma4/generated/index";
 import { MiniCPM5Model } from "./minicpm5/model";
@@ -75,9 +76,9 @@ export const MLX_GRAPH_TABLES: Readonly<Record<ModelGraph, GraphTable<Weights, R
     { id: QWEN38_TRELLIS_M4PRO_GRAPH, serves: QWEN38_TRELLIS_M4PRO_COMPOSITION,
       create: (weights, config, composition) => new Qwen38TrellisM4Pro(weights, config, composition),
       anePrograms: composition => qwen38TrellisM4ProAnePrograms(composition) },
-    // The M1 Max composition builds no Neural Engine operation (its device's table has none): no programs to install.
     { id: QWEN38_TRELLIS_M1MAX_GRAPH, serves: QWEN38_TRELLIS_M1MAX_COMPOSITION,
-      create: (weights, config, composition) => new Qwen38TrellisM1Max(weights, config, composition) },
+      create: (weights, config, composition) => new Qwen38TrellisM1Max(weights, config, composition),
+      anePrograms: composition => qwen38TrellisM1MaxAnePrograms(composition) },
     generic("qwen3.5", (weights, config, composition) => new Qwen35Model(weights, config, composition)),
   ], qwen35GraphFingerprint),
   "qwen3-moe": new GraphTable([generic("qwen3-moe", (weights, config, composition) => new Qwen3MoeModel(weights, config, composition))]),

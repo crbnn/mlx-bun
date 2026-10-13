@@ -988,7 +988,10 @@ at four the matrix-unit gate/up and affine set with the factored down; the
 matrix-unit set at five to eight; prompt pieces above eight rows with their
 attention and DeltaNet projections on `layers/dequantized-linear` (from 640 rows the
 weight dequantized to bf16 and MLX's dense GEMM, MLX's quantized matmul bit for bit
-at the artifact's shapes and about 1.35x faster there); adapters as on the M4 Pro.
+at the artifact's shapes and about 1.35x faster there); with the bridge and no
+adapters, Neural Engine operations over the M4 Pro's ranges and program sizes that
+split only the MLP, 34% of its channels on the Neural Engine; adapters as on the M4
+Pro.
 On both, decode and verify up to eight rows submit the graph every four layers;
 wider windows, prompt chunks on the GPU, tails above eight rows and vision
 positions run the generic blocks inside the graph (the M1 Max's prompt pieces with
