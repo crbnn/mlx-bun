@@ -898,7 +898,9 @@ threadgroup table and keep variant 13's one-row output bits.
 
 Outside the Trellis family, `kernels/quantization/affine{3,4}-{rows,mma}` run
 3- and 4-bit group-64 affine projections for 2..8 rows (shared decode) and
-1..8 rows (matrix unit); `kernels/attention/kvq4-decode` is one-row attention
+1..8 rows (matrix unit), and `affine-split-mma` 1..8 rows of either width on the
+matrix unit with output tiles sharing each activation fragment and K split across
+the threadgroup (the M1 Max form); `kernels/attention/kvq4-decode` is one-row attention
 over a 4-bit group-64 KV cache with head dim 256, reading each packed row once
 for all query heads of its KV head; `kernels/attention/multi-query` is causal
 flash decoding for 2..8 query rows over a BF16 cache. `kernels/ane` holds the
@@ -984,11 +986,16 @@ a whole chunk or a tail, of 640 to 2048 positions on the one whose programs (102
 composition that mounts adapters builds every operation on the generic blocks. On
 the M1 Max: the threadgroup-codebook kernels at one row; at two to three rows the
 factored Trellis kernels with the affine row kernels for the projections and head;
-at four the matrix-unit gate/up and affine set with the factored down; the
-matrix-unit set at five to eight; adapters as on the M4 Pro. On both, decode and
-verify up to eight rows submit the graph every four layers; wider windows, prompt
-chunks on the GPU, tails above eight rows and vision
-positions run the generic blocks inside the graph; known-token spans do too on the
+at four the matrix-unit gate/up with the factored down; the matrix-unit Trellis set
+at five to eight; the split matrix-unit affine kernel for the projections and head
+at four to eight; prompt pieces above eight rows with their
+attention and DeltaNet projections on `layers/dequantized-linear` (from 640 rows the
+weight dequantized to bf16 and MLX's dense GEMM, MLX's quantized matmul bit for bit
+at the artifact's shapes and about 1.35x faster there); adapters as on the M4 Pro.
+On both, decode and verify up to eight rows submit the graph every four layers;
+wider windows, prompt chunks on the GPU, tails above eight rows and vision
+positions run the generic blocks inside the graph (the M1 Max's prompt pieces with
+those projections); known-token spans do too on the
 M4 Pro, and append as windows on the block set of their width on the M1 Max. Each
 generated file's header lists its operations and the request shapes it serves.
 Each declares `verifyRoundCosts`, the verify cost by row count measured for
