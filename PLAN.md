@@ -79,6 +79,21 @@ Binding for every graph file in the tree, held by the architecture gate where me
 - A layer binds exactly one kernel and decides nothing at call time either. Where a layer today
   picks a kernel by row count, width, compiled form or adapter state, it becomes one class per
   kernel and the file names the class per binding.
+- A family's generic graph is a file too, and the loader can choose it: the table's least
+  constrained entry, serving any artifact of the family. Because its layer count is the artifact's,
+  it loops over the layers; it is never a published composition, and every artifact a version
+  publishes has its own file.
+- An adapter is a lego. It is a separately trained file, composed with the graph when it mounts:
+  the loader wraps the projections the graph names as adapter targets with the adapter's delta,
+  which adds to the projection's output and so composes with any projection kernel; the scheduler
+  sets which adapters are active for the rows of each forward. No graph file knows about adapters,
+  no graph declares whether it "supports" them, and nothing refuses an adapter for a graph.
+- The winning combination is what a file assembles. A kernel choice the composition carries as a
+  flag today (compiled GEGLU, compiled SwiGLU, packed mixed MLP, compiled decode, mixed gate/up) is
+  the file's line at the value profiling chose; the other forms stay importable layers anyone can
+  assemble into their own graph, and the flags go.
+- A file may bind the same operation at every row count, or different operations at certain row
+  counts; both are the same table, read the same way.
 - Bit identity with main (3ea6ba5e) on every served composition where main served it: the digests,
   the parity suites, the captured texts. Performance is unchanged (paired, preflight-gated) and is
   not the subject of this program.
@@ -94,13 +109,15 @@ matrix runs once at the end. Agents do the work; Josh reviews the plan, I review
       `verify`, `logits`, `appendKnown` as tables from exact row count to operation, up to the
       composition's cap; `prompt` as an ordered list of `{ from, to, operation }` position ranges for
       one-sequence pieces (replacing `prefillChunk.gpu`, `prefillChunk.ane` and `prefillTail`), plus
-      the multi-sequence chunk operation. A graph exports two operation sets of that shape: its plain
-      one and, when it serves adapters, its adapter-capable one (`adapters?: MlxTokenPhases`);
-      `GraphCapabilities.adapters` is derived from the second set's presence, never from the
-      composition. `phase-dispatch.ts` indexes by rows and by range and is built per execution
-      context (the batch group selects the adapter set when it enters an adapter context; the direct
-      path when the request carries adapters); adapter rows never take a Neural Engine operation
-      because the adapter set lists none. `widthClass`, `MlxWidthClass`, `byWidth`, `atEveryWidth` go.
+      the multi-sequence chunk operation. `phase-dispatch.ts` indexes by rows and by range.
+      `widthClass`, `MlxWidthClass`, `byWidth`, `atEveryWidth` go. The adapter lego: the delta that
+      `QuantizedLinear` applies inside its forward today becomes a wrapper layer the loader composes
+      around any projection the graph names as a target (the delta adds to the projection's output,
+      so the one-kernel affine layers and the Neural Engine splits take it like the plain linear);
+      the scheduler keeps setting the active adapters per execution context as it does now;
+      `GraphCapabilities.adapters`, the `adapter-batch-unsupported` refusal and every "adapters
+      are off for this graph" branch go. Compiled decode under adapters stays the scheduler's
+      routing, as today.
       The install step compiles the programs the selected file lists (`anePrograms()` takes no
       composition). The cache composer moves to the loader: a file declares each layer's cache kind
       (attention full or sliding, recurrent) as data, and the loader composes the lego from the
@@ -112,9 +129,8 @@ matrix runs once at the end. Agents do the work; Josh reviews the plan, I review
       64 layers listed in order with their attention or DeltaNet block and, per binding, the literal
       MLP and projection classes (rows 1 through 8, every row written; the prompt ranges 1..639 on the
       GPU prompt layers, 640..1024, 1025..1536, 1537..2048 on the Neural Engine layers, the
-      multi-sequence chunk); the adapter-capable set with the quantized-linear projections at every
-      row; the head per row; the declared facts (verify round costs, known-span chunk sizes, layer
-      cache kinds). No composition parameter, no branch, no loop. Exit: digests identical to main on
+      multi-sequence chunk); the head per row; the declared facts (verify round costs, known-span chunk sizes, layer
+      cache kinds, the adapter targets). No composition parameter, no branch, no loop. Exit: digests identical to main on
       the artifact (bf16, kv4, config; default and 128-token chunks; one and four rows; the long
       prompt), the identity test against the generic graph at maxDiff 0, the five captured texts
       identical, and the real-weight parity suite at its recorded numbers.
@@ -124,7 +140,7 @@ matrix runs once at the end. Agents do the work; Josh reviews the plan, I review
 - [ ] **G4. The Gemma 4 files.** `models/gemma4/generated/gemma4-{e4b,12b,26b}.ts` rewritten as files
       under `models/gemma4/` (the directory name goes with the scripts): every layer with its sliding
       or full attention, its KV donor where the model shares KV, its per-layer input, its GEGLU form
-      named (the composition's compiled GEGLU and packed mixed MLP become the file's lines; see D3),
+      named (the composition's compiled GEGLU and packed mixed MLP become the file's lines),
       the MoE block for the 26B; row-keyed tables with one operation at every row where the kernels
       are one. Exit: the identity tests, digests identical to main (e4b, 12B, 26B), the parity suite.
 - [ ] **G5. Layers decide nothing.** One class per kernel for every layer that chooses at call time:
@@ -142,11 +158,11 @@ matrix runs once at the end. Agents do the work; Josh reviews the plan, I review
       Colibri bypass and the encoder-decoder refusal in `factory.ts` become table facts or typed
       errors at the table. Exit: `graph-table` tests; every served composition on both machines
       selects the file this plan names.
-- [ ] **G7. The generic graphs.** Decision D1 below. If they stay as the entry for artifacts without
-      a file, they keep their loops over an unknown layer count and are documented as the library's
-      "any artifact of this family" path, never a published composition; their branches on
-      composition fields still go (G1 moved the cache composer; `packedMixedMlp`, `compiledGeglu`,
-      `compiledSwiglu`, `device` become their fixed lines or their own files).
+- [ ] **G7. The generic graphs.** They stay as each family's entry for artifacts without a file:
+      the loop over the artifact's layer count stays, and the ownership documentation says so; their
+      branches on composition fields go (G1 moved the cache composer; `packedMixedMlp`,
+      `compiledGeglu`, `compiledSwiglu` and `device` become fixed lines). Exit: no composition
+      parameter in any generic graph; their digests unchanged.
 - [ ] **G8. Delete and gate.** `scripts/gen-qwen38.ts`, `scripts/gen-gemma4.ts`, `tests/fixtures/
       qwen38-graphs`, `tests/fixtures/gemma4-graphs`, the two tests that compare files to script
       output, the "GENERATED, do not edit" headers. The architecture gate gains two mechanical
@@ -163,26 +179,6 @@ matrix runs once at the end. Agents do the work; Josh reviews the plan, I review
       matrix on every artifact in the served set, the parity suites, the captured texts on the M4
       Pro, the identity tests on both machines, the paired serve check on the M4 Pro and on the M1
       Max when clean. Then `refactor/graph-files` merges to `main` once.
-
-### Decisions for Josh
-
-- D1. The generic graphs. A family's generic graph serves any artifact of the family, so it cannot
-  be unrolled: its layer count is the artifact's. Keep it as the library's entry for artifacts
-  nobody wrote a file for (recommended: the drop-in promise needs a path for any model; it is not a
-  published composition, and every artifact the version publishes gets its file), or drop it and
-  serve only written files.
-- D2. Adapters as a second operation set in the same file (recommended: the plain set is unchanged,
-  the file is still one file, the scheduler picks the set by context) versus a separate adapters
-  file per composition the loader selects.
-- D3. The remaining kernel-choice fields of the composition (`compiledGeglu`, `compiledSwiglu`,
-  `packedMixedMlp`, `compiledDecode`, `mixedGateUp`): each becomes the file's line at the value
-  profiling chose (recommended; the alternative layers stay importable for anyone's own file), or
-  each value stays a flag and every served value is its own file.
-- D4. The row-keyed table's cap: the file binds rows one through the composition's rows-per-forward
-  cap and the scheduler never submits more; wider verify windows (sequences times positions above
-  the cap) bind to the file's wide operation as a last range entry.
-
-
 
 ## Composition refactor
 
