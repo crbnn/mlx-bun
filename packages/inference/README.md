@@ -972,9 +972,11 @@ at five to eight for decode and verify, with the affine projections and the head
 the affine row kernels at two to four rows and the matrix-unit ones at five to eight;
 and, when the composition has the
 Neural Engine bridge (`aneBridge`, on by default; a bridge that does not load fails
-the load with `AneBridgeError`) and mounts no adapters, a prompt-chunk operation of
-exactly the composition's chunk size that splits each layer between the Neural
-Engine and the GPU (`prefillChunk.ane`), which the scheduler dispatches; a
+the load with `AneBridgeError`) and mounts no adapters, Neural Engine operations that
+split each layer between the Neural Engine and the GPU (`prefillChunk.ane`), each
+declaring the row range it takes: the scheduler runs any one-sequence prompt piece,
+a whole chunk or a tail, of 640 to 2048 positions on the one whose programs (1024,
+1536 or 2048 positions) hold it, as main's M4 Pro graph did; a
 composition that mounts adapters builds every operation on the generic blocks. On
 the M1 Max: the reduce and scatter kernels at one to four rows and the generic
 blocks above. On both, wider windows, prompt chunks on the GPU, tails and vision

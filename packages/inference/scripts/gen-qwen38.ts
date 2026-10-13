@@ -176,8 +176,10 @@ interface DeviceKernels {
   readonly mixed: "perGroup" | "packed";
   /** The cache lego a composition's affine scheme composes; `null` for compositions serving every scheme. */
   readonly kvLego: string | null;
-  readonly ane: { readonly fraction: number; readonly rowMajorMlp: string; readonly k3InterleavedMlp: string;
-    readonly affine: string; readonly projections: readonly string[] } | null;
+  /** The Neural Engine operations: the channel fraction, the split layers, and the row counts their programs are built
+   *  for (ascending), the smallest of which a one-sequence prompt piece of `minRows` positions or more runs. */
+  readonly ane: { readonly fraction: number; readonly minRows: number; readonly rows: readonly number[];
+    readonly rowMajorMlp: string; readonly k3InterleavedMlp: string; readonly affine: string; readonly projections: readonly string[] } | null;
 }
 
 /** The module under src/layers each one-kernel MLP layer lives in. */
@@ -213,7 +215,10 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     knownSpans: true,
     mixed: "perGroup",
     kvLego: "Bf16FirstKv4Head256Cache",
-    ane: { fraction: 0.55, rowMajorMlp: "AneTrellisMlpSplit", k3InterleavedMlp: "AneTrellisMlpSplitK3i", affine: "AneAffineSplit",
+    // Main's Neural Engine prefill plan (9593d881, from a8a5ba45): every one-sequence prompt piece of 640 to 2048
+    // positions, a chunk or a tail, on the smallest of the programs built every 512 positions up to 2048.
+    ane: { fraction: 0.55, minRows: 640, rows: [1024, 1536, 2048],
+      rowMajorMlp: "AneTrellisMlpSplit", k3InterleavedMlp: "AneTrellisMlpSplitK3i", affine: "AneAffineSplit",
       projections: ["in_proj_z", "out_proj", "o_proj"] },
   },
   // The M1 Max GPU's kernels and evaluation, measured there: the reduce gate/up and scatter down kernels up to
@@ -336,6 +341,11 @@ export function emitQwen38Graph(description: Qwen38Description, stem: string,
   if ((c.kv === "every") !== (c.maxRows === null))
     throw new Error(`${stem}: this template constrains the KV schemes and the rows together, or neither`);
   if (c.aneBridge && !ane) throw new Error(`${stem}: ${c.device}'s table builds no Neural Engine operation`);
+  /** Each Neural Engine operation's row range: from the device's fewest positions, or one above the previous
+   *  program's, up to its own program's. */
+  const aneRanges = (ane?.rows ?? []).map((rows, j, all) => [j === 0 ? ane!.minRows : all[j - 1]! + 1, rows] as const);
+  if (aneRanges.some(([minRows, rows]) => minRows > rows))
+    throw new Error(`${stem}: ${c.device}'s Neural Engine programs ascend from at least the fewest positions a piece runs`);
   const one = k.mlp.one;
   if (!one) throw new Error(`${stem}: ${c.device}'s table names no one-row MLP layers`);
   if (c.mixedGateUp !== undefined && !NARROW.some(cls => k.mlp[cls]?.mixedGateUp === "ReduceMixedGateUp"))
@@ -482,13 +492,15 @@ ${row("operation", "MLP gate/up + down (row-major/interleaved)", "affine project
 ${classRows}
 ${row("decode/verify.wider,", "the generic blocks (TrellisMlp)", "QuantizedLinear")}
 ${row("prefillChunk.gpu, prefillTail", "", "")}${ane ? `
-${row("prefillChunk.ane", `${ane.rowMajorMlp}/K3i`, `${ane.projections.join(", ")} split`)}` : ""}
+${row(`prefillChunk.ane, ${ane.minRows}..${ane.rows.at(-1)}`, `${ane.rowMajorMlp}/K3i`, `${ane.projections.join(", ")} split`)}` : ""}
 //
 ${summary}
 //
 // Request shapes this graph serves:
-${ane ? `//   - prompt chunks of exactly the composition's chunk size (prefillChunk.gpu; prefillChunk.ane when the
-//     composition has the Neural Engine bridge and mounts no adapters) and prompt tails (prefillTail);`
+${ane ? `//   - prompt chunks of exactly the composition's chunk size (prefillChunk.gpu) and prompt tails (prefillTail),
+//     and, when the composition has the Neural Engine bridge and mounts no adapters, one sequence's chunk or tail
+//     of ${ane.minRows} to ${ane.rows.at(-1)} positions on the Neural Engine operation whose programs hold it (prefillChunk.ane:
+//     ${aneRanges.map(([minRows, rows]) => `${minRows}..${rows}`).join(", ")}, programs of ${ane.rows.join(", ")} positions);`
   : "//   - prompt chunks of exactly the composition's chunk size (prefillChunk.gpu) and prompt tails (prefillTail);"}
 //   - decode, one position per sequence, and speculative verify windows of sequences x (depth + 1) positions
 //     with the drafter's layer capture, for any number of sequences${c.maxRows === null ? "" : " up to the composition's rows per forward"}
@@ -586,6 +598,11 @@ ${ane ? `const ANE_PROJECTIONS: ReadonlySet<string> = new Set(${list(ane.project
 const ASYNC_EVERY = ${asyncEvery};
 ` : ""}${ane ? `/** The Neural Engine's channel fraction in each split. */
 const ANE_FRACTION = ${ane.fraction};
+/** The Neural Engine operations' row ranges, ascending: a one-sequence prompt piece, a chunk or a tail, whose positions
+ *  one holds runs on it, over programs built for its \`rows\`. From this machine's kernel table. */
+const ANE_RANGES: readonly { readonly minRows: number; readonly rows: number }[] = Object.freeze([
+  ${aneRanges.map(([minRows, rows]) => `{ minRows: ${minRows}, rows: ${rows} }`).join(", ")},
+]);
 
 /** The widths a graph's Neural Engine programs are built at: the MLP's hidden and intermediate widths, and the input
  *  and output widths of each distinct split projection shape. */
@@ -603,15 +620,14 @@ export const ANE_WIDTHS: AneWidths = Object.freeze({
 
 /** The distinct Neural Engine programs this graph loads for \`composition\`, at the artifact's widths unless
  *  \`widths\` names others (a synthetic artifact laid out like it): none without the bridge or with adapters mounted,
- *  otherwise the whole-MLP slice every layer shares and one program per split projection shape, each for exactly the
- *  composition's chunk size. The install step compiles them into the system cache (\`compileAnePrograms\`,
- *  models/ane-install); the constructor only loads them, so one missing there fails construction with
- *  \`AneBridgeError\`. */
+ *  otherwise, for each range in \`ANE_RANGES\`, the whole-MLP slice every layer shares and one program per split
+ *  projection shape, each for that range's rows. The install step compiles them into the system cache
+ *  (\`compileAnePrograms\`, models/ane-install); the constructor only loads them, so one missing there fails
+ *  construction with \`AneBridgeError\`. */
 export function anePrograms(composition: Composition, widths: AneWidths = ANE_WIDTHS): AneProgramSpec[] {
   if (!composition.aneBridge || composition.adapters) return [];
-  const chunk = composition.prefillChunkTokens;
-  return [aneMlpSplitProgram(widths.hidden, widths.intermediate, ANE_FRACTION, chunk),
-    ...widths.projections.map(([inputs, outputs]) => aneAffineSplitProgram(inputs, outputs, ANE_FRACTION, chunk))];
+  return ANE_RANGES.flatMap(({ rows }) => [aneMlpSplitProgram(widths.hidden, widths.intermediate, ANE_FRACTION, rows),
+    ...widths.projections.map(([inputs, outputs]) => aneAffineSplitProgram(inputs, outputs, ANE_FRACTION, rows))]);
 }
 ` : ""}
 /** One layer: input norm, mixer, residual, post-attention norm, MLP, residual. Consumes nothing; returns an owned output.
@@ -742,31 +758,33 @@ ${k.mixed === "packed" ? `    this.#layers = generic;
 ` : ""}
 ${narrowBlock}
 
-${ane ? `    // The Neural Engine chunk operation, for exactly the composition's chunk
-    // size. Layers run one at a time, so each MLP split shares the previous
-    // layer's program and projections of one shape share theirs: one loaded
-    // program per shape, the programs \`anePrograms\` lists, loaded from the
-    // compile cache the install step filled (nothing compiles here).
-    let ane: Step[] | null = null;
+${ane ? `    // The Neural Engine operations, one per range in ANE_RANGES, built largest
+    // first. Layers run one at a time and the scheduler runs one operation at a
+    // time, so each MLP split shares the previous split's program (identical
+    // within a range) or its buffers (the largest range's), and projections of
+    // one shape share theirs: one loaded program per shape and range, the
+    // programs \`anePrograms\` lists, loaded from the compile cache the install
+    // step filled (nothing compiles here).
+    let ane: { readonly minRows: number; readonly rows: number; readonly steps: Step[] }[] | null = null;
     if (composition.aneBridge && !composition.adapters) {
-      const started = performance.now(), chunk = composition.prefillChunkTokens;
+      const started = performance.now();
       const affineShares = new Map<string, ${ane.affine}>();
       let mlpShare: AneMlpSplit | undefined;
-      ane = generic.map((layer, i) => {
+      ane = [...ANE_RANGES].reverse().map(({ minRows, rows }) => ({ minRows, rows, steps: generic.map((layer, i) => {
         const spec = LAYERS[i]!, { gate, up, down } = mlpOf(i);
         const split = mlpShare = (spec.downLayout === "k3Interleaved" ? ${ane.k3InterleavedMlp} : ${ane.rowMajorMlp})
-          .build(gate, up, down, ANE_FRACTION, chunk, mlpShare);
+          .build(gate, up, down, ANE_FRACTION, rows, mlpShare);
         this.#owned.push(split);
         const block = blockOf(i, (linear, path) => {
           if (!ANE_PROJECTIONS.has(path.slice(path.lastIndexOf(".") + 1))) return linear;
           const shape = \`\${linear.inFeatures}:\${linear.outFeatures}\`;
-          const projection = ${ane.affine}.build(linear, ANE_FRACTION, chunk, affineShares.get(shape));
+          const projection = ${ane.affine}.build(linear, ANE_FRACTION, rows, affineShares.get(shape));
           affineShares.set(shape, projection);
           this.#owned.push(projection);
           return projection;
         });
         return layerStep(layer, mixerOf(block, spec.kind), post => split.forward(post, compiledSwiglu));
-      });
+      }) })).reverse();
       console.error(\`[ane] prefill programs ready in \${Math.round(performance.now() - started)} ms\`);
     }
 
@@ -801,8 +819,9 @@ ${kvLego ? `    // The attention cache the composition's KV scheme names, chosen
     const gpu: RowsForward = (ids, state, capture) =>
       this.#bounded(wide, embed.encode(ids), state, "window", capture, null, "wider");
 ${ane ? `    this.prefillChunk = Object.freeze(split
-      ? { gpu, ane: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
-        this.#bounded(split, embed.encode(ids), state, "window", capture, null, "wider") }
+      ? { gpu, ane: Object.freeze(split.map(({ minRows, rows, steps }) => Object.freeze({ minRows, rows,
+        forward: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
+          this.#bounded(steps, embed.encode(ids), state, "window", capture, null, "wider") }))) }
       : { gpu });` : "    this.prefillChunk = Object.freeze({ gpu });"}
     this.prefillTail = Object.freeze({
 ${NARROW.map(cls => entry(cls, "window", "bounded")).join("\n")}
