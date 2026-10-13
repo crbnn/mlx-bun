@@ -12,8 +12,9 @@ import { MlxPrefillCohort } from "./prefill-cohort";
 import { MlxStateRows } from "../state/rows";
 import { targetCacheLayout } from "../state/layout";
 import { leaseCacheStates } from "../state/leases";
-import { createKvMaintenance, type KvMaintenance } from "../state/kv-maintenance";
-import { bindMlxAutoregressiveGraph, supportsCommittedAppendCache, type MlxAutoregressiveBinding, type MlxTokenAppend } from "../generation/bindings/autoregressive";
+import { MlxPhaseDispatch } from "../generation/phase-dispatch";
+import { tokenPhasesOf } from "../models/capabilities";
+import { widthClass, type MlxKnownSpans } from "../contracts/mlx/graph";
 import { appendHiddenRows } from "../generation/fill-append";
 import { advanceSpeculativeOutputs } from "../generation/speculative/round";
 import { bindRowCacheRollback } from "../state/rollback";
@@ -34,18 +35,19 @@ export function bindFillGroupRequests(model: MlxTokenGraph) {
   return (input: GenerateOptions): MlxGroupMethodRequest => {
     const options = snapshotGenerationPolicy(input);
     return {
-      key: JSON.stringify(["fill", options.kvBits ?? null, options.kvGroupSize ?? 64,
-        options.quantizedKvStart ?? null, options.turboQuant ?? null, options.kvConfig ?? null]),
+      key: JSON.stringify(["fill"]),
       data: options,
-      open: host => new FillGroup(host, model, options),
+      open: host => new FillGroup(host, model),
     };
   };
 }
 
 class FillGroup implements MlxGroupedMethod {
-  readonly #binding: MlxAutoregressiveBinding;
-  readonly #maintain: KvMaintenance;
-  readonly #append: MlxTokenAppend | null | undefined;
+  readonly #dispatch: MlxPhaseDispatch;
+  /** The graph's committed known-token spans, when it declares them, this
+   *  group's rows carry no active adapter and the KV scheme keeps their
+   *  one-position arithmetic; otherwise known tokens append one at a time. */
+  readonly #spans: MlxKnownSpans | null;
   readonly #verify: MlxSpeculativeTargetBinding;
   readonly #requests = new Map<Row, RequestState>();
   #target: MlxStateRows<ReturnType<typeof targetCacheLayout>> | null = null;
@@ -54,12 +56,16 @@ class FillGroup implements MlxGroupedMethod {
   #real: boolean[] = [];
   #steps = 0;
 
-  constructor(readonly host: MlxGroupMethodHost, readonly model: MlxTokenGraph, options: GenerateOptions) {
-    this.#binding = bindMlxAutoregressiveGraph(model);
+  constructor(readonly host: MlxGroupMethodHost, readonly model: MlxTokenGraph) {
+    this.#dispatch = new MlxPhaseDispatch(tokenPhasesOf(model));
     this.#verify = bindSpeculativeTargetModel(model);
-    this.#maintain = createKvMaintenance(options);
-    const append = this.#binding.createAppend?.({ hasAdapters: !!this.#binding.adapters?.active.length, pagedKv: false });
-    this.#append = supportsCommittedAppendCache(append, options) ? append : null;
+    const spans = model.knownSpans;
+    this.#spans = spans && !model.loraState?.active.length ? spans : null;
+  }
+
+  /** Positions one known-token call takes: up to the spans' limit for one row, one per row otherwise. */
+  #knownChunk(caches: readonly Cache[], rows: number): number {
+    return this.#spans && rows === 1 ? this.#spans.maxChunkSize(caches) : 1;
   }
 
   get runningTokens(): number { return this.host.rows.length * Math.max(1, this.#burstLength(), this.#verifyLength()); }
@@ -76,7 +82,7 @@ class FillGroup implements MlxGroupedMethod {
   #burstLength(): number {
     const rows = this.host.rows;
     if (!rows.length || !this.#pending || this.#known.some(known => !known) ||
-        (this.#append?.maxChunkSize(this.#target!.caches, rows.length) ?? 1) <= 1) return 0;
+        this.#knownChunk(this.#target!.caches, rows.length) <= 1) return 0;
     return Math.min(...rows.map(row => {
       const proposal = this.#requests.get(row)!.proposal;
       return proposal?.value.policy === "assert" ? proposal.value.ids.length - proposal.emitted : 0;
@@ -86,11 +92,11 @@ class FillGroup implements MlxGroupedMethod {
   prepare(first: Row): MlxGroupPreparation {
     const ready: { row: Row; caches: Cache[]; retain?: () => void }[] = [];
     const target = new MlxPrefillCohort({
-      model: this.model, chunkSize: this.host.prefillChunkSize,
-      tailSplit: this.host.runtime.flag("MLX_BUN_PREFILL_TAIL_SPLIT", true),
-      promptCache: this.host.promptCache, maintain: this.#maintain,
-      forward: async (ids, caches) => this.#binding.graph.forwardHidden(ids, caches),
-      project: hidden => this.#binding.graph.projectLogits(hidden, { type: "all" }),
+      chunkSize: this.host.prefillChunkSize,
+      tailSplit: this.host.prefillTailSplit,
+      cache: this.host.cache, maintain: this.host.kvMaintenance,
+      forward: async (ids, caches, step) => this.#dispatch.prompt(step.phase, step.sequences, step.tokens)(ids, caches, null),
+      project: (hidden, _caches, _completed, step) => this.#dispatch.logits(step.sequences * step.tokens)(hidden),
       complete: async (state, logits) => {
         const row = state.row;
         const request = this.#requests.get(row)!;
@@ -99,7 +105,6 @@ class FillGroup implements MlxGroupedMethod {
         row.generated = row.sampled = 1;
         try {
           const reason = await this.#emit(row, token.toIntTokens()[0]!, false);
-          this.#maintain(state.solo);
           if (reason) {
             this.#put(row, state.solo, state.retain);
             state.solo = []; state.retain = undefined;
@@ -140,7 +145,7 @@ class FillGroup implements MlxGroupedMethod {
             if (state.row.req.signal?.aborted) {
               this.#closeRequest(state.row); state.row.reject(state.row.req.signal.reason); continue;
             }
-            this.#maintain.prepareBatch?.(state.caches);
+            this.host.kvMaintenance?.prepareBatch?.(state.caches);
             this.#target ??= new MlxStateRows(state.caches.map(targetCacheLayout));
             this.#target.append(state.caches);
             // Copies must settle before releasing a restored SSD lease.
@@ -180,7 +185,8 @@ class FillGroup implements MlxGroupedMethod {
     const nextKnown: boolean[] = [], nextReal: boolean[] = [];
     if (anyLive) {
       using input = previous ? ops.reshape(previous, [B, 1]) : ops.fromInt32(rows.map(row => row.current), [B, 1]);
-      using hidden = await (work ? work(input, this.#target!.caches) : this.#binding.graph.forwardHidden(input, this.#target!.caches));
+      const own = async () => this.#dispatch.decode(B)(input, this.#target!.caches, null);
+      using hidden = await (work ? work(input, this.#target!.caches, { phase: "decode", rows: B, width: widthClass(B), capture: null, own }) : own());
       const selected = rows.map((row, index) => {
         const request = this.#requests.get(row)!;
         // The next selected token is not committed until it becomes input.
@@ -195,7 +201,7 @@ class FillGroup implements MlxGroupedMethod {
         return value;
       });
       const needScores = rows.some((_row, index) => nextReal[index] && !nextKnown[index]);
-      using logits = needScores ? this.#binding.graph.projectLogits(hidden, { type: "last" }) : null;
+      using logits = needScores ? this.#dispatch.logits(B)(hidden) : null;
       const tokens: MlxArray[] = [];
       try {
         for (let index = 0; index < B; index++) {
@@ -287,8 +293,7 @@ class FillGroup implements MlxGroupedMethod {
     const rollback = bindRowCacheRollback(this.#target!.caches, rows.length);
     const verifying = rows.filter(row => this.#requests.get(row)!.proposal?.value.policy === "verify")
       .map(row => this.#requests.get(row)!.fill);
-    const pin = this.#verify.pinVerify?.();
-    try {
+    {
       const completed = await advanceSpeculativeOutputs(rows.map((row, index) => ({
         pending: pending[index]!, step: row.sampled, remaining: row.req.maxTokens - row.generated,
         eosTokenIds: row.req.eosTokenIds, sampling: samplers[index]!,
@@ -313,10 +318,10 @@ class FillGroup implements MlxGroupedMethod {
             for (const fill of verifying) fill.stats.checkpointMs += elapsed;
           },
         },
-        forward: async ids => {
-          const result = await this.#verify.forward(ids, this.#target!.caches);
+        forward: async (ids, window) => {
+          const result = await this.#verify.verify(ids, this.#target!.caches, window);
           const context = result.ctxML ?? result.hidden;
-          try { return { logits: this.#verify.projectLogits(result.hidden), context }; }
+          try { return { logits: this.#verify.projectLogits(result.hidden, window.sequences * window.positions), context }; }
           catch (error) { context.dispose(); throw error; }
           finally { if (result.ctxML) result.hidden.dispose(); }
         },
@@ -338,7 +343,7 @@ class FillGroup implements MlxGroupedMethod {
       }
       if (keep.length !== rows.length) this.host.filterRows(keep);
       if (++this.#steps % 256 === 0) clearCache();
-    } finally { pin?.close(); }
+    }
   }
 
   /** Multi-position arithmetic is model-owned. Wider cohorts whose model
@@ -350,10 +355,13 @@ class FillGroup implements MlxGroupedMethod {
       return [row, proposal.value.ids.slice(proposal.emitted, proposal.emitted + length)] as const;
     }));
     using input = ops.fromInt32(rows.flatMap(row => spans.get(row)!), [B, length]);
-    using hidden = await appendHiddenRows(this.#append!.forwardHidden.bind(this.#append), this.#target!.caches, input,
-      (caches, count) => Math.min(this.#append!.maxChunkSize(caches, count),
-        this.#maintain.maxAppendTokens?.(caches) ?? Infinity,
-        ...rows.map(row => this.#requests.get(row)!.fill.appendChunkSize || Infinity)));
+    // One row appends its span through appendKnown; several rows append one known token each through decode.
+    using hidden = await appendHiddenRows((part, caches, positions) => B === 1
+      ? this.#dispatch.known(positions)(part, caches) : this.#dispatch.decode(B)(part, caches, null),
+    this.#target!.caches, input,
+    (caches, count) => Math.min(this.#knownChunk(caches, count),
+      this.host.kvMaintenance?.maxAppendTokens?.(caches) ?? Infinity,
+      ...rows.map(row => this.#requests.get(row)!.fill.appendChunkSize || Infinity)));
     const nextKnown: boolean[] = [], nextReal: boolean[] = [];
     const selected = rows.map(row => {
       const request = this.#requests.get(row)!, proposal = request.proposal!;
@@ -366,7 +374,8 @@ class FillGroup implements MlxGroupedMethod {
       return next;
     });
     const needScores = rows.some((_row, index) => nextReal[index] && !nextKnown[index]);
-    using logits = needScores ? this.#binding.graph.projectLogits(hidden, { type: "last" }) : null;
+    using last = needScores ? hidden.slice([0, length - 1, 0], [B, length, hidden.shape[2]!]) : null;
+    using logits = last ? this.#dispatch.logits(B)(last) : null;
     const tokens: MlxArray[] = [];
     let next: MlxArray | null = null;
     try {
@@ -457,9 +466,8 @@ class FillGroup implements MlxGroupedMethod {
 
   #put(row: Row, caches: Cache[], retain?: () => void): void {
     try {
-      if (this.host.promptCache && !row.fedTainted && !row.req.signal?.aborted) {
-        this.host.promptCache.put([...row.req.promptIds, ...row.fed], caches,
-          row.cacheNamespace, retain, undefined, row.req.cacheSessionId);
+      if (this.host.cache.keeps(row.req) && !row.fedTainted && !row.req.signal?.aborted) {
+        this.host.cache.publish(row.req, row.cacheNamespace ?? "", [...row.req.promptIds, ...row.fed], { caches, retain });
         caches = []; retain = undefined;
       }
     } finally { disposeResources([...caches, { dispose: () => retain?.() }]); }

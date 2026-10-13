@@ -12,7 +12,10 @@ import { MlxStateRows } from "../../src/state/rows";
 import { BatchedKVCache } from "../../src/state/batched-kv";
 import { KVCache } from "../../src/state/kv";
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
+import { testComposition } from "../models/test-composition";
 import { bindSpeculativeGroupRequests } from "../../src/execution/speculative-group";
+import { atEveryWidth } from "../../src/models/graph";
+import { stubPhases } from "../models/phase-forward";
 
 let directory: string;
 let openSpy: ReturnType<typeof spyOn<typeof Weights, "open">>;
@@ -86,19 +89,15 @@ test("provider disposal releases weight maps and transpose views once", async ()
   provider.dispose();
   expect(disposeCalls).toBe(1);
   expect(liveBytes()).toBe(baseline);
-  expect(() => provider.open({} as Parameters<QwenMtpProvider["open"]>[0]))
+  expect(() => provider.grouped.openPrefill({ target: { identity: {} }, checkpoints: [] }))
     .toThrow("qwen MTP provider is disposed");
 });
 
 test("checkpoint identity survives provider reload and changes with draft bytes", async () => {
   const namespace = async () => {
     const provider = await QwenMtpProvider.load(directory);
-    const unused = () => { throw new Error("identity inspection must not execute the model"); };
-    const source = provider.open({ sampler: unused, target: { identity: {}, recurrentMtp: {
-      hiddenSize: 8, layerCount: 1, embed: unused, logitsFromHidden: unused,
-    } } });
-    try { return source.checkpoint!.namespace; }
-    finally { source.dispose(); provider.dispose(); }
+    try { return provider.grouped.checkpointNamespace!(); }
+    finally { provider.dispose(); }
   };
   const original = await namespace();
   expect(await namespace()).toBe(original);
@@ -109,8 +108,10 @@ test("checkpoint identity survives provider reload and changes with draft bytes"
 test("a target without the recurrent MTP port is refused by port, not by family", async () => {
   const provider = await QwenMtpProvider.load(directory);
   try {
-    expect(() => provider.open({ sampler: () => { throw new Error("unused"); }, target: { identity: {} } }))
-      .toThrow("target graph does not provide recurrentMtp");
+    for (const open of [() => provider.grouped.openPrefill({ target: { identity: {} }, checkpoints: [] }),
+      () => provider.grouped.open({ target: { identity: {} }, checkpoints: [],
+        sampling: { selection: { kind: "sampled" }, sample: () => { throw new Error("unused"); } } })])
+      expect(open).toThrow("target graph does not provide recurrentMtp");
   } finally { provider.dispose(); }
 });
 
@@ -136,7 +137,7 @@ test("group membership borrows committed checkpoints and survives reorder, drain
   const provider = await QwenMtpProvider.load(directory);
   const unused = () => { throw new Error("membership must not execute the model"); };
   const target = { identity: {}, recurrentMtp: {
-    hiddenSize: 8, layerCount: 1, embed: unused, logitsFromHidden: unused,
+    hiddenSize: 8, layerCount: 1, embed: unused, logits: atEveryWidth(unused),
   } };
   const checkpoint = (tokens: number, value: number): DraftRowCheckpoint => ({
     processedTokens: tokens,
@@ -153,11 +154,10 @@ test("group membership borrows committed checkpoints and survives reorder, drain
     metadata: state.attachment.metadata,
     tensors: state.attachment.tensors.map(array => [...array.toFloat32()]) });
   const expected = donors.map(values);
-  const group = provider.grouped.open({ target, sampling: { sample: unused }, checkpoints: [] });
-  const source = provider.open({ target, sampler: unused });
+  const group = provider.grouped.open({ target, sampling: { selection: { kind: "sampled" }, sample: unused }, checkpoints: [] });
   try {
     expect(group.rowCount).toBe(0);
-    expect(group.namespace).toBe(source.checkpoint!.namespace);
+    expect(group.namespace).toBe(provider.grouped.checkpointNamespace!());
     expect(group.tapLayers).toEqual([0]);
     group.append(donors.slice(0, 1));
     group.append(donors.slice(1));
@@ -185,12 +185,7 @@ test("group membership borrows committed checkpoints and survives reorder, drain
     expect(donors.map(values)).toEqual(expected);
     group.dispose();
     expect(disposeCalls).toBe(0);
-    // The same attachment can move between grouped and request execution.
-    source.checkpoint!.restore(donors[1]!.processedTokens, donors[1]!.attachment);
-    const restored = { processedTokens: 4, attachment: source.checkpoint!.capture(4) };
-    try { expect(values(restored)).toEqual(expected[1]!); }
-    finally { release(restored); }
-  } finally { group.dispose(); source.dispose(); donors.forEach(release); provider.dispose(); }
+  } finally { group.dispose(); donors.forEach(release); provider.dispose(); }
   expect(disposeCalls).toBe(1);
 });
 
@@ -199,8 +194,8 @@ test("target and draft admission publish together after every state owner prepar
   const provider = await QwenMtpProvider.load(directory);
   const unused = () => { throw new Error("admission must not execute the model"); };
   const draft = provider.grouped.open({ target: { identity: {}, recurrentMtp: {
-    hiddenSize: 8, layerCount: 1, embed: unused, logitsFromHidden: unused,
-  } }, sampling: { sample: unused }, checkpoints: [] });
+    hiddenSize: 8, layerCount: 1, embed: unused, logits: atEveryWidth(unused),
+  } }, sampling: { selection: { kind: "sampled" }, sample: unused }, checkpoints: [] });
   const target = new MlxStateRows([new BatchedKVCache()]);
   const pending = MlxArray.fromFloat32(new Float32Array(8).fill(17), [1, 1, 8]);
   const checkpoint: DraftRowCheckpoint = { processedTokens: 1,
@@ -238,7 +233,7 @@ test("prefill membership borrows the same checkpoints without constructing a sam
   const provider = await QwenMtpProvider.load(directory);
   const unused = () => { throw new Error("prefill membership must not execute the model"); };
   const target = { identity: {}, recurrentMtp: { hiddenSize: 8, layerCount: 1,
-    embed: unused, logitsFromHidden: unused } };
+    embed: unused, logits: atEveryWidth(unused) } };
   const hidden = MlxArray.fromFloat32(new Float32Array(8).fill(7), [1, 1, 8]);
   const checkpoint: DraftRowCheckpoint = { processedTokens: 1,
     attachment: { schema: "qwen-mtp-v1", metadata: { draftOffset: 0 }, tensors: [hidden] } };
@@ -259,7 +254,7 @@ test("prefill membership borrows the same checkpoints without constructing a sam
     expect(prefill.rowCount).toBe(2);
     prefill.filterRows([1]);
     const restored = prefill.capture(0);
-    const decode = provider.grouped.open({ target, sampling: { sample: unused }, checkpoints: [restored] });
+    const decode = provider.grouped.open({ target, sampling: { selection: { kind: "sampled" }, sample: unused }, checkpoints: [restored] });
     try {
       expect(decode.namespace).toBe(prefill.namespace);
       const captured = decode.capture(0);
@@ -274,19 +269,24 @@ test("Qwen MTP declares the target tap its grouped rows consume, resolved from t
   const provider = await QwenMtpProvider.load(directory);
   const unused = () => { throw new Error("declaration must not execute the model"); };
   try {
-    const target = { identity: {}, recurrentMtp: { hiddenSize: 8, layerCount: 3, embed: unused, logitsFromHidden: unused } };
+    const target = { identity: {}, recurrentMtp: { hiddenSize: 8, layerCount: 3, embed: unused, logits: atEveryWidth(unused) } };
     const declared = provider.grouped.targetTapLayers!(target);
     expect(declared).toEqual([2]);
-    for (const open of [() => provider.grouped.open({ target, sampling: { sample: unused }, checkpoints: [] }),
+    for (const open of [() => provider.grouped.open({ target, sampling: { selection: { kind: "sampled" }, sample: unused }, checkpoints: [] }),
       () => provider.grouped.openPrefill({ target, checkpoints: [] })]) {
       const rows = open();
       try { expect(rows.tapLayers).toEqual(declared); } finally { rows.dispose(); }
     }
     // The speculative binding resolves it against the legacy target view: it binds
-    // where the target forward captures hidden layers and refuses where it cannot.
-    const qwen = (tap: boolean) => Object.assign(Object.create(Qwen35Model.prototype), {
-      config: { modelType: "qwen3_5", eosTokenIds: [], text: { enableMoeBlock: false, hiddenSize: 8, numHiddenLayers: 3, vocabSize: 16 } },
-      embed: { encode: unused }, lmHead: null, makeCache: () => [], ...(tap ? { hiddenTap: null } : {}) }) as Qwen35Model;
+    // where the graph declares that its phases capture hidden layers and refuses where it does not.
+    const qwen = (tap: boolean) => {
+      const graph = Object.assign(Object.create(Qwen35Model.prototype), {
+        config: { modelType: "qwen3_5", eosTokenIds: [], text: { enableMoeBlock: false, hiddenSize: 8, numHiddenLayers: 3, vocabSize: 16 } },
+        embed: { encode: unused }, lmHead: null, makeCache: () => [], composition: testComposition(), ...stubPhases(unused, unused) });
+      const declared = Object.getOwnPropertyDescriptor(Qwen35Model.prototype, "graphCapabilities")!.get!.call(graph);
+      Object.defineProperty(graph, "graphCapabilities", { value: { ...declared, hiddenLayerTaps: tap } });
+      return graph as Qwen35Model;
+    };
     expect(bindSpeculativeGroupRequests(qwen(true), provider, 2)).toBeDefined();
     expect(bindSpeculativeGroupRequests(qwen(false), provider, 2)).toBeUndefined();
   } finally { provider.dispose(); }

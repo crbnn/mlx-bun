@@ -19,9 +19,9 @@
 //
 // MIGRATION NOTE. The shipped speculative lane
 // (packages/inference/src/generation/speculative/) has its own
-// `DraftSource` seam with a verify/rollback executor of its own (ngram, MTP,
+// grouped draft rows with a verify/rollback executor of their own (ngram, MTP,
 // two-model, DSpark). Those are NOT rewired onto this interface in this phase
-// — the adapter (a DraftSource wrapped as a `verify`-policy ProposalSource, so
+// — the adapter (draft rows wrapped as a `verify`-policy ProposalSource, so
 // one apply primitive serves both lanes) is future work, deliberately deferred
 // so the spec lane's oracles stay untouched.
 

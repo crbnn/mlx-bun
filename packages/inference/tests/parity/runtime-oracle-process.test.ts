@@ -74,7 +74,7 @@ test("worker excludes only opt-in controls without reloading dotenv or changing 
   const directory = mkdtempSync(join(tmpdir(), "runtime-parity-environment-"));
   const controls = { ...full, MLX_BUN_PARITY_TIMEOUT_MS: "60000", MLX_BUN_PARITY_ALLOW_UNRECORDED_CONFIG: "1",
     MLX_BUN_PARITY_REFERENCE_SHA256: "b".repeat(64) };
-  const numerical = { MLX_BUN_COMPILED_DECODE: "0", MLX_BUN_PREFILL_TAIL_SPLIT: "0",
+  const numerical = { MLX_BUN_RD_PREFILL_CHUNK: "512", MLX_BUN_BATCH_NO_PIPELINE: "1",
     MLX_BUN_PARITY_FUTURE_RUNTIME_OPTION: "keep", MLX_BUN_LIBMLXC: "/native-must-not-load" };
   const keys = [...Object.keys(controls), ...Object.keys(numerical), "PARITY_DOTENV_ONLY"];
   const snapshot = `Object.fromEntries(${JSON.stringify(keys)}.filter(key => process.env[key] !== undefined)

@@ -9,21 +9,28 @@
 // [trigger, ...ids] would duplicate a position and silently corrupt both the
 // cache and PromptCache.put's key. `model.forwards` records every id sequence
 // the loop pushed through the model, so the test can see it directly.
-import { describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, test } from "bun:test";
 import { generate, shouldUseFill, type GenerateOptions, type GenerateStats } from "../../src/generation/index";
 import {
   FillSession, type FillRow, type Proposal, type ProposalSource,
 } from "../../src/generation/fill/session";
 import { KVCache } from "../../src/state/kv";
-import { type Cache } from "../../src/contracts/mlx/cache";
+import { type Cache, type CommittedAttentionCache } from "../../src/contracts/mlx/cache";
+import type { Composition, KvStorageScheme } from "../../src/contracts/portable/composition";
+import { composedFullAttentionCache, composedSlidingAttentionCache } from "../../src/state/bf16-first-kv";
+import { AttentionMasks } from "../../src/state/attention-read";
+import { deferredTurboQuantKernels } from "../../src/state/turboquant-attention";
+import { testComposition } from "../models/test-composition";
+import { Dtype } from "@mlx-bun/mlx/ffi";
+import * as ops from "@mlx-bun/mlx/ops";
 import type { RuntimeModel } from "../../src/models/factory";
-import type { MlxTokenAppend } from "../../src/generation/bindings/autoregressive";
+import type { MlxKnownSpans } from "../../src/contracts/mlx/graph";
+import { stubPhases } from "../models/phase-forward";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { configureRuntime, runtimeConfig } from "../../src/runtime/config";
 import { cloneKvCaches } from "../../src/state/persistence";
-import { specServeRun } from "../../src/generation/speculative/run";
-import type { DraftProvider, DraftSource } from "../../src/generation/speculative/source";
 import { declareGraph } from "../../src/models/capabilities";
+import { kvStorage } from "../../src/state/kv-storage";
 
 const VOCAB = 128;
 const EOS = 2;
@@ -34,6 +41,31 @@ const SPAN = [11, 12, 13];
 /** Sampled at the trigger's own forward and DISCARDED by the fill — an
  *  in-flight pipeline dispatch, never inspected. It must never be emitted. */
 const WASTED = 61;
+
+/** A cache lego the stub's one layer composes: the composition's KV scheme and
+ * paging, on a full-attention layer or a sliding one of `window`. */
+interface Lego { readonly name: string; readonly kv: KvStorageScheme; readonly paged?: boolean; readonly window?: number }
+const affine = (bits: number, quantizedKvStart?: number): KvStorageScheme =>
+  ({ kind: "affine", bits, groupSize: 64, kernels: "unfused", ...(quantizedKvStart ? { quantizedKvStart } : {}) });
+const turbo = (kBits: number, vBits: number, quantizedKvStart?: number): KvStorageScheme =>
+  ({ kind: "turbo", kBits, vBits, ...(quantizedKvStart ? { quantizedKvStart } : {}) });
+/** Every lego the composition can name for the stub's layer, including the
+ * formats committed spans were once limited away from (affine 2 and 3 bits,
+ * TurboQuant 4/2) and starts the spans cross. */
+const LEGOS: readonly Lego[] = [
+  { name: "bf16", kv: { kind: "bf16" } },
+  { name: "affine 4", kv: affine(4) }, { name: "affine 3", kv: affine(3) }, { name: "affine 8 from 6", kv: affine(8, 6) },
+  { name: "per-layer affine 2", kv: { kind: "affine-layers", layers: [{ layer: 0, bits: 2, groupSize: 64 }], kernels: "tiled-causal" } },
+  { name: "TurboQuant 8/3", kv: turbo(8, 3) }, { name: "TurboQuant 4/2", kv: turbo(4, 2) }, { name: "TurboQuant 8/3 from 6", kv: turbo(8, 3, 6) },
+  { name: "paged bf16", kv: { kind: "bf16" }, paged: true }, { name: "paged affine 4", kv: affine(4), paged: true },
+  { name: "paged TurboQuant 8/3", kv: turbo(8, 3), paged: true },
+  { name: "sliding bf16", kv: { kind: "bf16" }, window: 8 }, { name: "sliding affine 4 from 6", kv: affine(4, 6), window: 8 },
+];
+/** The lego the stub's caches are, set by each lego's describe. */
+let lego: Lego = LEGOS[0]!;
+const legoCaches = (): Cache[] => [lego.window
+  ? composedSlidingAttentionCache(lego.kv, 0, lego.window, new AttentionMasks())
+  : composedFullAttentionCache(lego.kv, 0, new AttentionMasks(), deferredTurboQuantKernels)];
 
 /** last forwarded id → next greedy token. */
 const SCRIPT = new Map<number, number>([
@@ -46,8 +78,10 @@ const SCRIPT = new Map<number, number>([
 class StubModel {
   constructor(
     readonly script: Map<number, number> = SCRIPT,
-    private readonly makeCacheImpl: () => Cache[] = () => [new KVCache()],
+    private readonly makeCacheImpl: () => Cache[] = legoCaches,
   ) {}
+  /** The lego's KV scheme and paging (paged by the generation, as a request's state is). */
+  readonly composition: Composition = testComposition(lego.kv, lego.paged ? { pagedKv: { blockSize: 4, direct: false } } : {});
 
   readonly config = {
     eosTokenIds: [EOS],
@@ -56,7 +90,7 @@ class StubModel {
   };
   readonly weightsBytes = 1;
   readonly graphCapabilities = declareGraph();
-  /** Every id sequence pushed through forwardHidden, in order. */
+  /** Every id sequence pushed through forwardStub, in order. */
   readonly forwards: number[][] = [];
   readonly headInputs: number[][] = [];
 
@@ -64,19 +98,43 @@ class StubModel {
     return this.makeCacheImpl();
   }
 
-  createAppend(): MlxTokenAppend | null {
-    // This stub's rows are independent and have no shape-dependent rounding.
-    return { maxChunkSize: () => 32, forwardHidden: this.forwardHidden.bind(this) };
+  /** Every phase runs the stub's one forward (late-bound, so a subclass's override serves them all) and its head. */
+  readonly #phases = stubPhases((ids, cache) => this.forwardStub(ids, cache), hidden => this.logitsFromHidden(hidden));
+  readonly prefillChunk = this.#phases.prefillChunk;
+  readonly prefillTail = this.#phases.prefillTail;
+  readonly decode = this.#phases.decode;
+  readonly verify = this.#phases.verify;
+  /** Known tokens append through the cache's committed read. */
+  #committed = false;
+  readonly appendKnown = stubPhases((ids, cache) => {
+    this.#committed = true;
+    try { return this.forwardStub(ids, cache); } finally { this.#committed = false; }
+  }, hidden => this.logitsFromHidden(hidden)).appendKnown;
+  readonly logits = this.#phases.logits;
+
+  /** Committed known-token spans: this stub's rows are independent and have no shape-dependent rounding. */
+  get knownSpans(): MlxKnownSpans | undefined {
+    return { maxChunkSize: () => 32 };
   }
 
-  forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray {
+  forwardStub(ids: MlxArray, cache: Cache[]): MlxArray {
     const list = ids.toIntTokens();
     this.forwards.push(list);
     const L = list.length;
-    const k = MlxArray.fromFloat32(new Float32Array(L * 4), [1, 1, L, 4]);
-    const v = MlxArray.fromFloat32(new Float32Array(L * 4), [1, 1, L, 4]);
-    const [outK, outV] = cache[0]!.updateAndFetch(k, v);
-    for (const a of [k, v, outK, outV]) a.dispose();
+    // Head dimension 64: every affine group and TurboQuant codec stores it.
+    const plane = (seed: number) => {
+      using raw = MlxArray.fromFloat32(Float32Array.from({ length: L * 64 }, (_, i) => Math.sin(seed + i * 0.37 + list[Math.floor(i / 64)]!)), [1, 1, L, 64]);
+      return raw.astype(Dtype.bfloat16);
+    };
+    using k = plane(1), v = plane(2);
+    if (this.#committed) {
+      // The committed read the graph declares for known tokens, attended once.
+      const read = (cache[0] as CommittedAttentionCache).appendCommitted(k, v);
+      try { using q = plane(3); read.attend(q, 0.125).dispose(); } finally { read.dispose(); }
+    } else {
+      const [outK, outV] = kvStorage(cache[0]!).updateAndFetch(k, v);
+      outK.dispose(); outV.dispose();
+    }
     // The "hidden state" carries each position's token id, so logits can be
     // produced PER POSITION — which is what the verify policy reads.
     return MlxArray.fromFloat32(Float32Array.from(list), [1, L, 1]);
@@ -102,23 +160,12 @@ const session = (rows: FillRow[], maxSpan?: number, appendChunkSize?: number) =>
     { maxSpan, appendChunkSize },
   );
 
-test("the append binding owns affine fill format support", () => {
+test("fill is a request's choice, never the KV format's: the strict mode and the request decide", () => {
   const restore = configureRuntime({ MLX_BUN_FILL: "strict" });
   try {
-    const options = { fill: session([row([TRIGGER], SPAN)]), kvBits: 4 };
-    const supported = { affineKvBits: [4, 8] };
-    expect(shouldUseFill(options, runtimeConfig())).toBe(false);
-    expect(shouldUseFill(options, runtimeConfig(), supported)).toBe(true);
-    expect(shouldUseFill({ ...options, kvBits: 8 }, runtimeConfig(), supported)).toBe(true);
-    expect(shouldUseFill({ ...options, kvConfig: [{ layerIdx: 3, bits: 4, groupSize: 64 },
-      { layerIdx: 7, bits: 8, groupSize: 64 }] }, runtimeConfig(), supported)).toBe(true);
-    expect(shouldUseFill({ ...options, kvBits: 2 }, runtimeConfig(), supported)).toBe(false);
-    expect(shouldUseFill({ ...options, kvBits: 2, kvConfig: [{ layerIdx: 3, bits: 4, groupSize: 64 }] }, runtimeConfig(), supported)).toBe(true);
-    expect(shouldUseFill({ ...options, kvConfig: [{ layerIdx: 3, bits: 2, groupSize: 64 }] }, runtimeConfig(), supported)).toBe(false);
-    expect(shouldUseFill({ ...options, turboQuant: { kBits: 8, vBits: 3 } }, runtimeConfig(), supported)).toBe(false);
-    const rotated = { turboQuantFormats: [{ kBits: 8, vBits: 3 }] };
-    expect(shouldUseFill({ ...options, turboQuant: { kBits: 8, vBits: 3 } }, runtimeConfig(), rotated)).toBe(true);
-    expect(shouldUseFill({ ...options, turboQuant: { kBits: 4, vBits: 3 } }, runtimeConfig(), rotated)).toBe(false);
+    const options = { fill: session([row([TRIGGER], SPAN)]) };
+    expect(shouldUseFill(options, runtimeConfig())).toBe(true);
+    expect(shouldUseFill({ ...options, logprobs: true }, runtimeConfig())).toBe(false);
   } finally { restore(); }
 });
 
@@ -140,6 +187,24 @@ async function run(
   return { model, tokens, stats: gen.stats! };
 }
 
+// Every test outside a lego's describe runs over bf16.
+beforeEach(() => { lego = LEGOS[0]!; });
+
+/** The run's forwards against the stub's `expected`: exactly, unless the lego
+ * converts at a start the run crosses, whose transition ends a committed append
+ * at that start (`maxAppendTokens`): then the same ids in the same order, and
+ * no forward reaching past the start from below it. */
+function expectForwards(forwards: readonly number[][], expected: readonly number[][]): void {
+  const start = (lego.kv as { quantizedKvStart?: number }).quantizedKvStart;
+  if (!start) { expect(forwards).toEqual(expected); return; }
+  expect(forwards.flat()).toEqual(expected.flat());
+  let offset = 0;
+  for (const ids of forwards) {
+    expect(offset < start && offset + ids.length > start, `${lego.name}: a forward of ${ids.length} at ${offset} crosses ${start}`).toBe(false);
+    offset += ids.length;
+  }
+}
+
 const withFill = async <T>(env: Record<string, string | undefined>, fn: () => Promise<T>) => {
   const restore = configureRuntime(env as never);
   try { return await fn(); } finally { restore(); }
@@ -153,8 +218,8 @@ describe("generate(): cancellation", () => {
       override dispose(): void { disposals++; super.dispose(); }
     }
     class CancellingModel extends StubModel {
-      override forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray {
-        const hidden = super.forwardHidden(ids, cache);
+      override forwardStub(ids: MlxArray, cache: Cache[]): MlxArray {
+        const hidden = super.forwardStub(ids, cache);
         abort.abort(new DOMException("cancelled during prefill", "AbortError"));
         return hidden;
       }
@@ -177,47 +242,19 @@ describe("generate(): cancellation", () => {
       .rejects.toHaveProperty("name", "AbortError");
     expect(model.forwards).toEqual([]);
   });
-
-  test("speculative cancellation between target prefill chunks releases target and draft state", async () => {
-    const abort = new AbortController();
-    let cacheDisposals = 0;
-    let sourceDisposals = 0;
-    class OwnedCache extends KVCache {
-      override dispose(): void { cacheDisposals++; super.dispose(); }
-    }
-    class CancellingModel extends StubModel {
-      override forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray {
-        const hidden = super.forwardHidden(ids, cache);
-        abort.abort(new DOMException("cancelled during spec prefill", "AbortError"));
-        return hidden;
-      }
-    }
-    const model = new CancellingModel(SCRIPT, () => [new OwnedCache()]);
-    const source = {
-      prefill() { throw new Error("cancelled target must not start draft prefill"); },
-      dispose() { sourceDisposals++; },
-    } as unknown as DraftSource;
-    const provider = { open: () => source } as unknown as DraftProvider;
-    await expect(specServeRun(model as unknown as RuntimeModel, provider, 3,
-      Array.from({ length: 4098 }, () => 1), { temperature: 0, signal: abort.signal },
-      () => { throw new Error("cancelled prefill must not emit"); }))
-      .rejects.toHaveProperty("name", "AbortError");
-    expect(model.forwards).toHaveLength(1);
-    expect(cacheDisposals).toBe(1);
-    expect(sourceDisposals).toBe(1);
-  });
 });
 
-describe("generate(): the fill append", () => {
+for (const each of LEGOS) describe(`generate(): the fill append (${each.name})`, () => {
+  beforeEach(() => { lego = each; });
   test("an unqualified graph appends M1 without intermediate heads or verification", async () => {
     class UnqualifiedModel extends StubModel {
-      override createAppend(): null { return null; }
+      override get knownSpans(): undefined { return undefined; }
     }
     const fill = session([row([TRIGGER], SPAN)], 32, 4);
     const { model, tokens, stats } = await withFill({ MLX_BUN_FILL: "strict" },
       () => run({ fill }, Infinity, new UnqualifiedModel()));
     expect(tokens).toEqual([TRIGGER, ...SPAN, 20]);
-    expect(model.forwards).toEqual([[1, 41], [42], [TRIGGER], [11], [12], [13], [20], [EOS]]);
+    expectForwards(model.forwards, [[1, 41], [42], [TRIGGER], [11], [12], [13], [20], [EOS]]);
     expect(model.headInputs).not.toContainEqual([11]);
     expect(model.headInputs).not.toContainEqual([12]);
     expect(stats.fill).toMatchObject({ injected: 3, verifyEvents: 0 });
@@ -226,34 +263,31 @@ describe("generate(): the fill append", () => {
 
   test("the graph's chunk limit caps a caller's larger requested chunks", async () => {
     class TwoRowModel extends StubModel {
-      override createAppend(): MlxTokenAppend {
-        return { maxChunkSize: () => 2, forwardHidden: this.forwardHidden.bind(this) };
+      override get knownSpans(): MlxKnownSpans {
+        return { maxChunkSize: () => 2 };
       }
     }
     const fill = session([row([TRIGGER], SPAN)], 32, 8);
     const { model, tokens, stats } = await withFill({ MLX_BUN_FILL: "strict" },
       () => run({ fill }, Infinity, new TwoRowModel()));
     expect(tokens).toEqual([TRIGGER, ...SPAN, 20]);
-    expect(model.forwards).toEqual([[1, 41], [42], [TRIGGER], [11, 12], [13], [20], [EOS]]);
+    expectForwards(model.forwards, [[1, 41], [42], [TRIGGER], [11, 12], [13], [20], [EOS]]);
     expect(stats.fill).toMatchObject({ injected: 3, verifyEvents: 0 });
   });
 
   test("the graph rechecks its limit after each committed chunk", async () => {
     const offsets: number[] = [];
     class BoundaryModel extends StubModel {
-      override createAppend(): MlxTokenAppend {
-        return {
-          maxChunkSize(state) { offsets.push(state[0]!.offset); return state[0]!.offset === 4 ? 1 : 2; },
-          forwardHidden: this.forwardHidden.bind(this),
-        };
+      override get knownSpans(): MlxKnownSpans {
+        return { maxChunkSize(state) { offsets.push(state[0]!.offset); return state[0]!.offset === 4 ? 1 : 2; } };
       }
     }
     const fill = session([row([TRIGGER], SPAN)], 32, 4);
     const { model, tokens, stats } = await withFill({ MLX_BUN_FILL: "strict" },
       () => run({ fill }, Infinity, new BoundaryModel()));
-    expect(offsets).toEqual([4, 5]);
+    expect(offsets[0]).toBe(4);
     expect(tokens).toEqual([TRIGGER, ...SPAN, 20]);
-    expect(model.forwards).toEqual([[1, 41], [42], [TRIGGER], [11], [12, 13], [20], [EOS]]);
+    expectForwards(model.forwards, [[1, 41], [42], [TRIGGER], [11], [12, 13], [20], [EOS]]);
     expect(model.headInputs).not.toContainEqual([11]);
     expect(stats.fill).toMatchObject({ injected: 3, verifyEvents: 0 });
   });
@@ -265,7 +299,7 @@ describe("generate(): the fill append", () => {
     expect(tokens).toEqual([TRIGGER, ...SPAN, 20]);
     expect(tokens).not.toContain(WASTED);
     // ONE forward carried the whole span — that is the entire point.
-    expect(model.forwards).toEqual([
+    expectForwards(model.forwards, [
       [1, 41], [42],       // prefill (mlx-lm's drain-to-len-1 + L=1 step 0)
       [TRIGGER],           // ordinary decode step
       SPAN,                // the fill: injected ids ONLY, never [TRIGGER, ...SPAN]
@@ -292,7 +326,7 @@ describe("generate(): the fill append", () => {
     const { model, tokens, stats } = await withFill(
       { MLX_BUN_FILL: undefined }, () => run({ fill }));
     expect(tokens).toEqual([TRIGGER, WASTED]); // WASTED → not in SCRIPT → EOS
-    expect(model.forwards).toEqual([[1, 41], [42], [TRIGGER], [WASTED], [EOS]]);
+    expectForwards(model.forwards, [[1, 41], [42], [TRIGGER], [WASTED], [EOS]]);
     expect(stats.fill).toBeUndefined();
   });
 
@@ -309,7 +343,7 @@ describe("generate(): the fill append", () => {
       { MLX_BUN_FILL: "strict" }, () => run({ fill, maxTokens: 3 }));
     expect(tokens).toEqual([TRIGGER, 11, 12]);
     expect(stats.generatedTokens).toBe(3);
-    expect(model.forwards).toEqual([[1, 41], [42], [TRIGGER], [11, 12]]);
+    expectForwards(model.forwards, [[1, 41], [42], [TRIGGER], [11, 12]]);
     expect(stats.fill!.injected).toBe(2);
   });
 
@@ -334,7 +368,7 @@ describe("generate(): the fill append", () => {
       { MLX_BUN_FILL: "strict" }, () => run({ fill }));
     // Only one id survives the EOS cut → below the 2-token floor → no fill.
     expect(tokens).toEqual([TRIGGER, WASTED]);
-    expect(model.forwards).toEqual([[1, 41], [42], [TRIGGER], [WASTED], [EOS]]);
+    expectForwards(model.forwards, [[1, 41], [42], [TRIGGER], [WASTED], [EOS]]);
   });
 
   test("composition: a request that asks for logprobs never fills", async () => {
@@ -354,7 +388,8 @@ describe("generate(): the fill append", () => {
   });
 });
 
-describe("generate(): chunked assert append", () => {
+for (const each of LEGOS) describe(`generate(): chunked assert append (${each.name})`, () => {
+  beforeEach(() => { lego = each; });
   const span = [11, 12, 13, 14, 15, 16, 17, 18, 19];
   const script = new Map([...SCRIPT, [19, 20] as [number, number]]);
 
@@ -364,7 +399,7 @@ describe("generate(): chunked assert append", () => {
       { MLX_BUN_FILL: "strict", MLX_BUN_FILL_TRACE: "1" },
       () => run({ fill }, Infinity, new StubModel(script)));
     expect(tokens).toEqual([TRIGGER, ...span, 20]);
-    expect(model.forwards).toEqual([
+    expectForwards(model.forwards, [
       [1, 41], [42], [TRIGGER], span.slice(0, 4), span.slice(4, 8), [19], [20], [EOS],
     ]);
     expect(model.headInputs).toContainEqual([19]);
@@ -386,17 +421,25 @@ describe("generate(): chunked assert append", () => {
     const { model, tokens, stats } = await withFill({ MLX_BUN_FILL: "strict" },
       () => run({ fill, maxTokens: 6 }, Infinity, new StubModel(script)));
     expect(tokens).toEqual([TRIGGER, ...span.slice(0, 5)]);
-    expect(model.forwards.slice(-2)).toEqual([span.slice(0, 4), [15]]);
+    expectForwards(model.forwards, [[1, 41], [42], [TRIGGER], span.slice(0, 4), [15]]);
     expect(model.headInputs).not.toContainEqual([15]);
     expect(stats.cacheTokens).toEqual([...PROMPT, ...tokens]);
   });
+
+});
+
+// The cases that hand the loop their own KVCache: its cancellation and failure
+// lifecycle, over bf16 (a paged composition pages a fresh cache it is handed).
+describe("generate(): chunked assert append lifecycle", () => {
+  const span = [11, 12, 13, 14, 15, 16, 17, 18, 19];
+  const script = new Map([...SCRIPT, [19, 20] as [number, number]]);
 
   test("cancellation during an append finishes the cache update before the burst", async () => {
     const abort = new AbortController();
     const cache = new KVCache();
     class CancellingModel extends StubModel {
-      override forwardHidden(ids: MlxArray, caches: Cache[]): MlxArray {
-        const hidden = super.forwardHidden(ids, caches);
+      override forwardStub(ids: MlxArray, caches: Cache[]): MlxArray {
+        const hidden = super.forwardStub(ids, caches);
         if (ids.toIntTokens()[0] === 11) abort.abort();
         return hidden;
       }
@@ -419,10 +462,10 @@ describe("generate(): chunked assert append", () => {
       override dispose(): void { cacheDisposals++; super.dispose(); }
     }
     class FailingModel extends StubModel {
-      override forwardHidden(ids: MlxArray, caches: Cache[]): MlxArray {
+      override forwardStub(ids: MlxArray, caches: Cache[]): MlxArray {
         const first = ids.toIntTokens()[0];
         if (first === 15) throw new Error("failed append chunk");
-        const hidden = super.forwardHidden(ids, caches);
+        const hidden = super.forwardStub(ids, caches);
         if (first === 11) {
           const dispose = hidden.dispose.bind(hidden);
           hidden.dispose = () => { hiddenDisposals++; dispose(); };

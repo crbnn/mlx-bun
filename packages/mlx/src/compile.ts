@@ -27,7 +27,7 @@ const traceRegistry = new Map<number, { fn: TraceFn; count: number; shapeless: b
 let nextTraceId = 1;
 let shapelessTracing = false;
 
-/** Fixed-shape custom kernels must fall back while a shapeless graph traces. */
+/** A fixed-shape custom kernel cannot run inside a shapeless trace: while one traces, its caller takes the ops form. */
 export function isShapelessTracing(): boolean {
   return shapelessTracing;
 }

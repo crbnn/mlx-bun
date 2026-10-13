@@ -1,7 +1,7 @@
 # @mlx-bun/quantize
 
 Produces the quantized checkpoints that [`@mlx-bun/inference`](../inference/README.md)
-loads and specializes on. Inference never quantizes; this package never serves.
+loads and builds its graphs for. Inference never quantizes; this package never serves.
 
 | Module | Owns |
 | --- | --- |
@@ -13,7 +13,7 @@ loads and specializes on. Inference never quantizes; this package never serves.
 | `drafter` | Quantize a released DeepSpec (`Gemma4DSparkModel`) drafter: every matmul weight and gather table, `confidence_head` kept bf16, then a load smoke through the drafter loader |
 | `rotate`, `weight-transform` | Rotation and fold plans for Llama and Qwen families before quantization |
 | `trellis` | Trellis state packing, interleaving, and the host decoder. The 1MAD codebook and word geometry are imported from the inference kernels, which own the packed format |
-| `trellis-quantizer` | `quantizeTrellisModelDir`: fold an HF-layout Qwen3.5-family checkpoint (γ + R1), code every MLP tensor with the Trellis (QTIP TCQ, L=12, 1MAD, T=256, tail-biting) and write the packed format the inference kernels serve; the rest keeps the shipped-compact affine tiers |
+| `trellis-quantizer` | `quantizeTrellisModelDir`: fold an HF-layout Qwen3.5-family checkpoint (γ + R1), code every MLP tensor with the Trellis (QTIP TCQ, L=12, 1MAD, T=256, tail-biting) and write the packed format the inference kernels serve; the rest keeps the shipped-compact affine tiers. `turboquant_fold.json` records the R1 seed and the final-norm gain the fold moved into the head, the residual basis a drafter reads through the graph |
 | `trellis-encoder` | The Viterbi encode of one folded tensor into packed codes and fp16 row scales, unweighted or with BlockLDLQ error feedback against a Hessian factor |
 | `trellis-allocation`, `qwen35-hf-fold` | Pure planning: which tensor gets which treatment (k-map, axis, layer limit) and the fold plan for the `model.language_model.*` layout with stored γ−1 norms |
 | `config-writer`, `atomic-output` | Quantization metadata and atomic directory publication |
@@ -53,5 +53,5 @@ the frozen producer's (`02d723a:scripts/turboquant/tq-quantize-trellis-packed.ts
 checkpoint, [trellis-encoder](tests/trellis-encoder.test.ts) checks the codec and the
 LDLQ arm, and [trellis-allocation](tests/trellis-allocation.test.ts) the planning.
 
-Job orchestration and the CLI verbs (`mlx-bun convert --q-mode trellis`, `mlx-bun draft quantize`) belong to the app.
+Job orchestration and the CLI verbs belong to the app's modules: `mlx-bun convert --q-mode trellis` to [`@mlx-bun/module-quantize`](../module-quantize/README.md), `mlx-bun draft quantize` to [`@mlx-bun/module-train`](../module-train/README.md).
 

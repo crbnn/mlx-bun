@@ -1,20 +1,22 @@
-// Gemma4 graph generator: compiles a Gemma4 model description (config.json,
-// kv_config.json and the layer_scalar tensor names) into a branch-resolved,
-// unrolled `forwardLayers` override for that architecture. Layer loop, cache
-// class dispatch, donor/sharer indirection, MoE and per-layer-input forks and
-// the quantized-SDPA constants are all resolved at generation time, then
-// transcribed op-for-op from `DecoderLayer` / `Attention` in ../src/models/gemma4/model.ts.
+// Gemma 4 graph generator: compiles one composition (an artifact's config
+// fingerprint and the KV scheme its caches serve, the artifact's kv_config) into
+// an entire graph file: the layer table read from the artifact (attention type,
+// the cache each layer reads, its affine width, keys equal to values, the layer
+// scalar), written out as data, and the class that composes each layer from the
+// blocks in ../src/models/gemma4/blocks.ts for that table, with the named phases
+// and the entry points its consumers call. The graph extends nothing and calls no
+// other graph.
 //
-//   bun packages/inference/scripts/gen-gemma4.ts <model-dir> <stem> [--out <dir>]
+//   bun packages/inference/scripts/gen-gemma4.ts <model-dir> <composition> [--out <dir>]
 //   e.g. bun packages/inference/scripts/gen-gemma4.ts ~/.cache/huggingface/hub/models--mlx-community--gemma-4-12B-it-OptiQ-4bit/snapshots/<hash> gemma4-12b
 //
-// A base-algorithm change (Gemma4Model, layers, kernels) is a regeneration,
-// never a hand edit. The generated class checks each forward's cache signatures
-// and falls back to `Gemma4Model` for anything it was not generated for (plain
-// caches, vision bidirectional prefill, hidden-layer taps), so an outdated
-// specialization is slow, never wrong. tests/models/gemma4-generated-sync.test.ts
-// regenerates every registered graph from the committed hub-layout inputs and
-// fails when a committed file differs.
+// <model-dir> is an artifact snapshot (config.json, kv_config.json and the
+// safetensors index's names; no weights). A change to the blocks, layers or this
+// template is a regeneration, never a hand edit:
+// tests/models/gemma4-generated-sync.test.ts regenerates every composition from
+// tests/fixtures/gemma4-graphs and fails when a committed file differs. Whether a
+// regenerated graph computes the same bits is tests/models/gemma4-generated-identity.test.ts
+// (synthetic weights) and tests/parity/gemma4-generated.test.ts (real weights).
 
 import { parseArgs } from "node:util";
 import { loadModelConfig } from "../src/artifacts/config";
@@ -22,18 +24,29 @@ import type { ModelConfig } from "../src/artifacts/config";
 import { configFingerprint } from "../src/artifacts/fingerprint";
 import { GENERATED_GEMMA_FINGERPRINTS } from "../src/models/gemma4/family";
 
-/** Registered generated graphs: output stem -> key in GENERATED_GEMMA_FINGERPRINTS. */
-export const GEMMA4_GRAPHS = Object.freeze({
-  "gemma4-12b": "12b",
-  "gemma4-e4b": "e4b",
-  "gemma4-26b": "26b",
-} as const);
-export type Gemma4GraphStem = keyof typeof GEMMA4_GRAPHS;
+/** The facts that fix one generated graph: the artifact (its config fingerprint,
+ * which covers the kv_config) and so the KV scheme its caches serve, the
+ * artifact's per-layer kv_config (`--kv-quant config`). The file exports them as
+ * `COMPOSITION`, which the loader's selection table keys on. */
+export interface Gemma4Composition {
+  /** Output file stem under src/models/gemma4/generated. */
+  readonly stem: string;
+  /** Key in GENERATED_GEMMA_FINGERPRINTS (models/gemma4/family.ts). */
+  readonly key: keyof typeof GENERATED_GEMMA_FINGERPRINTS;
+  /** The artifact the composition was generated for, for the usage text. */
+  readonly artifact: string;
+}
+
+export const GEMMA4_COMPOSITIONS: Readonly<Record<string, Gemma4Composition>> = Object.freeze({
+  "gemma4-12b": { stem: "gemma4-12b", key: "12b", artifact: "mlx-community/gemma-4-12B-it-OptiQ-4bit" },
+  "gemma4-e4b": { stem: "gemma4-e4b", key: "e4b", artifact: "mlx-community/gemma-4-e4b-it-OptiQ-4bit" },
+  "gemma4-26b": { stem: "gemma4-26b", key: "26b", artifact: "mlx-community/gemma-4-26B-A4B-it-OptiQ-4bit" },
+});
 export const GENERATED_DIR = new URL("../src/models/gemma4/generated/", import.meta.url).pathname;
 
 export interface GraphSource {
   readonly config: ModelConfig;
-  /** Tensor names from model.safetensors.index.json (layer_scalar is a weights-layout fact). */
+  /** Tensor names from model.safetensors.index.json (layer_scalar and the prefix are weights-layout facts). */
   readonly tensorNames: ReadonlySet<string>;
 }
 
@@ -47,397 +60,555 @@ export async function readGraphSource(modelDir: string): Promise<GraphSource> {
   return { config, tensorNames };
 }
 
-export async function generateGemma4Graph(modelDir: string, stem: Gemma4GraphStem): Promise<string> {
-  return emitGemma4Graph(await readGraphSource(modelDir), stem, modelDir.split("/").slice(-3).join("/"));
+/** The repo@revision of a hub-layout snapshot path, else the path itself. */
+function sourceOf(dir: string): string {
+  const match = dir.replace(/\/+$/, "").match(/models--([^/]+)--([^/]+)\/snapshots\/([^/]+)$/);
+  return match ? `${match[1]}/${match[2]}@${match[3]}` : dir;
+}
+
+export async function generateGemma4Graph(modelDir: string, stem: string): Promise<string> {
+  return emitGemma4Graph(await readGraphSource(modelDir), stem, sourceOf(modelDir));
+}
+
+/** One decoder layer as the composition fixes it. */
+interface LayerSpec {
+  readonly sliding: boolean;
+  /** The layer whose cache it reads: itself, or the last donor of its type. */
+  readonly cache: number;
+  /** That cache's affine width and group under the artifact's kv_config; null keeps it bf16. */
+  readonly kv: { readonly bits: number; readonly groupSize: number } | null;
+  readonly kEqV: boolean;
+  readonly layerScalar: boolean;
+}
+
+const plural = (count: number, word: string) => `${count} ${word}${count === 1 ? "" : "s"}`;
+
+/** `text` as `//` comment lines of at most `width` columns. */
+function wrapComment(text: string, width = 84): string {
+  const lines: string[] = [];
+  let line = "//";
+  for (const word of text.split(" ")) {
+    if (line.length + 1 + word.length > width && line !== "//") { lines.push(line); line = "//"; }
+    line += ` ${word}`;
+  }
+  return [...lines, line].join("\n");
 }
 
 /** The generated module's text for `source`; `label` is the provenance line. */
-export function emitGemma4Graph({ config, tensorNames }: GraphSource, outStem: Gemma4GraphStem, label: string): string {
-  const key = GEMMA4_GRAPHS[outStem];
+export function emitGemma4Graph({ config, tensorNames }: GraphSource, stem: string, label: string): string {
+  const c = GEMMA4_COMPOSITIONS[stem];
+  if (!c) throw new Error(`no composition ${stem} (known: ${Object.keys(GEMMA4_COMPOSITIONS).join(", ")})`);
   const t = config.text;
   const fingerprint = configFingerprint(config);
-  if (fingerprint !== GENERATED_GEMMA_FINGERPRINTS[key])
-    throw new Error(`${outStem}: config fingerprint ${fingerprint} is not the registered ${GENERATED_GEMMA_FINGERPRINTS[key]} (models/gemma4/family.ts)`);
-  const prefixBase = tensorNames.has("language_model.model.embed_tokens.weight")
-    ? "language_model.model" : "model";
+  if (fingerprint !== GENERATED_GEMMA_FINGERPRINTS[c.key])
+    throw new Error(`${stem}: config fingerprint ${fingerprint} is not the registered ${GENERATED_GEMMA_FINGERPRINTS[c.key]} (models/gemma4/family.ts)`);
+  const prefix = tensorNames.has("language_model.model.embed_tokens.weight") ? "language_model.model" : "model";
+  const kvByLayer = new Map((config.kvQuant ?? []).map(e => [e.layerIdx, { bits: e.bits, groupSize: e.groupSize }]));
 
-  const kvByLayer = new Map<number, { groupSize: number; bits: number }>(
-    (config.kvQuant ?? []).map((e) => [e.layerIdx, { groupSize: e.groupSize, bits: e.bits }]),
-  );
-
-  const numLayers = t.numHiddenLayers;
-  const numDonors = numLayers - t.numKvSharedLayers;
-  const hasMoe = t.enableMoeBlock;
-  const hasPerLayer = t.hiddenSizePerLayerInput > 0;
-  interface LayerSpec {
-    idx: number;
-    sliding: boolean;
-    donor: boolean;
-    /** donor this sharer consumes (last donor of its type) */
-    donorIdx: number;
-    /** quantized KV under the shipped kv_config (donors only) */
-    quant: boolean;
-    /** Phase D constants, folded into the generated dispatch site */
-    gs: number;
-    bits: number;
-    kEqV: boolean;
-    layerScalar: boolean;
-    /** donor whose fetched KV at least one sharer consumes (export it) */
-    exports: boolean;
-  }
-
+  const layerCount = t.numHiddenLayers;
+  const caches = layerCount - t.numKvSharedLayers;
+  const sharing = caches < layerCount;
+  const moe = t.enableMoeBlock;
+  const perLayer = t.hiddenSizePerLayerInput > 0;
+  const softcap = t.finalLogitSoftcapping;
+  const compiledDecode = !moe;
   const lastByType: Record<string, number> = {};
-  for (let i = 0; i < numDonors; i++) lastByType[t.layerTypes[i]!] = i;
+  for (let i = 0; i < caches; i++) lastByType[t.layerTypes[i]!] = i;
+  const layers: LayerSpec[] = t.layerTypes.map((type, i) => {
+    const cache = i < caches ? i : lastByType[type];
+    if (cache === undefined) throw new Error(`${stem}: no donor layer of type ${type} for layer ${i}`);
+    const sliding = type === "sliding_attention";
+    return { sliding, cache, kv: kvByLayer.get(cache) ?? null, kEqV: t.attentionKEqV && !sliding,
+      layerScalar: tensorNames.has(`${prefix}.layers.${i}.layer_scalar`) };
+  });
+  const shared = [...new Set(layers.filter((layer, i) => layer.cache !== i).map(layer => layer.cache))].sort((a, b) => a - b);
+  const scalars = layers.filter(layer => layer.layerScalar).length;
 
-  const specs: LayerSpec[] = [];
-  for (let i = 0; i < numLayers; i++) {
-    const sliding = t.layerTypes[i] === "sliding_attention";
-    const donor = i < numDonors;
-    const donorIdx = donor ? i : lastByType[t.layerTypes[i]!]!;
-    const kv = donor ? kvByLayer.get(i) : kvByLayer.get(donorIdx);
-    specs.push({
-      idx: i,
-      sliding,
-      donor,
-      donorIdx,
-      quant: donor && kvByLayer.has(i),
-      gs: kv?.groupSize ?? 0,
-      bits: kv?.bits ?? 0,
-      kEqV: t.attentionKEqV && !sliding,
-      layerScalar: tensorNames.has(`${prefixBase}.layers.${i}.layer_scalar`),
-      exports: false,
-    });
+  // ── Header facts ──
+  const owned = layers.slice(0, caches);
+  const widths = new Map<string, number>();
+  for (const layer of owned) {
+    const key = layer.kv ? `${layer.kv.bits}-bit group ${layer.kv.groupSize}` : "bf16";
+    widths.set(key, (widths.get(key) ?? 0) + 1);
   }
-  for (const s of specs) if (!s.donor) specs[s.donorIdx]!.exports = true;
+  const kvLine = [...widths.entries()].map(([key, count]) => `${key} on ${plural(count, "cache")}`).join(", ");
+  const slidingCount = layers.filter(layer => layer.sliding).length;
+  const sharingLine = sharing
+    ? `${caches} own a cache, ${layerCount - caches} attend the read of the last donor of their type (${shared.map(i =>
+      `${i} ${layers[i]!.sliding ? "sliding" : "full"}`).join(", ")})`
+    : `every layer owns a cache`;
+  const pieces = [perLayer ? "per-layer inputs" : "", moe ? "the dense MLP and routed experts in parallel" : "dense feed-forward",
+    scalars === layerCount ? "a layer scalar on every layer" : scalars === 0 ? "no layer scalar" : `a layer scalar on ${scalars} layers`,
+    t.attentionKEqV ? "keys equal to values on the full layers" : ""].filter(Boolean).join("; ");
 
-  // --- per-layer helper emission ----------------------------------------------
+  // ── Table ──
+  const table = layers.map((layer, i) => `  /* ${String(i).padStart(2)} */ { attention: ${JSON.stringify(layer.sliding ? "sliding" : "full")}, ` +
+    `cache: ${layer.cache}, kv: ${layer.kv ? `{ bits: ${layer.kv.bits}, groupSize: ${layer.kv.groupSize} }` : "null"}, ` +
+    `kEqV: ${layer.kEqV}, layerScalar: ${layer.layerScalar} },`).join("\n");
 
-  /** One helper per distinct (donor/sharer, quant, kEqV, perLayer, moe,
-   *  layerScalar, exports) combination present in this model. */
-  function helperName(s: LayerSpec): string {
-    const quant = s.quant || (!s.donor && specs[s.donorIdx]!.quant);
-    return [
-      s.donor ? "donor" : "sharer",
-      s.sliding ? "Slid" : "Full",
-      quant ? `QuantG${s.gs}B${s.bits}` : "Plain",
-      s.kEqV ? "KeqV" : "V",
-      hasPerLayer ? "Pli" : "",
-      hasMoe ? "Moe" : "",
-      s.layerScalar ? "Scal" : "",
-      s.donor && s.exports ? "Exp" : "",
-    ].join("");
-  }
+  // ── The feed-forward each layer composes ──
+  const ffBody = (scaled: boolean) => {
+    let expr = moe ? "layer.moeFeedforward(hMid)" : "layer.denseFeedforward(hMid)";
+    if (perLayer) expr = `layer.perLayerGated(${expr}, perLayerInput)`;
+    if (scaled) expr = `layer.scaled(${expr})`;
+    return expr;
+  };
+  const ffParams = perLayer ? "(hMid, perLayerInput)" : "hMid";
+  const ffDoc = `${moe ? "the dense MLP and the routed experts in parallel" : "the dense feed-forward"}${perLayer ? ", the per-layer input gate" : ""}`;
+  const ffDocCap = `${ffDoc[0]!.toUpperCase()}${ffDoc.slice(1)}`;
+  const ffBuilders = scalars === layerCount
+    ? `/** ${ffDocCap}, then the layer scalar. */
+const feedforwardOf = (layer: DecoderLayer): Feedforward => ${ffParams} =>
+  ${ffBody(true)};`
+    : scalars === 0
+      ? `/** ${ffDocCap}. */
+const feedforwardOf = (layer: DecoderLayer): Feedforward => ${ffParams} =>
+  ${ffBody(false)};`
+      : `/** ${ffDocCap}, then the layer scalar where the layer carries one. */
+const feedforwardOf = (layer: DecoderLayer, scaled: boolean): Feedforward => scaled
+  ? ${ffParams} => ${ffBody(true)}
+  : ${ffParams} => ${ffBody(false)};`;
+  const ffBuild = scalars === layerCount || scalars === 0 ? "this.layers.map(layer => feedforwardOf(layer))"
+    : "this.layers.map((layer, i) => feedforwardOf(layer, LAYERS[i]!.layerScalar))";
 
-  /** Phase D: the quantized SDPA dispatch with this layer's kv_config
-   *  constants FOLDED — (bits, group_size) as literals, the static half of
-   *  fusedSdpaSupported pre-resolved at generation time. Together with the
-   *  nRep/headDim recorded at the site, every dispatch has a single known
-   *  (bits, group_size, nRep, head_dim): the Phase E kernel precondition. */
-  function emitQuantSdpaDispatch(s: LayerSpec, kqExpr: string, vqExpr: string): string[] {
-    const nKv = s.kEqV ? t.numGlobalKeyValueHeads : t.numKeyValueHeads;
-    const nRep = t.numAttentionHeads / nKv;
-    const headDim = s.sliding ? t.headDim : t.globalHeadDim;
-    const staticOk =
-      (s.bits === 4 || s.bits === 8) && (s.gs === 32 || s.gs === 64 || s.gs === 128);
-    const lines: string[] = [];
-    lines.push(`  // dispatch-site constants: bits=${s.bits} group_size=${s.gs} nRep=${nRep} head_dim=${headDim}`);
-    if (staticOk) {
-      lines.push(`  const attn = L > 1 && fusedSdpaRuntimeOk(q, mask)`);
-      lines.push(`    ? quantizedSdpaTiled(q, ${kqExpr}, ${vqExpr}, 1.0, mask, ${s.gs}, ${s.bits})`);
-      lines.push(`    : quantizedSdpaUnfused(q, ${kqExpr}, ${vqExpr}, 1.0, mask, ${s.gs}, ${s.bits});`);
-    } else {
-      lines.push(`  const attn = quantizedSdpaUnfused(q, ${kqExpr}, ${vqExpr}, 1.0, mask, ${s.gs}, ${s.bits});`);
+  // ── The attention each layer composes ──
+  const attendBuilders = sharing ? `/** Owns its cache and no later layer attends its read, which goes at once. */
+const ownCache = (layer: DecoderLayer, i: number): Attend => (x, caches, phase) => {
+  const { h, donor } = layer.forwardAttn(x, caches[i]!, phase, null);
+  donor!.dispose();
+  return h;
+};
+/** Owns its cache and later layers attend its read, kept in \`reads\` until the forward ends. */
+const donorCache = (layer: DecoderLayer, i: number): Attend => (x, caches, phase, reads) => {
+  const { h, donor } = layer.forwardAttn(x, caches[i]!, phase, null);
+  reads[i] = donor;
+  return h;
+};
+/** Attends the read its donor layer made in this forward. */
+const donorRead = (layer: DecoderLayer, donor: number): Attend => (x, _caches, phase, reads) =>
+  layer.forwardAttn(x, null, phase, reads[donor]!).h;` : `/** Owns its cache; no other layer attends its read, which goes at once. */
+const ownCache = (layer: DecoderLayer, i: number): Attend => (x, caches, phase) => {
+  const { h, donor } = layer.forwardAttn(x, caches[i]!, phase, null);
+  donor!.dispose();
+  return h;
+};`;
+  const attendBuild = sharing
+    ? `this.layers.map((layer, i) => LAYERS[i]!.cache !== i ? donorRead(layer, LAYERS[i]!.cache)
+      : SHARED.has(i) ? donorCache(layer, i) : ownCache(layer, i))`
+    : "this.layers.map((layer, i) => ownCache(layer, i))";
+
+  const readsDecl = sharing ? "\n    const reads: (DonorRead | null)[] = Array(CACHES).fill(null);" : "";
+  const readsArg = sharing ? ", reads" : "";
+  const readsFree = sharing ? "\n      for (const read of reads) read?.dispose();" : "";
+  const idsParam = perLayer ? ", ids: MlxArray" : "";
+  const idsArg = (ids: string) => perLayer ? `, ${ids}` : "";
+  const layerBody = perLayer ? `        const mid = this.#attend[i]!(h, caches, phase${readsArg});
+        let next: MlxArray;
+        try {
+          using input = perLayerInputs.layer(perLayer, i, B, L);
+          next = this.#feedforward[i]!(mid, input);
+        } finally { mid.dispose(); }` : `        const mid = this.#attend[i]!(h, caches, phase${readsArg});
+        let next: MlxArray;
+        try { next = this.#feedforward[i]!(mid); } finally { mid.dispose(); }`;
+
+  const softcapHead = softcap === null ? `    this.#head = hidden => embed.asLinear(hidden);`
+    : `    // The compiled softcap matches mlx-lm's @mx.compile logit_softcap; a compiled-decode trace records the plain ops.
+    this.#head = hidden => {
+      const logits = embed.asLinear(hidden);
+      return disposing(logits, compiledGeglu && !isCompiledTrace()
+        ? compiledLogitSoftcap(logits, FINAL_LOGIT_SOFTCAP) : logitSoftcap(logits, FINAL_LOGIT_SOFTCAP));
+    };`;
+
+  const prefillEmbeddings = perLayer ? `  /** The vision prefill phase: pre-merged (unscaled) input embeddings (borrowed) to hidden states: \`bidir\` (bool [L]) marks
+   *  image tokens, which attend each other both ways in a prompt's first window; \`ids\` ([1, L], the spliced token ids)
+   *  feed the per-layer inputs, with every multimodal position (\`multimodal\`, else \`bidir\`) taking token 0's. */
+  prefillEmbeddings(embeds: MlxArray, cache: Cache[], bidir: MlxArray | null, ids: MlxArray,
+    multimodal: MlxArray | null = null): MlxArray {
+    const h = ops.mulScalar(embeds, this.embedScale);
+    const zeroing = multimodal ?? bidir;
+    let plIds = ids;
+    if (zeroing) {
+      using cond = ops.reshape(zeroing, ids.shape);
+      using zero = ops.zeros(ids.shape, ids.dtype);
+      plIds = ops.where(cond, zero, ids);
     }
-    return lines;
-  }
+    try { return this.#run(h, cache, bidir ? { bidirectional: bidir } : "window", plIds, null); }
+    finally { if (plIds !== ids) plIds.dispose(); }
+  }` : `  /** The vision prefill phase: pre-merged (unscaled) input embeddings (borrowed) to hidden states: \`bidir\` (bool [L]) marks
+   *  image tokens, which attend each other both ways in a prompt's first window. */
+  prefillEmbeddings(embeds: MlxArray, cache: Cache[], bidir: MlxArray | null, _ids: MlxArray,
+    _multimodal: MlxArray | null = null): MlxArray {
+    const h = ops.mulScalar(embeds, this.embedScale);
+    return this.#run(h, cache, bidir ? { bidirectional: bidir } : "window", null);
+  }`;
 
-  function emitHelper(s: LayerSpec): string {
-    const name = helperName(s);
-    const quant = s.quant || (!s.donor && specs[s.donorIdx]!.quant);
-    const cacheTy = quant
-      ? (s.sliding ? "RotatingQuantizedKVCache" : "QuantizedKVCache")
-      : (s.sliding ? "RotatingKVCache" : "KVCache");
-    // NOTE: sharer helpers take the donor's exported fetch instead of a cache.
-    const sig = s.donor
-      ? `(layer: DecoderLayer, x: MlxArray, mask: Mask, cache: ${cacheTy}${hasPerLayer ? ", pli: MlxArray" : ""})`
-      : `(layer: DecoderLayer, x: MlxArray, mask: Mask, shared: SharedKv${hasPerLayer ? ", pli: MlxArray" : ""})`;
-    const ret = s.donor && s.exports
-      ? `{ h: MlxArray; shared: SharedKv }`
-      : `MlxArray`;
+  const mixedInputs = perLayer ? `
+            const [B, L] = group.ids.shape as [number, number];
+            inputs.push(perLayerInputs.layer(group.perLayer!, i, B, L));` : "";
+  const mixedPacked = perLayer ? `
+          // Per-layer inputs use the same token order as the hidden states.
+          let packedInput: MlxArray | null = null;
+          if (packedMlp && inputs.length) {
+            const flat = inputs.map(input => ops.reshape(input, [1, -1, perLayerInputs.width]));
+            try { packedInput = ops.concatAxis(flat, 1); }
+            finally { for (const input of flat) input.dispose(); }
+          }
+          using pli = packedInput;` : "";
+  const mixedFf = perLayer
+    ? { packed: "feedforward(packed, pli!)", rows: "for (const [row, mid] of mids.entries()) outputs.push(feedforward(mid, inputs[row]!))" }
+    : { packed: "feedforward(packed)", rows: "for (const mid of mids) outputs.push(feedforward(mid))" };
 
-    const lines: string[] = [];
-    lines.push(`function ${name}${sig}: ${ret} {`);
-    lines.push(`  const a = layer.attn;`);
-    lines.push(`  const [B, L] = x.shape as [number, number, number];`);
-    lines.push(`  let h = layer.inputNorm.forward(x);`);
-    lines.push(`  let q = a.qProj.forward(h);`);
-    lines.push(`  q = disposing(q, ops.reshape(q, [B, L, a.nHeads, a.headDim]));`);
-    lines.push(`  q = disposing(q, a.qNorm.forward(q));`);
-    if (s.donor) {
-      lines.push(`  const offset = cache.offset;`);
-      lines.push(`  let k = a.kProj!.forward(h);`);
-      lines.push(`  k = disposing(k, ops.reshape(k, [B, L, a.nKvHeads, a.headDim]));`);
-      if (!s.kEqV) {
-        lines.push(`  let v = a.vProj!.forward(h);`);
-        lines.push(`  v = disposing(v, ops.reshape(v, [B, L, a.nKvHeads, a.headDim]));`);
-      }
-      lines.push(`  const kNormed = a.kNorm!.forward(k);`);
-      lines.push(`  const kT = ops.transposeAxes(kNormed, [0, 2, 1, 3]);`);
-      lines.push(`  kNormed.dispose();`);
-      lines.push(`  const kRoped = a.rope(kT, cache.ropeOffsetArr ?? offset);`);
-      lines.push(`  kT.dispose();`);
-      // attention_k_eq_v: V is the K projection through the UNscaled norm
-      lines.push(`  const vNormed = a.vNorm!.forward(${s.kEqV ? "k" : "v"});`);
-      lines.push(`  const vT = ops.transposeAxes(vNormed, [0, 2, 1, 3]);`);
-      lines.push(`  vNormed.dispose();`);
-      if (!s.kEqV) lines.push(`  v.dispose();`);
-      lines.push(`  k.dispose();`);
-      if (quant) {
-        lines.push(`  const [kq, vq] = cache.updateAndFetchQuantized(kRoped, vT);`);
-        lines.push(`  kRoped.dispose();`);
-        lines.push(`  vT.dispose();`);
-      } else {
-        lines.push(`  const [keys, values] = cache.updateAndFetch(kRoped, vT);`);
-        lines.push(`  kRoped.dispose();`);
-        lines.push(`  vT.dispose();`);
-      }
-      lines.push(`  q = disposing(q, ops.transposeAxes(q, [0, 2, 1, 3]));`);
-      lines.push(`  q = disposing(q, a.rope(q, cache.ropeOffsetArr ?? offset));`);
-      if (quant) {
-        lines.push(...emitQuantSdpaDispatch(s, "kq", "vq"));
-      } else {
-        lines.push(`  const attn = ops.sdpa(q, keys, values, 1.0, mask.mode, mask.arr);`);
-      }
-    } else {
-      // sharer: consume the donor's fetched KV (offsets ride SharedKv)
-      lines.push(`  q = disposing(q, ops.transposeAxes(q, [0, 2, 1, 3]));`);
-      lines.push(`  q = disposing(q, a.rope(q, shared.offsetArr ?? shared.offset));`);
-      if (quant) {
-        lines.push(`  if (shared.kind !== "quant") throw new Error("generated sharer expected quant shared KV");`);
-        lines.push(...emitQuantSdpaDispatch(s, "shared.keys", "shared.values"));
-      } else {
-        lines.push(`  if (shared.kind !== "plain") throw new Error("generated sharer expected plain shared KV");`);
-        lines.push(`  const attn = ops.sdpa(q, shared.keys, shared.values, 1.0, mask.mode, mask.arr);`);
-      }
-    }
-    lines.push(`  q.dispose();`);
-    lines.push(`  const attnT = ops.transposeAxes(attn, [0, 2, 1, 3]);`);
-    lines.push(`  attn.dispose();`);
-    lines.push(`  const merged = ops.reshape(attnT, [B, L, -1]);`);
-    lines.push(`  attnT.dispose();`);
-    lines.push(`  const out = a.oProj.forward(merged);`);
-    lines.push(`  merged.dispose();`);
-    lines.push(`  h.dispose();`);
-    lines.push(`  h = out;`);
-    lines.push(`  h = disposing(h, layer.postAttnNorm.forward(h));`);
-    lines.push(`  h = disposing(h, ops.add(x, h));`);
-    lines.push(`  const residual = h;`);
-    if (hasMoe) {
-      lines.push(`  let h1 = layer.preFfNorm.forward(h);`);
-      lines.push(`  h1 = disposing(h1, layer.mlp.forward(h1));`);
-      lines.push(`  h1 = disposing(h1, layer.postFfNorm1!.forward(h1));`);
-      lines.push(`  const { indices, weights: topKWeights } = layer.router!.forward(h);`);
-      lines.push(`  let h2 = layer.preFfNorm2!.forward(h);`);
-      lines.push(`  h2 = disposing(h2, layer.experts!.forward(h2, indices, topKWeights));`);
-      lines.push(`  h2 = disposing(h2, layer.postFfNorm2!.forward(h2));`);
-      lines.push(`  indices.dispose();`);
-      lines.push(`  topKWeights.dispose();`);
-      lines.push(`  let f = ops.add(h1, h2);`);
-      lines.push(`  h1.dispose();`);
-      lines.push(`  h2.dispose();`);
-    } else {
-      lines.push(`  let f = layer.preFfNorm.forward(h);`);
-      lines.push(`  f = disposing(f, layer.mlp.forward(f));`);
-    }
-    lines.push(`  f = disposing(f, layer.postFfNorm.forward(f));`);
-    lines.push(`  h = ops.add(residual, f);`);
-    lines.push(`  residual.dispose();`);
-    lines.push(`  f.dispose();`);
-    if (hasPerLayer) {
-      lines.push(`  const res2 = h;`);
-      lines.push(`  let gate = layer.perLayerGate!.forward(h);`);
-      lines.push(`  gate = disposing(gate, ops.geluApprox(gate));`);
-      lines.push(`  gate = disposing(gate, ops.mul(gate, pli));`);
-      lines.push(`  gate = disposing(gate, layer.perLayerProjection!.forward(gate));`);
-      lines.push(`  gate = disposing(gate, layer.postPerLayerNorm!.forward(gate));`);
-      lines.push(`  h = ops.add(res2, gate);`);
-      lines.push(`  res2.dispose();`);
-      lines.push(`  gate.dispose();`);
-    }
-    if (s.layerScalar) {
-      lines.push(`  h = disposing(h, ops.mul(h, layer.layerScalar!));`);
-    }
-    if (s.donor && s.exports) {
-      if (quant) {
-        lines.push(`  const shared: SharedKv = { kind: "quant", keys: kq, values: vq, offset, groupSize: ${s.gs}, bits: ${s.bits}, offsetArr: cache.ropeOffsetArr };`);
-      } else {
-        lines.push(`  const shared: SharedKv = { kind: "plain", keys, values, offset, offsetArr: cache.ropeOffsetArr };`);
-      }
-      lines.push(`  return { h, shared };`);
-    } else {
-      if (s.donor && quant) {
-        lines.push(`  for (const t of [kq, vq]) for (const c of [t.packed, t.scales, t.biases]) c.dispose();`);
-      } else if (s.donor) {
-        lines.push(`  keys.dispose();`);
-        lines.push(`  values.dispose();`);
-      }
-      lines.push(`  return h;`);
-    }
-    lines.push(`}`);
-    return lines.join("\n");
-  }
+  const compiledMembers = compiledDecode ? `
+  /** The compiled decode step: it records this graph's own decode forward (${sharing || perLayer
+    ? "whole-graph, since KV sharing and per-layer inputs\n   *  plumb across layers" : "segmented at the growing caches'\n   *  layers, which run uncompiled"}), so it shares the graph's weights and constants. */
+  compiledDecodeStep(): MlxCompiledDecodeStep { return CompiledDecode.for(this); }
+  releaseCompiledDecode(): void { CompiledDecode.release(this); }
+` : "";
 
-  // --- forwardLayers emission ---------------------------------------------------
+  const kvHeaderLine = owned.every(layer => layer.kv) ? `the artifact's kv_config, affine per cache: ${kvLine}` : `the artifact's kv_config: ${kvLine}`;
 
-  const firstSliding = specs.findIndex((s) => s.sliding && s.donor);
-  const firstFull = specs.findIndex((s) => !s.sliding && s.donor);
-
-  function cacheClass(s: LayerSpec): string {
-    return s.quant
-      ? (s.sliding ? "RotatingQuantizedKVCache" : "QuantizedKVCache")
-      : (s.sliding ? "RotatingKVCache" : "KVCache");
-  }
-
-  // The dispatch helpers fold (bits, group_size) in as literals, so the
-  // guard must reject any cache whose actual quantization differs from what
-  // this file was generated for (e.g. uniform kv8 vs the per-layer mixed
-  // scheme) — otherwise quantized_matmul gets a shape it can't decode. A
-  // mismatch falls back to the monolith, which reads bits/group off the cache.
-  const guardChecks = specs
-    .filter((s) => s.donor)
-    .map((s) => {
-      const signature = s.quant
-        ? `kv:${s.sliding ? "rotating-quant" : "quant"}:${s.bits}:${s.gs}`
-        : `kv:${s.sliding ? "rotating-plain" : "plain"}`;
-      return `cacheSignature(cache[${s.idx}]) === "${signature}"`;
-    })
-    .join(" &&\n      ");
-
-  const bodyLines: string[] = [];
-  for (const s of specs) {
-    const name = helperName(s);
-    const pli = hasPerLayer
-      ? `, perLayerSlice(perLayer, ${s.idx}, B, L, this.perLayerWidth)`
-      : "";
-    const mask = s.sliding ? "maskS" : "maskF";
-    if (s.donor && s.exports) {
-      bodyLines.push(`    const r${s.idx} = ${name}(this.layers[${s.idx}]!, h, ${mask}, cache[${s.idx}] as ${cacheClass(s)}${pli});`);
-      bodyLines.push(`    h.dispose();`);
-      bodyLines.push(`    h = r${s.idx}.h;`);
-    } else if (s.donor) {
-      bodyLines.push(`    next = ${name}(this.layers[${s.idx}]!, h, ${mask}, cache[${s.idx}] as ${cacheClass(s)}${pli});`);
-      bodyLines.push(`    h.dispose();`);
-      bodyLines.push(`    h = next;`);
-    } else {
-      bodyLines.push(`    next = ${name}(this.layers[${s.idx}]!, h, ${mask}, r${s.donorIdx}.shared${pli});`);
-      bodyLines.push(`    h.dispose();`);
-      bodyLines.push(`    h = next;`);
-    }
-  }
-  // dispose exported donor KV after the pass (mirrors the monolith)
-  const exportDispose = specs
-    .filter((s) => s.donor && s.exports)
-    .map((s) => `    disposeSharedKv(r${s.idx}.shared);`)
-    .join("\n");
-
-  const helperBodies = [...new Map(specs.map((s) => [helperName(s), s])).values()]
-    .map(emitHelper)
-    .join("\n\n");
-
-  return `// GENERATED by packages/inference/scripts/gen-gemma4.ts — DO NOT EDIT (regenerate instead):
-//   bun packages/inference/scripts/gen-gemma4.ts <model-dir> ${outStem}
-// source: ${label}
-// fingerprint: ${fingerprint}
+  return `// GENERATED by packages/inference/scripts/gen-gemma4.ts from composition ${stem}; do not edit.
+// Regenerate: bun packages/inference/scripts/gen-gemma4.ts <snapshot> ${stem}
+// (tests/fixtures/gemma4-graphs holds the inputs it was generated from).
 //
-// Branch-resolved, unrolled forward pass for this architecture, compiled from
-// its config and kv_config. Bit-exactness vs the dedicated graph is gated by
-// tests/parity/gemma4-generated.test.ts (real weights); tests/models/gemma4-generated-sync.test.ts
-// fails when this file differs from what the generator emits. The cache-signature
-// guard falls back to Gemma4Model for anything this file wasn't generated for
-// (plain caches, vision bidirectional prefill, hidden-layer taps).
+// Composition ${stem}:
+//   artifact     ${label}, config fingerprint ${fingerprint}
+//   KV           ${kvHeaderLine} (LAYERS)
+//   layers       ${layerCount}: ${slidingCount} sliding, ${layerCount - slidingCount} full; ${sharingLine}
+//   blocks       ${pieces}
+//
+${wrapComment(`An entire graph: built once at construction for this composition, it inherits from no class and never calls another graph. Each layer is composed from the blocks (../blocks.ts) its row of LAYERS names: its attention half (it owns a cache${sharing ? ", owns one whose read later layers attend, or attends its donor's read" : ""}) and its row-wise half (${ffDoc}${scalars ? ", the layer scalar" : ""}). Every attention read goes through the cache, for the phase the caller names; the cache attends with the kernel it was composed with. Gemma has no width-specialized kernels yet, so decode, verify and logits serve every width class with one operation each.`)}
+//
+// Request shapes this graph serves:
+//   - prompt chunks and tails of token ids (prefillChunk.gpu, prefillTail);
+//   - decode, one position per sequence, and speculative verify windows with the
+//     drafter's layer capture, at every width (decode, verify, logits);
+//   - prepared image and audio embeddings, image tokens attending each other both
+//     ways (bindMediaInput, through prefillEmbeddings);${compiledDecode ? `
+//   - the compiled decode step (compiledDecodeStep);` : ""}
+//   - the assistant drafter's donor reads and the hidden-layer taps (draftTarget);
+//   - mounted LoRA adapters (loraTargets: the blocks' QuantizedLinear projections apply them);
+//   - paged KV (the paged caches' own reads), and mixed groups of rows in one
+//     forward (mixed);
+//   - the scoring forward over a whole sequence (sequenceHidden, the window read).
+// Its caches are the composition's (makeCache): under the scheme it serves, every
+// cache the kv_config lists is the bf16-first affine lego, read bf16 through its
+// first append and through its quantized storage after, with the read kernels the
+// composition names (--fused-sdpa); the other caches stay bf16.
+// The loader refuses, or gives the generic graph (Gemma4Model), from the declared
+// capabilities and its selection table, never by routing inside this graph:
+//   - any KV scheme other than the one COMPOSITION serves (bf16, uniform --kv-quant N,
+//     TurboQuant): the table builds the generic graph;
+//   - training: this graph declares no training operations (segmented backward,
+//     prefix sharing, gradient checkpointing, the fused head and the training
+//     forward over training caches are the generic graph's)${compiledDecode ? "" : `;
+//   - the compiled decode step: shapeless replay retraces the experts' growing windows`}.
 
-import { MlxArray } from "@mlx-bun/mlx/array";
+import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
-import { cacheSignature } from "../../../state/capabilities";
-import { disposing } from "../../../layers/helpers";
-import { fusedSdpaRuntimeOk, quantizedSdpaTiled, quantizedSdpaUnfused } from "../../../layers/quantized-attention";
-import { KVCache } from "../../../state/kv";
-import { QuantizedKVCache } from "../../../state/quantized-kv";
-import { RotatingKVCache } from "../../../state/rotating-kv";
-import { RotatingQuantizedKVCache } from "../../../state/rotating-quantized-kv";
-import { type Cache, type Mask, type SharedKv } from "../../../contracts/mlx/cache";
-import { Gemma4Model, type DecoderLayer } from "../model";
-${hasPerLayer ? `import { isCompiledTrace } from "../../../runtime/compiled-trace";\n` : ""}
-import { GENERATED_GEMMA_FINGERPRINTS } from "../family";
-export const FINGERPRINT = GENERATED_GEMMA_FINGERPRINTS["${key}"];
+import type { ModelConfig } from "../../../artifacts/config";
+import type { Weights } from "../../../artifacts/weights";
+import type { Cache } from "../../../contracts/mlx/cache";
+import type { TargetView } from "../../../contracts/mlx/draft-target";
+import type {
+  ${compiledDecode ? "MlxCompiledDecodeStep, " : ""}MlxDeclaredGraph, MlxHeadForward, MlxLayerCapture, MlxMixedForward, MlxPhaseForward,
+  MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward, MlxWidthClass, MlxWidthTable,
+} from "../../../contracts/mlx/graph";
+import type { MediaEncoders, MediaSidecarProbes, MlxPromptInput, Vision } from "../../../contracts/mlx/media";
+import type { Composition } from "../../../contracts/portable/composition";
+import type { GraphCapabilities } from "../../../contracts/portable/graph";
+import { mapPackedTokens } from "../../../input/token-groups";
+${softcap === null ? "" : `import { logitSoftcap } from "../../../kernels/logits";
+import { compiledLogitSoftcap } from "../../../kernels/softcap";
+`}import { disposing } from "../../../layers/helpers";
+import { LoraState } from "../../../layers/lora";
+import { RMSNorm } from "../../../layers/normalization";
+import { QuantizedEmbedding } from "../../../layers/quantized-embedding";
+import type { QuantizedLinear } from "../../../layers/quantized-linear";
+${softcap === null ? "" : `import { isCompiledTrace } from "../../../runtime/compiled-trace";
+`}import { disposeResources } from "../../../runtime/resources";
+import { AttentionMasks } from "../../../state/attention-read";
+import { composedFullAttentionCache, composedSlidingAttentionCache } from "../../../state/bf16-first-kv";
+import { deferredTurboQuantKernels } from "../../../state/turboquant-attention";
+import { declareGraph } from "../../capabilities";
+import { atEveryWidth } from "../../graph";
+import type { ServedComposition } from "../../implementation";
+import { DecoderLayer, ${perLayer ? "PerLayerInputs, " : ""}${sharing ? "type DonorRead, " : ""}type Gemma4Phase } from "../blocks";
+${compiledDecode ? `import { CompiledDecode } from "../compiled-decode";
+` : ""}import { GENERATED_GEMMA_FINGERPRINTS } from "../family";
+import { bindGemma4MediaInput, gemma4DraftTarget, gemma4MediaEncoders } from "../media";
 
-/** Forward passes served by the generated fast path (vs monolith
- *  fallback) — the parity gate asserts the fast path actually ran. */
-export let generatedForwardUses = 0;
+export const FINGERPRINT = GENERATED_GEMMA_FINGERPRINTS[${JSON.stringify(c.key)}];
 
-function disposeSharedKv(s: SharedKv): void {
-  if (s.kind === "view") {
-    s.attention.dispose();
-    s.offsetArr?.dispose();
-  } else if (s.kind === "plain") {
-    s.keys.dispose();
-    s.values.dispose();
-  } else {
-    for (const t of [s.keys, s.values])
-      for (const a of [t.packed, t.scales, t.biases]) a.dispose();
-  }
+/** One decoder layer as the composition fixes it: its attention type; the layer
+ *  whose cache it reads (itself when it owns one, else the last donor of its type,
+ *  whose read it attends in the same forward); that cache's affine width and group
+ *  under the composition's KV scheme (null: bf16); whether its keys are its values;
+ *  whether it carries a layer scalar. */
+export interface Gemma4Layer {
+  readonly attention: "sliding" | "full";
+  readonly cache: number;
+  readonly kv: { readonly bits: number; readonly groupSize: number } | null;
+  readonly kEqV: boolean;
+  readonly layerScalar: boolean;
 }
-${hasPerLayer ? `
-/** Per-layer-input split with the layer index baked; DynamicSlice under
- *  a compiled-decode trace (mlx Slice lacks output_shapes), the exact
- *  monolith ops otherwise. */
-function perLayerSlice(perLayer: MlxArray, i: number, B: number, L: number, width: number): MlxArray {
-  let pls: MlxArray;
-  if (isCompiledTrace()) {
-    const start = ops.fromInt32([i], [1]);
-    pls = ops.sliceDynamic(perLayer, start, [2], [B, L, 1, width]);
-    start.dispose();
-  } else {
-    pls = perLayer.slice([0, 0, i, 0], [B, L, i + 1, width]);
-  }
-  const r = ops.reshape(pls, [B, L, width]);
-  pls.dispose();
-  return r;
-}
-` : ""}
-${helperBodies}
 
-export class GeneratedGemma4 extends Gemma4Model {
-  /** Per-layer cache signatures must match what this file was generated for. */
-  #matches(cache: Cache[]): boolean {
-    return (
-      cache.length === ${numDonors} &&
-      ${guardChecks}
-    );
+/** The artifact's layers and kv_config, from ${label}. */
+export const LAYERS: readonly Gemma4Layer[] = Object.freeze([
+${table}
+]);
+
+/** Layers [0, CACHES) own a cache. */
+const CACHES = ${caches};
+${sharing ? `/** The donors whose read later layers attend. */
+const SHARED: ReadonlySet<number> = new Set([${shared.join(", ")}]);
+` : ""}const PREFIX = ${JSON.stringify(prefix)};
+${softcap === null ? "" : `const FINAL_LOGIT_SOFTCAP = ${softcap};
+`}
+/** The composition this file was generated for, its entry in the loader's table:
+ *  the artifact's config fingerprint and the KV scheme of the caches it serves (the
+ *  artifact's kv_config, \`--kv-quant config\`). The scheme's read kernels and
+ *  conversion start constrain nothing: \`makeCache\` composes them from the record
+ *  the constructor is handed. */
+export const COMPOSITION: ServedComposition = Object.freeze({
+  fingerprint: FINGERPRINT,
+  kv: Object.freeze([Object.freeze({
+    kind: "affine-layers" as const,
+    layers: Object.freeze(LAYERS.slice(0, CACHES).flatMap((layer, i) => layer.kv ? [Object.freeze({ layer: i, ...layer.kv })] : [])),
+  })]),
+});
+
+/** A layer's attention half over \`x\` (borrowed) for one forward, to the post-attention residual (owned). */
+type Attend = (x: MlxArray, caches: Cache[], phase: Gemma4Phase${sharing ? ", reads: (DonorRead | null)[]" : ""}) => MlxArray;
+/** A layer's row-wise half over the post-attention residual \`hMid\` (borrowed)${perLayer ? " and the layer's per-layer input (borrowed)" : ""},
+ *  to the layer output (owned). Rows are rows: it never sees how they group into sequences. */
+type Feedforward = (hMid: MlxArray${perLayer ? ", perLayerInput: MlxArray" : ""}) => MlxArray;
+
+${attendBuilders}
+${ffBuilders}
+
+export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
+  readonly config: ModelConfig;
+  /** The served configuration this graph was built for: its KV scheme is what \`makeCache\` composes. */
+  readonly composition: Composition;
+  /** Total weight-shard bytes (for the conditional wired-limit scope). */
+  readonly weightsBytes: number;
+  /** Weight-name prefix of the LoRA targets. */
+  readonly prefixBase = PREFIX;
+  /** Active LoRA adapters for the current generation. */
+  readonly loraState = new LoraState();
+  /** Prepared image and audio embeddings, layer taps for drafts${compiledDecode ? ", a compiled decode step" : ""}.
+   *  No training operations. */
+  readonly graphCapabilities: GraphCapabilities;
+  readonly embed: QuantizedEmbedding;
+  readonly layers: readonly DecoderLayer[];
+  readonly finalNorm: RMSNorm;
+  readonly embedScale: number;
+  readonly windowSize: number;
+  /** Layers [0, numDonors) own caches. */
+  readonly numDonors = CACHES;
+  /** The per-layer input width (0: none). */
+  readonly perLayerWidth: number;
+
+  readonly prefillChunk: MlxPrefillChunk;
+  readonly prefillTail: MlxWidthTable<(ids: MlxArray, caches: Cache[], capture: MlxLayerCapture | null) => MlxArray>;
+  readonly decode: MlxWidthTable<(ids: MlxArray, caches: Cache[], capture: MlxLayerCapture | null) => MlxArray>;
+  readonly verify: MlxWidthTable<MlxVerifyForward>;
+  /** Known tokens: this graph declares no committed spans, so they read as a window. */
+  readonly appendKnown: MlxWidthTable<MlxPhaseForward>;
+  readonly logits: MlxWidthTable<MlxHeadForward>;
+
+  readonly #attend: readonly Attend[];
+  readonly #feedforward: readonly Feedforward[];
+${perLayer ? "  readonly #perLayerInputs: PerLayerInputs;\n" : ""}  readonly #head: MlxHeadForward;
+  /** The composition's \`packedMixedMlp\`: the groups of a mixed forward share one feed-forward call. */
+  readonly #packMixedMlp: boolean;
+  #disposed = false;
+
+  constructor(weights: Weights, config: ModelConfig, composition: Composition) {
+    const t = config.text;
+    this.config = config;
+    this.composition = composition;
+    this.weightsBytes = [...weights.shards.files.values()].reduce((a, f) => a + f.mmap.size, 0);
+    this.embed = QuantizedEmbedding.load(weights, \`\${PREFIX}.embed_tokens\`, config);
+    // The GeGLU activations${softcap === null ? "" : " and the head's softcap"} run the compiled closures unless the
+    // composition's \`compiledGeglu\` is off: the spelled-out ops.
+    const compiledGeglu = composition.compiledGeglu;
+    this.layers = Object.freeze(LAYERS.map((_, i) => new DecoderLayer(weights, config, PREFIX, i, i < CACHES, compiledGeglu)));
+    this.finalNorm = new RMSNorm(weights.tensor(\`\${PREFIX}.norm.weight\`), t.rmsNormEps);
+    this.embedScale = Math.sqrt(t.hiddenSize);
+    this.windowSize = t.slidingWindow;
+${perLayer ? `    this.#perLayerInputs = new PerLayerInputs(weights, config, PREFIX);
+    this.perLayerWidth = this.#perLayerInputs.width;
+` : `    this.perLayerWidth = 0;
+`}    this.#attend = Object.freeze(${attendBuild});
+    this.#feedforward = Object.freeze(${ffBuild});
+    const embed = this.embed;
+${softcapHead}
+    this.#packMixedMlp = composition.packedMixedMlp;
+    this.graphCapabilities = declareGraph({
+      media: { input: "embeddings", video: false }, hiddenLayerTaps: true, compiledDecode: ${compiledDecode},
+    });
+
+    const head = this.#head;
+    const window = (ids: MlxArray, caches: Cache[], capture: MlxLayerCapture | null): MlxArray =>
+      this.#run(this.#embedTokens(ids), caches, "window"${idsArg("ids")}, capture);
+    this.prefillChunk = Object.freeze({ gpu: window });
+    this.prefillTail = atEveryWidth(window);
+    this.decode = atEveryWidth((ids: MlxArray, caches: Cache[], capture: MlxLayerCapture | null) => this.#run(this.#embedTokens(ids), caches, "decode"${idsArg("ids")}, capture));
+    this.verify = atEveryWidth(window);
+    this.appendKnown = atEveryWidth<MlxPhaseForward>((ids, caches) => window(ids, caches, null));
+    this.logits = atEveryWidth<MlxHeadForward>(hidden => head(hidden));
   }
 
-  protected override forwardLayers(
-    h0: MlxArray, cache: Cache[], bidir: MlxArray | null, ids: MlxArray | null,
-  ): MlxArray {
-    // hiddenTap (DSpark H_ctx capture) lives in the monolith's forwardLayers —
-    // this unrolled forward never calls captureLayer, so a tapped call MUST
-    // fall back or the spec path silently captures nothing and throws. Tapped
-    // forwards are only the spec path's prefill/verify; the monolith is the
-    // bit-exact reference, so this is correct-but-unspecialized.
-    if (bidir !== null${hasPerLayer ? " || ids === null" : ""} || this.hiddenTap !== null || !this.#matches(cache))
-      return super.forwardLayers(h0, cache, bidir, ids);
-    generatedForwardUses++;
-    ${hasPerLayer ? "const B = h0.shape[0]!;\n    " : ""}const L = h0.shape[1]!;
-    const maskS = cache[${firstSliding}]!.makeMask(L, this.windowSize);
-    const maskF = cache[${firstFull}]!.makeMask(L, null);
-${hasPerLayer ? `    const perLayer = this.computePerLayerInputs(ids!, h0);\n` : ""}    let h = h0;
-    let next: MlxArray;
-${bodyLines.join("\n")}
-${exportDispose}
-${hasPerLayer ? `    perLayer.dispose();\n` : ""}    maskS.arr?.dispose();
-    maskF.arr?.dispose();
-    return disposing(h, this.finalNorm.forward(h));
+  /** One cache per layer that owns one, all sharing one mask memo, so each
+   *  forward builds each mask once: the cache the composition's KV scheme names
+   *  for the layer, a ring of the sliding window for sliding layers
+   *  (\`composedSlidingAttentionCache\`) and for full layers a cache whose
+   *  TurboQuant read is deferred (\`composedFullAttentionCache\`,
+   *  \`deferredTurboQuantKernels\`). Under the scheme COMPOSITION serves, each
+   *  cache LAYERS gives a width is the bf16-first affine lego. */
+  makeCache(): Cache[] {
+    const masks = new AttentionMasks(), kv = this.composition.kv;
+    return LAYERS.slice(0, CACHES).map((layer, i) => layer.attention === "sliding"
+      ? composedSlidingAttentionCache(kv, i, this.windowSize, masks) : composedFullAttentionCache(kv, i, masks, deferredTurboQuantKernels));
   }
+
+  /** LoRA-mountable linears, keyed by weight-file module path: the attention and
+   *  MLP projections${perLayer ? " and the per-layer-input projections" : ""}. Expert pools are not targets. */
+  loraTargets(): Map<string, QuantizedLinear> {
+    const out = new Map<string, QuantizedLinear>();
+    this.layers.forEach((l, i) => {
+      const p = \`\${PREFIX}.layers.\${i}\`;
+      const add = (suffix: string, lin: QuantizedLinear | null) => { if (lin) out.set(\`\${p}.\${suffix}\`, lin); };
+      add("self_attn.q_proj", l.attn.qProj);
+      add("self_attn.k_proj", l.attn.kProj);
+      add("self_attn.v_proj", l.attn.vProj);
+      add("self_attn.o_proj", l.attn.oProj);
+      add("mlp.gate_proj", l.mlp.gate);
+      add("mlp.up_proj", l.mlp.up);
+      add("mlp.down_proj", l.mlp.down);
+      add("per_layer_input_gate", l.perLayerGate);
+      add("per_layer_projection", l.perLayerProjection);
+    });
+    return out;
+  }
+
+  bindMediaInput(input: Vision): MlxPromptInput { return bindGemma4MediaInput(this, input); }
+  mediaEncoders(modelDir: string, probes: MediaSidecarProbes): Promise<MediaEncoders> {
+    return gemma4MediaEncoders(this, modelDir, probes);
+  }
+  /** The drafter's ports over the live caches: the assistant drafter's donor reads
+   *  (the last sliding and full caches) and the hidden-layer taps. */
+  draftTarget(caches: Cache[]): TargetView { return gemma4DraftTarget(this, caches); }
+${compiledMembers}
+  /** Release the graph's constants after all executions and compiled runners have
+   *  stopped. Weight tensors and hidden taps are borrowed. */
+  dispose(): void {
+    if (this.#disposed) return;
+    this.#disposed = true;
+    disposeResources(this.layers.flatMap(layer => layer.attn.ropeFreqs ? [layer.attn.ropeFreqs] : []));
+  }
+
+  /** Computed constants keep their constructor arithmetic when a restored request
+   *  enters compiled decode without a prefill first. */
+  materializeGraphConstants(): void {
+    const constants = this.layers.flatMap(layer => layer.attn.ropeFreqs ? [layer.attn.ropeFreqs] : []);
+    if (constants.length) ops.evalAll(constants);
+  }
+
+  /** The scaled token embeddings [B, L, hidden] of \`ids\` (owned). */
+  #embedTokens(ids: MlxArray): MlxArray {
+    const h = this.embed.encode(ids);
+    return disposing(h, ops.mulScalar(h, this.embedScale));
+  }
+
+  /** Every layer over \`h0\` [B, L, hidden] (consumed), each reading for \`phase\`, to
+   *  the post-final-norm hidden (owned). \`capture\` sees every layer's output, then
+   *  the final hidden.${perLayer ? " `ids` [B, L] feed the per-layer inputs." : ""} */
+  #run(h0: MlxArray, caches: Cache[], phase: Gemma4Phase${idsParam}, capture: MlxLayerCapture | null): MlxArray {
+${perLayer ? `    const [B, L] = h0.shape as [number, number];
+    const perLayerInputs = this.#perLayerInputs;
+` : ""}    let h: MlxArray | null = h0;${readsDecl}${perLayer ? `
+    let perLayer: MlxArray | null = null;` : ""}
+    try {${perLayer ? `
+      perLayer = perLayerInputs.compute(ids, h0);` : ""}
+      for (let i = 0; i < LAYERS.length; i++) {
+${layerBody}
+        h.dispose();
+        h = next;
+        capture?.(i, h);
+      }
+      const out = this.finalNorm.forward(h);
+      h.dispose();
+      h = null;
+      capture?.(LAYERS.length, out);
+      return out;
+    } finally {
+      h?.dispose();${perLayer ? `
+      perLayer?.dispose();` : ""}${readsFree}
+    }
+  }
+
+  /** The scoring forward (\`MlxSequenceForward\`): the window read at every width. */
+  sequenceHidden(ids: MlxArray, cache: Cache[], _width: MlxWidthClass): MlxArray {
+    return this.#run(this.#embedTokens(ids), cache, "window"${idsArg("ids")}, null);
+  }
+
+${prefillEmbeddings}
+
+  /** Mixed rows in one forward: each group's attention reads its own caches in its
+   *  own phase (a verify group reads a window); the feed-forward runs once over the
+   *  groups' real tokens packed together, unless a group is a verify window or the
+   *  composition's \`packedMixedMlp\` is off. */
+  readonly mixed: MlxMixedForward = work => {
+    const groups: Array<{ ids: MlxArray; cache: Cache[]; h: MlxArray; phase: Gemma4Phase${perLayer ? ";\n      perLayer: MlxArray | null" : ""}${sharing ? `;${perLayer ? " " : "\n      "}reads: (DonorRead | null)[]` : ""} }> = [];
+    const results: MlxArray[] = [];
+    const packedMlp = this.#packMixedMlp && !work.some(group => group.phase === "verify");
+${perLayer ? "    const perLayerInputs = this.#perLayerInputs;\n" : ""}    try {
+      for (const { ids, state, phase } of work) {
+        const h = this.#embedTokens(ids);
+        const group = { ids, cache: state, h, phase: (phase === "decode" ? "decode" : "window") as Gemma4Phase${perLayer ? ",\n          perLayer: null as MlxArray | null" : ""}${sharing ? `,${perLayer ? " " : "\n          "}reads: Array<DonorRead | null>(CACHES).fill(null)` : ""} };
+        groups.push(group);${perLayer ? `
+        group.perLayer = perLayerInputs.compute(ids, group.h);` : ""}
+      }
+      for (let i = 0; i < LAYERS.length; i++) {
+        const attend = this.#attend[i]!, feedforward = this.#feedforward[i]!;
+        const mids: MlxArray[] = []${perLayer ? ", inputs: MlxArray[] = []" : ""};
+        try {
+          for (const group of groups) {
+            mids.push(attend(group.h, group.cache, group.phase${sharing ? ", group.reads" : ""}));${mixedInputs}
+          }${mixedPacked}
+          const outputs: MlxArray[] = [];
+          try {
+            if (packedMlp) outputs.push(...mapPackedTokens(mids, packed => ${mixedFf.packed}));
+            else ${mixedFf.rows};
+          } catch (error) { for (const output of outputs) output.dispose(); throw error; }
+          for (const [index, group] of groups.entries()) { group.h.dispose(); group.h = outputs[index]!; }
+          for (const [index, group] of groups.entries()) work[index]!.capture?.(i, group.h);
+        } finally {
+          for (const mid of mids) mid.dispose();${perLayer ? `
+          for (const input of inputs) input.dispose();` : ""}
+        }
+      }
+      for (const [index, group] of groups.entries()) {
+        const hidden = this.finalNorm.forward(group.h);
+        results.push(hidden);
+        work[index]!.capture?.(LAYERS.length, hidden);
+      }
+      return results;
+    } catch (error) { for (const result of results) result.dispose(); throw error; }
+    finally {
+      for (const group of groups) {
+        group.h.dispose();${perLayer ? `
+        group.perLayer?.dispose();` : ""}${sharing ? `
+        for (const read of group.reads) read?.dispose();` : ""}
+      }
+    }
+  };
+
+  /** The one head: the scoring forward's and the compiled decode step's; the phases index \`logits\`. */
+  logitsFromHidden(h: MlxArray): MlxArray { return this.#head(h); }
 }
 `;
 }
@@ -448,19 +619,20 @@ if (import.meta.main) {
     options: { out: { type: "string" }, help: { type: "boolean", short: "h" } },
     allowPositionals: true,
   });
-  const stems = Object.keys(GEMMA4_GRAPHS).join("|");
+  const stems = Object.keys(GEMMA4_COMPOSITIONS).join("|");
   const usage = `Usage: bun packages/inference/scripts/gen-gemma4.ts <model-dir> <${stems}> [--out <dir>]
-Compile a Gemma4 artifact (config.json, kv_config.json, model.safetensors.index.json) into its
-generated graph module. Reads no weights and needs no native library. The default output
-directory is src/models/gemma4/generated; the config fingerprint must equal the one registered
-for the stem in src/models/gemma4/family.ts.`;
+Compile a Gemma 4 composition into its entire graph module. <model-dir> is the artifact's
+snapshot (config.json, kv_config.json, model.safetensors.index.json; no weights, no native
+library). Its config fingerprint must be the one registered for the composition in
+src/models/gemma4/family.ts. The default output directory is src/models/gemma4/generated.
+Compositions: ${Object.values(GEMMA4_COMPOSITIONS).map(c => `${c.stem} (${c.artifact}, its kv_config)`).join("; ")}.`;
   if (values.help) { console.log(usage); process.exit(0); }
   const [modelDir, stem] = positionals;
-  if (!modelDir || !stem || positionals.length !== 2 || !(stem in GEMMA4_GRAPHS)) {
+  if (!modelDir || !stem || positionals.length !== 2 || !(stem in GEMMA4_COMPOSITIONS)) {
     console.error(usage);
     process.exit(1);
   }
   const outPath = `${values.out ?? GENERATED_DIR}/${stem}.ts`.replace(/\/\/+/g, "/");
-  await Bun.write(outPath, await generateGemma4Graph(modelDir, stem as Gemma4GraphStem));
+  await Bun.write(outPath, await generateGemma4Graph(modelDir, stem));
   console.log(`wrote ${outPath}`);
 }

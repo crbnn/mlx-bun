@@ -40,7 +40,7 @@ const vectorOf = (base64: string) => float32Of(new Uint8Array(Buffer.from(base64
 
 describe.skipIf(!opted)("qwen3-embedding vs mlx-lm and main", () => {
   setDefaultTimeout(600_000);
-  let model: import("@mlx-bun/inference/embeddings").EmbeddingGraph & { forwardHidden(ids: import("@mlx-bun/mlx/array").MlxArray, cache: unknown[]): import("@mlx-bun/mlx/array").MlxArray; makeCache(): { dispose?(): void }[] };
+  let model: import("@mlx-bun/inference/embeddings").EmbeddingGraph & { sequenceHidden(ids: import("@mlx-bun/mlx/array").MlxArray, cache: unknown[], width: import("@mlx-bun/inference/contracts/mlx").MlxWidthClass): import("@mlx-bun/mlx/array").MlxArray; makeCache(): { dispose?(): void }[] };
   let tokenizer: Awaited<ReturnType<typeof import("@mlx-bun/inference").loadTokenizer>>;
   let terminator: number;
   let embeddings: typeof import("@mlx-bun/inference/embeddings");
@@ -65,7 +65,7 @@ describe.skipIf(!opted)("qwen3-embedding vs mlx-lm and main", () => {
   });
   afterAll(() => (model as { dispose?(): void } | undefined)?.dispose?.());
 
-  test("the oracle's hidden states and pooled vector are bit-exact", () => {
+  test("the oracle's hidden states and pooled vector are bit-exact", async () => {
     expect(terminator).toBe(meta!.eod);
     const refHidden = float32Of(readBlob(reference!, "hidden.bin", meta!.oracle.blobs["hidden.bin"]));
     const refPooled = float32Of(readBlob(reference!, "pooled.bin", meta!.oracle.blobs["pooled.bin"]));
@@ -79,7 +79,9 @@ describe.skipIf(!opted)("qwen3-embedding vs mlx-lm and main", () => {
     const cache = model.makeCache();
     let ourHidden: Float32Array;
     try {
-      using hidden = model.forwardHidden(ids, cache);
+      // The whole sequence as one window: the scoring forward at the class of its rows.
+      const { widthClass } = await import("@mlx-bun/inference/contracts/mlx");
+      using hidden = model.sequenceHidden(ids, cache, widthClass(meta!.ids.length));
       expect(hidden.shape).toEqual([1, L, H]);
       ourHidden = hidden.toFloat32();
     } finally { for (const c of cache) c.dispose?.(); }

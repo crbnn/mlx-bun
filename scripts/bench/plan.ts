@@ -11,22 +11,34 @@ export const TREES: readonly Tree[] = ["baseline", "candidate"];
 /** Server configurations measured on both trees, as main's matrix measured its own arms. */
 export const CONFIGURATIONS = {
   default: { args: [] as string[], note: "real CLI defaults" },
-  /** Capacity-1 control: main's `--batch 1` serial path versus the candidate's
-   * continuous scheduler at capacity 1. Not a candidate serial lane. */
-  serial: { args: ["--batch", "1"], note: "capacity-1 control (baseline serial, candidate continuous at capacity 1)" },
+  /** Capacity-1 control: main at `--batch 1` (its one-request executor) against the
+   * candidate's continuous scheduler at capacity 1, a batch of one. */
+  serial: { args: ["--batch", "1"], note: "capacity-1 control (baseline one-request executor, candidate continuous at capacity 1)" },
   mixed: { args: ["--kv-quant", "config"], note: "artifact kv_config.json", requiresKvConfig: true },
   /** Native MTP companion (`--draft ID=PATH`) at a fixed verify depth; models without one are not applicable. */
   mtp2: { args: [] as string[], note: "MTP companion, depth 2", draftDepth: 2 },
   mtp3: { args: [] as string[], note: "MTP companion, depth 3", draftDepth: 3 },
+  /** The served DFlash 2 composition: the model's DFlash 2 drafter (`--dflash2-draft ID=PATH[=BASIS]`),
+   * adaptive depth over 4-bit KV. Models without a drafter are not applicable. */
+  dflash2: { args: ["--kv-quant", "4", "--num-draft-tokens", "adaptive"], note: "DFlash 2 drafter, adaptive depth, 4-bit KV", dflash2: true },
+  /** The served DFlash 2 composition against a baseline that cannot serve it: a graph that declares no verify costs
+   * refuses `--num-draft-tokens adaptive` (main's hand-written Trellis graph on the M1 Max), so the baseline drafts 7 every round and
+   * the candidate adapts, both over 4-bit KV. The trees run different configurations, so the pair is context and
+   * never gates, and its probes and request pairing are reported, not required. */
+  "dflash2-d7-baseline": { args: ["--kv-quant", "4"],
+    treeArgs: { baseline: ["--num-draft-tokens", "7"], candidate: ["--num-draft-tokens", "adaptive"] },
+    note: "DFlash 2 drafter over 4-bit KV: the baseline at depth 7, the candidate adaptive (context, not gated)", dflash2: true, context: true },
 } as const;
 export type Configuration = keyof typeof CONFIGURATIONS;
+/** A configuration whose trees run different settings: its pairs are shown beside the gate, never in it. */
+export const isContext = (name: Configuration): boolean => "context" in CONFIGURATIONS[name];
 
 /** Main's canonical `all` matrix: every model, every configuration, the stock reference. */
 export const CANONICAL = {
   models: ["cpm5", "e4b", "12B", "qwen27b"],
   configurations: ["default", "serial", "mixed"] as Configuration[],
-  /** The refactor gate's MTP depths, which a qualifying matrix may add after main's configurations. */
-  optionalConfigurations: ["mtp2", "mtp3"] as Configuration[],
+  /** The refactor gate's drafter configurations, which a qualifying matrix may add after main's configurations. */
+  optionalConfigurations: ["mtp2", "mtp3", "dflash2"] as Configuration[],
   references: ["mlx-lm"],
   withContext: true,
 } as const;
@@ -69,6 +81,10 @@ export interface ModelSpec {
   files: FileRecord[];
   /** MTP companion for the mtp configurations, pinned like the model. */
   draft?: { path: string; files: FileRecord[] };
+  /** DFlash 2 drafter for the dflash2 configuration, pinned like the model. `basis` is the target's
+   * rotation basis file: main's DFlash 2 provider reads it from MLX_BUN_DFLASH2_TARGET_BASIS, this
+   * tree declares it from the artifact's sidecar and ignores the variable; both servers get it. */
+  dflash2?: { path: string; files: FileRecord[]; basis?: FileRecord & { path: string } };
 }
 export interface Plan {
   schema: 1;
@@ -79,6 +95,9 @@ export interface Plan {
   trees: Record<Tree, TreeSpec>;
   references: ReferenceSpec[];
   configurations: Configuration[];
+  /** Server sessions per tree for each model and configuration (absent: one). Sessions alternate
+   * trees, so pairs pooled across them carry session-to-session drift. */
+  sessions?: number;
   models: ModelSpec[];
   /** Intended MLX library for both trees; children must prove they loaded it.
    * files[0] is the exact resolved library, the rest its bundled runtime. */
@@ -192,7 +211,13 @@ export function validatePlan(value: unknown): Plan {
     if (!model.id || !isAbsolute(model.path) || !Array.isArray(model.files) || !model.files.length) fail(`model ${model.id} is not pinned`);
     if (model.draft && (!isAbsolute(model.draft.path) || !Array.isArray(model.draft.files) || !model.draft.files.length))
       fail(`model ${model.id} draft is not pinned`);
+    const dflash2 = model.dflash2;
+    if (dflash2 && (!isAbsolute(dflash2.path) || !Array.isArray(dflash2.files) || !dflash2.files.length ||
+        (dflash2.basis && (!isAbsolute(dflash2.basis.path) || !/^[0-9a-f]{64}$/.test(dflash2.basis.sha256)))))
+      fail(`model ${model.id} DFlash 2 drafter is not pinned`);
   }
+  if (plan.sessions !== undefined && (!Number.isSafeInteger(plan.sessions) || plan.sessions < 2))
+    fail("sessions, when present, must be an integer of at least 2");
   if (!plan.native?.library || !isAbsolute(plan.native.library) || !plan.native.files?.length) fail("native library is not pinned");
   const problems = profileProblems(plan);
   if (problems.length) fail(`profile all is not main's full matrix: ${problems.join("; ")}`);
@@ -227,6 +252,10 @@ export function pinProblems(plan: Plan): string[] {
     if (JSON.stringify(actual) !== JSON.stringify(model.files)) problems.push(`model ${model.id} files changed`);
     if (model.draft && JSON.stringify(artifactFiles(model.draft.path)) !== JSON.stringify(model.draft.files))
       problems.push(`model ${model.id} draft files changed`);
+    if (model.dflash2 && JSON.stringify(artifactFiles(model.dflash2.path)) !== JSON.stringify(model.dflash2.files))
+      problems.push(`model ${model.id} DFlash 2 drafter files changed`);
+    const basis = model.dflash2?.basis;
+    if (basis && (!existsSync(basis.path) || fileSha(basis.path) !== basis.sha256)) problems.push(`model ${model.id} DFlash 2 basis changed`);
   }
   if (JSON.stringify(nativeFiles(plan.native.library)) !== JSON.stringify(plan.native.files)) problems.push("native library files changed");
   return problems;
@@ -239,19 +268,27 @@ export const needsRegister = (model: ModelSpec) => model.modelType === "gemma4_u
 export interface PlannedCell {
   key: string; model: string; kind: "tree" | "reference"; order: number;
   tree?: Tree; configuration?: Configuration; reference?: string; skipped?: string;
+  /** 1-based server session of a multi-session plan; absent when the plan runs one session per tree. */
+  session?: number;
 }
+/** The sessions every tree runs per model and configuration, 1-based. */
+export const sessionsOf = (plan: Pick<Plan, "sessions">): number[] => Array.from({ length: plan.sessions ?? 1 }, (_, i) => i + 1);
 /** Every cell of the matrix in run order. Per model, each configuration runs on
- * both trees back to back, alternating which tree goes first; references follow. */
+ * both trees back to back, alternating which tree goes first; with several sessions
+ * the pair repeats (A B A B), each session a fresh server. References follow. */
 export function planCells(plan: Plan): PlannedCell[] {
   const cells: PlannedCell[] = [];
+  const multi = (plan.sessions ?? 1) > 1;
   plan.models.forEach((model, m) => {
     plan.configurations.forEach((configuration, c) => {
       const trees = (m + c) % 2 ? [...TREES].reverse() : TREES;
       const spec = CONFIGURATIONS[configuration];
       const skipped = "requiresKvConfig" in spec && !model.kvConfig ? "no kv_config.json in the artifact"
-        : "draftDepth" in spec && !model.draft ? "no MTP companion (--draft) for this model" : undefined;
-      for (const tree of trees) cells.push({ key: `${model.id}/${configuration}/${tree}`, model: model.id, kind: "tree", tree,
-        configuration, order: cells.length, ...(skipped ? { skipped } : {}) });
+        : "draftDepth" in spec && !model.draft ? "no MTP companion (--draft) for this model"
+        : "dflash2" in spec && !model.dflash2 ? "no DFlash 2 drafter (--dflash2-draft) for this model" : undefined;
+      for (const session of sessionsOf(plan)) for (const tree of trees)
+        cells.push({ key: `${model.id}/${configuration}/${tree}${multi ? `/s${session}` : ""}`, model: model.id, kind: "tree", tree,
+          configuration, order: cells.length, ...(multi ? { session } : {}), ...(skipped ? { skipped } : {}) });
     });
     for (const ref of plan.references) {
       const skipped = model.packedTrellis ? "packed trellis has no stock reference loader; an expanded carrier is a different artifact"
@@ -269,10 +306,20 @@ export function cellArgs(plan: Plan, cell: PlannedCell, port: number, ssdDir: st
   if (cell.kind === "tree") {
     const spec = CONFIGURATIONS[cell.configuration!];
     const draft = "draftDepth" in spec
-      ? ["--draft-kind", "mtp", "--draft-model", model.draft!.path, "--num-draft-tokens", String(spec.draftDepth)] : [];
+      ? ["--draft-kind", "mtp", "--draft-model", model.draft!.path, "--num-draft-tokens", String(spec.draftDepth)]
+      : "dflash2" in spec ? ["--draft-model", model.dflash2!.path] : [];
+    const own = "treeArgs" in spec ? spec.treeArgs[cell.tree!] : [];
     return [...plan.trees[cell.tree!].command, "--model", model.path, "--port", String(port), "--no-open",
-      "--ssd-cache", ssdDir, ...spec.args, ...draft];
+      "--ssd-cache", ssdDir, ...spec.args, ...own, ...draft];
   }
   const ref = plan.references.find(r => r.label === cell.reference)!;
   return [...(needsRegister(model) ? ref.registerCommand! : ref.command), "--model", model.path, "--port", String(port)];
+}
+
+/** Environment a cell's configuration adds, identical for both trees: the DFlash 2 basis file
+ * when one is pinned (main reads it; this tree ignores the variable). */
+export function cellExtraEnvironment(plan: Plan, cell: PlannedCell): Record<string, string> {
+  if (cell.kind !== "tree" || !("dflash2" in CONFIGURATIONS[cell.configuration!])) return {};
+  const basis = plan.models.find(m => m.id === cell.model)?.dflash2?.basis;
+  return basis ? { MLX_BUN_DFLASH2_TARGET_BASIS: basis.path } : {};
 }

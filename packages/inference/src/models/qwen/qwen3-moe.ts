@@ -21,20 +21,25 @@ import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
-import { argmaxLastPosition } from "../../kernels/logits";
 import { disposing } from "../../layers/helpers";
 import { compiledSwiglu } from "../../layers/swiglu";
 import { isCompiledTrace } from "../../runtime/compiled-trace";
-import { KVCache } from "../../state/kv";
+import { composedFullAttentionCache } from "../../state/bf16-first-kv";
+import type { Composition } from "../../contracts/portable/composition";
+import { AttentionMasks } from "../../state/attention-read";
+import { denseTurboQuantKernels } from "../../state/turboquant-attention";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
-import type { MlxDeclaredGraph } from "../../contracts/mlx/graph";
+import type {
+  MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward, MlxWidthClass,
+} from "../../contracts/mlx/graph";
 import { declareGraph } from "../capabilities";
+import { atEveryWidth, type ReadPhase } from "../graph";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import { QuantizedLinear } from "../../layers/quantized-linear";
 import { QuantizedSwitchLinear } from "../../layers/quantized-switch-linear";
 import { RMSNorm } from "../../layers/normalization";
-import { type Cache, type Mask } from "../../contracts/mlx/cache";
+import { type Cache } from "../../contracts/mlx/cache";
 import { Qwen3Attention } from "./qwen3";
 
 // ── qwen3_moe.py Attention (== plain qwen3, rope_theta default 1e7) ───────────
@@ -43,6 +48,7 @@ const MOE_ROPE_THETA = 10000000;                                        // args.
 // ── qwen3_moe.py MLP (dense-layer FFN) ───────────────────────────────────────
 // def __call__(self, x): return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 class MLP {
+  readonly kind = "dense";
   readonly gateProj: QuantizedLinear;
   readonly upProj: QuantizedLinear;
   readonly downProj: QuantizedLinear;
@@ -136,6 +142,7 @@ class SwitchGLU {
 
 // ── qwen3_moe.py Qwen3MoeSparseMoeBlock ──────────────────────────────────────
 class Qwen3MoeSparseMoeBlock {
+  readonly kind = "moe";
   readonly gate: QuantizedLinear;
   readonly switchMlp: SwitchGLU;
   readonly numExperts: number;
@@ -211,9 +218,9 @@ class Qwen3MoeDecoderLayer {
       : new MLP(weights, config, `${prefix}.mlp`);
   }
 
-  forward(x: MlxArray, mask: Mask, cache: Cache): MlxArray {
+  forward(x: MlxArray, cache: Cache, phase: ReadPhase): MlxArray {
     const xn = this.inputLayernorm.forward(x);                       // self.input_layernorm(x)
-    const r1 = this.selfAttn.forward(xn, mask, cache);              // r = self.self_attn(..., mask, cache)
+    const r1 = this.selfAttn.forward(xn, cache, phase);             // r = self.self_attn(..., mask, cache)
     xn.dispose();
     const h = ops.add(x, r1); r1.dispose();                        // h = x + r
     const hn = this.postAttentionLayernorm.forward(h);             // self.post_attention_layernorm(h)
@@ -224,24 +231,24 @@ class Qwen3MoeDecoderLayer {
 }
 
 // ── qwen3_moe.py Qwen3MoeModel + Model ───────────────────────────────────────
-export class Qwen3MoeModel implements MlxDeclaredGraph {
+export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
+  /** The served configuration this graph was built for: its KV scheme is what `makeCache` composes. */
+  readonly composition: Composition;
   readonly weightsBytes: number;
   readonly prefixBase = "model";
   readonly loraState = new LoraState();
-  /** Layers whose attention reads plain keys and values: none; it attends the storage its caches hold. */
-  readonly requiredDenseKvLayers: readonly number[] = Object.freeze([]);
-  /** Attends the storage its caches hold: delayed affine rows convert per layer
-   * and serve ordinary decoding only. */
-  get graphCapabilities(): GraphCapabilities { return declareGraph({ kv: { delayedAffine: "ordinary" } }); }
+  /** An ordinary autoregressive graph: every method over every cache lego. */
+  get graphCapabilities(): GraphCapabilities { return declareGraph(); }
   readonly embed: QuantizedEmbedding;
   readonly layers: Qwen3MoeDecoderLayer[];
   readonly finalNorm: RMSNorm;
   /** Untied lm_head (tie_word_embeddings=false for this family). */
   readonly lmHead: QuantizedLinear | null;
 
-  constructor(weights: Weights, config: ModelConfig) {
+  constructor(weights: Weights, config: ModelConfig, composition: Composition) {
     this.config = config;
+    this.composition = composition;
     this.weightsBytes = [...weights.shards.files.values()]
       .reduce((a, f) => a + f.mmap.size, 0);
     this.embed = QuantizedEmbedding.load(weights, "model.embed_tokens", config); // nn.Embedding
@@ -264,7 +271,7 @@ export class Qwen3MoeModel implements MlxDeclaredGraph {
       out.set(`${p}.self_attn.k_proj`, l.selfAttn.kProj);
       out.set(`${p}.self_attn.v_proj`, l.selfAttn.vProj);
       out.set(`${p}.self_attn.o_proj`, l.selfAttn.oProj);
-      if (l.mlp instanceof MLP) {
+      if (l.mlp.kind === "dense") {
         out.set(`${p}.mlp.gate_proj`, l.mlp.gateProj);
         out.set(`${p}.mlp.up_proj`, l.mlp.upProj);
         out.set(`${p}.mlp.down_proj`, l.mlp.downProj);
@@ -275,63 +282,60 @@ export class Qwen3MoeModel implements MlxDeclaredGraph {
     return out;
   }
 
+  /** Builds no constants and opens no weights: nothing to release. */
+  dispose(): void {}
+
+  /** One cache per layer, sharing one mask memo (create_attention_mask's one
+   * mask per forward, built by the caches). Their TurboQuant read is dense
+   * (`denseTurboQuantKernels`): the read decodes keys and values, then runs the
+   * fused SDPA. */
   makeCache(): Cache[] {
-    return this.layers.map(() => new KVCache());
+    const masks = new AttentionMasks();
+    return this.layers.map((_, layer) => composedFullAttentionCache(this.composition.kv, layer, masks, denseTurboQuantKernels));
   }
 
-  forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray {
-    const h = this.embed.encode(ids);                               // self.embed_tokens(inputs)
-    return this.forwardLayers(h, cache);
+  /** The scoring forward (`MlxSequenceForward`): the window read at every width. */
+  sequenceHidden(ids: MlxArray, cache: Cache[], _width: MlxWidthClass): MlxArray {
+    return this.forwardLayers(this.embed.encode(ids), cache, "window"); // self.embed_tokens(inputs)
   }
 
-  forwardEmbeddings(_embeds: MlxArray, _cache: Cache[], _bidir: MlxArray | null): MlxArray {
-    throw new Error("qwen3_moe input-embedding path is not supported");
-  }
+  /** One whole chunk of a prompt; rows are sequences times the chunk size. The GPU is this graph's one unit. */
+  readonly prefillChunk: MlxPrefillChunk = {
+    gpu: (ids, cache) => this.forwardLayers(this.embed.encode(ids), cache, "window"),
+  };
 
-  protected forwardLayers(h0: MlxArray, cache: Cache[]): MlxArray {
-    const L = h0.shape[1]!;
-    const mask = cache[0]!.makeMask(L, null);                       // create_attention_mask(h, cache[0])
+  /** A prompt's positions that are not a whole chunk: the window read at every width. */
+  readonly prefillTail = atEveryWidth<MlxCapturingForward>((ids, cache) =>
+    this.forwardLayers(this.embed.encode(ids), cache, "window"));
+
+  /** Known tokens: this graph declares no committed spans, so they read as a window. */
+  readonly appendKnown = atEveryWidth<MlxPhaseForward>((ids, cache) =>
+    this.forwardLayers(this.embed.encode(ids), cache, "window"));
+
+  /** The one output head at every width. */
+  readonly logits = atEveryWidth<MlxHeadForward>(hidden => this.logitsFromHidden(hidden));
+
+  /** One new token per sequence: `ids` [sequences, 1]. */
+  readonly decode = atEveryWidth<MlxPhaseForward>((ids, cache) =>
+    this.forwardLayers(this.embed.encode(ids), cache, "decode"));
+
+  /** A speculative window of depth + 1 positions per sequence. This graph
+   * declares no hidden-layer taps, so `capture` is always null. */
+  readonly verify = atEveryWidth<MlxVerifyForward>((ids, cache) =>
+    this.forwardLayers(this.embed.encode(ids), cache, "window"));
+
+  /** The decoder over `h0` (consumed), every block reading its cache for `phase`. */
+  protected forwardLayers(h0: MlxArray, cache: Cache[], phase: ReadPhase): MlxArray {
     let cur = h0;
     for (let i = 0; i < this.layers.length; i++) {                  // for layer, c in zip(self.layers, cache)
-      const next = this.layers[i]!.forward(cur, mask, cache[i]!);   // h = layer(h, mask, c)
+      const next = this.layers[i]!.forward(cur, cache[i]!, phase);  // h = layer(h, mask, c)
       cur.dispose();
       cur = next;
     }
-    mask.arr?.dispose();
     return disposing(cur, this.finalNorm.forward(cur));            // return self.norm(h)
   }
 
   logitsFromHidden(h: MlxArray): MlxArray {
     return this.lmHead ? this.lmHead.forward(h) : this.embed.asLinear(h); // self.lm_head(out)
-  }
-
-  forward(tokens: number[] | MlxArray, cache: Cache[]): MlxArray {
-    const ids = Array.isArray(tokens)
-      ? ops.fromInt32(tokens, [1, tokens.length])
-      : tokens;
-    const h = this.forwardHidden(ids, cache);
-    if (Array.isArray(tokens)) ids.dispose();
-    const logits = this.logitsFromHidden(h);
-    h.dispose();
-    return logits;
-  }
-
-  generate(promptTokens: number[], maxTokens: number, eosIds: number[] = []): number[] {
-    const cache = this.makeCache();
-    const out: number[] = [];
-    try {
-      let tokens = promptTokens;
-      for (let step = 0; step < maxTokens; step++) {
-        const logits = this.forward(tokens, cache);
-        const next = argmaxLastPosition(logits);
-        logits.dispose();
-        if (eosIds.includes(next)) break;
-        out.push(next);
-        tokens = [next];
-      }
-    } finally {
-      for (const c of cache) c.dispose();
-    }
-    return out;
   }
 }

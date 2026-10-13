@@ -1,9 +1,10 @@
 import type { MlxArray } from '@mlx-bun/mlx/array';
 import type { Cache } from './cache';
+import type { MlxWidthClass } from './width';
 
 /** Prepared embeddings for vision/audio prompts. Qualified models consume
- * this through shared preparation and decode; other bindings retain serial
- * execution. Token-only prefix caching remains disabled for media. */
+ * this through the media prompt input the graph binds (`bindMediaInput`).
+ * Token-only prefix caching remains disabled for media. */
 export type Vision = {
   /** Producer identity includes all media and preceding rendered tokens. */
   prefixIdentity?: string;
@@ -17,7 +18,7 @@ export type Vision = {
    *  where zeroing falls back to imageMask. */
   multimodalMask?: MlxArray;
   /** Qwen3.5/3.8 vision: the request's mRoPE positions + decode delta,
-   *  owned by shared forward input, or scoped to the explicit serial run. */
+   *  owned by the media prompt input the graph binds. */
   mrope?: import("./positions").MropeRequestState;
 };
 
@@ -35,15 +36,23 @@ export interface AudioEncoder {
  * retains its tensors; the graph's binding returns an owned final hidden row.
  * Decode, sampling and row retirement use the ordinary execution group. */
 export interface MlxPromptInput {
-  forward(ids: MlxArray, caches: Cache[], start?: number): MlxArray;
+  /** The vision prefill phase: one sequence's prompt from position `start`,
+   * the prepared embeddings at 0 and its token ids after a reused prefix, at
+   * the request's positions. `phase` and `width` are the scheduler's: the
+   * planner's name for the piece (one position after a reused prefix appends
+   * as a decode, more as a tail) and the class of its rows. Returns the hidden
+   * of the prompt's last position. */
+  prefill(ids: MlxArray, caches: Cache[], start: number, phase: "tail" | "decode", width: MlxWidthClass): MlxArray;
   readonly decodeState?: MlxDecodeState;
 }
 
-/** Additional graph-owned forward state. Equal keys declare compatible row
+/** Additional graph-owned decode state. Equal keys declare compatible row
  * state; the backend supplies the current row order after joins/retirement. */
 export interface MlxDecodeState {
   readonly key: string;
-  forward(ids: MlxArray, caches: Cache[], rows: readonly MlxDecodeState[]): MlxArray;
+  /** One new token per row at the positions each row's state names; `width`
+   * is the class of the rows, named by the scheduler. */
+  decode(ids: MlxArray, caches: Cache[], rows: readonly MlxDecodeState[], width: MlxWidthClass): MlxArray;
 }
 
 /** Common contract for image encoders: preprocess image bytes into an

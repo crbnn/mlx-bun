@@ -4,8 +4,8 @@ import type { ExecutionContext } from "../contracts/portable/scheduling";
 import { type RuntimeConfig } from "../runtime/config";
 import type { PromptResponseTrace } from "../runtime/trace";
 import type { GrammarController } from "../sampling/grammar";
-import type { KvScheme } from "../state/kv-scheme";
-import type { MlxRequestStatePolicy } from "../state/request-policy";
+import type { KvMaintenance } from "../contracts/mlx/cache";
+import type { RequestStateCache } from "../state/cache-service";
 import type { OrdinaryContinuation } from "./continuation-types";
 
 // NOTE — oMLX-style "adaptive burst decode" (several steps per event-loop
@@ -40,7 +40,13 @@ export interface MlxGroupMethodHost {
   readonly rows: readonly Row[];
   readonly runtime: RuntimeConfig;
   readonly prefillChunkSize: number;
-  readonly promptCache: RowPromptCache | undefined;
+  /** The composition's `prefillTailSplit`: a prompt's last token prefills alone. */
+  readonly prefillTailSplit: boolean;
+  /** The composition's cache service: every row's state comes from it and returns to it. */
+  readonly cache: RequestStateCache;
+  /** The row-layout maintenance of the composition's KV scheme (where a row's
+   * composed caches join row layouts); absent under bf16. */
+  readonly kvMaintenance: KvMaintenance | undefined;
   join(row: Row): void;
   filterRows(keep: number[]): void;
   publish(row: Row, token: number, logprobs?: import("../generation/index").TokenLogprobs): Promise<void | boolean>;
@@ -72,9 +78,13 @@ export interface BatchRequestFields {
   /** Borrowed prepared input; its owner retains it through preparation. */
   promptInput?: import("../contracts/mlx/media").MlxPromptInput;
   cacheSessionId?: string;
-  /** Optional ordinary continuation policy; owns persistence and sampler recovery. */
+  /** Optional ordinary continuation: its checkpoint key and sampler recovery;
+   * the cache service resumes and checkpoints it. */
   continuation?: OrdinaryContinuation;
-  statePolicy?: MlxRequestStatePolicy;
+  /** False for a request whose prefix has no identity (prepared media without
+   * one): it takes fresh state and its state is not kept. Rows that differ here
+   * do not share a group. */
+  reusesPrefix?: boolean;
   context?: ExecutionContext;
   /** Resolve loaded-state identity under the execution lease, after any
    * queued adapter replacement has finished. */
@@ -106,7 +116,7 @@ export interface BatchRequestFields {
    *  log-softmax+argmax over [B,V] instead of B slice/sample/concat graphs)
    *  when EVERY live row qualifies. Numerically identical per row
    *  (row-independent ops, same per-row shapes); the per-row closure path
-   *  is the fallback and the MLX_BUN_BATCH_VEC_SAMPLE=0 kill switch. */
+   *  is the fallback and the composition's `vectorGreedySampling: false`. */
   plainGreedy?: boolean;
   /** Grammar controller for this row (B1: per-row matchers). When set, the
    *  scheduler drives it: `accept()` after each emitted token (fires the async
@@ -129,9 +139,9 @@ export interface BatchStats {
   fill?: import("../generation/index").GenerateStats["fill"];
   promptTokens: number;
   generatedTokens: number;
-  /** Prompt tokens served from the prompt cache: a joiner's solo
-   *  prefill starts from the longest usable cached prefix, exactly like the
-   *  serial lane's runGeneration take(). 0 on a cold prefill. */
+  /** Prompt tokens served from the prompt cache: a joiner's prefill starts
+   *  from the longest usable cached prefix the cache service acquires. 0 on a
+   *  cold prefill. */
   cachedTokens: number;
   finishReason: "stop" | "length";
   /** Wall-clock from admission (leaving the pending queue) to the first
@@ -140,16 +150,6 @@ export interface BatchStats {
   /** Wall-clock from the first emitted token to finish. */
   decodeMs: number;
 }
-
-/** The slice of PromptCache the scheduler drives (structural — the server's
- *  PromptCache satisfies it). take() on admission (any joiner: a restored
- *  prefix + suffix prefill is byte-safe whether the row later merges or
- *  not). put() paths: rows that finish NEVER-MERGED (adopted lone rows)
- *  hand their pristine serial caches over zero-copy; rows that
- *  finish INSIDE a multi-row batch get their KV EXTRACTED per row into
- *  fresh serial caches first (mlx-lm server.py:872 extract_cache — the
- *  cross-request reuse concurrent agents live on). */
-export type RowPromptCache = import("../state/checkpoint").MlxPrefixCache;
 
 export interface Row {
   spec?: import("../generation/index").GenerateStats["spec"];
@@ -204,7 +204,6 @@ export interface MlxBatchExecutionGroupOptions {
   prefillBatchTokenLimit?: number;
   runtime?: RuntimeConfig;
   maxQueued?: number;
-  stateCodecs?: import("../state/persistence-types").CacheCodecProvider;
   /** Max rows in the running batch (mlx-lm `--decode-concurrency`). */
   maxBatch: number;
   lock?: ExclusiveLock;
@@ -214,25 +213,13 @@ export interface MlxBatchExecutionGroupOptions {
   admissionHeld?: () => boolean;
   /** Joiner prefill chunk length (default 2048, the serial loop's constant). */
   prefillChunkSize?: number;
-  /** Aggregate KV-byte budget across all running rows (batching-perf-path
-   *  P3 admission, via `--kv-budget`). A joiner whose PROJECTED KV
-   *  (kvBytesAt(config, prompt + maxTokens), sliding window already capped)
-   *  would push the batch's projected total over this ceiling WAITS in the
-   *  queue (FIFO, head-of-line — no starvation, no reorder) until rows
-   *  evict. A request that can NEVER fit (over budget alone, empty batch)
-   *  is rejected instead of deadlocking. Unset = unlimited (v1 behavior). */
-  kvBudgetBytes?: number;
-  /** Authoritative server-wide scheme. Each joiner's solo prefill converts at
-   * the same chunk boundaries as the serial path, so a row's quantized bytes
-   * preserve the L2 composition. Unsupported schemes fail at construction. */
-  kvScheme?: KvScheme;
-  /** Model binding owns support for precision transitions. */
-  kvBatchCapabilities?: { delayedAffine?: boolean };
-  /** Prompt-cache hook: admission take()s the longest usable
-   *  prefix into the joiner's solo caches (suffix-only prefill — the
-   *  multi-turn chat TTFT path); rows that finish never-merged put() their
-   *  caches back. Adapter requests never reach the batch lane, so the
-   *  namespace is always "" here. Runs under the gateway mutex domain, so
-   *  take/put never race the serial lane's use of the same cache. */
-  promptCache?: RowPromptCache;
+  /** The composition's cache service (`state/cache-service`): admission under
+   *  its KV budget (a joiner that would push the admitted rows' projected KV
+   *  over `--kv-budget` WAITS in the queue, FIFO and head-of-line, until rows
+   *  finish; one that can never fit is rejected), each row's state at
+   *  admission (a reused prefix, a resumed generation, or fresh state), and
+   *  the state rows offer back when they finish. Runs under the gateway mutex
+   *  domain. Default: a service over the graph's composition that reuses and
+   *  keeps nothing and admits without a budget. */
+  cache?: RequestStateCache;
 }

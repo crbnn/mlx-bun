@@ -3,10 +3,11 @@ import { materializeCopy } from "@mlx-bun/mlx/materialize";
 import { withResource, disposeResources } from "../runtime/resources";
 import { leaseCacheState } from "./leases";
 import { FullPrefillPadding } from "./full-prefill-padding";
-import { KVCache } from "./kv";
+import { KVCache, type AffineKernelSet } from "./kv";
 import { QuantizedKVCache } from "./quantized-kv";
 import { TurboQuantKVCache } from "./turboquant-kv";
 import { type Cache, type Mask, type PrefillPadding } from "../contracts/mlx/cache";
+import { kvStorage } from "./kv-storage";
 
 type FullCache = KVCache | QuantizedKVCache | TurboQuantKVCache;
 
@@ -24,11 +25,8 @@ export class FullPrefillRow implements Cache {
   get stateNeedsDispose(): boolean { return (this.inner as Cache).stateNeedsDispose ?? false; }
   get affineConversion(): FullPrefillRow | undefined { return this.inner instanceof KVCache ? this : undefined; }
   get turboConversion(): FullPrefillRow | undefined { return this.inner instanceof KVCache ? this : undefined; }
-  get quantizedAttention() { return (this.inner as Cache).quantizedAttention; }
-  get rotatedValueAttention() { return (this.inner as Cache).rotatedValueAttention; }
-  /** The current inner storage's dense reads (maintenance replaces it in
-   * place); this one row is its row 0. */
-  get denseKvReads() { return (this.inner as Cache).denseKvReads; }
+  get quantizedAttention() { return kvStorage(this.inner).quantizedAttention; }
+  get rotatedValueAttention() { return kvStorage(this.inner).rotatedValueAttention; }
   signature(): string { return this.inner.signature(); }
   state(): MlxArray[] { return this.inner.state(); }
   makeMask(tokens: number, window: number | null): Mask { return this.inner.makeMask(tokens, window); }
@@ -61,17 +59,17 @@ export class FullPrefillRow implements Cache {
   private restored(planes: MlxArray[], offset: number): FullCache {
     const source = this.inner;
     if (source instanceof KVCache) {
-      const result = new KVCache();
+      const result = new KVCache(undefined, source.turboQuantKernels);
       if (planes.length) result.restoreState(planes[0]!, planes[1]!, offset);
       return result;
     }
     if (source instanceof QuantizedKVCache) {
-      const result = new QuantizedKVCache(source.groupSize, source.bits);
+      const result = new QuantizedKVCache(source.groupSize, source.bits, source.kernels);
       if (planes.length) result.restoreState({ packed: planes[0]!, scales: planes[1]!, biases: planes[2]! },
         { packed: planes[3]!, scales: planes[4]!, biases: planes[5]! }, offset);
       return result;
     }
-    const result = new TurboQuantKVCache(source.kBits, source.vBits, source.fusedDecode);
+    const result = new TurboQuantKVCache(source.kBits, source.vBits, source.turboQuantKernels, source.fusedDecode);
     if (planes.length) result.restoreState({ kIdx: planes[0]!, kScales: planes[1]!, kZeros: planes[2]!,
       vPacked: planes[3]!, vScales: planes[4]! }, offset, source.headDim!);
     return result;
@@ -95,12 +93,15 @@ export class FullPrefillRow implements Cache {
       return result;
     } finally { disposeResources(planes); }
   }
-  toQuantized(groupSize: number, bits: number): FullPrefillRow {
-    this.inner = (this.inner as KVCache).toQuantized(groupSize, bits);
+  /** The plain inner storage's conversion (`KVCache.toQuantized`): the
+   * converted row attends with the set `kernels` builds. */
+  toQuantized(groupSize: number, bits: number, kernels: AffineKernelSet): FullPrefillRow {
+    this.inner = (this.inner as KVCache).toQuantized(groupSize, bits, kernels);
     return this;
   }
-  toTurboQuantized(kBits: number, vBits: number): FullPrefillRow {
-    this.inner = TurboQuantKVCache.fromKVCache(this.inner as KVCache, kBits, vBits);
+  toTurboQuantized(kBits: number, vBits: number, fusedDecode?: boolean): FullPrefillRow {
+    const source = this.inner as KVCache;
+    this.inner = TurboQuantKVCache.fromKVCache(source, kBits, vBits, source.turboQuantKernels, fusedDecode);
     return this;
   }
   dispose(): void { this.inner.dispose(); this.padding.clear(); }

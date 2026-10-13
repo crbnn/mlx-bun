@@ -6,6 +6,9 @@ import { QwenMtpRows } from "../../src/generation/speculative/bindings/qwen-mtp-
 import { type MtpRowState } from "../../src/state/speculative/qwen-mtp-state";
 import type { MtpModule } from "../../src/models/qwen/mtp";
 import type { Cache } from "../../src/contracts/mlx/cache";
+import { atEveryWidth } from "../../src/models/graph";
+import { mtpModule } from "../models/phase-forward";
+import { kvStorage } from "../../src/state/kv-storage";
 
 function fixture() {
   const forwards: number[][] = [];
@@ -14,16 +17,16 @@ function fixture() {
       using floats = ids.astype(Dtype.float32);
       return ops.reshape(floats, [...ids.shape, 1]);
     },
-    logitsFromHidden(): MlxArray { throw new Error("prefill must not sample or project logits"); },
+    logits: atEveryWidth((): MlxArray => { throw new Error("prefill must not sample or project logits"); }),
   };
-  const module = { forward(embeds: MlxArray, hidden: MlxArray, cache: Cache) {
+  const module = mtpModule((embeds: MlxArray, hidden: MlxArray, cache: Cache) => {
     forwards.push([...embeds.shape]);
     const [B, N] = embeds.shape;
     using k = ops.reshape(embeds, [B!, 1, N!, 1]);
     using v = ops.reshape(hidden, [B!, 1, N!, 1]);
-    for (const view of cache.updateAndFetch(k, v)) view.dispose();
+    for (const view of kvStorage(cache).updateAndFetch(k, v)) view.dispose();
     return ops.copyOf(hidden);
-  } } as MtpModule;
+  }) as unknown as MtpModule;
   const rows = new QwenMtpRows(target, module, null, []);
   const feed = (tokens: number[][], hiddens = tokens.map(row => row.map(token => token * 10))) => {
     using ids = ops.fromInt32(tokens.flat(), [tokens.length, tokens[0]!.length]);

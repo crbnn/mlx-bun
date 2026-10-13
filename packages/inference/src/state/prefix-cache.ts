@@ -20,9 +20,9 @@ import { withResource, cleanupFailure, disposeResources, ownResource } from "../
 // TIERING (Layer 0, unified-engine plan): when a ColdTier is attached,
 // take() itself runs the two-tier dance — RAM peek vs cold find, restore
 // (streamed copy) + trim when the cold tier holds a strictly longer
-// prefix — so EVERY consumer (the serial lane, the batch scheduler, future
-// prefix sharing) gets SSD restores through the same take()/put() it
-// already calls. Eviction spills to the tier (the #spill hook); idle
+// prefix — so every consumer (the cache service the scheduler acquires
+// through, direct generation) gets SSD restores through the same take()/put()
+// it already calls. Eviction spills to the tier (the #spill hook); idle
 // entries demote to it when policy permits. TieredPromptCache owns queued
 // persistence and promotes restored prefixes into RAM.
 

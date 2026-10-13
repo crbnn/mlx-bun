@@ -21,11 +21,15 @@
 //
 // This module is STATELESS server-lifetime weights. Per-request context
 // K/V (the incremental cache DeepSpec threads through consecutive draft
-// rounds via a DynamicCache) is NOT stored here — see `projectContext` /
-// `draftBlock` below for the seam.
+// rounds via a DynamicCache) is NOT stored here — see `projectContextKVRows` /
+// `draftRows` below for the seam.
 
 import { Weights } from "../../artifacts/weights";
-import type { ContextKV, DeepspecContextAttention, DeepspecDraftBlock, DeepspecDraftRows, DeepspecDrafterModel } from "../../contracts/mlx/drafter";
+import type {
+  ContextKV, DeepspecContextAttention, DeepspecDraftRows, DeepspecDrafterModel, DrafterContextKV, DrafterContextProjection,
+} from "../../contracts/mlx/drafter";
+import type { MlxWidthTable } from "../../contracts/mlx/graph";
+import { atEveryWidth } from "../graph";
 import { isDeepspecArchitecture } from "./deepspec-artifact";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
@@ -209,13 +213,6 @@ interface Layer {
   layerScalar: MlxArray; // [1]
 }
 
-export function plainDeepspecContext(context: readonly ContextKV[]): DeepspecContextAttention {
-  return { attend(layer, query, blockKeys, blockValues) {
-    using keys = ops.concatAxis([context[layer]!.k, blockKeys], 2);
-    using values = ops.concatAxis([context[layer]!.v, blockValues], 2);
-    return ops.sdpa(query, keys, values, 1, "", null);
-  } };
-}
 export class DeepspecDrafter implements DeepspecDrafterModel {
   readonly cfg: DeepspecConfig;
   /** === config.target_layer_ids, alias for the ground-truth term. */
@@ -239,6 +236,10 @@ export class DeepspecDrafter implements DeepspecDrafterModel {
   #layers: Layer[] = [];
   #markovW1: TableW | null; // [vocab, markovRank] embedding
   #markovW2: MatW | null;   // markov_w2.weight [vocab, rank] Linear storage
+  /** One block step's token per row, bound once: the argmax of the step's
+   *  logits [B, V], plus the Markov head's bias from the previous tokens [B]
+   *  when the checkpoint carries one. Borrows both; owns the ids. */
+  readonly #selectStep: (logits: MlxArray, previous: MlxArray) => MlxArray;
   #confProj: MatW | null;   // proj.weight [1, confDim] Linear storage (bf16
                             // keeps the once-built transpose view — per-call
                             // transpose+cast leaked, 2026-07-06 review fix)
@@ -333,9 +334,15 @@ export class DeepspecDrafter implements DeepspecDrafterModel {
     if (cfg.markov_rank > 0) {
       this.#markovW1 = table("markov_head.markov_w1"); // [vocab, rank] embedding
       this.#markovW2 = mat("markov_head.markov_w2");   // stored [vocab, rank] Linear
+      this.#selectStep = (logits, previous) => {
+        using bias = this.#markovStepBias(previous);
+        using corrected = ops.add(logits, bias);
+        return ops.argmaxAxis(corrected, -1);
+      };
     } else {
       this.#markovW1 = null;
       this.#markovW2 = null;
+      this.#selectStep = logits => ops.argmaxAxis(logits, -1);
     }
 
     if (cfg.enable_confidence_head) {
@@ -398,12 +405,21 @@ export class DeepspecDrafter implements DeepspecDrafterModel {
    *
    * Returns the projected+normed context hidden [1, L, hidden] (still needs
    * per-layer k_proj + k_norm + rope to become cacheable ContextKV — see
-   * projectContextKV).
+   * projectContextKVRows).
    */
-  projectContext(targetHiddens: MlxArray): MlxArray {
+  #projectContext(targetHiddens: MlxArray): MlxArray {
     const proj = matmulW(targetHiddens, this.#fc); // [1,L,hidden]
     return disposing(proj, this.#rms(proj, this.#hiddenNorm));
   }
+
+  /** The context projection per width class of the B·L rows projected: one kernel at every class (`matmulW`:
+   *  MLX's quantized matmul, matmul for a BF16 checkpoint). */
+  readonly projectContext: MlxWidthTable<DrafterContextProjection> =
+    atEveryWidth((targetHiddens: MlxArray) => this.#projectContext(targetHiddens));
+
+  /** Each layer's context K/V per width class of the B·L context rows: the same kernel at every class. */
+  readonly projectContextKVRows: MlxWidthTable<DrafterContextKV> =
+    atEveryWidth((contextHidden: MlxArray, position: number | MlxArray) => this.#projectContextKVRows(contextHidden, position));
 
   /**
    * Per-layer context K/V rows, projected + normed + ROPE'd, ready to cache
@@ -432,15 +448,10 @@ export class DeepspecDrafter implements DeepspecDrafterModel {
    *
    * v ≡ k when attention_k_eq_v (v_proj is absent; v_norm is the SAME
    * concat-then-scale-less-norm, over k_proj's output — v gets NO rope).
+   * `position` is the first context row's absolute position (per row as an
+   * array when the rows start at different positions).
    */
-  projectContextKV(contextHidden: MlxArray, positions: number[]): ContextKV[] {
-    if (positions.length !== contextHidden.shape[1])
-      throw new Error(`projectContextKV: ${positions.length} positions for ${contextHidden.shape[1]} context rows`);
-    assertContiguous(positions);
-    return this.projectContextKVRows(contextHidden, positions[0]!);
-  }
-
-  projectContextKVRows(contextHidden: MlxArray, position: number | MlxArray): ContextKV[] {
+  #projectContextKVRows(contextHidden: MlxArray, position: number | MlxArray): ContextKV[] {
     const B = contextHidden.shape[0]!, L = contextHidden.shape[1]!;
     const out: ContextKV[] = [];
     for (const layer of this.#layers) {
@@ -514,7 +525,7 @@ export class DeepspecDrafter implements DeepspecDrafterModel {
 
       // k_noise = k_proj(x); norm+rope IDENTICALLY to the cached context
       // rows (concat-then-norm == norm-then-concat per the RMSNorm argument
-      // in projectContextKV's doc comment).
+      // in projectContextKVRows's doc comment).
       const kNoiseFlat = matmulW(x, layer.kProj);
       const kNoise4 = ops.reshape(kNoiseFlat, [B, G, this.nKvHeads, this.headDim]);
       kNoiseFlat.dispose();
@@ -661,18 +672,13 @@ export class DeepspecDrafter implements DeepspecDrafterModel {
    *   if not below.any(): return block_size
    *   return first index where below is True         # ℓ can be 0 (EMPTY proposal)
    *
-   * ctxKV: this round's cached context K/V (see projectContextKV/crop notes
-   * on the class doc — caller owns cache lifetime and crop-after-round).
-   * anchorTok: the just-verified/bonus token starting this block.
-   * anchorPos: its absolute sequence position (blockPositions[0]).
+   * Here the graph and the sequential proposal head run at the active row
+   * count, one block per anchor (the just-verified or bonus token starting
+   * it); confidence selects each row's length after the full device chain.
+   * `context` reads the rows' cached context K/V (projectContextKVRows; the
+   * caller owns its lifetime and the crop after the round); `position` is
+   * each block's first absolute position.
    */
-  draftBlock(ctxKV: ContextKV[], anchorTok: number, anchorPos: number): DeepspecDraftBlock {
-    const result = this.draftRows(plainDeepspecContext(ctxKV), [anchorTok], anchorPos, true);
-    return { tokens: result.tokens[0]!, conf: result.conf[0]!, baseLogits: result.baseLogits! };
-  }
-
-  /** The graph and sequential proposal head run at the active row count.
-   * Confidence selects each row's length after the full device chain. */
   draftRows(context: DeepspecContextAttention, anchors: readonly number[], position: number | MlxArray,
     collectLogits = false): DeepspecDraftRows {
     const B = anchors.length, G = this.gamma, V = this.cfg.vocab_size;
@@ -686,9 +692,7 @@ export class DeepspecDrafter implements DeepspecDrafterModel {
       for (let step = 0; step < G; step++) {
         using row = base.slice([0, step, 0], [B, step + 1, V]);
         using logits = ops.reshape(row, [B, V]);
-        using bias = this.#markovW1 ? this.#markovStepBias(previous) : null;
-        using corrected = bias ? ops.add(logits, bias) : null;
-        const token = ops.argmaxAxis(corrected ?? logits, -1);
+        const token = this.#selectStep(logits, previous);
         sampled.push(token); previous = token;
       }
       // Serving does not consume confidence when truncation is disabled.
@@ -735,9 +739,3 @@ export class DeepspecDrafter implements DeepspecDrafterModel {
   }
 }
 
-function assertContiguous(positions: number[]): void {
-  for (let i = 1; i < positions.length; i++) {
-    if (positions[i] !== positions[i - 1]! + 1)
-      throw new Error(`DeepspecDrafter: expected contiguous positions, got ${JSON.stringify(positions)}`);
-  }
-}

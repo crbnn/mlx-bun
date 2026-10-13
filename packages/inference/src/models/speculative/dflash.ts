@@ -17,6 +17,7 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { Gemma4Model } from "../gemma4/model";
 import type { DraftProjection } from "../../contracts/mlx/draft-projection";
+import { widthClass } from "../../contracts/mlx/graph";
 import type { DsparkContextAttention, DsparkDrafterModel } from "../../contracts/mlx/drafter";
 import { loadAdapterTensors } from "../../adapters/manager";
 import { writeShardedSafetensors, type NamedTensor } from "../../artifacts/safetensors-writer";
@@ -28,7 +29,7 @@ import { join } from "node:path";
  *  (confidence, accepted) verify outcomes (`fitStsThresholds` in
  *  `@mlx-bun/training/dspark`; `mlx-bun draft calibrate` writes them into
  *  dspark.json). Consumed by the confidence-scheduled
- *  draft-length pruning (Alg 1, single-user form) in forwardInfer. Stored
+ *  draft-length pruning (Alg 1) in forwardRows. Stored
  *  inside DflashConfig so it round-trips through dspark.json for free.
  *  ABSENT ⟹ no pruning — an uncalibrated checkpoint drafts exactly as before. */
 export interface StsCalibration {
@@ -70,11 +71,10 @@ export const DEFAULT_DFLASH_CONFIG: DflashConfig = {
 export interface TargetDims { hiddenSize: number; vocabSize: number; eps: number }
 
 export interface DflashTrainOut { draftLogits: MlxArray; conf: MlxArray }
-/** tokens/conf may be SHORTER than the requested γ when confidence pruning
- *  fires (Alg 1); always ≥1. draftLogits covers exactly tokens.length
+/** Per row, tokens/conf may be SHORTER than the requested γ when confidence
+ *  pruning fires (Alg 1); always ≥1. draftLogits covers the drafted
  *  positions — ABSENT when the caller passed collectLogits:false (the loop
  *  never materialized/concatenated the per-position logits). */
-export interface DflashDraftBlock { tokens: number[]; conf: number[]; draftLogits?: MlxArray }
 export interface DflashDraftRows { tokens: number[][]; conf: number[][]; draftLogits?: MlxArray; }
 export type DflashContextAttention = DsparkContextAttention;
 export interface DflashDraftOpts {
@@ -90,8 +90,8 @@ export interface DflashDraftOpts {
   thresholds?: number[];
   minConf?: number;
   /** Materialize+concat the per-position draft logits into the returned
-   *  DflashDraftBlock.draftLogits. Default true. The serve-loop
-   *  draft() path runs its own verify lm-head and never reads it — pass false
+   *  DflashDraftRows.draftLogits. Default true. The grouped draft rows
+   *  run their own verify lm-head and never read it — pass false
    *  there to skip the dead concat + a host-unrelated GPU alloc every round. */
   collectLogits?: boolean;
   /** Return confidence telemetry; pruning still computes it when needed. */
@@ -333,10 +333,10 @@ export class DflashDrafter implements DsparkDrafterModel {
     return pairs;
   }
 
-  #baseLogits(model: DraftProjection, block: MlxArray): MlxArray {
+  #baseLogits(model: DraftProjection, block: MlxArray, anchors: number): MlxArray {
     const hOut = ops.matmul(block, this.get("out_proj")); // [A,γ,H]
     const hBf = hOut.astype(model.embed.scales.dtype); hOut.dispose();
-    const logits = model.logitsFromHidden(hBf); hBf.dispose();
+    const logits = model.logits[widthClass(anchors * this.cfg.gamma)](hBf); hBf.dispose();
     return logits;
   }
   #markov(prevToks: MlxArray): { B: MlxArray; emb1: MlxArray } {
@@ -363,7 +363,7 @@ export class DflashDrafter implements DsparkDrafterModel {
     const wH = this.get("rnn.wH"), bH = this.get("rnn.bH"), wO = this.get("rnn.wO");
     let s: MlxArray | null = zerosArray([A, r]); // s_{-1} = 0
     const bSlices: MlxArray[] = [];
-    const pending: MlxArray[] = []; // iteration temps, for the catch (forwardInfer pattern)
+    const pending: MlxArray[] = []; // iteration temps, released by the catch
     try {
       for (let k = 0; k < G; k++) {
         const e1S = emb1.slice([0, k, 0], [A, k + 1, r]); pending.push(e1S);
@@ -417,7 +417,7 @@ export class DflashDrafter implements DsparkDrafterModel {
     let B: MlxArray | null = null, emb1: MlxArray | null = null;
     try {
       block = this.#backbone(hCtx, anchorEmb, ctxMask, A);
-      const U = this.#baseLogits(model, block);
+      const U = this.#baseLogits(model, block, A);
       Uf = U.astype(CDT); U.dispose();
       ({ B, emb1 } = this.#seqHead(prevToks));
       const draftLogits = ops.add(Uf, B);
@@ -433,11 +433,6 @@ export class DflashDrafter implements DsparkDrafterModel {
     }
   }
 
-  /** Single-request callers use the same graph and proposal head at B1. */
-  forwardInfer(model: DraftProjection, hCtx: MlxArray, anchor: number, gamma: number, opts: DflashDraftOpts = {}): DflashDraftBlock {
-    const result = this.forwardRows(model, hCtx, [anchor], gamma, opts);
-    return { tokens: result.tokens[0]!, conf: result.conf[0]!, draftLogits: result.draftLogits };
-  }
 
   forwardRows(model: DraftProjection, hCtx: MlxArray | null, anchors: readonly number[], gamma: number,
     opts: DflashDraftOpts = {}, context?: DflashContextAttention): DflashDraftRows {
@@ -449,7 +444,7 @@ export class DflashDrafter implements DsparkDrafterModel {
     using embeddings = model.embed.encode(ids);
     using anchorEmb = ops.reshape(embeddings, [B, this.dims.hiddenSize]);
     using block = this.#backbone(hCtx, anchorEmb, null, B, context);
-    using raw = this.#baseLogits(model, block);
+    using raw = this.#baseLogits(model, block, B);
     using base = raw.astype(CDT);
     const isRnn = this.cfg.seqHead === "rnn";
     let state: MlxArray | null = isRnn ? zerosArray([B, r]) : null;

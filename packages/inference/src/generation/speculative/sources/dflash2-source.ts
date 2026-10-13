@@ -4,43 +4,21 @@
 // the anchor plus accepted rows), projected once into per-layer K/V.
 // Drafting is greedy; the shared verify decides acceptance.
 //
-// The drafter's projections are quantized to 4 bits at load (1.0 GB resident
-// instead of the 3.85 GB BF16 checkpoint). MLX_BUN_DFLASH2_TARGET_BASIS names
-// the JSON file {"seed": 42, "finalGain": [...hidden]} describing a target
-// whose residual stream carries a TurboQuant R1 fold (our Trellis artifact);
-// absent, the target basis is the drafter's.
+// The drafter loads in the basis it was trained on, its projections quantized
+// to the width its composer passes (the draft registry passes 4: 1.0 GB
+// resident instead of the 3.85 GB BF16 checkpoint). A target whose residual
+// stream carries a TurboQuant R1 fold declares it on its draft target
+// (`residualBasis`); binding a draft group applies it before the first draft.
 
 import { artifactIdentity } from "../../../artifacts/identity";
-import { projectedDraftGroups } from "../bindings/projected-draft-rows";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { projectedDraftGroups, type ProjectedDraftMethod } from "../bindings/projected-draft-rows";
+import { widthClass } from "../../../contracts/mlx/graph";
+import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import type { DraftProvider, DraftSource, GroupedDraftProvider } from "../source";
+import type { DraftProvider, GroupedDraftProvider } from "../source";
 import { targetLacks } from "../source";
-import { runtimeValue } from "../../../runtime/config";
-import type { Dflash2DrafterModel, Dflash2TargetBasis } from "../../../contracts/mlx/drafter";
+import type { Dflash2DrafterModel } from "../../../contracts/mlx/drafter";
 import { loadDflash2Drafter } from "../../../models/drafter-loaders";
-
-/** R1 sign lane 0 of the rotation fold (packages/quantize/src/rotate.ts signVector). */
-function r1Signs(seed: number, n: number): Float32Array {
-  let state = (seed ^ Math.imul(1, 0x9e3779b9)) >>> 0;
-  const out = new Float32Array(n);
-  for (let i = 0; i < n; i++) {
-    state = (state + 0x9e3779b9) >>> 0;
-    let z = state;
-    z = Math.imul(z ^ (z >>> 16), 0x21f0aaad);
-    z = Math.imul(z ^ (z >>> 15), 0x735a2d97);
-    z ^= z >>> 15;
-    out[i] = (z & 1) === 0 ? 1 : -1;
-  }
-  return out;
-}
-
-function targetBasis(path: string | undefined): Dflash2TargetBasis | null {
-  if (!path) return null;
-  const raw = JSON.parse(readFileSync(path, "utf8")) as { seed: number; finalGain: number[] };
-  const finalGain = Float32Array.from(raw.finalGain);
-  return { seed: raw.seed, signs: r1Signs(raw.seed, finalGain.length), finalGain };
-}
 
 export class Dflash2Provider implements DraftProvider {
   readonly id: string;
@@ -58,36 +36,47 @@ export class Dflash2Provider implements DraftProvider {
       if (target.hiddenLayerTaps.layerCount !== layers) throw new Error(
         `DFlash 2 drafter was trained for a ${layers}-layer target; this model has ` +
         `${target.hiddenLayerTaps.layerCount} layers — wrong (target, drafter) pairing`);
+      drafter.bindResidualBasis(target.residualBasis ?? null);
       const projection = target.hiddenLayerTaps.projection;
+      // The block for the rows drafted this round: anchors × columns rows index the drafter's draft table.
+      const draftDevice: NonNullable<ProjectedDraftMethod["draftDevice"]> = (context, pending, positions, depth) => {
+        const columns = drafter.blockColumns(depth);
+        return drafter.draft[widthClass(pending.length * columns)](context, projection, pending, positions, columns);
+      };
       return {
         namespace, schema: "dflash2-context-v1", layers: drafter.cfg.layers,
+        // The B × L context rows a prefill or a commit appends index the drafter's context tables.
         project(hidden, positions) {
-          using context = drafter.projectContext(hidden);
-          return drafter.projectContextKVRows(context, positions);
+          const width = widthClass(hidden.shape[0]! * hidden.shape[1]!);
+          using context = drafter.projectContext[width](hidden);
+          return drafter.projectContextKVRows[width](context, positions);
         },
-        draft: (context, pending, positions, depth) => drafter.draftRows(context, projection, pending, positions, depth),
-        draftDevice: (context, pending, positions, depth) => drafter.draftRowsDevice(context, projection, pending, positions, depth),
+        draft(context, pending, positions, depth) {
+          const steps = drafter.blockColumns(depth) - 1;
+          if (!steps) return pending.map(() => []);
+          using tokens = draftDevice(context, pending, positions, depth);
+          const flat = tokens.toIntTokens();
+          return pending.map((_, row) => flat.slice(row * steps, (row + 1) * steps));
+        },
+        draftDevice,
       };
     });
   }
 
-  static async load(modelDir: string): Promise<Dflash2Provider> {
-    const bits = 4;
-    const basis = targetBasis(runtimeValue("MLX_BUN_DFLASH2_TARGET_BASIS"));
-    const drafter = await loadDflash2Drafter(modelDir, { bits, basis });
+  /** `bits`: the drafter's projection width (0 keeps BF16). Persisted context is
+   *  keyed by the drafter and that width; the target's own identity scopes it
+   *  to one residual basis. */
+  static async load(modelDir: string, options: { bits: number }): Promise<Dflash2Provider> {
+    const { bits } = options;
+    const drafter = await loadDflash2Drafter(modelDir, { bits });
     const id = modelDir.split("/").filter(Boolean).at(-1)!;
     try {
       const files = readdirSync(modelDir).filter(file => file.endsWith(".safetensors"));
       const identity = await artifactIdentity(await Bun.file(`${modelDir}/config.json`).text(),
         files.map(name => ({ name, path: join(modelDir, name) })));
       const bytes = files.reduce((total, file) => total + statSync(join(modelDir, file)).size, 0);
-      const basisTag = basis ? `:r1-${basis.seed}` : "";
-      return new Dflash2Provider(drafter, id, bytes, `dflash2-context-v1:${identity}:b${bits}${basisTag}`);
+      return new Dflash2Provider(drafter, id, bytes, `dflash2-context-v1:${identity}:b${bits}`);
     } catch (error) { drafter.dispose(); throw error; }
-  }
-
-  open(): DraftSource {
-    throw new Error("the DFlash 2 drafter runs only in the batched speculative lane");
   }
 
   dispose(): void { this.drafter.dispose(); }

@@ -29,10 +29,8 @@ const modelDir = process.env.MLX_BUN_APP_TEST_GEMMA2_MODEL;
 type Trace = { calls: string[]; batches: { rows: number; adapters: string }[]; firstLogits?: Float32Array };
 
 async function setup(dir: string) {
-  const { configureRuntime } = await import("@mlx-bun/inference/runtime/config");
-  // Both paths split the prompt tail and skip compiled decode, so they issue
-  // the same forward calls; the scheduler reads this snapshot at bind time.
-  const restoreRuntime = configureRuntime({ MLX_BUN_PREFILL_TAIL_SPLIT: "1", MLX_BUN_COMPILED_DECODE: "0" });
+  // Both paths split the prompt tail (the composition's default) and this graph
+  // builds no compiled step, so they issue the same forward calls.
   const ops = await import("@mlx-bun/mlx/ops");
   const { Dtype } = await import("@mlx-bun/mlx");
   const { loadContext } = await import("../../src/engine/model-host");
@@ -63,7 +61,10 @@ async function setup(dir: string) {
   // Every graph step records the KV after it; every logits projection (both
   // paths project through logitsFromHidden) records the complete logits.
   let trace: Trace | null = null;
-  const forward = model.forward.bind(model), hidden = model.forwardHidden.bind(model);
+  // Both paths name phases on the same graph tables, whose forwards all run its layer loop.
+  type Layers = (h0: MlxArray, caches: Cache[], phase: string) => MlxArray;
+  const graph = model as unknown as { forwardLayers: Layers };
+  const layers = graph.forwardLayers.bind(model);
   const project = model.logitsFromHidden.bind(model);
   const step = (kind: string, input: unknown, out: MlxArray, caches: Cache[]) => {
     if (!trace) return;
@@ -71,8 +72,7 @@ async function setup(dir: string) {
     trace.batches.push({ rows, adapters: model.loraState.active.join("+") });
     trace.calls.push(`${kind} ${out.shape.join("x")} kv ${kv(caches)}`);
   };
-  model.forward = (tokens, caches) => { const out = forward(tokens, caches); step("forward", tokens, out, caches); return out; };
-  model.forwardHidden = (ids, caches) => { const out = hidden(ids, caches); step("hidden", ids, out, caches); return out; };
+  graph.forwardLayers = (h0, caches, phase) => { const out = layers(h0, caches, phase); step("hidden", h0, out, caches); return out; };
   model.logitsFromHidden = (h) => {
     const out = project(h);
     if (trace) {
@@ -104,7 +104,7 @@ async function setup(dir: string) {
     fine_tune_type: "lora", lora_parameters: { rank: 4, scale: 2.0, dropout: 0.0 } }));
   await ctx.adapters.mount("generated-lora", adapterDir);
 
-  const prep = createRequestPrep({ ctx, serverOptions: {}, kvScheme: {}, defaultGeneratedTokens: undefined });
+  const prep = createRequestPrep({ ctx, serverOptions: {}, defaultGeneratedTokens: undefined });
   const binding = await modelServingBinding(ctx);
   // One gateway per scenario, closed before the next: an idle scheduler still
   // holding an adapter context must not overlap a direct generation that
@@ -120,7 +120,7 @@ async function setup(dir: string) {
     return compiled.controller;
   };
   const shape = (options: GenerateOptions): RequestShape => ({ hasVision: false, hasAdapters: !!options.adapters?.length,
-    hasRepetitionPenalty: false, userSeed: false, kvQuant: false, turboQuant: false, hasLogitsExtras: false,
+    hasRepetitionPenalty: false, userSeed: false, hasLogitsExtras: false,
     hasGrammar: !!options.grammar, wantsLogprobs: false, hasDraft: false });
   const traced = async <T>(run: () => Promise<T>) => {
     trace = { calls: [], batches: [] };
@@ -144,7 +144,7 @@ async function setup(dir: string) {
     traced,
     decode: (tokens: number[]) => ctx.tokenizer.decode(tokens),
     async close() {
-      ctx.dispose(); rmSync(adapterDir, { recursive: true, force: true }); restoreRuntime();
+      ctx.dispose(); rmSync(adapterDir, { recursive: true, force: true });
     },
   };
 }

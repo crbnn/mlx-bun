@@ -1,8 +1,9 @@
 import type { SentinelTokenTexts, MediaTokenTexts } from "../../input/special-tokens";
 import { L1, type TrainingDefaults, configuredMoe, defineFamily } from "../family";
 
-/** Construction identities of the specializations generated from a Gemma 4 config
- * (`scripts/gen-gemma4.ts`). Metadata only: inspecting a profile never loads a graph. */
+/** The config fingerprints the generated Gemma 4 graphs were generated from
+ * (`scripts/gen-gemma4.ts`): each generated file's table entry serves its own
+ * (`generated/index.ts`). Metadata only. */
 export const GENERATED_GEMMA_FINGERPRINTS = Object.freeze({
   "12b": "9f812d2eb461fcbe",
   "e4b": "418e9adc386ea67c",
@@ -32,7 +33,6 @@ export const GEMMA4_FAMILY = defineFamily({
   specialization: "dedicated",
   profileId: "gemma4-dedicated",
   capabilities: ["gemma4-graph"],
-  generated: { profileId: "gemma4-generated", fingerprints: Object.values(GENERATED_GEMMA_FINGERPRINTS) },
   moe: configuredMoe,
   trainingDefaults: GEMMA_TRAINING_DEFAULTS,
   sentinels: GEMMA_SENTINELS,

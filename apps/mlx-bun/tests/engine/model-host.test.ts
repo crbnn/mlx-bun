@@ -139,15 +139,15 @@ test("closing the app drains borrowed execution before disposing the model", asy
   const events: string[] = [];
   const entered = Promise.withResolvers<void>(); const finish = Promise.withResolvers<void>();
   const host = ownModelContext(context(), [{ dispose() { events.push("model disposed"); } }]);
-  const execution = { method: "autoregressive", mechanism: "continuous", pagedKv: false,
+  const execution = { method: "autoregressive", mechanism: "continuous",
     promptCache: false, checkpoint: false, fill: false, compiledDecode: false,
     grammarJump: false, reasons: [] } as const;
   const supplied = { gateway: { runtime: runtimeConfig(), config: { eosTokenIds: [2] },
-    cachesBatchable: () => true, plan: () => execution,
+    plan: () => execution, reusesPrefix: () => true,
     continuationRequest(_plan: unknown, _opts: unknown, _prompt: unknown, onToken: unknown) {
       return { continuation: {}, sample() {}, plainGreedy: true, onToken, dispose() {} };
     },
-    createBatchGroup() { return { activeRows: 0, pendingRows: 0, projectedKvBytes: 0,
+    createBatchGroup() { return { activeRows: 0, pendingRows: 0,
       async submit() { entered.resolve(); await finish.promise; events.push("execution stopped");
         return { promptTokens: 1, cachedTokens: 0, generatedTokens: 1, prefillMs: 0, decodeMs: 0 }; },
       kick() {}, async close() { events.push("group closed"); },
@@ -156,7 +156,7 @@ test("closing the app drains borrowed execution before disposing the model", asy
   const engine = await createAppEngine(host, { capacity: 1, binding: supplied,
     beforeModelDispose() { events.push("cache closed"); } });
   const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false,
-    userSeed: false, kvQuant: false, turboQuant: false, hasLogitsExtras: false,
+    userSeed: false, hasLogitsExtras: false,
     hasGrammar: false, wantsLogprobs: false, hasDraft: false };
   const run = engine.completion.run([1], {}, () => {}, undefined, shape, engine.completion.place(shape)).catch(() => {});
   await entered.promise; const closing = engine.close();
@@ -192,7 +192,7 @@ test("compiled runner retirement is idempotent and never allocates an absent run
     CompiledDecode.release(model);
     assert.equal(materializations, 0); assert.equal(allocations, 0);
     const runner = CompiledDecode.for(model);
-    // A cache that declares the compiled-decode capability; the fake closure never traces its stand-in.
+    // A cache with a compiled decode form (the CompiledDecodeCache protocol); the fake closure never traces its stand-in.
     const keys = new ArrayValue(), values = new ArrayValue();
     const slot = { key: "fake", fetch: "concat", inputs: 2, outputs: 2, trace() { throw new Error("never traced"); } };
     const cache = { offset: 1, prepareDecodeStep: () => ({ fetch: "concat", activeLen: 1 }),

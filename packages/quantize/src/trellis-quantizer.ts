@@ -28,7 +28,7 @@ import { MlxArray as Arr, cpuStream, gpuStream, type MlxArray } from "@mlx-bun/m
 import { Dtype, activeMemory, cacheMemory, clearCache } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { quantize } from "@mlx-bun/mlx/ops";
-import { Weights, ShardedWriter, type WriteResult } from "@mlx-bun/inference/artifacts";
+import { TURBOQUANT_FOLD_FILE, Weights, ShardedWriter, type WriteResult } from "@mlx-bun/inference/artifacts";
 import { writeAtomicDirectory } from "./atomic-output";
 import { buildQuantizationBlock, writeQuantizedConfig, type PerLayerEntry } from "./config-writer";
 import type { ProgressEvent } from "./quantizer";
@@ -45,6 +45,9 @@ import {
 const INTERLEAVE_WORDS = 48;
 /** The trellis encoder holds ~2 GB of its own, so shards stay below the writer's default ceiling. */
 const DEFAULT_SHARD_BYTES = 2 * 1024 ** 3;
+/** `final_gain_convention` in turboquant_fold.json, verbatim as the published artifact's sidecar records it. */
+const FINAL_GAIN_CONVENTION = "effective final-norm gain gamma = stored + 1 of the source model`s final norm, " +
+  "the value folded into lm_head; a drafter that enters the folded head divides by it";
 
 export interface TrellisQuantizeOptions {
   /** Trellis bits per weight for every coded tensor without a k-map entry. Default 3. */
@@ -132,7 +135,7 @@ async function produce(
     try { return planQwen35HfFold(weights, { numHiddenLayers, layerTypes }); }
     catch (error) { weights.dispose(); throw error; }
   })();
-  const { ops: foldOps, gammaNames, zeroNorms } = plan;
+  const { ops: foldOps, gammaNames, zeroNorms, headGamma } = plan;
 
   const one = Arr.fromFloat32(new Float32Array(1).fill(1), [1]);
   // Stored gains are γ−1: the fold context reads γ = stored + 1.
@@ -374,10 +377,15 @@ async function produce(
     }, null, 2));
     for (const f of ["preprocessor_config.json", "video_preprocessor_config.json"])
       if (existsSync(join(srcDir, f))) copyFileSync(join(srcDir, f), join(outDir, f));
-    writeFileSync(join(outDir, "turboquant_fold.json"), JSON.stringify({
+    writeFileSync(join(outDir, TURBOQUANT_FOLD_FILE), JSON.stringify({
       source: srcDir, generatedAt: new Date().toISOString(), seed,
       r1: true, r2: false, hiddenSize,
       gamma_convention: "stored+1 folded in; folded norms written as zeros",
+      // The γ the fold scaled lm_head by (its fold op names it), read back from
+      // the fold context; a drafter entering the folded head divides by it.
+      final_gain: Array.from(ctx.gain(headGamma)),
+      final_gain_convention: FINAL_GAIN_CONVENTION,
+      final_gain_source: `${srcDir} ${headGamma} (stored + 1 in float32, as folded into lm_head.weight)`,
     }, null, 2));
     progress("done", `${nAffine} affine + ${nTrellis} trellis modules · ${(totalBits / totalParams).toFixed(4)} coded bpw · ` +
       `${(write.totalSize / 2 ** 30).toFixed(3)} GiB · ${((performance.now() - t0) / 60000).toFixed(1)} min`, 1);

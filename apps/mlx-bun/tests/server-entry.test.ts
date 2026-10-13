@@ -55,11 +55,15 @@ const prelude = (mocks = "") => `
     const pending = () => caches.durable ? { pendingSnapshots: 0, pendingSpills: 0, pendingSpillBytes: 0, droppedSpills: 0, failedSpills: 0 }
       : { pendingSnapshots: 1, pendingSpills: 2, pendingSpillBytes: 64, droppedSpills: 0, failedSpills: 1 };
     const result = () => ({ ...pending(), durable: caches.durable, flushedSnapshots: 1, missingSnapshots: 0, elapsedMs: 1 });
-    return { resolvedKvScheme, kvScheme: resolvedKvScheme.generationOptions, stateCodecs: {}, checkpoints: null, continuationServices: {},
-      adapterNamespace: () => "", stats: pending, flush: async () => result(), stopIdleDemotion() {},
-      promptCache: { peekPrefixLen: () => 0, size: 0, totalBytes: 0, maxBytes: 0, hits: 0, misses: 0, sessionHits: 0, sessionMisses: 0,
-        prefixScans: 0, objectHits: 0, objectMisses: 0, objectRestores: 0, demotions: 0, closeSession() {} },
+    // The loaded model's cache service, as the app's engine, server and model host reach it.
+    const cache = { checkpointEveryTokens: undefined, async prefetch() { return () => {}; }, peekPrefixLen: () => 0, closeSession() {},
+      savedPrefixes: () => [], set onPut(_observe) {},
+      report: () => ({ prefixes: { entries: 0, bytes: 0, maxBytes: 0, hits: 0, misses: 0, sessionHits: 0, sessionMisses: 0,
+        prefixScans: 0, objectHits: 0, objectMisses: 0, objectRestores: 0, demotions: 0 }, saved: null, pending: pending(),
+        kv: { projectedBytes: 0, budgetBytes: null } }),
+      stats: pending, flush: async () => result(), stopIdleDemotion() {},
       async close() { events.push("cache close"); if (caches.closeFails) throw new Error("cache close failed"); return result(); } };
+    return { resolvedKvScheme, adapterNamespace: () => "", cache };
   } }));
   // The chat module is real: its socket, its model description over the model host, and the loopback the Pi SDK talks to. Only the SDK is a stand-in:
   // it reads the served model's facts when a chat connects, as the real backend does, and asks the loopback for one completion.
@@ -80,7 +84,7 @@ const prelude = (mocks = "") => `
     max_position_embeddings: 4096, eos_token_id: 0 }));
   const selected = [], prompts = [], hold = { next: false };
   let config;
-  const group = { activeRows: 0, pendingRows: 0, projectedKvBytes: 0, kvBudgetBytes: undefined, kick() {}, async close() {},
+  const group = { activeRows: 0, pendingRows: 0, kick() {}, async close() {},
     async submit(request) {
       selected.push(request.method.id);
       if (hold.next) {
@@ -96,11 +100,11 @@ const prelude = (mocks = "") => `
     } };
   // No RuntimeModel, forward(), makeCache(), or native weights: this binding is the model.
   const binding = (stateCompatibility = "synthetic-runtime-v1") => ({ stateCompatibility,
-    gateway: { config, runtime: runtimeConfig(), cachesBatchable: () => true, kvBatchable: () => false,
+    gateway: { config, runtime: runtimeConfig(),
       plan: (_shape, options) => ({ method: options.temperature === 0 ? "custom-exact" : "custom-alternate", mechanism: "continuous",
-        pagedKv: false, promptCache: false, checkpoint: false, fill: false, compiledDecode: false, grammarJump: false, reasons: [] }),
-      methodRequest: execution => ({ id: execution.method }), createBatchGroup: () => group, configureContinuation() {} },
-    restore: () => null, signal: async () => ({ bins: [1], vocab: 16 }),
+        promptCache: false, checkpoint: false, fill: false, compiledDecode: false, grammarJump: false, reasons: [] }),
+      reusesPrefix: () => true, methodRequest: execution => ({ id: execution.method }), createBatchGroup: () => group },
+    signal: async () => ({ bins: [1], vocab: 16 }),
     diagnostics: () => ({ custom_model: { method_count: 2 } }),
     discovery: { adapters: false, training: false, dsa: false, embeddings: false } });
   const buildPrompt = async () => { prompts.push("built");

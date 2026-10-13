@@ -1,9 +1,8 @@
 import { MlxArray } from "@mlx-bun/mlx/array";
-import { Dtype,deviceArchitecture } from "@mlx-bun/mlx/ffi";
+import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { Mask } from "../contracts/mlx/cache";
 import { isCompiledTrace } from "../runtime/compiled-trace";
-import { runtimeValue } from "../runtime/config";
 
 
 export const FINFO_MIN: Partial<Record<Dtype, number>> = {
@@ -19,6 +18,29 @@ export const FINFO_MIN: Partial<Record<Dtype, number>> = {
 export function quantizedSdpaUnfused(
   q: MlxArray, kq: ops.QuantizedTensor, vq: ops.QuantizedTensor,
   scale: number, mask: Mask, groupSize: number, bits: number,
+): MlxArray {
+  return unfused(q, kq, vq, scale, mask, groupSize, bits, false);
+}
+
+/** `quantizedSdpaUnfused` with the key matmul over three GQA heads per batch:
+ *  the queries of each KV head enter the key quantized_matmul as [2, 9] rows
+ *  instead of 18, and the scores are restored to [nRep, L] before the mask,
+ *  softmax and value matmul. On the M4 Pro GPU (applegpu_g16s) MLX's native
+ *  key matvec keeps exact arithmetic in that grouping at 8192 or more keys.
+ *  A kernel for one composition: depth-2 speculative verify (L = 3) on 24
+ *  query heads, 4 KV heads, head dim 256, B <= 2, a 4-bit group-64 cache and
+ *  bf16 or f32 queries, built only by the cache composed for it. Other shapes
+ *  are outside its contract (the [2, 9] split needs nRep * L = 18). */
+export function quantizedSdpaGroupedHeads(
+  q: MlxArray, kq: ops.QuantizedTensor, vq: ops.QuantizedTensor,
+  scale: number, mask: Mask, groupSize: number, bits: number,
+): MlxArray {
+  return unfused(q, kq, vq, scale, mask, groupSize, bits, true);
+}
+
+function unfused(
+  q: MlxArray, kq: ops.QuantizedTensor, vq: ops.QuantizedTensor,
+  scale: number, mask: Mask, groupSize: number, bits: number, groupHeads: boolean,
 ): MlxArray {
   const [B, H, L, D] = q.shape as [number, number, number, number];
   const KV = kq.packed.shape[1]!;
@@ -50,12 +72,8 @@ export function quantizedSdpaUnfused(
     vT = expand(vq);
   }
 
-  // M4 Pro's native key matvec retains exact arithmetic when three GQA
-  // heads share a batch. Restore score geometry before softmax/value work.
-  const groupHeads = B <= 2 && H === 24 && KV === 4 && L === 3 && D === 256 &&
-    N >= 8192 && groupSize === 64 && bits === 4 &&
-    (q.dtype === Dtype.bfloat16 || q.dtype === Dtype.float32) &&
-    deviceArchitecture() === "applegpu_g16s";
+  // Grouped heads (quantizedSdpaGroupedHeads): three GQA heads per key
+  // matmul batch; restore score geometry before softmax/value work.
   let keyQueries = queries;
   if (groupHeads) {
     keyQueries = ops.reshape(queries, [B, KV, 2, 9, D]);
@@ -327,68 +345,9 @@ export function quantizedSdpaTiled(
   return out;
 }
 
-/** Gate for the tiled path — port of fused_quant_sdpa._supported plus the
- *  wrapper's mask check, with one documented deviation: the oracle wrapper
- *  falls back to unfused on ARRAY masks because mlx-lm always hands it the
- *  "causal" string for windowless continuations (its make_mask returns
- *  "causal" even at offset > 0); our makeMask materializes the equivalent
- *  bool matrix — so masks flagged causalEquivalent tile too (the oracle's
- *  INNER function handles them with the same column slicing we use).
- *  Window/bidir array masks do NOT tile, matching the reference's
- *  scenario-level dispatch exactly (sliding-layer quantized
- *  prefill is unfused in optiq too). */
-function fusedSdpaSupported(q: MlxArray, mask: Mask, groupSize: number, bits: number): boolean {
-  // Escape hatch mirroring optiq serve's --no-fused-kv: forces the
-  // stock unfused path everywhere. Also the A/B lever for
-  // `02d723a:scripts/bench-levers.ts` fused-prefill. Read per call (cheap next to the
-  // FFI work) so tests and paired A/B harnesses can flip it in-process.
-  if (runtimeValue("MLX_BUN_NO_FUSED_SDPA") === "1") return false;
-  if (bits !== 4 && bits !== 8) return false;
-  if (groupSize !== 32 && groupSize !== 64 && groupSize !== 128) return false;
-  if (q.dtype !== Dtype.bfloat16 && q.dtype !== Dtype.float16) return false;
-  if (mask.mode === "causal" || mask.mode === "") return true; // "" = oracle's mask=None
-  if (mask.mode === "array")
-    return mask.causalEquivalent === true && mask.arr !== null &&
-      mask.arr.shape.length === 2 && mask.arr.dtype === Dtype.bool;
-  return false;
-}
-
-/** Quantized-cache SDPA dispatch: L > 1 (prefill/continuation) with a
- *  supported config goes through the N-tiled fused path; decode (L = 1)
- *  and unsupported configs stay on the stock unfused port. Exported for
- *  the dispatch-gate tests. */
-export function quantizedSdpa(
-  q: MlxArray, kq: ops.QuantizedTensor, vq: ops.QuantizedTensor,
-  scale: number, mask: Mask, groupSize: number, bits: number,
-): MlxArray {
-  const tile = q.shape[2]! > 1;
-  if (tile && fusedSdpaSupported(q, mask, groupSize, bits)) {
-    // The N-tiled loop CANNOT be traced: its tile count and slice extents
-    // bake at trace-time N, so under shapeless replay a growing (concat-
-    // phase) quantized cache's newest rows are silently never attended.
-    // This throw is the backstop for any compiled caller — it lands in the
-    // trace's transactional fallback instead of producing silently wrong
-    // attention.
-    if (isCompiledTrace())
-      throw new Error(
-        "quantizedSdpaTiled inside a compiled trace: the tile loop bakes trace-time N " +
-          "(growing KV rows would be silently dropped) — run this generation uncompiled",
-      );
-    return quantizedSdpaTiled(q, kq, vq, scale, mask, groupSize, bits);
-  }
-  return quantizedSdpaUnfused(q, kq, vq, scale, mask, groupSize, bits);
-}
-
-/** The runtime-only half of fusedSdpaSupported (env flag, dtype, mask
- *  kind) — generated models bake the (bits, group_size) half
- *  as a compile-time constant and call this for the rest. The combined
- *  predicate is exactly fusedSdpaSupported. */
-export function fusedSdpaRuntimeOk(q: MlxArray, mask: Mask): boolean {
-  if (runtimeValue("MLX_BUN_NO_FUSED_SDPA") === "1") return false;
-  if (q.dtype !== Dtype.bfloat16 && q.dtype !== Dtype.float16) return false;
-  if (mask.mode === "causal" || mask.mode === "") return true;
-  if (mask.mode === "array")
-    return mask.causalEquivalent === true && mask.arr !== null &&
-      mask.arr.shape.length === 2 && mask.arr.dtype === Dtype.bool;
-  return false;
+/** The (bits, group size, dtype) the tiled kernel takes: the composition's
+ *  tiled-causal set (`composedAffineKernels`) tiles exactly these. */
+export function fusedSdpaConfigSupported(groupSize: number, bits: number, dtype: Dtype): boolean {
+  return (bits === 4 || bits === 8) && (groupSize === 32 || groupSize === 64 || groupSize === 128) &&
+    (dtype === Dtype.bfloat16 || dtype === Dtype.float16);
 }

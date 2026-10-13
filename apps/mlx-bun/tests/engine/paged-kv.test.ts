@@ -1,11 +1,10 @@
-// Opt-in with real weights: `--paged-kv` on a cached Gemma4 snapshot named by
-// MLX_BUN_COMPILED_GEMMA_E4B serves completions through the paged path, and
-// on a non-Gemma4 model (MLX_BUN_APP_TEST_MODEL) the request answers the
-// typed capability error instead of a hidden serial fallback.
+// Opt-in with real weights: `--paged-kv` composes the paged KV lego at load, so a
+// cached Gemma4 snapshot named by MLX_BUN_COMPILED_GEMMA_E4B and any other model
+// (MLX_BUN_APP_TEST_MODEL) serve completions through paged state.
 //
 // HTTP cancellation, once per paged reader (the gathered SDPA reader and the
-// direct reader MLX_BUN_PAGED_ATTN=1 selects, which the app reads from its
-// runtime snapshot): a greedy /v1/completions stream is abandoned by its
+// direct reader `--paged-kv-direct` composes, the composition's
+// `pagedKv.direct`, which /stats prints): a greedy /v1/completions stream is abandoned by its
 // client mid-generation; the server observes the disconnect and drains; the
 // same server then answers a different prompt and the abandoned prompt
 // exactly as a fresh paged server with the same reader does, and the frames
@@ -24,13 +23,14 @@ const gemma = process.env.MLX_BUN_COMPILED_GEMMA_E4B;
 const other = process.env.MLX_BUN_APP_TEST_MODEL;
 
 async function serveWithPaging(root: string, snapshot: string,
-  { blockSize = "256", promptCacheGiB = "0.125", hooks = {} }: { blockSize?: string; promptCacheGiB?: string; hooks?: AppSocketHooks } = {}) {
+  { blockSize = "256", promptCacheGiB = "0.125", hooks = {}, direct = false }:
+    { blockSize?: string; promptCacheGiB?: string; hooks?: AppSocketHooks; direct?: boolean } = {}) {
   const { startModelServer, parseServeOptions } = await import("../../src/cli/serve");
   const { scanSnapshot } = await import("@mlx-bun/hub/registry");
   const model = await scanSnapshot(snapshot, "test-model");
   if (!model) throw new Error(`${snapshot} has no loadable checkpoint`);
   const options = parseServeOptions({ values: { port: "0", "max-tokens": "16", "prompt-cache": promptCacheGiB, "no-open": true, thinking: "off",
-    "paged-kv": true, "paged-kv-block-size": blockSize }, positionals: [] });
+    "paged-kv": true, "paged-kv-block-size": blockSize, "paged-kv-direct": direct }, positionals: [] });
   options.readOnly = true;
   options.chatPaths = { cwd: join(root, "project"), agentDir: join(root, "agent"), sessionDir: join(root, "sessions"), toolApprovalsFile: join(root, "approvals.json") };
   options.memoryPaths = { vault: join(root, "vault"), skills: join(root, "skills") };
@@ -52,16 +52,15 @@ test.skipIf(!gemma)("paged KV serves a Gemma4 completion", async () => {
   } finally { try { await app?.close(); } finally { rmSync(root, { recursive: true, force: true }); } }
 }, 300_000);
 
-test.skipIf(!other)("paged KV on a non-Gemma4 model answers the typed capability error", async () => {
+test.skipIf(!other)("paged KV serves a completion on a model of another family", async () => {
   const root = mkdtempSync(join(tmpdir(), "mlx-paged-")); mkdirSync(join(root, "project"));
   let app: RunningApp | undefined;
   try {
     app = await serveWithPaging(root, other!);
     const response = await chat(app);
-    expect(response.status).toBe(501);
+    expect(response.status).toBe(200);
     const body = await response.json();
-    expect(body.error).toMatchObject({ type: "not_implemented", code: "unsupported_execution" });
-    expect(body.error.reasons).toContain("paged-kv-batch-unsupported");
+    expect(body.usage.completion_tokens).toBeGreaterThan(0);
   } finally { try { await app?.close(); } finally { rmSync(root, { recursive: true, force: true }); } }
 }, 300_000);
 
@@ -126,16 +125,15 @@ async function until(label: string, check: () => Promise<boolean> | boolean) {
 for (const direct of [false, true]) {
   const reader = direct ? "direct" : "gathered";
   test.skipIf(!gemma)(`paged KV (${reader} reader): a client that leaves mid-stream is cancelled and drained, its received frames equal a stopped control, and the server then answers exactly as a fresh paged server`, async () => {
-    const { configureRuntime } = await import("@mlx-bun/inference/runtime/config");
     const { PagedKVCache } = await import("@mlx-bun/inference/state/paged");
     const { loadTokenizer } = await import("@mlx-bun/inference/input");
     const { ToolAwareStream } = await import("../../src/server/token-streams");
     const root = mkdtempSync(join(tmpdir(), "mlx-paged-cancel-")); mkdirSync(join(root, "project"));
-    // Every paged cache that stores or reads KV in this case reports its reader;
+    // Every paged cache that stores KV in this case reports its reader;
     // while the abandoned row is the only one, the tokens it stored are tracked.
     const readers: boolean[] = [];
     let abandoning = false, abandonedOffset = 0;
-    const spies = (["appendAndFetch", "updateAndFetch"] as const).map(method => {
+    const spies = (["append"] as const).map(method => {
       const original = PagedKVCache.prototype[method] as (this: InstanceType<typeof PagedKVCache>, ...args: unknown[]) => unknown;
       return spyOn(PagedKVCache.prototype, method).mockImplementation(function (this: InstanceType<typeof PagedKVCache>, ...args: unknown[]) {
         readers.push(this.direct);
@@ -144,13 +142,11 @@ for (const direct of [false, true]) {
         return result;
       } as never);
     });
-    // The app's runtime snapshot is read when the gateway binds; keep it for the servers' lifetime.
-    const restoreRuntime = configureRuntime({ MLX_BUN_PAGED_ATTN: direct ? "1" : "0" });
     let app: RunningApp | undefined;
     try {
       // 1. A fresh paged server whose first request is abandoned by its client.
       const served: { aborted: boolean }[] = [];
-      app = await serveWithPaging(root, gemma!, { ...cold, hooks: { routes: group => ({ async handle(request) {
+      app = await serveWithPaging(root, gemma!, { ...cold, direct, hooks: { routes: group => ({ async handle(request) {
         if (request.method === "POST" && new URL(request.url).pathname === "/v1/completions") {
           const entry = { aborted: false };
           served.push(entry);
@@ -159,6 +155,9 @@ for (const direct of [false, true]) {
         return group.handle(request);
       } }) } });
       let base = new URL(`http://127.0.0.1:${app.port}`);
+      // The reader is the loaded composition's, as /stats prints it.
+      const { composition } = await (await fetch(new URL("/stats", base))).json();
+      expect(composition.paged_kv).toEqual({ block_size: 16, direct });
       const leave = new AbortController();
       abandoning = true;
       const response = await completions(base, { prompt: STORY, max_tokens: 256, stream: true }, leave.signal);
@@ -189,7 +188,7 @@ for (const direct of [false, true]) {
       await app.close(); app = undefined;
 
       // 2. References from a fresh paged server with the same reader.
-      app = await serveWithPaging(root, gemma!, cold);
+      app = await serveWithPaging(root, gemma!, { ...cold, direct });
       base = new URL(`http://127.0.0.1:${app.port}`);
       const otherControl = await whole(base, { prompt: OTHER, max_tokens: 32 });
       const control = await streamed(base, { prompt: STORY, max_tokens: 256 });
@@ -234,7 +233,6 @@ for (const direct of [false, true]) {
       expect(readers.filter(flag => flag !== direct)).toEqual([]);
     } finally {
       try { await app?.close(); } finally {
-        restoreRuntime();
         for (const spy of spies) spy.mockRestore();
         rmSync(root, { recursive: true, force: true });
       }

@@ -7,7 +7,8 @@ import type { MemoryPlan } from "@mlx-bun/inference/contracts/portable";
 import type { RequestPrepOptions } from "../server/request-prep";
 import type { DraftKind } from "../engine/model-host";
 import type { DownloadOwner } from "../hub/downloads";
-import type { KvSchemeOptions } from "@mlx-bun/inference/state/kv-scheme";
+import type { KvQuantOverride } from "@mlx-bun/inference/state/kv-scheme";
+import type { TurboQuantScheme } from "@mlx-bun/inference/artifacts/config";
 import type { AppStoragePaths, ChatPaths } from "./serve-state";
 
 export interface ServeOptions {
@@ -24,7 +25,8 @@ export interface ServeOptions {
   modelBudgetBytes?: number;
   /** Main's `--context-length`: the context a memory-planning runtime reserves; models without a plan ignore it. */
   contextTokens?: number;
-  /** Startup kernel override; absent derives from the selected KV scheme. */
+  /** `--fused-sdpa on|off`: the affine read kernels of the composition's KV scheme (on: tiled-causal, off:
+   * unfused); absent, they follow the scheme's kind (tiled-causal for `config`, unfused otherwise). */
   fusedSdpa?: boolean;
   forceWire?: boolean;
   expertOffload?: boolean;
@@ -48,7 +50,9 @@ export interface ServeOptions {
   /** `--in-process`: the models load in this process (serve-host.ts) instead of in a worker process each behind this
    * process's proxy (serve-isolated.ts, the default). */
   inProcess?: boolean;
-  cache: CacheServiceOptions;
+  /** Cache policy, and the KV flags the loaded composition resolves its KV scheme from (`--kv-quant`, its
+   * TurboQuant spelling, `--quantized-kv-start`). */
+  cache: CacheServiceOptions & ServeKvFlags;
   request: RequestPrepOptions;
   /** App-owned vault and skill destinations; not CLI flags. */
   memoryPaths?: { vault: string; skills: string };
@@ -86,18 +90,13 @@ export interface RunningApp {
   close(): Promise<void>;
 }
 
-/** Validate resolved startup policy before handing resources to the engine.
- * Paging must not silently replace a selected KV codec or draft provider. */
-export function validatePagedServingOptions(
-  pagedKv: RequestPrepOptions["pagedKv"],
-  kvScheme: Pick<KvSchemeOptions, "kvConfig" | "turboQuant">,
-  hasDraft: boolean,
-): void {
-  if (!pagedKv) return;
-  if (kvScheme.kvConfig?.length || kvScheme.turboQuant)
-    throw new Error("--paged-kv supports bf16 and uniform affine KV4/KV8; per-layer and TurboQuant pages are not implemented.");
-  if (hasDraft)
-    throw new Error("--paged-kv cannot combine with --draft-model in v1.");
+/** The KV flags a loaded composition resolves its scheme from. */
+export interface ServeKvFlags {
+  kvQuant?: KvQuantOverride;
+  turboQuant?: TurboQuantScheme;
+  quantizedKvStart?: number;
+  /** `--paged-kv`, `--paged-kv-block-size` and `--paged-kv-direct`: the composition's paging. */
+  pagedKv?: { blockSize?: number; direct?: boolean };
 }
 
 /** Main's MLX_BUN_SHUTDOWN_TIMEOUT_MS: any finite value > 0, else 120 s. How long a close may take to drain work and flush saved state. */

@@ -13,17 +13,22 @@ const stats = (over: Partial<GenerateStats> = {}): GenerateStats => ({ promptTok
 
 function setup(run: CompletionEngine["run"], input: { publish?: (event: AppEvent) => void } = {}) {
   const published: CoreEvent[] = [], clock = { ms: 0 }, wall = { at: 1_000 };
-  const gateway = { activeRows: 0, kvBytes: { projected: 0, budget: null as number | null } };
+  const gateway = { activeRows: 0 };
+  // What the cache service reports it holds: the admitted KV against its budget, and its RAM prefixes.
+  const kv = { projected: 0, budget: null as number | null };
   const promptCache = { totalBytes: 0, maxBytes: 8e9, hits: 0, misses: 0 };
+  const cache = { report: () => ({ kv: { projectedBytes: kv.projected, budgetBytes: kv.budget },
+    prefixes: { bytes: promptCache.totalBytes, maxBytes: promptCache.maxBytes, hits: promptCache.hits, misses: promptCache.misses } }) } as
+    unknown as Parameters<typeof createEngineTelemetry>[0]["cache"];
   const intervals: (() => void)[] = [];
   const engine: CompletionEngine & { marker: string } = { marker: "kept", place: () => { throw new Error("unused"); }, run };
   const telemetry = createEngineTelemetry({ events: { publish: input.publish ?? (event => { published.push(event as CoreEvent); }) }, model: "org/model", capacity: 4,
-    weightsBytes: 700, gateway, promptCache, now: () => wall.at, performanceNow: () => clock.ms,
+    weightsBytes: 700, gateway, cache, now: () => wall.at, performanceNow: () => clock.ms,
     timers: { setInterval: run => { intervals.push(run); return intervals.length; }, clearInterval: () => { intervals.length = 0; } } });
   const observed = telemetry.observe(engine);
   const call = (signal?: AbortSignal, onToken: (token: number) => unknown = () => {}) =>
     observed.run([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], {}, onToken as never, undefined, {} as never, {} as never, signal);
-  return { published, clock, wall, gateway, promptCache, intervals, telemetry, observed, engine, call };
+  return { published, clock, wall, gateway, kv, promptCache, intervals, telemetry, observed, engine, call };
 }
 const only = <T extends CoreEvent["type"]>(events: CoreEvent[], type: T) => events.filter((event): event is EventOf<T> => event.type === type);
 
@@ -76,7 +81,7 @@ test("a bus that throws or never delivers cannot reach a request", async () => {
 test("a sample reports rows, the queue, tokens per second, both caches and the model's memory, then goes quiet while idle and unchanged", async () => {
   const gate = Promise.withResolvers<void>();
   const context = setup(async (_prompt, _options, onToken) => { await onToken(1); await onToken(2); await onToken(3); await gate.promise; return stats(); });
-  context.gateway.activeRows = 1; context.gateway.kvBytes = { projected: 250, budget: 1_000 };
+  context.gateway.activeRows = 1; Object.assign(context.kv, { projected: 250, budget: 1_000 });
   context.promptCache.totalBytes = 300; context.promptCache.hits = 3; context.promptCache.misses = 1;
   const first = context.call(), second = context.call();
   await Bun.sleep(0);

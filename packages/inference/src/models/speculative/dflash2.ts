@@ -21,17 +21,33 @@
 // Target basis: a TurboQuant R1 fold stores the residual stream as h·R1,
 // R1 = diag(s)·M with M = MLX's hadamard_transform/√n (x ↦ x·M), and folds the
 // final-norm gain γ into the head. The drafter was trained on the unrotated
-// model: taps reach fc as tap·R1ᵀ (folded into fc at load as fc·diag(s)·M),
+// model and loads in that basis; the target declares its own
+// (`TargetView.residualBasis`) and the drafter applies it once, when a draft
+// group binds: taps reach fc as tap·R1ᵀ (folded into fc as fc·diag(s)·M),
 // embedding rows are rotated back as (x·Mᵀ)⊙s, and draft hiddens enter the
 // folded head as ((v/γ)⊙s)·M. For n = 5120 = 20·256, M is orthogonal but NOT
 // symmetric, so x·Mᵀ needs the dense transpose, not a second transform.
+//
+// Kernels: each 4-bit projection is built on both kernels it runs (at load; fc
+// when the first draft group binds), and every call runs the kernel the width
+// class of its rows names: five to eight rows (the fiveToEight class, one block
+// of 8) on the simdgroup matrix unit, every other width on MLX's quantized
+// matmul. The context projection (fc, then each layer's k and v, over the B × L
+// rows a prefill or a commit appends) and the draft block (B anchors × G
+// columns) are width tables; the caller indexes them by the rows it projects or
+// drafts.
 
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { Weights } from "../../artifacts/weights";
 import type { DraftProjection } from "../../contracts/mlx/draft-projection";
-import type { Dflash2ContextAttention, Dflash2DrafterModel, Dflash2TargetBasis } from "../../contracts/mlx/drafter";
+import type { ResidualBasis } from "../../contracts/mlx/draft-target";
+import type {
+  ContextKV, Dflash2ContextAttention, Dflash2DraftBlock, Dflash2DrafterModel, DrafterContextKV, DrafterContextProjection,
+} from "../../contracts/mlx/drafter";
+import { widthClass, type MlxWidthClass, type MlxWidthTable } from "../../contracts/mlx/graph";
+import { byWidth } from "../graph";
 import { isDflash2Architecture } from "./dflash2-artifact";
 import { QuantizedLinear } from "../../layers/quantized-linear";
 import { Affine4MmaLinear } from "../../layers/affine-verify-linear";
@@ -52,37 +68,64 @@ export interface Dflash2Config {
   numTargetLayers: number;
 }
 
+/** One projection on one kernel. */
+interface Projection { forward(x: MlxArray): MlxArray }
 
-/** A projection: BF16 (transposed), or quantized at load. 4-bit projections
- *  run 5..8-row inputs (a drafting block, a commit's accepted rows) on the
- *  simdgroup matrix unit and every other row count through MLX's quantized
- *  matmul. */
-type MatW =
-  | { kind: "bf16"; t: MlxArray }
-  | { kind: "quant"; linear: QuantizedLinear; mma: Affine4MmaLinear | null };
-
-function matmulW(x: MlxArray, m: MatW): MlxArray {
-  if (m.kind === "bf16") return ops.matmul(x, m.t);
-  const rows = x.size / x.shape.at(-1)!;
-  return m.mma && rows >= 5 && rows <= 8 ? m.mma.forward(x) : m.linear.forward(x);
+/** A BF16 projection over its stored transpose. */
+class Bf16Projection implements Projection {
+  constructor(readonly t: MlxArray) {}
+  forward(x: MlxArray): MlxArray { return ops.matmul(x, this.t); }
 }
-function quantW(source: MlxArray, bits: number): MatW {
+
+/** The two kernels of a projection: `anyRows` takes every row count, `blockOf8` 5..8 rows. */
+type ProjectionKernel = "anyRows" | "blockOf8";
+
+/** The kernel a width class runs, read once per table entry at construction: `blockOf8` for five to eight
+ *  rows, `anyRows` at every other width. */
+function kernelAt(width: MlxWidthClass): ProjectionKernel {
+  return width === "fiveToEight" ? "blockOf8" : "anyRows";
+}
+
+/** A projection on both kernels, built at load (fc when the target binds). `anyRows`: MLX's
+ *  quantized matmul (matmul for BF16). `blockOf8`: the simdgroup matrix unit
+ *  for 4-bit weights whose shape it takes (N a multiple of 8, K of 256), the
+ *  `anyRows` kernel otherwise. */
+interface Weight extends Readonly<Record<ProjectionKernel, Projection>> { dispose(): void }
+
+function bf16Weight(projection: Bf16Projection): Weight {
+  return { anyRows: projection, blockOf8: projection, dispose: () => projection.t.dispose() };
+}
+function quantizedWeight(source: MlxArray, bits: number): Weight {
   const q = ops.quantize(source, 64, bits);
   ops.evalAll([q.packed, q.scales, q.biases]);
   const linear = new QuantizedLinear(q.packed, q.scales, q.biases, { bits, groupSize: 64, mode: "affine" });
   const mma = bits === 4 && q.scales.shape[0]! % 8 === 0 && (q.scales.shape[1]! * 64) % 256 === 0 ? new Affine4MmaLinear(linear) : null;
-  return { kind: "quant", linear, mma };
+  return {
+    anyRows: linear, blockOf8: mma ?? linear,
+    dispose() { linear.w.dispose(); linear.scales.dispose(); linear.biases!.dispose(); },
+  };
 }
-function disposeW(m: MatW): void {
-  if (m.kind === "bf16") m.t.dispose();
-  else { m.linear.w.dispose(); m.linear.scales.dispose(); m.linear.biases!.dispose(); }
+
+/** R1 sign lane 0 of the rotation fold (packages/quantize/src/rotate.ts signVector). */
+function r1Signs(seed: number, n: number): Float32Array {
+  let state = (seed ^ Math.imul(1, 0x9e3779b9)) >>> 0;
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    state = (state + 0x9e3779b9) >>> 0;
+    let z = state;
+    z = Math.imul(z ^ (z >>> 16), 0x21f0aaad);
+    z = Math.imul(z ^ (z >>> 15), 0x735a2d97);
+    z ^= z >>> 15;
+    out[i] = (z & 1) === 0 ? 1 : -1;
+  }
+  return out;
 }
 
 interface Layer {
   inNorm: MlxArray; postNorm: MlxArray;
-  q: MatW; k: MatW; v: MatW; o: MatW; qNorm: MlxArray; kNorm: MlxArray;
-  gate: MatW; up: MatW; down: MatW;
-  attnBase: MlxArray; attnProj: MatW; mlpBase: MlxArray; mlpProj: MatW;
+  q: Weight; k: Weight; v: Weight; o: Weight; qNorm: MlxArray; kNorm: MlxArray;
+  gate: Weight; up: Weight; down: Weight;
+  attnBase: MlxArray; attnProj: Bf16Projection; mlpBase: MlxArray; mlpProj: Bf16Projection;
 }
 
 function readConfig(raw: Record<string, any>): Dflash2Config {
@@ -105,85 +148,83 @@ export class Dflash2Drafter implements Dflash2DrafterModel {
   readonly tapLayers: number[];
   /** Draft tokens per block (block size minus the anchor). */
   readonly gamma: number;
+  readonly #bits: number;
   #w: Weights | null;
-  #fc: MatW;
+  /** fc in the trained basis, owned until the target binds and fc is built from it. */
+  #fcSource: MlxArray | null;
+  #fc: Weight | null = null;
   #hiddenNorm: MlxArray;
   #norm: MlxArray;
-  #selProj: MatW;
+  #selProj: Bf16Projection;
   #pred: MlxArray;
   #succ: MlxArray;
   #layers: Layer[] = [];
-  #signs: MlxArray | null = null;
-  #finalGain: MlxArray | null = null;
-  /** Dense Mᵀ [H, H] (bf16; every entry is ±1/√H). */
-  #hadamardT: MlxArray | null = null;
+  /** The basis bound by the first draft group: undefined until then, null for the trained basis. */
+  #bound: ResidualBasis | null | undefined = undefined;
+  /** R1's signs, the folded gain and dense Mᵀ [H, H] (bf16; every entry is ±1/√H) of a bound fold. */
+  #rotation: { signs: MlxArray; finalGain: MlxArray; hadamardT: MlxArray } | null = null;
+  /** Target-basis rows → drafter basis; identity until a fold binds. */
+  #fromTarget: (x: MlxArray) => MlxArray = x => ops.contiguous(x);
+  /** Drafter's normed hidden → input of the target's head; identity until a fold binds. */
+  #toTargetHead: (v: MlxArray) => MlxArray = v => ops.contiguous(v);
 
-  private constructor(w: Weights, cfg: Dflash2Config, bits: number, basis: Dflash2TargetBasis | null) {
+  private constructor(w: Weights, cfg: Dflash2Config, bits: number) {
     this.#w = w;
     this.cfg = cfg;
+    this.#bits = bits;
     this.tapLayers = cfg.targetLayerIds;
     this.gamma = cfg.blockSize - 1;
     const T = (name: string) => w.tensor(name);
+    const bf16 = (name: string) => new Bf16Projection(ops.transposeAxes(T(name), [1, 0]));
     // Splash quantizes projections only; convs, norms and codebooks stay BF16.
-    const mat = (name: string, quantize: boolean): MatW => {
-      if (!quantize || !bits) return { kind: "bf16", t: ops.transposeAxes(T(name), [1, 0]) };
+    const weight = (name: string): Weight => {
+      if (!bits) return bf16Weight(bf16(name));
       using source = T(name);
-      return quantW(source, bits);
+      return quantizedWeight(source, bits);
     };
-    this.#fc = basis ? this.#foldedFc(T("fc.weight"), basis.signs, bits) : mat("fc.weight", true);
+    this.#fcSource = T("fc.weight");
     this.#hiddenNorm = T("hidden_norm.weight");
     this.#norm = T("norm.weight");
-    this.#selProj = mat("candidate_selector.hidden_projection.weight", false);
+    this.#selProj = bf16("candidate_selector.hidden_projection.weight");
     this.#pred = T("candidate_selector.predecessor_codebook");
     this.#succ = T("candidate_selector.successor_codebook");
     for (let i = 0; i < cfg.layers; i++) {
       const p = `layers.${i}`;
       this.#layers.push({
         inNorm: T(`${p}.input_layernorm.weight`), postNorm: T(`${p}.post_attention_layernorm.weight`),
-        q: mat(`${p}.self_attn.q_proj.weight`, true), k: mat(`${p}.self_attn.k_proj.weight`, true),
-        v: mat(`${p}.self_attn.v_proj.weight`, true), o: mat(`${p}.self_attn.o_proj.weight`, true),
+        q: weight(`${p}.self_attn.q_proj.weight`), k: weight(`${p}.self_attn.k_proj.weight`),
+        v: weight(`${p}.self_attn.v_proj.weight`), o: weight(`${p}.self_attn.o_proj.weight`),
         qNorm: T(`${p}.self_attn.q_norm.weight`), kNorm: T(`${p}.self_attn.k_norm.weight`),
-        gate: mat(`${p}.mlp.gate_proj.weight`, true), up: mat(`${p}.mlp.up_proj.weight`, true),
-        down: mat(`${p}.mlp.down_proj.weight`, true),
+        gate: weight(`${p}.mlp.gate_proj.weight`), up: weight(`${p}.mlp.up_proj.weight`),
+        down: weight(`${p}.mlp.down_proj.weight`),
         attnBase: this.#baseKernel(T(`${p}.attention_conv.base_kernel`)),
-        attnProj: mat(`${p}.attention_conv.kernel_projection.weight`, false),
+        attnProj: bf16(`${p}.attention_conv.kernel_projection.weight`),
         mlpBase: this.#baseKernel(T(`${p}.mlp_conv.base_kernel`)),
-        mlpProj: mat(`${p}.mlp_conv.kernel_projection.weight`, false),
+        mlpProj: bf16(`${p}.mlp_conv.kernel_projection.weight`),
       });
-    }
-    if (basis) {
-      this.#signs = MlxArray.fromFloat32(basis.signs, [cfg.hidden]);
-      this.#finalGain = MlxArray.fromFloat32(basis.finalGain, [cfg.hidden]);
-      const eye = new Float32Array(cfg.hidden * cfg.hidden);
-      for (let i = 0; i < cfg.hidden; i++) eye[i * cfg.hidden + i] = 1;
-      using identity = MlxArray.fromFloat32(eye, [cfg.hidden, cfg.hidden]);
-      using dense = ops.hadamardTransform(identity, 1 / Math.sqrt(cfg.hidden)); // rows e_i·M
-      using transposed = ops.transposeAxes(dense, [1, 0]);
-      using contiguous = ops.contiguous(transposed);
-      this.#hadamardT = contiguous.astype(Dtype.bfloat16);
-      this.#hadamardT.eval();
     }
     if (bits) this.#releaseCheckpoint();
   }
 
   /** Quantized projections own their storage; copy the remaining BF16 tensors
-   *  out of the checkpoint map so its 3.85 GB mapping can be released. */
+   *  (fc's source among them) out of the checkpoint map so its 3.85 GB mapping
+   *  can be released. */
   #releaseCheckpoint(): void {
     const own = (a: MlxArray): MlxArray => {
       const copy = a.dtype === Dtype.float32 ? ops.contiguous(a) : ops.mulScalar(a, 1);
       copy.eval(); a.dispose(); return copy;
     };
-    const ownW = (m: MatW): MatW => {
-      if (m.kind !== "bf16") return m;
+    const ownBf16 = (m: Bf16Projection): Bf16Projection => {
       const t = ops.contiguous(m.t); // materializes the transposed view
-      t.eval(); m.t.dispose(); return { kind: "bf16", t };
+      t.eval(); m.t.dispose(); return new Bf16Projection(t);
     };
+    this.#fcSource = own(this.#fcSource!);
     this.#hiddenNorm = own(this.#hiddenNorm); this.#norm = own(this.#norm);
-    this.#pred = own(this.#pred); this.#succ = own(this.#succ); this.#selProj = ownW(this.#selProj);
+    this.#pred = own(this.#pred); this.#succ = own(this.#succ); this.#selProj = ownBf16(this.#selProj);
     for (const l of this.#layers) {
       l.inNorm = own(l.inNorm); l.postNorm = own(l.postNorm); l.qNorm = own(l.qNorm); l.kNorm = own(l.kNorm);
       l.attnBase = own(l.attnBase); l.mlpBase = own(l.mlpBase);
-      l.attnProj = ownW(l.attnProj); l.mlpProj = ownW(l.mlpProj);
+      l.attnProj = ownBf16(l.attnProj); l.mlpProj = ownBf16(l.mlpProj);
     }
     const w = this.#w!;
     w.dispose();
@@ -191,8 +232,8 @@ export class Dflash2Drafter implements Dflash2DrafterModel {
     this.#w = null;
   }
 
-  /** fc acting on target-basis taps: per tap block, fc_k·diag(s)·M (f32 fold). */
-  #foldedFc(source: MlxArray, signs: Float32Array, bits: number): MatW {
+  /** fc acting on target-basis taps: per tap block, fc_k·diag(s)·M (f32 fold). Consumes `source`. */
+  #foldedFc(source: MlxArray, signs: Float32Array, bits: number): Weight {
     const H = this.cfg.hidden, m = this.cfg.targetLayerIds.length;
     using s = MlxArray.fromFloat32(signs, [H]);
     using f = source.astype(Dtype.float32);
@@ -205,18 +246,72 @@ export class Dflash2Drafter implements Dflash2DrafterModel {
     if (!bits) {
       const t = ops.transposeAxes(folded, [1, 0]);
       t.eval();
-      return { kind: "bf16", t };
+      return bf16Weight(new Bf16Projection(t));
     }
-    return quantW(folded, bits);
+    return quantizedWeight(folded, bits);
   }
 
-  /** `dir`: the drafter checkpoint. `bits` 0 keeps BF16 projections. */
-  static async load(dir: string, opts: { bits?: number; basis?: Dflash2TargetBasis | null } = {}): Promise<Dflash2Drafter> {
+  /** `dir`: the drafter checkpoint, loaded in the basis it was trained on.
+   *  `bits`: the projections' quantized width; 0 keeps BF16 projections. */
+  static async load(dir: string, opts: { bits: number }): Promise<Dflash2Drafter> {
     const raw = (await Bun.file(`${dir}/config.json`).json()) as Record<string, any>;
     const cfg = readConfig(raw);
     const w = await Weights.open(dir);
-    try { return new Dflash2Drafter(w, cfg, opts.bits ?? 4, opts.basis ?? null); }
+    try { return new Dflash2Drafter(w, cfg, opts.bits); }
     catch (error) { w.dispose(); throw error; }
+  }
+
+  /** Build fc for the target's basis and, for a fold, the rotations at the
+   *  embedding and the head. The first call applies; later calls (every draft
+   *  group binds) must pass the same declaration. */
+  bindResidualBasis(basis: ResidualBasis | null): void {
+    if (this.#bound !== undefined) {
+      if (this.#bound !== basis) throw new Error("this DFlash 2 drafter is bound to a target with a different residual basis");
+      return;
+    }
+    const source = this.#fcSource!;
+    this.#fcSource = null;
+    if (!basis) {
+      if (this.#bits) {
+        using unrotated = source;
+        this.#fc = quantizedWeight(unrotated, this.#bits);
+      } else {
+        this.#fc = bf16Weight(new Bf16Projection(ops.transposeAxes(source, [1, 0])));
+        source.dispose();
+      }
+      this.#bound = null;
+      return;
+    }
+    const H = this.cfg.hidden;
+    const signs = r1Signs(basis.r1Seed, H);
+    this.#fc = this.#foldedFc(source, signs, this.#bits);
+    const eye = new Float32Array(H * H);
+    for (let i = 0; i < H; i++) eye[i * H + i] = 1;
+    using identity = MlxArray.fromFloat32(eye, [H, H]);
+    using dense = ops.hadamardTransform(identity, 1 / Math.sqrt(H)); // rows e_i·M
+    using transposed = ops.transposeAxes(dense, [1, 0]);
+    using contiguous = ops.contiguous(transposed);
+    const hadamardT = contiguous.astype(Dtype.bfloat16);
+    hadamardT.eval();
+    const rotation = this.#rotation = {
+      signs: MlxArray.fromFloat32(signs, [H]), finalGain: MlxArray.fromFloat32(basis.finalGain, [H]), hadamardT,
+    };
+    // x·R1ᵀ = (x·Mᵀ)⊙s over the last axis (target basis → drafter basis).
+    this.#fromTarget = x => {
+      using h = ops.matmul(x.dtype === Dtype.bfloat16 ? x : x.astype(Dtype.bfloat16), rotation.hadamardT);
+      using back = ops.mul(h, rotation.signs);
+      return back.astype(x.dtype);
+    };
+    // (v/γ)·R1 (drafter's normed hidden → input of the target's folded head).
+    this.#toTargetHead = v => {
+      const n = v.shape[v.shape.length - 1]!;
+      using f = v.astype(Dtype.float32);
+      using unscaled = ops.div(f, rotation.finalGain);
+      using signed = ops.mul(unscaled, rotation.signs);
+      using h = ops.hadamardTransform(signed, 1 / Math.sqrt(n));
+      return h.astype(v.dtype);
+    };
+    this.#bound = basis;
   }
 
   /** [stage, tap, H] base kernel as f32 [1, 1, stage, tap, H] for broadcasting. */
@@ -228,29 +323,10 @@ export class Dflash2Drafter implements Dflash2DrafterModel {
 
   #rms(x: MlxArray, weight: MlxArray): MlxArray { return ops.rmsNorm(x, weight, this.cfg.eps); }
 
-  /** x·R1ᵀ = (x·Mᵀ)⊙s over the last axis (target basis → drafter basis). */
-  #fromTarget(x: MlxArray): MlxArray {
-    if (!this.#signs) return ops.contiguous(x);
-    using h = ops.matmul(x.dtype === Dtype.bfloat16 ? x : x.astype(Dtype.bfloat16), this.#hadamardT!);
-    using back = ops.mul(h, this.#signs);
-    return back.astype(x.dtype);
-  }
-
-  /** (v/γ)·R1 (drafter's normed hidden → input of the target's folded head). */
-  #toTargetHead(v: MlxArray): MlxArray {
-    if (!this.#signs) return ops.contiguous(v);
-    const n = v.shape[v.shape.length - 1]!;
-    using f = v.astype(Dtype.float32);
-    using unscaled = ops.div(f, this.#finalGain!);
-    using signed = ops.mul(unscaled, this.#signs);
-    using h = ops.hadamardTransform(signed, 1 / Math.sqrt(n));
-    return h.astype(v.dtype);
-  }
-
   /** Per-row dynamic coefficients [B,G,stage,tap,H] (f32) for one conv site. */
-  #coefficients(n: MlxArray, proj: MatW, base: MlxArray): MlxArray {
+  #coefficients(n: MlxArray, proj: Bf16Projection, base: MlxArray): MlxArray {
     const B = n.shape[0]!, G = n.shape[1]!, H = this.cfg.hidden, groups = H / this.cfg.convGroupSize;
-    using d = matmulW(n, proj);
+    using d = proj.forward(n);
     using d32 = d.astype(Dtype.float32);
     using grouped = ops.reshape(d32, [B, G, 2, 2, groups, 1]);
     using wide = ops.broadcastTo(grouped, [B, G, 2, 2, groups, this.cfg.convGroupSize]);
@@ -280,40 +356,52 @@ export class Dflash2Drafter implements Dflash2DrafterModel {
       : ops.ropeDynamic(x, this.cfg.headDim, this.cfg.ropeTheta, position, null);
   }
 
-  /** Target taps [B,L,5·H] (target basis; fc carries the R1 fold) → context rows [B,L,H]. */
-  projectContext(taps: MlxArray): MlxArray {
-    using projected = matmulW(taps, this.#fc);
-    return this.#rms(projected, this.#hiddenNorm);
-  }
+  /** Target taps [B,L,m·H] (target basis; fc carries the bound fold) → context rows [B,L,H], per width class of
+   *  the B·L rows: fc on the simdgroup matrix unit for five to eight rows, MLX's quantized matmul at every other
+   *  width. */
+  readonly projectContext: MlxWidthTable<DrafterContextProjection> = byWidth(width => {
+    const kernel = kernelAt(width);
+    return taps => {
+      using projected = this.#fc![kernel].forward(taps);
+      return this.#rms(projected, this.#hiddenNorm);
+    };
+  });
 
-  /** Context rows → per-layer K/V [B,kv,L,D] at absolute positions from `position`. */
-  projectContextKVRows(context: MlxArray, position: number | MlxArray): { k: MlxArray; v: MlxArray }[] {
+  /** Context rows [B,L,H] → per-layer K/V [B,kv,L,D] at absolute positions from `position`, per width class of
+   *  the B·L rows: each layer's k and v on the kernel `projectContext` runs for that class. */
+  readonly projectContextKVRows: MlxWidthTable<DrafterContextKV> = byWidth(width => {
+    const kernel = kernelAt(width);
+    return (context, position) => this.#contextKV(context, position, kernel);
+  });
+
+  #contextKV(context: MlxArray, position: number | MlxArray, kernel: ProjectionKernel): ContextKV[] {
     const B = context.shape[0]!, L = context.shape[1]!, { kvHeads, headDim } = this.cfg;
     return this.#layers.map(layer => {
-      using kFlat = matmulW(context, layer.k);
+      using kFlat = layer.k[kernel].forward(context);
       using k4 = ops.reshape(kFlat, [B, L, kvHeads, headDim]);
       using kn = this.#rms(k4, layer.kNorm);
       using kT = ops.transposeAxes(kn, [0, 2, 1, 3]);
-      using vFlat = matmulW(context, layer.v);
+      using vFlat = layer.v[kernel].forward(context);
       using v4 = ops.reshape(vFlat, [B, L, kvHeads, headDim]);
       return { k: this.#rope(kT, position), v: ops.transposeAxes(v4, [0, 2, 1, 3]) };
     });
   }
 
-  /** One block per anchor: up to `depth` (≤ gamma) greedy tokens per row. */
-  draftRows(context: Dflash2ContextAttention, projection: DraftProjection, anchors: readonly number[],
-    position: number | MlxArray, depth: number): number[][] {
-    const steps = Math.min(this.cfg.blockSize, Math.max(1, depth) + 1) - 1;
-    if (!steps) return anchors.map(() => []);
-    using tokens = this.draftRowsDevice(context, projection, anchors, position, depth);
-    const flat = tokens.toIntTokens();
-    return anchors.map((_, row) => flat.slice(row * steps, (row + 1) * steps));
-  }
+  /** The columns of a block drafting `depth` tokens: the anchor and up to `depth` (≤ gamma) mask positions. */
+  blockColumns(depth: number): number { return Math.min(this.cfg.blockSize, Math.max(1, depth) + 1); }
 
-  /** The same proposals left on the device: [B, steps] uint32, row-major. */
-  draftRowsDevice(context: Dflash2ContextAttention, projection: DraftProjection, anchors: readonly number[],
-    position: number | MlxArray, depth: number): MlxArray {
-    const B = anchors.length, G = Math.min(this.cfg.blockSize, Math.max(1, depth) + 1);
+  /** The draft block per width class of its rows (anchors × columns): the simdgroup matrix unit for five to
+   *  eight rows, MLX's quantized matmul at every other width. */
+  readonly draft: MlxWidthTable<Dflash2DraftBlock> = byWidth(width => {
+    const kernel = kernelAt(width);
+    return (context, projection, anchors, position, columns) => this.#block(context, projection, anchors, position, columns, kernel);
+  });
+
+  /** One block per anchor over `columns` positions, every projection on `kernel`: the proposals left on the
+   *  device, [B, columns - 1] uint32, row-major. */
+  #block(context: Dflash2ContextAttention, projection: DraftProjection, anchors: readonly number[],
+    position: number | MlxArray, columns: number, kernel: ProjectionKernel): MlxArray {
+    const B = anchors.length, G = columns;
     const { hidden: H, heads, kvHeads, headDim } = this.cfg;
     using ids = ops.fromInt32(anchors.flatMap(anchor => [anchor, ...Array(G - 1).fill(this.cfg.maskTokenId)]), [B, G]);
     using embedded = projection.embed.encode(ids);
@@ -325,23 +413,23 @@ export class Dflash2Drafter implements Dflash2DrafterModel {
           using coef = this.#coefficients(n, layer.attnProj, layer.attnBase);
           using a32 = this.#conv(n, coef, 0);
           using a = a32.astype(x.dtype);
-          using qFlat = matmulW(a, layer.q);
+          using qFlat = layer.q[kernel].forward(a);
           using q4 = ops.reshape(qFlat, [B, G, heads, headDim]);
           using qn = this.#rms(q4, layer.qNorm);
           using qT = ops.transposeAxes(qn, [0, 2, 1, 3]);
           using q = this.#rope(qT, position);
-          using kFlat = matmulW(a, layer.k);
+          using kFlat = layer.k[kernel].forward(a);
           using k4 = ops.reshape(kFlat, [B, G, kvHeads, headDim]);
           using kn = this.#rms(k4, layer.kNorm);
           using kT = ops.transposeAxes(kn, [0, 2, 1, 3]);
           using k = this.#rope(kT, position);
-          using vFlat = matmulW(a, layer.v);
+          using vFlat = layer.v[kernel].forward(a);
           using v4 = ops.reshape(vFlat, [B, G, kvHeads, headDim]);
           using v = ops.transposeAxes(v4, [0, 2, 1, 3]);
           using attn = context.attend(li, q, k, v, 1 / Math.sqrt(headDim));
           using attnT = ops.transposeAxes(attn, [0, 2, 1, 3]);
           using attnFlat = ops.reshape(attnT, [B, G, heads * headDim]);
-          using out = matmulW(attnFlat, layer.o);
+          using out = layer.o[kernel].forward(attnFlat);
           using finished = this.#conv(out, coef, 1);
           using x32 = x.astype(Dtype.float32);
           using sum = ops.add(x32, finished);
@@ -353,11 +441,11 @@ export class Dflash2Drafter implements Dflash2DrafterModel {
           using coef = this.#coefficients(m, layer.mlpProj, layer.mlpBase);
           using inner32 = this.#conv(m, coef, 0);
           using inner = inner32.astype(x.dtype);
-          using g = matmulW(inner, layer.gate);
-          using u = matmulW(inner, layer.up);
+          using g = layer.gate[kernel].forward(inner);
+          using u = layer.up[kernel].forward(inner);
           using act = ops.silu(g);
           using prod = ops.mul(act, u);
-          using mlp = matmulW(prod, layer.down);
+          using mlp = layer.down[kernel].forward(prod);
           using finished = this.#conv(mlp, coef, 1);
           using x32 = x.astype(Dtype.float32);
           using sum = ops.add(x32, finished);
@@ -368,8 +456,8 @@ export class Dflash2Drafter implements Dflash2DrafterModel {
       using rows = x.slice([0, 1, 0], [B, G, H]);
       using h = this.#rms(rows, this.#norm);
       using headInput = this.#toTargetHead(h);
-      using logits = projection.logitsFromHidden(headInput);
-      using z = matmulW(h, this.#selProj);
+      using logits = projection.logits[widthClass(B * (G - 1))](headInput);
+      using z = this.#selProj.forward(h);
       using columns = this.#select(logits, z, anchors, G - 1); // [steps, B]
       using rowsMajor = ops.transposeAxes(columns, [1, 0]);
       return ops.contiguous(rowsMajor);
@@ -423,14 +511,15 @@ export class Dflash2Drafter implements Dflash2DrafterModel {
   }
 
   dispose(): void {
-    disposeW(this.#fc); disposeW(this.#selProj);
+    this.#fc?.dispose(); this.#fcSource?.dispose(); this.#selProj.t.dispose();
     this.#hiddenNorm.dispose(); this.#norm.dispose(); this.#pred.dispose(); this.#succ.dispose();
     for (const l of this.#layers) {
       l.inNorm.dispose(); l.postNorm.dispose(); l.qNorm.dispose(); l.kNorm.dispose();
-      for (const m of [l.q, l.k, l.v, l.o, l.gate, l.up, l.down, l.attnProj, l.mlpProj]) disposeW(m);
+      for (const m of [l.q, l.k, l.v, l.o, l.gate, l.up, l.down]) m.dispose();
+      l.attnProj.t.dispose(); l.mlpProj.t.dispose();
       l.attnBase.dispose(); l.mlpBase.dispose();
     }
-    this.#signs?.dispose(); this.#finalGain?.dispose(); this.#hadamardT?.dispose();
+    if (this.#rotation) { this.#rotation.signs.dispose(); this.#rotation.finalGain.dispose(); this.#rotation.hadamardT.dispose(); }
     this.#w?.dispose();
   }
 }

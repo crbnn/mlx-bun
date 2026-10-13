@@ -3,11 +3,11 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { completionProbe, decodeStable, measureChatRequest, probeVerdict, runCell, scaledBudgetMs, ServerProcess, waitReady,
-  workloadNonce, processFamily, familyRssMB, loadedMlxLibraries, type CellResult, type ReqResult } from "./measure";
-import { artifactFiles, CANONICAL, cellArgs, checkOutputDirectory, describeModel, nativeFiles, planCells, profileProblems, sourceSnapshot, validatePlan,
-  WORKLOAD, type Plan } from "./plan";
-import { comparePair, qualification, type CellRecord, type RunRecord } from "./report";
-import { run } from "../bench-serve";
+  workloadNonce, processFamily, loadedMlxLibraries, parseFootprint, workerMemory, type CellResult, type MemoryReading, type ReqResult } from "./measure";
+import { artifactFiles, CANONICAL, cellArgs, cellExtraEnvironment, checkOutputDirectory, describeModel, fileSha, nativeFiles, planCells, profileProblems,
+  sourceSnapshot, validatePlan, WORKLOAD, type Plan } from "./plan";
+import { comparePair, pooledComparison, qualification, type CellRecord, type RunRecord } from "./report";
+import { makePlan, run } from "../bench-serve";
 
 const FAKE = resolve(import.meta.dir, "fixtures/fake-server.ts");
 const scratch = realpathSync(mkdtempSync(join(tmpdir(), "bench-serve-test-")));
@@ -15,12 +15,26 @@ afterAll(() => rmSync(scratch, { recursive: true, force: true }));
 let counter = 0;
 const fresh = (name: string) => { const dir = join(scratch, `${name}-${counter++}`); mkdirSync(dir, { recursive: true }); return dir; };
 
-test("memory observation includes workers, grandchildren and orphaned group members but excludes unrelated servers", () => {
-  const listing = "12 11 12 1024\n14 13 999 3072\n13 12 13 2048\n15 1 12 4096\n16 1 16 8192\n";
+test("the process family includes workers, grandchildren and orphaned group members but excludes unrelated servers", () => {
+  const listing = "12 11 12\n14 13 999\n13 12 13\n15 1 12\n16 1 16\n";
   expect(processFamily(12, listing).map(row => row.pid)).toEqual([12, 14, 13, 15]);
-  expect(familyRssMB(12, listing)).toBe(10);
   expect(processFamily(99, listing)).toEqual([]);
-  expect(familyRssMB(12, "")).toBe(0);
+  expect(processFamily(12, "")).toEqual([]);
+});
+
+test("memory is the primary worker's MLX allocator from /stats and the footprint tool's reading, never ps RSS", () => {
+  const stats = { prompt_cache: {}, engine: { isolated: true, workers: [
+    { id: "companion", role: "companion", pid: 7, memory: { active_bytes: 1, cache_bytes: 1, peak_bytes: 1 } },
+    { id: "model", role: "primary", pid: 4321, memory: { active_bytes: 10.52 * 2 ** 30, cache_bytes: 2 ** 29, peak_bytes: 11.22 * 2 ** 30 } }] } };
+  expect(workerMemory(stats)).toEqual({ pid: 4321, mlxActiveMB: 10.52 * 1024, mlxCacheMB: 512, mlxPeakMB: 11.22 * 1024 });
+  // Before the worker's first report its memory is null; a server without workers reports none.
+  expect(workerMemory({ engine: { workers: [{ role: "primary", pid: 9, memory: null }] } })).toEqual({ pid: 9, mlxActiveMB: null, mlxCacheMB: null, mlxPeakMB: null });
+  expect(workerMemory({ prompt_cache: {} })).toBeNull();
+  expect(workerMemory(null)).toBeNull();
+  const footprint = "======\nbun [4321]: 64-bit    Footprint: 11496587264 B (16384 bytes per page)\n======\n\nAuxiliary data:\n" +
+    "    phys_footprint: 11496587264 B\n    phys_footprint_peak: 12218007552 B\n";
+  expect(parseFootprint(footprint)).toEqual({ footprintMB: 11496587264 / 2 ** 20, footprintPeakMB: 12218007552 / 2 ** 20 });
+  expect(parseFootprint("footprint: no process found")).toBeNull();
 });
 
 test("native provenance observes a library opened only by a worker", async () => {
@@ -128,6 +142,74 @@ test("mtp configurations need a pinned companion and pass it at their depth", ()
     .toThrow("draft is not pinned");
 });
 
+test("sessions repeat each tree pair in alternation (A B A B), every session its own keyed cell", () => {
+  const plan = testPlan({}, { sessions: 2, configurations: ["default", "serial"] });
+  expect(plan.cells.map(cell => cell.key)).toEqual(["fake/default/baseline/s1", "fake/default/candidate/s1", "fake/default/baseline/s2",
+    "fake/default/candidate/s2", "fake/serial/candidate/s1", "fake/serial/baseline/s1", "fake/serial/candidate/s2", "fake/serial/baseline/s2"]);
+  expect(plan.cells.map(cell => cell.session)).toEqual([1, 1, 2, 2, 1, 1, 2, 2]);
+  expect(validatePlan(plan).sessions).toBe(2);
+  // One session keeps the single-session keys and no session field: earlier records still validate.
+  expect(testPlan().cells.map(cell => [cell.key, cell.session])).toEqual([["fake/default/baseline", undefined], ["fake/default/candidate", undefined]]);
+  expect(() => validatePlan({ ...plan, sessions: 1 })).toThrow("sessions, when present, must be an integer of at least 2");
+});
+
+test("dflash2 needs a pinned DFlash 2 drafter, serves it at adaptive depth over 4-bit KV, and hands the basis to both trees", () => {
+  const drafter = artifact(), basis = join(fresh("basis"), "target-basis.json");
+  writeFileSync(basis, '{"r1":"fold"}');
+  const trellis = { ...describeModel("qwen27b", artifact({ trellis: true })),
+    dflash2: { path: drafter, files: artifactFiles(drafter), basis: { name: "target-basis.json", path: basis, bytes: 13, sha256: fileSha(basis) } } };
+  const plan = testPlan({}, { configurations: ["default", "dflash2"], models: [trellis, describeModel("e4b", artifact())] });
+  expect(plan.cells.filter(cell => cell.skipped).map(cell => [cell.key, cell.skipped])).toEqual([
+    ["e4b/dflash2/baseline", "no DFlash 2 drafter (--dflash2-draft) for this model"],
+    ["e4b/dflash2/candidate", "no DFlash 2 drafter (--dflash2-draft) for this model"]]);
+  for (const tree of ["baseline", "candidate"]) {
+    const cell = plan.cells.find(c => c.key === `qwen27b/dflash2/${tree}`)!;
+    expect(cellArgs(plan, cell, 1, "/ssd").slice(-8)).toEqual(["--ssd-cache", "/ssd", "--kv-quant", "4", "--num-draft-tokens", "adaptive", "--draft-model", drafter]);
+    expect(cellExtraEnvironment(plan, cell)).toEqual({ MLX_BUN_DFLASH2_TARGET_BASIS: basis });
+  }
+  const plain = plan.cells.find(c => c.key === "qwen27b/default/candidate")!;
+  expect(cellArgs(plan, plain, 1, "/ssd")).not.toContain("--draft-model");
+  expect(cellExtraEnvironment(plan, plain)).toEqual({});
+  expect(validatePlan(plan).configurations).toEqual(["default", "dflash2"]);
+  expect(() => validatePlan({ ...plan, models: [{ ...trellis, dflash2: { ...trellis.dflash2, files: [] } }, plan.models[1]!] }))
+    .toThrow("DFlash 2 drafter is not pinned");
+});
+
+test("dflash2-d7-baseline runs the baseline at depth 7 and the candidate adaptive, both over 4-bit KV with the drafter and basis", () => {
+  const drafter = artifact(), basis = join(fresh("basis"), "target-basis.json");
+  writeFileSync(basis, '{"r1":"fold"}');
+  const trellis = { ...describeModel("qwen27b", artifact({ trellis: true })),
+    dflash2: { path: drafter, files: artifactFiles(drafter), basis: { name: "target-basis.json", path: basis, bytes: 13, sha256: fileSha(basis) } } };
+  const plan = testPlan({}, { configurations: ["default", "dflash2-d7-baseline"], models: [trellis, describeModel("e4b", artifact())] });
+  expect(plan.cells.filter(cell => cell.skipped).map(cell => cell.key)).toEqual(["e4b/dflash2-d7-baseline/baseline", "e4b/dflash2-d7-baseline/candidate"]);
+  const args = (tree: string) => cellArgs(plan, plan.cells.find(c => c.key === `qwen27b/dflash2-d7-baseline/${tree}`)!, 1, "/ssd").slice(-8);
+  expect(args("baseline")).toEqual(["--ssd-cache", "/ssd", "--kv-quant", "4", "--num-draft-tokens", "7", "--draft-model", drafter]);
+  expect(args("candidate")).toEqual(["--ssd-cache", "/ssd", "--kv-quant", "4", "--num-draft-tokens", "adaptive", "--draft-model", drafter]);
+  for (const tree of ["baseline", "candidate"])
+    expect(cellExtraEnvironment(plan, plan.cells.find(c => c.key === `qwen27b/dflash2-d7-baseline/${tree}`)!)).toEqual({ MLX_BUN_DFLASH2_TARGET_BASIS: basis });
+  expect(validatePlan(plan).configurations).toEqual(["default", "dflash2-d7-baseline"]);
+});
+
+test("plan pins a --dflash2-draft drafter and its basis file and records --sessions", () => {
+  const baseline = repo(), candidate = repo(), lib = library(), model = artifact({ trellis: true }), drafter = artifact();
+  const basis = join(fresh("basis"), "basis.json");
+  writeFileSync(basis, "{}");
+  const command = (root: string) => JSON.stringify([process.execPath, join(root, "serve.ts")]);
+  const plan = makePlan(["--profile", "scoped", "--baseline-root", baseline, "--baseline-command", command(baseline),
+    "--candidate-root", candidate, "--candidate-command", command(candidate), "--native", lib, "--model", `qwen27b=${model}`,
+    "--configurations", "default,dflash2", "--dflash2-draft", `qwen27b=${drafter}=${basis}`, "--sessions", "2"]);
+  expect(plan.sessions).toBe(2);
+  expect(plan.models[0]!.dflash2).toEqual({ path: realpathSync(drafter), files: artifactFiles(drafter),
+    basis: { name: "basis.json", path: realpathSync(basis), bytes: 2, sha256: fileSha(basis) } });
+  expect(plan.cells.filter(cell => !cell.skipped)).toHaveLength(8);
+  const single = makePlan(["--profile", "scoped", "--baseline-root", baseline, "--baseline-command", command(baseline),
+    "--candidate-root", candidate, "--candidate-command", command(candidate), "--native", lib, "--model", `qwen27b=${model}`]);
+  expect("sessions" in single).toBe(false);
+  expect(() => makePlan(["--profile", "scoped", "--baseline-root", baseline, "--baseline-command", command(baseline),
+    "--candidate-root", candidate, "--candidate-command", command(candidate), "--native", lib, "--model", `qwen27b=${model}`,
+    "--dflash2-draft", `e4b=${drafter}`])).toThrow("must be ID=/abs/drafter[=/abs/target-basis.json] for a planned model");
+});
+
 test("a qualifying matrix may add the MTP depths after main's configurations, never replace them", () => {
   const plan = testPlan();
   const configured = (configurations: string[]) => profileProblems({ ...plan, profile: "all", configurations: configurations as Plan["configurations"] })
@@ -137,6 +219,8 @@ test("a qualifying matrix may add the MTP depths after main's configurations, ne
   expect(configured(["default", "serial", "mixed", "mtp3"])).toEqual([]);
   expect(configured(["default", "serial", "mixed", "mtp3", "mtp2"])).toHaveLength(1);
   expect(configured(["default", "mtp2"])).toHaveLength(1);
+  expect(configured(["default", "serial", "mixed", "mtp2", "mtp3", "dflash2"])).toEqual([]);
+  expect(configured(["default", "serial", "mixed", "dflash2", "mtp2"])).toHaveLength(1);
 });
 
 test("the pinned native library is the exact resolved file supplied plus its bundled runtime", () => {
@@ -246,11 +330,21 @@ test("a complete scoped run: every phase on both trees, matched samples, unrevie
   expect(record.cells.map(cell => cell.result!.measured)).toEqual([0, 1].map(() => ["warmup", "parity", "decode", "ttft1k", "ctx", "restart", "agg"]));
   expect(record.cells.every(cell => cell.result!.loadedLibraries!.some(lib => lib.path === record.plan.native.files[0]!.path))).toBe(true);
   expect(record.pins.end).toEqual([]);
+  for (const cell of record.cells) {
+    const memory = cell.result!.memory;
+    expect(memory.byLeg.map(([leg]) => leg)).toEqual(["warmup", "parity", "decode", "ttft1k", "ctx", "restart", "agg"]);
+    expect(memory.idle.mlxActiveMB).toBeGreaterThanOrEqual(1000);
+    expect(memory.byLeg.at(-1)![1].mlxActiveMB!).toBeGreaterThan(memory.idle.mlxActiveMB!);
+    expect(memory.idle.footprintMB).toBeGreaterThan(0);
+  }
   const decode = comparePair(record, "fake", "default")!.find(metric => metric.metric === "decode")!;
   expect(decode.pairs).toHaveLength(5);
   expect(decode.observation).not.toBe("unpaired");
   const report = readFileSync(join(out, "report.md"), "utf8");
   expect(report).toContain("performance acceptance: **unreviewed**");
+  expect(report).toContain("| peak MLX active | MB |");
+  expect(report).toContain("| physical footprint after decode | MB |");
+  expect(report).not.toContain("RSS |");
   // Context size is a nominal target; the report shows what each server actually counted.
   const [baselineCell, candidateCell] = (["baseline", "candidate"] as const).map(tree => record.cells.find(cell => cell.tree === tree)!.result!);
   expect(baselineCell!.ctx!.promptTokens).not.toBe(record.plan.workload.contextTokens);
@@ -259,6 +353,29 @@ test("a complete scoped run: every phase on both trees, matched samples, unrevie
   // Sandboxed servers: nothing written into either tree.
   for (const tree of ["baseline", "candidate"] as const) expect(sourceSnapshot(record.plan.trees[tree].root).clean).toBe(true);
 }, 120_000);
+
+test("a two-session run pairs each session with its counterpart and pools the pairs across sessions", async () => {
+  const out = join(fresh("run"), "out"), plan = testPlan({}, { sessions: 2 });
+  expect(await run(writePlan(plan), out, quick)).toBe(0);
+  const record = runRecord(out);
+  expect(record.cells.map(cell => [cell.key, cell.session])).toEqual([["fake/default/baseline/s1", 1], ["fake/default/candidate/s1", 1],
+    ["fake/default/baseline/s2", 2], ["fake/default/candidate/s2", 2]]);
+  expect(qualification(record).problems).toEqual([]);
+  expect(comparePair(record, "fake", "default", 2)!.find(m => m.metric === "decode")!.pairs).toHaveLength(5);
+  const pooled = pooledComparison(record, "fake", "default")!;
+  const decode = pooled.pooled.find(m => m.metric === "decode")!;
+  expect(decode.pairs).toHaveLength(10);
+  expect(decode.pairs.map(p => p.id.split("|")[0])).toEqual(["s1", "s1", "s1", "s1", "s1", "s2", "s2", "s2", "s2", "s2"]);
+  expect(pooled.sessions.map(s => s.session)).toEqual([1, 2]);
+  expect(pooled.pooled.find(m => m.metric === "peak MLX active")!.pairs).toHaveLength(2);
+  const report = readFileSync(join(out, "report.md"), "utf8");
+  expect(report).toContain("## fake · default · session 2");
+  expect(report).toContain("sessions: 2 per tree");
+  // A session that does not pair names its session.
+  const broken = structuredClone(record);
+  for (const q of broken.requests) if (q.cell === "fake/default/candidate/s2" && q.phase === "decode") q.attempt = 1;
+  expect(qualification(broken).problems.join()).toContain("fake/default s2 decode: final attempts do not pair");
+}, 180_000);
 
 test("unstable decode, a missing phase, divergent or empty probes and a foreign runtime library each make the run incomplete", async () => {
   for (const [mode, expected] of [["unstable", "unstable decode"], ["no-flush", "required phases missing: restart"],
@@ -378,8 +495,9 @@ test("a parent SIGTERM stops and joins the running server, saves the run and exi
 }, 60_000);
 
 // ---- paired comparison --------------------------------------------------------------
-const cellResult = (rss: number): CellResult => ({ key: "", readyMs: 100, idleRssMB: rss, parity: null, peakRssMB: rss,
-  rssByLeg: [["decode", rss]], coldStartMs: 200, restart: null, decodeTps: [], decodeSpread: 1, decodeStable: true, ttft: null,
+const reading = (mb: number): MemoryReading => ({ mlxActiveMB: mb, mlxCacheMB: 0, mlxPeakMB: mb, footprintMB: mb, footprintPeakMB: mb, pid: 1 });
+const cellResult = (mb: number): CellResult => ({ key: "", readyMs: 100, parity: null, memory: { idle: reading(mb), byLeg: [["decode", reading(mb)]] },
+  coldStartMs: 200, restart: null, decodeTps: [], decodeSpread: 1, decodeStable: true, ttft: null,
   ctx: null, agg: null, phaseFailures: [], measured: [], loadedLibraries: null, processes: [] });
 const reqResult = (decodeTps: number, counts: Partial<ReqResult> = {}) =>
   ({ decodeTps, wallMs: 1000, ttftMs: 10, promptTokens: 20, genTokens: 8, cachedTokens: 0, finishReason: "length", ...counts }) as ReqResult;
@@ -401,7 +519,8 @@ test("the paired comparison flags any worse candidate median without a tolerance
   expect(metric(record, "decode").pairs).toHaveLength(5);
   expect(metric(record, "decode").ratio).toBeCloseTo(0.999, 6);
   // Identical workloads: cell-level memory pairs too, and any increase is flagged.
-  expect(metric(record, "peak RSS").observation).toBe("candidate worse");
+  expect(metric(record, "peak MLX active").observation).toBe("candidate worse");
+  expect(metric(record, "MLX active after decode").observation).toBe("candidate worse");
   expect(metric(record, "ready").observation).toBe("equal");
 });
 
@@ -411,7 +530,7 @@ test("unmatched workloads are raw evidence, never a paired ratio", () => {
     { cell: "b", attempt: 1, index: 0, sha: "hashB", result: reqResult(20) }]);
   expect(metric(record, "decode")).toMatchObject({ observation: "unpaired", ratio: null, pairs: [],
     unpaired: { baseline: [10], candidate: [20] } });
-  expect(metric(record, "peak RSS")).toMatchObject({ observation: "unpaired", ratio: null });
+  expect(metric(record, "peak physical footprint")).toMatchObject({ observation: "unpaired", ratio: null });
   // Same identity but different observed counts or cache state: excluded, with the reason.
   const mismatched = comparisonRecord([{ cell: "a", attempt: 0, index: 0, sha: "h", result: reqResult(10) },
     { cell: "b", attempt: 0, index: 0, sha: "h", result: reqResult(20, { genTokens: 5, cachedTokens: 4 }) }]);

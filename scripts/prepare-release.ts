@@ -201,7 +201,7 @@ if (import.meta.main) {
   const [command, path, credential, ...extra] = process.argv.slice(2);
   if (command === "--help") console.log(`Usage: bun scripts/prepare-release.ts <stage> <new-or-existing-directory> [credential]
   prepare   NEW directory: staged native build, package graph, unsigned archives/formula,
-            then the verify:binary acceptance on the unsigned archive (CPU only)
+            then the model-free verify:binary acceptance on the unsigned archive
   sign      prepared directory + explicit Developer ID identity
   notarize  signed directory + explicit notarytool keychain profile
   package   accepted directory: release archives, checksums and Homebrew formula

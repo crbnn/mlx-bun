@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -8,8 +8,33 @@ import type { UniversalDenseModel } from "../../../src/models/universal/dense";
 import type { ModelConfig } from "../../../src/artifacts/config";
 import type { Weights } from "../../../src/artifacts/weights";
 import type { Cache, Mask } from "../../../src/contracts/mlx/cache";
+import type { Composition } from "../../../src/contracts/portable/composition";
+import type { ReadPhase } from "../../../src/models/graph";
 import type { DraftProvider } from "../../../src/generation/speculative/source";
 import type { GenerateOptions } from "../../../src/generation/index";
+import { kvStorage } from "../../../src/state/kv-storage";
+import type { KvCacheService } from "../../../src/state/cache-service";
+import type { PromptCache } from "../../../src/state/prefix-cache";
+
+/** State values the native suites load first: imported here, they would initialize native before the opt-in probe. */
+let stateValues: { KvCacheService: typeof KvCacheService;
+  composeAtLayer: typeof import("../../../src/state/persistence").composeAtLayer } | undefined;
+async function loadStateValues() {
+  const [{ KvCacheService }, { composeAtLayer }] =
+    await Promise.all([import("../../../src/state/cache-service"), import("../../../src/state/persistence")]);
+  stateValues = { KvCacheService, composeAtLayer };
+}
+/** The prefix store a test hands the cache service: its own take and put. */
+type PrefixStore = Pick<PromptCache, "take" | "put">;
+/** A cache service over `graph` keeping prefixes in `store`. */
+const keepingIn = (graph: ConstructorParameters<typeof KvCacheService>[0], store: PrefixStore) =>
+  new stateValues!.KvCacheService(graph, { prefixes: { take: store.take.bind(store), put: store.put.bind(store), reclaim() {} } as unknown as PromptCache });
+/** Stored caches handed back as the caches `graph` composes, as the cache service's clone does. */
+function composedAs(graph: { makeCache(): Cache[] }, caches: Cache[]): Cache[] {
+  const prototypes = graph.makeCache();
+  try { return caches.map((cache, layer) => stateValues!.composeAtLayer(prototypes[layer]!, cache)); }
+  finally { for (const prototype of prototypes) prototype.dispose(); }
+}
 
 // Native numerical tests are explicit: CPU-only planning/CI never initializes
 // model tensors. All synthetic weights exist in memory, not tracked fixtures.
@@ -89,6 +114,16 @@ const { rotatingSourcePosition } = await import("../../../src/state/rotating-kv-
 const { plainRowStorage, temporalStorageView } = await import("../../../src/state/batched-row-storage");
 const { bindMlxGateway } = await import("../../../src/execution/gateway-binding");
 const { resolveKvScheme } = await import("../../../src/state/kv-scheme");
+const { captureKvAttention } = await import("../../../src/state/kv-attention-view");
+const { unfusedAffineKernels } = await import("../../../src/state/affine-attention");
+const { softcapAttention } = await import("../../../src/state/softcap-attention");
+const { testComposition } = await import("../test-composition");
+const { observedPhases, phaseHidden, phaseLogits } = await import("../phase-forward");
+const { syntheticDigests } = await import("../synthetic-digest");
+const digests = syntheticDigests("gemma2");
+const { widthClass } = await import("../../../src/contracts/mlx/graph");
+/** The storage class a cache holds: a composed lego's storage, else the cache itself. */
+const storageKind = (cache: Cache) => (cache.composed?.storage() ?? cache).constructor.name;
 function fixture() {
   const raw = { model_type: "gemma2", hidden_size: 32, num_hidden_layers: 1,
     num_attention_heads: 8, num_key_value_heads: 4, head_dim: 4,
@@ -113,7 +148,8 @@ function fixture() {
   const weights = { shards: { files: new Map() }, tensorNames: [...arrays.keys()],
     has: (name: string) => arrays.has(name), tensor: (name: string) => arrays.get(name)! } as unknown as Weights;
   const models: UniversalDenseModel[] = [];
-  return { make(legacy = false) { const model = legacy ? new LegacyMaskModel(weights, config) : new UniversalDenseModel(weights, config);
+  return { make(causalReference = false) { const model = causalReference ? new OffsetCausalMaskModel(weights, config, testComposition())
+    : new UniversalDenseModel(weights, config, testComposition());
     models.push(model); return model; },
     dispose() {
       // Own the synthetic model's transposed views and folded norm weights too.
@@ -128,20 +164,43 @@ function fixture() {
     } };
 }
 
-// Main's original explicit-mask path; only this mask selection is duplicated.
-// Every projection, norm and attention operation remains the production graph.
-class LegacyMaskModel extends UniversalDenseModel {
-  protected override forwardLayers(hidden: MlxArray, caches: Cache[]): MlxArray {
-    const length = hidden.shape[1]!;
+/** A reference graph whose layers attend under the masks it selects for each
+ * forward, through the calls the graph made before its blocks read through the
+ * cache: the plain fetch and the manual softcap attention, or the attention
+ * view. Only the mask selection is duplicated; every projection, norm and
+ * attention operation remains the production graph's. */
+abstract class SelectedMaskModel extends UniversalDenseModel {
+  /** One mask per layer for a `length`-position forward over `caches`, before it appends. */
+  protected abstract selectMasks(caches: Cache[], length: number): Mask[];
+  protected override forwardLayers(hidden: MlxArray, caches: Cache[], phase: ReadPhase): MlxArray {
+    const masks = this.selectMasks(caches, hidden.shape[1]!);
+    try {
+      for (const [index, layer] of this.layers.entries())
+        Object.assign(layer.attn, { reads: maskedRead(masks[index]!, layer.attn.softcap) });
+      return super.forwardLayers(hidden, caches, phase);
+    } finally { for (const arr of new Set(masks.map(mask => mask.arr))) arr?.dispose(); }
+  }
+}
+function maskedRead(mask: Mask, softcap: number | null) {
+  return { read(cache: Cache, _phase: ReadPhase, k: MlxArray, v: MlxArray) {
+    if (softcap === null) {
+      // The mask models compose bf16 KV: the view never reads the affine kernel set.
+      const view = captureKvAttention(cache, k, v, unfusedAffineKernels(4, 64, k.dtype));
+      return { attend: (q: MlxArray, scale: number) => view.attend(q, scale, mask), dispose: () => view.dispose() };
+    }
+    const [keys, values] = kvStorage(cache).updateAndFetch(k, v);
+    return { attend: (q: MlxArray, scale: number) => softcapAttention(q, keys, values, mask, scale, softcap),
+      dispose() { keys.dispose(); values.dispose(); } };
+  } };
+}
+
+// The explicit causal mask by definition for this one-layer full-attention
+// fixture: one causal matrix at the cache's offset (main's explicit-mask path).
+class OffsetCausalMaskModel extends SelectedMaskModel {
+  protected selectMasks(caches: Cache[], length: number): Mask[] {
     const mask: Mask = length === 1 ? { mode: "", arr: null }
       : { mode: "array", arr: createCausalMask(length, caches[0]!.offset, null) };
-    let current = hidden;
-    try {
-      for (const [index, layer] of this.layers.entries()) {
-        const next = layer.forward(current, mask, caches[index]!); current.dispose(); current = next;
-      }
-      return this.finalNorm.forward(current);
-    } finally { current.dispose(); mask.arr?.dispose(); }
+    return this.layers.map(() => mask);
   }
 }
 const dispose = (caches: Cache[]) => { for (const cache of caches) cache.dispose(); };
@@ -155,18 +214,18 @@ test.skipIf(!native)("a fill group's last row leaving with a pipelined token dra
   const settled = () => { synchronize(gpuStream); return activeMemory(); };
   const f = fixture(), model = f.make();
   const binding = bindMlxGateway(model);
-  const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false, kvQuant: false,
-    turboQuant: false, hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
+  const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
+    hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
   // One scheduler for every request: a poisoned drain would surface on reuse.
   const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: 64,
-    runtime: createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1", MLX_BUN_COMPILED_DECODE: "0" }) });
+    runtime: createRuntimeConfig({}) });
   const prompt = [2, 4, 7, 9, 3];
   // A consumer stop or a cancellation ends the last row in an ordinary step
   // whose next token is already pipelined: the group filters to no rows while
   // a token is pending.
   const run = async (end?: { stopAfter?: number; cancelAfter?: number }) => {
     const options = { maxTokens: 8, temperature: 0, fill: new FillSession({ rows: [], eos: [], echo: null }, prompt) };
-    const plan = binding.plan(shape, options, { continuous: binding.cachesBatchable(), quantizedBatch: false, checkpoints: false });
+    const plan = binding.plan(shape, options, { checkpoints: false });
     expect(plan).toMatchObject({ mechanism: "continuous", fill: true });
     const tokens: number[] = [], abort = new AbortController();
     const outcome = await group.submit({ promptIds: prompt, maxTokens: 8, eosTokenIds: [], method: binding.methodRequest!(plan, options)!,
@@ -197,11 +256,11 @@ test.skipIf(!native)("a fill group's last row leaving with a pipelined token dra
 
 describe.skipIf(!native)("Gemma2 manual attention native masks", () => {
   test("ordinary B1 prefill, continuation chunks and decode preserve main's complete logits", () => {
-    const f = fixture(), actual = f.make(), legacy = f.make(true);
-    const current = actual.makeCache(), reference = legacy.makeCache();
+    const f = fixture(), actual = f.make(), causal = f.make(true);
+    const current = actual.makeCache(), reference = causal.makeCache();
     try {
       for (const tokens of [[2, 4, 7], [8, 3], [6], [5, 9]]) {
-        using a = actual.forward(tokens, current), b = legacy.forward(tokens, reference);
+        using a = phaseLogits(actual, tokens, current), b = phaseLogits(causal, tokens, reference);
         expect(a.rawBytes()).toEqual(b.rawBytes());
       }
     } finally { dispose(current); dispose(reference); f.dispose(); }
@@ -211,7 +270,7 @@ describe.skipIf(!native)("Gemma2 manual attention native masks", () => {
     const f = fixture(), model = f.make();
     const solos = [2, 5, 3, 7].slice(0, batch).map(length => {
       const cache = model.makeCache();
-      using logits = model.forward(Array.from({ length }, (_, index) => index + 2), cache);
+      using logits = phaseLogits(model, Array.from({ length }, (_, index) => index + 2), cache);
       logits.eval(); return cache;
     });
     const actual = new BatchedKVCache(), reference = new BatchedKVCache();
@@ -242,13 +301,13 @@ describe.skipIf(!native)("Gemma2 manual attention native masks", () => {
       };
       for (const length of [2, 1]) {
         using ids = ops.fromInt32(Array.from({ length: batch * length }, (_, index) => index + 10), [batch, length]);
-        using a = model.forward(ids, [actual]), b = model.forward(ids, [reference]);
+        using a = phaseLogits(model, ids, [actual]), b = phaseLogits(model, ids, [reference]);
         expect(a.shape).toEqual([batch, length, 96]);
         expect(a.rawBytes()).toEqual(b.rawBytes());
       }
       expect(maskCalls).toBe(2);
       actual.filterRows([0]); reference.filterRows([0]);
-      using a = model.forward([25], [actual]), b = model.forward([25], [reference]);
+      using a = phaseLogits(model, [25], [actual]), b = phaseLogits(model, [25], [reference]);
       expect(a.rawBytes()).toEqual(b.rawBytes());
     } finally { actual.dispose(); reference.dispose(); solos.forEach(dispose); f.dispose(); }
   });
@@ -286,8 +345,10 @@ function mixedFixture(types: string[], explicitMask: boolean, headDim = 4) {
     ...(explicitMask ? {} : { attnLogitSoftcap: null }) };
   const models: UniversalDenseModel[] = [];
   return {
-    make<M extends UniversalDenseModel>(Model: new (w: Weights, c: ModelConfig, a: typeof args) => M = UniversalDenseModel as never): M {
-      const model = new Model(weights, config, args); models.push(model); return model;
+    /** A graph of this fixture composed with `composition` (bf16 KV unless it names a scheme). */
+    make<M extends UniversalDenseModel>(Model: new (w: Weights, c: ModelConfig, k: Composition, a: typeof args) => M = UniversalDenseModel as never,
+      composition: Composition = testComposition()): M {
+      const model = new Model(weights, config, composition, args); models.push(model); return model;
     },
     dispose() {
       const owned = new Set<MlxArray>(arrays.values()), seen = new Set<object>();
@@ -305,56 +366,13 @@ function mixedFixture(types: string[], explicitMask: boolean, headDim = 4) {
 /** Each layer's mask from absolute positions alone: full layers see every
  * earlier key; sliding layers see the ring's newest window (mlx-lm
  * create_causal_mask(N, min(W - 1, offset), W)); single tokens need none. */
-class PositionMaskModel extends UniversalDenseModel {
-  protected override forwardLayers(hidden: MlxArray, caches: Cache[]): MlxArray {
-    const length = hidden.shape[1]!, masks: MlxArray[] = [];
-    let current = hidden;
-    try {
-      for (const [index, layer] of this.layers.entries()) {
-        const sliding = this.args.layerTypes![index] === S, offset = caches[index]!.offset;
-        const arr = length === 1 ? null
-          : sliding ? createCausalMask(length, Math.min(W - 1, offset), W) : createCausalMask(length, offset, null);
-        if (arr) masks.push(arr);
-        const next = layer.forward(current, arr ? { mode: "array", arr } : { mode: "", arr: null }, caches[index]!);
-        current.dispose(); current = next;
-      }
-      return this.finalNorm.forward(current);
-    } finally { current.dispose(); for (const mask of masks) mask.dispose(); }
-  }
-}
-
-/** The selection this change replaces, verbatim: with explicit masks every
- * layer took cache 0's full mask; otherwise one mask per group. */
-class PreviousSelectionModel extends UniversalDenseModel {
-  protected override forwardLayers(h0: MlxArray, cache: Cache[]): MlxArray {
-    const a = this.args;
-    const L = h0.shape[1]!;
-    let faMask: Mask;
-    let swaMask: Mask | null = null;
-    if (a.maskArray) {
-      faMask = cache[0]!.makeMask(L, null);
-      if (faMask.mode === "causal")
-        faMask = { mode: "array", arr: createCausalMask(L, cache[0]!.offset, null) };
-    } else if (a.layerTypes && a.layerTypes.includes("sliding_attention")) {
-      const faIdx = a.layerTypes.indexOf("full_attention");
-      const swaIdx = a.layerTypes.indexOf("sliding_attention");
-      faMask = cache[faIdx === -1 ? 0 : faIdx]!.makeMask(L, null);
-      swaMask = cache[swaIdx]!.makeMask(L, a.slidingWindow);
-    } else {
-      faMask = cache[0]!.makeMask(L, null);
-    }
-    let cur = h0;
-    for (let i = 0; i < this.layers.length; i++) {
-      const mask = a.layerTypes?.[i] === "sliding_attention" && swaMask ? swaMask : faMask;
-      const next = this.layers[i]!.forward(cur, mask, cache[i]!);
-      cur.dispose();
-      cur = next;
-    }
-    faMask.arr?.dispose();
-    swaMask?.arr?.dispose();
-    const out = this.finalNorm.forward(cur);
-    cur.dispose();
-    return out;
+class PositionMaskModel extends SelectedMaskModel {
+  protected selectMasks(caches: Cache[], length: number): Mask[] {
+    return this.layers.map((_, index): Mask => {
+      const sliding = this.args.layerTypes![index] === S, offset = caches[index]!.offset;
+      return length === 1 ? { mode: "", arr: null } : { mode: "array",
+        arr: sliding ? createCausalMask(length, Math.min(W - 1, offset), W) : createCausalMask(length, offset, null) };
+    });
   }
 }
 
@@ -365,42 +383,40 @@ const ORDERS: [string, string[]][] = [["full first", [F, S, F, S]], ["sliding fi
 describe.skipIf(!native)("Universal mixed full/sliding masks", () => {
   for (const [order, types] of ORDERS) {
     test(`explicit masks, ${order}: each group masks through its own cache at W-1, W, W+1 and across chunks`, () => {
-      const f = mixedFixture(types, true), actual = f.make(), reference = f.make(PositionMaskModel), previous = f.make(PreviousSelectionModel);
-      const caches = [actual.makeCache(), reference.makeCache(), previous.makeCache()];
-      let previousFailed = false;
+      const f = mixedFixture(types, true), actual = f.make(), reference = f.make(PositionMaskModel);
+      const caches = [actual.makeCache(), reference.makeCache()];
       try {
         expect(caches[0]!.map(cache => cache instanceof RotatingKVCache)).toEqual(types.map(type => type === S));
         for (const tokens of CHUNKS) {
-          using a = actual.forward(tokens, caches[0]!), b = reference.forward(tokens, caches[1]!);
+          using a = phaseLogits(actual, tokens, caches[0]!), b = phaseLogits(reference, tokens, caches[1]!);
           expect(a.shape).toEqual([1, tokens.length, 96]);
           expect(a.rawBytes()).toEqual(b.rawBytes());
-          // The replaced selection gives sliding layers a full-width mask; past the window it cannot run.
-          if (!previousFailed) {
-            try { using c = previous.forward(tokens, caches[2]!); c.eval(); if (c.rawBytes().join() !== a.rawBytes().join()) previousFailed = true; }
-            catch { previousFailed = true; }
-          }
         }
         expect(caches[0]![types.indexOf(S)]!.offset).toBe(12);
-        expect(previousFailed).toBe(true);
       } finally { caches.forEach(dispose); f.dispose(); }
     });
 
-    test(`ordinary masks, ${order}: the recipe reproduces the previous per-group selection exactly`, () => {
-      const f = mixedFixture(types, false), actual = f.make(), previous = f.make(PreviousSelectionModel);
-      const caches = [actual.makeCache(), previous.makeCache()];
+    // Ordinary masks have no definitional reference here (a causal-mode read
+    // and an explicit array differ in the last bits): the recorded digest holds
+    // them, recorded from the tree whose per-group selection equalled the
+    // previous one byte for byte on these chunks.
+    digests.test(`ordinary masks, ${order}: every chunk's logits and caches at W-1, W, W+1 and across chunks`, digest => {
+      const f = mixedFixture(types, false), actual = f.make();
+      const caches = actual.makeCache();
       try {
-        for (const tokens of CHUNKS) {
-          using a = actual.forward(tokens, caches[0]!), b = previous.forward(tokens, caches[1]!);
-          expect(a.rawBytes()).toEqual(b.rawBytes());
+        for (const [index, tokens] of CHUNKS.entries()) {
+          using logits = phaseLogits(actual, tokens, caches);
+          digest.tensors(`chunk ${index} logits`, logits);
+          digest.caches(`chunk ${index} caches`, caches);
         }
-      } finally { caches.forEach(dispose); f.dispose(); }
+      } finally { dispose(caches); f.dispose(); }
     });
 
     for (const lengths of [[W + 2, 2], [W - 1, W + 1]]) test(`explicit masks, ${order}: B2 rows of lengths ${lengths} ignore poisoned padding in both groups`, () => {
       const f = mixedFixture(types, true), model = f.make();
       const solos = lengths.map((length, row) => {
         const cache = model.makeCache();
-        using logits = model.forward(Array.from({ length }, (_, index) => 2 + index + row * 7), cache);
+        using logits = phaseLogits(model, Array.from({ length }, (_, index) => 2 + index + row * 7), cache);
         logits.eval(); return cache;
       });
       /** B2 caches from the solo rows; `poison` fills every padding column with large values. */
@@ -435,7 +451,7 @@ describe.skipIf(!native)("Universal mixed full/sliding masks", () => {
         expect(poisoned.some(cache => (cache as unknown as { leftPad: number[] }).leftPad.some(pad => pad > 0))).toBe(true);
         for (const length of [2, 1, 3]) {
           using ids = ops.fromInt32(Array.from({ length: 2 * length }, (_, index) => 20 + index), [2, length]);
-          using a = model.forward(ids, clean), b = model.forward(ids, poisoned);
+          using a = phaseLogits(model, ids, clean), b = phaseLogits(model, ids, poisoned);
           expect(a.shape).toEqual([2, length, 96]);
           expect(a.rawBytes()).toEqual(b.rawBytes());
         }
@@ -458,7 +474,7 @@ describe.skipIf(!native)("Universal construction binding", () => {
       expect(layout(caches[0]!)).toEqual(expected);
       expect(expected).toEqual(types.map(type => type === S ? W : "full"));
       for (const tokens of CHUNKS) {
-        using a = edited.forward(tokens, caches[0]!), b = fresh.forward(tokens, caches[1]!);
+        using a = phaseLogits(edited, tokens, caches[0]!), b = phaseLogits(fresh, tokens, caches[1]!);
         expect(a.rawBytes()).toEqual(b.rawBytes());
       }
     } finally { caches.forEach(dispose); f.dispose(); g.dispose(); }
@@ -475,10 +491,8 @@ describe.skipIf(!native)("Universal attention bound at construction", () => {
       expect(edited.encodedKvAttention).toBe(false);
       edited.args.attnLogitSoftcap = null;
       expect(edited.encodedKvAttention).toBe(false);
-      // Affine KV is admitted through certified plain reads; attention still reads plain.
-      expect([bindMlxGateway(edited).kvBatchable(immediate()), bindMlxGateway(edited).kvBatchable(delayed())]).toEqual([true, true]);
       for (const tokens of [[2, 4, 7], [8, 3], [6]]) {
-        using a = edited.forward(tokens, caches[0]!), b = fresh.forward(tokens, caches[1]!);
+        using a = phaseLogits(edited, tokens, caches[0]!), b = phaseLogits(fresh, tokens, caches[1]!);
         expect(a.rawBytes()).toEqual(b.rawBytes());
       }
     } finally { caches.forEach(dispose); f.dispose(); }
@@ -492,9 +506,8 @@ describe.skipIf(!native)("Universal attention bound at construction", () => {
       expect(edited.encodedKvAttention).toBe(true);
       edited.args.attnLogitSoftcap = 50;
       expect(edited.encodedKvAttention).toBe(true);
-      expect([bindMlxGateway(edited).kvBatchable(immediate()), bindMlxGateway(edited).kvBatchable(delayed())]).toEqual([true, true]);
       for (const tokens of CHUNKS) {
-        using a = edited.forward(tokens, caches[0]!), b = fresh.forward(tokens, caches[1]!);
+        using a = phaseLogits(edited, tokens, caches[0]!), b = phaseLogits(fresh, tokens, caches[1]!);
         expect(a.rawBytes()).toEqual(b.rawBytes());
       }
     } finally { caches.forEach(dispose); f.dispose(); g.dispose(); }
@@ -508,33 +521,37 @@ describe.skipIf(!native)("Universal forward ownership", () => {
     MlxArray.prototype.dispose = function (this: MlxArray) { calls.set(this, (calls.get(this) ?? 0) + 1); return original.call(this); };
     try { return run(array => calls.get(array) ?? 0); } finally { MlxArray.prototype.dispose = original; }
   };
-  /** Record the hidden states and masks the layers see, optionally failing layer `failAt`. */
-  const instrument = (model: UniversalDenseModel, failAt = -1) => {
-    const hidden: MlxArray[] = [], masks = new Set<MlxArray>();
+  /** Record the hidden states the layers see, optionally failing layer `failAt`, and the mask each read takes
+   * from its cache: the caches hand out their causal masks as arrays, so every release can be counted. */
+  const instrument = (model: UniversalDenseModel, caches: Cache[], failAt = -1) => {
+    const hidden: MlxArray[] = [], masks: MlxArray[] = [];
     // The forward owns its input (the scaled embedding) and every layer output.
-    const forwardLayers = (model as unknown as { forwardLayers(h: MlxArray, c: Cache[]): MlxArray }).forwardLayers.bind(model);
-    Object.assign(model, { forwardLayers: (h: MlxArray, c: Cache[]) => { hidden.push(h); return forwardLayers(h, c); } });
+    type Layers = { forwardLayers(h: MlxArray, c: Cache[], p: ReadPhase): MlxArray };
+    const forwardLayers = (model as unknown as Layers).forwardLayers.bind(model);
+    Object.assign(model, { forwardLayers: (h: MlxArray, c: Cache[], p: ReadPhase) => { hidden.push(h); return forwardLayers(h, c, p); } });
     model.layers.forEach((layer, index) => {
       const forward = layer.forward.bind(layer);
-      layer.forward = ((x: MlxArray, mask: Mask, cache: Cache) => {
-        if (mask.arr) masks.add(mask.arr);
+      layer.forward = ((x: MlxArray, cache: Cache, phase: ReadPhase) => {
         if (index === failAt) throw new Error(`layer ${index} failed`);
-        const out = forward(x, mask, cache); hidden.push(out); return out;
+        const out = forward(x, cache, phase); hidden.push(out); return out;
       }) as never;
     });
+    for (const cache of caches) kvStorage(cache).makeMask = (length: number, window: number | null) => {
+      const arr = createCausalMask(length, cache.offset, window); masks.push(arr); return { mode: "array", arr };
+    };
     return { hidden, masks };
   };
   const tokens = () => ops.fromInt32([2, 4, 7], [1, 3]);
 
-  test("a successful forward releases every intermediate and mask exactly once and returns an owned result", () => {
+  test("a successful forward releases every intermediate and every read's mask exactly once and returns an owned result", () => {
     const f = mixedFixture([S, F, S, F], true), model = f.make(), caches = model.makeCache();
     try {
       counting(count => {
-        const seen = instrument(model);
+        const seen = instrument(model, caches);
         using ids = tokens();
-        const out = model.forwardHidden(ids, caches);
+        const out = phaseHidden(model, ids, caches);
         try {
-          expect(seen.masks.size).toBe(2);
+          expect(seen.masks.length).toBe(4); // one per layer's read
           for (const array of [...seen.hidden, ...seen.masks]) expect(count(array)).toBe(1);
           expect(count(out)).toBe(0);
         } finally { out.dispose(); }
@@ -542,33 +559,32 @@ describe.skipIf(!native)("Universal forward ownership", () => {
     } finally { dispose(caches); f.dispose(); }
   });
 
-  test("a failing layer releases the owned hidden state and both masks once and keeps its error", () => {
+  test("a failing layer releases the owned hidden state and the earlier reads' masks once and keeps its error", () => {
     const f = mixedFixture([S, F, S, F], true), model = f.make(), caches = model.makeCache();
     try {
       counting(count => {
-        const seen = instrument(model, 2);
+        const seen = instrument(model, caches, 2);
         using ids = tokens();
-        expect(() => model.forwardHidden(ids, caches)).toThrow("layer 2 failed");
+        expect(() => phaseHidden(model, ids, caches)).toThrow("layer 2 failed");
         expect(seen.hidden.length).toBe(3); // the input and two layer outputs
-        expect(seen.masks.size).toBe(2);
+        expect(seen.masks.length).toBe(2);
         for (const array of [...seen.hidden, ...seen.masks]) expect(count(array)).toBe(1);
       });
     } finally { dispose(caches); f.dispose(); }
   });
 
-  test("a failing second mask releases the input and the first mask", () => {
-    // Sliding first: the full group's mask (cache 1) is built before the sliding group's (cache 0).
+  test("a failing mask releases the forward's hidden states and the earlier read's mask once and keeps its error", () => {
+    // Sliding first: layer 0 reads its ring's mask, then layer 1's full cache fails to build one.
     const f = mixedFixture([S, F, S, F], true), model = f.make(), caches = model.makeCache();
     try {
       counting(count => {
-        const seen = instrument(model);
-        let first: MlxArray | null = null;
-        caches[1]!.makeMask = (length: number) => ({ mode: "array", arr: first = createCausalMask(length, 0, null) });
-        caches[0]!.makeMask = () => { throw new Error("sliding mask failed"); };
+        const seen = instrument(model, caches);
+        kvStorage(caches[1]!).makeMask = () => { throw new Error("full mask failed"); };
         using ids = tokens();
-        expect(() => model.forwardHidden(ids, caches)).toThrow("sliding mask failed");
-        expect(first).not.toBeNull();
-        expect([count(seen.hidden[0]!), count(first!)]).toEqual([1, 1]);
+        expect(() => phaseHidden(model, ids, caches)).toThrow("full mask failed");
+        expect(seen.masks.length).toBe(1);
+        expect(seen.hidden.length).toBe(2); // the input and layer 0's output
+        for (const array of [...seen.hidden, ...seen.masks]) expect(count(array)).toBe(1);
       });
     } finally { dispose(caches); f.dispose(); }
   });
@@ -576,19 +592,19 @@ describe.skipIf(!native)("Universal forward ownership", () => {
   test("throwing destructors never release an array twice and never leak the survivor", () => {
     const f = mixedFixture([S, F, S, F], true), model = f.make();
     try {
-      // A mask destructor fails after every layer ran: it is not retried and the last hidden state is still released.
+      // A read's mask destructor fails: it is not retried, and the hidden states are still released.
       let caches = model.makeCache();
       try {
         counting(count => {
-          const seen = instrument(model);
+          const seen = instrument(model, caches);
           let failing: MlxArray | null = null;
-          caches[1]!.makeMask = (length: number) => {
+          kvStorage(caches[1]!).makeMask = (length: number) => {
             const arr = failing = createCausalMask(length, 0, null), release = arr.dispose.bind(arr);
             arr.dispose = () => { release(); throw new Error("mask release failed"); };
             return { mode: "array", arr };
           };
           using ids = tokens();
-          expect(() => model.forwardHidden(ids, caches)).toThrow("mask release failed");
+          expect(() => phaseHidden(model, ids, caches)).toThrow("mask release failed");
           expect(failing).not.toBeNull();
           for (const array of [...seen.hidden, ...seen.masks]) expect(count(array)).toBe(1);
           expect(count(failing!)).toBe(1);
@@ -600,15 +616,15 @@ describe.skipIf(!native)("Universal forward ownership", () => {
         counting(count => {
           const layers = model.layers, last = layers[layers.length - 1]!, forward = last.forward.bind(last);
           let normalized: MlxArray | null = null;
-          last.forward = ((x: MlxArray, mask: Mask, cache: Cache) => {
-            const out = forward(x, mask, cache), release = out.dispose.bind(out);
+          last.forward = ((x: MlxArray, cache: Cache, phase: ReadPhase) => {
+            const out = forward(x, cache, phase), release = out.dispose.bind(out);
             out.dispose = () => { release(); throw new Error("hidden release failed"); };
             return out;
           }) as never;
           const norm = model.finalNorm.forward.bind(model.finalNorm);
           model.finalNorm.forward = ((x: MlxArray) => normalized = norm(x)) as never;
           using ids = tokens();
-          expect(() => model.forwardHidden(ids, caches)).toThrow("hidden release failed");
+          expect(() => phaseHidden(model, ids, caches)).toThrow("hidden release failed");
           expect(count(normalized!)).toBe(1);
         });
       } finally { dispose(caches); }
@@ -625,7 +641,6 @@ test.skipIf(!native || !artifact)("cached Gemma2 preserves B1 and serves ragged 
     expect(config.modelType).toBe("gemma2");
     const model = createModel(weights, config) as UniversalDenseModel;
     const binding = bindMlxGateway(model);
-    expect(binding.cachesBatchable()).toBe(true);
     // Main's Gemma2 L1 descriptor deliberately uses full attention, matching
     // the pinned mlx-lm implementation even if HF config lists a window.
     expect(model.args.layerTypes).toBeNull(); expect(model.args.slidingWindow).toBeNull();
@@ -639,16 +654,16 @@ test.skipIf(!native || !artifact)("cached Gemma2 preserves B1 and serves ragged 
       const caches = model.makeCache(), logits: Float32Array[] = [];
       try {
         // Default prefill tail split: head first, then token zero at L=1.
-        using prefix = model.forward(prompt.slice(0, -1), caches); prefix.eval();
+        using prefix = phaseLogits(model, prompt.slice(0, -1), caches); prefix.eval();
         for (let step = 0; step < steps; step++) {
-          using result = model.forward([step ? forced[step - 1]! : prompt.at(-1)!], caches);
+          using result = phaseLogits(model, [step ? forced[step - 1]! : prompt.at(-1)!], caches);
           logits.push(result.toFloat32());
         }
         return logits;
       } finally { dispose(caches); }
     };
     const baseline = prompts.map(direct);
-    const runtime = createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1", MLX_BUN_COMPILED_DECODE: "0" });
+    const runtime = createRuntimeConfig({});
     for (const capacity of [1, 2, 4]) {
       let held = true, joined = false, highWater = 0;
       const group = binding.createBatchGroup({ maxBatch: capacity, admissionHeld: () => held,
@@ -737,7 +752,7 @@ test.skipIf(!native || !artifact || !referencePath)("real Gemma2 ragged B2/B4 lo
       expect(expected.steps).toHaveLength(3);
       const solos = lengths.map(length => {
         const caches = model.makeCache();
-        using logits = model.forward(Array.from({ length }, (_, i) => i + 2), caches); logits.eval();
+        using logits = phaseLogits(model, Array.from({ length }, (_, i) => i + 2), caches); logits.eval();
         return caches;
       });
       const caches = model.layers.map((_, layer) => {
@@ -750,7 +765,7 @@ test.skipIf(!native || !artifact || !referencePath)("real Gemma2 ragged B2/B4 lo
           const tokens = step === 2 ? [25] : Array.from({ length: rows * length }, (_, i) => i + 10);
           expect(expected.steps[step].ids).toEqual(Array.from({ length: rows }, (_, row) => tokens.slice(row * length, (row + 1) * length)));
           using ids = ops.fromInt32(tokens, [rows, length]);
-          using logits = model.forward(ids, caches);
+          using logits = phaseLogits(model, ids, caches);
           expect(encoded(logits), `B${batch} step ${step} logits`).toEqual(expected.steps[step].logits);
           const state = caches.map(cache => {
             const view = cache.captureDonorRows();
@@ -799,7 +814,7 @@ test.skipIf(!native || !artifact)("cached Gemma2 plain fill matches main's seria
     // append), one forward per verify span, and a trim after a rejection.
     const serial = (prompt: number[], fill: Session | null) => {
       const caches = model.makeCache(), logits: string[] = [], tokens: number[] = [];
-      const forward = (ids: number[]) => { using input = ops.fromInt32(ids, [1, ids.length]); return model.forwardHidden(input, caches); };
+      const forward = (ids: number[]) => { using input = ops.fromInt32(ids, [1, ids.length]); return phaseHidden(model, input, caches); };
       const project = (hidden: MlxArray) => { const out = model.logitsFromHidden(hidden); logits.push(...hashRows(out)); return out; };
       try {
         { using head = forward(prompt.slice(0, -1)); head.eval(); }
@@ -868,9 +883,9 @@ test.skipIf(!native || !artifact)("cached Gemma2 plain fill matches main's seria
     });
 
     const binding = bindMlxGateway(model);
-    const runtime = createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1", MLX_BUN_COMPILED_DECODE: "0" });
-    const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false, kvQuant: false,
-      turboQuant: false, hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
+    const runtime = createRuntimeConfig({});
+    const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
+      hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
     const logitsFromHidden = model.logitsFromHidden;
     // Each row joins after the previous row's first token. The B4 case cancels
     // its third row, which is live when the fourth joins, so four rows share
@@ -890,7 +905,7 @@ test.skipIf(!native || !artifact)("cached Gemma2 plain fill matches main's seria
       let highWater = 0;
       const submit = (position: number) => {
         const index = order[position]!, fill = session(index, plans[index]!), options = { maxTokens, temperature: 0, fill };
-        const plan = binding.plan(shape, options, { continuous: binding.cachesBatchable(), quantizedBatch: false, checkpoints: false });
+        const plan = binding.plan(shape, options, { checkpoints: false });
         expect(plan).toMatchObject({ method: "autoregressive", mechanism: "continuous", fill: true });
         emitted.set(index, []); sessions.set(index, fill);
         pending.push(group.submit({ promptIds: prompts[index]!, maxTokens, eosTokenIds: eos, method: binding.methodRequest!(plan, options)!,
@@ -953,15 +968,14 @@ test.skipIf(!native || !artifact)("cached Gemma2 two-model speculation keeps B1 
       prompt("List four facts about the Moon, one per line.")];
     // Target forward geometry, measured (the draft instance is separate).
     const widths: number[] = [];
-    const forwardHidden = model.forwardHidden.bind(model);
-    model.forwardHidden = (ids: MlxArray, caches: Cache[]) => { widths.push(ids.shape[0]!); return forwardHidden(ids, caches); };
-    const binding = bindMlxGateway(model, { provider: draft!, numDraftTokens: 3 });
-    const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false, kvQuant: false,
-      turboQuant: false, hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true };
+    const view = observedPhases(model, { forward(ids: MlxArray) { widths.push(ids.shape[0]!); } });
+    const binding = bindMlxGateway(view, { provider: draft!, numDraftTokens: 3 });
+    const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
+      hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true };
     const options = { maxTokens: 32, temperature: 0 };
-    const plan = binding.plan(shape, options, { continuous: binding.cachesBatchable(), quantizedBatch: false, checkpoints: false });
+    const plan = binding.plan(shape, options, { checkpoints: false });
     expect(plan).toMatchObject({ method: "speculative", mechanism: "continuous" });
-    const runtime = createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1", MLX_BUN_COMPILED_DECODE: "0" });
+    const runtime = createRuntimeConfig({});
     const group = binding.createBatchGroup({ maxBatch: 4, prefillChunkSize: 512, runtime });
     const submit = (index: number, hooks: { signal?: AbortSignal; onToken?: (tokens: number[]) => void } = {}) => {
       const tokens: number[] = [];
@@ -1021,7 +1035,7 @@ test.skipIf(!native || !artifact)("cached Gemma2 two-model speculation keeps B1 
           try {
             const request = { ...options, maxTokens: 16, grammar };
             const grammarShape = { ...shape, hasGrammar: true, hasDraft: speculate };
-            const placed = binding.plan(grammarShape, request, { continuous: true, quantizedBatch: false, checkpoints: false });
+            const placed = binding.plan(grammarShape, request, { checkpoints: false });
             expect(placed).toMatchObject({ method: speculate ? "speculative" : "autoregressive", mechanism: "continuous" });
             const ordinary = speculate ? undefined : createRowSampling(makeStepSampler(request, { tokenRepresentation: "device",
               grammarWait: "external", historyUpdate: "after-sample", initialHistory: prompts[2]! }), token => { tokens.push(token); });
@@ -1088,20 +1102,15 @@ test.skipIf(!native || !artifact)("cached Gemma2 n-gram speculation mixes empty 
     // the hooks go in first.
     const forwards: string[] = [], rounds: number[][] = [], rowZero: string[] = [];
     let capture = false;
-    const forwardHidden = model.forwardHidden.bind(model), logitsFromHidden = model.logitsFromHidden.bind(model);
-    model.forwardHidden = (...args: Parameters<typeof forwardHidden>) => {
-      forwards.push(`${args[0].shape[0]}x${args[0].shape[1]}`);
-      return forwardHidden(...args);
-    };
-    model.logitsFromHidden = (...args: Parameters<typeof logitsFromHidden>) => {
-      const out = logitsFromHidden(...args);
-      if (capture) {
+    const view = observedPhases(model, {
+      forward(ids: MlxArray) { forwards.push(`${ids.shape[0]}x${ids.shape[1]}`); },
+      head(_hidden: MlxArray, out: MlxArray) {
+        if (!capture) return;
         using row = out.slice([0, 0, 0], [1, out.shape[1]!, out.shape[2]!]);
         using flat = ops.contiguous(row);
         rowZero.push(createHash("sha256").update(flat.rawBytes()).digest("hex"));
-      }
-      return out;
-    };
+      },
+    });
     const recorded = (policy?: { max: number; min: number }) => {
       const provider = new NgramProvider(policy), open = provider.grouped.open.bind(provider.grouped);
       Object.assign(provider.grouped, { open: (options: Parameters<typeof open>[0]) => {
@@ -1119,11 +1128,11 @@ test.skipIf(!native || !artifact)("cached Gemma2 n-gram speculation mixes empty 
     // Lookup policies are served knobs: the default (3..1), and a 4-gram policy
     // under which novel-text peers propose nothing. Ten draft tokens is the
     // served n-gram default.
-    const lookup = bindMlxGateway(model, { provider: recorded(), numDraftTokens: 10 });
-    const strict = bindMlxGateway(model, { provider: recorded({ max: 4, min: 4 }), numDraftTokens: 10 });
-    const runtime = createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1", MLX_BUN_COMPILED_DECODE: "0" });
-    const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false, kvQuant: false,
-      turboQuant: false, hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true };
+    const lookup = bindMlxGateway(view, { provider: recorded(), numDraftTokens: 10 });
+    const strict = bindMlxGateway(view, { provider: recorded({ max: 4, min: 4 }), numDraftTokens: 10 });
+    const runtime = createRuntimeConfig({});
+    const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
+      hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true };
     const greedy: GenerateOptions = { maxTokens: 32, temperature: 0 };
     const seeded: GenerateOptions = { maxTokens: 32, temperature: 0.7, seed: 7 };
     type Row = { prompt: number[]; options?: GenerateOptions; joinOnFirst?: number; cancelAt?: number; stopAt?: number };
@@ -1139,7 +1148,7 @@ test.skipIf(!native || !artifact)("cached Gemma2 n-gram speculation mixes empty 
       const start = (index: number) => {
         const row = spec[index]!, outcome = outcomes[index]!, options = row.options ?? greedy, abort = new AbortController();
         const plan = binding.plan({ ...shape, userSeed: options.seed !== undefined }, options,
-          { continuous: binding.cachesBatchable(), quantizedBatch: false, checkpoints: false });
+          { checkpoints: false });
         expect(plan).toMatchObject({ method: "speculative", mechanism: "continuous" });
         started.push(group.submit({ promptIds: row.prompt, maxTokens: options.maxTokens!, eosTokenIds: eos, signal: abort.signal,
           method: binding.methodRequest!(plan, options)!,
@@ -1249,7 +1258,7 @@ test.skipIf(!native || !artifact)("cached Gemma2 n-gram speculation mixes empty 
       const unconstrained: number[] = [];
       await group.submit({ promptIds: moon, maxTokens: 16, eosTokenIds: eos, onToken: token => { unconstrained.push(token); },
         method: lookup.methodRequest!(lookup.plan(shape, { maxTokens: 16, temperature: 0 },
-          { continuous: true, quantizedBatch: false, checkpoints: false }), { maxTokens: 16, temperature: 0 })! });
+          { checkpoints: false }), { maxTokens: 16, temperature: 0 })! });
       for (const [body, valid, terminates] of [
         [{ guided_choice: ["Paris", "Lisbon", "Kyoto"] }, /^(Paris|Lisbon|Kyoto)$/, true],
         [{ guided_grammar: 'root ::= ("yes" | "no") ", " [a-z] [a-z] [a-z]*' }, /^(yes|no), [a-z]{2,}$/, false],
@@ -1262,7 +1271,7 @@ test.skipIf(!native || !artifact)("cached Gemma2 n-gram speculation mixes empty 
           try {
             const request = { maxTokens: 16, temperature: 0, grammar };
             const placed = lookup.plan({ ...shape, hasGrammar: true, hasDraft: speculate }, request,
-              { continuous: true, quantizedBatch: false, checkpoints: false });
+              { checkpoints: false });
             expect(placed).toMatchObject({ method: speculate ? "speculative" : "autoregressive", mechanism: "continuous" });
             const ordinary = speculate ? undefined : createRowSampling(makeStepSampler(request, { tokenRepresentation: "device",
               grammarWait: "external", historyUpdate: "after-sample", initialHistory: moon }), token => { tokens.push(token); });
@@ -1312,31 +1321,30 @@ test.skipIf(!native || !artifact)("a structurally equivalent delegating provider
       prompt("Explain step by step how bread dough rises overnight in a bakery.")];
     // Every target forward's geometry and every projection's exact bytes.
     const forwards: string[] = [], logits: string[] = [];
-    const forwardHidden = model.forwardHidden.bind(model), logitsFromHidden = model.logitsFromHidden.bind(model);
-    model.forwardHidden = (...args: Parameters<typeof forwardHidden>) => { forwards.push(args[0].shape.join("x")); return forwardHidden(...args); };
-    model.logitsFromHidden = (...args: Parameters<typeof logitsFromHidden>) => {
-      const out = logitsFromHidden(...args);
-      using flat = ops.contiguous(out);
-      logits.push(createHash("sha256").update(flat.rawBytes()).digest("hex"));
-      return out;
-    };
+    const view = observedPhases(model, {
+      forward(ids: MlxArray) { forwards.push(ids.shape.join("x")); },
+      head(_hidden: MlxArray, out: MlxArray) {
+        using flat = ops.contiguous(out);
+        logits.push(createHash("sha256").update(flat.rawBytes()).digest("hex"));
+      },
+    });
     /** The n-gram provider's operations behind a plain object: no class identity, same contracts. */
     const delegating = (): DraftProvider => {
       const inner = new NgramProvider(), grouped = inner.grouped;
-      return { id: "ngram-delegate", weightsBytes: 0, open: options => inner.open(options), dispose: () => inner.dispose(),
+      return { id: "ngram-delegate", weightsBytes: 0, dispose: () => inner.dispose(),
         grouped: { checkpointNamespace: () => grouped.checkpointNamespace!(), supportsTargetAdapters: grouped.supportsTargetAdapters,
           open: options => grouped.open(options), openPrefill: options => grouped.openPrefill(options) } };
     };
-    const runtime = createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1", MLX_BUN_COMPILED_DECODE: "0" });
-    const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false, kvQuant: false,
-      turboQuant: false, hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true };
+    const runtime = createRuntimeConfig({});
+    const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
+      hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true };
     const options = { maxTokens: 24, temperature: 0 };
     // Row 0 first runs alone (the fresh B1 baseline). Then row 0 leads again,
     // row 1 joins at its first token and row 2 at row 1's first token, cancelled
     // at its third; the group drains, and row 0 reruns alone (the recovery).
     const run = async (provider: DraftProvider) => {
-      const binding = bindMlxGateway(model, { provider, numDraftTokens: 10 });
-      const plan = binding.plan(shape, options, { continuous: binding.cachesBatchable(), quantizedBatch: false, checkpoints: false });
+      const binding = bindMlxGateway(view, { provider, numDraftTokens: 10 });
+      const plan = binding.plan(shape, options, { checkpoints: false });
       expect(plan).toMatchObject({ method: "speculative", mechanism: "continuous" });
       const group = binding.createBatchGroup({ maxBatch: 4, prefillChunkSize: 512, runtime });
       forwards.length = 0; logits.length = 0;
@@ -1394,50 +1402,60 @@ test.skipIf(!native || !artifact)("a structurally equivalent delegating provider
   } finally { weights.dispose(); }
 }, 900_000);
 
-// A graph that reads plain KV serves affine KV rows while their storage reads
-// plain. At a row's actual transition its pending output publishes first (it
-// may finish there), then only that row is rejected, before any shared append.
-describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
+// A graph that reads dense KV (Gemma 2's softcapped read) serves affine KV rows
+// before and after each row's transition: its manual attention reads the
+// storage's dense fetch, the bf16 window through the append that reaches the
+// start and the window dequantized after it (dequantize-and-read, so a
+// converted layer keeps the graph's own arithmetic over the values its storage
+// holds). The requantizing-oracle case holds every phase to that definition at
+// maxDiff 0; the served rows of every kind are held to the direct B1 order.
+describe.skipIf(!native)("dense-read graphs with delayed affine KV", () => {
+  beforeAll(loadStateValues);
   const types = [F, S, F, S];
   // Rows that pass the transition in prefill convert for real: affine
   // quantization needs a head dimension divisible by its group size (64).
   const HEAD_DIM = 64;
   type End = { stopAfter?: number; cancelAfter?: number; eos?: number[] };
   type SetupOptions = { tailSplit?: boolean; chunk?: number; pipeline?: boolean; turbo?: boolean;
-    promptCache?: import("../../../src/execution/batch-types").RowPromptCache; grammarJump?: boolean;
+    promptCache?: PrefixStore; grammarJump?: boolean;
     kvScheme?: ReturnType<typeof resolveKvScheme>; encoded?: boolean; direct?: boolean };
   /** The Gemma2-style mixed graph; without manual softcap attention it reads encoded KV. */
-  const setup = async (start: number | null, options: SetupOptions = {}) => {
+  const setup = async (start: number | null, options: SetupOptions = {}) => setupWith(composition => {
     const f = mixedFixture(types, !options.encoded, HEAD_DIM);
-    return setupWith({ model: f.make(), dispose: () => f.dispose() }, start, options);
-  };
-  /** A group over `graph`, which the environment owns and releases on close. */
+    return { model: f.make(undefined, composition), dispose: () => f.dispose() };
+  }, start, options);
+  /** A group over the graph `build` composes with the environment's KV scheme
+   * (bf16 without one); the environment owns the graph and releases it on close. */
   const setupWith = async <M extends SpanGraph & import("../../../src/models/factory").RuntimeModel>(
-    graph: { model: M; dispose(): void }, start: number | null, options: SetupOptions = {}) => {
-    const { bindMlxGateway, createRuntimeConfig, createRowSampling, withRuntimeConfig, MlxBatchExecutionGroup } = await import("../../../src/execution");
+    build: (composition: Composition) => { model: M; dispose(): void } | Promise<{ model: M; dispose(): void }>,
+    start: number | null, options: SetupOptions = {}) => {
+    const { bindMlxGateway, createRuntimeConfig, createRowSampling, MlxBatchExecutionGroup } = await import("../../../src/execution");
     const { makeStepSampler } = await import("../../../src/sampling");
-    const f = graph, model = graph.model;
-    const binding = options.grammarJump
-      ? withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }), () => bindMlxGateway(model))
-      : bindMlxGateway(model);
     const kvScheme = options.kvScheme ?? (start === null ? undefined : options.turbo
       ? resolveKvScheme({ turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: start })
       : resolveKvScheme({ override: 4, quantizedKvStart: start }));
+    const f = await build(testComposition(kvScheme?.storage,
+      { prefillTailSplit: options.tailSplit !== false, grammarJump: options.grammarJump === true })), model = f.model;
+    // The scheduler binds to a view of the graph whose phases call the hooks a test adds (`forwardHooks`
+    // before each forward, `headHooks` after each head projection); methods bind on first submission.
+    const forwardHooks: ((ids: MlxArray, caches: Cache[]) => void)[] = [], headHooks: ((logits: MlxArray) => void)[] = [];
+    const view = observedPhases(model, {
+      forward(ids, caches) { for (const hook of forwardHooks) hook(ids, caches); },
+      head(_hidden, logits) { for (const hook of headHooks) hook(logits); },
+    });
+    const binding = bindMlxGateway(view);
     let held = false;
     const groupOptions = { maxBatch: 2, prefillChunkSize: options.chunk ?? 64, admissionHeld: () => held,
-      ...(options.promptCache ? { promptCache: options.promptCache } : {}),
+      ...(options.promptCache ? { cache: keepingIn(view, options.promptCache) } : {}),
       // Compiled decode stays at its default: these graphs bind none (below).
-      runtime: createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: options.tailSplit === false ? "0" : "1",
-        ...(options.pipeline === false ? { MLX_BUN_BATCH_NO_PIPELINE: "1" } : {}) }),
-      ...(kvScheme ? { kvScheme } : {}) };
-    // Composed directly, the group binds the graph's own declaration; only
-    // the delayed-affine capability is the composer's to state.
+      runtime: createRuntimeConfig(options.pipeline === false ? { MLX_BUN_BATCH_NO_PIPELINE: "1" } : {}) };
+    // Composed directly, the group binds the graph's own declaration and composition.
     const group = options.direct
-      ? new MlxBatchExecutionGroup(model, { ...groupOptions, kvBatchCapabilities: { delayedAffine: true } })
+      ? new MlxBatchExecutionGroup(view, groupOptions)
       : binding.createBatchGroup(groupOptions);
     const submit = (prompt: number[], maxTokens: number, end: End = {}, grammar?: import("../../../src/sampling").GrammarController) => {
       const tokens: number[] = [], abort = new AbortController();
-      const request = { maxTokens, temperature: 0, ...(kvScheme?.generationOptions ?? {}) };
+      const request = { maxTokens, temperature: 0 };
       const sampling = createRowSampling(makeStepSampler(request, { tokenRepresentation: "device", grammarWait: "external", historyUpdate: "after-sample",
         initialHistory: prompt }), token => {
         tokens.push(token);
@@ -1457,16 +1475,24 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
       held = false; group.kick();
       return Promise.all(pending);
     };
-    return { binding, model, kvScheme, group, submit, together,
+    return { binding, model, view, kvScheme, group, submit, together, forwardHooks, headHooks,
       async close() { try { await group.close(); expect(group.activeRows + group.pendingRows).toBe(0); } finally { f.dispose(); } } };
   };
   const A = [2, 4, 7, 9, 3], B = [5, 8];
   /** Every projection's complete logits, in order: shape, dtype and bytes, so
    * matching geometry is asserted along with the values. */
   /** What the span helpers read from a test environment. */
-  type SpanEnv = Pick<Awaited<ReturnType<typeof setup>>, "binding" | "kvScheme" | "group"> & {
+  type SpanEnv = Pick<Awaited<ReturnType<typeof setup>>, "binding" | "kvScheme" | "group" | "forwardHooks"> & {
+    /** The graph the scheduler binds: a view whose phases call the hooks (`forwardHooks`). */
+    view: object;
     model: SpanGraph & import("../../../src/models/factory").RuntimeModel };
-  type SpanGraph = Pick<UniversalDenseModel, "forwardHidden" | "logitsFromHidden">;
+  type SpanGraph = Pick<import("../../../src/contracts/mlx/graph").MlxTokenPhases, "prefillTail" | "decode" | "logits"> &
+    { logitsFromHidden(hidden: MlxArray): MlxArray };
+  /** A view of `model` for the scheduler whose phases call the hooks a test adds before each forward. */
+  const hooked = <M extends object>(model: M) => {
+    const forwardHooks: ((ids: MlxArray, caches: Cache[]) => void)[] = [];
+    return { view: observedPhases(model, { forward(ids, caches) { for (const hook of forwardHooks) hook(ids, caches); } }), forwardHooks };
+  };
   const projections = (env: SpanEnv) => {
     const seen: { shape: number[]; dtype: string; sha256: string }[] = [], project = env.model.logitsFromHidden.bind(env.model);
     env.model.logitsFromHidden = (hidden: MlxArray) => {
@@ -1479,13 +1505,10 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
   };
   // A peer's control shares its schedule, not only its prompt: batch shape
   // changes bf16 rounding (one layer-3 projection element here), so B decoded
-  // beside A is compared with plain KV where A leaves after the same tokens,
-  // read before the next build (unpipelined), exactly as the boundary flush does.
-  const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false, kvQuant: true,
-    turboQuant: false, hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
+  // beside A is compared with plain KV where A runs the same schedule.
+  const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
+    hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
 
-  /** The graph's attention reads every layer's keys and values plain. */
-  const LAYERS = types.map((_, layer) => layer);
   /** A permissive matcher that forces the given spans, one per jump. */
   const spanGrammar = (spans: readonly (readonly number[])[]) => {
     const accepted: number[] = [];
@@ -1511,23 +1534,18 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
 
   type Reference = { encoded?: boolean; sampling?: Partial<GenerateOptions> };
   /** The direct B1 jump-forward step order from `cached` restored tokens: one
-   * maintenance, then one unsplit forward of the pending token and its forced
-   * span. Softcap attention cannot read a converted affine layer, so on a
-   * plain-read graph the reference stops at the first maintenance that leaves
-   * one: that step's token reaches the matcher but is never published. An
-   * encoded-read graph reads converted layers and continues. The caller owns
-   * `model` and `caches`. */
+   * unsplit forward of the pending token and its forced span per step. The
+   * caches are the ones `model` composes with its scheme, which convert inside
+   * the append that leaves them holding the start (a restored prefix converts
+   * when it is composed). Both graphs read converted layers and continue. The
+   * caller owns `model` and `caches`. */
   const directSpansFrom = async (model: SpanGraph, caches: Cache[], prompt: number[], cached: number, maxTokens: number,
-    scheme: ReturnType<typeof resolveKvScheme>, spans: number[][], { encoded = false, sampling = {} }: Reference = {}) => {
-    const { createKvMaintenance } = await import("../../../src/state/kv-maintenance");
+    spans: number[][], { sampling = {} }: Reference = {}) => {
     const { makeStepSampler } = await import("../../../src/sampling");
-    const maintain = createKvMaintenance(scheme.generationOptions);
-    const readable = () => encoded || caches.every(cache => cache.denseKvReads !== undefined);
     const grammar = spanGrammar(spans);
     const sampler = makeStepSampler({ temperature: 0, ...sampling, grammar }, { tokenRepresentation: "device", grammarWait: "external",
       historyUpdate: "manual", initialHistory: prompt });
     const seen: Projection[] = [], tokens: number[] = [];
-    let refused = false;
     const project = (hidden: MlxArray) => {
       const [, length, width] = hidden.shape as [number, number, number];
       using last = hidden.slice([0, length - 1, 0], [1, length, width]);
@@ -1538,63 +1556,57 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
     let pending: MlxArray | null = null;
     try {
       run: {
-        maintain(caches);
-        if (!readable()) { refused = true; break run; }
         if (prompt.length - 1 > cached) {
           using ids = ops.fromInt32(prompt.slice(cached, -1), [1, prompt.length - 1 - cached]);
-          using head = model.forwardHidden(ids, caches); head.eval();
+          using head = phaseHidden(model, ids, caches); head.eval();
         }
-        maintain(caches);
-        if (!readable()) { refused = true; break run; }
-        { using ids = ops.fromInt32([prompt.at(-1)!], [1, 1]); using hidden = model.forwardHidden(ids, caches);
+        { using ids = ops.fromInt32([prompt.at(-1)!], [1, 1]); using hidden = phaseHidden(model, ids, caches);
           using logits = project(hidden); pending = draw(logits, 0); }
         while (pending) {
           using current = pending;
           pending = null;
           const token = current.toIntTokens()[0]!, step = tokens.length;
           const forced = step + 1 < maxTokens ? (grammar.accept(token), grammar.jumpForward(maxTokens - (step + 1))) : null;
-          if (forced || step + 1 < maxTokens) {
-            maintain(caches);
-            if (!readable()) { refused = true; break; }
-          }
           if (forced) {
             sampler.commitDevice(current);
             sampler.commitNumbers(forced);
             const after = step + 1 + forced.length;
             using ids = ops.fromInt32([token, ...forced], [1, forced.length + 1]);
-            using hidden = model.forwardHidden(ids, caches);
+            using hidden = phaseHidden(model, ids, caches);
             if (after < maxTokens) { using logits = project(hidden); pending = draw(logits, after); }
           } else if (step + 1 < maxTokens) {
             sampler.commitDevice(current);
             using ids = ops.fromInt32([token], [1, 1]);
-            using hidden = model.forwardHidden(ids, caches);
+            using hidden = phaseHidden(model, ids, caches);
             using logits = project(hidden); pending = draw(logits, step + 1);
           }
           tokens.push(token, ...(forced ?? []));
         }
       }
-      return { tokens, seen, accepted: grammar.accepted, refused, kinds: caches.map(cache => cache.constructor.name) };
+      return { tokens, seen, accepted: grammar.accepted, kinds: caches.map(storageKind) };
     } finally { pending?.dispose(); sampler.dispose(); }
   };
+  /** The direct B1 order over a fresh mixed graph composed with `scheme`. */
   const directSpans = async (prompt: number[], maxTokens: number, scheme: ReturnType<typeof resolveKvScheme>, spans: number[][],
     reference: Reference = {}) => {
-    const f = mixedFixture(types, !reference.encoded, HEAD_DIM), model = f.make(), caches = model.makeCache();
-    try { return await directSpansFrom(model, caches, prompt, 0, maxTokens, scheme, spans, reference); }
+    const f = mixedFixture(types, !reference.encoded, HEAD_DIM), model = f.make(undefined, testComposition(scheme.storage));
+    const caches = model.makeCache();
+    try { return await directSpansFrom(model, caches, prompt, 0, maxTokens, spans, reference); }
     finally { dispose(caches); f.dispose(); }
   };
 
   type SpanEnd = { stopAfter?: number; cancelAfter?: number; throwAfter?: number };
-  /** Direct callers bind the span method with the graph's layers themselves. */
+  /** Direct callers bind the span method themselves. */
   const submitSpans = async (env: SpanEnv, prompt: number[], maxTokens: number,
     spans: number[][], end: SpanEnd = {}, onPublish?: (published: number) => void,
     method?: (options: GenerateOptions) => import("../../../src/execution/batch-types").MlxGroupMethodRequest,
     extra: Partial<GenerateOptions> = {}) => {
     const { bindGrammarGroupRequests } = await import("../../../src/execution/grammar-group");
     const grammar = spanGrammar(spans), tokens: number[] = [], abort = new AbortController();
-    const options = { temperature: 0, maxTokens, ...env.kvScheme!.generationOptions, ...extra, grammar };
+    const options = { temperature: 0, maxTokens, ...extra, grammar };
     const failure = new Error("consumer failed");
     const outcome = await env.group.submit({ promptIds: prompt, maxTokens, eosTokenIds: [], grammar, signal: abort.signal,
-      method: (method ?? bindGrammarGroupRequests(env.model, LAYERS, LAYERS.length))(options),
+      method: (method ?? bindGrammarGroupRequests(env.view as typeof env.model))(options),
       onToken(token: number) {
         tokens.push(token); onPublish?.(tokens.length);
         if (tokens.length === end.cancelAfter) abort.abort(new DOMException("client left", "AbortError"));
@@ -1603,22 +1615,29 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
       } }).then(stats => stats.finishReason as string, (error: Error) => error === failure ? "consumer failed" : error.name);
     return { tokens, outcome, accepted: grammar.accepted };
   };
-  /** The span method the gateway binds, with the layers from its own cache probe. */
+  /** The span method the gateway binds; the KV scheme is the bound graph's composition. */
   const gatewaySpans = (env: SpanEnv) => (options: GenerateOptions) => {
-    const turboQuant = !!env.kvScheme!.generationOptions.turboQuant;
-    const execution = env.binding.plan({ ...shape, kvQuant: !turboQuant, turboQuant, hasGrammar: true,
+    const execution = env.binding.plan({ ...shape, hasGrammar: true,
       hasRepetitionPenalty: options.repetitionPenalty !== undefined }, options,
-      { continuous: true, quantizedBatch: env.binding.kvBatchable(env.kvScheme!), checkpoints: false });
+      { checkpoints: false });
     expect(execution).toMatchObject({ method: "autoregressive", mechanism: "continuous", grammarJump: true });
     return env.binding.methodRequest!(execution, options)!;
+  };
+  /** The span method bound directly. The planner serves grammar jump as
+   * verified proposals on a graph whose verifier qualifies them, whatever its
+   * KV storage; such a graph exercises the span lego itself through this binding. */
+  const boundSpans = async (env: SpanEnv) => {
+    const { bindGrammarGroupRequests } = await import("../../../src/execution/grammar-group");
+    return bindGrammarGroupRequests(env.view as typeof env.model);
   };
   const spansA = [[11, 12], [13]], spansB = [[21], [22, 23]];
 
   /** A small Llama-style graph over affine-quantized synthetic weights, as its
    * artifacts ship; affine KV needs a head dimension of the group size.
-   * Deterministic: two instances are identical. */
-  const quantizedGraph = <M extends object>(Model: new (weights: Weights, config: ModelConfig) => M, modelType: string,
-    { layers = 2, qkNorm = false } = {}) => {
+   * Deterministic: two instances are identical. The graph is composed with
+   * `composition` (bf16 KV unless it names a scheme). */
+  const quantizedGraph = <M extends object>(Model: new (weights: Weights, config: ModelConfig, composition: Composition) => M,
+    modelType: string, { layers = 2, qkNorm = false, composition = testComposition() } = {}) => {
     const hidden = 64, heads = 2, kvHeads = 1, intermediate = 128, vocab = 96;
     const spec = { bits: 4, groupSize: 64, mode: "affine" };
     const config = { modelType, raw: { model_type: modelType }, eosTokenIds: [],
@@ -1655,7 +1674,7 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
     }
     const weights = { shards: { files: new Map() }, tensorNames: [...arrays.keys()],
       has: (name: string) => arrays.has(name), tensor: (name: string) => arrays.get(name)! } as unknown as Weights;
-    const model = new Model(weights, config);
+    const model = new Model(weights, config, composition);
     return { model, dispose() {
       // The weights and any array the graph derived from them at construction.
       const owned = new Set<MlxArray>(arrays.values()), seen = new Set<object>();
@@ -1670,22 +1689,21 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
   };
 
   test("admission: affine KV binds as ordinary continuous decoding; the graph binds no compiled replay; TurboQuant binds through dense reads", async () => {
-    const env = await setup(64);
+    // A binding is for the scheme its graph composes: TurboQuant is asked of a graph composed with it.
+    const env = await setup(64), turboEnv = await setup(0, { turbo: true });
     try {
       expect(env.model.encodedKvAttention).toBe(false);
       // Compiled B1 replay is bound only for graphs that declare it (non-MoE
       // Gemma4); the group builds its replay from the same declaration, so no
       // plain-read step replays.
       expect(env.model.graphCapabilities.compiledDecode).toBe(false);
-      expect(env.binding.kvBatchable(env.kvScheme!)).toBe(true);
-      expect(env.binding.kvBatchable(resolveKvScheme({ turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: 0 }))).toBe(true);
-      const plan = env.binding.plan(shape, { maxTokens: 4, ...env.kvScheme!.generationOptions },
-        { continuous: true, quantizedBatch: env.binding.kvBatchable(env.kvScheme!), checkpoints: false });
+      const plan = env.binding.plan(shape, { maxTokens: 4 },
+        { checkpoints: false });
       expect(plan).toMatchObject({ method: "autoregressive", mechanism: "continuous", fill: false, compiledDecode: false });
-      // Requested (the flag is on) and refused by the capability, not disabled.
-      expect(env.binding.runtime.flag("MLX_BUN_COMPILED_DECODE", true)).toBe(true);
+      // Requested (the composition turns it on) and refused by the capability, not disabled.
+      expect(env.model.composition.compiledDecode).toBe(true);
       expect(plan.reasons).toContain("compiled-decode-unavailable-for-request");
-    } finally { await env.close(); }
+    } finally { try { await env.close(); } finally { await turboEnv.close(); } }
   });
 
   test("below the transition, delayed affine rows equal plain rows at B1 and in a B2 co-prefill", async () => {
@@ -1700,33 +1718,107 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
     } finally { await plain.close(); await delayed.close(); }
   });
 
-  test("at a decode transition the row publishes its last plain token, then only it is rejected; the peer and the group continue", async () => {
-    const plain = await setup(null), control = await setup(null, { pipeline: false });
-    const delayed = await setup(7);   // A (5 tokens) may produce 7 - 5 + 1 = 3
+  // The requantizing oracle (no artifact holds Gemma 2 numbers past the transition:
+  // main threw at the first forward that read a converted
+  // layer). The graph and its manual attention are the production graph's; the
+  // storage is the oracle's: the plain storage the graph composes without a
+  // scheme (KVCache, RotatingKVCache on a sliding layer), whose fetched window a
+  // converted layer requantizes with mlx's own quantize and dequantize, from the
+  // append after the one that leaves it holding the start. Groups run along the
+  // head dimension, so a position's codes do not depend on when it was
+  // quantized. Every phase a served row kind runs (a prompt chunk and tail,
+  // decode, a verification window, known tokens) reads at B1 through the
+  // composed legos at maxDiff 0, across the ring's window and the conversion.
+  const requantized = (x: MlxArray, bits: number): MlxArray => {
+    const q = ops.quantize(x, HEAD_DIM, bits);
+    try { return ops.dequantize(q.packed, q.scales, q.biases, { groupSize: HEAD_DIM, bits, mode: "affine" }); }
+    finally { q.packed.dispose(); q.scales.dispose(); q.biases.dispose(); }
+  };
+  class OracleKv {
+    readonly #plain: InstanceType<typeof KVCache> | InstanceType<typeof RotatingKVCache>;
+    #converted = false;
+    constructor(window: number | null, readonly bits: number | null, readonly start: number) {
+      this.#plain = window ? new RotatingKVCache(window) : new KVCache();
+    }
+    get offset(): number { return this.#plain.offset; }
+    signature(): string { return "oracle"; }
+    makeMask(N: number, window: number | null): Mask { return this.#plain.makeMask(N, window); }
+    updateAndFetch(k: MlxArray, v: MlxArray): [MlxArray, MlxArray] {
+      const fetched = this.#plain.updateAndFetch(k, v);
+      if (!this.#converted) {
+        this.#converted = this.bits !== null && this.#plain.offset >= this.start && this.#plain.offset !== 0;
+        return fetched;
+      }
+      try { return [requantized(fetched[0], this.bits!), requantized(fetched[1], this.bits!)]; }
+      finally { fetched[0].dispose(); fetched[1].dispose(); }
+    }
+    dispose(): void { this.#plain.dispose(); }
+  }
+  const oracleSchemes = [
+    ...[0, 7, 9, 12, 15].map(start => ({ name: `affine 4 from ${start}`, scheme: affine(start), bits: types.map(() => 4 as number | null), start })),
+    { name: "affine 8 from 9", scheme: resolveKvScheme({ override: 8, quantizedKvStart: 9 }), bits: types.map(() => 8 as number | null), start: 9 },
+    { name: "layer 2 at 4 bits from 9", start: 9, bits: types.map((_, layer) => layer === 2 ? 4 : null),
+      scheme: resolveKvScheme({ override: "config", config: [{ layerIdx: 2, bits: 4, groupSize: HEAD_DIM }], quantizedKvStart: 9 }) },
+  ];
+  for (const { name, scheme, bits, start } of oracleSchemes) test(`requantizing oracle, ${name}: every phase's logits through the composed legos equal the oracle storage's at maxDiff 0`, () => {
+    const f = mixedFixture(types, true, HEAD_DIM), model = f.make(undefined, testComposition(scheme.storage));
+    const composed = model.makeCache();
+    const oracle = types.map((type, layer) => new OracleKv(type === S ? W : null, bits[layer]!, start)) as unknown as Cache[];
+    // Offsets 0 → 6 (a chunk) → 7 (the tail) → 10 (decodes) → 13 (a verification window) → 16 (known tokens) → 18 (decodes).
+    const steps: [string, number[]][] = [["prefillChunk", [2, 4, 7, 9, 3, 11]], ["prefillTail", [13]], ["decode", [17]],
+      ["decode", [19]], ["decode", [23]], ["verify", [29, 31, 37]], ["appendKnown", [41, 43, 47]], ["decode", [53]], ["decode", [59]]];
+    type Forward = (ids: MlxArray, caches: Cache[], capture: null) => MlxArray;
+    const forward = (phase: string, width: ReturnType<typeof widthClass>): Forward => phase === "prefillChunk" ? model.prefillChunk.gpu as Forward
+      : (model as unknown as Record<string, Record<string, Forward>>)[phase]![width]!;
+    const run = (caches: Cache[], phase: string, ids: number[]) => {
+      using input = ops.fromInt32(ids, [1, ids.length]);
+      using hidden = forward(phase, widthClass(ids.length))(input, caches, null);
+      return model.logitsFromHidden(hidden);
+    };
     try {
+      for (const [index, [phase, ids]] of steps.entries()) {
+        using actual = run(composed, phase, ids), expected = run(oracle, phase, ids);
+        const label = `${name}: step ${index} (${phase}, ${ids.length} at ${composed[0]!.offset - ids.length})`;
+        expect([actual.shape, actual.dtypeName], label).toEqual([expected.shape, expected.dtypeName]);
+        expect(Buffer.from(actual.rawBytes()).equals(Buffer.from(expected.rawBytes())), `${label}: maxDiff 0`).toBe(true);
+      }
+      // The composed legos converted where the scheme names it.
+      expect(composed.map(storageKind)).toEqual(types.map((type, layer) => bits[layer] === null
+        ? (type === F ? "KVCache" : "RotatingKVCache") : (type === F ? "QuantizedKVCache" : "RotatingQuantizedKVCache")));
+    } finally { dispose(composed); dispose(oracle); f.dispose(); }
+  });
+
+  test("a row crossing its decode transition continues over its converted layers, equal to the direct B1 order; beside a peer both finish and the group serves again", async () => {
+    const plain = await setup(null), control = await setup(null, { pipeline: false });
+    const delayed = await setup(7);   // A (5 tokens) reads its converted layers from its fourth token on
+    try {
+      const reference = await directSpans(A, 8, affine(7), []);
+      expect(reference.kinds).toEqual(types.map(type => type === F ? "QuantizedKVCache" : "RotatingQuantizedKVCache"));
       const soloA = await plain.submit(A, 8), soloB = await plain.submit(B, 5);
-      const pl = projections(control), dl = projections(delayed);
-      const [left, peer] = await control.together([A, 3], [B, 5]);
-      expect(left).toEqual({ tokens: soloA.tokens.slice(0, 3), outcome: "length" });
+      expect(reference.tokens.slice(0, 3)).toEqual(soloA.tokens.slice(0, 3));
+      const dl = projections(delayed);
+      expect(await delayed.submit(A, 8)).toEqual({ tokens: reference.tokens, outcome: "length" });
+      expect(dl).toEqual(reference.seen);
+      // B stays below the transition: it equals its plain-KV control in the same schedule.
+      const [, peer] = await control.together([A, 8], [B, 5]);
       const [a, b] = await delayed.together([A, 8], [B, 5]);
-      expect(a).toEqual({ tokens: soloA.tokens.slice(0, 3), outcome: "DenseKvReadError" });
+      expect([a!.outcome, a!.tokens.length]).toEqual(["length", 8]);
       expect(b).toEqual(peer);
-      expect(dl).toEqual(pl);   // every projection of both rows, before and after A leaves
       // The same group drains and serves again.
       expect(await delayed.submit(B, 5)).toEqual(soloB);
+      expect(await delayed.submit(A, 8)).toEqual({ tokens: reference.tokens, outcome: "length" });
     } finally { await plain.close(); await control.close(); await delayed.close(); }
   });
 
-  test("a group composed directly binds the graph's declared dense-read layers: its ordinary row is refused at the transition", async () => {
-    const plain = await setup(null), direct = await setup(7, { direct: true });
+  test("a group composed directly serves the row past its transition, as through the gateway", async () => {
+    const direct = await setup(7, { direct: true });
     try {
-      expect(direct.model.requiredDenseKvLayers).toEqual(LAYERS);
-      const soloA = await plain.submit(A, 8);
-      expect(await direct.submit(A, 8)).toEqual({ tokens: soloA.tokens.slice(0, 3), outcome: "DenseKvReadError" });
-    } finally { await plain.close(); await direct.close(); }
+      const reference = await directSpans(A, 8, affine(7), []);
+      expect(await direct.submit(A, 8)).toEqual({ tokens: reference.tokens, outcome: "length" });
+    } finally { await direct.close(); }
   });
 
-  test("EOS as the last plain token ends the row as a stop, unpublished, not a rejection", async () => {
+  test("EOS as the last plain token ends the row as a stop, unpublished; without it the row reads past the transition", async () => {
     const plain = await setup(null);
     try {
       const soloA = await plain.submit(A, 8);
@@ -1737,41 +1829,133 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
       const eos = [soloA.tokens[at]!];
       const stopped = await plain.submit(A, 8, { eos });
       expect(stopped).toEqual({ tokens: soloA.tokens.slice(0, at), outcome: "stop" });
-      const control = await setup(null, { pipeline: false });
+      const control = await setup(null);
       const delayed = await setup(A.length + at);   // the EOS is A's last plain token
       try {
-        const pl = projections(control), dl = projections(delayed);
+        // The pipelined step built before the EOS is read appends it over A's
+        // converted layers and is discarded: tokens and outcomes are compared.
         const [left, peer] = await control.together([A, 8, { eos }], [B, 5]);
         expect(left).toEqual(stopped);
         const [a, b] = await delayed.together([A, 8, { eos }], [B, 5]);
         expect(a).toEqual(stopped);
         expect(b).toEqual(peer);
-        expect(dl).toEqual(pl);
-        // Without the EOS the same row reads past it and is rejected there.
-        expect(await delayed.submit(A, 8)).toEqual({ tokens: soloA.tokens.slice(0, at + 1), outcome: "DenseKvReadError" });
+        // Without the EOS the same row reads past it over its converted layers.
+        const past = await directSpans(A, 8, affine(A.length + at), []);
+        expect(await delayed.submit(A, 8)).toEqual({ tokens: past.tokens, outcome: "length" });
       } finally { await control.close(); await delayed.close(); }
     } finally { await plain.close(); }
+  });
+
+  test("speculative rows (n-gram drafts) verify and roll back across the transition and equal the ordinary greedy order", async () => {
+    const { bindMlxGateway, createRuntimeConfig } = await import("../../../src/execution");
+    const { NgramProvider } = await import("../../../src/generation/speculative");
+    // A prompt that repeats, so the n-gram source drafts from it.
+    const prompt = [2, 4, 7, 9, 3, 2, 4, 7, 9, 3, 2, 4], maxTokens = 12;
+    for (const start of [prompt.length + 3, 0]) {
+      const reference = await directSpans(prompt, maxTokens, affine(start), []);
+      const f = mixedFixture(types, true, HEAD_DIM), model = f.make(undefined, testComposition(affine(start).storage));
+      const binding = bindMlxGateway(model, { provider: new NgramProvider(), numDraftTokens: 3 });
+      const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: 64, runtime: createRuntimeConfig({}) });
+      try {
+        const options = { maxTokens, temperature: 0 };
+        const plan = binding.plan({ ...shape, hasDraft: true }, options, { checkpoints: false });
+        expect(plan).toMatchObject({ method: "speculative", mechanism: "continuous" });
+        const tokens: number[] = [];
+        const stats = await group.submit({ promptIds: prompt, maxTokens, eosTokenIds: [], method: binding.methodRequest!(plan, options)!,
+          onToken(token: number) { tokens.push(token); } });
+        console.log(`[gemma2 affine speculative] start ${start}: ${JSON.stringify(stats.spec)}`);
+        expect({ tokens, finish: stats.finishReason }).toEqual({ tokens: reference.tokens, finish: "length" });
+      } finally { try { await group.close(); } finally { f.dispose(); } }
+    }
+  });
+
+  test("a fill row's asserted scaffold appends past the transition, equal to main's serial fill at B1 in tokens and every projection", async () => {
+    const { bindMlxGateway, createRuntimeConfig } = await import("../../../src/execution");
+    const { FillSession } = await import("../../../src/generation/fill");
+    type Session = InstanceType<typeof FillSession>;
+    const maxTokens = 14, start = 7, emit = [11, 12, 13];
+    const f = mixedFixture(types, true, HEAD_DIM), model = f.make(undefined, testComposition(affine(start).storage));
+    const hash = (logits: MlxArray) => { using flat = ops.contiguous(logits); return createHash("sha256").update(flat.rawBytes()).digest("hex"); };
+    // Greedy over the normalized scores in the logits dtype, as the row's sampler
+    // selects: bf16 rounding of this small graph's scores ties often, and a
+    // raw-logit argmax would not preserve the ties.
+    const argmax = (logits: MlxArray) => {
+      using lse = ops.logsumexpAxis(logits, -1, true);
+      using scores = ops.sub(logits, lse);
+      using best = ops.argmaxAxis(scores, -1);
+      return best.toIntTokens()[0]!;
+    };
+    // Main 02d723a's serial fill at B=1 with asserted spans only: tail-split
+    // prefill, one-position assert appends (Gemma2 declares no multi-position append).
+    const serial = (fill: Session | null) => {
+      const caches = model.makeCache(), logits: string[] = [], tokens: number[] = [];
+      const forward = (ids: number[]) => { using input = ops.fromInt32(ids, [1, ids.length]); return phaseHidden(model, input, caches); };
+      const project = (hidden: MlxArray) => { const out = model.logitsFromHidden(hidden); logits.push(hash(out)); return out; };
+      try {
+        { using head = forward(A.slice(0, -1)); head.eval(); }
+        let pending: number | null, generated = 0;
+        { using hidden = forward([A.at(-1)!]); using out = project(hidden); pending = argmax(out); }
+        while (pending !== null) {
+          const current: number = pending;
+          let next: number | null = null;
+          if (generated + 1 < maxTokens) { using hidden = forward([current]); using out = project(hidden); next = argmax(out); }
+          generated++;
+          tokens.push(current);
+          const proposal: ReturnType<Session["push"]> | undefined = fill?.push(current, next !== null ? maxTokens - generated : 0);
+          if (proposal && next !== null && proposal.policy === "assert") {
+            let last: MlxArray | null = null;
+            for (const id of proposal.ids) { last?.dispose(); last = forward([id]); }
+            using hidden = last!;
+            fill!.commit(proposal, proposal.ids.length);
+            tokens.push(...proposal.ids); generated += proposal.ids.length;
+            if (generated < maxTokens) { using out = project(hidden); next = argmax(out); } else next = null;
+          }
+          pending = next;
+        }
+        return { tokens, logits, kinds: caches.map(storageKind) };
+      } finally { dispose(caches); }
+    };
+    try {
+      // The trigger: the plain greedy run's fifth token, generated after the row
+      // converted (A holds 5 tokens and converts at 7); every later match fires again.
+      const g = serial(null).tokens, t = 4;
+      expect(t + emit.length, `greedy ${g}`).toBeLessThan(maxTokens);
+      const rows = [{ trigger: [g[t]!], emit, kind: "scaffold" as const }];
+      const session = () => new FillSession({ rows, echo: null, eos: [] }, A, { maxSpan: 8, appendChunkSize: 0 });
+      const fill = session(), expected = serial(fill);
+      expect(fill.stats.strict).toBeGreaterThan(0);
+      expect(expected.kinds).toEqual(types.map(type => type === F ? "QuantizedKVCache" : "RotatingQuantizedKVCache"));
+      const binding = bindMlxGateway(model), logits: string[] = [];
+      const logitsFromHidden = model.logitsFromHidden;
+      model.logitsFromHidden = function (this: UniversalDenseModel, hidden: MlxArray) {
+        const out = logitsFromHidden.call(this, hidden); logits.push(hash(out)); return out;
+      };
+      const group = binding.createBatchGroup({ maxBatch: 1, prefillChunkSize: 64, runtime: createRuntimeConfig({}) });
+      try {
+        const served = session(), options = { maxTokens, temperature: 0, fill: served };
+        const plan = binding.plan(shape, options, { checkpoints: false });
+        expect(plan).toMatchObject({ method: "autoregressive", mechanism: "continuous", fill: true });
+        const tokens: number[] = [];
+        const stats = await group.submit({ promptIds: A, maxTokens, eosTokenIds: [], method: binding.methodRequest!(plan, options)!,
+          onToken(token: number) { tokens.push(token); } });
+        expect({ tokens, finish: stats.finishReason, strict: served.stats.strict }).toEqual({ tokens: expected.tokens, finish: "length", strict: fill.stats.strict });
+        expect(logits).toEqual(expected.logits);
+      } finally { model.logitsFromHidden = logitsFromHidden; await group.close(); }
+    } finally { f.dispose(); }
   });
 
   test("a stop, a cancellation or the budget on the last plain token finishes normally", async () => {
     const plain = await setup(null);
     try {
       const soloA = await plain.submit(A, 8);
-      // The boundary flush reads A's last token before the next build, so A leaves
-      // the batch there however it ends: the geometry of A leaving by budget.
-      // A plain group can keep a row whose consumer cancelled during its last
-      // token callback in one more batched forward (#emit checks the signal on the
-      // next token), so each case's same-ending control checks tokens and outcomes,
-      // and the budget control checks every projection.
-      const geometry = await setup(null, { pipeline: false }), gl = projections(geometry);
-      try {
-        expect(await geometry.together([A, 3], [B, 5]))
-          .toEqual([{ tokens: soloA.tokens.slice(0, 3), outcome: "length" }, expect.anything()]);
-      } finally { await geometry.close(); }
+      // A pipelined group may run one more batched forward for a row that ends on
+      // its token (the next step is built before that token is read); past the
+      // transition that discarded forward reads A's converted layers, so each
+      // case checks the published tokens and outcomes against its same-ending
+      // plain control in the same schedule.
       for (const [maxTokens, end, outcome] of [[8, { stopAfter: 3 }, "stop"], [8, { cancelAfter: 3 }, "AbortError"], [3, {}, "length"]] as const) {
-        const control = await setup(null, { pipeline: false }), delayed = await setup(7);
+        const control = await setup(null), delayed = await setup(7);
         try {
-          const dl = projections(delayed);
           const [left, peer] = await control.together([A, maxTokens, end], [B, 5]);
           const [a, b] = await delayed.together([A, maxTokens, end], [B, 5]);
           // The last plain token is published once, with no extra publication, and
@@ -1779,66 +1963,82 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
           expect(a, outcome).toEqual({ tokens: soloA.tokens.slice(0, 3), outcome });
           expect(left, outcome).toEqual(a);
           expect(b, outcome).toEqual(peer);
-          expect(dl, outcome).toEqual(gl);
         } finally { await control.close(); await delayed.close(); }
       }
     } finally { await plain.close(); }
   });
 
-  test("a row converted in a co-prefill is rejected before its next chunk with no output; its peer is unaffected", async () => {
-    const plain = await setup(null, { chunk: 4 }), delayed = await setup(5, { chunk: 4 });
-    const long = [2, 4, 7, 9, 3, 11, 13, 17, 19, 23, 29, 31], short = [5, 8, 3];   // short may produce 5 - 3 + 1 = 3
+  test("a row converting in a co-prefill continues over its converted layers; its peer is unaffected", async () => {
+    const control = await setup(null, { chunk: 4 }), delayed = await setup(5, { chunk: 4 });
+    const long = [2, 4, 7, 9, 3, 11, 13, 17, 19, 23, 29, 31], short = [5, 8, 3];   // short reads only plain layers (5 - 3 + 1 = 3)
     try {
-      const soloShort = await plain.submit(short, 3);
+      const [, peer] = await control.together([long, 4], [short, 3]);
       const [l, s] = await delayed.together([long, 4], [short, 3]);
-      expect(l).toEqual({ tokens: [], outcome: "DenseKvReadError" });
-      expect(s).toEqual(soloShort);
-    } finally { await plain.close(); await delayed.close(); }
+      expect([l!.outcome, l!.tokens.length]).toEqual(["length", 4]);
+      expect(s).toEqual(peer);
+      // Alone, the long row is the same each time: the group serves it again.
+      const again = await delayed.submit(long, 4);
+      expect(await delayed.submit(long, 4)).toEqual(again);
+      expect(again.outcome).toBe("length");
+    } finally { await control.close(); await delayed.close(); }
   });
 
   test("a checkpoint before the transition restores exactly in a fresh group: alone it repeats the control byte for byte; beside a sibling it equals plain KV resumed the same way", async () => {
-    const { bindMlxGateway, createRuntimeConfig, createOrdinaryContinuationRequest, ContinuationPersistence, createRowSampling } =
+    const { bindMlxGateway, createRuntimeConfig, createOrdinaryContinuationRequest, createRowSampling } =
       await import("../../../src/execution");
     const { makeStepSampler } = await import("../../../src/sampling");
-    const { SsdCacheStore, PromptCache, cloneKvCaches, leaseCacheState } = await import("../../../src/state");
+    const { SsdCacheStore, ContinuationPersistence, KvCacheService, cloneKvCaches, leaseCacheState } = await import("../../../src/state");
     const plain = await setup(null);
     const soloA = await plain.submit(A, 8);
     await plain.close();
     const directory = await mkdtemp(join(tmpdir(), "plain-kv-continuation-"));
     const scheme = resolveKvScheme({ override: 4, quantizedKvStart: 9 });   // A (5 tokens) may produce 9 - 5 + 1 = 5
+    // The scheme's composition stores a state holding the start converted: a
+    // plain-KV checkpoint is also recorded as that composition stores it.
+    const schemeFixture = mixedFixture(types, true, HEAD_DIM);
+    const schemeBinding = bindMlxGateway(schemeFixture.make(undefined, testComposition(scheme.storage)));
     /** One run of A with delayed affine KV (`kv`) or plain KV (null). */
     const run = async (name: string, kv: typeof scheme | null, interruptAt?: number, sibling = false) => {
-      // A fresh graph, binding and group per run: only the SSD directory is shared.
-      const f = mixedFixture(types, true, HEAD_DIM), model = f.make(), binding = bindMlxGateway(model);
+      // A fresh graph (composed with the run's scheme), binding and group per run: only the SSD directory is shared.
+      const f = mixedFixture(types, true, HEAD_DIM), model = f.make(undefined, testComposition(kv?.storage)), binding = bindMlxGateway(model);
       const store = new SsdCacheStore({ dir: join(directory, name), maxBytes: 1 << 30, modelId: "synthetic-gemma2",
         configFingerprint: `plain-kv-continuation:${(kv ?? resolveKvScheme({})).cacheKey}`, tokenizerHash: "fixture", verify: true });
       // A fresh store indexes the durable records it finds, as a restarted server does.
       const scanned = store.scan();
       const persistence = new ContinuationPersistence(store, { maxBytes: 1 << 30 });
-      const prefix = new PromptCache(1 << 20, null, null, cloneKvCaches);
-      binding.configureContinuation!({ promptCache: prefix, checkpoints: store, checkpointEveryTokens: 2,
-        checkpointPersistence: persistence, identity: "plain-kv", cloneState: cloneKvCaches, adapterNamespace: () => "" });
-      let held = true;
-      const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: 64, ...(kv ? { kvScheme: kv } : {}), admissionHeld: () => held,
-        runtime: createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1" }) });
-      const options = { ...(kv?.generationOptions ?? {}), maxTokens: 8, temperature: 0 };
-      const execution = binding.plan({ ...shape, kvQuant: !!kv }, options,
-        { continuous: true, quantizedBatch: !!kv && binding.kvBatchable(kv), checkpoints: true });
-      expect(execution).toMatchObject({ method: "autoregressive", mechanism: "continuous", checkpoint: true });
       const tokens: number[] = [], restored: number[] = [], captured = new Map<number, string>(), abort = new AbortController();
-      const request = createOrdinaryContinuationRequest({ store, persistence, interval: 2, prompt: A, options, execution, identity: "plain-kv",
-        restore: entry => { const loaded = store.restore(entry, model); if (loaded) restored.push(loaded.tokens.length); return loaded; },
+      const converted = new Map<number, string>();
+      // Every checkpoint the cache service restores is counted.
+      const restore = store.restore.bind(store);
+      store.restore = (entry, graph) => { const loaded = restore(entry, graph); if (loaded) restored.push(loaded.tokens.length); return loaded; };
+      // The composition's cache service: generation checkpoints in `store` every 2 tokens; no prefix store.
+      const cache = new KvCacheService(binding.graph, { continuations: { store, persistence, everyTokens: 2 } }, { identity: "plain-kv" });
+      let held = true;
+      const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: 64, admissionHeld: () => held,
+        runtime: createRuntimeConfig({}), cache });
+      const options = { maxTokens: 8, temperature: 0 };
+      const execution = binding.plan(shape, options,
+        { checkpoints: true });
+      expect(execution).toMatchObject({ method: "autoregressive", mechanism: "continuous", checkpoint: true });
+      const request = createOrdinaryContinuationRequest({ interval: 2, prompt: A, options, execution,
         onToken(token) { tokens.push(token); if (tokens.length === interruptAt) abort.abort(new DOMException("interrupted", "AbortError")); } });
-      const enqueue = request.continuation.captureOwned;
-      request.continuation.captureOwned = state => {
-        const digest = new Bun.CryptoHasher("sha256");
-        digest.update(JSON.stringify([state.pendingToken, state.cacheTokens]));
-        for (const cache of state.caches) {
-          const lease = leaseCacheState(cache);
-          try { for (const plane of lease.borrow()) { using exact = ops.contiguous(plane); digest.update(exact.rawBytes()); } } finally { lease.close(); }
+      const enqueue = cache.checkpoint.bind(cache);
+      cache.checkpoint = (row, state) => {
+        const digestOf = (caches: Cache[]) => {
+          const digest = new Bun.CryptoHasher("sha256");
+          digest.update(JSON.stringify([state.pendingToken, state.cacheTokens]));
+          for (const cache of caches) {
+            const lease = leaseCacheState(cache);
+            try { for (const plane of lease.borrow()) { using exact = ops.contiguous(plane); digest.update(exact.rawBytes()); } } finally { lease.close(); }
+          }
+          return digest.digest("hex");
+        };
+        captured.set(state.generatedTokens, digestOf(state.caches));
+        if (!kv) {
+          const composed = composedAs(schemeBinding.graph, cloneKvCaches(state.caches));
+          try { converted.set(state.generatedTokens, digestOf(composed)); } finally { dispose(composed); }
         }
-        captured.set(state.generatedTokens, digest.digest("hex"));
-        enqueue(state);
+        enqueue(row, state);
       };
       const siblingTokens: number[] = [];
       const siblingSampling = sibling ? createRowSampling(makeStepSampler({ temperature: 0 }, { tokenRepresentation: "device",
@@ -1851,18 +2051,22 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
           .then(stats => stats.finishReason as string, (error: Error) => error.name) : undefined;
         held = false; group.kick();
         const outcome = await a, siblingOutcome = await b;
-        return { tokens, outcome, scanned, restored, captured, sibling: b ? { tokens: siblingTokens, outcome: siblingOutcome } : undefined };
+        return { tokens, outcome, scanned, restored, captured, converted,
+          sibling: b ? { tokens: siblingTokens, outcome: siblingOutcome } : undefined };
       } finally {
         try { await group.close(); } finally {
-          try { await persistence.flush(); } finally { request.dispose(); siblingSampling?.dispose(); prefix.clear(); f.dispose(); }
+          try { await persistence.flush(); } finally { request.dispose(); siblingSampling?.dispose(); f.dispose(); }
         }
       }
     };
     try {
       const control = await run("control", scheme);
-      expect({ tokens: control.tokens, outcome: control.outcome, scanned: control.scanned, restored: control.restored })
-        .toEqual({ tokens: soloA.tokens.slice(0, 5), outcome: "DenseKvReadError", scanned: 0, restored: [] });
-      expect([...control.captured.keys()]).toEqual([2, 4]);
+      expect({ outcome: control.outcome, scanned: control.scanned, restored: control.restored })
+        .toEqual({ outcome: "length", scanned: 0, restored: [] });
+      // Plain through the transition (the checkpoint at 4 holds the start), then over converted layers.
+      expect(control.tokens.slice(0, 5)).toEqual(soloA.tokens.slice(0, 5));
+      expect(control.tokens).toEqual((await directSpans(A, 8, scheme, [])).tokens);
+      expect([...control.captured.keys()]).toEqual([2, 4, 6]);
       const interrupted = await run("restart", scheme, 3);
       expect({ outcome: interrupted.outcome, scanned: interrupted.scanned, restored: interrupted.restored })
         .toEqual({ outcome: "AbortError", scanned: 0, restored: [] });
@@ -1872,43 +2076,50 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
       const resumed = await run("restart", scheme);
       expect(resumed.scanned).toBe(1);   // the interrupted row's record at 2, and only it
       expect(resumed.restored).toEqual([A.length + 2]);
-      expect({ tokens: resumed.tokens, outcome: resumed.outcome }).toEqual({ tokens: control.tokens, outcome: "DenseKvReadError" });
-      expect(resumed.captured.get(4)).toBe(control.captured.get(4)!);
+      expect({ tokens: resumed.tokens, outcome: resumed.outcome }).toEqual({ tokens: control.tokens, outcome: "length" });
+      expect([resumed.captured.get(4), resumed.captured.get(6)]).toEqual([control.captured.get(4)!, control.captured.get(6)!]);
       // Beside a sibling the resumed row decodes at B2, where one layer-3 value
       // element rounds differently from B1 (a valid-state difference plain KV shares),
       // so its control is plain KV restored and resumed beside the same sibling.
+      // The checkpoint at 4 holds 9 positions, the start, which the scheme's
+      // composition stores converted: the control is plain KV's state there as
+      // that composition stores it.
       const plainInterrupted = await run("plain-restart", null, 3);
       expect({ outcome: plainInterrupted.outcome, scanned: plainInterrupted.scanned }).toEqual({ outcome: "AbortError", scanned: 0 });
       const plainResumed = await run("plain-restart", null, undefined, true);
       const beside = await run("restart-sibling", scheme, undefined, true);
       expect([beside.scanned, beside.restored, plainResumed.scanned, plainResumed.restored]).toEqual([1, [A.length + 2], 1, [A.length + 2]]);
-      expect({ tokens: beside.tokens, outcome: beside.outcome }).toEqual({ tokens: control.tokens, outcome: "DenseKvReadError" });
-      expect(beside.captured.get(4)).toBe(plainResumed.captured.get(4)!);
+      // Past the transition the B2 row reads its own converted layers in the B2 geometry.
+      expect([beside.outcome, beside.tokens.length, beside.tokens.slice(0, 5)]).toEqual(["length", 8, control.tokens.slice(0, 5)]);
+      expect(beside.captured.get(4)).toBe(plainResumed.converted.get(4)!);
       expect(beside.sibling).toEqual(plainResumed.sibling);
-    } finally { await rm(directory, { recursive: true, force: true }); }
+    } finally { try { await rm(directory, { recursive: true, force: true }); } finally { schemeFixture.dispose(); } }
   });
 
-  test("a grammar row takes the read-before-build step, publishes its last plain token with its matcher advanced, then is rejected", async () => {
-    const plain = await setup(null), delayed = await setup(7);
+  test("a grammar row takes the read-before-build step across its transition and continues, equal to the direct B1 order", async () => {
+    const delayed = await setup(7);
     try {
-      const soloA = await plain.submit(A, 8);
+      const reference = await directSpans(A, 8, affine(7), []);
       // A permissive controller: the group routes live grammar rows through
       // its read-before-build step; masking belongs to the row's sampler.
       const accepted: number[] = [];
       const grammar = { accept(token: number) { accepted.push(token); }, get isTerminated() { return false; },
         ready: () => Promise.resolve() } as unknown as import("../../../src/sampling").GrammarController;
       const result = await delayed.submit(A, 8, {}, grammar);
-      expect(result).toEqual({ tokens: soloA.tokens.slice(0, 3), outcome: "DenseKvReadError" });
-      expect(accepted).toEqual(result.tokens);
-    } finally { await plain.close(); await delayed.close(); }
+      expect(result).toEqual({ tokens: reference.tokens, outcome: "length" });
+      // Every token the row went on from reached the matcher, in order.
+      expect(accepted.length).toBeGreaterThanOrEqual(result.tokens.length - 1);
+      expect(result.tokens.slice(0, accepted.length)).toEqual(accepted);
+    } finally { await delayed.close(); }
   });
 
-  test("the first decode of a prompt past the transition is refused with no output; a single final chunk may still finish", async () => {
+  test("a prompt past the transition converts in its drain chunk and decodes over its converted layers, equal to the direct B1 order", async () => {
     const plain = await setup(null, { tailSplit: false }), split = await setup(5), single = await setup(5, { tailSplit: false });
     const prompt = [2, 4, 7, 9, 3, 11, 13, 17];
     try {
-      // Tail split: the drain chunk converts the row; its tail forward is refused.
-      expect(await split.submit(prompt, 4)).toEqual({ tokens: [], outcome: "DenseKvReadError" });
+      // Tail split: the drain chunk converts the row; its tail forward reads the converted layers.
+      const reference = await directSpans(prompt, 4, affine(5), []);
+      expect(await split.submit(prompt, 4)).toEqual({ tokens: reference.tokens, outcome: "length" });
       // One final chunk from offset 0 reads plain; a one-token budget ends before any later append.
       const first = await plain.submit(prompt, 1);
       expect(await single.submit(prompt, 1)).toEqual(first);
@@ -1916,25 +2127,22 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
     } finally { await plain.close(); await split.close(); await single.close(); }
   });
 
-  // TurboQuant storage decodes on read, so its rows stay dense-readable: no
-  // transition rejects them. B1 is compared with main's serial order (the
-  // drain chunk, maintenance, the final token at L=1, then maintenance before
-  // every decode build: generate.ts and prefill.ts at 02d723a). Main served
-  // no B>1 here, so B2 is checked for its own behavior only.
+  // TurboQuant storage decodes on read. B1 is compared with main's serial order (the
+  // drain chunk, the final token at L=1, then one decode build per token:
+  // generate.ts and prefill.ts at 02d723a), over the caches the graph composes
+  // with the scheme, which convert at the end of the append that reaches the
+  // start, where main's maintenance converted before the next build. Main
+  // served no B>1 here, so B2 is checked for its own behavior only.
   describe("TurboQuant rows", () => {
     const serial = async (prompt: number[], maxTokens: number, start: number) => {
-      const { createKvMaintenance } = await import("../../../src/state/kv-maintenance");
-      const f = mixedFixture(types, true, HEAD_DIM), model = f.make(), caches = model.makeCache();
-      const maintain = createKvMaintenance({ turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: start });
+      const f = mixedFixture(types, true, HEAD_DIM), model = f.make(undefined, testComposition(turbo(start).storage));
+      const caches = model.makeCache();
       const seen: { shape: number[]; dtype: string; sha256: string }[] = [], tokens: number[] = [];
       try {
-        maintain(caches);
-        { using head = model.forward(prompt.slice(0, -1), caches); head.eval(); }
-        maintain(caches);
+        { using head = phaseLogits(model, prompt.slice(0, -1), caches); head.eval(); }
         let next = prompt.at(-1)!;
         for (let step = 0; step < maxTokens; step++) {
-          if (step) maintain(caches);
-          using logits = model.forward([next], caches);
+          using logits = phaseLogits(model, [next], caches);
           seen.push({ shape: [...logits.shape], dtype: logits.dtypeName,
             sha256: createHash("sha256").update(logits.rawBytes()).digest("hex") });
           // Main samples normalized scores in the logits dtype. BF16 rounding
@@ -1944,7 +2152,7 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
           using token = ops.argmaxAxis(scores, -1);
           next = token.toIntTokens()[0]!; tokens.push(next);
         }
-        return { seen, tokens, kinds: caches.map(cache => cache.constructor.name) };
+        return { seen, tokens, kinds: caches.map(storageKind) };
       } finally { dispose(caches); f.dispose(); }
     };
 
@@ -1975,41 +2183,43 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
     });
 
     test("a TurboQuant checkpoint restores exactly in a fresh group and repeats the control", async () => {
-      const { bindMlxGateway, createRuntimeConfig, createOrdinaryContinuationRequest, ContinuationPersistence } =
+      const { bindMlxGateway, createRuntimeConfig, createOrdinaryContinuationRequest } =
         await import("../../../src/execution");
-      const { SsdCacheStore, PromptCache, cloneKvCaches, leaseCacheState } = await import("../../../src/state");
+      const { SsdCacheStore, ContinuationPersistence, KvCacheService, leaseCacheState } = await import("../../../src/state");
       const directory = await mkdtemp(join(tmpdir(), "turbo-continuation-"));
       const scheme = resolveKvScheme({ turboQuant: { kBits: 8, vBits: 3 }, quantizedKvStart: 0 });
       const run = async (name: string, interruptAt?: number) => {
-        const f = mixedFixture(types, true, HEAD_DIM), model = f.make(), binding = bindMlxGateway(model);
+        const f = mixedFixture(types, true, HEAD_DIM), model = f.make(undefined, testComposition(scheme.storage));
+        const binding = bindMlxGateway(model);
         const store = new SsdCacheStore({ dir: join(directory, name), maxBytes: 1 << 30, modelId: "synthetic-gemma2",
           configFingerprint: `turbo-continuation:${scheme.cacheKey}`, tokenizerHash: "fixture", verify: true });
         const scanned = store.scan();
         const persistence = new ContinuationPersistence(store, { maxBytes: 1 << 30 });
-        const prefix = new PromptCache(1 << 20, null, null, cloneKvCaches);
-        binding.configureContinuation!({ promptCache: prefix, checkpoints: store, checkpointEveryTokens: 2,
-          checkpointPersistence: persistence, identity: "turbo", cloneState: cloneKvCaches, adapterNamespace: () => "" });
-        let held = true;
-        const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: 64, kvScheme: scheme, admissionHeld: () => held,
-          runtime: createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1" }) });
-        const options = { ...scheme.generationOptions, maxTokens: 8, temperature: 0 };
-        const execution = binding.plan({ ...shape, kvQuant: false, turboQuant: true }, options,
-          { continuous: true, quantizedBatch: binding.kvBatchable(scheme), checkpoints: true });
-        expect(execution).toMatchObject({ method: "autoregressive", mechanism: "continuous", checkpoint: true });
         const tokens: number[] = [], restored: number[] = [], captured = new Map<number, string>(), abort = new AbortController();
-        const request = createOrdinaryContinuationRequest({ store, persistence, interval: 2, prompt: A, options, execution, identity: "turbo",
-          restore: entry => { const loaded = store.restore(entry, model); if (loaded) restored.push(loaded.tokens.length); return loaded; },
+        // Every checkpoint the cache service restores is counted.
+        const restore = store.restore.bind(store);
+        store.restore = (entry, graph) => { const loaded = restore(entry, graph); if (loaded) restored.push(loaded.tokens.length); return loaded; };
+        // The composition's cache service: generation checkpoints in `store` every 2 tokens; no prefix store.
+        const cache = new KvCacheService(binding.graph, { continuations: { store, persistence, everyTokens: 2 } }, { identity: "turbo" });
+        let held = true;
+        const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: 64, admissionHeld: () => held,
+          runtime: createRuntimeConfig({}), cache });
+        const options = { maxTokens: 8, temperature: 0 };
+        const execution = binding.plan(shape, options,
+          { checkpoints: true });
+        expect(execution).toMatchObject({ method: "autoregressive", mechanism: "continuous", checkpoint: true });
+        const request = createOrdinaryContinuationRequest({ interval: 2, prompt: A, options, execution,
           onToken(token) { tokens.push(token); if (tokens.length === interruptAt) abort.abort(new DOMException("interrupted", "AbortError")); } });
-        const enqueue = request.continuation.captureOwned;
-        request.continuation.captureOwned = state => {
+        const enqueue = cache.checkpoint.bind(cache);
+        cache.checkpoint = (row, state) => {
           const digest = new Bun.CryptoHasher("sha256");
-          digest.update(JSON.stringify([state.pendingToken, state.cacheTokens, state.caches.map(cache => cache.constructor.name)]));
+          digest.update(JSON.stringify([state.pendingToken, state.cacheTokens, state.caches.map(storageKind)]));
           for (const cache of state.caches) {
             const lease = leaseCacheState(cache);
             try { for (const plane of lease.borrow()) { using exact = ops.contiguous(plane); digest.update(exact.rawBytes()); } } finally { lease.close(); }
           }
           captured.set(state.generatedTokens, digest.digest("hex"));
-          enqueue(state);
+          enqueue(row, state);
         };
         try {
           const outcome = group.submit({ ...request, promptIds: A, cacheNamespace: "a", signal: abort.signal, maxTokens: 8, eosTokenIds: [] })
@@ -2018,7 +2228,7 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
           return { tokens, outcome: await outcome, scanned, restored, captured };
         } finally {
           try { await group.close(); } finally {
-            try { await persistence.flush(); } finally { request.dispose(); prefix.clear(); f.dispose(); }
+            try { await persistence.flush(); } finally { request.dispose(); f.dispose(); }
           }
         }
       };
@@ -2038,8 +2248,9 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
     });
 
     // Committed grammar spans over TurboQuant, as main's serial jump did: one
-    // maintenance call, then one unsplit [token, ...forced] forward over the
-    // maintained caches, which decode on read; the last position is projected.
+    // unsplit [token, ...forced] forward over the composed caches (converted
+    // where main's maintenance converted them), which decode on read; the last
+    // position is projected.
     describe("grammar spans", () => {
 
       for (const start of [0, A.length + 2]) test(`solo spans from start ${start} equal main's serial jump in tokens, matcher history and every projection`, async () => {
@@ -2059,12 +2270,11 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
 
       test("a reused grammar prefix crossing the TurboQuant threshold is maintained before its first suffix append", async () => {
         const { PromptCache, cloneKvCaches, leaseCacheState } = await import("../../../src/state");
-        const { createKvMaintenance } = await import("../../../src/state/kv-maintenance");
         const { makeStepSampler } = await import("../../../src/sampling");
         const prefix = new PromptCache(16 << 20, null, null, cloneKvCaches);
         const state = (caches: Cache[]) => caches.map(cache => {
           const lease = leaseCacheState(cache);
-          try { return { kind: cache.constructor.name, offset: cache.offset,
+          try { return { kind: storageKind(cache), offset: cache.offset,
             planes: lease.borrow().map(record) }; }
           finally { lease.close(); }
         });
@@ -2089,17 +2299,15 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
             return hit;
           },
         } });
-        let reference: ReturnType<typeof prefix.take> = null;
+        let reference: ReturnType<typeof prefix.take> = null, composed: Cache[] | null = null;
         let recordSuffix = false;
         const forwards: { ids: number[]; kinds: string[]; offsets: number[] }[] = [];
-        const originalForward = env.model.forwardHidden.bind(env.model);
         // The grammar method binds model operations on its first submission and
         // survives between requests. Install observers before that first bind.
-        env.model.forwardHidden = (ids, caches) => {
-          if (recordSuffix) forwards.push({ ids: ids.toIntTokens(), kinds: caches.map(cache => cache.constructor.name),
+        env.forwardHooks.push((ids, caches) => {
+          if (recordSuffix) forwards.push({ ids: ids.toIntTokens(), kinds: caches.map(storageKind),
             offsets: caches.map(cache => cache.offset) });
-          return originalForward(ids, caches);
-        };
+        });
         const seen = projections(env);
         try {
           expect(A).toHaveLength(5);
@@ -2112,8 +2320,10 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
           expect(committed).toHaveLength(8);
           expect(puts).toHaveLength(1);
           expect(puts[0]!.tokens).toEqual(committed);
+          // The span's append crossed the start (7), and the composed caches
+          // converted at its end: the prefix is stored converted.
           expect(puts[0]!.state.map(({ kind, offset }) => ({ kind, offset }))).toEqual(
-            types.map(type => ({ kind: type === F ? "KVCache" : "RotatingKVCache", offset: 8 })));
+            types.map(type => ({ kind: type === F ? "TurboQuantKVCache" : "RotatingKVCache", offset: 8 })));
           expect(hits).toHaveLength(0);
           expect(puts[0]!.minimum.every(offset => offset <= committed.length), JSON.stringify(puts[0])).toBe(true);
           expect(puts[0]!.resident, JSON.stringify(puts[0])).toBe(1);
@@ -2129,9 +2339,10 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
           expect(reference, JSON.stringify({ stored: puts[0], size: prefix.size, bytes: prefix.totalBytes })).not.toBeNull();
           expect(reference!.tokens).toEqual(committed);
           const restored = state(reference!.caches);
-          createKvMaintenance(turbo(7).generationOptions)(reference!.caches);
+          // Handed back as the caches the graph composes, as the suffix append reads them.
+          composed = composedAs(env.binding.graph, reference!.caches);
           const expectedKinds = types.map(type => type === F ? "TurboQuantKVCache" : "RotatingKVCache");
-          expect(reference!.caches.map(cache => cache.constructor.name)).toEqual(expectedKinds);
+          expect(composed.map(storageKind)).toEqual(expectedKinds);
           let expectedProjection: Projection, expectedToken: number;
           const grammar = spanGrammar([]);
           const sampler = makeStepSampler({ temperature: 0, grammar }, { tokenRepresentation: "device",
@@ -2139,7 +2350,7 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
           try {
             await grammar.ready();
             using ids = ops.fromInt32([suffix], [1, 1]);
-            using hidden = env.model.forwardHidden(ids, reference!.caches);
+            using hidden = phaseHidden(env.model, ids, composed);
             using logits = env.model.logitsFromHidden(hidden);
             expectedProjection = record(logits);
             using sampled = sampler.sample(logits, 0).token;
@@ -2154,15 +2365,16 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
           expect(forwards).toHaveLength(1);
           expect(forwards[0]!.ids).toEqual([suffix]);
           expect(forwards[0]!.offsets).toEqual(types.map(() => 8));
-          // Main generate.ts performs initial maintenance on the borrowed cache
-          // before this suffix, even when it is the final one-token prefill.
+          // Main generate.ts performed initial maintenance on the borrowed cache
+          // before this suffix, even when it is the final one-token prefill; the
+          // suffix reads the converted storage either way.
           expect(forwards[0]!.kinds).toEqual(expectedKinds);
           expect(seen).toEqual([expectedProjection]);
           expect(second).toEqual({ tokens: [expectedToken], outcome: "length", accepted: [] });
         } finally {
           try { await env.close(); }
           finally {
-            try { if (reference) { try { dispose(reference.caches); } finally { reference.retain?.(); } } }
+            try { if (reference) { try { dispose(composed ?? reference.caches); } finally { reference.retain?.(); } } }
             finally { prefix.clear(); }
           }
         }
@@ -2194,186 +2406,67 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
     });
   });
 
-  // A span or step whose maintenance leaves every layer plain appends unsplit,
-  // even across the transition; softcap attention cannot read a converted
-  // layer, so the span method refuses that row before the forward, with the
-  // layers the gateway binds from its cache probe. Preservation is checked
-  // at matched options and chunking (chunk 64, tail split).
-  describe("affine grammar spans", () => {
+  /** The committed-span cases over delayed affine KV, on the dense-read graph
+   * (Gemma 2's softcapped read, whose grammar jump the gateway binds as the span
+   * method) or the encoded-read graph (whose grammar jump the planner serves as
+   * verified proposals; the span lego is bound directly). A span appends
+   * unsplit, plain across the start, and later appends read the converted
+   * layers. Preservation is checked at matched options and chunking (chunk 64,
+   * tail split); a repetition penalty makes sampling read the committed history. */
+  const spanCases = (encoded: boolean) => {
     const plainKinds = types.map(type => type === F ? "KVCache" : "RotatingKVCache");
-    const jumping = (start: number | null, options: Parameters<typeof setup>[1] = {}) => setup(start, { grammarJump: true, ...options });
-    /** Record each forward's input offsets; the span method binds model
+    const convertedKinds = types.map(type => type === F ? "QuantizedKVCache" : "RotatingQuantizedKVCache");
+    const penalty = { repetitionPenalty: 1.3 };
+    const options = { encoded, sampling: penalty };
+    const spanEnv = (start: number | null, setupOptions: Parameters<typeof setup>[1] = {}) =>
+      setup(start, { grammarJump: true, encoded, ...setupOptions });
+    /** The span method the graph's grammar jump is served by, or the span lego bound directly. */
+    const spanMethod = async (env: SpanEnv) => encoded ? await boundSpans(env) : gatewaySpans(env);
+    /** Each forward's input ids and cache classes; the span method binds model
      * operations on its first submission, so observers are installed first. */
-    const offsets = (env: Awaited<ReturnType<typeof setup>>) => {
-      const forwards: number[][] = [], forward = env.model.forwardHidden.bind(env.model);
-      env.model.forwardHidden = (ids, caches) => { forwards.push(caches.map(cache => cache.offset)); return forward(ids, caches); };
+    const observe = (env: SpanEnv) => {
+      const forwards: { ids: number[]; kinds: string[] }[] = [];
+      env.forwardHooks.push((ids, caches) => {
+        forwards.push({ ids: [...ids.toIntTokens()], kinds: caches.map(storageKind) });
+      });
       return forwards;
     };
 
     test("below the transition, spans equal the direct B1 jump in tokens, matcher history and every projection", async () => {
-      const reference = await directSpans(A, 9, affine(64), spansA);
-      expect(reference.refused).toBe(false);
+      const reference = await directSpans(A, 9, affine(64), spansA, options);
       expect(reference.tokens).toHaveLength(9);
       expect(reference.tokens).toEqual(expect.arrayContaining([11, 12, 13]));
       expect(reference.kinds).toEqual(plainKinds);
-      const env = await jumping(64);
+      const env = await spanEnv(64);
       try {
         const seen = projections(env);
-        expect(await submitSpans(env, A, 9, spansA, {}, undefined, gatewaySpans(env)))
+        expect(await submitSpans(env, A, 9, spansA, {}, undefined, await spanMethod(env), penalty))
           .toEqual({ tokens: reference.tokens, outcome: "length", accepted: reference.accepted });
         expect(seen).toEqual(reference.seen);
       } finally { await env.close(); }
     });
 
-    test("a final span crossing the transition completes and stores its plain prefix; reusing that prefix is refused before its suffix forward", async () => {
-      const { PromptCache, cloneKvCaches } = await import("../../../src/state");
-      const reference = await directSpans(A, 3, affine(7), [[11, 12]]);
-      expect(reference.refused).toBe(false);
-      expect(reference.tokens).toHaveLength(3);
-      expect(reference.tokens.slice(1)).toEqual([11, 12]);
-      expect(reference.kinds).toEqual(plainKinds);
-      const prefix = new PromptCache(16 << 20, null, null, cloneKvCaches);
-      const puts: { tokens: number[]; kinds: string[]; offsets: number[] }[] = [], hits: number[][] = [];
-      const env = await jumping(7, { promptCache: {
-        put(tokens, caches, ...rest) {
-          puts.push({ tokens: [...tokens], kinds: caches.map(cache => cache.constructor.name), offsets: caches.map(cache => cache.offset) });
-          prefix.put(tokens, caches, ...rest);
-        },
-        take(prompt, ...rest) {
-          const hit = prefix.take(prompt, ...rest);
-          if (hit) hits.push([...hit.tokens]);
-          return hit;
-        },
-      } });
-      const forwards = offsets(env);
-      try {
-        const seen = projections(env);
-        const first = await submitSpans(env, A, 3, [[11, 12]], {}, undefined, gatewaySpans(env));
-        expect(first).toEqual({ tokens: reference.tokens, outcome: "length", accepted: reference.accepted });
-        expect(seen).toEqual(reference.seen);
-        const committed = [...A, ...first.tokens];
-        expect(puts).toEqual([{ tokens: committed, kinds: plainKinds, offsets: types.map(() => committed.length) }]);
-        // Opening converts the reused prefix; its first append would read converted layers.
-        const before = forwards.length;
-        expect(await submitSpans(env, [...committed, 17], 2, [], {}, undefined, gatewaySpans(env)))
-          .toEqual({ tokens: [], outcome: "DenseKvReadError", accepted: [] });
-        expect(hits).toEqual([committed]);
-        expect(forwards).toHaveLength(before);
-      } finally { try { await env.close(); } finally { prefix.clear(); } }
-    });
-
-    test("crossing and continuing, the row is refused before its next forward with that token unpublished; an interleaved peer and the group continue", async () => {
-      // A crosses the transition (11) in a plain step after its span; B finishes below it.
-      const referenceA = await directSpans(A, 10, affine(11), [[11, 12]]);
-      const referenceB = await directSpans(B, 7, affine(11), spansB);
-      expect(referenceA.refused).toBe(true);
-      expect(referenceA.tokens.slice(1, 3)).toEqual([11, 12]);
-      expect(referenceA.accepted).toHaveLength(referenceA.tokens.length + 1);
-      expect(referenceB.refused).toBe(false);
-      expect(referenceB.tokens).toHaveLength(7);
-      const env = await jumping(11);
-      try {
-        const seen = projections(env);
-        expect(await submitSpans(env, A, 10, [[11, 12]], {}, undefined, gatewaySpans(env)))
-          .toEqual({ tokens: referenceA.tokens, outcome: "DenseKvReadError", accepted: referenceA.accepted });
-        expect(seen).toEqual(referenceA.seen);
-        let overlap = 0;
-        const watch = () => { overlap = Math.max(overlap, env.group.activeRows); };
-        const [a, b] = await Promise.all([submitSpans(env, A, 10, [[11, 12]], {}, watch, gatewaySpans(env)),
-          submitSpans(env, B, 7, spansB, {}, watch, gatewaySpans(env))]);
-        expect(overlap).toBe(2);
-        expect(a).toEqual({ tokens: referenceA.tokens, outcome: "DenseKvReadError", accepted: referenceA.accepted });
-        expect(b).toEqual({ tokens: referenceB.tokens, outcome: "length", accepted: referenceB.accepted });
-        // The same group serves again.
-        expect(await submitSpans(env, B, 7, spansB, {}, undefined, gatewaySpans(env)))
-          .toEqual({ tokens: referenceB.tokens, outcome: "length", accepted: referenceB.accepted });
-      } finally { await env.close(); }
-    });
-
-    test("a prefill reaching the transition is refused before its tail forward with no output, also for immediate affine KV", async () => {
-      for (const start of [3, 0]) {
-        const reference = await directSpans(A, 4, affine(start), spansA);
-        expect(reference, `start ${start}`).toMatchObject({ refused: true, tokens: [], accepted: [], seen: [] });
-        const env = await jumping(start);
-        const forwards = offsets(env);
+    test(`the planner serves grammar jump on this graph as ${encoded ? "verified proposals" : "the committed-span method"} over delayed affine KV, as over bf16`, async () => {
+      for (const start of [null, 7, 0]) {
+        const env = await spanEnv(start);
         try {
-          for (let attempt = 1; attempt <= 2; attempt++) {
-            expect(await submitSpans(env, A, 4, spansA, {}, undefined, gatewaySpans(env)))
-              .toEqual({ tokens: [], outcome: "DenseKvReadError", accepted: [] });
-            // Only each attempt's drain chunk ran, from an empty cache.
-            expect(forwards, `start ${start}`).toEqual(Array.from({ length: attempt }, () => types.map(() => 0)));
-          }
+          expect(env.binding.plan({ ...shape, hasGrammar: true }, {}, { checkpoints: false }), `start ${start}`)
+            .toMatchObject({ method: encoded ? "speculative" : "autoregressive", mechanism: "continuous", grammarJump: true });
         } finally { await env.close(); }
       }
     });
 
-    test("a later layer converting alone refuses the row before any earlier plain layer appends", async () => {
-      // Per-layer config: only layer 2 converts at the transition; 0, 1 and 3 read plain.
-      const partial = resolveKvScheme({ override: "config", config: [{ layerIdx: 2, bits: 4, groupSize: HEAD_DIM }], quantizedKvStart: 11 });
-      const reference = await directSpans(A, 10, partial, [[11, 12]]);
-      expect(reference.refused).toBe(true);
-      expect(reference.kinds).toEqual(["KVCache", "RotatingKVCache", "QuantizedKVCache", "RotatingKVCache"]);
-      const env = await jumping(null, { kvScheme: partial });
-      const forwards = offsets(env);
-      try {
-        expect(await submitSpans(env, A, 10, [[11, 12]], {}, undefined, gatewaySpans(env)))
-          .toEqual({ tokens: reference.tokens, outcome: "DenseKvReadError", accepted: reference.accepted });
-        // The last forward started below the transition; none began after layer 2 converted.
-        expect(forwards.at(-1)).toEqual(types.map(() => 10));
-        expect(forwards.some(start => start.some(offset => offset >= 11))).toBe(false);
-      } finally { await env.close(); }
-    });
-
-    test("a directly bound span method refuses by its own copy of the graph's layers on a group composed without the gateway", async () => {
-      const { MlxBatchExecutionGroup, createRuntimeConfig } = await import("../../../src/execution");
-      const { bindGrammarGroupRequests } = await import("../../../src/execution/grammar-group");
-      const reference = await directSpans(A, 10, affine(11), [[11, 12]]);
-      const env = await setup(null), kvScheme = affine(11);
-      // Composed without the gateway: the method refuses by its own copy of the layers.
-      const group = new MlxBatchExecutionGroup(env.model, { maxBatch: 2, prefillChunkSize: 64,
-        runtime: createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1" }), kvScheme, kvBatchCapabilities: { delayedAffine: true } });
-      const layers = [...LAYERS], bound = bindGrammarGroupRequests(env.model, layers, LAYERS.length);
-      layers.length = 0;   // a later edit to the caller's list cannot reach the binding
-      try {
-        expect(await submitSpans({ ...env, kvScheme, group } as typeof env, A, 10, [[11, 12]], {}, undefined, bound))
-          .toEqual({ tokens: reference.tokens, outcome: "DenseKvReadError", accepted: reference.accepted });
-      } finally { try { await group.close(); } finally { await env.close(); } }
-    });
-  });
-
-  // Encoded-read graphs commit spans over delayed affine KV before and after
-  // conversion: they read converted layers. The gateway binds the span method with no dense-read
-  // requirement for them. Preservation is checked at matched options and
-  // chunking; a repetition penalty makes sampling read the committed history.
-  describe("encoded-read graph spans over delayed affine KV", () => {
-    const plainKinds = types.map(type => type === F ? "KVCache" : "RotatingKVCache");
-    const convertedKinds = types.map(type => type === F ? "QuantizedKVCache" : "RotatingQuantizedKVCache");
-    const penalty = { repetitionPenalty: 1.3 };
-    const encodedEnv = (start: number | null, options: Parameters<typeof setup>[1] = {}) =>
-      setup(start, { grammarJump: true, encoded: true, ...options });
-    /** Each forward's input ids and cache classes; the span method binds model
-     * operations on its first submission, so observers are installed first. */
-    const observe = (env: SpanEnv) => {
-      const forwards: { ids: number[]; kinds: string[] }[] = [], forward = env.model.forwardHidden.bind(env.model);
-      env.model.forwardHidden = (ids, caches) => {
-        forwards.push({ ids: [...ids.toIntTokens()], kinds: caches.map(cache => cache.constructor.name) });
-        return forward(ids, caches);
-      };
-      return forwards;
-    };
-
     test("spans before and after conversion equal the direct B1 jump: unsplit inputs, matcher and sampler history, every projection", async () => {
-      const reference = await directSpans(A, 9, affine(7), spansA, { encoded: true, sampling: penalty });
-      expect(reference.refused).toBe(false);
+      const reference = await directSpans(A, 9, affine(7), spansA, options);
       expect(reference.tokens).toHaveLength(9);
       expect(reference.tokens.slice(1, 3)).toEqual([11, 12]);
       expect(reference.tokens[4]).toBe(13);
       expect(reference.kinds).toEqual(convertedKinds);
-      const env = await encodedEnv(7);
+      const env = await spanEnv(7);
       const forwards = observe(env);
       try {
         const seen = projections(env);
-        expect(await submitSpans(env, A, 9, spansA, {}, undefined, gatewaySpans(env), penalty))
+        expect(await submitSpans(env, A, 9, spansA, {}, undefined, await spanMethod(env), penalty))
           .toEqual({ tokens: reference.tokens, outcome: "length", accepted: reference.accepted });
         expect(seen).toEqual(reference.seen);
         // The first span appends plain across the start; the next appends, unsplit, over converted layers.
@@ -2382,40 +2475,43 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
       } finally { await env.close(); }
     });
 
-    test("a reused prefix owing its conversion converts before its suffix forward, and spans continue over converted layers", async () => {
+    test("a reused prefix stored past its conversion is read converted from its suffix forward, and spans continue over converted layers", async () => {
       const { PromptCache, cloneKvCaches } = await import("../../../src/state");
       const prefix = new PromptCache(16 << 20, null, null, cloneKvCaches);
       const namespaces: (string | undefined)[] = [];
-      const env = await encodedEnv(7, { promptCache: {
+      const env = await spanEnv(7, { promptCache: {
         put(tokens, caches, ...rest) { namespaces.push(rest[0]); prefix.put(tokens, caches, ...rest); },
         take: (prompt, ...rest) => prefix.take(prompt, ...rest),
       } });
       const forwards = observe(env);
-      let reference: ReturnType<typeof prefix.take> = null;
+      let reference: ReturnType<typeof prefix.take> = null, composed: Cache[] | null = null;
       try {
         const seen = projections(env);
-        const first = await submitSpans(env, A, 3, [[11, 12]], {}, undefined, gatewaySpans(env), penalty);
+        const first = await submitSpans(env, A, 3, [[11, 12]], {}, undefined, await spanMethod(env), penalty);
         expect(first.outcome).toBe("length");
         const committed = [...A, ...first.tokens], prompt = [...committed, 17];
         expect(namespaces).toHaveLength(1);
-        // Borrow the same stored prefix, still plain at 8, as the next hit does.
+        // Borrow the same stored prefix as the next hit does. The span's append
+        // crossed the start (7) and the composed caches converted at its end,
+        // so the prefix is stored converted at 8.
         reference = prefix.take(prompt, namespaces[0]);
         expect(reference!.tokens).toEqual(committed);
-        expect(reference!.caches.map(cache => cache.constructor.name)).toEqual(plainKinds);
-        const expected = await directSpansFrom(env.model, reference!.caches, prompt, committed.length, 6, affine(7), [[21, 22]],
-          { encoded: true, sampling: penalty });
-        expect(expected.refused).toBe(false);
+        expect(reference!.caches.map(storageKind)).toEqual(convertedKinds);
+        // Handed back as the caches the graph composes, as the suffix forward reads them.
+        composed = composedAs(env.binding.graph, reference!.caches);
+        const expected = await directSpansFrom(env.model, composed, prompt, committed.length, 6, [[21, 22]],
+          options);
         expect(expected.tokens.slice(1, 3)).toEqual([21, 22]);
         seen.length = 0; forwards.length = 0;
-        expect(await submitSpans(env, prompt, 6, [[21, 22]], {}, undefined, gatewaySpans(env), penalty))
+        expect(await submitSpans(env, prompt, 6, [[21, 22]], {}, undefined, await spanMethod(env), penalty))
           .toEqual({ tokens: expected.tokens, outcome: "length", accepted: expected.accepted });
         expect(seen).toEqual(expected.seen);
-        // Opening converted the reused prefix before the suffix forward read it.
+        // The suffix forward reads the reused prefix converted.
         expect(forwards[0]).toEqual({ ids: [17], kinds: convertedKinds });
       } finally {
         try { await env.close(); }
         finally {
-          try { if (reference) { try { dispose(reference.caches); } finally { reference.retain?.(); } } }
+          try { if (reference) { try { dispose(composed ?? reference.caches); } finally { reference.retain?.(); } } }
           finally { prefix.clear(); }
         }
       }
@@ -2423,13 +2519,13 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
 
     test("interleaved rows across the conversion each equal their solo reference; a row stopped, cancelled or failing beside an active peer leaves it and the group usable", async () => {
       // B runs longer than A and is submitted first, so it is active whenever A publishes.
-      const referenceA = await directSpans(A, 12, affine(7), spansA, { encoded: true, sampling: penalty });
-      const referenceB = await directSpans(B, 12, affine(7), spansB, { encoded: true, sampling: penalty });
+      const referenceA = await directSpans(A, 12, affine(7), spansA, options);
+      const referenceB = await directSpans(B, 12, affine(7), spansB, options);
       expect(referenceA.kinds).toEqual(convertedKinds);
       expect(referenceB.kinds).toEqual(convertedKinds);
-      const env = await encodedEnv(7);
+      const env = await spanEnv(7);
       try {
-        const spans = gatewaySpans(env);
+        const spans = await spanMethod(env);
         let overlap = 0;
         const watch = () => { overlap = Math.max(overlap, env.group.activeRows); };
         const [b, a] = await Promise.all([submitSpans(env, B, 12, spansB, {}, watch, spans, penalty),
@@ -2458,48 +2554,102 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
       // Per-layer config: only layer 2 converts at the start; the others keep plain storage.
       const partial = resolveKvScheme({ override: "config", config: [{ layerIdx: 2, bits: 4, groupSize: HEAD_DIM }], quantizedKvStart: 7 });
       const mixedKinds = ["KVCache", "RotatingKVCache", "QuantizedKVCache", "RotatingKVCache"];
-      const reference = await directSpans(A, 9, partial, spansA, { encoded: true, sampling: penalty });
-      expect(reference.refused).toBe(false);
+      const reference = await directSpans(A, 9, partial, spansA, options);
       expect(reference.kinds).toEqual(mixedKinds);
-      const env = await encodedEnv(null, { kvScheme: partial });
+      const env = await spanEnv(null, { kvScheme: partial });
       const forwards = observe(env);
       try {
         const seen = projections(env);
-        expect(await submitSpans(env, A, 9, spansA, {}, undefined, gatewaySpans(env), penalty))
+        expect(await submitSpans(env, A, 9, spansA, {}, undefined, await spanMethod(env), penalty))
           .toEqual({ tokens: reference.tokens, outcome: "length", accepted: reference.accepted });
         expect(seen).toEqual(reference.seen);
         expect(forwards).toContainEqual({ ids: [reference.tokens[3]!, 13], kinds: mixedKinds });
       } finally { await env.close(); }
     });
 
-    /** A small MiniCPM5 graph over affine-quantized synthetic weights; its attention reads encoded KV. */
-    const miniCpm = async () => {
+    test("a prefill reaching the transition, also for immediate affine KV, converts and its spans continue, equal to the direct B1 jump", async () => {
+      for (const start of [3, 0]) {
+        const reference = await directSpans(A, 9, affine(start), spansA, options);
+        expect(reference.kinds, `start ${start}`).toEqual(convertedKinds);
+        const env = await spanEnv(start);
+        try {
+          const seen = projections(env);
+          expect(await submitSpans(env, A, 9, spansA, {}, undefined, await spanMethod(env), penalty), `start ${start}`)
+            .toEqual({ tokens: reference.tokens, outcome: "length", accepted: reference.accepted });
+          expect(seen, `start ${start}`).toEqual(reference.seen);
+        } finally { await env.close(); }
+      }
+    });
+
+    test("a span method bound directly serves a group composed without the gateway past the transition", async () => {
+      const { MlxBatchExecutionGroup, createRuntimeConfig } = await import("../../../src/execution");
+      const { bindGrammarGroupRequests } = await import("../../../src/execution/grammar-group");
+      const reference = await directSpans(A, 10, affine(11), [[11, 12]], options);
+      // The graph is composed with the scheme the group stores.
+      const kvScheme = affine(11), env = await setup(null, { kvScheme, encoded });
+      const group = new MlxBatchExecutionGroup(env.model, { maxBatch: 2, prefillChunkSize: 64,
+        runtime: createRuntimeConfig({}) });
+      try {
+        expect(await submitSpans({ ...env, kvScheme, group } as typeof env, A, 10, [[11, 12]], {}, undefined,
+          bindGrammarGroupRequests(env.model), penalty))
+          .toEqual({ tokens: reference.tokens, outcome: "length", accepted: reference.accepted });
+      } finally { try { await group.close(); } finally { await env.close(); } }
+    });
+  };
+
+  describe("dense-read graph spans over delayed affine KV", () => spanCases(false));
+
+  // Encoded-read graphs commit spans over delayed affine KV before and after
+  // conversion: they read converted layers. Preservation is checked at matched
+  // options and chunking; a repetition penalty makes sampling read the
+  // committed history.
+  describe("encoded-read graph spans over delayed affine KV", () => {
+    const plainKinds = types.map(type => type === F ? "KVCache" : "RotatingKVCache");
+    const convertedKinds = types.map(type => type === F ? "QuantizedKVCache" : "RotatingQuantizedKVCache");
+    const penalty = { repetitionPenalty: 1.3 };
+    const encodedEnv = (start: number | null, options: Parameters<typeof setup>[1] = {}) =>
+      setup(start, { grammarJump: true, encoded: true, ...options });
+    /** Each forward's input ids and cache classes; the span method binds model
+     * operations on its first submission, so observers are installed first. */
+    const observe = (env: SpanEnv) => {
+      const forwards: { ids: number[]; kinds: string[] }[] = [];
+      env.forwardHooks.push((ids, caches) => {
+        forwards.push({ ids: [...ids.toIntTokens()], kinds: caches.map(storageKind) });
+      });
+      return forwards;
+    };
+
+    spanCases(true);
+
+    /** A small MiniCPM5 graph over affine-quantized synthetic weights, composed
+     * with `scheme`; its attention reads encoded KV. */
+    const miniCpm = async (scheme: ReturnType<typeof resolveKvScheme>) => {
       const { MiniCPM5Model } = await import("../../../src/models/minicpm5/model");
-      return quantizedGraph(MiniCPM5Model, "minicpm5");
+      return quantizedGraph(MiniCPM5Model, "minicpm5", { composition: testComposition(scheme.storage, { grammarJump: true }) });
     };
 
     test("a MiniCPM5 graph: spans before and after conversion equal the direct B1 jump in tokens, histories and every projection", async () => {
-      const { bindMlxGateway, createRuntimeConfig, withRuntimeConfig } = await import("../../../src/execution");
+      const { bindMlxGateway, createRuntimeConfig } = await import("../../../src/execution");
       const plainMini = ["KVCache", "KVCache"], convertedMini = ["QuantizedKVCache", "QuantizedKVCache"];
-      const referenceGraph = await miniCpm(), graph = await miniCpm();
+      const kvScheme = affine(7);
+      const referenceGraph = await miniCpm(kvScheme), graph = await miniCpm(kvScheme);
       const caches = referenceGraph.model.makeCache();
       let reference: Awaited<ReturnType<typeof directSpansFrom>>;
-      try { reference = await directSpansFrom(referenceGraph.model, caches, A, 0, 9, affine(7), spansA, { encoded: true, sampling: penalty }); }
+      try { reference = await directSpansFrom(referenceGraph.model, caches, A, 0, 9, spansA, { encoded: true, sampling: penalty }); }
       finally { try { dispose(caches); } finally { referenceGraph.dispose(); } }
-      expect(reference.refused).toBe(false);
       expect(reference.tokens).toHaveLength(9);
       expect(reference.tokens.slice(1, 3)).toEqual([11, 12]);
       expect(reference.tokens[4]).toBe(13);
       expect(reference.kinds).toEqual(convertedMini);
-      const kvScheme = affine(7);
-      const binding = withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }), () => bindMlxGateway(graph.model));
+      const { view, forwardHooks } = hooked(graph.model);
+      const binding = bindMlxGateway(view);
       const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: 64,
-        runtime: createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1" }), kvScheme });
-      const env: SpanEnv = { binding, model: graph.model, kvScheme, group };
+        runtime: createRuntimeConfig({}) });
+      const env: SpanEnv = { binding, model: graph.model, view, kvScheme, group, forwardHooks };
       const forwards = observe(env);
       try {
         const seen = projections(env);
-        expect(await submitSpans(env, A, 9, spansA, {}, undefined, gatewaySpans(env), penalty))
+        expect(await submitSpans(env, A, 9, spansA, {}, undefined, await boundSpans(env), penalty))
           .toEqual({ tokens: reference.tokens, outcome: "length", accepted: reference.accepted });
         expect(seen).toEqual(reference.seen);
         // The first span appends plain across the start; the next appends, unsplit, over converted layers.
@@ -2513,20 +2663,21 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
 
     /** The gateway's span method over a fresh MiniCPM5 graph; the environment owns the graph. */
     const miniCpmEnv = async (kvScheme: ReturnType<typeof resolveKvScheme>,
-      promptCache?: import("../../../src/execution/batch-types").RowPromptCache) => {
-      const { bindMlxGateway, createRuntimeConfig, withRuntimeConfig } = await import("../../../src/execution");
-      const graph = await miniCpm();
-      const binding = withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }), () => bindMlxGateway(graph.model));
-      const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: 64, ...(promptCache ? { promptCache } : {}),
-        runtime: createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1" }), kvScheme });
-      return { binding, model: graph.model, kvScheme, group, async close() {
+      promptCache?: PrefixStore) => {
+      const { bindMlxGateway, createRuntimeConfig } = await import("../../../src/execution");
+      const graph = await miniCpm(kvScheme);
+      const { view, forwardHooks } = hooked(graph.model);
+      const binding = bindMlxGateway(view);
+      const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: 64, ...(promptCache ? { cache: keepingIn(view, promptCache) } : {}),
+        runtime: createRuntimeConfig({}) });
+      return { binding, model: graph.model, view, kvScheme, group, forwardHooks, async close() {
         try { await group.close(); expect(group.activeRows + group.pendingRows).toBe(0); } finally { graph.dispose(); }
       } };
     };
     /** The direct B1 order over a separate, identical MiniCPM5 graph. */
     const miniReference = async (prompt: number[], maxTokens: number, scheme: ReturnType<typeof resolveKvScheme>, spans: number[][]) => {
-      const graph = await miniCpm(), caches = graph.model.makeCache();
-      try { return await directSpansFrom(graph.model, caches, prompt, 0, maxTokens, scheme, spans, { encoded: true, sampling: penalty }); }
+      const graph = await miniCpm(scheme), caches = graph.model.makeCache();
+      try { return await directSpansFrom(graph.model, caches, prompt, 0, maxTokens, spans, { encoded: true, sampling: penalty }); }
       finally { try { dispose(caches); } finally { graph.dispose(); } }
     };
 
@@ -2536,7 +2687,7 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
       expect(referenceB.kinds).toEqual(["QuantizedKVCache", "QuantizedKVCache"]);
       const env = await miniCpmEnv(affine(7));
       try {
-        const spans = gatewaySpans(env);
+        const spans = await boundSpans(env);
         // B runs longer than A and is submitted first, so it is active whenever A publishes.
         for (const [end, outcome] of [[{ stopAfter: 2 }, "stop"], [{ cancelAfter: 2 }, "AbortError"],
           [{ throwAfter: 2 }, "consumer failed"]] as const) {
@@ -2553,7 +2704,7 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
       } finally { await env.close(); }
     });
 
-    test("a MiniCPM5 graph: a reused prefix owing its conversion converts before its suffix forward, and spans continue over converted layers", async () => {
+    test("a MiniCPM5 graph: a reused prefix stored past its conversion is read converted from its suffix forward, and spans continue over converted layers", async () => {
       const { PromptCache, cloneKvCaches } = await import("../../../src/state");
       const prefix = new PromptCache(16 << 20, null, null, cloneKvCaches);
       const namespaces: (string | undefined)[] = [];
@@ -2562,30 +2713,32 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
         take: (prompt, ...rest) => prefix.take(prompt, ...rest),
       });
       const forwards = observe(env);
-      let reference: ReturnType<typeof prefix.take> = null;
+      let reference: ReturnType<typeof prefix.take> = null, composed: Cache[] | null = null;
       try {
         const seen = projections(env);
-        const first = await submitSpans(env, A, 3, [[11, 12]], {}, undefined, gatewaySpans(env), penalty);
+        const first = await submitSpans(env, A, 3, [[11, 12]], {}, undefined, await boundSpans(env), penalty);
         expect(first.outcome).toBe("length");
         const committed = [...A, ...first.tokens], prompt = [...committed, 17];
         expect(namespaces).toHaveLength(1);
-        // Borrow the same stored prefix, still plain at 8, as the next hit does.
+        // Borrow the same stored prefix as the next hit does: stored converted at 8,
+        // as the span's append crossed the start (7) and the composed caches converted at its end.
         reference = prefix.take(prompt, namespaces[0]);
         expect(reference!.tokens).toEqual(committed);
-        expect(reference!.caches.map(cache => cache.constructor.name)).toEqual(["KVCache", "KVCache"]);
-        const expected = await directSpansFrom(env.model, reference!.caches, prompt, committed.length, 6, affine(7), [[21, 22]],
+        expect(reference!.caches.map(storageKind)).toEqual(["QuantizedKVCache", "QuantizedKVCache"]);
+        // Handed back as the caches the graph composes, as the suffix forward reads them.
+        composed = composedAs(env.binding.graph, reference!.caches);
+        const expected = await directSpansFrom(env.model, composed, prompt, committed.length, 6, [[21, 22]],
           { encoded: true, sampling: penalty });
-        expect(expected.refused).toBe(false);
         expect(expected.tokens.slice(1, 3)).toEqual([21, 22]);
         seen.length = 0; forwards.length = 0;
-        expect(await submitSpans(env, prompt, 6, [[21, 22]], {}, undefined, gatewaySpans(env), penalty))
+        expect(await submitSpans(env, prompt, 6, [[21, 22]], {}, undefined, await boundSpans(env), penalty))
           .toEqual({ tokens: expected.tokens, outcome: "length", accepted: expected.accepted });
         expect(seen).toEqual(expected.seen);
         expect(forwards[0]).toEqual({ ids: [17], kinds: ["QuantizedKVCache", "QuantizedKVCache"] });
       } finally {
         try { await env.close(); }
         finally {
-          try { if (reference) { try { dispose(reference.caches); } finally { reference.retain?.(); } } }
+          try { if (reference) { try { dispose(composed ?? reference.caches); } finally { reference.retain?.(); } } }
           finally { prefix.clear(); }
         }
       }
@@ -2596,13 +2749,12 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
       const partial = resolveKvScheme({ override: "config", config: [{ layerIdx: 1, bits: 4, groupSize: HEAD_DIM }], quantizedKvStart: 7 });
       const mixedKinds = ["KVCache", "QuantizedKVCache"];
       const reference = await miniReference(A, 9, partial, spansA);
-      expect(reference.refused).toBe(false);
       expect(reference.kinds).toEqual(mixedKinds);
       const env = await miniCpmEnv(partial);
       const forwards = observe(env);
       try {
         const seen = projections(env);
-        expect(await submitSpans(env, A, 9, spansA, {}, undefined, gatewaySpans(env), penalty))
+        expect(await submitSpans(env, A, 9, spansA, {}, undefined, await boundSpans(env), penalty))
           .toEqual({ tokens: reference.tokens, outcome: "length", accepted: reference.accepted });
         expect(seen).toEqual(reference.seen);
         expect(forwards).toContainEqual({ ids: [reference.tokens[3]!, 13], kinds: mixedKinds });
@@ -2614,22 +2766,21 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
   // as mlx-lm's scaled_dot_product_attention does: a delayed affine row
   // converts at its start and continues over converted layers.
   describe("Qwen3 graph with delayed affine KV", () => {
-    const qwen3Graph = async () => {
+    const qwen3Graph = async (composition: Composition) => {
       const { Qwen3Model } = await import("../../../src/models/qwen/qwen3");
-      return quantizedGraph(Qwen3Model, "qwen3", { qkNorm: true });
+      return quantizedGraph(Qwen3Model, "qwen3", { qkNorm: true, composition });
     };
-    const qwen3 = async (start: number | null, options: SetupOptions = {}) => setupWith(await qwen3Graph(), start, options);
-    /** The direct B1 order over a separate, identical graph. */
+    const qwen3 = async (start: number | null, options: SetupOptions = {}) => setupWith(qwen3Graph, start, options);
+    /** The direct B1 order over a separate, identical graph composed with affine KV from `start`. */
     const reference = async (prompt: number[], maxTokens: number, start: number, spans: number[][] = []) => {
-      const g = await qwen3Graph(), caches = g.model.makeCache();
-      try { return await directSpansFrom(g.model, caches, prompt, 0, maxTokens, affine(start), spans, { encoded: true }); }
+      const g = await qwen3Graph(testComposition(affine(start).storage)), caches = g.model.makeCache();
+      try { return await directSpansFrom(g.model, caches, prompt, 0, maxTokens, spans, { encoded: true }); }
       finally { try { dispose(caches); } finally { g.dispose(); } }
     };
 
     test("below the transition, delayed affine rows equal plain rows at B1 and in a B2 co-prefill", async () => {
       const plain = await qwen3(null), delayed = await qwen3(64);
       try {
-        expect(delayed.model.requiredDenseKvLayers).toEqual([]);
         const pl = projections(plain), dl = projections(delayed);
         expect(await delayed.submit(A, 6)).toEqual(await plain.submit(A, 6));
         expect(dl).toEqual(pl);
@@ -2659,11 +2810,13 @@ describe.skipIf(!native)("plain-KV graphs with delayed affine KV", () => {
     test("grammar spans before, across and after the transition equal the direct B1 jump", async () => {
       const run = async (maxTokens: number, start: number, spans: number[][]) => {
         const expected = await reference(A, maxTokens, start, spans);
-        expect(expected.refused).toBe(false);
         const env = await qwen3(start, { grammarJump: true });
         try {
+          // The planner serves this graph's grammar jump as verified proposals; the span lego is bound directly.
+          expect(env.binding.plan({ ...shape, hasGrammar: true }, {}, { checkpoints: false }))
+            .toMatchObject({ method: "speculative", grammarJump: true });
           const seen = projections(env);
-          expect(await submitSpans(env, A, maxTokens, spans, {}, undefined, gatewaySpans(env)))
+          expect(await submitSpans(env, A, maxTokens, spans, {}, undefined, await boundSpans(env)))
             .toEqual({ tokens: expected.tokens, outcome: "length", accepted: expected.accepted });
           expect(seen).toEqual(expected.seen);
         } finally { await env.close(); }

@@ -43,8 +43,8 @@ found; offload restore only redirects routing and never unmaps borrowed weights.
 and unfused SDPA; `--l2` selects model-config KV and fused SDPA, and wins if both
 are given. An explicit `--kv-quant` overrides the preset and sets the kernel
 default (fused for `config`, unfused otherwise); `--fused-sdpa on|off` overrides
-that default. The policy is resolved before model loading, including in isolated
-model workers, and restored on shutdown or startup failure.
+that default. The policy is part of the loaded model's composition, resolved before
+its graph is built (including in isolated model workers); no process setting changes.
 
 `--adapter <dir>` (alias `--adapter-path`) mounts a LoRA adapter right after the
 model loads, before any request, under the directory's basename as its id; it
@@ -69,31 +69,35 @@ The opt-in [draft flags test](tests/engine/draft-flags.test.ts) serves with
 ngram drafting and checks the speculation telemetry and exactness against a
 plain run.
 `--paged-kv` (env mirror `MLX_BUN_PAGED_KV=1`) with `--paged-kv-block-size`
-(only alongside paging) sets the paged KV request default; Gemma4-family
-requests use the paged path and other families answer the typed capability
-error, never a hidden serial lane.
-Startup rejects paging combined with a loaded draft, per-layer KV quantization,
-or TurboQuant; bf16 and uniform KV4/KV8 remain supported.
-As main's server did, startup also rejects `--kv-quant turbo` when the model's
-full-attention head dimension is not one the TurboQuant codec encodes
-(`TURBOQUANT_HEAD_DIMS`), before any request, instead of failing each request in
-prefill.
-Startup, and `generate`, also reject a requested KV scheme the model's cache
-layers cannot take, since every request carries it: GLM-5.2's MLA cache takes no
-KV scheme, so `--kv-quant 4|8|turbo` (and `config` or `--l2` when a
-`kv_config.json` exists) is refused there; main accepted the option and served GLM-5.2 in bf16
-while reporting the requested scheme.
+(only alongside paging) composes the paged KV lego when the model loads: every
+request, drafted, grammar, fill, media and adapter rows included, keeps its
+full-attention keys and values in blocks. Pages store what `--kv-quant` names
+for each layer: bf16, affine at the scheme's width (per layer under `config`),
+or TurboQuant. `--paged-kv-direct` reads them with the direct Metal kernel
+(Lab numerics) for decode and windows of up to eight queries; the kernel has
+no compiled form, so that composition decodes without the compiled step.
+The TurboQuant sign tables are generated for the served head dimensions (64, 96, 128,
+256, 512; `packages/inference/scripts/gen-turboquant-signs.ts`, held to the generator by a
+drift test), so `--kv-quant turbo` composes for every served model; the fused decode kernel
+covers 64, 128, 256 and 512, and 96 decodes on the plain path.
+The graphs that compose their own caches take the scheme and paging too:
+GLM-5.2's compressed MLA state (the latent, RoPE key and DSA index key) is stored
+as the scheme names and paged under `--paged-kv`, and DiffusionGemma's denoising
+caches are the scheme's legos; main accepted the option and served GLM-5.2 in
+bf16 while reporting the requested scheme.
 `--kv-quant config` without the model's `kv_config.json` stays bf16.
-The opt-in [paged KV test](tests/engine/paged-kv.test.ts) covers both family
-outcomes.
+The opt-in [paged KV test](tests/engine/paged-kv.test.ts) serves a Gemma4 and
+a model of another family.
 
 Shutdown stops background cache demotion, closes chat sessions, drains active
 HTTP responses, then flushes caches and releases the engine. The CLI bounds this
 with a 120-second deadline; cleanup failures or deadline expiry exit with code 1
 (main exited 0 on timeout). SSD sub-options fail before model loading when saved
-state is off (`--ssd-cache off` or `--prompt-cache 0`) instead of warning and being ignored. The existing
-`MLX_BUN_RD_CONTEXT_LIMIT` cap remains supported and is intersected with a loaded
-loaded runtime memory plan; this draft adds no serving context or read-only CLI flags.
+state is off (`--ssd-cache off` or `--prompt-cache 0`) instead of warning and being ignored.
+`MLX_BUN_RD_CONTEXT_LIMIT` is main's enforced context cap, intersected with a
+loaded runtime memory plan (or, under `--memory-budget`, the admission estimate's
+safe context); no CLI flag sets that cap or read-only chat, and `--context-length`
+only sizes a memory-planning runtime's reservation.
 Programmatic composition still accepts explicit context and read-only policy.
 
 `src/cli/main.ts` dispatches commands; `args.ts` owns accepted options and help;
@@ -201,7 +205,7 @@ launch forms, and no flag selects either:
   serve the model form).
 
 `server/worker-routes.ts` answers `GET /health`, `POST /admin/lease`,
-`POST /admin/drain`, `POST /admin/memory/complete` and `GET /admin/events` (the
+`POST /admin/drain`, `POST /admin/memory/complete`, `POST /admin/adapters` and `GET /admin/events` (the
 worker's own event stream, NDJSON) ahead of the routes on
 the socket only: a TCP listener answers 404 for all of them, and `/engine`
 under `--in-process` is 404 too. In the app form its `/health` replaces
@@ -405,10 +409,11 @@ website and transcription example app remain private.
 exits. It uses the model's chat template when available; `--raw` feeds the prompt
 verbatim. Main's greedy sampling, 256-token default cap, optional sampler/KV
 settings, and unfiltered generated text are CLI policy. Model-author serving
-sampling defaults do not replace them. Tier, serial, and compiled switches are
-not exposed; execution uses the same continuous engine at capacity one.
-TurboQuant KV options remain unavailable until shared execution supports them;
-`generate --help` lists the currently accepted settings.
+sampling defaults do not replace them. Tier and compiled-step switches are not
+exposed (compiled decode is a composition field the loader resolves), and the
+request runs on the same continuous engine at capacity one, a batch of one.
+`generate --help` lists the accepted settings, including every `--kv-quant`
+scheme `serve` takes and `--quantized-kv-start`.
 
 `mlx-bun embed [query] --text "…"` prints a vector per text, or one OpenAI-style
 list with `--json`. Without text it reads nonempty stdin lines; `--instruct`
@@ -485,15 +490,17 @@ HTTP parsing, response formatting and web policy belong above this boundary.
 loading and lifecycle without native MLX. The gateway and session tests beside
 it cover cancellation, output delivery and the same scheduler path at capacity
 one and greater. These are CPU checks, not real-weight numerical verification.
-The first engine slice reports unsupported shared-execution capabilities rather
-than running a hidden serial path. Diffusion models are served through the same
+A request shape the loaded composition does not serve gets the typed capability
+error; there is no other path to fall to. Diffusion models are served through the same
 scheduler by the library's interleaved denoising method. An image request's pixels
 ride its options, and the gateway releases them exactly once, whether the row
 settles or fails before submission. Requests the method cannot apply (grammar,
-draft, logprobs, logits processors, fill, encoded or paged KV) receive the typed
-capability error.
+draft, logprobs, logits processors, fill) receive the typed
+capability error; its caches are the legos the composition's KV scheme and paging name.
 
-`engine/cache-services` composes the library prompt cache and persistence. Its
+`engine/cache-services` builds the loaded model's cache service (the library's
+`state/cache-service`) from the serve flags: RAM prefixes, saved state, generation
+checkpoints, `--kv-budget` admission and paging, behind one interface. Its
 default is 8 GB of RAM with plain KV; a caller supplies `ssdCacheDir` for saved state.
 `mlx-bun serve` supplies it by default (`MLX_BUN_HOME/kv`, `--ssd-cache <dir>` moves it,
 `off` disables it): one directory per model identity under the root, and
@@ -505,11 +512,10 @@ after every close. A model that returns finds its directory, and its prefix, int
 The hub's resolved model directory supplies the identity, so startup does not hash
 weight files. Saved KV is disposable; after replacing weights in place, clear it
 when you want fresh state.
-Composition must pass the returned `continuationServices` to
-`binding.gateway.configureContinuation` and supply `promptCache`,
-`resolvedKvScheme`, `stateCodecs`, `adapterNamespace`, and checkpoint availability
-as gateway options. The engine borrows these services; construction alone does
-not attach them. Pass `close` through the owned `beforeModelDispose` hook so shutdown
+Composition passes the returned `cache` and `adapterNamespace` as gateway options;
+`/stats`, the cache routes, telemetry and the model host read the service's own
+`report()`. The engine borrows the service; construction alone does not attach it.
+Pass its `close` through the owned `beforeModelDispose` hook so shutdown
 drains execution, flushes persistence, clears cache state, then frees the model.
 `flush` also supports explicit durability checks while the app is running:
 `server/cache-routes.ts` serves main's `POST /admin/cache/flush` (200 with the
@@ -581,8 +587,8 @@ lifecycle, numerical parity, or performance.
 
 The opt-in [paged KV test](tests/engine/paged-kv.test.ts) also covers Gemma4
 HTTP cancellation for each paged reader: the gathered reader and the direct
-reader that `MLX_BUN_PAGED_ATTN=1` selects (read, like every `MLX_BUN_` switch,
-into the runtime snapshot from the environment). A client leaves a greedy
+reader that `--paged-kv-direct` composes (the composition's `pagedKv.direct`,
+which `/stats` prints). A client leaves a greedy
 `/v1/completions` stream mid-generation; the server observes the disconnect, the
 row stops storing tokens before its natural end, and the scheduler drains. The
 same server then answers another prompt and the abandoned one exactly as a fresh
@@ -598,8 +604,8 @@ fit functions (`@mlx-bun/inference/execution/fit`) and the served artifact metad
 not impose an admission limit. A runtime that plans its own memory reports that
 plan (`/fit`'s `plan` object lists its streamed tiers and generation allowance;
 `/stats.runtime` carries the runtime's own telemetry) instead of the generic
-resident-weight estimate. Batch mode remains
-continuous even at capacity one. Pending SSD counters include the generation
+resident-weight estimate. `/stats.batch` reports the continuous scheduler
+(`mode: "batch"`, `batched: true`) at every capacity, one included. Pending SSD counters include the generation
 checkpoint queue as well as prompt-cache persistence work.
 Historical EvalDB measurements have no migrated owner, so measurement fields
 remain null; old machine-specific throughput constants are not reported as
@@ -682,7 +688,7 @@ retry, and close rules.
 The [engine tests](tests/engine-entry.test.ts) import the entry through the
 export map with native MLX blocked and drive the host over a fake worker;
 `verify-packages` repeats them from the installed package. The worker's own
-refusal and startup behaviors are covered by C2a's
+refusal and startup behaviors are covered by the
 [worker-entry](tests/worker-entry.test.ts) and
 [worker-process](tests/jobs/worker-process.test.ts) tests. The opt-in
 [native test](tests/engine/library-host.test.ts) (`MLX_BUN_TEST_NATIVE=1` with
@@ -785,7 +791,7 @@ Migration from main (`02d723a`):
 | `ServerContext`, `ServingContext` | `ModelContext`, `LoadedModelContext` |
 | `ServerContext.serving?: ModelServingBinding` | `options.binding` (`ModelBinding`) and `options.buildPrompt` for `serving.buildPrompt`; `createSerial` has no counterpart, since every request runs on the shared scheduler through `binding.gateway` |
 | `ModelPromptBuilder`, `BuiltPrompt` | the same names |
-| `batch` (1 pinned main's serial executor) | `capacity` (1 is the continuous scheduler at capacity one) |
+| `batch` (1 pinned main's one-request executor) | `capacity` (1 is the continuous scheduler at capacity one) |
 | `promptCacheBytes`, `kvQuant`, `quantizedKvStart`, `turboQuant`, `ssdCacheDir`, `ssdCacheMaxBytes`, `ssdDemoteIdleSec`, `ssdCacheVerify`, `generationCheckpointTokens` | `cache.*` |
 | `pagedKv`, `defaultThinking`, `defaultTemperature`, `defaultTopP`, `defaultTopK`, `hlg` | `request.*` |
 | `defaultMaxTokens` | `defaultGeneratedTokens` |
@@ -870,7 +876,8 @@ headers. The packed consumer check verifies the same assets after installation.
 Adapters are the models module's (`/v1/adapters*`, [module README](../../packages/module-models/README.md)): the routes
 reach the served model through its `adapters` operation, which `engine/adapter-operation.ts` builds over the loaded context
 (mount, unmount and merge run under the engine execution lock in the process that holds the model); no HTTP handler owns
-tensors. Serving with an adapter still uses the shared scheduler and reports 501 for unsupported batched capabilities.
+tensors. Serving with an adapter uses the shared scheduler; an adapter request to a graph whose declared capabilities
+serve no adapter rows gets the typed 501 (`adapter-batch-unsupported`).
 
 ## Memory vault
 
@@ -944,12 +951,13 @@ for that worker's lifetime (until it is respawned or the server stops). A cancel
 disconnect, or the parent's shutdown aborts the request, and the worker aborts
 and joins every row. A call is never retried: a worker that stops mid-call fails
 that call with an error, and a restart drops the task model with
-its worker. Every path rides a continuous-batching scheduler. `MLX_BUN_MEMORY_BATCH`
+its worker. Every path rides a continuous-batching scheduler, where one call is a
+batch of one. `MLX_BUN_MEMORY_BATCH`
 (default 1) bounds the calls in flight per batched stage. Nothing in the memory
-domain loads a model, and no serial lane exists. Each run receives its client
+domain loads a model. Each run receives its client
 and vault root explicitly; Meta policy reads use that same vault. A failed batch
 stops admission, cancels siblings, and joins them before returning its error.
-`server/memory-synthesis.ts` owns active server runs: request/body cancellation
+The memory module's `createMemorySynthesis` (`packages/module-memory/src/synthesis.ts`) owns active server runs: request/body cancellation
 aborts the run and its in-flight completions (or its wait for the lease), and
 server shutdown cancels and joins all synthesis alongside managed jobs and
 downloads, then closes the task model, before engine drain. Completed stage writes are resumable; cancellation does not roll them back.
@@ -961,9 +969,9 @@ main's subcommands: `init`/`setup` (the wizard below), `status` (default),
 `open`, `list`, `search`, `toc`, `section`, `links`, `read`, `synthesize`
 (`--dry-run`; `--since`/`--model` parsed but not consumed, as in main), the
 stage workers `segment`, `extract`, `route`, `synthesize-stage` (`--limit`,
-`--convs`), `link`, and `schedule`/`unschedule`. Model-driven subcommands talk
-to the server named by `--host`/`--port` (the serve defaults) and fail with a
-pointer to `mlx-bun serve` when none answers. The entity gold main read from
+`--convs`), `link`, and `schedule`/`unschedule`. Model-driven subcommands load
+the memory task model in-process on first use (`cli/memory-engine.ts`), as main
+did, or talk to the serving mlx-bun named by `--host`/`--port`. The entity gold main read from
 `goldens/dreaming-entities-gold.json` is a published dataset: without that
 file the resolver runs unseeded (store aliases still fold).
 
@@ -994,10 +1002,9 @@ not thrown. `memory unschedule` runs `launchctl unload -w` and deletes the
 plist. The job runs `/bin/zsh -lc "exec <program> memory synthesize"`, where
 the program is the executable identity captured at startup
 (`jobs/executable.ts`) plus the CLI entry when running from source; it is
-never a PATH lookup and never `process.execPath` read later. Because synthesis
-runs through a serving mlx-bun, the job needs `mlx-bun serve` running at that
-time; every status surface says so (the improvement that the server should own
-the scheduled run is recorded in PLAN).
+never a PATH lookup and never `process.execPath` read later. The job's
+`memory synthesize` loads the memory task model itself, so it needs no running
+server; every status surface says so.
 
 `scheduleStatus` reports `installed` (plist present), `loaded` (`launchctl
 list com.mlx-bun.memory` succeeds), `at` (read back from the plist; `null`
@@ -1306,7 +1313,11 @@ temporary home, then upgrades once. It checks the actual CLI and managed child p
 web, memory, synthetic registry/fit, native path resolution, microphone helper
 help, and Photon initialization in the relocated, installed, and retained
 previous bundles.
-The default performs no MLX/GPU operation or remote download. Mac CI runs this check.
+The default runs no model and makes no remote download. Each install ends with
+the installed executable's Neural Engine install step (`mlx-bun compile-ane`),
+which the check requires to run: it compiles this Mac's programs or reports none
+to compile, and where the Neural Engine cannot compile (a virtual machine) the
+installer warns and keeps the installation. Mac CI runs this check.
 With exclusive GPU access, `bun run verify:binary --model /path/to/cached-model`
 also starts the actual relocated executable, checks its web assets, `/stats`,
 `/fit`, and a chat completion, then requires a clean SIGTERM exit. It discovers
@@ -1321,7 +1332,9 @@ bundle under `${MLX_BUN_INSTALL_DIR:-$HOME/.mlx-bun}/app-install/` and links
 executable; all are refused where a directory stands and switch with the app).
 `MLX_BUN_VERSION` selects `latest` or a pinned tag.
 The installer validates the files and version before switching its `current`
-symlink and retains the old app on failure. Successful updates keep the current
+symlink and retains the old app on failure. After switching it runs the
+installed `mlx-bun compile-ane` (the Neural Engine install step; a failure warns
+and keeps the installation). Successful updates keep the current
 and immediate previous bundles, plus any older bundle used by a running app.
 Other older owned bundles and stale stages are removed on the next install;
 vnode inspection keeps bundles used by apps launched through PATH or symlinks,
@@ -1354,7 +1367,7 @@ app-root and `current` ownership), without network access.
 `bun scripts/prepare-release.ts prepare /new/output/directory` builds from staged
 natives, checks the executable against the app manifest version, packs workspace
 packages, and writes unsigned local archives, checksums, and a Homebrew formula.
-It then runs the `verify:binary` acceptance (CPU only) on the unsigned archive
+It then runs the model-free `verify:binary` acceptance on the unsigned archive
 and requires unchanged bundle hashes afterwards; a failure removes `unsigned/`
 and writes no `preparation.json`.
 `preparation.json` records bundle hashes, dependency-first package publication

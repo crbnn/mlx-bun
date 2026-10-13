@@ -1,8 +1,9 @@
+import { unfusedAffineKernels } from "../../src/state/affine-attention";
 import { expect, test } from "bun:test";
 import { Dtype, clearCache } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { QuantizedKVCache } from "../../src/state/quantized-kv";
-import { quantizedSdpa } from "../../src/layers/quantized-attention";
+import { quantizedSdpaUnfused } from "../../src/layers/quantized-attention";
 import { quantizedAppendAttention } from "../../src/layers/quantized-append-attention";
 
 test("affine committed spans retain sequential attention at each causal prefix", () => {
@@ -18,7 +19,7 @@ test("affine committed spans retain sequential attention at each causal prefix",
       using q = ops.randomNormal([batch, 24, length, 256], dtype, 0, 1, null);
       using k = ops.randomNormal([batch, 4, prefix + length, 256], dtype, 0, 1, null);
       using v = ops.randomNormal([batch, 4, prefix + length, 256], dtype, 0, 1, null);
-      const sequential = new QuantizedKVCache(groupSize, bits), combined = new QuantizedKVCache(groupSize, bits);
+      const sequential = new QuantizedKVCache(groupSize, bits, unfusedAffineKernels(bits, groupSize, Dtype.bfloat16)), combined = new QuantizedKVCache(groupSize, bits, unfusedAffineKernels(bits, groupSize, Dtype.bfloat16));
       const outputs: import("@mlx-bun/mlx/array").MlxArray[] = [];
       try {
         using prefixK = slice(k, 0, prefix), prefixV = slice(v, 0, prefix);
@@ -30,7 +31,7 @@ test("affine committed spans retain sequential attention at each causal prefix",
           using ki = slice(k, prefix + position, prefix + position + 1);
           using vi = slice(v, prefix + position, prefix + position + 1);
           const [keys, values] = sequential.updateAndFetchQuantized(ki, vi);
-          try { outputs.push(quantizedSdpa(qi, keys, values, 1 / 16, { mode: "", arr: null }, groupSize, bits)); }
+          try { outputs.push(quantizedSdpaUnfused(qi, keys, values, 1 / 16, { mode: "", arr: null }, groupSize, bits)); }
           finally { dispose(keys); dispose(values); }
         }
         using expected = ops.concatAxis(outputs, 2);

@@ -1,10 +1,11 @@
-import { captureKvAttention } from "../../state/kv-attention-view";
 // UniversalDense — the Tier-0 config-driven dense llama-family module
 // (`02d723a:docs/design/generic-model-support.md` §4.1). One module, shaped exactly
 // like qwen3.ts, with every arch delta selected by the UniversalArgs
-// descriptor (archs.ts). Monolith path only: no compiled
-// decode. Standard attention uses the shared plain/affine KV port; the
-// softcap branch retains plain KV. The bar is L1 bit-exactness
+// descriptor (archs.ts). No compiled
+// decode. Each attention block reads its cache for the phase its caller names
+// (`ReadPhase`) with the read the descriptor composes at construction: the
+// cache's own read, or the score-softcapped read over dense KV
+// (`state/softcap-attention.ts`). The bar is L1 bit-exactness
 // vs mlx-lm on this machine's GPU (`02d723a:tests/parity/universal-parity.test.ts`).
 //
 // Porting discipline: each branch transcribes its mlx-lm source op-for-op
@@ -15,25 +16,50 @@ import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
-import { argmaxLastPosition, logitSoftcap } from "../../kernels/logits";
-import { createCausalMask } from "../../kernels/attention/masks";
+import { logitSoftcap } from "../../kernels/logits";
 import { disposing } from "../../layers/helpers";
-import { FINFO_MIN } from "../../layers/quantized-attention";
-import { KVCache } from "../../state/kv";
+import { composedFullAttentionCache, composedSlidingAttentionCache } from "../../state/bf16-first-kv";
+import type { Composition } from "../../contracts/portable/composition";
+import { AttentionMasks } from "../../state/attention-read";
+import { softcapAttentionReads } from "../../state/softcap-attention";
+import { denseTurboQuantKernels } from "../../state/turboquant-attention";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
-import type { MlxDeclaredGraph } from "../../contracts/mlx/graph";
-import { PLAIN_KV_VERIFICATION, declareGraph } from "../capabilities";
-import { QuantizedLinear } from "../../layers/quantized-linear";
+import type {
+  MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward, MlxWidthClass,
+} from "../../contracts/mlx/graph";
+import { ORDINARY_VERIFICATION, declareGraph } from "../capabilities";
+import { atEveryWidth, type ReadPhase } from "../graph";
+import type { QuantizedLinear } from "../../layers/quantized-linear";
+import { TrellisLinear } from "../../layers/trellis-linear";
 import { RMSNorm } from "../../layers/normalization";
-import { RotatingKVCache } from "../../state/rotating-kv";
-import { type Cache, type Mask } from "../../contracts/mlx/cache";
-import { genericArgsFor, universalCacheWindows, universalMaskRecipe, type UniversalArgs, type UniversalMaskRecipe } from "./archs";
+import { type Cache } from "../../contracts/mlx/cache";
+import { genericArgsFor, universalCacheWindows, universalMaskRecipe, type UniversalArgs } from "./archs";
 import { compiledSwiglu } from "../../layers/swiglu";
 import { initializeRope, NoRope, phi3SuRope, UniversalRope } from "../../layers/rope";
 import { loadEmbedding, loadLayerNorm, loadLinear, loadRmsNorm, type AnyEmbedding, type AnyLinear, type AnyNorm } from "../../layers/loading";
 import { WeightAudit } from "../../artifacts/weight-audit";
-import { cleanupFailure, disposeResources } from "../../runtime/resources";
+import { cleanupFailure } from "../../runtime/resources";
+import { cacheRead, type AttentionReadStrategy } from "../qwen/blocks";
+
+/** The score-softcapped read as a block's read strategy: decode reads
+ * `appendDecode`, a window `appendWindow`; this graph has no committed append
+ * (its `appendKnown` is the window read), so a committed span reads as a window. */
+function softcapRead(softcap: number, window: number | null, arrayMasks: boolean): AttentionReadStrategy {
+  const reads = softcapAttentionReads(softcap, window, arrayMasks);
+  const byPhase: Readonly<Record<ReadPhase, typeof reads.appendDecode>> = {
+    decode: reads.appendDecode, window: reads.appendWindow, committed: reads.appendWindow,
+  };
+  return Object.freeze({ read: (cache: Cache, phase: ReadPhase, k: MlxArray, v: MlxArray) => byPhase[phase](cache, k, v) });
+}
+
+/** The linear `loadLinear` loads for `path` when the checkpoint stores it
+ * affine-quantized (a `.scales` tensor and no Trellis entry in the quant
+ * table): a `QuantizedLinear`, the only flavor adapters mount on. Read from the
+ * artifact at load, as `loadLinear` reads it. */
+function adapterTarget(weights: Weights, config: ModelConfig, path: string, linear: AnyLinear): QuantizedLinear | null {
+  return !TrellisLinear.isTrellis(config, path) && weights.has(`${path}.scales`) ? linear as QuantizedLinear : null;
+}
 
 /** Rope for one attention module, per the descriptor (llama's
  *  initialize_rope, the plain-nn.RoPE archs, or phi3's Su/linear branch). */
@@ -68,9 +94,14 @@ class UniversalAttention {
   readonly oProj: AnyLinear;
   readonly qNorm: RMSNorm | null;
   readonly kNorm: RMSNorm | null;
-  /** Bound at construction: the score softcap selects manual attention over
-   * plain K/V arrays; without it, view attention also reads encoded KV. */
+  /** Bound at construction: the score softcap composes the manual attention
+   * over dense K/V arrays (any storage, fetched dense) as this block's read;
+   * without it, the block reads through the cache's own read, which also
+   * attends encoded KV. */
   readonly softcap: number | null;
+  /** The projections adapters mount on (affine-quantized), read at load. */
+  readonly adapters: { readonly q: QuantizedLinear | null; readonly k: QuantizedLinear | null;
+    readonly v: QuantizedLinear | null; readonly qkv: QuantizedLinear | null; readonly o: QuantizedLinear | null };
 
   constructor(
     weights: Weights,
@@ -79,18 +110,25 @@ class UniversalAttention {
     readonly a: UniversalArgs,
     readonly rope: UniversalRope,
     audit: WeightAudit,
+    /** How the block reads its cache, composed by the graph from the descriptor. */
+    readonly reads: AttentionReadStrategy,
   ) {
     this.softcap = a.attnLogitSoftcap;
+    const load = (name: string) => loadLinear(weights, `${prefix}.${name}`, config, audit);
+    const target = (name: string, linear: AnyLinear | null) =>
+      linear && adapterTarget(weights, config, `${prefix}.${name}`, linear);
     if (a.fusedQkv) {
-      this.qkvProj = loadLinear(weights, `${prefix}.qkv_proj`, config, audit);
+      this.qkvProj = load("qkv_proj");
       this.qProj = this.kProj = this.vProj = null;
     } else {
-      this.qProj = loadLinear(weights, `${prefix}.q_proj`, config, audit);
-      this.kProj = loadLinear(weights, `${prefix}.k_proj`, config, audit);
-      this.vProj = loadLinear(weights, `${prefix}.v_proj`, config, audit);
+      this.qProj = load("q_proj");
+      this.kProj = load("k_proj");
+      this.vProj = load("v_proj");
       this.qkvProj = null;
     }
-    this.oProj = loadLinear(weights, `${prefix}.o_proj`, config, audit);
+    this.oProj = load("o_proj");
+    this.adapters = Object.freeze({ q: target("q_proj", this.qProj), k: target("k_proj", this.kProj),
+      v: target("v_proj", this.vProj), qkv: target("qkv_proj", this.qkvProj), o: target("o_proj", this.oProj) });
     if (a.qkNorm !== "none") {
       // qwen3 ("head"): RMSNorm(head_dim); olmo2 ("full"): RMSNorm(width) —
       // both live at q_norm/k_norm and use rms_norm_eps.
@@ -101,7 +139,9 @@ class UniversalAttention {
     }
   }
 
-  forward(x: MlxArray, mask: Mask, cache: Cache): MlxArray {
+  /** `x` [B, L, hidden] (borrowed) to an owned [B, L, hidden], appending to
+   *  `cache` and attending through the read `phase` names. */
+  forward(x: MlxArray, cache: Cache, phase: ReadPhase): MlxArray {
     const a = this.a;
     const [B, L] = x.shape as [number, number, number];
 
@@ -142,8 +182,8 @@ class UniversalAttention {
     // Batched decode: the scheduler's mask wrapper exposes each row's REAL
     // position as ropeOffsetArr (rows have different prompt lengths under
     // left-padding; the scalar offset would mis-position every padded row by
-    // its pad amount — the 2026-07-03 uneven-batch bug). Serial lane: scalar
-    // offset, byte-identical to before (the S1b.1 pattern, cf. qwen3_5.ts).
+    // its pad amount — the 2026-07-03 uneven-batch bug). One row: the scalar
+    // offset.
     const offArr = (cache as { ropeOffsetArr?: MlxArray }).ropeOffsetArr;
     q = disposing(q, offArr
       ? this.rope.applyDynamic(q, offArr)
@@ -152,17 +192,15 @@ class UniversalAttention {
       ? this.rope.applyDynamic(k, offArr)
       : this.rope.apply(k, cache.offset));
 
+    // The read holds its mask: a failed release keeps the attention output
+    // from leaking, and an attention failure stays the primary error.
     let attn: MlxArray;
     try {
-      if (this.softcap !== null) {
-        const [keys, values] = cache.updateAndFetch(k, v);
-        try { attn = this.#softcapAttention(q, keys, values, mask, B, L); }
-        finally { keys.dispose(); values.dispose(); }
-      } else {
-        const view = captureKvAttention(cache, k, v);
-        try { attn = view.attend(q, a.attnScale, mask); }
-        finally { view.dispose(); }
-      }
+      const read = this.reads.read(cache, phase, k, v);
+      try { attn = read.attend(q, a.attnScale); }
+      catch (error) { return cleanupFailure(error, () => read.dispose()); }
+      try { read.dispose(); }
+      catch (error) { return cleanupFailure(error, () => attn.dispose()); }
     } finally { k.dispose(); v.dispose(); q.dispose(); }
 
     const attnT = ops.transposeAxes(attn, [0, 2, 1, 3]);
@@ -171,58 +209,6 @@ class UniversalAttention {
     attnT.dispose();
     const out = this.oProj.forward(merged);
     merged.dispose();
-    return out;
-  }
-
-  /** gemma2.py manual attention: scale → GQA 5-d reshape → q·kᵀ →
-   *  tanh-softcap → bool-mask via where(finfo.min) → precise softmax → ·v.
-   *  ops.sdpa can't express the score softcap. */
-  #softcapAttention(
-    q: MlxArray, keys: MlxArray, values: MlxArray, mask: Mask, B: number, L: number,
-  ): MlxArray {
-    const a = this.a;
-    const repeats = Math.floor(a.numHeads / a.numKvHeads);
-    let queries = ops.mulScalar(q, a.attnScale); // queries * self.scale
-
-    let kk = keys;
-    let vv = values;
-    let kExp: MlxArray | null = null;
-    let vExp: MlxArray | null = null;
-    if (repeats > 1) {
-      queries = disposing(queries, ops.reshape(queries, [B, a.numKvHeads, repeats, L, a.headDim]));
-      kExp = ops.expandDims(keys, 2);
-      vExp = ops.expandDims(values, 2);
-      kk = kExp;
-      vv = vExp;
-    }
-
-    const kT = ops.transposeAxes(kk, repeats > 1 ? [0, 1, 2, 4, 3] : [0, 1, 3, 2]);
-    let scores = ops.matmul(queries, kT);
-    kT.dispose();
-    queries.dispose();
-
-    // tanh(scores / cap) * cap — same composition as logitSoftcap.
-    scores = disposing(scores, logitSoftcap(scores, this.softcap!));
-
-    if (mask.mode === "array" && mask.arr) {
-      // bool mask: where(mask, scores, finfo(scores.dtype).min)
-      const minVal = FINFO_MIN[scores.dtype];
-      if (minVal === undefined) throw new Error(`no finfo.min for dtype ${scores.dtypeName}`);
-      const minArr = ops.scalarLike(minVal, scores);
-      // GQA scores are [B, Hkv, repeats, L, S]. Row masks carry B,
-      // unlike the ordinary [L, S] causal mask, so keep that axis aligned.
-      using rowMask = repeats > 1 && mask.arr.shape.length === 4
-        ? ops.expandDims(mask.arr, 2) : null;
-      scores = disposing(scores, ops.where(rowMask ?? mask.arr, scores, minArr));
-      minArr.dispose();
-    }
-
-    scores = disposing(scores, ops.softmaxAxis(scores, -1, true));
-    let out = ops.matmul(scores, vv);
-    scores.dispose();
-    kExp?.dispose();
-    vExp?.dispose();
-    if (repeats > 1) out = disposing(out, ops.reshape(out, [B, a.numHeads, L, a.headDim]));
     return out;
   }
 }
@@ -244,6 +230,9 @@ export class UniversalMLP {
    *  are unaffected (the oracle does NOT @mx.compile those — gemma/gemma2/starcoder2
    *  use a plain nn.gelu composition). Set to null for the uncompiled composition. */
   swigluFn: SwigluFn | null = compiledSwiglu;
+  /** The projections adapters mount on (affine-quantized), read at load. */
+  readonly adapters: { readonly gate: QuantizedLinear | null; readonly up: QuantizedLinear | null;
+    readonly gateUp: QuantizedLinear | null; readonly down: QuantizedLinear | null };
 
   constructor(
     weights: Weights,
@@ -252,20 +241,26 @@ export class UniversalMLP {
     readonly kind: UniversalArgs["mlp"],
     audit: WeightAudit,
   ) {
+    const load = (name: string) => loadLinear(weights, `${prefix}.${name}`, config, audit);
+    const target = (name: string, linear: AnyLinear) => adapterTarget(weights, config, `${prefix}.${name}`, linear);
     if (kind === "fused_swiglu") {
-      this.gateUp = loadLinear(weights, `${prefix}.gate_up_proj`, config, audit);
+      this.gateUp = load("gate_up_proj");
       this.gate = this.up = null;
-      this.down = loadLinear(weights, `${prefix}.down_proj`, config, audit);
+      this.down = load("down_proj");
+      this.adapters = Object.freeze({ gate: null, up: null, gateUp: target("gate_up_proj", this.gateUp), down: target("down_proj", this.down) });
     } else if (kind === "gelu_mlp") {
       // starcoder2: c_fc → gelu(precise) → c_proj
-      this.gate = loadLinear(weights, `${prefix}.c_fc`, config, audit);
+      this.gate = load("c_fc");
       this.up = this.gateUp = null;
-      this.down = loadLinear(weights, `${prefix}.c_proj`, config, audit);
+      this.down = load("c_proj");
+      this.adapters = Object.freeze({ gate: target("c_fc", this.gate), up: null, gateUp: null, down: target("c_proj", this.down) });
     } else {
-      this.gate = loadLinear(weights, `${prefix}.gate_proj`, config, audit);
-      this.up = loadLinear(weights, `${prefix}.up_proj`, config, audit);
+      this.gate = load("gate_proj");
+      this.up = load("up_proj");
       this.gateUp = null;
-      this.down = loadLinear(weights, `${prefix}.down_proj`, config, audit);
+      this.down = load("down_proj");
+      this.adapters = Object.freeze({ gate: target("gate_proj", this.gate), up: target("up_proj", this.up), gateUp: null,
+        down: target("down_proj", this.down) });
     }
   }
 
@@ -346,8 +341,9 @@ export class UniversalLayer {
     readonly a: UniversalArgs,
     rope: UniversalRope,
     audit: WeightAudit,
+    reads: AttentionReadStrategy,
   ) {
-    this.attn = new UniversalAttention(weights, config, `${prefix}.self_attn`, a, rope, audit);
+    this.attn = new UniversalAttention(weights, config, `${prefix}.self_attn`, a, rope, audit, reads);
     this.mlp = new UniversalMLP(weights, config, `${prefix}.mlp`, a.mlp, audit);
     const norm = (name: string): AnyNorm =>
       a.norm === "layernorm"
@@ -374,11 +370,11 @@ export class UniversalLayer {
     }
   }
 
-  forward(x: MlxArray, mask: Mask, cache: Cache): MlxArray {
+  forward(x: MlxArray, cache: Cache, phase: ReadPhase): MlxArray {
     const a = this.a;
     if (a.block === "post") {
       // olmo2: h = x + norm(attn(x)); out = h + norm(mlp(h))
-      const r1 = this.attn.forward(x, mask, cache);
+      const r1 = this.attn.forward(x, cache, phase);
       const n1 = disposing(r1, this.postAttnNorm.forward(r1));
       const h = ops.add(x, n1);
       n1.dispose();
@@ -392,7 +388,7 @@ export class UniversalLayer {
     if (a.block === "gemma2") {
       // h = x + postAttn(attn(inputNorm(x))); out = h + postFfn(mlp(preFfn(h)))
       const xn = this.inputNorm!.forward(x);
-      const r1 = this.attn.forward(xn, mask, cache);
+      const r1 = this.attn.forward(xn, cache, phase);
       xn.dispose();
       const n1 = disposing(r1, this.postAttnNorm.forward(r1));
       const h = ops.add(x, n1);
@@ -410,7 +406,7 @@ export class UniversalLayer {
       // x1 = x + postSelfAttn(attn(inputNorm(x)));
       // out = postMlp(mlp(postAttn(x1))) + x1
       const xn = this.inputNorm!.forward(x);
-      const r1 = this.attn.forward(xn, mask, cache);
+      const r1 = this.attn.forward(xn, cache, phase);
       xn.dispose();
       const n1 = disposing(r1, this.extraNorm1!.forward(r1));
       const x1 = ops.add(x, n1);
@@ -426,7 +422,7 @@ export class UniversalLayer {
     }
     // pre (llama family): h = x + r·mult; out = h + r·mult
     const xn = this.inputNorm!.forward(x);
-    let r1 = this.attn.forward(xn, mask, cache);
+    let r1 = this.attn.forward(xn, cache, phase);
     xn.dispose();
     if (a.residualMultiplier !== null)
       r1 = disposing(r1, ops.mulScalar(r1, a.residualMultiplier));
@@ -444,9 +440,11 @@ export class UniversalLayer {
   }
 }
 
-export class UniversalDenseModel implements MlxDeclaredGraph {
+export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
   readonly args: UniversalArgs;
+  /** The served configuration this graph was built for: its KV scheme is what `makeCache` composes. */
+  readonly composition: Composition;
   readonly weightsBytes: number;
   readonly prefixBase = "model";
   readonly loraState = new LoraState();
@@ -456,36 +454,38 @@ export class UniversalDenseModel implements MlxDeclaredGraph {
   readonly lmHead: AnyLinear | null;
   readonly sharedRope: UniversalRope;
   readonly ropes: UniversalRope[];
-  // Cache layout and mask groups come from the same descriptor facts, bound
-  // at construction; later edits to `args` cannot make them disagree.
-  readonly #masks: UniversalMaskRecipe;
   /** Whether every attention layer, as bound, reads encoded (affine) KV views. */
   readonly encodedKvAttention: boolean;
-  /** Layers whose bound attention reads plain keys and values: the manual softcap layers. */
-  readonly requiredDenseKvLayers: readonly number[];
 
-  /** Softcapped attention reads plain K/V in every layer it softcaps, so encoded
-   * storage decodes on read and verification qualifies plain-KV rounds only.
-   * Otherwise attention attends the storage its caches hold: delayed affine rows
-   * convert per layer and serve ordinary decoding only. Before the attention
-   * facts are bound, neither is declared. */
+  /** A graph whose attention softcaps its scores verifies ordinary rounds only
+   * (its layers read dense K/V through the softcapped read). */
   get graphCapabilities(): GraphCapabilities {
-    const denseReads = this.encodedKvAttention === false;
-    return declareGraph({
-      kv: { denseReads, delayedAffine: this.encodedKvAttention === true ? "ordinary" : "none" },
-      ...(denseReads ? { speculation: PLAIN_KV_VERIFICATION } : {}),
-    });
+    return declareGraph(this.encodedKvAttention === false ? { speculation: ORDINARY_VERIFICATION } : {});
   }
+  // Cache layout and each layer's read come from the same descriptor facts,
+  // bound at construction; later edits to `args` cannot make them disagree.
   readonly #cacheWindows: readonly (number | null)[];
 
-  constructor(weights: Weights, config: ModelConfig, args?: UniversalArgs) {
+  constructor(weights: Weights, config: ModelConfig, composition: Composition, args?: UniversalArgs) {
     const a = args ?? genericArgsFor(config);
     if (!a)
       throw new Error(`UniversalDenseModel: no descriptor for model_type ${config.modelType}`);
     this.config = config;
     this.args = a;
-    this.#masks = universalMaskRecipe(a);
+    this.composition = composition;
     this.#cacheWindows = universalCacheWindows(a);
+    // Each layer's read: the cache's own read, or the softcapped read over plain
+    // KV with the layer group's window (gemma2: create_attention_mask(...,
+    // return_array=True) materializes the causal mask). The cache's own read
+    // builds the mask the cache answers for its query count, so array masks
+    // without a score softcap have no read here.
+    const recipe = universalMaskRecipe(a);
+    const softcap = a.attnLogitSoftcap;
+    if (softcap === null && recipe.array)
+      throw new Error(`UniversalDenseModel: ${a.modelType} asks for array masks without a score softcap; ` +
+        "the composed attention reads take the cache's own mask (state/softcap-attention.ts reads array masks)");
+    const reads = (layer: number): AttentionReadStrategy => softcap === null ? cacheRead
+      : softcapRead(softcap, recipe.slidingLayers[layer] ? recipe.window : null, recipe.array);
     this.weightsBytes = [...weights.shards.files.values()]
       .reduce((acc, f) => acc + f.mmap.size, 0);
 
@@ -500,10 +500,9 @@ export class UniversalDenseModel implements MlxDeclaredGraph {
     );
     this.layers = Array.from(
       { length: a.numHiddenLayers },
-      (_, i) => new UniversalLayer(weights, config, `model.layers.${i}`, a, this.ropes[i]!, audit),
+      (_, i) => new UniversalLayer(weights, config, `model.layers.${i}`, a, this.ropes[i]!, audit, reads(i)),
     );
     this.encodedKvAttention = this.layers.every(layer => layer.attn.softcap === null);
-    this.requiredDenseKvLayers = Object.freeze(this.layers.flatMap((layer, index) => layer.attn.softcap === null ? [] : [index]));
     this.finalNorm = a.norm === "layernorm"
       ? loadLayerNorm(weights, "model.norm", a.normEps, audit)
       : loadRmsNorm(weights, "model.norm", a.normEps, a.norm === "rmsnorm_plus_one", audit);
@@ -517,65 +516,93 @@ export class UniversalDenseModel implements MlxDeclaredGraph {
   }
 
   /** LoRA hot-swap targets — quantized linears only (dense checkpoints
-   *  serve without adapter support at Tier-0). */
+   *  serve without adapter support at Tier-0), read at load. */
   loraTargets(): Map<string, QuantizedLinear> {
     const out = new Map<string, QuantizedLinear>();
-    const put = (path: string, lin: AnyLinear | null) => {
-      if (lin instanceof QuantizedLinear) out.set(path, lin);
+    const put = (path: string, lin: QuantizedLinear | null) => {
+      if (lin) out.set(path, lin);
     };
     for (let i = 0; i < this.layers.length; i++) {
-      const l = this.layers[i]!;
+      const { attn, mlp } = this.layers[i]!;
       const p = `model.layers.${i}`;
-      put(`${p}.self_attn.q_proj`, l.attn.qProj);
-      put(`${p}.self_attn.k_proj`, l.attn.kProj);
-      put(`${p}.self_attn.v_proj`, l.attn.vProj);
-      put(`${p}.self_attn.qkv_proj`, l.attn.qkvProj);
-      put(`${p}.self_attn.o_proj`, l.attn.oProj);
-      put(`${p}.mlp.gate_proj`, l.mlp.gate);
-      put(`${p}.mlp.up_proj`, l.mlp.up);
-      put(`${p}.mlp.gate_up_proj`, l.mlp.gateUp);
-      put(`${p}.mlp.down_proj`, l.mlp.down);
+      put(`${p}.self_attn.q_proj`, attn.adapters.q);
+      put(`${p}.self_attn.k_proj`, attn.adapters.k);
+      put(`${p}.self_attn.v_proj`, attn.adapters.v);
+      put(`${p}.self_attn.qkv_proj`, attn.adapters.qkv);
+      put(`${p}.self_attn.o_proj`, attn.adapters.o);
+      put(`${p}.mlp.gate_proj`, mlp.adapters.gate);
+      put(`${p}.mlp.up_proj`, mlp.adapters.up);
+      put(`${p}.mlp.gate_up_proj`, mlp.adapters.gateUp);
+      put(`${p}.mlp.down_proj`, mlp.adapters.down);
     }
     return out;
   }
 
+  /** Releases the rope frequency table it built (a scaled rope's); the weights are its owner's. */
+  dispose(): void { this.sharedRope.dispose(); }
+
+  /** One cache per layer (a ring on a sliding layer with a window), sharing
+   * one mask memo. The full-attention caches' TurboQuant read is dense
+   * (`denseTurboQuantKernels`): the read decodes keys and values first (the
+   * softcapped read attends the decoded window). */
   makeCache(): Cache[] {
-    return this.#cacheWindows.map(window => window ? new RotatingKVCache(window) : new KVCache());
+    const masks = new AttentionMasks();
+    const kv = this.composition.kv;
+    return this.#cacheWindows.map((window, layer) => window ? composedSlidingAttentionCache(kv, layer, window, masks)
+      : composedFullAttentionCache(kv, layer, masks, denseTurboQuantKernels));
   }
 
-  forwardHidden(ids: MlxArray, cache: Cache[]): MlxArray {
-    let h = this.embed.encode(ids);
-    if (this.args.embedMultiplier !== null)
-      h = disposing(h, ops.mulScalar(h, this.args.embedMultiplier));
-    return this.forwardLayers(h, cache);
+  /** The scoring forward (`MlxSequenceForward`): the window read at every width. */
+  sequenceHidden(ids: MlxArray, cache: Cache[], _width: MlxWidthClass): MlxArray {
+    return this.forwardLayers(this.#embed(ids), cache, "window");
   }
 
-  forwardEmbeddings(_embeds: MlxArray, _cache: Cache[], _bidir: MlxArray | null): MlxArray {
-    throw new Error("universal-dense input-embedding path is not supported");
+  /** One whole chunk of a prompt; rows are sequences times the chunk size. The GPU is this graph's one unit. */
+  readonly prefillChunk: MlxPrefillChunk = {
+    gpu: (ids, cache) => this.forwardLayers(this.#embed(ids), cache, "window"),
+  };
+
+  /** A prompt's positions that are not a whole chunk: the window read at every width. */
+  readonly prefillTail = atEveryWidth<MlxCapturingForward>((ids, cache) =>
+    this.forwardLayers(this.#embed(ids), cache, "window"));
+
+  /** Known tokens: this graph declares no committed spans, so they read as a window. */
+  readonly appendKnown = atEveryWidth<MlxPhaseForward>((ids, cache) =>
+    this.forwardLayers(this.#embed(ids), cache, "window"));
+
+  /** The one output head at every width. */
+  readonly logits = atEveryWidth<MlxHeadForward>(hidden => this.logitsFromHidden(hidden));
+
+  /** One new token per sequence: `ids` [sequences, 1]. */
+  readonly decode = atEveryWidth<MlxPhaseForward>((ids, cache) =>
+    this.forwardLayers(this.#embed(ids), cache, "decode"));
+
+  /** A speculative window of depth + 1 positions per sequence. This graph
+   * declares no hidden-layer taps, so `capture` is always null. */
+  readonly verify = atEveryWidth<MlxVerifyForward>((ids, cache) =>
+    this.forwardLayers(this.#embed(ids), cache, "window"));
+
+  /** Token embeddings, scaled where the descriptor scales them (owned). */
+  #embed(ids: MlxArray): MlxArray {
+    const h = this.embed.encode(ids);
+    return this.args.embedMultiplier !== null ? disposing(h, ops.mulScalar(h, this.args.embedMultiplier)) : h;
   }
 
-  protected forwardLayers(h0: MlxArray, cache: Cache[]): MlxArray {
-    const r = this.#masks;
-    const L = h0.shape[1]!;
-    // This call owns h0 and each intermediate hidden state, and releases them
-    // and its masks on failure as on success; an execution failure stays the
-    // primary error. One mask per attention group, from that group's first
-    // cache, as the per-arch mlx-lm __call__ does.
+  /** The decoder over `h0` (consumed), every block reading its cache for
+   *  `phase`. This call owns h0 and each intermediate hidden state, and
+   *  releases them on failure as on success; an execution failure stays the
+   *  primary error. */
+  protected forwardLayers(h0: MlxArray, cache: Cache[], phase: ReadPhase): MlxArray {
     let cur = h0;
-    const masks: MlxArray[] = []; // owned; drained before each release attempt
-    const own = (mask: Mask): Mask => { if (mask.arr) masks.push(mask.arr); return mask; };
     try {
-      const faMask = own(this.#groupMask(cache[r.full]!, L, null));
-      const swaMask = r.sliding === null ? null : own(this.#groupMask(cache[r.sliding]!, L, r.window));
       for (let i = 0; i < this.layers.length; i++) {
-        const next = this.layers[i]!.forward(cur, r.slidingLayers[i] ? swaMask! : faMask, cache[i]!);
+        const next = this.layers[i]!.forward(cur, cache[i]!, phase);
         const done = cur;
         cur = next;
         done.dispose();
       }
-      disposeResources(masks.splice(0));
     } catch (error) {
-      return cleanupFailure(error, () => disposeResources([...masks.splice(0), cur]));
+      return cleanupFailure(error, () => cur.dispose());
     }
     let out: MlxArray;
     try { out = this.finalNorm.forward(cur); }
@@ -583,16 +610,6 @@ export class UniversalDenseModel implements MlxDeclaredGraph {
     try { cur.dispose(); }
     catch (error) { return cleanupFailure(error, () => out.dispose()); }
     return out;
-  }
-
-  /** A group's mask from its own cache; storage owns row validity. Manual
-   * softcap attention (gemma2: create_attention_mask(..., return_array=True))
-   * needs the ordinary causal spelling materialized, preserving B1 math: a
-   * cache answers "causal" only while it holds exactly `offset` earlier keys. */
-  #groupMask(cache: Cache, L: number, window: number | null): Mask {
-    const mask = cache.makeMask(L, window);
-    return this.#masks.array && mask.mode === "causal"
-      ? { mode: "array", arr: createCausalMask(L, cache.offset, window) } : mask;
   }
 
   logitsFromHidden(h: MlxArray): MlxArray {
@@ -605,35 +622,5 @@ export class UniversalDenseModel implements MlxDeclaredGraph {
       d.dispose();
     }
     return logits;
-  }
-
-  forward(tokens: number[] | MlxArray, cache: Cache[]): MlxArray {
-    const ids = Array.isArray(tokens)
-      ? ops.fromInt32(tokens, [1, tokens.length])
-      : tokens;
-    const h = this.forwardHidden(ids, cache);
-    if (Array.isArray(tokens)) ids.dispose();
-    const logits = this.logitsFromHidden(h);
-    h.dispose();
-    return logits;
-  }
-
-  generate(promptTokens: number[], maxTokens: number, eosIds: number[] = []): number[] {
-    const cache = this.makeCache();
-    const out: number[] = [];
-    try {
-      let tokens = promptTokens;
-      for (let step = 0; step < maxTokens; step++) {
-        const logits = this.forward(tokens, cache);
-        const next = argmaxLastPosition(logits);
-        logits.dispose();
-        if (eosIds.includes(next)) break;
-        out.push(next);
-        tokens = [next];
-      }
-    } finally {
-      for (const c of cache) c.dispose();
-    }
-    return out;
   }
 }

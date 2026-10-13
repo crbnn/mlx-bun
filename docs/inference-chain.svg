@@ -1,0 +1,221 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1380" height="2078" viewBox="0 0 1380 2078" font-family="-apple-system, 'Helvetica Neue', Helvetica, Arial, sans-serif">
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#333"/></marker></defs>
+<rect width="1380" height="2078" fill="#ffffff"/>
+<text x="30" y="34" font-size="22" font-weight="700" fill="#222">mlx-bun inference chain: the modules and the features each one owns</text>
+<text x="30" y="58" font-size="13" fill="#444">Solid arrows: the request path at run time. Dashed arrows: built once at load from the model, the flags and the machine. Nothing below the scheduler decides anything at run time.</text>
+<text x="30" y="76" font-size="13" fill="#444">Each module implements its contract and never checks what another is doing: composition is the guarantee. Swap any box for another implementation of the same contract and the rest does not care.</text>
+<g><rect x="30" y="96" width="352" height="415" rx="10" fill="#eef3fb" stroke="#4a6fa5" stroke-width="2"/>
+<text x="44" y="120" font-size="18" font-weight="700" fill="#222">Server</text>
+<text x="44" y="136" font-size="11" font-family="'SF Mono', Menlo, Consolas, monospace" fill="#555">apps/mlx-bun/src/server</text>
+<text x="44" y="150" font-size="12.5" font-style="italic" fill="#333">Protocols in, streams out. Decides nothing about the</text>
+<text x="44" y="165" font-size="12.5" font-style="italic" fill="#333">model.</text>
+<text x="44" y="190" font-size="12.5" fill="#222">• OpenAI: /v1/chat/completions, /v1/completions,</text>
+<text x="55" y="207" font-size="12.5" fill="#222">/v1/responses, /v1/embeddings, /v1/models</text>
+<text x="44" y="224" font-size="12.5" fill="#222">• Anthropic: /v1/messages</text>
+<text x="44" y="241" font-size="12.5" fill="#222">• Audio: /v1/audio/transcriptions,</text>
+<text x="55" y="258" font-size="12.5" fill="#222">/v1/audio/translations, streaming audio sessions</text>
+<text x="44" y="275" font-size="12.5" fill="#222">• Adapters: /v1/adapters (list, mount, remove,</text>
+<text x="55" y="292" font-size="12.5" fill="#222">available)</text>
+<text x="44" y="309" font-size="12.5" fill="#222">• Request shapes, prompt policy, SSE streaming,</text>
+<text x="55" y="326" font-size="12.5" fill="#222">JSON</text>
+<text x="44" y="343" font-size="12.5" fill="#222">• Tool-call and reasoning markers surfaced as API</text>
+<text x="55" y="360" font-size="12.5" fill="#222">fields (declared by the family record)</text>
+<text x="44" y="377" font-size="12.5" fill="#222">• Borrows the engine; serve startup owns it</text>
+<text x="55" y="394" font-size="12.5" fill="#222">(serve-state / serve-host)</text>
+<text x="44" y="411" font-size="12.5" fill="#222">• Web UI and /api routes belong to app modules,</text>
+<text x="55" y="428" font-size="12.5" fill="#222">not the chain</text>
+</g>
+<g><rect x="514" y="96" width="352" height="415" rx="10" fill="#eef3fb" stroke="#4a6fa5" stroke-width="2"/>
+<text x="528" y="120" font-size="18" font-weight="700" fill="#222">Input</text>
+<text x="528" y="136" font-size="11" font-family="'SF Mono', Menlo, Consolas, monospace" fill="#555">inference/input</text>
+<text x="528" y="150" font-size="12.5" font-style="italic" fill="#333">Text and media become tokens.</text>
+<text x="528" y="175" font-size="12.5" fill="#222">• Tokenizer, special tokens, token groups</text>
+<text x="528" y="192" font-size="12.5" fill="#222">• Chat templates and the family's chat defaults</text>
+<text x="528" y="209" font-size="12.5" fill="#222">• Tool-call formats: parse and emit</text>
+<text x="528" y="226" font-size="12.5" fill="#222">• Vision preprocessing: images to patches and soft</text>
+<text x="539" y="243" font-size="12.5" fill="#222">tokens; media fetch</text>
+<text x="528" y="260" font-size="12.5" fill="#222">• Audio features for Whisper</text>
+<text x="528" y="277" font-size="12.5" fill="#222">• Prompt assembly through encoder interfaces</text>
+</g>
+<g><rect x="998" y="96" width="352" height="415" rx="10" fill="#fdf3e0" stroke="#b8860b" stroke-width="2"/>
+<text x="1012" y="120" font-size="18" font-weight="700" fill="#222">Loader</text>
+<text x="1012" y="136" font-size="11" font-family="'SF Mono', Menlo, Consolas, monospace" fill="#555">inference/models (factory, implementation,</text>
+<text x="1012" y="150" font-size="11" font-family="'SF Mono', Menlo, Consolas, monospace" fill="#555">composition), artifacts, adapters,</text>
+<text x="1012" y="164" font-size="11" font-family="'SF Mono', Menlo, Consolas, monospace" fill="#555">@mlx-bun/hub</text>
+<text x="1012" y="178" font-size="12.5" font-style="italic" fill="#333">Resolves the composition once from model + flags +</text>
+<text x="1012" y="193" font-size="12.5" font-style="italic" fill="#333">machine, then builds everything the scheduler runs.</text>
+<text x="1012" y="218" font-size="12.5" fill="#222">• Composition: device, ANE bridge, KV scheme</text>
+<text x="1023" y="235" font-size="12.5" fill="#222">(--kv-quant), draft depth (--num-draft-tokens),</text>
+<text x="1023" y="252" font-size="12.5" fill="#222">prefill chunk, adapters, max rows (--batch)</text>
+<text x="1012" y="269" font-size="12.5" fill="#222">• Graph table: the most-constrained graph wins;</text>
+<text x="1023" y="286" font-size="12.5" fill="#222">exactly one generic graph per family</text>
+<text x="1012" y="303" font-size="12.5" fill="#222">• Artifacts: config dialects, safetensors (mmap),</text>
+<text x="1023" y="320" font-size="12.5" fill="#222">Trellis codebooks, TurboQuant fold, expert</text>
+<text x="1023" y="337" font-size="12.5" fill="#222">offload, fingerprints and identity</text>
+<text x="1012" y="354" font-size="12.5" fill="#222">• Family records: marker tokens, chat defaults,</text>
+<text x="1023" y="371" font-size="12.5" fill="#222">media soft tokens, memory plan</text>
+<text x="1012" y="388" font-size="12.5" fill="#222">• Drafter loading: MTP head, DFlash 2 basis,</text>
+<text x="1023" y="405" font-size="12.5" fill="#222">assistant model (--draft-model)</text>
+<text x="1012" y="422" font-size="12.5" fill="#222">• LoRA adapters mounted onto named targets</text>
+<text x="1023" y="439" font-size="12.5" fill="#222">(--adapter-path)</text>
+<text x="1012" y="456" font-size="12.5" fill="#222">• Fit estimate and memory plan</text>
+<text x="1012" y="473" font-size="12.5" fill="#222">• ANE programs compiled at install (compile-ane)</text>
+<text x="1012" y="490" font-size="12.5" fill="#222">• Model download, search and upload: @mlx-bun/hub</text>
+</g>
+<g><rect x="30" y="587" width="352" height="406" rx="10" fill="#f3eefb" stroke="#7b5ea7" stroke-width="2"/>
+<text x="44" y="611" font-size="18" font-weight="700" fill="#222">Sampler</text>
+<text x="44" y="627" font-size="11" font-family="'SF Mono', Menlo, Consolas, monospace" fill="#555">inference/sampling</text>
+<text x="44" y="641" font-size="12.5" font-style="italic" fill="#333">Logits become tokens.</text>
+<text x="44" y="666" font-size="12.5" fill="#222">• Temperature, top-k, top-p, min-p, XTC</text>
+<text x="44" y="683" font-size="12.5" fill="#222">• Processors: repetition, presence and frequency</text>
+<text x="55" y="700" font-size="12.5" fill="#222">penalties, logit bias</text>
+<text x="44" y="717" font-size="12.5" fill="#222">• Grammar constraints: JSON schema or grammar to</text>
+<text x="55" y="734" font-size="12.5" fill="#222">token masks</text>
+<text x="44" y="751" font-size="12.5" fill="#222">• Draft acceptance sampling for speculative</text>
+<text x="55" y="768" font-size="12.5" fill="#222">decoding</text>
+<text x="44" y="785" font-size="12.5" fill="#222">• Curve sampler (log-prob transfer curve), window</text>
+<text x="55" y="802" font-size="12.5" fill="#222">filters</text>
+<text x="44" y="819" font-size="12.5" fill="#222">• Seeded draws: key derived from (seed, step);</text>
+<text x="55" y="836" font-size="12.5" fill="#222">only the token id crosses to JS</text>
+</g>
+<g><rect x="514" y="587" width="352" height="406" rx="10" fill="#e9f6ea" stroke="#2e7d32" stroke-width="2"/>
+<text x="528" y="611" font-size="18" font-weight="700" fill="#222">Scheduler</text>
+<text x="528" y="627" font-size="11" font-family="'SF Mono', Menlo, Consolas, monospace" fill="#555">inference/execution (+ generation/ methods)</text>
+<text x="528" y="641" font-size="12.5" font-style="italic" fill="#333">The only component that decides at run time.</text>
+<text x="528" y="666" font-size="12.5" fill="#222">• Admission, queue, cancellation, sessions and</text>
+<text x="539" y="683" font-size="12.5" fill="#222">continuations</text>
+<text x="528" y="700" font-size="12.5" fill="#222">• Continuous batching: rows up to --batch;</text>
+<text x="539" y="717" font-size="12.5" fill="#222">one request is a batch of one</text>
+<text x="528" y="734" font-size="12.5" fill="#222">• Names the phase and width: prefillChunk,</text>
+<text x="539" y="751" font-size="12.5" fill="#222">prefillTail, decode, verify, appendKnown,</text>
+<text x="539" y="768" font-size="12.5" fill="#222">logits (widths 1, 2-3, 4, 5-8, wider)</text>
+<text x="528" y="785" font-size="12.5" fill="#222">• Dispatches prefill chunks to the GPU or the ANE:</text>
+<text x="539" y="802" font-size="12.5" fill="#222">the ANE is a compute unit it manages</text>
+<text x="528" y="819" font-size="12.5" fill="#222">• Mixed iteration: prefill rows and decode rows in</text>
+<text x="539" y="836" font-size="12.5" fill="#222">one round</text>
+<text x="528" y="853" font-size="12.5" fill="#222">• Speculative rounds: draft, verify, accept;</text>
+<text x="539" y="870" font-size="12.5" fill="#222">adaptive depth over the built widths</text>
+<text x="528" y="887" font-size="12.5" fill="#222">• Methods: autoregressive, speculative, denoising,</text>
+<text x="539" y="904" font-size="12.5" fill="#222">fill, grammar groups</text>
+<text x="528" y="921" font-size="12.5" fill="#222">• Asks the cache for prefix hit or miss; KV</text>
+<text x="539" y="938" font-size="12.5" fill="#222">budget; fit</text>
+<text x="528" y="955" font-size="12.5" fill="#222">• Row sampling: hands each row's logits to the</text>
+<text x="539" y="972" font-size="12.5" fill="#222">sampler</text>
+</g>
+<g><rect x="998" y="587" width="352" height="406" rx="10" fill="#e6f4f4" stroke="#1f7a78" stroke-width="2"/>
+<text x="1012" y="611" font-size="18" font-weight="700" fill="#222">Drafter</text>
+<text x="1012" y="627" font-size="11" font-family="'SF Mono', Menlo, Consolas, monospace" fill="#555">inference/generation/speculative/sources,</text>
+<text x="1012" y="641" font-size="11" font-family="'SF Mono', Menlo, Consolas, monospace" fill="#555">models/speculative</text>
+<text x="1012" y="655" font-size="12.5" font-style="italic" fill="#333">A second graph proposing tokens; the target verifies</text>
+<text x="1012" y="670" font-size="12.5" font-style="italic" fill="#333">them.</text>
+<text x="1012" y="695" font-size="12.5" fill="#222">• Qwen MTP head, GLM-5.2 MTP</text>
+<text x="1012" y="712" font-size="12.5" fill="#222">• DFlash and DFlash 2 (residual basis captured</text>
+<text x="1023" y="729" font-size="12.5" fill="#222">from the target)</text>
+<text x="1012" y="746" font-size="12.5" fill="#222">• DeepSpec drafter, n-gram, assistant model</text>
+<text x="1023" y="763" font-size="12.5" fill="#222">(two-model)</text>
+<text x="1012" y="780" font-size="12.5" fill="#222">• Built by the loader; reads the target's KV and</text>
+<text x="1023" y="797" font-size="12.5" fill="#222">hidden states through its TargetView ports</text>
+<text x="1012" y="814" font-size="12.5" fill="#222">• Drafts through grouped rows (one request is a</text>
+<text x="1023" y="831" font-size="12.5" fill="#222">group of one); the scheduler verifies</text>
+</g>
+<g><rect x="30" y="1069" width="836" height="406" rx="10" fill="#fdeee3" stroke="#c25e1c" stroke-width="2"/>
+<text x="44" y="1093" font-size="18" font-weight="700" fill="#222">Graph</text>
+<text x="44" y="1109" font-size="11" font-family="'SF Mono', Menlo, Consolas, monospace" fill="#555">inference/models</text>
+<text x="44" y="1123" font-size="12.5" font-style="italic" fill="#333">One entire graph per model x quant x machine. Extends nothing; never inspects its input or its cache.</text>
+<text x="44" y="1148" font-size="12.5" fill="#222">• Generated: Qwen3.8-27B Trellis 3.2bpw (M4 Pro, M1 Max), Gemma 4 e4b / 12B / 26B</text>
+<text x="44" y="1165" font-size="12.5" fill="#222">• Generic, one per family: Qwen3 / 3.5 / MoE, Gemma 4, MiniCPM5, GLM-5.2, Llama (universal dense), DiffusionGemma, Whisper</text>
+<text x="44" y="1182" font-size="12.5" fill="#222">• Phases: prefillChunk { gpu, ane }, prefillTail, decode / verify / appendKnown / logits width tables</text>
+<text x="44" y="1199" font-size="12.5" fill="#222">• makeCache(): composes the cache lego its composition names</text>
+<text x="44" y="1216" font-size="12.5" fill="#222">• Layer captures: residual basis and hidden taps for drafters</text>
+<text x="44" y="1233" font-size="12.5" fill="#222">• Declared capabilities: vision, audio, draft head, pooled embeddings; vision and audio towers</text>
+<text x="44" y="1250" font-size="12.5" fill="#222">• Forward for LoRA training (consumed by @mlx-bun/training)</text>
+</g>
+<g><rect x="998" y="1069" width="352" height="406" rx="10" fill="#fbeaf0" stroke="#b03060" stroke-width="2"/>
+<text x="1012" y="1093" font-size="18" font-weight="700" fill="#222">Cache</text>
+<text x="1012" y="1109" font-size="11" font-family="'SF Mono', Menlo, Consolas, monospace" fill="#555">inference/state</text>
+<text x="1012" y="1123" font-size="12.5" font-style="italic" fill="#333">Owns storage and the read. Answers hit or miss.</text>
+<text x="1012" y="1148" font-size="12.5" fill="#222">• Storage legos: bf16; affine uniform (--kv-quant</text>
+<text x="1023" y="1165" font-size="12.5" fill="#222">N, mlx-lm parity), tiled-causal (OptiQ parity),</text>
+<text x="1023" y="1182" font-size="12.5" fill="#222">tiled; TurboQuant dense / deferred; KV4 head-256</text>
+<text x="1023" y="1199" font-size="12.5" fill="#222">(M4 Pro); bf16-first (first append bf16, then</text>
+<text x="1023" y="1216" font-size="12.5" fill="#222">quantized: the default)</text>
+<text x="1012" y="1233" font-size="12.5" fill="#222">• The read: attend(q, scale); masks memoized once</text>
+<text x="1023" y="1250" font-size="12.5" fill="#222">per forward</text>
+<text x="1012" y="1267" font-size="12.5" fill="#222">• Rotating / sliding-window KV; recurrent state</text>
+<text x="1023" y="1284" font-size="12.5" fill="#222">(GatedDelta, SSM)</text>
+<text x="1012" y="1301" font-size="12.5" fill="#222">• Paged rows and row layouts for batching; row</text>
+<text x="1023" y="1318" font-size="12.5" fill="#222">transactions</text>
+<text x="1012" y="1335" font-size="12.5" fill="#222">• Prefix reuse (prefix cache, tiered); SSD offload</text>
+<text x="1023" y="1352" font-size="12.5" fill="#222">(--ssd-cache-max, persistence worker)</text>
+<text x="1012" y="1369" font-size="12.5" fill="#222">• Eviction and retention policy, KV budget, leases</text>
+<text x="1012" y="1386" font-size="12.5" fill="#222">• Snapshots and rollback for speculative verify;</text>
+<text x="1023" y="1403" font-size="12.5" fill="#222">donor reads for drafters</text>
+<text x="1012" y="1420" font-size="12.5" fill="#222">• Adapter-namespaced caches; encoder cache</text>
+<text x="1012" y="1437" font-size="12.5" fill="#222">• Delayed quantization legos take their kernel set</text>
+<text x="1023" y="1454" font-size="12.5" fill="#222">at build</text>
+</g>
+<g><rect x="30" y="1551" width="836" height="287" rx="10" fill="#eef1f5" stroke="#53627a" stroke-width="2"/>
+<text x="44" y="1575" font-size="18" font-weight="700" fill="#222">Layers</text>
+<text x="44" y="1591" font-size="11" font-family="'SF Mono', Menlo, Consolas, monospace" fill="#555">inference/layers, models/qwen/blocks, models/gemma4/blocks</text>
+<text x="44" y="1605" font-size="12.5" font-style="italic" fill="#333">The blocks a graph is made of. Each imports the kernels it needs.</text>
+<text x="44" y="1630" font-size="12.5" fill="#222">• Attention: Qwen3, Gemma, KV4 decode, quantized-append; the read strategy is cache.attend</text>
+<text x="44" y="1647" font-size="12.5" fill="#222">• GatedDeltaNet recurrence; MLP: SwiGLU, GeGLU, Trellis gate-up / down, affine</text>
+<text x="44" y="1664" font-size="12.5" fill="#222">• Linears: dense, quantized, Trellis (variant 13), switch (MoE experts), affine-verify</text>
+<text x="44" y="1681" font-size="12.5" fill="#222">• Embeddings (dense, quantized); norms (RMS, layer norm); softcap</text>
+<text x="44" y="1698" font-size="12.5" fill="#222">• RoPE, mRoPE, 2D RoPE; LoRA application on named targets</text>
+<text x="44" y="1715" font-size="12.5" fill="#222">• ANE prefill split: instance-owned programs for exactly the chunk size</text>
+<text x="44" y="1732" font-size="12.5" fill="#222">• Per-layer MLX compile choice (measured, never an app option)</text>
+</g>
+<g><rect x="998" y="1551" width="352" height="287" rx="10" fill="#eef1f5" stroke="#53627a" stroke-width="2"/>
+<text x="1012" y="1575" font-size="18" font-weight="700" fill="#222">Kernels</text>
+<text x="1012" y="1591" font-size="11" font-family="'SF Mono', Menlo, Consolas, monospace" fill="#555">inference/kernels, native/</text>
+<text x="1012" y="1605" font-size="12.5" font-style="italic" fill="#333">One op, one way, measured.</text>
+<text x="1012" y="1630" font-size="12.5" fill="#222">• attention: fused SDPA, KV4 decode attention,</text>
+<text x="1023" y="1647" font-size="12.5" fill="#222">softcap</text>
+<text x="1012" y="1664" font-size="12.5" fill="#222">• quantization: affine quant / dequant, qmv, steel</text>
+<text x="1023" y="1681" font-size="12.5" fill="#222">qmm</text>
+<text x="1012" y="1698" font-size="12.5" fill="#222">• trellis: codebook decode, fused gate-up / down,</text>
+<text x="1023" y="1715" font-size="12.5" fill="#222">qualified representations</text>
+<text x="1012" y="1732" font-size="12.5" fill="#222">• turboquant: codec (rotate, encode, decode)</text>
+<text x="1012" y="1749" font-size="12.5" fill="#222">• delta: gated delta rule; glm52: MLA</text>
+<text x="1012" y="1766" font-size="12.5" fill="#222">• ane: bridge (private AppleNeuralEngine, MIL</text>
+<text x="1023" y="1783" font-size="12.5" fill="#222">compile), linear</text>
+<text x="1012" y="1800" font-size="12.5" fill="#222">• logits, sampling kernels (categorical = inverse</text>
+<text x="1023" y="1817" font-size="12.5" fill="#222">CDF)</text>
+</g>
+<g><rect x="30" y="1914" width="1320" height="134" rx="10" fill="#fafafa" stroke="#999999" stroke-width="2"/>
+<text x="44" y="1938" font-size="18" font-weight="700" fill="#222">Outside the chain</text>
+<text x="44" y="1954" font-size="11" font-family="'SF Mono', Menlo, Consolas, monospace" fill="#555">packages, app modules</text>
+<text x="44" y="1968" font-size="12.5" font-style="italic" fill="#333">Produce or consume the chain; they are not on the request path.</text>
+<text x="44" y="1993" font-size="12.5" fill="#222">• @mlx-bun/quantize: the Trellis quantizer, publishes the one quant per tier (Qwen3.8-27B-Trellis-3.2bpw)   |   @mlx-bun/training: LoRA and ORPO on the graphs and state contracts   |   @mlx-bun/mlx: the</text>
+<text x="55" y="2010" font-size="12.5" fill="#222">native binding</text>
+<text x="44" y="2027" font-size="12.5" fill="#222">• App modules: chat (Pi, sessions, tool approvals), web, jobs, hub, memory (vault, synthesis), datasets, quantize and train jobs, metrics, models, transcription</text>
+</g>
+<line x1="382" y1="303.5" x2="514" y2="303.5" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="448" y="295.5" font-size="12" fill="#222" text-anchor="middle" paint-order="stroke" stroke="#ffffff" stroke-width="5" stroke-linejoin="round">messages, media</text>
+<line x1="690" y1="511" x2="690" y2="587" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="700" y="553" font-size="12" fill="#222" text-anchor="start" paint-order="stroke" stroke="#ffffff" stroke-width="5" stroke-linejoin="round">tokens, prompt</text>
+<line x1="514" y1="790" x2="382" y2="790" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="448" y="768" font-size="12" fill="#222" text-anchor="middle" paint-order="stroke" stroke="#ffffff" stroke-width="5" stroke-linejoin="round">logits per row</text>
+<text x="448" y="782" font-size="12" fill="#222" text-anchor="middle" paint-order="stroke" stroke="#ffffff" stroke-width="5" stroke-linejoin="round">token back</text>
+<line x1="866" y1="790" x2="998" y2="790" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="932" y="768" font-size="12" fill="#222" text-anchor="middle" paint-order="stroke" stroke="#ffffff" stroke-width="5" stroke-linejoin="round">draft(n)</text>
+<text x="932" y="782" font-size="12" fill="#222" text-anchor="middle" paint-order="stroke" stroke="#ffffff" stroke-width="5" stroke-linejoin="round">verify, accept</text>
+<line x1="690" y1="993" x2="690" y2="1069" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="700" y="1035" font-size="12" fill="#222" text-anchor="start" paint-order="stroke" stroke="#ffffff" stroke-width="5" stroke-linejoin="round">phase(rows): the width the scheduler is loading</text>
+<line x1="866" y1="1252" x2="998" y2="1252" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="932" y="1244" font-size="12" fill="#222" text-anchor="middle" paint-order="stroke" stroke="#ffffff" stroke-width="5" stroke-linejoin="round">attend(q, scale), append</text>
+<line x1="866" y1="1292" x2="998" y2="1292" stroke="#333" stroke-width="2" stroke-dasharray="7,5" marker-end="url(#arrow)"/>
+<text x="932" y="1312" font-size="12" fill="#222" text-anchor="middle" paint-order="stroke" stroke="#ffffff" stroke-width="5" stroke-linejoin="round">makeCache() at load</text>
+<line x1="448" y1="1475" x2="448" y2="1551" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="458" y="1517" font-size="12" fill="#222" text-anchor="start" paint-order="stroke" stroke="#ffffff" stroke-width="5" stroke-linejoin="round">the layers it was built with</text>
+<line x1="866" y1="1694.5" x2="998" y2="1694.5" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="932" y="1686.5" font-size="12" fill="#222" text-anchor="middle" paint-order="stroke" stroke="#ffffff" stroke-width="5" stroke-linejoin="round">imports</text>
+<line x1="1174" y1="1475" x2="1174" y2="1551" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="1184" y="1517" font-size="12" fill="#222" text-anchor="start" paint-order="stroke" stroke="#ffffff" stroke-width="5" stroke-linejoin="round">quant, codec and attention kernels</text>
+<line x1="1058" y1="511" x2="826" y2="587" stroke="#333" stroke-width="2" stroke-dasharray="7,5" marker-end="url(#arrow)"/>
+<text x="958" y="547" font-size="12" fill="#222" text-anchor="start" paint-order="stroke" stroke="#ffffff" stroke-width="5" stroke-linejoin="round">composition, built once:</text>
+<text x="958" y="561" font-size="12" fill="#222" text-anchor="start" paint-order="stroke" stroke="#ffffff" stroke-width="5" stroke-linejoin="round">graph, cache lego, drafter, widths</text>
+<line x1="1174" y1="511" x2="1174" y2="587" stroke="#333" stroke-width="2" stroke-dasharray="7,5" marker-end="url(#arrow)"/>
+<text x="1184" y="553" font-size="12" fill="#222" text-anchor="start" paint-order="stroke" stroke="#ffffff" stroke-width="5" stroke-linejoin="round">builds</text>
+</svg>

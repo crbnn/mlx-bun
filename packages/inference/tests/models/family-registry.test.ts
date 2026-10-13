@@ -12,6 +12,7 @@ import { ENGINE_CAPABILITIES, MODEL_FAMILIES, familyForGraph, familyOf, familyOf
 import { configFingerprint } from "../../src/artifacts/fingerprint";
 import { fit } from "../../src/execution/fit";
 import { kvGeometry, sdpaFallbackBytes } from "../../src/state/kv-scheme";
+import { implementationIdFor } from "../../src/models/implementation";
 
 const root = mkdtempSync(join(tmpdir(), "mlx-family-registry-"));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
@@ -91,7 +92,7 @@ function resolution(config: ModelConfig): string {
     const resolved = resolveModelProfile(config);
     const { profile } = resolved;
     const { execution } = profile;
-    const implementation = execution.implementation ?? (execution.specialization === "generated" ? `${execution.graph}-generated` : execution.graph);
+    const implementation = implementationIdFor(execution);
     const sentinels = sentinelDeclarationFor(resolved), media = mediaTokenDeclarationFor(resolved), embedding = embeddingDeclarationFor(resolved);
     parts.push(
       `profile=${profile.id}`, `graph=${execution.graph}`, `${execution.loader}/${execution.loop}/${execution.specialization}`, `impl=${implementation}`,
@@ -325,13 +326,13 @@ const EXPECTED_SNAPSHOTS: Record<string, string> = {
   "mjriii/Qwen3.8-27B-MTP-TQ-bf16@staged":
     "cfg=cd002d6f767f record=null kv={\"fullBytesPerToken\":65536,\"slidingBytesPerToken\":0,\"linearStateBytes\":153944064,\"window\":0} sdpa=805306368 fit=230.599 error=unsupported model_type \"qwen3_5_mtp\" — targeted: gemma4*, diffusion_gemma, glm_moe_dsa, qwen3_5, qwen3, qwen3_moe, whisper, MiniCPM5; generic (Tier-0): gemma, gemma2, glm4, granite, llama, olmo2, phi3, qwen2, qwen3, smollm3, starcoder2",
   "mlx-community/gemma-4-12B-it-OptiQ-4bit@b617be81":
-    "cfg=008dfd4f074a record=targeted kv={\"fullBytesPerToken\":16384,\"slidingBytesPerToken\":327680,\"linearStateBytes\":0,\"window\":1024} sdpa=536870912 fit=233.843 profile=gemma4-generated graph=gemma4 safetensors/autoregressive/generated impl=gemma4-generated l1:mlx-lm caps=safetensors,autoregressive,gemma4-graph,generated-graph exact=false train=8192 gen={\"noThinkTemperatureCap\":0.7} embed=- sentinels=true media=true template=-",
+    "cfg=008dfd4f074a record=targeted kv={\"fullBytesPerToken\":16384,\"slidingBytesPerToken\":327680,\"linearStateBytes\":0,\"window\":1024} sdpa=536870912 fit=233.843 profile=gemma4-dedicated graph=gemma4 safetensors/autoregressive/dedicated impl=gemma4 l1:mlx-lm caps=safetensors,autoregressive,gemma4-graph exact=false train=8192 gen={\"noThinkTemperatureCap\":0.7} embed=- sentinels=true media=true template=-",
   "mlx-community/MiniCPM5-1B-OptiQ-4bit@fce82a8b":
     "cfg=6ba1d3ce36a6 record=generic kv={\"fullBytesPerToken\":24576,\"slidingBytesPerToken\":0,\"linearStateBytes\":0,\"window\":0} sdpa=0 fit=298.002 profile=minicpm5-dedicated graph=minicpm5 safetensors/autoregressive/dedicated impl=minicpm5 l1:mlx-lm caps=safetensors,autoregressive,minicpm5-graph exact=false train=4096 gen={\"noThinkTemperatureCap\":0.7,\"enableThinking\":false} embed=- sentinels=false media=false template=-",
   "mlx-community/gemma-4-E4B-it-assistant-bf16@844e008e":
     "cfg=362b80cb8324 record=null kv={\"fullBytesPerToken\":4096,\"slidingBytesPerToken\":6144,\"linearStateBytes\":0,\"window\":512} sdpa=134217728 fit=321.593 profile=gemma4-dedicated graph=gemma4 safetensors/autoregressive/dedicated impl=gemma4 l1:mlx-lm caps=safetensors,autoregressive,gemma4-graph exact=false train=8192 gen={\"noThinkTemperatureCap\":0.7} embed=- sentinels=true media=true template=-",
   "mlx-community/gemma-4-e4b-it-OptiQ-4bit@98d7dc6a":
-    "cfg=d97ddeea343b record=targeted kv={\"fullBytesPerToken\":28672,\"slidingBytesPerToken\":71680,\"linearStateBytes\":0,\"window\":512} sdpa=268435456 fit=284.194 profile=gemma4-generated graph=gemma4 safetensors/autoregressive/generated impl=gemma4-generated l1:mlx-lm caps=safetensors,autoregressive,gemma4-graph,generated-graph exact=false train=8192 gen={\"noThinkTemperatureCap\":0.7} embed=- sentinels=true media=true template=-",
+    "cfg=d97ddeea343b record=targeted kv={\"fullBytesPerToken\":28672,\"slidingBytesPerToken\":71680,\"linearStateBytes\":0,\"window\":512} sdpa=268435456 fit=284.194 profile=gemma4-dedicated graph=gemma4 safetensors/autoregressive/dedicated impl=gemma4 l1:mlx-lm caps=safetensors,autoregressive,gemma4-graph exact=false train=8192 gen={\"noThinkTemperatureCap\":0.7} embed=- sentinels=true media=true template=-",
   "mlx-community/gemma-4-e2b-it-qat-OptiQ-4bit@b0162532":
     "cfg=9727792633a9 record=targeted kv={\"fullBytesPerToken\":14336,\"slidingBytesPerToken\":28672,\"linearStateBytes\":0,\"window\":512} sdpa=268435456 fit=305.571 profile=gemma4-dedicated graph=gemma4 safetensors/autoregressive/dedicated impl=gemma4 l1:mlx-lm caps=safetensors,autoregressive,gemma4-graph exact=false train=8192 gen={\"noThinkTemperatureCap\":0.7} embed=- sentinels=true media=true template=-",
   "openbmb/MiniCPM5-2B@abe115e8":
@@ -343,7 +344,7 @@ const EXPECTED_SNAPSHOTS: Record<string, string> = {
   "mjriii/Qwen3.8-27B-TQ@staged":
     "cfg=cb2a69e5c503 record=targeted kv={\"fullBytesPerToken\":65536,\"slidingBytesPerToken\":0,\"linearStateBytes\":153944064,\"window\":0} sdpa=805306368 fit=230.599 profile=qwen3.5-dedicated graph=qwen3.5 safetensors/autoregressive/dedicated impl=qwen3.5 l1:mlx-lm caps=safetensors,autoregressive,qwen3.5-graph,recurrent-state exact=false train=4096 gen={\"noThinkTemperatureCap\":0.7} embed=- sentinels=false media=false template=-",
   "mlx-community/gemma-4-26B-A4B-it-OptiQ-4bit@dbfd2a77":
-    "cfg=1a8b12070ab3 record=targeted kv={\"fullBytesPerToken\":20480,\"slidingBytesPerToken\":204800,\"linearStateBytes\":0,\"window\":1024} sdpa=536870912 fit=368.551 profile=gemma4-generated graph=gemma4 safetensors/autoregressive/generated impl=gemma4-generated l1:mlx-lm caps=safetensors,autoregressive,gemma4-graph,generated-graph exact=false train=8192 gen={\"noThinkTemperatureCap\":0.7} embed=- sentinels=true media=true template=-",
+    "cfg=1a8b12070ab3 record=targeted kv={\"fullBytesPerToken\":20480,\"slidingBytesPerToken\":204800,\"linearStateBytes\":0,\"window\":1024} sdpa=536870912 fit=368.551 profile=gemma4-dedicated graph=gemma4 safetensors/autoregressive/dedicated impl=gemma4 l1:mlx-lm caps=safetensors,autoregressive,gemma4-graph exact=false train=8192 gen={\"noThinkTemperatureCap\":0.7} embed=- sentinels=true media=true template=-",
   "mjriii/Qwen3.8-27B@staged":
     "cfg=458e3d550642 record=targeted kv={\"fullBytesPerToken\":65536,\"slidingBytesPerToken\":0,\"linearStateBytes\":153944064,\"window\":0} sdpa=805306368 fit=230.599 profile=qwen3.5-dedicated graph=qwen3.5 safetensors/autoregressive/dedicated impl=qwen3.5 l1:mlx-lm caps=safetensors,autoregressive,qwen3.5-graph,recurrent-state exact=false train=4096 gen={\"noThinkTemperatureCap\":0.7} embed=- sentinels=false media=false template=-",
   "mlx-bun/qwen38-trellis-global-exit5-h39-q4b-v2@local":

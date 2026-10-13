@@ -26,6 +26,8 @@ export abstract class FullTransitioningKvRows<Layout extends FullLayout>
     super({ ...transition,
       converted: row => transition.converted(fullRowInner(row)),
       extractRow: row => row instanceof FullPrefillRow ? row.extract() : cloneKvCaches([row])[0]!,
+      // An unpadded row is storage the lone row's lego adopts as it is.
+      adopt: row => row instanceof FullPrefillRow ? null : row,
       packRows(layout, rows) {
         layout.mergeRows(rows.map(fullRowInner));
         if (rows.some(row => row instanceof FullPrefillRow)) {
@@ -37,9 +39,11 @@ export abstract class FullTransitioningKvRows<Layout extends FullLayout>
       },
     }, row, new PrefillPositions());
   }
+  /** The plain row an empty layout starts each prefill row with. */
+  protected plainRow(): KVCache { return new KVCache(); }
   preparePrefill(padding: PrefillPadding): void {
     if (this.packed) { this.packed.preparePrefill(padding); return; }
-    if (!this.rows.length) this.rows = padding.lengths.map(() => new KVCache());
+    if (!this.rows.length) this.rows = padding.lengths.map(() => this.plainRow());
     this.rows = this.rows.map(row => row instanceof FullPrefillRow ? row : new FullPrefillRow(row as KVCache));
     for (const [index, row] of this.rows.entries()) (row as FullPrefillRow).preparePrefill({
       lengths: [padding.lengths[index]!],

@@ -17,11 +17,14 @@ needs a separate installation or release boundary.
 - Keep one inference package with enforced internal boundaries. Split a package
   when a consumer needs that boundary, not merely because a directory exists.
 - Preserve behavior during migration; numerical optimization is separate work.
-  A specialized model graph composes layers and kernels; its layers own whether
+  A model graph composes layers and kernels; its layers own whether
   operations compile. Keep this implementation choice out of app options.
-- The app uses continuous batching by default, including a single request. Do
-  not add a separate serial serving lane. Preserve main's application behavior
-  while giving each domain a clear owner; benchmark the full draft afterward.
+- The app runs every request on the continuous batching scheduler: one request
+  is a batch of one, and `--batch` is only the cap on rows per forward. Choosing
+  a cap above one opts into batching, which may move the last bits of a result;
+  `--batch 1` says nothing can be batched, so nothing changes. There is no second
+  engine for one request. Preserve main's application behavior while giving each
+  domain a clear owner; benchmark the full draft afterward.
 - Inference and the app do not require a Python environment. Separately runnable
   verification and evaluation tools may use pinned Python environments; their
   reusable code, launch configuration, and instructions belong in Git. Runtime
@@ -43,7 +46,8 @@ graphs, state, sampling, and generation directly. A small convenience API does
 not require hiding those components.
 
 `@mlx-bun/training` owns adapter training and production above the inference
-graphs, layers, state contracts, and MLX autograd. Training progress is a
+graphs, layers, state contracts, and MLX autograd. Training caches own their rope
+positions (`TrainingAttentionCache.ropePositions`); there is no module-level prefix layout. Training progress is a
 library contract; job lifecycle and terminal output stay in apps.
 Inference and quantization never depend on training.
 
@@ -53,13 +57,21 @@ same contract. Concrete model loading remains available as a convenience.
 
 ### Construct the implementation before executing it
 
-The model description is an input to constructing an implementation. Resolve
-known architecture, weight layout, quantization, layer roles, and configured
-capabilities when loading and binding the graph. Compose the selected layers
-and kernels into that implementation so execution does not repeatedly interpret
-the descriptor or rediscover what a particular layer does. Adding model support
-should reuse these components where they fit and give specialized code an
-explicit owner. A universal fallback can remain available.
+The model description is an input to constructing an implementation. Every
+served configuration is one composition, resolved once at load from the user's
+model choice, their flags and the machine (`contracts/portable/composition.ts`):
+the loader builds the graph, its cache and its drafter for exactly that
+configuration and hands them to the scheduler. Resolve known architecture,
+weight layout, quantization, layer roles, and configured capabilities there.
+Compose the selected layers and kernels into that implementation so execution
+does not repeatedly interpret the descriptor or rediscover what a particular
+layer does. Nothing below the scheduler decides anything at run time: no flag,
+environment variable, device query or `instanceof` of a layer or cache class
+inside a forward, a read or a kernel dispatch. Constructors, `build`, `load` and
+the loader read those facts. Every graph is an entire graph built for a
+composition and extends nothing. A family's generic graph is one of them: the
+table entry the loader selects when no more constrained entry matches, never a
+path another graph falls back to.
 
 Here, "compile" means resolving those facts into a concrete implementation;
 it does not require generated source or MLX graph compilation. Layers own MLX
@@ -74,7 +86,8 @@ allowlists. For example, a missing draft head is a missing component. Dynamic
 request data, batch membership, cancellation, and state transitions still need
 runtime handling. Graphs declare their capabilities when constructed; the gateway
 plans from those declarations and the app engine binds media through graph
-operations. Facts the server and CLI need (memory plans, native draft heads,
+operations. Every graph implements `dispose()` and releases what it built;
+providers and the host call it. Facts the server and CLI need (memory plans, native draft heads,
 pooled-embedding recipes, tool-call and reasoning marker tokens, media soft
 tokens, chat defaults, template fallbacks) are declared by the model layer, in
 the family record (`models/families`, one record per family) or the opened
@@ -86,11 +99,26 @@ readers.
 Scheduling (`execution/`) is written against the structural `MlxTokenGraph`, not
 the registry's closed `RuntimeModel` union of model classes, and moves cache rows
 through each layer's row layout (`state/layout`, the `BatchableCache` port) rather
-than a concrete cache class. The gate rejects both there. Elsewhere this remains the target design and a review criterion
-for remaining migration work, not a claim that every existing path already
-satisfies it.
+than a concrete cache class. The gate rejects both there, and its composition
+rules (the seam ratchet below) hold the mechanical part of this section across
+the library. What no rule can see remains a review criterion, not a claim that
+every existing path already satisfies it.
+
+Two contracts carry the composition. The cache owns its storage and its read:
+a layer appends through `AttentionCache` and reads through `AttentionRead.attend`,
+and no caller reaches a representation-specific escape hatch; the cache also
+owns prefix reuse, paging, SSD offload and eviction behind that interface and
+answers hit or miss. The graph names its phases (`MlxTokenPhases`:
+`prefillChunk` per execution unit, and `prefillTail`, `decode`, `verify`,
+`appendKnown` and `logits` as width tables); the scheduler calls the phase it is in for the rows
+it batched and dispatches prompt chunks to the GPU or the Neural Engine as a
+resource it manages. Row-wise layers take M rows and do not know whether they
+are one sequence or M; only `attend` and the recurrence see the row layout.
 
 ## Ownership and dependency direction
+
+![The inference chain: the modules and the features each one owns](docs/inference-chain.svg)
+
 
 Inside `packages/inference/src/`:
 
@@ -102,14 +130,14 @@ Inside `packages/inference/src/`:
 | `kernels/` | Numerical operations and their input layouts. No concrete cache, artifact loader, model, or scheduler imports. |
 | `artifacts/` | Configuration, weights, formats, auxiliary checkpoint files, expert storage/residency, and conversion of artifact layouts into kernel descriptors. |
 | `layers/` | Reusable graph building blocks, including LoRA application and positional operations. |
-| `state/` | Cache implementations, snapshots, row storage, retention, and persistence. |
+| `state/` | Cache legos that own their storage and their read (`attend`), the KV scheme they compose from, the row layouts the scheduler moves rows through (`layout`), snapshots, and the cache service (`cache-service`): one per loaded model, owning prefix reuse, the KV budget, SSD persistence, retention and eviction behind acquire and release. |
 | `input/` | Tokenizers, templates, media preprocessing, and prompt assembly through encoder interfaces. |
 | `sampling/` | Sampling policy, processors, constraints, and draft sampling. |
 | `adapters/` | Loading and mounting adapter weights through named target interfaces. |
-| `models/` | Concrete graphs and graph construction from artifacts. |
-| `generation/` | Autoregressive, denoising, fill, and speculative methods. `bindings/` connects concrete graphs to those methods. |
+| `models/` | Family records and profiles; entire graphs, generated per model, quantization and machine, or a family's generic graph; the composition resolver (`composition`) and the selection tables the loader picks a graph from (`factory`); drafter loaders; the Neural Engine programs the shipped compositions load (`ane-install`). |
+| `generation/` | Autoregressive, denoising, fill, and speculative methods, and the phase dispatch (`phase-dispatch`) that resolves the operation a graph built for the phase and rows its caller names. `bindings/` connects concrete graphs to those methods. |
 | `scoring/`, `embeddings/`, `transcription/` | Operations consuming graphs and caller-supplied inputs. |
-| `execution/` | Optional admission, scheduling, sessions, and coordination of generation work. |
+| `execution/` | Admission, the plan from declared capabilities, the batch groups that call the graph's phases for the rows they batched, sessions, coordination, and fit estimates: the one component that decides at run time. |
 | `index.ts` | High-level public entry point consuming these components. |
 
 Dependencies form a DAG, with independent branches rather than one universal
@@ -258,7 +286,7 @@ lets a host that also generates make room first), the registry-backed catalog, s
 entries under `MLX_BUN_HOME`, verb parsing and help from manifests, route
 mounting, module activation and verb running. A host adds only its own execution
 lock and serving; `apps/mlx-bun` also owns the generation side of `modelHost`
-(`src/engine/model-residency.ts`: residency by memory fit over serving units, with
+(`src/residency/model-residency.ts`: residency by memory fit over serving units, with
 `src/server/model-routes.ts` routing requests by model id). A module's manifest is also importable alone
 (`@mlx-bun/module-<id>/manifest`, data only), so a host lists commands and
 `--help` and the documentation generators read verbs and routes without loading
@@ -317,9 +345,17 @@ the host's automatic choice (`pickDefault`), which the app supplies from the sel
 - Seam ratchet: model-class and cache-class `instanceof`, imports of concrete model
   modules (`models/<family>`, from other inference layers and other packages), model-type,
   `architectures` and repo-id/name checks, family-named env flags read outside
-  `models/`, and scheduler-core imports beyond contracts and runtime. The code that
-  still breaks them is listed per file in `seamRatchet` (a count may only fall; a
-  drop prints a reminder to lower it); each cleanup PR shrinks the table.
+  `models/`, and scheduler-core imports beyond contracts and runtime; and the
+  composition rules: a graph class that extends a graph or reads `super.` of one, a
+  runtime flag, env read, `deviceArchitecture()`, `globalThis` access or layer, cache
+  or model `instanceof` inside a forward, read, append or kernel body (construction,
+  acceptance and the loader are exempt; profiling hooks and the two compile-context
+  queries, `isCompiledTrace` and `isShapelessTracing`, which ask whether the graph is
+  being recorded rather than run, by name), a
+  representation-specific cache read outside `state/`, and the removed whole-forward
+  entry points reached from `execution/` or `generation/`. Code that breaks them is
+  listed per file in `seamRatchet`, whose counts may only fall; the table is empty,
+  so any finding fails the gate with the paved road in its message.
 - Panel code imports only panel files and its `protocol.ts`, which imports
   nothing; this generalizes the browser rule for `chat/` and `jobs/`.
 - `web-shell` is browser code with no workspace dependencies and no imports beyond its own files; no module imports
@@ -338,8 +374,8 @@ For example, paged attention accepts numerical storage without knowing its
 allocator; adapter mounting consumes named mount points rather than the model
 union; prompt preparation consumes encoders rather than Gemma or Qwen classes.
 A new implementation must preserve the contract's tensor shapes, ownership,
-state transitions, cancellation, and disposal semantics. Specialized numerical
-paths remain explicit and reusable.
+state transitions, cancellation, and disposal semantics. Every numerical
+path is explicit and reusable: one kernel, bound by one layer.
 
 Composition follows the operations and invariants each component provides.
 Compatible graph, cache, sampling, and generation implementations should compose
@@ -348,20 +384,40 @@ such as an attention operation requiring a particular cache representation, belo
 in the owning component's contract and binding; the scheduler consumes that binding.
 Prefer the smallest existing interface that expresses the requirement.
 
+One supported way per pattern; a second way is a gate failure, not a style note:
+
+- Add a model by generating its graph from the family's blocks with the
+  generator script; a hand-written graph for one composition is not a pattern.
+- Add a kernel as one file in `kernels/` bound by exactly one layer.
+- Read a cache through `attend`; add a representation as a cache lego, never as
+  a read path inside a layer.
+- Add a phase through the graph contract (`MlxTokenPhases`) and call it from the
+  scheduler by name.
+- Add a composition fact as a field of the composition record the loader
+  resolves, never as a flag read inside a forward.
+
+The architecture gate holds these rules where they are mechanical, with a
+ratchet of violators (empty) whose counts only fall; every failure message
+names the paved road.
+
 For every newly supported model, the target is to compile its description into
 a concrete implementation. Here, compilation means resolving known facts during
 graph construction or startup; it is distinct from the layers' MLX compilation
 policy and can use ordinary functions and explicit graph construction. Resolve
 model, artifact, layer, and selected option facts into specific kernels, layers,
-state layouts, and bound operations. The specialized Gemma implementations
-demonstrate the intended pattern for model support generally. Adding support means assembling
-the graph from reusable components and implementing any missing operation in its
-owning layer.
+state layouts, and bound operations. The generated graphs demonstrate the
+pattern for model support generally: `packages/inference/scripts/gen-gemma4.ts`
+emits `models/gemma4/generated/*` from `models/gemma4/blocks.ts`, and
+`gen-qwen38.ts` emits the M4 Pro and M1 Max Qwen3.8 graphs from
+`models/qwen/blocks.ts`; drift tests keep the committed
+graphs equal to what the generators emit. Adding support means generating the
+graph from reusable blocks and implementing any missing operation in its owning
+layer.
 
 Known data flow is part of that construction: which operations produce and consume
 a tensor, its layout, and its ownership and lifetime obligations. Use these facts
 to determine which intermediate state must be materialized, copied, or retained.
-A specialized implementation may avoid that work when it can establish that every
+An implementation may avoid that work when it can establish that every
 bound consumer's contract, including the state required by a selected generation
 method, checkpoint, or exposed output, is still met.
 These are properties of the chosen graph and bindings, not guesses about how a
@@ -371,8 +427,9 @@ or implementation.
 Execution calls the resulting operations without repeatedly interpreting model
 descriptors or rediscovering invariant capabilities in the hot path. Current
 sequence lengths, cache contents, batch membership, request choices, and
-cancellation remain dynamic. A universal fallback is allowed; no universal model
-abstraction, code-generation system, or compiler framework is required. This is
+cancellation remain dynamic. A family's generic graph is the loader's selection
+when no more constrained entry matches; no graph falls back inside its forward.
+No universal model abstraction or compiler framework is required. This is
 the target for refining migrated paths, not a claim that every current path already
 follows it; changes still require the
 [numerical and performance evidence](CONTRIBUTING.md#numerical-and-performance-evidence).

@@ -6,7 +6,8 @@ import type { ModelRecord } from "@mlx-bun/hub/registry";
 import type { LoadedModelContext } from "../src/engine/model-host";
 import { loadContextTemplate, requireChatTemplate } from "../src/engine/model-host";
 import { UnsupportedExecutionError } from "../src/engine/completion";
-import { configureRuntime, runtimeValue } from "@mlx-bun/inference/runtime/config";
+import { configureRuntime } from "@mlx-bun/inference/runtime/config";
+import { resolveKvScheme } from "@mlx-bun/inference/state/kv-scheme";
 import { commandInvocation, help, parseCommand } from "../src/cli/args";
 import { generateOptions, resolveInferenceModel, runInference, type InferenceDependencies, type OneShotEngine } from "../src/cli/inference";
 import { createRequestPrep } from "../src/server/request-prep";
@@ -31,7 +32,7 @@ function harness(template = true) {
   const engine: OneShotEngine = {
     context, completion: {
       place(shape) { placed++; return { shape, mechanism: "continuous", execution: { method: "autoregressive", mechanism: "continuous",
-        pagedKv: false, promptCache: false, checkpoint: false, fill: false, compiledDecode: false, grammarJump: false, reasons: [] } }; },
+        promptCache: false, checkpoint: false, fill: false, compiledDecode: false, grammarJump: false, reasons: [] } }; },
       async run(...args) { runs.push(args); await args[2](1); await args[2](2);
         return { promptTokens: 2, cachedTokens: 0, generatedTokens: 2, prefillTps: 0, decodeTps: 0, prefillMs: 0, decodeMs: 0, cacheTokens: [7, 8, 1, 2] }; },
     }, binding: { embed(texts, instruction) { embeds.push([texts, instruction]); return texts.map(text => ({ vector: Float32Array.from([1, 2]), tokens: text.length })); } },
@@ -40,8 +41,13 @@ function harness(template = true) {
   };
   const dependencies: InferenceDependencies = {
     resolve: async (...args) => { selections.push(args); return model; },
-    load: async (selected, maxTokens) => { expect(selected).toBe(model); events.push(`load:${maxTokens}`); return context; },
-    engine: async (loaded, scheme) => { expect(loaded).toBe(context); schemes.push(scheme.generationOptions); return engine; },
+    // The loaded composition resolves the command's KV flags against the artifact's kv_config, as loadContext does.
+    load: async (selected, maxTokens, composition) => {
+      expect(selected).toBe(model); events.push(`load:${maxTokens}`);
+      Object.assign(context, { composition: { kv: resolveKvScheme({ ...composition?.kv, config: context.kvConfig }).storage } });
+      return context;
+    },
+    engine: async loaded => { expect(loaded).toBe(context); schemes.push(loaded.composition?.kv); return engine; },
     write: text => { writes.push(text); }, stdin: async () => " first \n\n second\r\n", stdinIsTTY: () => false,
   };
   return { dependencies, context, engine, events, encoded, decoded, rendered, writes, selections, runs, schemes, embeds,
@@ -68,15 +74,16 @@ test("numerical aliases resolve the KV scheme before generation, with explicit c
     expect(generateOptions(parse("--prompt", "x", ...flags)).kvQuant).toBe(expected);
     const run = harness(); run.context.kvConfig = [{ layerIdx: 0, bits: 4, groupSize: 64 }];
     await runInference("generate", parse("--prompt", "x", ...flags), run.dependencies);
-    expect(run.schemes).toEqual([expected === "config" ? { kvConfig: run.context.kvConfig }
-      : expected === "off" ? {} : { kvBits: 8, quantizedKvStart: 0 }]);
+    expect(run.schemes).toEqual([expected === "config"
+      ? { kind: "affine-layers", layers: [{ layer: 0, bits: 4, groupSize: 64 }], kernels: "tiled-causal" }
+      : expected === "off" ? { kind: "bf16" } : { kind: "affine", bits: 8, groupSize: 64, kernels: "unfused" }]);
   }
   const restore = configureRuntime({ MLX_BUN_EVAL_KV_QUANT: "1" });
   try {
     const run = harness();
     run.context.kvConfig = [{ layerIdx: 0, bits: 4, groupSize: 64 }];
     await runInference("generate", parse("--prompt", "x", "--l1"), run.dependencies);
-    expect(run.schemes[0]).toEqual({});
+    expect(run.schemes[0]).toEqual({ kind: "bf16" });
   } finally { restore(); }
 });
 
@@ -117,9 +124,10 @@ test("the existing eval thinking and KV environment policy stays local to the on
   try {
     await runInference("generate", parse("--prompt", "hi"), run.dependencies);
     expect(run.rendered[0]![1]).toEqual({ addGenerationPrompt: true, enableThinking: true });
-    expect(run.schemes).toEqual([{ kvConfig: run.context.kvConfig, quantizedKvStart: 0 }]);
+    // The evaluation switch keeps the unfused route (fused SDPA off) for its per-layer scheme.
+    expect(run.schemes).toEqual([{ kind: "affine-layers", layers: [{ layer: 0, bits: 4, groupSize: 64 }], kernels: "unfused" }]);
     const explicit = harness(); await runInference("generate", parse("--prompt", "hi", "--kv-quant", "off"), explicit.dependencies);
-    expect(explicit.schemes).toEqual([{}]);
+    expect(explicit.schemes).toEqual([{ kind: "bf16" }]);
   } finally { restore(); }
 });
 
@@ -127,17 +135,23 @@ test("generate carries main's TurboQuant spec to the engine's KV scheme", async 
   for (const [spec, turboQuant] of [["turbo", { kBits: 8, vBits: 3 }], ["turbo:k4v2", { kBits: 4, vBits: 2 }]] as const) {
     const run = harness();
     await runInference("generate", parse("--prompt", "hi", "--kv-quant", spec), run.dependencies);
-    expect(run.schemes).toEqual([{ turboQuant, quantizedKvStart: 0 }]);
+    expect(run.schemes).toEqual([{ kind: "turbo", ...turboQuant }]);
   }
   expect(() => generateOptions(parse("--prompt", "x", "--kv-quant", "turbo:k8v7"))).toThrow("vBits must be one of 2,3,4,5,8 (got 7)");
 });
 
-/** Records the fused-attention route each seam observes: load, engine, run, close. */
+/** Records the fused-attention route the command composes at load (`--fused-sdpa`, resolved: 0 fused, 1 unfused;
+ * embedding composes none), and the seams the command passes in order (load, engine, run, close). */
 function routeSeams(run?: (args: Parameters<OneShotEngine["completion"]["run"]>) => Promise<void>) {
-  const base = harness(), seen: string[] = [];
-  const note = (seam: string) => { seen.push(`${seam}:${runtimeValue("MLX_BUN_NO_FUSED_SDPA") ?? "unset"}`); };
+  const base = harness(), seen: string[] = [], routes: string[] = [];
+  const note = (seam: string) => { seen.push(seam); };
   const dependencies: InferenceDependencies = { ...base.dependencies,
-    load: async (...args) => { note("load"); return base.dependencies.load(...args); },
+    load: async (...args) => {
+      note("load");
+      const fused = args[2]?.kv?.fusedSdpa;
+      routes.push(fused === undefined ? "ambient" : fused ? "0" : "1");
+      return base.dependencies.load(...args);
+    },
     engine: async (...args) => {
       note("engine");
       const engine = await base.dependencies.engine(...args);
@@ -145,11 +159,12 @@ function routeSeams(run?: (args: Parameters<OneShotEngine["completion"]["run"]>)
         note("run"); await run?.(runArgs); return engine.completion.run(...runArgs); } },
       async close() { note("close"); return engine.close(); } };
     } };
-  return { dependencies, seen };
+  return { dependencies, seen, routes };
 }
+const seams = (...names: string[]) => names;
 
-test("generate scopes main's decode route to its own load, engine, run and cleanup", async () => {
-  const restore = configureRuntime({ MLX_BUN_NO_FUSED_SDPA: "ambient", MLX_BUN_EVAL_KV_QUANT: undefined });
+test("generate composes main's decode route into its own load", async () => {
+  const restore = configureRuntime({ MLX_BUN_EVAL_KV_QUANT: undefined });
   try {
     for (const [flags, route] of [[[], "1"], [["--kv-quant", "off"], "1"], [["--kv-quant", "4"], "1"], [["--kv-quant", "8"], "1"],
       [["--kv-quant", "turbo"], "1"], [["--kv-quant", "turbo:k4v2"], "1"], [["--kv-quant", "config"], "0"], [["--l1"], "1"], [["--l2"], "0"],
@@ -157,47 +172,41 @@ test("generate scopes main's decode route to its own load, engine, run and clean
       [["--l2", "--fused-sdpa", "off"], "1"], [["--kv-quant", "4", "--fused-sdpa", "on"], "0"]] as const) {
       const run = routeSeams();
       await runInference("generate", parse("--prompt", "hi", ...flags), run.dependencies);
-      expect({ flags, seen: run.seen }).toEqual({ flags, seen: ["load", "engine", "run", "close"].map(seam => `${seam}:${route}`) });
-      expect(runtimeValue("MLX_BUN_NO_FUSED_SDPA")).toBe("ambient");
+      expect({ flags, routes: run.routes, seen: run.seen })
+        .toEqual({ flags, routes: [route], seen: seams("load", "engine", "run", "close") });
     }
     // Main: the evaluation KV switch without --kv-quant keeps the unfused route.
     const evaluation = configureRuntime({ MLX_BUN_EVAL_KV_QUANT: "1" });
     try {
       const run = routeSeams();
       await runInference("generate", parse("--prompt", "hi"), run.dependencies);
-      expect(run.seen).toEqual(["load:1", "engine:1", "run:1", "close:1"]);
+      expect(run.routes).toEqual(["1"]);
     } finally { evaluation(); }
-    // Embedding keeps the ambient route.
+    // Embedding composes no route.
     const embed = routeSeams();
     await runInference("embed", parseCommand("embed", ["--text", "x"]), embed.dependencies);
-    expect(embed.seen).toEqual(["load:ambient", "engine:ambient", "close:ambient"]);
+    expect({ routes: embed.routes, seen: embed.seen }).toEqual({ routes: ["ambient"], seen: seams("load", "engine", "close") });
   } finally { restore(); }
 });
 
 test("the generate route survives failure and cancellation cleanup and isolates concurrent commands", async () => {
-  const restore = configureRuntime({ MLX_BUN_NO_FUSED_SDPA: "ambient" });
-  try {
-    const failing = routeSeams(async () => { throw new Error("run failed"); });
-    await expect(runInference("generate", parse("--prompt", "hi", "--kv-quant", "config"), failing.dependencies)).rejects.toThrow("run failed");
-    expect(failing.seen).toEqual(["load:0", "engine:0", "run:0", "close:0"]);
-    expect(runtimeValue("MLX_BUN_NO_FUSED_SDPA")).toBe("ambient");
-    const abort = new AbortController();
-    const cancelled = routeSeams(async () => { abort.abort(new Error("cancelled")); });
-    await expect(runInference("generate", parse("--prompt", "hi", "--kv-quant", "config"), cancelled.dependencies, abort.signal)).rejects.toThrow("cancelled");
-    expect(cancelled.seen).toEqual(["load:0", "engine:0", "run:0", "close:0"]);
-    expect(runtimeValue("MLX_BUN_NO_FUSED_SDPA")).toBe("ambient");
-    // Two commands interleave inside their runs; each keeps its own route.
-    let release!: () => void;
-    const both = new Promise<void>(resolve => { release = resolve; });
-    let waiting = 0;
-    const barrier = async () => { if (++waiting === 2) release(); await both; };
-    const fused = routeSeams(barrier), unfused = routeSeams(barrier);
-    await Promise.all([runInference("generate", parse("--prompt", "hi", "--kv-quant", "config"), fused.dependencies),
-      runInference("generate", parse("--prompt", "hi", "--kv-quant", "4"), unfused.dependencies)]);
-    expect(fused.seen).toEqual(["load:0", "engine:0", "run:0", "close:0"]);
-    expect(unfused.seen).toEqual(["load:1", "engine:1", "run:1", "close:1"]);
-    expect(runtimeValue("MLX_BUN_NO_FUSED_SDPA")).toBe("ambient");
-  } finally { restore(); }
+  const failing = routeSeams(async () => { throw new Error("run failed"); });
+  await expect(runInference("generate", parse("--prompt", "hi", "--kv-quant", "config"), failing.dependencies)).rejects.toThrow("run failed");
+  expect({ routes: failing.routes, seen: failing.seen }).toEqual({ routes: ["0"], seen: seams("load", "engine", "run", "close") });
+  const abort = new AbortController();
+  const cancelled = routeSeams(async () => { abort.abort(new Error("cancelled")); });
+  await expect(runInference("generate", parse("--prompt", "hi", "--kv-quant", "config"), cancelled.dependencies, abort.signal)).rejects.toThrow("cancelled");
+  expect({ routes: cancelled.routes, seen: cancelled.seen }).toEqual({ routes: ["0"], seen: seams("load", "engine", "run", "close") });
+  // Two commands interleave inside their runs; each composed its own route.
+  let release!: () => void;
+  const both = new Promise<void>(resolve => { release = resolve; });
+  let waiting = 0;
+  const barrier = async () => { if (++waiting === 2) release(); await both; };
+  const fused = routeSeams(barrier), unfused = routeSeams(barrier);
+  await Promise.all([runInference("generate", parse("--prompt", "hi", "--kv-quant", "config"), fused.dependencies),
+    runInference("generate", parse("--prompt", "hi", "--kv-quant", "4"), unfused.dependencies)]);
+  expect([fused.routes, unfused.routes]).toEqual([["0"], ["1"]]);
+  expect([fused.seen, unfused.seen]).toEqual([seams("load", "engine", "run", "close"), seams("load", "engine", "run", "close")]);
 });
 
 for (const json of [false, true]) test(`embeddings accept stdin lines without a chat template and preserve output format (${json})`, async () => {
@@ -249,7 +258,7 @@ test("missing templates remain a server error while optional one-shot loading re
   expect(() => requireChatTemplate(run.context)).toThrow("has no chat template");
   // Serving refuses at the template's consumers, so a supplied prompt builder can serve without one;
   // the stable-boundary probe refuses outside its best-effort fallback.
-  const prep = createRequestPrep({ ctx: run.context, serverOptions: {}, kvScheme: {}, defaultGeneratedTokens: undefined });
+  const prep = createRequestPrep({ ctx: run.context, serverOptions: {}, defaultGeneratedTokens: undefined });
   const request = { messages: [{ role: "user" as const, content: "hi" }] };
   expect(() => prep.promptIdsFor(request, null)).toThrow("has no chat template");
   expect(() => prep.stableLenFor(request, null, [1, 2, 3])).toThrow("has no chat template");
@@ -294,17 +303,20 @@ test("production CLI composition requests optional templates and a continuous en
     import { mock } from "bun:test";
     import { strict as assert } from "node:assert";
     const app = ${JSON.stringify(app)};
-    let loaded = 0, opened = 0, closed = 0, output = "";
+    let loaded = 0, opened = 0, closed = 0, installs = 0, output = "";
     const context = { modelId: "test", model: { config: {} }, template: null, kvConfig: null,
       tokenizer: { encode: (text, special) => { assert.equal(text, "hello"); assert.equal(special, true); return [1]; },
         decode: (ids, special) => { assert.deepEqual(ids, [2]); assert.equal(special, true); return "answer"; } } };
+    // The Neural Engine startup step runs before every model load.
+    mock.module(app + "src/cli/ane-install.ts", () => ({ ensureAneInstall: async () => { installs++; assert.equal(installs, loaded + 1); } }));
     mock.module(app + "src/engine/model-host.ts", () => ({ loadContext: async (path, id, options) => {
       loaded++; assert.equal(path, "/unused"); assert.equal(id, "test");
-      assert.deepEqual(options, { requireChatTemplate: false, runtime: { nativeDraft: false, maxGenerationTokens: loaded === 1 ? 256 : undefined } });
+      assert.deepEqual(options, { requireChatTemplate: false, runtime: { nativeDraft: false, maxGenerationTokens: loaded === 1 ? 256 : undefined },
+        kv: loaded === 1 ? { override: "off", fusedSdpa: false } : { override: "off" }, adapters: false, maxRows: 1 });
       return context;
     } }));
     mock.module(app + "src/engine/index.ts", () => ({ createAppEngine: async (supplied, options) => {
-      opened++; assert.equal(supplied, context); assert.equal(options.capacity, 1); assert.equal(options.gateway.kvScheme.kind, "bf16");
+      opened++; assert.equal(supplied, context); assert.equal(options.capacity, 1); assert.equal(options.gateway, undefined);
       return { context, binding: { embed: (texts) => { assert.deepEqual(texts, ["alpha", "beta"]); return texts.map(text => ({ vector: Float32Array.from([text.length]), tokens: text.length })); } }, gateway: { runExclusive: async work => work() }, completion: {
         place: shape => ({ shape, mechanism: "continuous" }),
         run: async (ids, options, token, vision, shape, placement) => { assert.deepEqual(ids, [1]); assert.equal(placement.mechanism, "continuous"); await token(2); },
@@ -317,7 +329,7 @@ test("production CLI composition requests optional templates and a continuous en
     await runInference("embed", { positionals: [], values: {} }, {
       resolve: async () => ({ path: "/unused", repoId: "test" }), write: text => { output += text; },
     });
-    assert.equal(output, "answer\\n[5]\\n[4]\\n"); assert.equal(loaded, 2); assert.equal(opened, 2); assert.equal(closed, 2);
+    assert.equal(output, "answer\\n[5]\\n[4]\\n"); assert.equal(loaded, 2); assert.equal(opened, 2); assert.equal(closed, 2); assert.equal(installs, 2);
   `;
   const child = Bun.spawn([process.execPath, "--eval", script], { stdin: "pipe", stdout: "pipe", stderr: "pipe",
     env: { ...process.env, MLX_BUN_LIBMLXC: "/nonexistent" } });
@@ -374,8 +386,8 @@ test("generate --adapter mounts the directory under its name before the request 
 test("--quantized-kv-start feeds the KV scheme's start; without it affine KV starts at token 0", async () => {
   const started = harness();
   await runInference("generate", parse("--prompt", "hi", "--kv-quant", "4", "--quantized-kv-start", "5000"), started.dependencies);
-  expect(started.schemes).toEqual([{ kvBits: 4, quantizedKvStart: 5000 }]);
+  expect(started.schemes).toEqual([{ kind: "affine", bits: 4, groupSize: 64, quantizedKvStart: 5000, kernels: "unfused" }]);
   const immediate = harness();
   await runInference("generate", parse("--prompt", "hi", "--kv-quant", "4"), immediate.dependencies);
-  expect(immediate.schemes).toEqual([{ kvBits: 4, quantizedKvStart: 0 }]);
+  expect(immediate.schemes).toEqual([{ kind: "affine", bits: 4, groupSize: 64, kernels: "unfused" }]);
 });

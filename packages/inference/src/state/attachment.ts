@@ -33,8 +33,9 @@ export function captureCacheAttachment(schema: string, caches: readonly Cache[],
             push(length === null ? array : liveSlice(array, length), length !== null);
         },
       };
-      const entry = codecs.forCache(cache).snapshot(cache, context);
-      if (cache.minimumReusableOffset !== undefined) entry.minimumReusableOffset = cache.minimumReusableOffset;
+      const stored = cache.composed ? cache.composed.storage() : cache;
+      const entry = codecs.forCache(stored).snapshot(stored, context);
+      if (stored.minimumReusableOffset !== undefined) entry.minimumReusableOffset = stored.minimumReusableOffset;
       headers.push(entry);
     }
     return { schema, metadata: { ...metadata, cacheCodecs: codecs.id, cacheHeaders: JSON.stringify(headers) }, tensors };
@@ -54,7 +55,7 @@ export function restoreCacheAttachment(attachment: CheckpointAttachment, makeCac
   try {
     for (const [index, entry] of headers.entries()) {
       if (!entry) continue;
-      const cache = codecs.forHeader(entry).load(entry, { path: attachment.schema, arr, grownArr: arr,
+      const cache = codecs.forHeader(entry).load(entry, { path: attachment.schema, prototype: caches[index]!, arr, grownArr: arr,
         triple: (slots, at) => ({ packed: arr(slots[at]!), scales: arr(slots[at + 1]!), biases: arr(slots[at + 2]!) }),
       });
       pending.length = 0;

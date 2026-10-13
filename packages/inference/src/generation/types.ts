@@ -8,7 +8,6 @@
 // - sampling stays on-device; only the chosen token id crosses to JS
 
 import { MlxArray } from "@mlx-bun/mlx/array";
-import type { KvQuantSpec,TurboQuantScheme } from "../artifacts/config";
 import { type Cache } from "../contracts/mlx/cache";
 import type { TokenLogprobs } from "../contracts/portable/generation";
 import type { PromptResponseTrace } from "../runtime/trace";
@@ -86,34 +85,6 @@ export interface GenerateOptions extends SamplerOptions, LogitsProcessorOptions 
    *  When unset, zeroing falls back to imageMask (the legacy vision shape).
    *  Caller keeps ownership. */
   multimodalMask?: MlxArray;
-  /** Quantize full-attention KV caches to this many bits (4 or 8).
-   *  Full-attention and rotating caches both convert when populated. */
-  kvBits?: number;
-  kvGroupSize?: number;
-  /** Per-layer mixed-precision KV from kv_config.json (config.kvQuant).
-   *  Overrides kvBits, like optiq serve's --kv-config. layerIdx indexes
-   *  the cache list (== layer index for the donor prefix), including
-   *  rotating/sliding caches. */
-  kvConfig?: KvQuantSpec[];
-  /** Convert once a cache's offset reaches this (uniform-kvBits default
-   *  5000 = mlx-lm; kvConfig default 0 = optiq serve). */
-  quantizedKvStart?: number;
-  /** TurboQuant scheme (`02d723a:docs/design/turboquant.md`): rotation-based KV
-   *  quantization, a CLI-only runtime lever in the same class as uniform
-   *  kvBits (mutually exclusive with kvBits/kvConfig — maybeQuantizeKv
-   *  checks turboQuant first, so set at most one). Full-attention
-   *  KVCache layers convert via TurboQuantKVCache.fromKVCache;
-   *  RotatingKVCache (sliding-window) layers stay bf16 in v1 — a one-time
-   *  warning names the limitation, never a throw. */
-  turboQuant?: TurboQuantScheme;
-  /** OPTIONAL paged KV storage (`02d723a:docs/design/kv-cache.md`): fresh
-   *  full-attention KVCache layers are replaced with PagedKVCache (block
-   *  pool + gather-to-contiguous) before prefill. Scope: B1/B>1
-   *  Gemma4-family, bf16 — mutually exclusive with kvBits/kvConfig/
-   *  turboQuant/draft/compiled decode (callers refuse the combos; the
-   *  cache swap itself only ever touches plain empty KVCache entries).
-   *  Values are gated bit-exact vs the plain path (tests/paged-kv*). */
-  pagedKv?: { blockSize?: number };
   /** Mounted LoRA adapter ids to apply (resolved/validated by
    *  AdapterManager.resolveSpec). Residuals sum in order. Set on the
    *  model's LoraState for exactly the duration of this generation —
@@ -150,7 +121,7 @@ export interface GenerateOptions extends SamplerOptions, LogitsProcessorOptions 
    *  or rolled back, and no comparison is made against what the model would
    *  have produced. Injection bypasses the sampler, which is a documented
    *  behavior-policy deviation at temperature > 0 — hence opt-in
-   *  (MLX_BUN_FILL=strict) and the composition refusals in shouldUseFill.
+   *  (MLX_BUN_FILL=strict) and the request refusals in shouldUseFill.
    *  Serial lane only: the batch scheduler and the spec loop never read it. */
   fill?: FillSession;
 }
@@ -185,8 +156,8 @@ export interface GenerateStats {
      *  relies on, so the sum is not production round time). */
     phaseMs?: SpecPhaseMs;
   };
-  /** Token fast-forwarding telemetry (serial lane, MLX_BUN_FILL=strict).
-   *  Present only when a fill table was actually armed for this generation. */
+  /** Token fast-forwarding telemetry (MLX_BUN_FILL=strict). Present only when
+   *  a fill table was actually armed for this generation. */
   fill?: FillStats;
 }
 

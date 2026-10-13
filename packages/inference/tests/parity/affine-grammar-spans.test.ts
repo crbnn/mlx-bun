@@ -1,11 +1,12 @@
 // Opt in with MLX_BUN_TEST_AFFINE_SPANS_MODEL=/cached/checkpoint. No downloads.
 // Committed grammar spans over delayed affine KV on real weights: the span
-// method the gateway binds, in a batch group, against this tree's direct
-// jump-forward generation at B1, below and across the transition, and beside
-// an interleaved peer. A graph that reads plain KV refuses the crossing row
-// before the forward direct generation fails in; a graph that reads encoded KV
-// continues over converted layers. The model must be one whose gateway admits
-// the jump over affine KV.
+// method in a batch group, against this tree's direct jump-forward generation
+// at B1, below and across the transition, and beside an interleaved peer. Every
+// graph continues over converted layers: one that reads dense KV (Gemma 2's
+// softcapped read) reads them dequantized, one that reads encoded KV through
+// its affine kernels. The gateway binds spans as the grammar jump of a graph whose verifier
+// does not qualify grammar proposals; on any other graph it verifies proposals,
+// over every cache lego, and the span method is bound directly.
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -35,54 +36,70 @@ function spanGrammar(spans: readonly (readonly number[])[]) {
 }
 
 test.skipIf(!target)("real-weight committed spans over delayed affine KV equal direct generation below and across the transition, and beside a peer", async () => {
-  const { Weights, loadModelConfig, createModel, generateAutoregressive } = await import("../../src/index");
-  const { bindMlxGateway, createRuntimeConfig, withRuntimeConfig } = await import("../../src/execution");
+  const { Weights, loadModelConfig, createModel, generateAutoregressive, resolveComposition } = await import("../../src/index");
+  const { bindMlxGateway } = await import("../../src/execution");
+  const { bindGrammarGroupRequests } = await import("../../src/execution/grammar-group");
   const { bindMlxAutoregressiveGraph } = await import("../../src/generation/bindings/autoregressive");
   const { resolveKvScheme } = await import("../../src/state/kv-scheme");
+  const { observedPhases } = await import("../models/phase-forward");
   const weights = await Weights.open(target!);
   try {
-    const model = createModel(weights, await loadModelConfig(target!));
-    const dense = model.requiredDenseKvLayers.length > 0;
+    const config = await loadModelConfig(target!);
     type Projection = { shape: number[]; dtype: string; sha256: string };
     let lane: Projection[] | null = null, kinds: string[][] = [];
-    const project = model.logitsFromHidden.bind(model), forward = model.forwardHidden.bind(model);
-    model.logitsFromHidden = (hidden: MlxArray) => {
-      const logits = project(hidden);
-      lane?.push({ shape: [...logits.shape], dtype: logits.dtypeName, sha256: createHash("sha256").update(logits.rawBytes()).digest("hex") });
-      return logits;
+    // One graph per conversion start, composed with that scheme: the
+    // tiled-causal affine reads (`fusedSdpa`: OptiQ's wrapper rule).
+    const affine = (start: number) => resolveKvScheme({ override: 4, quantizedKvStart: start, fusedSdpa: true });
+    type Scheme = ReturnType<typeof affine>;
+    const graphs = new Map<number, { model: ReturnType<typeof createModel>; binding: ReturnType<typeof bindMlxGateway> }>();
+    const graphFor = (scheme: Scheme) => {
+      const start = scheme.options.quantizedKvStart ?? 0;
+      const existing = graphs.get(start);
+      if (existing) return existing;
+      // The scheduler binds to a view whose phases report each forward's cache storage and each head's logits.
+      const model = observedPhases(createModel(weights, config, resolveComposition(config,
+        { kv: { override: 4, quantizedKvStart: start, fusedSdpa: true }, grammarJump: true })), {
+        forward(_ids, caches) { kinds.push(caches.map(cache => (cache.composed?.storage() ?? cache).constructor.name)); },
+        head(_hidden, logits) {
+          lane?.push({ shape: [...logits.shape], dtype: logits.dtypeName, sha256: createHash("sha256").update(logits.rawBytes()).digest("hex") });
+        },
+      });
+      const graph = { model, binding: bindMlxGateway(model) };
+      graphs.set(start, graph);
+      return graph;
     };
-    (model as { forwardHidden: typeof forward }).forwardHidden = (ids, caches) => {
-      kinds.push(caches.map(cache => cache.constructor.name));
-      return forward(ids, caches as never);
-    };
-    const binding = withRuntimeConfig(createRuntimeConfig({ MLX_BUN_GRAMMAR_JUMP: "1" }), () => bindMlxGateway(model));
-    const affine = (start: number) => resolveKvScheme({ override: 4, quantizedKvStart: start });
+    // A graph that reads dense KV (the softcapped read) verifies ordinary rounds only: its grammar jump is the span method.
+    const dense = (graphFor(affine(64)).model as { encodedKvAttention?: boolean }).encodedKvAttention === false;
     const chunk = 64;
-    const options = (scheme: ReturnType<typeof affine>, maxTokens: number, grammar: GrammarController): GenerateOptions =>
-      ({ temperature: 0, maxTokens, eosTokenIds: [], prefillChunkSize: chunk, ...scheme.generationOptions, grammar });
+    const options = (maxTokens: number, grammar: GrammarController): GenerateOptions =>
+      ({ temperature: 0, maxTokens, eosTokenIds: [], prefillChunkSize: chunk, grammar });
 
-    const direct = async (prompt: number[], maxTokens: number, scheme: ReturnType<typeof affine>, spans: number[][]) => {
+    const direct = async (prompt: number[], maxTokens: number, scheme: Scheme, spans: number[][]) => {
       const grammar = spanGrammar(spans), tokens: number[] = [], seen: Projection[] = [];
       let outcome = "length";
       lane = seen; kinds = [];
       try {
-        const generation = generateAutoregressive(bindMlxAutoregressiveGraph(model), prompt,
-          { ...options(scheme, maxTokens, grammar), decodePolicy: { compiledDecode: false, grammarJump: true } });
+        const generation = generateAutoregressive(bindMlxAutoregressiveGraph(graphFor(scheme).model), prompt,
+          { ...options(maxTokens, grammar), decodePolicy: { compiledDecode: false, grammarJump: true } });
         for await (const { token } of generation) tokens.push(token);
       } catch (error) { outcome = (error as Error).name; } finally { lane = null; }
       return { tokens, accepted: grammar.accepted, seen, outcome, kinds };
     };
-    const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false, kvQuant: true,
-      turboQuant: false, hasLogitsExtras: false, hasGrammar: true, wantsLogprobs: false, hasDraft: false };
-    const grouped = (scheme: ReturnType<typeof affine>) => {
-      const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: chunk, kvScheme: scheme,
-        runtime: createRuntimeConfig({ MLX_BUN_PREFILL_TAIL_SPLIT: "1" }) });
+    const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
+      hasLogitsExtras: false, hasGrammar: true, wantsLogprobs: false, hasDraft: false };
+    const grouped = (scheme: Scheme) => {
+      const { model, binding } = graphFor(scheme);
+      const group = binding.createBatchGroup({ maxBatch: 2, prefillChunkSize: chunk });
+      // The committed-span method, bound as the gateway binds it for a graph whose verifier does not
+      // qualify grammar proposals; on any other graph the gateway verifies proposals over every cache
+      // lego, and the span method is checked here bound directly.
+      const spanMethod = bindGrammarGroupRequests(model);
       const submit = async (prompt: number[], maxTokens: number, spans: number[][], onToken?: () => void) => {
-        const grammar = spanGrammar(spans), tokens: number[] = [], request = options(scheme, maxTokens, grammar);
-        const execution = binding.plan(shape, request, { continuous: true, quantizedBatch: binding.kvBatchable(scheme), checkpoints: false });
-        expect(execution).toMatchObject({ method: "autoregressive", mechanism: "continuous", grammarJump: true });
+        const grammar = spanGrammar(spans), tokens: number[] = [], request = options(maxTokens, grammar);
+        const execution = binding.plan(shape, request, { checkpoints: false });
+        expect(execution).toMatchObject({ method: dense ? "autoregressive" : "speculative", mechanism: "continuous", grammarJump: true });
         const outcome = await group.submit({ promptIds: prompt, maxTokens, eosTokenIds: [], grammar,
-          method: binding.methodRequest!(execution, request)!,
+          method: dense ? binding.methodRequest!(execution, request)! : spanMethod(request),
           onToken(token: number) { tokens.push(token); onToken?.(); return undefined; } })
           .then(stats => stats.finishReason as string, (error: Error) => error.name);
         return { tokens, accepted: grammar.accepted, outcome };
@@ -91,9 +108,6 @@ test.skipIf(!target)("real-weight committed spans over delayed affine KV equal d
     };
     const A = [2, 651, 6037, 576, 6081, 603, 1000, 1200], B = [2, 651, 6037];
     const spansA = [[3000, 3001], [3002]], spansB = [[3003], [3004, 3005]];
-    // Direct generation fails in the forward that reads a converted layer on a
-    // plain-read graph; the span method refuses before that forward.
-    const refused = dense ? "DenseKvReadError" : "length";
 
     // Below the transition.
     const below = await direct(A, 9, affine(64), spansA);
@@ -111,7 +125,7 @@ test.skipIf(!target)("real-weight committed spans over delayed affine KV equal d
     // Across the transition: A converts three tokens into decode, after its span.
     const start = A.length + 3;
     const across = await direct(A, 10, affine(start), [[3000, 3001]]);
-    expect(across.outcome).toBe(dense ? "Error" : "length");
+    expect(across.outcome).toBe("length");
     expect(across.kinds.at(-1)!.some(kind => kind.includes("Quantized"))).toBe(true);
     const peer = await direct(B, 7, affine(start), spansB);
     expect(peer.outcome).toBe("length");
@@ -119,7 +133,7 @@ test.skipIf(!target)("real-weight committed spans over delayed affine KV equal d
       const env = grouped(affine(start)), seen: Projection[] = [];
       lane = seen;
       try {
-        expect(await env.submit(A, 10, [[3000, 3001]])).toEqual({ tokens: across.tokens, accepted: across.accepted, outcome: refused });
+        expect(await env.submit(A, 10, [[3000, 3001]])).toEqual({ tokens: across.tokens, accepted: across.accepted, outcome: "length" });
         expect(seen).toEqual(across.seen);
         lane = null;
         // Beside an interleaved peer, each row equals its solo direct run; the group serves again.
@@ -127,7 +141,7 @@ test.skipIf(!target)("real-weight committed spans over delayed affine KV equal d
         const watch = () => { overlap = Math.max(overlap, env.group.activeRows); };
         const [a, b] = await Promise.all([env.submit(A, 10, [[3000, 3001]], watch), env.submit(B, 7, spansB, watch)]);
         expect(overlap).toBe(2);
-        expect(a).toEqual({ tokens: across.tokens, accepted: across.accepted, outcome: refused });
+        expect(a).toEqual({ tokens: across.tokens, accepted: across.accepted, outcome: "length" });
         expect(b).toEqual({ tokens: peer.tokens, accepted: peer.accepted, outcome: "length" });
         expect(await env.submit(B, 7, spansB)).toEqual({ tokens: peer.tokens, accepted: peer.accepted, outcome: "length" });
       } finally { lane = null; await env.close(); }

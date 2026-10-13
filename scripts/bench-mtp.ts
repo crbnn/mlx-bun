@@ -18,6 +18,11 @@ Plan (local artifacts only; first variant is the baseline):
  "variants":[{"id":"mtp2","depth":2},{"id":"mtp4","depth":4},{"id":"mtp8","depth":8}],
  "maxTokens":192,"warmupTokens":32,"repetitions":4}
 
+A variant at depth 0 loads no drafter and runs plain greedy decode on the same
+lane, one step per token (no diagnostic run): a graph's verifyRoundCosts are
+each fixed depth's mean step time over this one, the DFlash 2 drafter at
+depths 1..7 against {"id":"plain","depth":0} in one plan.
+
 Each repetition runs every variant in a fresh process; odd repetitions reverse
 the order (two arms give ABBA). Each process warms every prompt at its depth.
 Throughput runs precede separate diagnostic runs (--throughput-only skips them). Diagnostics force state
@@ -52,27 +57,53 @@ async function worker(plan: MtpPlan, variantIndex: number, mode: MtpSample["mode
   checkTraining();
   const v = plan.variants[variantIndex]!;
   // Imports happen only after the parent has set the arm's environment.
-  const { loadModelConfig, loadTokenizer, ChatTemplate, Weights, createModel } = await import("@mlx-bun/inference");
+  const { loadModelConfig, loadTokenizer, ChatTemplate, Weights, createModel, resolveComposition } = await import("@mlx-bun/inference");
+  const { KvScheme } = await import("@mlx-bun/inference/state");
   const { QwenMtpProvider, Dflash2Provider, detectDraftKind } = await import("@mlx-bun/inference/generation/speculative");
   const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
   const { resetPeakMemory, peakMemory, clearCache, synchronize, deviceArchitecture, MLX_VERSION } = await import("@mlx-bun/mlx/ffi");
   const { gpuStream } = await import("@mlx-bun/mlx/array");
+  const ops = await import("@mlx-bun/mlx/ops");
   const weights = await Weights.open(plan.target);
-  const model = createModel(weights, await loadModelConfig(plan.target));
+  // The plan's KV scheme is the graph's composition (a uniform width, a 5000-token start unless the plan names one,
+  // read with the tiled-causal set this screen read before the composition carried it).
+  const config = await loadModelConfig(plan.target);
+  const model = createModel(weights, config, { ...resolveComposition(config),
+    ...(plan.kv ? { kv: new KvScheme("affine-uniform", { ...plan.kv }, "tiled-causal").storage } : {}) });
   const draftDir = v.draft ?? plan.draft;
-  const provider = await detectDraftKind(draftDir) === "dflash2"
-    ? await Dflash2Provider.load(draftDir) : await QwenMtpProvider.load(draftDir);
+  // Depth 0 loads no drafter: plain greedy decode, the step verify round costs are relative to.
+  const provider = v.depth === 0 ? null : await detectDraftKind(draftDir) === "dflash2"
+    ? await Dflash2Provider.load(draftDir, { bits: 4 }) : await QwenMtpProvider.load(draftDir);
   const tokenizer = await loadTokenizer(plan.target), template = await ChatTemplate.load(plan.target);
   const prompts = plan.prompts.map(text => {
     const ids = tokenizer.encode(template.render([{ role: "user", content: text }], { enableThinking: plan.thinking ?? false }));
     return ids[0] === ids[1] && ids[0] === tokenizer.bosTokenId ? ids.slice(1) : ids;
   });
-  const binding = bindMlxGateway(model, { provider, numDraftTokens: v.depth, adaptiveDepth: v.adaptiveDepth ?? false });
-  const run = async (prompt: number, maxTokens: number): Promise<MtpSample> => {
-    const options = { ...(plan.sampling ?? { temperature: 0 }), ...(plan.kv ?? {}), maxTokens };
+  const binding = provider ? bindMlxGateway(model, { provider, numDraftTokens: v.depth, adaptiveDepth: v.adaptiveDepth ?? false })
+    : bindMlxGateway(model);
+  /** Plain greedy decode on the same lane at one row. A step is the interval between consecutive tokens (the first
+   *  comes from prefill), read in the token callback, which adds no barrier. */
+  const plain = async (prompt: number, maxTokens: number): Promise<MtpSample> => {
+    const tokens: number[] = [], stamps: number[] = [];
+    synchronize(gpuStream); resetPeakMemory();
+    const start = performance.now(), group = binding.createBatchGroup({ maxBatch: 1 });
+    try {
+      const stats = await group.submit({ promptIds: prompts[prompt]!, maxTokens, eosTokenIds: [], plainGreedy: true,
+        sample: logits => ops.argmaxAxis(logits, -1), onToken(token) { tokens.push(token); stamps.push(performance.now()); } });
+      await group.close();
+      synchronize(gpuStream);
+      assert(tokens.length === maxTokens, `short output: ${tokens.length}/${maxTokens}`);
+      const steps = stamps.slice(1).map((at, i) => ({ ms: at - stamps[i]!, emitted: 1 }));
+      return { variant: v.id, mode, repetition, prompt, tokens, steps, spec: { drafted: 0, accepted: 0, rounds: steps.length },
+        promptTokens: prompts[prompt]!.length, requestMs: performance.now() - start,
+        prefillMs: stats.prefillMs, decodeMs: stats.decodeMs, peakBytes: peakMemory() };
+    } finally { await group.close(); clearCache(); }
+  };
+  const drafted = async (prompt: number, maxTokens: number): Promise<MtpSample> => {
+    const options = { ...(plan.sampling ?? { temperature: 0 }), maxTokens };
     const execution = binding.plan({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: !!plan.sampling,
-      kvQuant: !!plan.kv, turboQuant: false, hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true },
-      options, { continuous: true, quantizedBatch: false, checkpoints: false });
+      hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true },
+      options, { checkpoints: false });
     assert(execution.method === "speculative", "requested MTP did not bind");
     const request = binding.methodRequest!(execution, options)!;
     const tokens: number[] = [], steps: MtpSample["steps"] = [];
@@ -99,6 +130,7 @@ async function worker(plan: MtpPlan, variantIndex: number, mode: MtpSample["mode
         prefillMs: stats.prefillMs, decodeMs: stats.decodeMs, peakBytes: peakMemory() };
     } finally { await group.close(); clearCache(); }
   };
+  const run = provider ? drafted : plain;
   try {
     for (let p = 0; p < prompts.length; p++) await run(p, Math.max(v.depth + 1, plan.warmupTokens));
     appendFileSync(output, JSON.stringify({ kind: "runtime", variant: v.id, mode, repetition,
@@ -111,7 +143,7 @@ async function worker(plan: MtpPlan, variantIndex: number, mode: MtpSample["mode
       console.error(`${mode} ${v.id} rep=${repetition} prompt=${p}: ${mtpMetrics([sample]).emittedPerSecond.toFixed(2)} emitted tok/s`);
     }
   } finally {
-    synchronize(gpuStream); provider.dispose(); weights.dispose();
+    synchronize(gpuStream); provider?.dispose(); weights.dispose();
     for (const file of weights.shards.files.values()) file.mmap.unmap();
     clearCache();
   }
@@ -151,6 +183,7 @@ async function main() {
       for (let rep = 0; rep < plan.repetitions; rep++) {
         const order = plan.variants.map((_, i) => i); if (rep % 2) order.reverse();
         for (const index of order) {
+          if (mode === "diagnostic" && plan.variants[index]!.depth === 0) continue; // no speculative phases to time
           checkTraining();
           const child = Bun.spawn([process.execPath, "--no-env-file", import.meta.filename, "--plan", planPath,
             "--out", raw, "--worker", String(index), "--mode", mode, "--repetition", String(rep)], {

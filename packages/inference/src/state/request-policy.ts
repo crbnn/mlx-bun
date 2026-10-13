@@ -1,58 +1,48 @@
-import { namespacedCache } from "./namespaced-cache";
-import { runtimeConfig, runtimeFlag, withRuntimeConfig, type RuntimeConfig } from "../runtime/config";
-import type { KvSchemeOptions } from "./kv-scheme";
-
-export interface PagedRequestOptions extends KvSchemeOptions { pagedKv?: { blockSize?: number } }
-export interface CacheFactory { makeCache(): Cache[] }
-
-import { KVCache } from "./kv";
+import type { KvStorageScheme, PagedKvComposition } from "../contracts/portable/composition";
 import { type Cache } from "../contracts/mlx/cache";
-import { PagedKVCache } from "./paged/cache";
-import type { MlxPrefixCache as RowPromptCache } from "./checkpoint";
-import { disposeResources } from "../runtime/resources";
+import { PagedKVCache, type PagedQuantization, type PagedTurboQuant } from "./paged/cache";
+import type { KVCache } from "./kv";
+import { turboQuantFusedDecode } from "./turboquant-codec";
+import { composedStorageOf, isPlainKvCache } from "./capabilities";
 
-/** Request state construction and reusable-prefix policy. Equal keys declare
- * compatible state layouts; the executor need not inspect their settings. */
-export interface MlxRequestStatePolicy {
-  readonly key: string;
-  readonly promptCache?: RowPromptCache;
-  create(): Cache[];
+/** The affine pages the composition's KV scheme `kv` names for the layer at
+ * cache index `layer`: every layer of a uniform scheme, the listed layers of a
+ * per-layer one; none (bf16 or TurboQuant pages) otherwise. */
+function pageQuantization(kv: KvStorageScheme, layer: number): PagedQuantization | undefined {
+  if (kv.kind === "affine") return { bits: kv.bits, groupSize: kv.groupSize };
+  if (kv.kind !== "affine-layers") return undefined;
+  const entry = kv.layers.find(item => item.layer === layer);
+  return entry ? { bits: entry.bits, groupSize: entry.groupSize } : undefined;
 }
 
-/** Replace fresh full-attention storage before prefill. Sliding layers retain
- * their layout; pre-warmed library caches retain their existing storage. */
-export function maybePageKv(
-  cache: Cache[], options: PagedRequestOptions, capacityTokens: number,
-): void {
-  if (!options.pagedKv) return;
+/** Replace fresh full-attention storage before prefill with pages storing what
+ * the composition's scheme `kv` names for each layer (bf16, affine at the
+ * layer's width, TurboQuant read with the layer's composed read), sized for
+ * `capacityTokens` (the pool grows past it). Pages store their format from the
+ * first position. Sliding layers retain their layout; pre-warmed caches retain
+ * their existing storage. Nothing changes without paging. */
+export function maybePageKv(cache: Cache[], kv: KvStorageScheme, paged: PagedKvComposition | null, capacityTokens: number): void {
+  if (!paged) return;
   if (cache.some((c) => c.offset > 0)) return;
-  const blockSize = options.pagedKv.blockSize ?? PagedKVCache.DEFAULT_BLOCK_SIZE;
   for (let i = 0; i < cache.length; i++) {
-    if (cache[i] instanceof KVCache) {
-      cache[i]!.dispose(); // fresh (offset 0) — nothing stored yet
-      cache[i] = new PagedKVCache(capacityTokens, blockSize, undefined,
-        options.kvBits === 4 || options.kvBits === 8 ? { bits: options.kvBits, groupSize: options.kvGroupSize ?? 64 } : undefined);
-    }
+    const storage = composedStorageOf(cache[i]!);
+    if (!isPlainKvCache(storage)) continue;
+    const turbo: PagedTurboQuant | undefined = kv.kind === "turbo" ? Object.freeze({ kBits: kv.kBits, vBits: kv.vBits,
+      fusedDecode: turboQuantFusedDecode(), kernels: (storage as KVCache).turboQuantKernels }) : undefined;
+    cache[i]!.dispose(); // fresh (offset 0) — nothing stored yet
+    cache[i] = new PagedKVCache(capacityTokens, paged.blockSize, paged.direct, pageQuantization(kv, i), undefined, turbo);
   }
 }
 
-export function pagedPrefixNamespace(options: PagedRequestOptions, base: string,
-  direct = runtimeFlag("MLX_BUN_PAGED_ATTN", false)): string {
-  return JSON.stringify(["paged-v1", options.pagedKv?.blockSize ?? PagedKVCache.DEFAULT_BLOCK_SIZE,
-    options.kvBits ?? 0, options.kvGroupSize ?? 64, direct, base]);
-}
-
-export function bindPagedRequestState(model: CacheFactory, options: PagedRequestOptions,
-  capacityTokens: number, cache?: RowPromptCache, runtime: RuntimeConfig = runtimeConfig()): MlxRequestStatePolicy | undefined {
-  if (!options.pagedKv) return undefined;
-  const blockSize = options.pagedKv.blockSize ?? PagedKVCache.DEFAULT_BLOCK_SIZE;
-  const stateOptions = { pagedKv: { blockSize }, kvBits: options.kvBits, kvGroupSize: options.kvGroupSize };
-  const direct = runtime.flag("MLX_BUN_PAGED_ATTN", false);
-  const namespace = (base: string) => pagedPrefixNamespace(stateOptions, base, direct);
-  return { key: namespace(""),
-    promptCache: cache ? namespacedCache(cache, namespace) : undefined, create: () => withRuntimeConfig(runtime, () => {
-    const caches = model.makeCache();
-    try { maybePageKv(caches, stateOptions, capacityTokens); return caches; }
-    catch (error) { disposeResources(caches); throw error; }
-  }) };
+/** The prefix namespace of paged state over a method's namespace `base`: the
+ * block size, what the pages store and their read (bf16 and uniform affine
+ * pages keep the namespace they had before per-layer and TurboQuant pages
+ * existed). */
+export function pagedPrefixNamespace(kv: KvStorageScheme, paged: PagedKvComposition, base: string): string {
+  const direct = paged.direct;
+  if (kv.kind === "affine-layers")
+    return JSON.stringify(["paged-v1", paged.blockSize, "layers", kv.layers.map(entry => [entry.layer, entry.bits, entry.groupSize]), direct, base]);
+  if (kv.kind === "turbo") return JSON.stringify(["paged-v1", paged.blockSize, "turbo", kv.kBits, kv.vBits, direct, base]);
+  const pages = pageQuantization(kv, 0);
+  return JSON.stringify(["paged-v1", paged.blockSize, pages?.bits ?? 0, pages?.groupSize ?? 64, direct, base]);
 }

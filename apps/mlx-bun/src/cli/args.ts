@@ -46,8 +46,9 @@ const commands = {
     "ngram-max": { type: "string", description: "Prompt-lookup longest k-gram, integer >= 1 (ngram only) [default: 3]" },
     "ngram-min": { type: "string", description: "Prompt-lookup shortest k-gram, integer >= 1 (ngram only) [default: 1]" },
     mtp: { type: "string", description: "Checkpoint-native multi-token-prediction draft head: on | off [default: on]; models without one ignore it" },
-    "paged-kv": { type: "boolean", description: "Paged KV cache for graphs that declare paged attention (env mirror MLX_BUN_PAGED_KV=1); other graphs answer the typed capability error" },
+    "paged-kv": { type: "boolean", description: "Paged KV cache, composed when the model loads (env mirror MLX_BUN_PAGED_KV=1): every request keeps its full-attention keys and values in fixed blocks, stored as --kv-quant names for each layer" },
     "paged-kv-block-size": { type: "string", description: "Tokens per KV block with --paged-kv, integer >= 1 [default: 256]" },
+    "paged-kv-direct": { type: "boolean", description: "With --paged-kv, read at most eight queries (decode, short prefill and verification windows) with the direct Metal kernel over the blocks (Lab numerics) instead of gathered blocks through the fused SDPA; TurboQuant pages and affine widths that straddle a 32-bit word read gathered" },
     adapter: { type: "string", description: "Mount a LoRA adapter directory at startup as the default for requests without an adapter field" },
     "adapter-path": { type: "string", description: "Alias for --adapter (mlx_lm spelling)" },
     "whisper-model": { type: "string", description: "Whisper checkpoint (path or cached query) for /v1/audio/* beside the chat model [default: the first downloaded whisper model, resolved on the first request]; serving a Whisper checkpoint ALONE starts a transcription-only server" },
@@ -98,7 +99,11 @@ const commands = {
     "batch-size": { type: "string", description: "Rows per forward [default: 8]" },
     seed: { type: "string", description: "Sample-shuffle seed [default: 123]" },
   } },
-
+  "compile-ane": { description: "Compile the Neural Engine programs this Mac's models use that the system cache lacks (the install step)", positional: "",
+    details: "Checks every Neural Engine program the models mlx-bun ships load on this Mac against the system's compile\ncache, compiles the ones it lacks, then exits. The installer runs it, and the app runs it quietly before\nevery model load, so a program the system removed from its cache is compiled again first. Loading a model\nonly loads its programs from the cache (about 4 ms each) and never compiles: a model whose program is\nmissing fails to load and names this command. The cache belongs to the executable that compiled it, so run\nthe same mlx-bun that serves. Programs are built for the prefill chunk size (MLX_BUN_RD_PREFILL_CHUNK), so\nrun it in the environment you serve in.", options: {
+    check: { type: "boolean", description: "List each program and whether the compile cache holds it; compile nothing (exit 1 when one is missing)" },
+    quiet: { type: "boolean", description: "Print only the programs it compiles (nothing when every program is cached)" },
+  } },
 } satisfies Record<string, { description: string; positional: string; usage?: string; details?: string; options: Record<string, { type: "string" | "boolean"; description: string; short?: string }> }>;
 export type Command = keyof typeof commands;
 export type CommandArgs = { values: Record<string, string | boolean | undefined>; positionals: string[] };
@@ -170,5 +175,5 @@ export function help(command?: string): string {
   if (!isCommand(command)) throw new Error(`Unknown command: ${command}`);
   const info = commands[command];
   const details = (info as { details?: string }).details;
-  return `mlx-bun ${command} — ${info.description}\n\nUsage: mlx-bun ${command} ${info.positional} [options]\n${details ? `\n${details}\n` : ""}\nOptions:\n${Object.entries(info.options).map(([name, option]: [string, { type: string; description: string; short?: string }]) => `  ${((option.short ? `-${option.short}, ` : "") + `--${name}` + (option.type === "string" ? " <value>" : "")).padEnd(24)} ${option.description}`).join("\n")}\n  -h, --help               Show help`;
+  return `mlx-bun ${command} — ${info.description}\n\nUsage: mlx-bun ${command}${info.positional ? ` ${info.positional}` : ""} [options]\n${details ? `\n${details}\n` : ""}\nOptions:\n${Object.entries(info.options).map(([name, option]: [string, { type: string; description: string; short?: string }]) => `  ${((option.short ? `-${option.short}, ` : "") + `--${name}` + (option.type === "string" ? " <value>" : "")).padEnd(24)} ${option.description}`).join("\n")}\n  -h, --help               Show help`;
 }

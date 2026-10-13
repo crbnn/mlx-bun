@@ -1,22 +1,29 @@
-// Model construction consumes one declared profile. Exact artifact profiles
-// outrank family profiles; dedicated/generated graphs outrank the universal
-// fallback. Request-level methods are resolved elsewhere and are never changed
-// by this module.
+// Model construction consumes one declared profile and one composition. Exact
+// artifact profiles outrank family profiles; the profile names the family's
+// implementation, and the family's graph table picks the graph for the
+// composition. Request-level methods are resolved elsewhere and are never
+// changed by this module.
 
 import { loadModelConfig, type ModelConfig } from "../artifacts/config";
 import { totalmem } from "node:os";
 import { Weights } from "../artifacts/weights";
 import { Gemma4Model } from "./gemma4/model";
 import { configFingerprint } from "../artifacts/fingerprint";
-import { Qwen38TrellisTQ, qwen38TrellisTqAccepts } from "./qwen/qwen38-27b-trellis-tq";
-import { Qwen38TrellisM4Pro, qwen38TrellisM4ProAccepts } from "./qwen/qwen38-27b-trellis-m4pro";
-import { GENERATED } from "./gemma4/generated/index";
+import { qwen35GraphFingerprint } from "./qwen/checkpoint";
+import {
+  COMPOSITION as QWEN38_TRELLIS_M4PRO_COMPOSITION, QWEN38_TRELLIS_M4PRO_GRAPH, Qwen38TrellisM4Pro,
+  anePrograms as qwen38TrellisM4ProAnePrograms,
+} from "./qwen/qwen38-27b-trellis-m4pro";
+import {
+  COMPOSITION as QWEN38_TRELLIS_M1MAX_COMPOSITION, QWEN38_TRELLIS_M1MAX_GRAPH, Qwen38TrellisM1Max,
+} from "./qwen/qwen38-27b-trellis-m1max";
+import { GENERATED_GRAPHS, type GeneratedGemma4Graph } from "./gemma4/generated/index";
 import { MiniCPM5Model } from "./minicpm5/model";
 import { Qwen35Model } from "./qwen/qwen3_5";
 import { Qwen3Model } from "./qwen/qwen3";
 import { Qwen3MoeModel } from "./qwen/qwen3-moe";
 import { DiffusionGemmaModel } from "./diffusion-gemma/model";
-import { Glm52Model } from "./glm52/model";
+import { Glm52Model, type Glm52LatentCaches } from "./glm52/model";
 import {
   GLM52_G5_DEFAULT_CONTEXT_TOKENS,
   GLM52_G5_DEFAULT_MAX_GENERATION_TOKENS,
@@ -28,8 +35,12 @@ import { UniversalDenseModel } from "./universal/dense";
 import { WhisperModel } from "./whisper/model";
 import { genericArgsFor } from "./universal/archs";
 import { familyForGraph } from "./families";
+import { resolveComposition } from "./composition";
+import type { Composition } from "../contracts/portable/composition";
 import {
+  GraphTable,
   ModelImplementationRegistry,
+  type GraphEntry,
   type ModelImplementation,
   type ModelImplementationProvider,
 } from "./implementation";
@@ -42,47 +53,63 @@ import {
 } from "./profile";
 
 export type RuntimeModel =
-  | Gemma4Model | MiniCPM5Model | Qwen35Model | Qwen3Model | Qwen3MoeModel
+  | Gemma4Model | GeneratedGemma4Graph | MiniCPM5Model | Qwen35Model | Qwen38TrellisM4Pro | Qwen38TrellisM1Max | Qwen3Model | Qwen3MoeModel
   | DiffusionGemmaModel | Glm52Model | UniversalDenseModel;
 
-/** A resident graph's native construction. Its loader and loop are the family's own declaration. */
-function residentImplementation(
-  id: string,
-  graph: ModelGraph,
-  create: ModelImplementation<Weights, RuntimeModel>["create"],
-): ModelImplementation<Weights, RuntimeModel> {
+/** A family's generic graph: the table entry that constrains nothing. */
+function generic(id: string, create: GraphEntry<Weights, RuntimeModel>["create"]): GraphEntry<Weights, RuntimeModel> {
+  return { id, serves: {}, create };
+}
+
+/** Every resident family's graphs, keyed by the graph its family declares. Each
+ * table lists its graphs built for particular compositions (each with the
+ * composition it was built and qualified for) and the family's generic graph; see {@link GraphTable} for how one is
+ * selected. Adding a graph means adding an entry here (or to the list a table
+ * spreads in). */
+export const MLX_GRAPH_TABLES: Readonly<Record<ModelGraph, GraphTable<Weights, RuntimeModel>>> = Object.freeze({
+  "diffusion-gemma": new GraphTable([generic("diffusion-gemma", (weights, config, composition) => new DiffusionGemmaModel(weights, config, composition))]),
+  "minicpm5": new GraphTable([generic("minicpm5", (weights, config, composition) => new MiniCPM5Model(weights, config, composition))]),
+  // Our published Trellis quant has its generated graphs (scripts/gen-qwen38.ts), keyed by its graph
+  // fingerprint (architecture plus the complete quantization table) and the GPU each was built for.
+  "qwen3.5": new GraphTable([
+    { id: QWEN38_TRELLIS_M4PRO_GRAPH, serves: QWEN38_TRELLIS_M4PRO_COMPOSITION,
+      create: (weights, config, composition) => new Qwen38TrellisM4Pro(weights, config, composition),
+      anePrograms: composition => qwen38TrellisM4ProAnePrograms(composition) },
+    // The M1 Max composition builds no Neural Engine operation (its device's table has none): no programs to install.
+    { id: QWEN38_TRELLIS_M1MAX_GRAPH, serves: QWEN38_TRELLIS_M1MAX_COMPOSITION,
+      create: (weights, config, composition) => new Qwen38TrellisM1Max(weights, config, composition) },
+    generic("qwen3.5", (weights, config, composition) => new Qwen35Model(weights, config, composition)),
+  ], qwen35GraphFingerprint),
+  "qwen3-moe": new GraphTable([generic("qwen3-moe", (weights, config, composition) => new Qwen3MoeModel(weights, config, composition))]),
+  "qwen3": new GraphTable([generic("qwen3", (weights, config, composition) => new Qwen3Model(weights, config, composition))]),
+  "gemma4": new GraphTable([...GENERATED_GRAPHS, generic("gemma4", (weights, config, composition) => new Gemma4Model(weights, config, composition))],
+    configFingerprint),
+  "universal-dense": new GraphTable([generic("universal-dense", (weights, config, composition) =>
+    new UniversalDenseModel(weights, config, composition, genericArgsFor(config)!))]),
+});
+
+/** A resident family's native construction: its graph table selects the graph for
+ * the composition it receives. Its loader and loop are the family's own declaration. */
+function residentImplementation(graph: ModelGraph, table: GraphTable<Weights, RuntimeModel>): ModelImplementation<Weights, RuntimeModel> {
   const family = familyForGraph(graph);
-  if (!family) throw new Error(`implementation ${id} names graph ${graph}, which no model family declares`);
-  return { id, graph, loader: family.loader, loop: family.loop, create };
+  if (!family) throw new Error(`graph table ${graph} names a graph no model family declares`);
+  return { id: graph, graph, loader: family.loader, loop: family.loop,
+    create: (weights, config, _profile, composition) => table.select(config, composition).create(weights, config, composition) };
 }
 
 /** Engine-owned registrations, one per resident graph of `MODEL_FAMILIES`. Exact
  * quant profiles can name additional implementations in a composed registry,
  * without changing sessions or files. */
-export const MLX_MODEL_IMPLEMENTATIONS = new ModelImplementationRegistry<Weights, RuntimeModel>([
-  residentImplementation("diffusion-gemma", "diffusion-gemma", (weights, config) => new DiffusionGemmaModel(weights, config)),
-  residentImplementation("minicpm5", "minicpm5", (weights, config) => new MiniCPM5Model(weights, config)),
-  // Our published Trellis quant loads its own purpose-built graph — the M4 Pro
-  // graph on that GPU family, the TQ graph elsewhere; every other
-  // Qwen3.5-family artifact keeps the generic model.
-  residentImplementation("qwen3.5", "qwen3.5", (weights, config) =>
-    qwen38TrellisM4ProAccepts(config) ? new Qwen38TrellisM4Pro(weights, config)
-      : qwen38TrellisTqAccepts(config) ? new Qwen38TrellisTQ(weights, config) : new Qwen35Model(weights, config)),
-  residentImplementation("qwen3-moe", "qwen3-moe", (weights, config) => new Qwen3MoeModel(weights, config)),
-  residentImplementation("qwen3", "qwen3", (weights, config) => new Qwen3Model(weights, config)),
-  residentImplementation("gemma4", "gemma4", (weights, config) => new Gemma4Model(weights, config)),
-  residentImplementation("gemma4-generated", "gemma4", (weights, config) => {
-    const Graph = GENERATED.get(configFingerprint(config));
-    if (!Graph) throw new Error("no generated Gemma graph for this config; refusing to fall back");
-    return new Graph(weights, config);
-  }),
-  residentImplementation("universal-dense", "universal-dense", (weights, config) =>
-    new UniversalDenseModel(weights, config, genericArgsFor(config)!)),
-]);
+export const MLX_MODEL_IMPLEMENTATIONS = new ModelImplementationRegistry<Weights, RuntimeModel>(
+  Object.entries(MLX_GRAPH_TABLES).map(([graph, table]) => residentImplementation(graph, table)));
 
 export interface ModelOpenOptions<Model = RuntimeModel> extends Glm52RuntimeOpenOptions {
   readonly profiles?: ResolveModelProfileOptions;
   readonly implementations?: ModelImplementationProvider<Weights, Model>;
+  /** The composition the graph is built for; absent resolves the default record
+   * (`resolveComposition(config)`). The direct Colibri runtime plans its own
+   * resources from the options above and takes none. */
+  readonly composition?: Composition;
 }
 
 export interface Glm52RuntimeOpenOptions {
@@ -102,6 +129,9 @@ export interface Glm52RuntimeOpenOptions {
   machineBytes?: number;
   /** Native expert-I/O dylib override. Packaged/dev defaults are automatic. */
   libraryPath?: string;
+  /** The composition's KV scheme and paging, which the graph's latent caches
+   * compose (default f32, unpaged). */
+  caches?: Glm52LatentCaches;
 }
 
 /** Open the direct Colibri artifact through the validated bounded expert
@@ -134,6 +164,7 @@ export async function openGlm52RuntimeModel(
     decodeKernel: "metal",
     enableMtp: plan.enableMtp,
     mtpDraftTokens: plan.mtpDraftTokens,
+    ...(options.caches ? { caches: options.caches } : {}),
   });
   if (model.expertRuntime?.plan.plannedBytes !== plan.plannedProcessBytes) {
     const actual = model.expertRuntime?.plan.plannedBytes ?? 0;
@@ -186,7 +217,8 @@ export async function openModel<Model>(
   if (profile.profile.execution.loader === "colibri") {
     if (options.implementations || profile.profile.execution.implementation !== undefined)
       throw new Error("custom Colibri implementations require a streamed loader binding; refusing to fall back");
-    return (await openGlm52RuntimeModel(modelDir, options)).model;
+    return (await openGlm52RuntimeModel(modelDir, options.composition
+      ? { ...options, caches: { kv: options.composition.kv, pagedKv: options.composition.pagedKv } } : options)).model;
   }
   if (profile.profile.execution.loop === "encoder-decoder")
     throw new Error(
@@ -195,25 +227,29 @@ export async function openModel<Model>(
     );
   // Resolve before opening weights; missing or incompatible code allocates nothing.
   const implementation = (options.implementations ?? MLX_MODEL_IMPLEMENTATIONS).select(config, profile);
+  const composition = options.composition ?? resolveComposition(config);
   const weights = await Weights.open(modelDir);
-  try { return implementation.create(weights, config, profile); }
+  try { return implementation.create(weights, config, profile, composition); }
   catch (error) { weights.dispose(); throw error; }
 }
 
-/** Construct the binding named by a validated profile. A supplied registry can
- * return any backend-owned interface; the compatibility default returns the
- * legacy model union. The caller retains ownership of the supplied weights. */
+/** Construct the binding named by a validated profile for `composition`, which
+ * the implementation receives (absent: the default record,
+ * `resolveComposition(config)`). A supplied registry can return any
+ * backend-owned interface; the compatibility default returns the legacy model
+ * union. The caller retains ownership of the supplied weights. */
 export function createModel<Model>(
-  weights: Weights, config: ModelConfig, resolved: ResolvedModelProfile | undefined,
-  implementations: ModelImplementationProvider<Weights, Model>,
+  weights: Weights, config: ModelConfig, composition: Composition | undefined,
+  resolved: ResolvedModelProfile | undefined, implementations: ModelImplementationProvider<Weights, Model>,
 ): Model;
 export function createModel(
-  weights: Weights, config: ModelConfig, resolved?: ResolvedModelProfile,
+  weights: Weights, config: ModelConfig, composition?: Composition, resolved?: ResolvedModelProfile,
   implementations?: ModelImplementationProvider<Weights, RuntimeModel>,
 ): RuntimeModel;
 export function createModel<Model>(
   weights: Weights,
   config: ModelConfig,
+  composition: Composition = resolveComposition(config),
   resolved: ResolvedModelProfile = resolveModelProfile(config),
   implementations: ModelImplementationProvider<Weights, Model> | ModelImplementationProvider<Weights, RuntimeModel> = MLX_MODEL_IMPLEMENTATIONS,
 ): Model | RuntimeModel {
@@ -223,5 +259,5 @@ export function createModel<Model>(
       `${resolved.profile.id} uses the direct Colibri container; construct it with ` +
       "openModel(modelDir) or Glm52Model.open(modelDir)",
     );
-  return implementations.select(config, resolved).create(weights, config, resolved);
+  return implementations.select(config, resolved).create(weights, config, resolved, composition);
 }

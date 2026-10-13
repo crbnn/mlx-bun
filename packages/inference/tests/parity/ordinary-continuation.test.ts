@@ -13,13 +13,14 @@
 // two-model draft to adapter rows. The provider cannot serve adapters, so the
 // row must decode ordinarily with checkpoints, never open draft rows, and match
 // a draftless adapter control token for token and checkpoint for checkpoint.
-import { expect, test, spyOn } from "bun:test";
+import { expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { KvSchemeOptions } from "@mlx-bun/inference/state/kv-scheme";
+import type { KvOptions } from "../models/test-composition";
 import type { Cache } from "@mlx-bun/inference/contracts/mlx";
 import { applyDescriptor, descriptorFor } from "./real-weight-inputs";
+import type { PhaseObserver } from "../models/phase-forward";
 const target = Bun.env.MLX_BUN_TEST_CONTINUATION_MODEL;
 const adapter = Bun.env.MLX_BUN_TEST_CONTINUATION_ADAPTER;
 if (target && !existsSync(`${target}/config.json`)) throw new Error(`unavailable model: ${target}`);
@@ -60,12 +61,13 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
   const { createModel } = await import("@mlx-bun/inference/models");
   const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
   const { createOrdinaryContinuationRequest } = await import("@mlx-bun/inference/execution");
-  const { ContinuationPersistence } = await import("@mlx-bun/inference/execution");
+  const { ContinuationPersistence, KvCacheService } = await import("@mlx-bun/inference/state");
   const { SsdCacheStore } = await import("@mlx-bun/inference/state");
   const { TwoModelProvider } = await import("../../src/generation/speculative/sources/two-model");
   const ops = await import("@mlx-bun/mlx/ops");
-  const { leaseCacheState, minimumReusableOffset, PromptCache, cloneKvCaches } = await import("@mlx-bun/inference/state");
+  const { leaseCacheState, minimumReusableOffset } = await import("@mlx-bun/inference/state");
   const { clearCache } = await import("@mlx-bun/mlx/ffi");
+  const { observedPhases, phaseLogits } = await import("../models/phase-forward");
   const directory = phase === "child" ? childDirectory! : mkdtempSync(join(tmpdir(), "ordinary-continuation-"));
   const weights = await Weights.open(target!);
   let released = false;
@@ -95,22 +97,25 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
   };
   try {
     const config = await continuationConfig();
-    const model = createModel(weights, config);
+    const prompt = [2, 105, 2364, 107, 1567, 506, 2390, 107];
+    const kv = await continuationKv(prompt.length);
+    const model = await composedModel(weights, config, kv);
     checkDescriptor(model as never, config);
+    const observer: PhaseObserver = {}, view = observedPhases(model, observer);
     if (!("loraState" in model) || !model.loraState) throw new Error("continuation test requires adapter state");
     manager = new AdapterManager(model);
     const adapters = manager;
     if (adapter) await manager.mount("upper", adapter);
     const adapterNamespace = adapter ? adapters.cacheNamespace(["upper"]) : "";
-    const prompt = [2, 105, 2364, 107, 1567, 506, 2390, 107];
-    const kv = await continuationKv(prompt.length);
     /** A saved or restored checkpoint of `tokens` committed tokens (always
      * after the prefill). Delayed conversion gives each converted cache the
      * offset it converted at as its reuse floor. A start within the prompt
      * converts at the first prefill maintenance boundary at or past it (a drain
-     * chunk's end or the prompt's end); a later start converts inside the next
-     * decode append once the committed offset has reached it, so a checkpoint
-     * of exactly `start` tokens taken after a decode step is still plain.
+     * chunk's end or the prompt's end); a later start converts once the
+     * committed offset has reached it, and a row handed back to serial use is
+     * the graph's composed cache again, which converts storage already holding
+     * its start as it adopts it, so a checkpoint of exactly `start` tokens is
+     * converted too (its floor is `start`).
      * Other artifacts may carry recurrent or other non-KV state, so they check
      * only the floor's bound;
      * the custom window graph is sliding and full KV layers throughout, so it
@@ -124,7 +129,8 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
      * scheme's bits, each sliding cache stays a plain ring, and every KV
      * layer is at the checkpoint's offset. From token 0 there is no reuse
      * floor. Recurrent layers keep their own state and are not KV. */
-    const checkTurbo = (caches: readonly Cache[], tokens: number) => {
+    const checkTurbo = (composed: readonly Cache[], tokens: number) => {
+      const caches = composed.map(cache => cache.composed?.storage() ?? cache);
       const { kBits, vBits } = kv.options.turboQuant!;
       // One effective type per cache for both the check and the count: a
       // config without layer types is full attention throughout.
@@ -159,10 +165,11 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
       expect(encoded).toBeGreaterThan(0);
       expect(encoded).toBe(types.filter(type => type === "full_attention").length);
     };
-    const checkSaved = (caches: readonly Cache[], tokens: number) => {
-      if (kv.mode === "turbo" && (kv.start <= prompt.length || tokens > kv.start)) checkTurbo(caches, tokens);
+    const checkSaved = (composed: readonly Cache[], tokens: number) => {
+      const caches = composed.map(cache => cache.composed?.storage() ?? cache);
+      if (kv.mode === "turbo" && (kv.start <= prompt.length || tokens >= kv.start)) checkTurbo(caches, tokens);
       if (kv.mode === "bf16" || kv.start === 0) return;
-      const converted = kv.start <= prompt.length || tokens > kv.start;
+      const converted = kv.start <= prompt.length || tokens >= kv.start;
       const minimum = minimumReusableOffset(caches);
       if (windowSetting === undefined) {
         if (converted) expect(minimum).toBeGreaterThanOrEqual(kv.start);
@@ -193,11 +200,11 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
       });
     };
     const widths: number[] = [];
-    const forward = model.forwardHidden.bind(model);
+
     const probe = (active: string[]) => {
       const previous = model.loraState!.active, caches = model.makeCache();
       model.loraState!.active = active;
-      try { using logits = model.forward(prompt, caches); using exact = ops.contiguous(logits); return Buffer.from(exact.rawBytes()); }
+      try { using logits = phaseLogits(model as never, prompt, caches); using exact = ops.contiguous(logits); return Buffer.from(exact.rawBytes()); }
       finally { model.loraState!.active = previous; for (const cache of caches) cache.dispose(); }
     };
     const baseLogits = adapter ? probe([]) : undefined;
@@ -212,61 +219,62 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
         useDraft = ignoredDraft && useAdapter) => {
         let held = true;
         const unexpected = () => { throw new Error("an ignored draft opened rows"); };
-        const binding = bindMlxGateway(model, useDraft ? { numDraftTokens: 3, provider: Object.assign(
+        const binding = bindMlxGateway(view, useDraft ? { numDraftTokens: 3, provider: Object.assign(
           Object.create(TwoModelProvider.prototype), { id: "ignored-draft", weightsBytes: 0,
             grouped: { checkpointNamespace: () => "ignored-draft", open: unexpected, openPrefill: unexpected } }) } : undefined);
         const context = useAdapter ? binding.bindAdapterContext!(["upper"], "adapters:upper") : undefined;
         const namespace = useAdapter ? adapterNamespace : "";
         const activeContexts: string[][] = [];
-        const contextGraph = spyOn(model, "forwardHidden").mockImplementation((ids, caches) => {
-          widths.push(ids.shape[0]!); activeContexts.push([...model.loraState!.active]); return forward(ids, caches);
-        });
-        const group = binding.createBatchGroup({ maxBatch: batch, kvScheme: kv.scheme, admissionHeld: () => held });
+        observer.forward = ids => { widths.push(ids.shape[0]!); activeContexts.push([...model.loraState!.active]); };
         const aborts = Array.from({ length: batch }, () => new AbortController());
         const captured = new Map<string, string>(), restored: number[] = [];
         let idle!: () => void;
         const idleGate = new Promise<void>(resolve => { idle = resolve; });
         const persistence = new ContinuationPersistence(store, { maxBytes: 1024 ** 3,
           runStep: async step => { await idleGate; return step(); } });
+        // The composition's cache service: generation checkpoints in `store` every 4 tokens; no prefix store.
+        const cache = new KvCacheService(binding.graph, { continuations: { store, persistence, everyTokens: 4 } },
+          { identity: "same-B-fixture", runtime: binding.runtime });
+        const group = binding.createBatchGroup({ maxBatch: batch, admissionHeld: () => held, cache });
         const outputs: number[][] = Array.from({ length: batch }, () => []);
-        const prefix = new PromptCache(1024 ** 2, null, null, cloneKvCaches);
         const requests: ReturnType<typeof createOrdinaryContinuationRequest>[] = [];
+        /** A request's row, by the checkpoint key the cache service keys it under. */
+        const rowOfKey = new Map<string, number>();
         try {
-          binding.configureContinuation!({ promptCache: prefix, checkpoints: store, checkpointEveryTokens: 4,
-            checkpointPersistence: persistence, identity: "same-B-fixture", cloneState: cloneKvCaches,
-            adapterNamespace: ids => adapters.cacheNamespace(ids) });
-          const options = { ...kv.options, ...(useAdapter ? { adapters: ["upper"] } : {}), maxTokens: 16,
+          const options = { ...(useAdapter ? { adapters: ["upper"] } : {}), maxTokens: 16,
             temperature: 0.7, seedWasExplicit: true, repetitionPenalty: 1.1, repetitionContextSize: 32 };
           const execution = binding.plan({ hasVision: false, hasAdapters: useAdapter, hasRepetitionPenalty: true,
-            userSeed: true, kvQuant: kv.scheme.kind !== "bf16" && kv.scheme.kind !== "turbo", turboQuant: kv.scheme.kind === "turbo",
+            userSeed: true,
             hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: useDraft }, options,
-          { continuous: binding.cachesBatchable(), quantizedBatch: binding.kvBatchable(kv.scheme), checkpoints: true });
+          { checkpoints: true });
           expect(execution).toMatchObject({ method: "autoregressive", mechanism: "continuous", checkpoint: true });
           if (useDraft) {
             expect(execution.reasons).toContain("draft-incompatible-with-request");
             expect(binding.methodRequest!(execution, options)).toBeUndefined();
           }
+          // Every checkpoint the cache service restores from `store` is checked and logged.
+          const restore = store.restore.bind(store);
+          store.restore = (entry, graph) => {
+            const loaded = restore(entry, graph);
+            if (!loaded) return loaded;
+            const row = rowOfKey.get(entry.generationCheckpoint?.key ?? "");
+            try {
+              checkSaved(loaded.caches, loaded.tokens.length);
+              const planes = loaded.caches.map(cache => { const lease = leaseCacheState(cache); try { return lease.borrow().length; } finally { lease.close(); } });
+              console.log(`[continuation-restore] ${phase} B${batch} row ${row}: ${loaded.tokens.length} tokens, offsets ` +
+                `${[...new Set(loaded.caches.map(cache => cache.offset))]}, minimum ${minimumReusableOffset(loaded.caches)}, ` +
+                `planes ${[...new Set(planes)]} over ${loaded.caches.length} caches`);
+            } catch (error) {
+              // Ownership passes to the caller only on return.
+              for (const cache of loaded.caches) cache.dispose();
+              for (const attachment of loaded.attachments ?? []) for (const tensor of attachment.tensors) tensor.dispose();
+              throw error;
+            }
+            restored.push(loaded.tokens.length);
+            return loaded;
+          };
           for (const [row, tokens] of outputs.entries()) requests.push(createOrdinaryContinuationRequest({
-            store, persistence, interval: 4, prompt,
-            restore: entry => {
-              const loaded = store.restore(entry, model);
-              if (!loaded) return loaded;
-              try {
-                checkSaved(loaded.caches, loaded.tokens.length);
-                const planes = loaded.caches.map(cache => { const lease = leaseCacheState(cache); try { return lease.borrow().length; } finally { lease.close(); } });
-                console.log(`[continuation-restore] ${phase} B${batch} row ${row}: ${loaded.tokens.length} tokens, offsets ` +
-                  `${[...new Set(loaded.caches.map(cache => cache.offset))]}, minimum ${minimumReusableOffset(loaded.caches)}, ` +
-                  `planes ${[...new Set(planes)]} over ${loaded.caches.length} caches`);
-              } catch (error) {
-                // Ownership passes to the caller only on return.
-                for (const cache of loaded.caches) cache.dispose();
-                for (const attachment of loaded.attachments ?? []) for (const tensor of attachment.tensors) tensor.dispose();
-                throw error;
-              }
-              restored.push(loaded.tokens.length);
-              return loaded;
-            },
-            options: { ...options, seed: 42 + row }, execution, identity: "same-B-fixture",
+            interval: 4, prompt, options: { ...options, seed: 42 + row }, execution,
             onToken(token) {
               tokens.push(token);
               if (interrupt && tokens.length === kv.interruptAt) {
@@ -275,9 +283,14 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
               }
             },
           }));
-          for (const [row, request] of requests.entries()) {
-            const enqueue = request.continuation.captureOwned;
-            request.continuation.captureOwned = state => {
+          const cacheNamespace = (row: number) => adapter ? namespace : `row-${row}`;
+          for (const [row, request] of requests.entries())
+            rowOfKey.set(request.continuation.key(cacheNamespace(row), "same-B-fixture"), row);
+          // Every checkpoint the scheduler offers the cache service is digested first.
+          const enqueue = cache.checkpoint.bind(cache);
+          cache.checkpoint = (request, state) => {
+            const row = requests.findIndex(item => item.continuation === request.continuation);
+            {
               const digest = new Bun.CryptoHasher("sha256");
               digest.update(JSON.stringify(state.caches.map(cache => ({ offset: cache.offset, minimum: cache.minimumReusableOffset ?? 0 }))));
               checkSaved(state.caches, state.cacheTokens.length);
@@ -289,11 +302,11 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
                 } } finally { lease.close(); }
               }
               captured.set(`row-${row}:${state.generatedTokens}`, digest.digest("hex"));
-              enqueue(state);
-            };
-          }
+              enqueue(request, state);
+            }
+          };
           const pending = requests.map((request, row) => group.submit({ ...request, promptIds: prompt,
-            cacheNamespace: adapter ? namespace : `row-${row}`, context, signal: aborts[row]!.signal, compiledDecode: false, maxTokens: 16, eosTokenIds: [] }));
+            cacheNamespace: cacheNamespace(row), context, signal: aborts[row]!.signal, compiledDecode: false, maxTokens: 16, eosTokenIds: [] }));
           held = false; group.kick();
           const results = await Promise.allSettled(pending);
           if (!interrupt) for (const result of results) if (result.status === "rejected") throw result.reason;
@@ -305,9 +318,9 @@ test.skipIf(!target)("ordinary B1/B4 restore pending tokens and sampler history 
           for (const abort of aborts) abort.abort(new Error("continuation test cleanup"));
           try { await group.close(); }
           finally {
-            contextGraph.mockRestore(); idle();
+            observer.forward = undefined; idle();
             try { await persistence.flush(); }
-            finally { requests.forEach(request => request.dispose()); prefix.clear(); clearCache(); }
+            finally { requests.forEach(request => request.dispose()); clearCache(); }
           }
           expect(model.loraState!.active).toEqual([]);
         }
@@ -411,20 +424,24 @@ test.skipIf(!target || !adapter || !Bun.env.MLX_BUN_TEST_CONTINUATION_KV_START |
   const { AdapterManager } = await import("@mlx-bun/inference/adapters");
   const { bindMlxGateway, createRowSampling } = await import("@mlx-bun/inference/execution");
   const { makeStepSampler } = await import("@mlx-bun/inference/sampling");
-  const { leaseCacheState, isBatchableCache } = await import("@mlx-bun/inference/state");
+  const { leaseCacheState } = await import("@mlx-bun/inference/state");
+  const { isBatchableCache } = await import("../../src/state/capabilities");
+  const { observedPhases } = await import("../models/phase-forward");
   const ops = await import("@mlx-bun/mlx/ops");
   const weights = await Weights.open(target!);
   let manager: InstanceType<typeof AdapterManager> | undefined;
   try {
     const config = await continuationConfig();
-    const model = createModel(weights, config);
-    checkDescriptor(model as never, config);
-    manager = new AdapterManager(model);
-    const adapters = manager, prompt = [2, 105, 2364, 107, 1567, 506, 2390, 107];
+    const prompt = [2, 105, 2364, 107, 1567, 506, 2390, 107];
     const kv = await continuationKv(prompt.length);
+    const model = await composedModel(weights, config, kv);
+    checkDescriptor(model as never, config);
+    const observer: PhaseObserver = {}, view = observedPhases(model, observer);
+    manager = new AdapterManager(model);
+    const adapters = manager;
     if (!["4", "8", "per-layer"].includes(kv.mode) || kv.start <= 0 || kv.start >= prompt.length + 16)
       throw new Error("adapter lifecycle requires delayed affine conversion inside the generated sequence");
-    const binding = bindMlxGateway(model);
+    const binding = bindMlxGateway(view);
     const hash = (array: import("@mlx-bun/mlx/array").MlxArray) => {
       using exact = ops.contiguous(array);
       return [array.shape, array.dtype, new Bun.CryptoHasher("sha256").update(exact.rawBytes()).digest("hex")];
@@ -467,7 +484,7 @@ test.skipIf(!target || !adapter || !Bun.env.MLX_BUN_TEST_CONTINUATION_KV_START |
     await adapters.mount("upper", adapter!);
     const scenario = async (batch: number, cancel: boolean, baseOnly = false) => {
       let held = true, leased = false, joined = false, queuedBase = false;
-      const group = binding.createBatchGroup({ maxBatch: batch, kvScheme: kv.scheme, admissionHeld: () => held,
+      const group = binding.createBatchGroup({ maxBatch: batch, admissionHeld: () => held,
         lock: { async acquire() { leased = true; return () => { leased = false; }; } } });
       const drained = async () => {
         const deadline = Date.now() + 10_000;
@@ -480,34 +497,25 @@ test.skipIf(!target || !adapter || !Bun.env.MLX_BUN_TEST_CONTINUATION_KV_START |
       type JobResult = { status: "fulfilled"; stats: Awaited<ReturnType<typeof group.submit>> } | { status: "rejected"; error: unknown };
       const jobs: Promise<JobResult>[] = [], samplers: { dispose(): void }[] = [];
       const aborts: AbortController[] = [];
-      let hidden: { mockRestore(): void } | undefined, logits: { mockRestore(): void } | undefined;
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
-        const forward = model.forwardHidden.bind(model), project = model.logitsFromHidden.bind(model);
         const context = () => model.loraState!.active.join(",");
-        hidden = spyOn(model, "forwardHidden").mockImplementation((ids, caches) => {
-          const value = forward(ids, caches);
-          try {
-            const planes = caches.map(validCache);
-            calls.push(["forward", context(), hash(ids), planes]); widths.push(ids.shape[0]!); active.push(context());
-          } catch (error) { value.dispose(); throw error; }
-          return value;
-        });
-        logits = spyOn(model, "logitsFromHidden").mockImplementation(value => {
-          const result = project(value);
-          try { calls.push(["logits", context(), hash(result)]); } catch (error) { result.dispose(); throw error; }
-          return result;
-        });
+        // Every forward the scheduler names, observed after it appends, and every head projection.
+        observer.forwarded = (ids, caches) => {
+          const planes = caches.map(validCache);
+          calls.push(["forward", context(), hash(ids), planes]); widths.push(ids.shape[0]!); active.push(context());
+        };
+        observer.head = (_hidden, result) => { calls.push(["logits", context(), hash(result)]); };
         const enqueue = (row: number, adapted: boolean) => {
           const tokens: number[] = []; outputs[row] = tokens;
           const abort = new AbortController(); aborts.push(abort);
           const ids = row === batch - 1 && adapted ? [...prompt, 42, 43] : prompt;
-          const options = { ...kv.options, maxTokens: row === 1 && !cancel ? 4 : 16, temperature: 0,
+          const options = { maxTokens: row === 1 && !cancel ? 4 : 16, temperature: 0,
             ...(adapted ? { adapters: ["upper"] } : {}) };
           const execution = binding.plan({ hasVision: false, hasAdapters: adapted, hasRepetitionPenalty: false,
-            userSeed: false, kvQuant: true, turboQuant: false, hasLogitsExtras: false,
+            userSeed: false, hasLogitsExtras: false,
             hasGrammar: false, wantsLogprobs: false, hasDraft: false }, options,
-          { continuous: binding.cachesBatchable(), quantizedBatch: binding.kvBatchable(kv.scheme), checkpoints: false });
+          { checkpoints: false });
           expect(execution).toMatchObject({ mechanism: "continuous", method: "autoregressive", fill: false });
           const sampling = createRowSampling(makeStepSampler(options, { tokenRepresentation: "device",
             grammarWait: "external", historyUpdate: "after-sample", initialHistory: ids }), token => {
@@ -578,7 +586,7 @@ test.skipIf(!target || !adapter || !Bun.env.MLX_BUN_TEST_CONTINUATION_KV_START |
         finally {
           try { await Promise.all(jobs.filter(Boolean)); }
           finally {
-            hidden?.mockRestore(); logits?.mockRestore();
+            observer.forwarded = undefined; observer.head = undefined;
             try { for (const sampler of samplers) sampler.dispose(); }
             finally { expect(model.loraState!.active).toEqual([]); }
           }
@@ -609,7 +617,7 @@ async function continuationKv(promptLength: number) {
   const interruptAt = Number(Bun.env.MLX_BUN_TEST_CONTINUATION_INTERRUPT ?? 6);
   if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(interruptAt) || interruptAt < 6 || interruptAt >= 16)
     throw new Error("continuation fixture requires start>=0 and 6<=interrupt<16");
-  let options: KvSchemeOptions = {};
+  let options: KvOptions = {};
   let kind: ConstructorParameters<typeof KvScheme>[0] = "bf16";
   if (mode === "4" || mode === "8") {
     kind = "affine-uniform";
@@ -621,5 +629,16 @@ async function continuationKv(promptLength: number) {
     kind = "affine-config";
     options = { kvConfig: [{ layerIdx: 0, bits: 4, groupSize: 64 }, { layerIdx: 1, bits: 8, groupSize: 64 }], quantizedKvStart: start };
   } else if (mode !== "bf16") throw new Error(`unknown continuation KV fixture: ${mode}`);
-  return { mode, start, interruptAt, options, scheme: new KvScheme(kind, options) };
+  // The graph composes this scheme. Affine reads take the tiled-causal set this
+  // test read before E3, when its environment left fused SDPA on.
+  const scheme = new KvScheme(kind, { ...options, kvConfig: options.kvConfig?.map(entry => ({ ...entry })) }, "tiled-causal");
+  return { mode, start, interruptAt, options, scheme };
+}
+
+/** `config`'s graph composed with the continuation fixture's KV scheme. */
+async function composedModel(weights: import("@mlx-bun/inference/artifacts").Weights, config: import("@mlx-bun/inference/artifacts").ModelConfig,
+  kv: Awaited<ReturnType<typeof continuationKv>>) {
+  const { createModel } = await import("@mlx-bun/inference/models");
+  const { resolveComposition } = await import("@mlx-bun/inference");
+  return createModel(weights, config, { ...resolveComposition(config), kv: kv.scheme.storage });
 }

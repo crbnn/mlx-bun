@@ -3,24 +3,27 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import { KVCache } from "../../src/state/kv";
+import type { Cache } from "../../src/contracts/mlx/cache";
 import { SSMCache } from "../../src/state/ssm";
 import { BatchedKVCache } from "../../src/state/batched-kv";
 import { BatchedSSMCache } from "../../src/state/batched-ssm";
 import { MlxStateRows } from "../../src/state/rows";
 import { MlxAutoregressiveDraftRows } from "../../src/generation/speculative/bindings/autoregressive-rows";
+import { MlxPhaseDispatch } from "../../src/generation/phase-dispatch";
+import { stubPhases } from "../models/phase-forward";
+import { kvStorage } from "../../src/state/kv-storage";
 
 test("batched draft graph retains independent attention and recurrent boundaries", async () => {
   const state = new MlxStateRows([new BatchedKVCache(), new BatchedSSMCache()]);
   const empty = Array.from({ length: 3 }, () => [new KVCache(), new SSMCache()]);
   state.mergeRows(empty); for (const row of empty) for (const cache of row) cache.dispose();
   const calls: number[][] = [], sampled: number[][] = [];
-  const draft = new MlxAutoregressiveDraftRows({
-    descriptor: { id: "test", backend: "mlx", graphAbi: "test", stateAbi: "test", artifact: "test" },
-    forwardHidden(ids, caches) {
+  const draft = new MlxAutoregressiveDraftRows(new MlxPhaseDispatch(stubPhases(
+    (ids: MlxArray, caches: Cache[]) => {
       const tokens = ids.toIntTokens(), B = ids.shape[0]!, N = ids.shape[1]!; calls.push(tokens);
       using floating = ids.astype(Dtype.float32);
       using kv = ops.reshape(floating, [B, 1, N, 1]);
-      const pair = caches[0]!.updateAndFetch(kv, kv); pair.forEach(a => a.dispose());
+      const pair = kvStorage(caches[0]!).updateAndFetch(kv, kv); pair.forEach(a => a.dispose());
       const ssm = caches[1] as SSMCache;
       const previous = ssm.recurrent ? [...ssm.recurrent.toFloat32()] : Array(B).fill(0);
       const counts = ssm.prefillPadding?.advance(N) ?? Array(B).fill(N);
@@ -30,12 +33,12 @@ test("batched draft graph retains independent attention and recurrent boundaries
       ssm.offsets = ssm.offsets!.map((offset, row) => offset + counts[row]!); ssm.offset = Math.max(...ssm.offsets);
       return ops.reshape(floating, [B, N, 1]);
     },
-    projectLogits(hidden) {
+    (hidden: MlxArray) => {
       const values = [...hidden.toFloat32()], B = hidden.shape[0]!, N = hidden.shape[1]!;
       const tokens = Array.from({ length: B }, (_, row) => values[row * N + N - 1]!);
       return MlxArray.fromFloat32(Float32Array.from(tokens.flatMap(token => Array.from({ length: 32 }, (_, id) => id === token + 1 ? 10 : 0))), [tokens.length, 1, 32]);
     },
-  }, state, { sample(logprobs, steps) { sampled.push([...steps]); return ops.argmaxAxis(logprobs, -1); } });
+  )), state, { selection: { kind: "sampled" }, sample(logprobs, steps) { sampled.push([...steps]); return ops.argmaxAxis(logprobs, -1); } });
   const inspect = (row: number) => {
     const caches = state.extractRow(row);
     try {

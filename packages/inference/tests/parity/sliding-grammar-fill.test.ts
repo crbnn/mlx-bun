@@ -9,7 +9,7 @@
 //   before it) and every projection's complete logits; the scheduler may add
 //   one discarded single-token lookahead step. Rows prepared together or
 //   joining late (B2) each equal their B1 direct output.
-// - Grammar with MLX_BUN_GRAMMAR_JUMP=1: the graph binds grammar proposals, so
+// - Grammar with the composition's grammarJump on: the graph binds grammar proposals, so
 //   the gateway places the request on the speculative group, which verifies
 //   the matcher's forced string rather than committing it (no forced span is
 //   taken from the matcher). At B1 and B2 its tokens equal direct
@@ -23,11 +23,19 @@
 //   session records the injected and accepted tokens, and echo proposals reach
 //   verify forwards.
 // - For each of those three shapes, a B2 group in which one row is cancelled at
-//   its third token: it emits exactly those three tokens and rejects with the
-//   cancellation; its peer runs to its end equal to its B1 output; the drained
-//   group then serves the cancelled request again, equal to its B1 run (direct
-//   generation for grammar, a fresh group for proposals and fill) in tokens,
-//   forwards and projections.
+//   its third token, against the same pair run uncancelled (formed, admitted and
+//   started the same way): the cancelled row emits exactly the uncancelled
+//   row's first three tokens and rejects with the cancellation; up to the
+//   cancel its peer equals the uncancelled pair's peer in tokens and forced
+//   spans; after the cancel the peer only completes, with the uncancelled
+//   peer's finish reason and within its request's token budget. Up to the
+//   cancel both pairs decode the same two rows, which is exact. After it the
+//   peer decodes alone while the uncancelled peer keeps decoding beside its
+//   row, so the peer's width class changes and its last bits may move (the
+//   plan's bit-stability decision): an fp16 tie can then tip a token, as it
+//   does on Llama 3.2 3B. The drained group then serves the cancelled request
+//   again alone, equal to its B1 run (direct generation for grammar, a fresh
+//   group for proposals and fill) in tokens, forwards and projections.
 // Compiled decode is off and the prompt tail is split on both paths, so every
 // step is observed and both issue the same calls.
 // Opt in with both of
@@ -178,9 +186,13 @@ const inputs = optIn(Bun.env);
 type Shape = "grammar" | "jump" | "fill";
 type FillMode = "strict" | "echo" | "reject";
 interface Request { prompt: PromptName; grammar?: GrammarName; fill?: FillMode }
-interface Outcome { tokens: number[]; spans: number[][]; status: "fulfilled" | "rejected"; error?: unknown; fill?: FillSession }
-/** The graph operations the recorder wraps. */
-interface Graph { forwardHidden(ids: MlxArray, caches: Cache[]): MlxArray; logitsFromHidden(hidden: MlxArray): MlxArray; args?: WindowDescriptor }
+interface Outcome {
+  tokens: number[]; spans: number[][]; status: "fulfilled" | "rejected"; error?: unknown; fill?: FillSession;
+  /** The batch group's finish reason, for a fulfilled row. */
+  finish?: "stop" | "length";
+}
+/** The custom graph's window descriptor. */
+interface Graph { args?: WindowDescriptor }
 /** MLX_BUN_FILL for a set of rows: echo (which a rejected-proposal row also needs) is additive to strict. */
 const fillMode = (rows: readonly Request[]): "strict" | "echo" | undefined =>
   rows.some(row => row.fill === "echo" || row.fill === "reject") ? "echo" : rows.some(row => row.fill === "strict") ? "strict" : undefined;
@@ -193,6 +205,7 @@ async function setup() {
   const { loadTokenizer } = await import("@mlx-bun/inference/input");
   const { FillSession: Session } = await import("@mlx-bun/inference/generation/fill");
   const { clearCache } = await import("@mlx-bun/mlx/ffi");
+  const { observedPhases } = await import("../models/phase-forward");
   const { hash, rowStates } = await rotatingRowReader();
   const { model: dir, window, descriptor } = inputs!;
   const config = await loadModelConfig(dir);
@@ -202,23 +215,27 @@ async function setup() {
     try { weights.dispose(); }
     finally { releaseAll([...weights.shards.files.values()].map(file => () => file.mmap.unmap())); clearCache(); }
   };
-  const { model, graph, tokenizer, prompts } = await (async () => {
+  const { model, tokenizer, prompts } = await (async () => {
     const model = createModel(weights, config), graph = model as unknown as Graph;
     expect({ layerTypes: graph.args?.layerTypes, slidingWindow: graph.args?.slidingWindow }).toEqual(descriptor);
     const tokenizer = await loadTokenizer(dir);
     const prompts = planPrompts(tokenizer.encode("Name one city you like and rate it from 1 to 5 as JSON.", true),
       tokenizer.encode("Answer yes or no, then add one lowercase word.", true), window);
     assert(prompts.long.length > window && prompts.other.length > window && prompts.short.length < window, "prompts do not bracket the window");
-    return { model, graph, tokenizer, prompts };
+    return { model, tokenizer, prompts };
   })().catch(error => { releaseWeights(); throw error; });
 
-  // One recorder for both paths, installed before any binding or group binds
-  // the graph's operations: every forward (IDs; at B1, the row's valid state
-  // before it) and every projection's complete logits, per row and position.
+  // One recorder for both paths: the direct generator and the gateway are bound
+  // to this observed view of the graph's phases. Every forward (IDs; at B1, the
+  // row's valid state before it) and every projection's complete logits, per row
+  // and position.
   let trace: { forwards: Forward[]; projections: Projection[]; states: boolean } | null = null;
-  const forwardHidden = graph.forwardHidden, logitsFromHidden = graph.logitsFromHidden;
-  graph.forwardHidden = function (this: Graph, ids: MlxArray, caches: Cache[]) {
-    if (trace) {
+  /** Told each forward's row count as the forward is issued (`watchForwards`). */
+  let forwardWatcher: ((rows: number) => void) | null = null;
+  const view = observedPhases(model, {
+    forward(ids: MlxArray, caches: Cache[]) {
+      forwardWatcher?.(ids.shape[0]!);
+      if (!trace) return;
       const [B, L] = ids.shape as [number, number], flat = ids.toIntTokens();
       let state: Forward["state"] = null;
       if (trace.states && B === 1 && caches[0]!.offset > 0) {
@@ -228,18 +245,14 @@ async function setup() {
         catch (error) { state = { unreadable: (error as Error).message }; }
       }
       trace.forwards.push({ B, L, ids: Array.from({ length: B }, (_, r) => flat.slice(r * L, (r + 1) * L)), state });
-    }
-    return forwardHidden.call(this, ids, caches);
-  };
-  graph.logitsFromHidden = function (this: Graph, hidden: MlxArray) {
-    const out = logitsFromHidden.call(this, hidden);
-    if (trace) try {
+    },
+    head(_hidden: MlxArray, out: MlxArray) {
+      if (!trace) return;
       const [B, L, V] = out.shape as [number, number, number], rows: string[] = [];
       for (let b = 0; b < B; b++) for (let l = 0; l < L; l++) { using row = out.slice([b, l, 0], [b + 1, l + 1, V]); rows.push(hash(row)); }
       trace.projections.push({ B, L, dtype: out.dtypeName, rows });
-    } catch (error) { out.dispose(); throw error; }
-    return out;
-  };
+    },
+  });
   const traced = async <T>(states: boolean, run: () => Promise<T>) => {
     trace = { forwards: [], projections: [], states };
     try { const value = await run(); return { value, forwards: trace.forwards, projections: trace.projections }; }
@@ -248,8 +261,7 @@ async function setup() {
 
   /** The scenario's runtime, active while `run` binds and generates. */
   const under = async <T>(shape: Shape, fill: FillMode | undefined, run: () => Promise<T>) => {
-    const restore = configureRuntime({ MLX_BUN_PREFILL_TAIL_SPLIT: "1", MLX_BUN_COMPILED_DECODE: "0", MLX_BUN_GRAMMAR: "1",
-      MLX_BUN_GRAMMAR_JUMP: shape === "jump" ? "1" : "0", MLX_BUN_FILL: fill === "reject" ? "echo" : fill ?? "off" });
+    const restore = configureRuntime({ MLX_BUN_GRAMMAR: "1", MLX_BUN_FILL: fill === "reject" ? "echo" : fill ?? "off" });
     try { return await run(); } finally { restore(); clearCache(); }
   };
   /** A matcher that reports each forced span it commits (none is expected on
@@ -308,7 +320,7 @@ async function setup() {
     try {
       const { value, forwards, projections } = await traced(true, async () => {
         const tokens: number[] = [];
-        const generation = generate(model, prompt, { ...options, decodePolicy: { compiledDecode: false, grammarJump: false } });
+        const generation = generate(view, prompt, { ...options, decodePolicy: { compiledDecode: false, grammarJump: false } });
         for await (const step of generation) tokens.push(step.token);
         return tokens;
       });
@@ -320,7 +332,7 @@ async function setup() {
     const { prompt, options } = await optionsFor(request, []);
     const { value, forwards, projections } = await traced(true, async () => {
       const tokens: number[] = [];
-      for await (const step of generate(model, prompt, { ...options, decodePolicy: { compiledDecode: false, grammarJump: false } }))
+      for await (const step of generate(view, prompt, { ...options, decodePolicy: { compiledDecode: false, grammarJump: false } }))
         tokens.push(step.token);
       return tokens;
     });
@@ -354,22 +366,26 @@ async function setup() {
    * `start`, which places, binds and samples it as the app's gateway does and
    * submits it; `hold` holds admission so rows started together prefill together. */
   const gateway = <T>(shape: Shape, fill: FillMode | undefined, maxBatch: number, run: (lane: {
-    prepare(request: Request, end?: { cancelAt?: number; onToken?: (emitted: number) => void }): Promise<{ start(): Promise<Outcome> }>;
+    prepare(request: Request, end?: { cancelAt?: number; onToken?: (emitted: number) => void }): Promise<{
+      start(): Promise<Outcome>; readonly tokens: readonly number[]; readonly spans: readonly (readonly number[])[];
+    }>;
     hold(held: boolean): void;
     drained(): Promise<void>;
   }) => Promise<T>) => under(shape, fill, async () => {
-    const binding = bindMlxGateway(model);
+    // The jump scenario binds the view under a composition that turns grammar jump on.
+    const binding = bindMlxGateway(shape === "jump"
+      ? Object.create(view, { composition: { value: { ...(view as { composition?: object }).composition, grammarJump: true } } }) as typeof view : view);
     let held = false;
     const group = binding.createBatchGroup({ maxBatch, runtime: binding.runtime, prefillChunkSize: CHUNK, admissionHeld: () => held });
     const prepare = async (request: Request, end: { cancelAt?: number; onToken?: (emitted: number) => void } = {}) => {
       const spans: number[][] = [], tokens: number[] = [], abort = new AbortController();
       const { prompt, options } = await optionsFor(request, spans);
       const start = async (): Promise<Outcome> => {
-        const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false, kvQuant: false,
-          turboQuant: false, hasLogitsExtras: false, hasGrammar: !!options.grammar, wantsLogprobs: false, hasDraft: false };
+        const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
+          hasLogitsExtras: false, hasGrammar: !!options.grammar, wantsLogprobs: false, hasDraft: false };
         let sampling: ReturnType<typeof createRowSampling> | undefined;
         try {
-          const execution = binding.plan(shape, options, { continuous: binding.cachesBatchable(), quantizedBatch: false, checkpoints: false });
+          const execution = binding.plan(shape, options, { checkpoints: false });
           assert.equal(execution.mechanism, "continuous", `placement refused ${JSON.stringify(request)}: ${execution.reasons.join(", ")}`);
           const method = binding.methodRequest?.(execution, options);
           const sink = (token: number) => {
@@ -378,16 +394,17 @@ async function setup() {
           };
           sampling = method ? undefined : createRowSampling(makeStepSampler(options, { tokenRepresentation: "device",
             grammarWait: "external", historyUpdate: "after-sample", initialHistory: prompt }), sink);
-          await group.submit({ promptIds: prompt, prefillChunkSize: CHUNK, compiledDecode: execution.compiledDecode,
+          const stats = await group.submit({ promptIds: prompt, prefillChunkSize: CHUNK, compiledDecode: execution.compiledDecode,
             maxTokens: options.maxTokens!, eosTokenIds: options.eosTokenIds!, cacheNamespace: "", signal: abort.signal,
-            statePolicy: binding.statePolicy?.(execution, options, prompt.length + options.maxTokens!),
+            reusesPrefix: binding.reusesPrefix(execution),
             ...(method ? { method, onToken: sink } : { sample: sampling!.sample, plainGreedy: sampling!.plainGreedy, onToken: sampling!.onToken }),
             ...(options.grammar ? { grammar: options.grammar } : {}) });
-          return { tokens, spans, status: "fulfilled", fill: options.fill };
+          return { tokens, spans, status: "fulfilled", fill: options.fill, finish: stats.finishReason };
         } catch (error) { return { tokens, spans, status: "rejected", error, fill: options.fill }; }
         finally { sampling?.dispose(); options.grammar?.dispose(); }
       };
-      return { start };
+      // The row's live token and forced-span lists, for a peer read while the row runs.
+      return { start, tokens: tokens as readonly number[], spans: spans as readonly (readonly number[])[] };
     };
     const drained = async () => {
       const deadline = Date.now() + 10_000;
@@ -419,8 +436,9 @@ async function setup() {
   };
   return {
     prompts, reference, single, alone, directFill, gateway, traced, checkFillApplied,
+    /** Call `watcher` with each forward's row count as it is issued; null stops. */
+    watchForwards(watcher: ((rows: number) => void) | null) { forwardWatcher = watcher; },
     release() {
-      graph.forwardHidden = forwardHidden; graph.logitsFromHidden = logitsFromHidden;
       releaseWeights();
     },
   };
@@ -510,7 +528,7 @@ describe.skipIf(!inputs)("sliding-window Universal grammar, grammar proposals an
       { together: false, rows: [{ prompt: "other", fill: "echo" }, { prompt: "short", fill: "strict" }] }]);
   }, 900_000);
 
-  test("a cancelled row leaves its peer equal to its B1 output, and the drained group serves the request again", async () => {
+  test("a cancelled row leaves its peer equal to the same pair uncancelled up to the cancel, and the drained group serves the request again", async () => {
     const cases: [Shape, Request, Request][] = [
       ["grammar", { prompt: "long", grammar: "json" }, { prompt: "short", grammar: "json" }],
       ["jump", { prompt: "long", grammar: "json" }, { prompt: "short", grammar: "json" }],
@@ -518,21 +536,62 @@ describe.skipIf(!inputs)("sliding-window Universal grammar, grammar proposals an
     ];
     for (const [shape, survivor, cancelled] of cases) {
       const label = `${shape} cancellation`;
-      const kept = await env.single(shape, survivor), left = await env.single(shape, cancelled);
+      const left = await env.single(shape, cancelled);
       assert(left.tokens.length > CANCEL_AT, `${label}: the cancelled request ends within ${CANCEL_AT} tokens`);
+      // The same pair, formed, admitted and started as below, with no cancellation.
+      const uncancelled = await env.gateway(shape, fillMode([survivor, cancelled]), 2, async lane => {
+        const peer = await lane.prepare(survivor), other = await lane.prepare(cancelled);
+        const { value, forwards } = await env.traced(false, async () => {
+          lane.hold(true);
+          const outcomes = [peer.start(), other.start()];
+          lane.hold(false);
+          return Promise.all(outcomes);
+        });
+        expect(forwards.some(forward => forward.B === 2), `${label}: the uncancelled rows never shared a forward`).toBe(true);
+        value.forEach((outcome, index) => {
+          expect({ label, index, status: outcome.status, error: String(outcome.error ?? "") })
+            .toEqual({ label, index, status: "fulfilled", error: "" });
+          env.checkFillApplied(`${label} uncancelled row ${index}`, outcome.fill);
+        });
+        return { outcomes: value, forwards };
+      });
+      const [kept, whole] = uncancelled.outcomes;
+      assert(whole!.tokens.length > CANCEL_AT, `${label}: the uncancelled second row ends within ${CANCEL_AT} tokens`);
       const reused = await env.gateway(shape, fillMode([survivor, cancelled]), 2, async lane => {
+        // What the peer had emitted as each forward was issued, so the exact part can
+        // be read once the run ends: the tokens it emitted before the first forward in
+        // which the two pairs differ, all of which came from forwards both pairs ran
+        // identically on identical state.
+        const emitted: { tokens: number; spans: number }[] = [];
         const peer = await lane.prepare(survivor), gone = await lane.prepare(cancelled, { cancelAt: CANCEL_AT });
+        env.watchForwards(() => { emitted.push({ tokens: peer.tokens.length, spans: peer.spans.length }); });
         const { value: [kept2, left2], forwards } = await env.traced(false, async () => {
           lane.hold(true);
           const outcomes = [peer.start(), gone.start()];
           lane.hold(false);
           return Promise.all(outcomes);
-        });
+        }).finally(() => env.watchForwards(null));
         expect(forwards.some(forward => forward.B === 2), `${label}: the rows never shared a forward`).toBe(true);
         expect({ label, status: left2!.status, error: String(left2!.error), tokens: left2!.tokens })
-          .toEqual({ label, status: "rejected", error: "Error: client left", tokens: left.tokens.slice(0, CANCEL_AT) });
-        expect({ label, status: kept2!.status, error: String(kept2!.error ?? ""), tokens: kept2!.tokens, spans: kept2!.spans })
-          .toEqual({ label, status: "fulfilled", error: "", tokens: kept.tokens, spans: kept.spans });
+          .toEqual({ label, status: "rejected", error: "Error: client left", tokens: whole!.tokens.slice(0, CANCEL_AT) });
+        // Up to the cancel the peer equals the uncancelled pair's peer; after it, it only completes.
+        const same = (a: Forward, b: Forward) => a.B === b.B && a.L === b.L && JSON.stringify(a.ids) === JSON.stringify(b.ids);
+        const split = forwards.findIndex((forward, index) => !uncancelled.forwards[index] || !same(forward, uncancelled.forwards[index]!));
+        assert(split > 0 && forwards.slice(0, split).some(forward => forward.B === 2),
+          `${label}: the pairs differ from forward ${split}, before they shared one`);
+        // The exact part can be empty: with grammar proposals the short row's first
+        // rounds run before the pair shares a verify round, so it is cancelled before
+        // its peer emits a token, and the pairs differ from the peer's first round.
+        const at = emitted[split]!;
+        console.log(`[sliding] ${label}: the pairs' forwards agree through ${split} of ${forwards.length}; the peer equals ` +
+          `the uncancelled pair's for its first ${at.tokens} of ${kept2!.tokens.length} tokens, finish ${kept2!.finish}`);
+        expect({ label, status: kept2!.status, error: String(kept2!.error ?? ""),
+          tokens: kept2!.tokens.slice(0, at.tokens), spans: kept2!.spans.slice(0, at.spans) })
+          .toEqual({ label, status: "fulfilled", error: "", tokens: kept!.tokens.slice(0, at.tokens), spans: kept!.spans.slice(0, at.spans) });
+        const budget = survivor.grammar ? GRAMMARS[survivor.grammar].maxTokens : FILL_TOKENS;
+        expect({ label, finish: kept2!.finish, withinBudget: kept2!.tokens.length <= budget,
+          atBudgetWhenLength: kept2!.finish !== "length" || kept2!.tokens.length === budget })
+          .toEqual({ label, finish: kept!.finish, withinBudget: true, atBudgetWhenLength: true });
         env.checkFillApplied(`${label} peer`, kept2!.fill);
         await lane.drained();
         // The same group serves the cancelled request again, alone.

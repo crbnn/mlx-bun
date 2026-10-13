@@ -171,7 +171,7 @@ describe("interleaved shared denoising", () => {
   }
 
   const groupModel = { config: { modelType: "diffusion_gemma", text: { enableMoeBlock: false }, eosTokenIds: [] },
-    makeCache: () => [], weightsBytes: 0, requiredDenseKvLayers: [], graphCapabilities: declareGraph({ method: "denoising" }) } as unknown as RuntimeModel;
+    makeCache: () => [], weightsBytes: 0, graphCapabilities: declareGraph({ method: "denoising" }) } as unknown as RuntimeModel;
 
   type Fixture = ReturnType<typeof interleaved>;
   type RowOptions = Pick<BatchRequest, "signal" | "onAdmitted"> & { onToken?: (token: number) => unknown };
@@ -528,7 +528,7 @@ describe("interleaved shared denoising", () => {
     const f = interleaved();
     const model = Object.assign(Object.create(DiffusionGemmaModel.prototype), {
       config: { modelType: "diffusion_gemma", text: { vocabSize: 4, enableMoeBlock: false }, eosTokenIds: [] },
-      canvasLength: 2, embedScale: 1, loraState: f.adapters, weightsBytes: 0, makeCache: () => [], requiredDenseKvLayers: [],
+      canvasLength: 2, embedScale: 1, loraState: f.adapters, weightsBytes: 0, makeCache: () => [],
       // The legacy binding closes an array of disposable caches.
       prefill: (ids: number[]) => {
         const state = f.graph.prefill(ids);
@@ -538,9 +538,9 @@ describe("interleaved shared denoising", () => {
       dequantEmbedWeight: f.graph.dequantEmbedWeight, softEmbeddings: f.graph.softEmbeddings,
     }) as DiffusionGemmaModel;
     const binding = bindMlxGateway(model);
-    const shape = { hasVision: false, hasAdapters: true, hasRepetitionPenalty: false, userSeed: true, kvQuant: false,
-      turboQuant: false, hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
-    const execution = binding.plan(shape, {}, { continuous: binding.cachesBatchable(), quantizedBatch: false, checkpoints: false });
+    const shape = { hasVision: false, hasAdapters: true, hasRepetitionPenalty: false, userSeed: true,
+      hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
+    const execution = binding.plan(shape, {}, { checkpoints: false });
     expect(execution).toMatchObject({ method: "denoising", mechanism: "continuous", promptCache: false });
     const group = binding.createBatchGroup({ maxBatch: 2 });
     try {

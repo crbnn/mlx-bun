@@ -274,13 +274,12 @@ export class ServerProcess {
   }
 }
 
-export interface ProcessRow { pid: number; parentPid: number; groupId: number; rssKiB: number }
-/** Include worker descendants and surviving members of the supervised group. */
+export interface ProcessRow { pid: number; parentPid: number; groupId: number }
+/** Include worker descendants and surviving members of the supervised group (`ps -axo pid=,ppid=,pgid=`). */
 export function processFamily(pid: number, listing: string): ProcessRow[] {
   const rows = listing.trim().split("\n").flatMap(line => {
-    const [id, parentPid, groupId, rssKiB] = line.trim().split(/\s+/).map(Number);
-    return [id, parentPid, groupId, rssKiB].every(Number.isFinite) && id! > 0
-      ? [{ pid: id!, parentPid: parentPid!, groupId: groupId!, rssKiB: rssKiB! }] : [];
+    const [id, parentPid, groupId] = line.trim().split(/\s+/).map(Number);
+    return [id, parentPid, groupId].every(Number.isFinite) && id! > 0 ? [{ pid: id!, parentPid: parentPid!, groupId: groupId! }] : [];
   });
   const owned = new Set([pid]);
   let changed = true;
@@ -292,9 +291,57 @@ export function processFamily(pid: number, listing: string): ProcessRow[] {
   }
   return rows.filter(row => owned.has(row.pid));
 }
-const PROCESS_LIST_ARGS = ["ps", "-axo", "pid=,ppid=,pgid=,rss="];
-export function familyRssMB(pid: number, listing: string): number {
-  return processFamily(pid, listing).reduce((sum, row) => sum + row.rssKiB, 0) / 1024;
+const PROCESS_LIST_ARGS = ["ps", "-axo", "pid=,ppid=,pgid="];
+
+// ---- memory ---------------------------------------------------------------------------
+/** Memory of the process holding the model, read between phases. Not `ps` RSS: on the M1 Max
+ * neither tree pins the model (12 GB is under half the 26.8 GB working set), so the OS drops pages
+ * from a process's RSS without freeing them, and RSS read 5.6 to 8.2 GB for main against 12.0 GB
+ * for the head while both held 10.7 GB (MLX active 10.52 GB, `vmmap` identical; measured on the composition refactor's merge,
+ * bisected 2026-10-12). What a tree holds is its worker's MLX allocator, which the server reports on
+ * `/stats`, and the process's physical footprint. */
+export interface MemoryReading {
+  /** The primary worker's MLX memory from the server's `/stats` (MiB); null where the server reports none (references). */
+  mlxActiveMB: number | null; mlxCacheMB: number | null;
+  /** MLX's high-water mark of active memory since the worker started. */
+  mlxPeakMB: number | null;
+  /** `footprint`'s phys_footprint and phys_footprint_peak (MiB) of `pid`: the worker when `/stats` names one, else the server. */
+  footprintMB: number | null; footprintPeakMB: number | null;
+  pid: number;
+}
+const MIB = 2 ** 20;
+const bytesToMB = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value / MIB : null;
+/** The primary worker of an isolated server's `/stats` (`engine.workers[]`, memory in bytes). */
+export function workerMemory(stats: unknown): { pid: number | null; mlxActiveMB: number | null; mlxCacheMB: number | null; mlxPeakMB: number | null } | null {
+  type Worker = { role?: string; pid?: number | null; memory?: { active_bytes?: number; cache_bytes?: number; peak_bytes?: number } | null };
+  const workers = (stats as { engine?: { workers?: Worker[] } } | null)?.engine?.workers;
+  const worker = Array.isArray(workers) ? workers.find(w => w.role === "primary") ?? workers[0] : undefined;
+  if (!worker) return null;
+  return { pid: typeof worker.pid === "number" && worker.pid > 0 ? worker.pid : null, mlxActiveMB: bytesToMB(worker.memory?.active_bytes),
+    mlxCacheMB: bytesToMB(worker.memory?.cache_bytes), mlxPeakMB: bytesToMB(worker.memory?.peak_bytes) };
+}
+/** `footprint -f bytes --noCategories` output: phys_footprint and phys_footprint_peak. */
+export function parseFootprint(text: string): { footprintMB: number; footprintPeakMB: number | null } | null {
+  const now = /phys_footprint:\s*(\d+)\s*B/.exec(text), peak = /phys_footprint_peak:\s*(\d+)\s*B/.exec(text);
+  return now ? { footprintMB: Number(now[1]) / MIB, footprintPeakMB: peak ? Number(peak[1]) / MIB : null } : null;
+}
+async function footprintOf(pid: number): Promise<{ footprintMB: number; footprintPeakMB: number | null } | null> {
+  try {
+    const child = Bun.spawn(["footprint", "-f", "bytes", "--noCategories", "-p", String(pid)], { stdout: "pipe", stderr: "ignore" });
+    const [text, code] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+    return code === 0 ? parseFootprint(text) : null;
+  } catch { return null; }
+}
+/** One reading: `/stats` for the worker's MLX memory and pid, then the footprint of the worker (else the server). */
+export async function readMemory(base: string, apiKey: string | undefined, serverPid: number): Promise<MemoryReading> {
+  let worker: ReturnType<typeof workerMemory> = null;
+  try {
+    const response = await fetch(`${base}/stats`, { headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {}, signal: AbortSignal.timeout(5_000) });
+    if (response.ok && (response.headers.get("content-type") ?? "").includes("json")) worker = workerMemory(await response.json());
+  } catch { /* a server without /stats: footprint only */ }
+  const pid = worker?.pid ?? serverPid, footprint = await footprintOf(pid);
+  return { mlxActiveMB: worker?.mlxActiveMB ?? null, mlxCacheMB: worker?.mlxCacheMB ?? null, mlxPeakMB: worker?.mlxPeakMB ?? null,
+    footprintMB: footprint?.footprintMB ?? null, footprintPeakMB: footprint?.footprintPeakMB ?? null, pid };
 }
 
 /** MLX libraries the server and its inference workers mapped (lsof), each with its hash.
@@ -350,9 +397,10 @@ export interface RestartDurability {
   failedSpills: number; longestDurablePrefixTokens: number; entries: number;
 }
 export interface CellResult {
-  key: string; readyMs: number; idleRssMB: number;
+  key: string; readyMs: number;
   parity: { completion: ProbeOut; chat: ProbeOut } | null;
-  peakRssMB: number; rssByLeg: Array<[string, number]>;
+  /** Read once the server is ready (idle) and after each phase (by leg). */
+  memory: { idle: MemoryReading; byLeg: Array<[string, MemoryReading]> };
   coldStartMs: number | null;
   restart: null | { readyMs: number; ctxTtftMs: number; cachedTokens: number; durability: RestartDurability | null };
   decodeTps: number[] | null; decodeSpread: number | null; decodeStable: boolean | null;
@@ -396,26 +444,10 @@ export async function runCell(spec: CellSpec, workload: Workload, raw: RawReques
   const assertAlive = () => {
     if (!proc.running) throw new Error(`server exited before ready: code=${proc.exitCode} signal=${proc.signalCode}; ${stderrTail.join("\n").slice(-2000)}`);
   };
-  const sampleRss = (): number => {
-    const r = Bun.spawnSync(PROCESS_LIST_ARGS);
-    return r.exitCode === 0 ? familyRssMB(proc.pid, r.stdout.toString()) : 0;
-  };
-  // The periodic sampler never blocks the event loop that timestamps the streams
-  // (a synchronous ps call would delay observed token times by tens of ms).
-  const sampleRssAsync = async (): Promise<number> => {
-    const ps = Bun.spawn(PROCESS_LIST_ARGS, { stdout: "pipe", stderr: "ignore" });
-    const [text, code] = await Promise.all([new Response(ps.stdout).text(), ps.exited]);
-    return code === 0 ? familyRssMB(proc.pid, text) : 0;
-  };
-  let peakRssMB = 0, legPeakMB = 0, sampling = false;
-  const rssByLeg: Array<[string, number]> = [];
-  const rssTimer = setInterval(() => {
-    if (sampling) return;
-    sampling = true;
-    void sampleRssAsync().then(mb => { if (mb > peakRssMB) peakRssMB = mb; if (mb > legPeakMB) legPeakMB = mb; })
-      .finally(() => { sampling = false; });
-  }, 500);
-  const markLeg = (name: string) => { rssByLeg.push([name, legPeakMB]); legPeakMB = sampleRss(); };
+  // Between phases only, so nothing is streaming while it reads. A short settle lets the worker's
+  // report of the request that just finished reach the server's /stats.
+  const memoryByLeg: Array<[string, MemoryReading]> = [];
+  const markLeg = async (name: string) => { await Bun.sleep(250); memoryByLeg.push([name, await readMemory(base, apiKey, proc.pid)]); };
   const phaseFailures: PhaseFailure[] = [], measured: Phase[] = [];
   let respawnUsed = false, serverDeclaredDead = false;
   /** A server that cannot be joined is fatal: the campaign must not start another cell. */
@@ -473,11 +505,10 @@ export async function runCell(spec: CellSpec, workload: Workload, raw: RawReques
   let failure: unknown;
   try {
     const readyMs = await waitReady(base, apiKey, readyTimeoutMs, assertAlive, options.signal);
-    const idleRssMB = sampleRss();
-    legPeakMB = idleRssMB;
+    const idle = await readMemory(base, apiKey, proc.pid);
     const coldStartMs = await runPhase("warmup", async () =>
       readyMs + (await timedRequest("Warmup: say hello.", 32, { apiKey, modelId, timeoutMs: 600_000 })).ttftMs);
-    markLeg("warmup");
+    await markLeg("warmup");
     // Lazily loading stacks have mapped their libraries by now.
     const loadedLibraries = loadedMlxLibraries(proc.pid, spec.pinnedLibraries);
     const parity = await runPhase("parity", async () => {
@@ -487,7 +518,7 @@ export async function runCell(spec: CellSpec, workload: Workload, raw: RawReques
       return { completion, chat: { text: chat.text, promptTokens: chat.promptTokens, completionTokens: chat.genTokens,
         finishReason: chat.finishReason ?? "" } };
     });
-    markLeg("parity");
+    await markLeg("parity");
     // Fixed-count decode sampling; slow samples are retained, never dropped.
     const decode = await runPhase("decode", async () => {
       const tps: number[] = [];
@@ -496,7 +527,7 @@ export async function runCell(spec: CellSpec, workload: Workload, raw: RawReques
           workload.decodeTokens, { apiKey, modelId, timeoutMs: FIXED_BUDGET_MS })).decodeTps);
       return tps;
     });
-    markLeg("decode");
+    await markLeg("decode");
     const decodeMedianTps = decode ? median(decode) : 0;
     // Cold ~1k TTFT (nonce-busted) then the exact repeat, as one phase.
     const ttft = await runPhase("ttft1k", async () => {
@@ -511,7 +542,7 @@ export async function runCell(spec: CellSpec, workload: Workload, raw: RawReques
       const warm = await timedRequest(lastColdPrompt, 8, { apiKey, modelId, timeoutMs: FIXED_BUDGET_MS });
       return { coldMs, prefill1kTps, warmMs: warm.ttftMs, warmCachedTokens: warm.cachedTokens };
     });
-    markLeg("ttft1k");
+    await markLeg("ttft1k");
     // One long prefill, decode sampled on 64 tokens, two cached repeats.
     let ctxPrompt = "";
     const ctx = workload.withContext ? await runPhase("ctx", async () => {
@@ -528,7 +559,7 @@ export async function runCell(spec: CellSpec, workload: Workload, raw: RawReques
       }
       return { promptTokens: cold.promptTokens, prefillTps, ttftMs: cold.ttftMs, decodeTps, cachedRepeatTtftMs };
     }) : null;
-    markLeg("ctx");
+    await markLeg("ctx");
     // Restart: flush durably (tree servers), stop and join, respawn, resend the long prompt.
     const restart = ctx ? await runPhase("restart", async () => {
       let durability: RestartDurability | null = null;
@@ -550,8 +581,8 @@ export async function runCell(spec: CellSpec, workload: Workload, raw: RawReques
         timeoutMs: scaledBudgetMs(ctx.promptTokens, ctx.prefillTps, CTX_MIN_BUDGET_MS) });
       return { readyMs: readyMs2, ctxTtftMs: after.ttftMs, cachedTokens: after.cachedTokens, durability };
     }) : null;
-    markLeg("restart");
-    // Four concurrent generations; budget is the serial worst case at the measured rate.
+    await markLeg("restart");
+    // Four concurrent generations; budget is the one-after-another worst case at the measured rate.
     const agg = await runPhase("agg", async () => {
       const budget = scaledBudgetMs(workload.aggregateTokens * workload.aggregateStreams, decodeMedianTps, FIXED_BUDGET_MS) +
         (workload.aggregateContext ? scaledBudgetMs(workload.aggregateContext * workload.aggregateStreams,
@@ -578,14 +609,13 @@ export async function runCell(spec: CellSpec, workload: Workload, raw: RawReques
         wallMs: wallS * 1000, arrivalMs, ttftMs: rs.map(r => r.ttftMs), promptTokens: rs.map(r => r.promptTokens),
         cachedTokens: rs.map(r => r.cachedTokens) };
     });
-    markLeg("agg");
+    await markLeg("agg");
     const decodeSpread = decode ? spreadOf(decode) : null;
-    return { key: spec.key, readyMs, idleRssMB, coldStartMs, restart, parity, peakRssMB, rssByLeg,
+    return { key: spec.key, readyMs, coldStartMs, restart, parity, memory: { idle, byLeg: memoryByLeg },
       decodeTps: decode, decodeSpread, decodeStable: decode ? decodeStable(decode, workload.spreadLimit) : null,
       ttft, ctx, agg, phaseFailures, measured, loadedLibraries, processes };
   } catch (error) { failure = error; throw error; }
   finally {
-    clearInterval(rssTimer);
     let unjoined: unknown;
     try { await stopProc(); } catch (error) { unjoined = error; }
     // A cell that fails still reports whether its servers were joined.

@@ -1,18 +1,28 @@
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
-import type { CompiledDecodeCache,DecodeSlot,DecodeStepInputs,DecodeStepPlan,DecodeTrace,KvDonorRows,Mask } from "../contracts/mlx/cache";
-import { createCausalMask } from "../kernels/attention/masks";
-import { concatDecodeSlot } from "./kv";
+import type { AttentionRead,BidirectionalAttentionCache,BlockAttentionCache,CommittedAttentionCache,CompiledDecodeCache,DecodeSlot,DecodeStepInputs,DecodeStepPlan,DecodeTrace,EncoderAttentionCache,KvDonorRows,Mask } from "../contracts/mlx/cache";
+import { Dtype } from "@mlx-bun/mlx/ffi";
+import { bidirMask, createCausalMask } from "../kernels/attention/masks";
+import { concatDecodeSlot, type AffineKernelSet } from "./kv";
 import { RotatingQuantizedKVCache } from "./rotating-quantized-kv";
-import { plainKvStorage } from "./dense-kv-reads";
+import { AttentionMasks, causalLease, decodeByPosition, encoderWindowMask, rotatingBlockMask, sdpaRead, unmaskedLease, withLease, type MaskLease } from "./attention-read";
 
 
 /** Rotating (sliding-window) KV cache — port of mlx-lm RotatingKVCache
  *  with keep=0 (gemma4's configuration): a ring buffer of max_size
  *  entries, so decode attends over at most the window. RoPE offsets use
- *  the true position; masks use the buffer-clamped offset. */
-export class RotatingKVCache implements CompiledDecodeCache {
-  readonly denseKvReads = plainKvStorage;
+ *  the true position; masks use the buffer-clamped offset.
+ *
+ *  Reads: the sliding window is `maxSize`, the window every graph passes for
+ *  the layers it gives this cache. Decode writes in place at the ring head and
+ *  attends the whole ring with no mask (eviction enforces the window). A window
+ *  writes by concatenation, in temporal order, and attends under the causal
+ *  mask, materialized with the sliding window once the window binds. Both use
+ *  the stock fused SDPA, as the graphs do after `updateAndFetch` today, which
+ *  picks the in-place write for one position and concatenation otherwise. The
+ *  method picks here, so a one-row window concatenates: the same bits until the
+ *  ring wraps, a different key order after. */
+export class RotatingKVCache implements CompiledDecodeCache, CommittedAttentionCache, BidirectionalAttentionCache, EncoderAttentionCache, BlockAttentionCache {
   declare minimumReusableOffset?: number;
   static readonly STEP = 256;
   /** Set only by compiled-decode trace adapters (see Cache). */
@@ -23,11 +33,107 @@ export class RotatingKVCache implements CompiledDecodeCache {
   #idx = 0;
   readonly maxSize: number;
 
-  constructor(maxSize: number) {
+  constructor(
+    maxSize: number,
+    /** The per-forward masks of the model this cache belongs to. Row layouts
+     * made from this cache (`state/layout`) share them. */
+    readonly masks = new AttentionMasks(),
+  ) {
     this.maxSize = maxSize;
   }
 
   signature(): string { return "kv:rotating-plain"; }
+
+  appendDecode(k: MlxArray, v: MlxArray): AttentionRead {
+    const [keys, values] = this.#updateInPlace(k, v);
+    return sdpaRead(keys, values, unmaskedLease);
+  }
+
+  appendWindow(k: MlxArray, v: MlxArray): AttentionRead {
+    return withLease(this.#windowMask(k.shape[2]!), mask => {
+      const [keys, values] = this.#updateConcat(k, v);
+      return sdpaRead(keys, values, mask);
+    });
+  }
+
+  /** A committed span, one decode per position (`decodeByPosition`): the
+   * in-place ring write and read each position would get. */
+  appendCommitted(k: MlxArray, v: MlxArray): AttentionRead {
+    return decodeByPosition(this, k, v);
+  }
+
+  /** Gemma 4's vision prefill read on a sliding layer: `bidirMask` with this
+   * cache's window over a first window, then the fused SDPA. */
+  appendBidirectional(k: MlxArray, v: MlxArray, bidirectional: MlxArray): AttentionRead {
+    const L = k.shape[2]!;
+    const mask = this.masks.lease(`bidirectional:${this.maxSize}`, `${L}`,
+      () => bidirMask(L, this.maxSize, bidirectional), bidirectional);
+    return withLease(mask, held => {
+      const [keys, values] = this.#updateConcat(k, v);
+      return sdpaRead(keys, values, held);
+    });
+  }
+
+  /** DiffusionGemma's vision encoder read on a sliding layer, as its encoder
+   * computes it: the window's concatenating append (every position kept, even
+   * past `maxSize`), then the fused SDPA under the encoder window's mask
+   * (`encoderWindowMask`), which this cache's window does not limit. */
+  appendEncoderWindow(k: MlxArray, v: MlxArray, bidirectional: MlxArray): AttentionRead {
+    return withLease(encoderWindowMask(this.masks, k.shape[2]!, bidirectional), mask => {
+      const [keys, values] = this.#updateConcat(k, v);
+      return sdpaRead(keys, values, mask);
+    });
+  }
+
+  /** DiffusionGemma's canvas read on a sliding layer, as its decoder computes
+   * it: the live window in temporal order, cut to the newest `maxSize - 1`
+   * positions once it is full, then the block's keys and values. The mask is
+   * the decoder's (stored positions past the window start and the whole block),
+   * sliced to the kept columns. */
+  readBlock(k: MlxArray, v: MlxArray): AttentionRead {
+    let [storedK, storedV] = this.temporalView();
+    const window = Math.max(this.maxSize - 1, 0);
+    const storedLength = storedK.shape[2]!;
+    const L = k.shape[2]!;
+    const mask = storedLength <= window ? unmaskedLease : this.#blockMask(L, storedLength);
+    let maskArr = mask.mask.arr;
+    const held: MlxArray[] = [storedK, storedV];
+    try {
+      if (window && storedLength > window && this.offset >= storedLength) {
+        storedK = storedK.slice([0, 0, storedLength - window, 0], storedK.shape); held.push(storedK);
+        storedV = storedV.slice([0, 0, storedLength - window, 0], storedV.shape); held.push(storedV);
+        if (maskArr) {
+          const columns = maskArr.shape;
+          maskArr = maskArr.slice([0, 0, 0, columns[3]! - (window + L)], columns);
+        }
+      }
+      const keys = ops.concatAxis([storedK, k], 2);
+      let values: MlxArray;
+      try { values = ops.concatAxis([storedV, v], 2); }
+      catch (error) { keys.dispose(); throw error; }
+      const sliced = maskArr !== mask.mask.arr ? maskArr : null;
+      const mode = maskArr ? "array" : mask.mask.mode;
+      return {
+        attend: (q, scale) => ops.sdpa(q, keys, values, scale, mode, maskArr),
+        dispose() { keys.dispose(); values.dispose(); sliced?.dispose(); mask.release(); },
+      };
+    } catch (error) {
+      if (maskArr !== mask.mask.arr) maskArr?.dispose();
+      mask.release();
+      throw error;
+    } finally { for (const array of held) array.dispose(); }
+  }
+
+  /** The causal mask of a `N`-position window, before its append. */
+  #windowMask(N: number): MaskLease {
+    return rotatingWindowMask(this.masks, this.maxSize, this.offset, N);
+  }
+
+  /** DiffusionGemma's sliding-layer decoder mask over `storedLength` stored
+   * positions and an `N`-position block (`rotatingBlockMask`). */
+  #blockMask(N: number, storedLength: number): MaskLease {
+    return rotatingBlockMask(this.masks, this.maxSize, this.offset, N, storedLength);
+  }
 
   bytesPerToken(): number {
     const steps = this.keys?.shape[2] ?? 0;
@@ -343,9 +449,11 @@ export class RotatingKVCache implements CompiledDecodeCache {
   /** Port of optiq rotating.py _replay_into_quantized: quantize the
    *  whole buffer AS-LAID-OUT (ring order, not temporal order — correct
    *  because ringIdx is preserved with it) into a
-   *  RotatingQuantizedKVCache. */
-  toQuantized(groupSize: number, bits: number): RotatingQuantizedKVCache {
-    const q = new RotatingQuantizedKVCache(this.maxSize, groupSize, bits);
+   *  RotatingQuantizedKVCache, which attends with the kernel set `kernels`
+   *  builds for its bits, group size and this cache's activation dtype. */
+  toQuantized(groupSize: number, bits: number, kernels: AffineKernelSet): RotatingQuantizedKVCache {
+    const q = new RotatingQuantizedKVCache(this.maxSize, groupSize, bits,
+      kernels(bits, groupSize, this.keys?.dtype ?? Dtype.bfloat16), this.masks);
     if (this.keys && this.values) {
       q.keys = ops.quantize(this.keys, groupSize, bits);
       q.values = ops.quantize(this.values, groupSize, bits);
@@ -362,7 +470,20 @@ export class RotatingKVCache implements CompiledDecodeCache {
     this.keys = this.values = null;
     this.offset = 0;
     this.#idx = 0;
+    this.masks.clear();
   }
+}
+
+/** The causal mask of an `N`-position window over a `maxSize` ring holding
+ * `offset` positions, before the window's append: the fused kernel's causal
+ * mask while the window fits, the materialized sliding-window mask once it
+ * binds (`makeMask(N, maxSize)` of the plain and the affine ring). Leased from
+ * `masks` under one family, so plain and affine rings of one model share it. */
+export function rotatingWindowMask(masks: AttentionMasks, maxSize: number, offset: number, N: number): MaskLease {
+  const clamped = Math.min(maxSize - 1, offset);
+  if (clamped + N <= maxSize) return causalLease;
+  return masks.lease(`rotating:${maxSize}`, `${N}:${clamped}`,
+    () => ({ mode: "array", arr: createCausalMask(N, clamped, maxSize) }));
 }
 
 /** The rotating plain cache at steady state inside a compiled decode trace:
@@ -389,6 +510,13 @@ class TracedRingKVCache extends RotatingKVCache implements DecodeTrace {
     this.outs = [updK, updV];
     const whole = (a: MlxArray): MlxArray => a.slice(a.shape.map(() => 0), a.shape);
     return [whole(updK), whole(updV)];
+  }
+
+  /** The decode read over the in-graph write: the whole updated ring with no
+   *  mask, as `RotatingKVCache.appendDecode` reads the ring it writes in place. */
+  override appendDecode(k: MlxArray, v: MlxArray): AttentionRead {
+    const [keys, values] = this.updateAndFetch(k, v);
+    return sdpaRead(keys, values, unmaskedLease);
   }
 }
 

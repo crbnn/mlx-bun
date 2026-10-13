@@ -14,6 +14,21 @@ import type { RuntimeModel } from "../../src/models/factory";
 import type { PromptResponseTrace } from "../../src/runtime/trace";
 import { configureRuntime, createRuntimeConfig, runtimeValue } from "../../src/runtime/config";
 import { declareGraph } from "../../src/models/capabilities";
+import type { Cache } from "../../src/contracts/mlx/cache";
+import type { MlxMixedForward } from "../../src/contracts/mlx/graph";
+import { stubPhases } from "../models/phase-forward";
+import { kvStorage } from "../../src/state/kv-storage";
+import { KvCacheService } from "../../src/state/cache-service";
+import type { PromptCache } from "../../src/state/prefix-cache";
+import { testComposition } from "../models/test-composition";
+
+/** A cache service over `model` whose prefix store is the test's `take` and `put`. */
+const keeping = (model: StandIn, prefixes: { take: PromptCache["take"] | (() => unknown); put: (tokens: number[], caches: Cache[]) => void }) =>
+  new KvCacheService(model, { prefixes: { reclaim() {}, ...prefixes } as unknown as PromptCache });
+
+/** The fixture graph: its one forward and head, which tests replace, and the mixed forward a test may declare. */
+type StandIn = RuntimeModel & { forward(ids: MlxArray, caches: Cache[]): MlxArray; logitsFromHidden(hidden: MlxArray): MlxArray;
+  mixed?: MlxMixedForward };
 
 function fixture() {
   const calls = { allocations: 0, disposals: 0, retains: 0 };
@@ -25,9 +40,12 @@ function fixture() {
     config: { modelType: "fixture", text: { numHiddenLayers: 1, layerTypes: ["full_attention"],
       numGlobalKeyValueHeads: 1, globalHeadDim: 8, slidingWindow: 0 } },
     makeCache() { calls.allocations++; return [new TrackedCache()]; },
-    // Its one layer's keys and values are read plain (updateAndFetch).
-    requiredDenseKvLayers: [0], graphCapabilities: declareGraph({ kv: { denseReads: true } }),
-  } as unknown as RuntimeModel;
+    graphCapabilities: declareGraph(),
+    // Every phase runs the fixture's one forward and head, which a test replaces (late-bound).
+    forward(): MlxArray { throw new Error("unexpected forward"); },
+    logitsFromHidden(): MlxArray { throw new Error("unexpected projection"); },
+    ...stubPhases((ids, caches) => model.forward(ids, caches), hidden => model.logitsFromHidden(hidden)),
+  } as unknown as StandIn;
   const request: BatchRequest = { promptIds: [0, 1], maxTokens: 1, eosTokenIds: [],
     sample() { throw new Error("unexpected sampling"); }, onToken() { throw new Error("unexpected output"); } };
   return { calls, model, request, TrackedCache };
@@ -40,7 +58,8 @@ test("admission callback failure rejects the removed request instead of losing i
     await expect(group.submit({ ...f.request, onAdmitted() { throw new Error("admission failed"); } }))
       .rejects.toThrow("admission failed");
     expect(group.pendingRows).toBe(0);
-    expect(f.calls.allocations).toBe(1); // constructor's empty prototype only
+    // The constructor's empty prototype and the cache service's admission probe only.
+    expect(f.calls.allocations).toBe(2);
   } finally { await group.close(); }
 });
 
@@ -58,23 +77,25 @@ test("lazy batch construction and admission execute under the captured runtime",
       seen.push(runtimeValue("MLX_BUN_GRAMMAR"));
       throw new Error("admission failed");
     } })).rejects.toThrow("admission failed");
-    expect(seen).toEqual(["bound", "bound"]);
+    // The constructor's prototype, the cache service's admission probe, and admission itself.
+    expect(seen).toEqual(["bound", "bound", "bound"]);
     expect(runtimeValue("MLX_BUN_GRAMMAR")).toBe("host");
   } finally { await group.close(); restore(); }
 });
 
 test("failure after prefix acquisition releases both caches and backing retention", async () => {
   const f = fixture();
-  const group = new MlxBatchExecutionGroup(f.model, { maxBatch: 2, promptCache: {
+  const group = new MlxBatchExecutionGroup(f.model, { maxBatch: 2, cache: keeping(f.model, {
     take() { return { tokens: [0], caches: [new f.TrackedCache()], retain: () => { f.calls.retains++; } }; },
     put() { throw new Error("failed state must not be stored"); },
-  } });
+  }) });
+  // The lookup span closes after the cache service handed the prefix over.
   const trace = { begin(phase: string) {
-    return () => { if (phase === "prefill.batch_setup") throw new Error("setup failed"); };
+    return () => { if (phase === "cache.lookup_restore") throw new Error("setup failed"); };
   } } as unknown as PromptResponseTrace;
   try {
     await expect(group.submit({ ...f.request, trace })).rejects.toThrow("setup failed");
-    expect(f.calls.disposals).toBe(2); // prototype plus acquired prefix
+    expect(f.calls.disposals).toBe(3); // prototype, admission probe and acquired prefix
     expect(f.calls.retains).toBe(1);
     expect(group.activeRows + group.pendingRows).toBe(0);
   } finally { await group.close(); }
@@ -96,22 +117,22 @@ test("an uncapped request reaches execution and an actual forward failure releas
   const f = fixture();
   const events: string[] = [];
   let locked = false;
-  f.model.forwardHidden = () => { events.push("forward"); throw new Error("forward failed"); };
+  f.model.forward = () => { events.push("forward"); throw new Error("forward failed"); };
   const group = new MlxBatchExecutionGroup(f.model, { maxBatch: 2,
     lock: { async acquire() { locked = true; return () => { locked = false; }; } },
-    promptCache: {
+    cache: keeping(f.model, {
       take() {
         expect(locked).toBe(true);
         events.push("take");
         return { tokens: [0], caches: [new f.TrackedCache()], retain: () => { f.calls.retains++; } };
       },
       put() { throw new Error("failed state must not be stored"); },
-    },
+    }),
   });
   try {
     await expect(group.submit({ ...f.request, maxTokens: Infinity })).rejects.toThrow("forward failed");
     expect(events).toEqual(["take", "forward"]);
-    expect(f.calls.disposals).toBe(2);
+    expect(f.calls.disposals).toBe(3); // prototype, admission probe and acquired prefix
     expect(f.calls.retains).toBe(1);
     expect(group.activeRows + group.pendingRows).toBe(0);
   } finally { await group.close(); }
@@ -188,7 +209,7 @@ test("forward-state compatibility groups rows independently of method and cache 
   try {
     const requests = ["grid-a", "grid-a", undefined, "grid-b", "grid-b"].map((key, row) =>
       group.submit({ ...f.request, promptIds: [row + 1], maxTokens: 4, onToken() {}, method,
-        ...(key ? { promptInput: { forward: unused, decodeState: { key, forward: unused } } } : {}),
+        ...(key ? { promptInput: { prefill: unused, decodeState: { key, decode: unused } } } : {}),
       }));
     held = false; group.kick();
     await Promise.all(requests);
@@ -201,7 +222,7 @@ test("forward-state compatibility groups rows independently of method and cache 
 
 test.each([undefined, 7])("ordinary prefill and method hosts share a captured chunk setting, explicit=%s", async explicit => {
   const f = fixture(), chunks: number[] = [], observed: number[] = [];
-  f.model.forwardHidden = ids => { chunks.push(ids.shape[1]!); throw new Error("observed first chunk"); };
+  f.model.forward = ids => { chunks.push(ids.shape[1]!); throw new Error("observed first chunk"); };
   const runtime = createRuntimeConfig({ MLX_BUN_RD_PREFILL_CHUNK: "3" });
   const ordinary = new MlxBatchExecutionGroup(f.model, { maxBatch: 2, runtime, prefillChunkSize: explicit });
   const method = new MlxBatchExecutionGroup(f.model, { maxBatch: 2, runtime, prefillChunkSize: explicit });
@@ -226,8 +247,8 @@ test("automatic request chunks reach ordinary and grouped preparation without re
   Object.assign(f.model.config.text, { numHiddenLayers: 2, numAttentionHeads: 24,
     globalHeadDim: 256, headDim: 256, layerTypes: ["linear_attention", "full_attention"] });
   // A recurrent-attention graph declares its bounded prefill workspace.
-  Object.assign(f.model, { graphCapabilities: declareGraph({ kv: { denseReads: true }, prefill: { boundedWorkspace: true } }) });
-  f.model.forwardHidden = ids => { chunks.push(ids.shape[1]!); throw new Error("observed chunk"); };
+  Object.assign(f.model, { graphCapabilities: declareGraph({ prefill: { boundedWorkspace: true } }) });
+  f.model.forward = ids => { chunks.push(ids.shape[1]!); throw new Error("observed chunk"); };
   const runtime = createRuntimeConfig({});
   const ordinary = new MlxBatchExecutionGroup(f.model, { maxBatch: 2, runtime });
   const method = new MlxBatchExecutionGroup(f.model, { maxBatch: 2, runtime });
@@ -348,7 +369,7 @@ test("failure after method state admission retires only the admitted row", async
 
 test("ordinary preparation admits a cohort before its first shared forward and rejects all members on failure", async () => {
   const f = fixture(), shapes: number[][] = [];
-  f.model.forwardHidden = ids => { shapes.push([...ids.shape]); throw new Error("cohort forward failed"); };
+  f.model.forward = ids => { shapes.push([...ids.shape]); throw new Error("cohort forward failed"); };
   const group = new MlxBatchExecutionGroup(f.model, { maxBatch: 3, prefillChunkSize: 4,
     lock: { async acquire() { return () => {}; } },
   });
@@ -368,12 +389,12 @@ test("a request arriving during a forward joins the next prefill chunk", async (
   const f = fixture(), shapes: number[][] = [];
   let late: Promise<unknown> | undefined;
   const group = new MlxBatchExecutionGroup(f.model, { maxBatch: 2, prefillChunkSize: 4 });
-  f.model.forwardHidden = (ids, caches) => {
+  f.model.forward = (ids, caches) => {
     shapes.push([...ids.shape]);
     if (shapes.length > 1) throw new Error("observed staggered batch");
     late = group.submit({ ...f.request, promptIds: Array(9).fill(2) }).catch(error => error);
     using kv = ops.zeros([1, 1, 4, 8], Dtype.float32);
-    const [k, v] = caches[0]!.updateAndFetch(kv, kv); k.dispose(); v.dispose();
+    const [k, v] = kvStorage(caches[0]!).updateAndFetch(kv, kv); k.dispose(); v.dispose();
     return ops.zeros([1, 4, 8], Dtype.float32);
   };
   try {
@@ -390,12 +411,12 @@ test("a nearly completed prefill keeps its admission weight until it retires", a
   const f = fixture(), shapes: number[][] = [];
   let late: Promise<unknown> | undefined;
   const group = new MlxBatchExecutionGroup(f.model, { maxBatch: 2, prefillChunkSize: 4, prefillBatchTokenLimit: 20 });
-  f.model.forwardHidden = (ids, caches) => {
+  f.model.forward = (ids, caches) => {
     shapes.push([...ids.shape]);
     if (shapes.length > 1) throw new Error("observed separate preparation");
     late = group.submit({ ...f.request, promptIds: Array(9).fill(2) }).catch(error => error);
     using kv = ops.zeros([1, 1, 4, 8], Dtype.float32);
-    const [k, v] = caches[0]!.updateAndFetch(kv, kv); k.dispose(); v.dispose();
+    const [k, v] = kvStorage(caches[0]!).updateAndFetch(kv, kv); k.dispose(); v.dispose();
     return ops.zeros([1, 4, 8], Dtype.float32);
   };
   try {
@@ -413,33 +434,36 @@ test("a nearly completed prefill keeps its admission weight until it retires", a
 test.each(["finish", "cancel", "consumer", "grammar"])("mixed work preserves row ownership and completion through %s", async mode => {
   const f = fixture();
   const { captureKvAttention } = await import("../../src/state/kv-attention-view");
+  const { unfusedAffineKernels } = await import("../../src/state/affine-attention");
   const { PromptResponseTrace } = await import("../../src/runtime/trace");
-  type TokenGroup = import("../../src/contracts/mlx/token-work").TokenGroup;
+
   const shapes: number[][][] = [], outputs: number[][] = [[], [], []];
   const failures: unknown[] = [], siblings: Promise<unknown>[] = [];
   const controller = new AbortController();
   let accepted = 0, readied = 0;
   const grammar = { isTerminated: false, accept() { accepted++; }, async ready() { readied++; } } as unknown as NonNullable<BatchRequest["grammar"]>;
-  const forward: RuntimeModel["forwardHidden"] = (ids, caches) => {
+  const forward: StandIn["forward"] = (ids, caches) => {
     const [batch, count] = ids.shape;
     using reshaped = ops.reshape(ids, [batch!, 1, count!, 1]);
     using zeros = ops.zeros([batch!, 1, count!, 8], Dtype.float32);
     using expanded = ops.add(reshaped, zeros);
     using kv = expanded.astype(Dtype.float32);
     for (const cache of caches) {
-      const view = cache.attentionState?.appendAndFetch(kv, kv) ?? captureKvAttention(cache, kv, kv);
+      const view = kvStorage(cache).attentionState?.appendAndFetch(kv, kv) ?? captureKvAttention(cache, kv, kv, unfusedAffineKernels(4, 64, kv.dtype));
       view.dispose();
     }
     return ops.zeros([batch!, count!, 8], Dtype.float32);
   };
-  f.model.forwardHidden = forward;
+  f.model.forward = forward;
   f.model.logitsFromHidden = hidden => ops.copyOf(hidden);
-  (f.model as RuntimeModel & { forwardHiddenMixed(groups: readonly TokenGroup[]): import("@mlx-bun/mlx/array").MlxArray[] }).forwardHiddenMixed = groups => {
+  // The fixture graph declares a mixed forward: each group in its own phase over its own caches.
+  f.model.mixed = groups => {
     shapes.push(groups.map(group => [...group.ids.shape]));
-    return groups.map(group => forward(group.ids, group.cache));
+    return groups.map(group => forward(group.ids, group.state));
   };
-  const group = new MlxBatchExecutionGroup(f.model, { maxBatch: 4, prefillChunkSize: 32,
-    runtime: createRuntimeConfig({ MLX_BUN_MIXED_PREFILL: "1", MLX_BUN_MIXED_TOKEN_BUDGET: "9" }) });
+  // Its composition turns the mixed iteration on, nine prompt tokens beside the decode rows.
+  (f.model as { composition?: unknown }).composition = testComposition(undefined, { mixedPrefill: true, mixedTokenBudget: 9 });
+  const group = new MlxBatchExecutionGroup(f.model, { maxBatch: 4, prefillChunkSize: 32 });
   const request = (index: number): BatchRequest => ({
     promptIds: Array.from({ length: index ? 31 + index : 5 }, (_, t) => t + index * 100),
     maxTokens: index ? 3 : 12, eosTokenIds: [], sample: logits => ops.argmaxAxis(logits, -1),
@@ -470,24 +494,20 @@ test.each(["finish", "cancel", "consumer", "grammar"])("mixed work preserves row
 });
 
 
-test("the forced-span binding requires the graph's dense-read layers as distinct indices within its caches", () => {
-  const f = fixture();
-  expect(() => bindGrammarGroupRequests(f.model, undefined as never, 1)).toThrow(TypeError);
-  // The fixture's graph has one cache layer.
-  for (const layers of [[-1], [0.5], [0, 0], [1]]) expect(() => bindGrammarGroupRequests(f.model, layers, 1), String(layers)).toThrow(RangeError);
-  expect(bindGrammarGroupRequests(f.model, [0], 1)({}).key).toBe("grammar-forced-span");
+test("the forced-span binding names its method", () => {
+  expect(bindGrammarGroupRequests(fixture().model)({}).key).toBe("grammar-forced-span");
 });
 
 function grammarGroupFixture() {
   const f = fixture();
   const forwards: { owner: number; ids: number[] }[] = [];
   const owners = new Map<import("../../src/contracts/mlx/cache").Cache, number>();
-  f.model.forwardHidden = (ids, caches) => {
+  f.model.forward = (ids, caches) => {
     const tokens = ids.toIntTokens();
     if (!owners.has(caches[0]!)) owners.set(caches[0]!, owners.size);
     forwards.push({ owner: owners.get(caches[0]!)!, ids: tokens });
     using kv = MlxArray.fromFloat32(new Float32Array(tokens.length * 8), [1, 1, tokens.length, 8]);
-    const results = caches[0]!.updateAndFetch(kv, kv);
+    const results = kvStorage(caches[0]!).updateAndFetch(kv, kv);
     for (const result of results) result.dispose();
     return MlxArray.fromFloat32(Float32Array.from(tokens), [1, tokens.length, 1]);
   };
@@ -497,10 +517,7 @@ function grammarGroupFixture() {
     ids.forEach((token, index) => { values[index * 16 + (token + 1) % 16] = 20; });
     return MlxArray.fromFloat32(values, [1, ids.length, 16]);
   };
-  // The graph reads its one layer's keys and values plain. The binding keeps
-  // its own copy: a layer the caller adds later would refuse every row.
-  const layers = [0], method = bindGrammarGroupRequests(f.model, layers, 1);
-  layers.push(1);
+  const method = bindGrammarGroupRequests(f.model);
   const request = (forcedIds: number[], terminal = false, overrides: import("../../src/generation/index").GenerateOptions = {}) => {
     let jumped = false, terminated = false, disposed = 0;
     const accepted: number[] = [], tokens: number[] = [];
@@ -530,7 +547,7 @@ for (const cancel of ["none", "callback-false", "abort-false", "abort-last"] as 
     const f = grammarGroupFixture(), first = f.request([3, 4], true), peer = f.request([3, 4, 5], true);
     const stored: { tokens: number[]; caches: import("../../src/contracts/mlx/cache").Cache[] }[] = [];
     const group = new MlxBatchExecutionGroup(f.model, { maxBatch: 2, prefillChunkSize: 1,
-      promptCache: { take: () => null, put(tokens, caches) { stored.push({ tokens: [...tokens], caches }); } } });
+      cache: keeping(f.model, { take: () => null, put(tokens, caches) { stored.push({ tokens: [...tokens], caches }); } }) });
     const abort = new AbortController(), reason = new Error("cancel forced publication");
     let simultaneous = false;
     const matchers = [first.grammar, peer.grammar];
@@ -579,7 +596,7 @@ test("forced-span pending disposal failure rejects without publishing final cach
   const f = grammarGroupFixture(), first = f.request([3, 4]), peer = f.request([3, 4, 5], true);
   const stored: { tokens: number[]; caches: import("../../src/contracts/mlx/cache").Cache[] }[] = [];
   const group = new MlxBatchExecutionGroup(f.model, { maxBatch: 2, prefillChunkSize: 1,
-    promptCache: { take: () => null, put(tokens, caches) { stored.push({ tokens: [...tokens], caches }); } } });
+    cache: keeping(f.model, { take: () => null, put(tokens, caches) { stored.push({ tokens: [...tokens], caches }); } }) });
   const original = ops.asyncEvalAll;
   const failure = new Error("pending dispose failed");
   let injected = false;
@@ -675,8 +692,8 @@ for (const failCleanup of [false, true]) {
     peer.input.promptIds = [8, 1];
     const abort = new AbortController(), reason = new Error("abort between advances"), cleanup = new Error("cancelled cache cleanup failed");
     let owner: KVCache | undefined, releases = 0;
-    const forward = f.model.forwardHidden.bind(f.model);
-    f.model.forwardHidden = (ids, caches) => {
+    const forward = f.model.forward.bind(f.model);
+    f.model.forward = (ids, caches) => {
       const hidden = forward(ids, caches);
       if (!owner) {
         owner = caches[0] as KVCache;

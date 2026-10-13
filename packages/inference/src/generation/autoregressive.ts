@@ -18,12 +18,12 @@ synchronize
 import * as ops from "@mlx-bun/mlx/ops";
 import { appendFileSync } from "node:fs";
 import { type Cache } from "../contracts/mlx/cache";
+import { widthClass, type MlxKnownSpans } from "../contracts/mlx/graph";
 import { nextPrefillStep } from "../contracts/portable/prefill";
 import {
 assertMlxAutoregressiveBinding,
-supportsCommittedAppendCache,
 type MlxAutoregressiveBinding,
-type MlxDecodeStep,type MlxTokenAppend
+type MlxDecodeStep
 } from "./bindings/autoregressive";
 import { runtimeConfig,type RuntimeConfig } from "../runtime/config";
 import { appendFillHidden } from "./fill-append";
@@ -37,9 +37,9 @@ readStepExtras,
 stepExtrasArrays,
 type StepExtras
 } from "../sampling/index";
-import { createKvMaintenance } from "../state/kv-maintenance";
+import { BF16_KV, COMPOSITION_DEFAULTS, type KvStorageScheme } from "../contracts/portable/composition";
 import { maybePageKv } from "../state/request-policy";
-import { isRotatingPlainCache } from "../state/capabilities";
+import { rollbackVerifyBlock, rollsBackVerifyBlock } from "../state/rollback";
 import {
 fillTraceEnabled,
 fillTracePath,
@@ -50,12 +50,14 @@ type Proposal
 import { Generation } from "./result";
 import { GenerateDiagnostics,GenerateOptions,GenerateStats,GeneratedToken } from "./types";
 
+/** Jump-forward decoding for this request under a composition whose
+ * `grammarJump` is `composed`: grammar requests that return no logprobs. */
 export function shouldUseGrammarJump(
   options: Pick<GenerateOptions, "grammar" | "logprobs" | "topLogprobs">,
-  runtime: RuntimeConfig = runtimeConfig(),
+  composed: boolean = COMPOSITION_DEFAULTS.grammarJump,
 ): boolean {
   return options.grammar !== undefined &&
-    runtime.flag("MLX_BUN_GRAMMAR_JUMP", false) &&
+    composed &&
     !options.logprobs &&
     !(options.topLogprobs && options.topLogprobs > 0);
 }
@@ -63,36 +65,24 @@ export function shouldUseGrammarJump(
 /** Composition gate for token fast-forwarding, enforced inside the engine
  *  The serving planner owns request-level eligibility, including explicit
  *  seeds in serial execution and mounted draft models. Shared strict fill
- *  has its own grouped method and uses the same append-format declaration.
+ *  has its own grouped method. The composition's KV scheme is no gate: every
+ *  cache lego takes known tokens, one position at a time or through the
+ *  graph's committed spans.
  *   - grammar: forced-token production is the grammar's job; two producers in
  *     one iteration is forbidden (asserted in the loop).
  *   - logprobs/top_logprobs: injected tokens are never sampled, so they have
  *     no distribution row (same rule as shouldUseGrammarJump).
- *   - promptEmbeddings: vision/audio prompts (and mRoPE) — untested shape.
- *   - affine KV: the model's append binding declares its supported formats.
- *     Verify-policy quantized appends remain a separate gate. */
+ *   - promptEmbeddings: vision/audio prompts (and mRoPE) — untested shape. */
 export function shouldUseFill(
-  options: Pick<
-    GenerateOptions,
-    "fill" | "grammar" | "logprobs" | "topLogprobs" | "promptEmbeddings"
-    | "kvBits" | "kvConfig" | "turboQuant"
-  >,
+  options: Pick<GenerateOptions, "fill" | "grammar" | "logprobs" | "topLogprobs" | "promptEmbeddings">,
   runtime: RuntimeConfig = runtimeConfig(),
-  append?: Pick<MlxTokenAppend, "affineKvBits" | "turboQuantFormats"> | null,
 ): boolean {
   if (!options.fill) return false;
   if (resolveFillMode(runtime.value("MLX_BUN_FILL") ?? "off") === "off") return false;
   return options.grammar === undefined &&
     !options.logprobs &&
     !(options.topLogprobs && options.topLogprobs > 0) &&
-    options.promptEmbeddings === undefined &&
-    supportsCommittedAppendCache(append, options);
-}
-
-/** Compatibility entry point for callers that perform a single conversion.
- * Execution sessions compose createKvMaintenance once and reuse it. */
-export function maybeQuantizeKv(cache: Cache[], options: GenerateOptions): void {
-  createKvMaintenance(options)(cache);
+    options.promptEmbeddings === undefined;
 }
 
 /** The rewind surface a verify-policy fill needs. `Cache` declares the
@@ -149,7 +139,7 @@ async function* generateInner(
 
   try {
     assertMlxAutoregressiveBinding(binding);
-    if (options.promptEmbeddings && !binding.forwardEmbeddings)
+    if (options.promptEmbeddings && !binding.prefillEmbeddings)
       throw new Error("AR binding does not support prompt embeddings");
     if (options.adapters?.length && !binding.adapters)
       throw new Error("AR binding does not support adapters");
@@ -157,8 +147,7 @@ async function* generateInner(
     options.grammar?.dispose();
     throw error;
   }
-  const graph = binding.graph;
-  const maintainKv = createKvMaintenance(options);
+  const phases = binding.phases;
 
   // logprobs capture (mlx_lm.server semantics — see GenerateOptions.logprobs).
   // Everything below is gated: when neither flag is set, no extra ops, evals,
@@ -186,7 +175,9 @@ async function* generateInner(
   const ownsCache = !options.cache;
   const resuming = options.initialPendingToken !== undefined;
   let cache: Cache[] = options.cache ?? [];
-  let appender: MlxTokenAppend | null = null;
+  // The composition's KV scheme, which every request stores.
+  const kv = binding.kv ?? BF16_KV;
+  let appender: MlxKnownSpans | null = null;
   try {
     if (ownsCache) cache = binding.makeCache();
     if (!cache.length) throw new Error("AR binding returned an empty cache");
@@ -200,10 +191,11 @@ async function* generateInner(
       );
     // Replace fresh full-attention caches before any forward. The deepest
     // write is prompt + maxTokens - 1, so capacity covers every decode step.
-    maybePageKv(cache, options, promptTokens.length + maxTokens);
-    appender = options.fill ? binding.createAppend?.({
-      hasAdapters: !!options.adapters?.length, pagedKv: !!options.pagedKv,
-    }) ?? null : null;
+    maybePageKv(cache, kv, binding.pagedKv ?? null, promptTokens.length + maxTokens);
+    // Committed known-token spans, where the graph declares them and the run
+    // mounts no adapter; otherwise known tokens append one position at a time.
+    appender = options.fill && binding.knownSpans && !options.adapters?.length
+      ? binding.knownSpans : null;
   } catch (error) {
     if (ownsCache) for (const state of cache) state.dispose();
     stepSampler.dispose();
@@ -216,7 +208,7 @@ async function* generateInner(
   // Token fast-forwarding gate (see shouldUseFill). Sliding-window layers take
   // part: a multi-token append is one concat write, and a rejected verify tail
   // leaves the ring by the bypass trim that write allows (see rewind below).
-  const fillOn = shouldUseFill(options, runtime, appender);
+  const fillOn = shouldUseFill(options, runtime);
   const fillTrace = fillOn && fillTraceEnabled();
   const fillTraceFile = fillOn ? fillTracePath() : null;
   // Verify-policy proposals (echo tier) need the rejected tail rewound. That
@@ -225,9 +217,7 @@ async function* generateInner(
   // restore a pre-round snapshot and bit-exactly replay the accepted prefix.
   // A model whose caches can do neither still gets assert-policy fills; verify
   // proposals are dropped and counted (stats.verifyUnsupported).
-  const verifyCapable = fillOn && !options.kvBits && !options.kvConfig?.length && !options.turboQuant && cache.every(
-    (c) => c.isTrimmable() || isRotatingPlainCache(c) || typeof rewindable(c).specRoundRollback === "function",
-  );
+  const verifyCapable = fillOn && rollsBackVerifyBlock(kv, cache);
   closeBatchSetup?.();
 
   // logits [1,1,V] → sampled token array [1] (+ optional logprob capture,
@@ -359,8 +349,6 @@ async function* generateInner(
     nextPending = null;
     disposeStepExtras(nextExtras);
     nextExtras = null;
-    // Conversion runs at the ordinary committed-token boundary as well.
-    maintainKv(cache);
 
     let checkpointMs = 0;
     let roundOpen = false;
@@ -374,28 +362,27 @@ async function* generateInner(
     let hf: MlxArray | null = null;
     let logitsAll: MlxArray | null = null;
     try {
+      // A committed span stops at any composed cache's pending transition,
+      // which that cache then runs inside its append.
       const chunkSize = (state: readonly Cache[]) => {
         const maxChunk = Math.min(appender?.maxChunkSize(state) ?? 1,
-          maintainKv.maxAppendTokens?.(state) ?? Number.POSITIVE_INFINITY);
+          ...state.map(c => c.maxAppendTokens?.() ?? Number.POSITIVE_INFINITY));
         return fill.appendChunkSize > 0 ? Math.min(fill.appendChunkSize, maxChunk) : maxChunk;
       };
-      const committedGraph = appender ? appender.forwardHidden.bind(appender) : graph.forwardHidden.bind(graph);
-      const forwardCommitted = maintainKv.maxAppendTokens ? async (ids: MlxArray, state: Cache[]) => {
-        const hidden = await committedGraph(ids, state);
-        try { maintainKv(state); return hidden; }
-        catch (error) { hidden.dispose(); throw error; }
-      } : committedGraph;
-      hf = await appendFillHidden(
-        verify ? graph.forwardHidden.bind(graph) : forwardCommitted,
-        cache, ids, verify ? () => ids.length : chunkSize,
-      );
+      // A verified proposal is one verify window (one position decodes); an
+      // asserted span appends known tokens, through the committed read under
+      // the graph's known spans, one decoded position at a time otherwise.
+      const forward = (part: MlxArray, state: Cache[], positions: number) => positions === 1 && (verify || !appender)
+        ? phases.decode(1)(part, state, null)
+        : verify ? phases.verify(1, positions)(part, state, null) : phases.known(positions)(part, state);
+      hf = await appendFillHidden(forward, cache, ids, verify ? () => ids.length : chunkSize);
       const [, Lf, Hf] = hf.shape as [number, number, number];
       let pred: number[] | null = null;
       if (verify || fillTraceFile) {
         // Free logits: this forward already computed every span position's
         // hidden state. argmax at j is the model's continuation after ids[j],
         // so it verifies ids[j+1]. (Under assert this readback is trace-only.)
-        logitsAll = graph.projectLogits(hf, { type: "all" });
+        logitsAll = phases.logits(ids.length)(hf);
         const argmax = ops.argmaxAxis(logitsAll, -1);
         pred = argmax.toIntTokens();
         argmax.dispose();
@@ -409,20 +396,9 @@ async function* generateInner(
         traceProposal(proposal, generatedNow, accepted, [inFlight, ...pred.slice(0, ids.length - 1)]);
       const t1 = performance.now();
       if (accepted < ids.length) {
-        // Trimmable caches drop the rejected tail; recurrent caches restore
-        // their pre-round snapshot and bit-exactly replay the accepted prefix
-        // (Cache.specRoundRollback — the same primitive
-        // packages/inference/src/generation/speculative/run.ts
-        // uses after its accept walk).
-        for (const c of cache) {
-          const rc = rewindable(c);
-          if (rc.specRoundRollback) rc.specRoundRollback(accepted);
-          // A ring stops being trimmable once it wraps, but the verify block
-          // was one concat write that keeps the newest window-1 positions plus
-          // the block in temporal order: dropping its rejected tail leaves at
-          // least the window (accepted >= 1).
-          else rc.trim(ids.length - accepted, isRotatingPlainCache(c));
-        }
+        // The state drops the rejected tail (trim, a ring's rollback trim, or
+        // a recurrence's restore and replay).
+        rollbackVerifyBlock(cache, accepted, ids.length);
         roundOpen = false;
       } else if (roundOpen) {
         for (const c of cache) rewindable(c).specRoundCommit?.();
@@ -447,7 +423,7 @@ async function* generateInner(
           logits = logitsAll.slice([0, accepted - 1, 0], [1, accepted, V]);
         } else {
           const hLast = hf.slice([0, Lf - 1, 0], [1, Lf, Hf]);
-          logits = graph.projectLogits(hLast, { type: "all" });
+          logits = phases.logits(1)(hLast);
           hLast.dispose();
         }
         const sn = sampleStep(logits, willGen);
@@ -494,13 +470,7 @@ async function* generateInner(
       closePrefill?.();
       tDecode = performance.now();
     } else {
-    // ---- prefill ----
-    const closeInitialKv = diagnostics.trace?.begin("prefill.kv_maintenance", {
-      mechanism: diagnostics.mechanism ?? "serial",
-      boundary: "initial",
-    });
-    maintainKv(cache);
-    closeInitialKv?.();
+    // ---- prefill ---- (composed caches convert inside their own appends)
     tPrefill = performance.now();
     let h0: MlxArray;
     if (options.promptEmbeddings) {
@@ -511,9 +481,9 @@ async function* generateInner(
       // e2b/e4b need the spliced token ids to build per-layer inputs
       // (multimodal soft-token positions zeroed inside forwardEmbeddings).
       const embedIds = ops.fromInt32(promptTokens, [1, promptTokens.length]);
-      h0 = binding.forwardEmbeddings!(
+      h0 = binding.prefillEmbeddings!(
         options.promptEmbeddings, cache, options.imageMask ?? null, embedIds,
-        options.multimodalMask ?? null,
+        options.multimodalMask ?? null, widthClass(promptTokens.length),
       );
       embedIds.dispose();
     } else {
@@ -521,9 +491,8 @@ async function* generateInner(
       const snapshotAt = options.onPrefillDone && options.snapshotAt !== undefined
         ? Math.min(Math.max(options.snapshotAt, cachedTokens), promptTokens.length)
         : undefined;
-      const tailSplit = runtime.flag("MLX_BUN_PREFILL_TAIL_SPLIT", true);
-      const forward = graph.forwardHidden.bind(graph);
-      const maintain = () => maintainKv(cache);
+      const tailSplit = binding.prefillTailSplit ?? COMPOSITION_DEFAULTS.prefillTailSplit;
+
       while (true) {
         options.signal?.throwIfAborted();
         const step = nextPrefillStep({ length: promptTokens.length, position: pos,
@@ -534,7 +503,7 @@ async function* generateInner(
           tokens: step.end - step.start, ...(step.kind === "final" ? { final: true } : {}),
         });
         let hidden: MlxArray | null;
-        try { hidden = await executeMlxPrefillStep(forward, cache, promptTokens, step, maintain); }
+        try { hidden = await executeMlxPrefillStep(phases, cache, promptTokens, step); }
         finally { closeChunk?.(); }
         pos = step.end;
         if (hidden) { h0 = hidden; break; }
@@ -557,7 +526,7 @@ async function* generateInner(
     const [, L0, H] = h0.shape as [number, number, number];
     const hLast = h0.slice([0, L0 - 1, 0], [1, L0, H]);
     h0.dispose();
-    const logits0 = graph.projectLogits(hLast, { type: "all" });
+    const logits0 = phases.logits(1)(hLast);
     hLast.dispose();
     const s0 = sampleStep(logits0, 0); // token array [1] (+ optional extras)
     pending = s0.tok;
@@ -575,23 +544,22 @@ async function* generateInner(
     }
 
     // ---- decode (pipelined) ----
-    // Selection and transactional fallback belong to the graph's binding.
-    decoder = options.decodePolicy?.compiledDecode === false ? null : binding.createDecode?.({
-      hasAdapters: !!options.adapters?.length, pagedKv: !!options.pagedKv,
-    }) ?? null;
+    // The compiled step is the graph binding's, chosen once for this run's caches; it has no fallback.
+    decoder = options.decodePolicy?.compiledDecode === false ? null
+      : binding.createDecode?.({ hasAdapters: !!options.adapters?.length }) ?? null;
     let stop = false;
     /** Token id read eagerly at the top of the loop for grammar (reused for
      *  the yield, avoiding a second readback). -1 when grammar is off — the
      *  pipelined path keeps its deferred itemUint32 below. */
     let grammarTok = -1;
-    // Jump-forward decoding (opt-in, MLX_BUN_GRAMMAR_JUMP=1; serial lane
-    // only — the batch lane's #stepGrammar doesn't jump yet): when the
-    // grammar forces a unique continuation, emit its retokenized ids without
+    // Jump-forward decoding in this direct loop (opt-in, the composition's
+    // grammarJump; the scheduler's grammar rows jump through the span method
+    // the planner binds): when the grammar forces a unique continuation, emit its retokenized ids without
     // per-token forwards — ONE multi-token forward carries them into the KV
     // (see GrammarController.jumpForward for the contract + the fidelity
     // note on why this is opt-in). Excluded when logprobs are requested
     // (jumped tokens are never sampled, so they'd have no logprobs rows).
-    const grammarJump = options.decodePolicy?.grammarJump ?? shouldUseGrammarJump(options, runtime);
+    const grammarJump = options.decodePolicy?.grammarJump ?? shouldUseGrammarJump(options, binding.grammarJump);
     // Yield token zero before its own decode forward. The captured runtime
     // keeps this scheduling choice stable across consumer awaits.
     const earlyFirstToken = runtime.flag("MLX_BUN_EARLY_FIRST_TOKEN", true) &&
@@ -667,13 +635,12 @@ async function* generateInner(
         // into the KV (they are all committed content — jumpForward's
         // contract); the next sampled token, if the budget and grammar allow
         // one, comes from its last position. Compiled decode resumes on the
-        // following iteration (supports() re-checks the grown caches).
-        maintainKv(cache);
+        // following iteration over the same caches.
         pushHistory(cur);
         stepSampler.commitNumbers(jumpEmit);
         const chunk = [grammarTok, ...jumpEmit];
         const willGen = stepIndex + 1 + jumpEmit.length;
-        await appendGrammarSpan(graph, cache, chunk,
+        await appendGrammarSpan(phases, cache, chunk,
           ids => { forwarded.push(...ids); },
           willGen < maxTokens && !options.grammar!.isTerminated ? logits => {
             const sampled = sampleStep(logits, willGen);
@@ -682,20 +649,15 @@ async function* generateInner(
           } : undefined);
         if (nextPending) ops.asyncEvalAll([nextPending, ...stepExtrasArrays(nextExtras)]);
       } else if (stepIndex + 1 < maxTokens && !options.grammar?.isTerminated) {
-        maintainKv(cache);
         pushHistory(cur);
-        let logits: MlxArray | null = null;
+        let logits: MlxArray;
         let evalWith: MlxArray[] = [];
-        const decoded = decoder?.tryStep(cur, cache);
-        if (decoded) {
-          logits = decoded.logits;
-          evalWith = decoded.evalWith;
-        }
-        if (!logits) {
+        if (decoder) ({ logits, evalWith } = decoder.step(cur, cache));
+        else {
           const ids = ops.reshape(cur, [1, 1]);
-          const h = await graph.forwardHidden(ids, cache);
+          const h = await phases.decode(1)(ids, cache, null);
           ids.dispose();
-          logits = graph.projectLogits(h, { type: "all" });
+          logits = phases.logits(1)(h);
           h.dispose();
         }
         const sn = sampleStep(logits, stepIndex + 1);
@@ -834,10 +796,9 @@ async function* generateInner(
       // hit folds the token into an M>1 prefill and changes native reductions.
       // Aborted requests and caches owned by this run need no retained state.
       if (!ownsCache && !threw && !options.signal?.aborted && earlyUnforwardedToken !== null) {
-        maintainKv(cache);
         const ids = ops.reshape(pending!, [1, 1]);
         try {
-          const hidden = await graph.forwardHidden(ids, cache);
+          const hidden = await phases.decode(1)(ids, cache, null);
           try { evalCacheState(cache); }
           finally { hidden.dispose(); }
         } finally { ids.dispose(); }

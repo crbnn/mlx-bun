@@ -1,6 +1,6 @@
 // Opt-in with real weights: Gemma2 plain-KV generation continuation through the
 // app's own serving composition, as `serve --ssd-cache DIR --generation-checkpoint 4`
-// builds it: createCacheServices, configureContinuation, and the app engine's
+// builds it: createCacheServices (the cache service) and the app engine's
 // gateway place/run with checkpoints enabled. Runs only with MLX_BUN_TEST_NATIVE=1
 // and MLX_BUN_APP_TEST_GEMMA2_MODEL naming a cached gemma2 snapshot (for example
 // mlx-community/gemma-2-2b-it-4bit); loads the model natively on the GPU. The SSD
@@ -22,12 +22,13 @@
 // the comparison against main run outside the repository. This is preservation
 // within the tree, not an external-oracle claim, and no cross-version checkpoint
 // compatibility is promised.
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { Cache } from "@mlx-bun/inference/contracts/mlx";
+import { ContinuationPersistence, SsdCacheStore, type KvCacheService } from "@mlx-bun/inference/state";
 import type { GenerateOptions } from "@mlx-bun/inference/generation";
 import type { RequestShape } from "../../src/engine/completion";
 
@@ -69,53 +70,62 @@ test.skipIf(!native || !modelDir)("Gemma2 plain-KV generation checkpoints surviv
       const options = (): GenerateOptions => ({ maxTokens, prefillChunkSize: 512, eosTokenIds: [], seed: 42,
         seedWasExplicit: true, ...sampling });
       const requestShape: RequestShape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false,
-        userSeed: true, kvQuant: false, turboQuant: false, hasLogitsExtras: false, hasGrammar: false,
+        userSeed: true, hasLogitsExtras: false, hasGrammar: false,
         wantsLogprobs: false, hasDraft: false, ...shape };
-      /** One serve lifetime over `dir`: cache services, continuation, engine, one request, close. */
+      /** One serve lifetime over `dir`: the cache service, engine, one request, close. The
+       * service's checkpoint writer and saved-state store are observed through their classes. */
       const serve = async (dir: string, interrupt: boolean) => {
         const binding = await modelServingBinding(context);
-        const caches = await createCacheServices(context, binding, { ssdCacheDir: dir, generationCheckpointTokens: interval });
-        const store = caches.checkpoints!, persistence = caches.continuationServices.checkpointPersistence!;
         const snapshots: Snapshot[] = [], removed: string[] = [], restored: { tokens: number[]; kv: string }[] = [];
-        const enqueue = persistence.enqueue.bind(persistence);
-        persistence.enqueue = (attempt, state, meta) => {
-          snapshots.push({ key: meta.key, tokens: [...state.cacheTokens], generatedTokens: meta.generatedTokens,
-            pendingToken: meta.pendingToken, seed: meta.seed, seedWasExplicit: meta.seedWasExplicit, kv: digest(state.caches) });
-          enqueue(attempt, state, meta);
-        };
-        const removeRecords = store.removeGenerationCheckpoints.bind(store);
-        store.removeGenerationCheckpoints = key => { removed.push(key); removeRecords(key); };
-        const restore = store.restore.bind(store);
-        store.restore = (entry, model) => {
-          const loaded = restore(entry, model);
-          if (loaded) restored.push({ tokens: [...loaded.tokens], kv: digest(loaded.caches) });
-          return loaded;
-        };
-        binding.gateway.configureContinuation!(caches.continuationServices);
-        let flushed: Awaited<ReturnType<typeof caches.close>> | undefined;
+        const enqueue = ContinuationPersistence.prototype.enqueue, removeRecords = SsdCacheStore.prototype.removeGenerationCheckpoints;
+        const restore = SsdCacheStore.prototype.restore;
+        const spies = [
+          spyOn(ContinuationPersistence.prototype, "enqueue").mockImplementation(function (this: ContinuationPersistence, attempt, state, meta) {
+            snapshots.push({ key: meta.key, tokens: [...state.cacheTokens], generatedTokens: meta.generatedTokens,
+              pendingToken: meta.pendingToken, seed: meta.seed, seedWasExplicit: meta.seedWasExplicit, kv: digest(state.caches) });
+            enqueue.call(this, attempt, state, meta);
+          }),
+          spyOn(SsdCacheStore.prototype, "removeGenerationCheckpoints").mockImplementation(function (this: SsdCacheStore, key) {
+            removed.push(key); removeRecords.call(this, key);
+          }),
+          spyOn(SsdCacheStore.prototype, "restore").mockImplementation(function (this: SsdCacheStore, entry, model) {
+            const loaded = restore.call(this, entry, model);
+            if (loaded) restored.push({ tokens: [...loaded.tokens], kv: digest(loaded.caches) });
+            return loaded;
+          }),
+        ];
+        const { cache, adapterNamespace } = await createCacheServices(context, binding, { ssdCacheDir: dir, generationCheckpointTokens: interval });
+        let flushed: Awaited<ReturnType<typeof cache.close>> | undefined;
         const engine = await createAppEngine(context, { capacity: 4, binding, ownership: "borrowed",
-          gateway: { checkpoints: true, stateCodecs: caches.stateCodecs, kvScheme: caches.resolvedKvScheme,
-            promptCache: caches.promptCache, adapterNamespace: caches.adapterNamespace },
-          beforeModelDispose: async () => { flushed = await caches.close(); } });
+          gateway: { cache, adapterNamespace },
+          beforeModelDispose: async () => { flushed = await cache.close(); } });
         const tokens: number[] = [], abort = new AbortController();
         let outcome: unknown;
         try {
           const placement = engine.gateway.place(requestShape, options());
           expect(placement.execution).toMatchObject({ method: "autoregressive", mechanism: "continuous",
-            promptCache: true, checkpoint: true, fill: false, pagedKv: false });
+            promptCache: true, checkpoint: true, fill: false });
           outcome = await engine.gateway.run(prompt, options(), token => {
             tokens.push(token);
             if (interrupt && tokens.length === interruptAt) abort.abort(new Error("interrupted by test"));
           }, undefined, requestShape, placement, abort.signal).then(stats => stats, error => error);
-        } finally { await engine.close(); }
+        } finally {
+          try { await engine.close(); } finally { for (const spy of spies) spy.mockRestore(); }
+        }
         return { tokens, outcome, snapshots, removed, restored, flushed };
       };
-      /** A fresh store over `dir`: the generation record a restart would select. */
+      /** A fresh cache service over `dir`: the generation record a restart would select, read from the
+       * saved-state store it scanned. */
       const durable = async (dir: string, key: string) => {
         const binding = await modelServingBinding(context);
-        const caches = await createCacheServices(context, binding, { ssdCacheDir: dir, generationCheckpointTokens: interval });
-        try { return caches.checkpoints!.findGenerationCheckpoint(prompt, key, ""); }
-        finally { expect((await caches.close()).durable).toBe(true); }
+        let store: SsdCacheStore | undefined;
+        const scan = SsdCacheStore.prototype.scan;
+        const spy = spyOn(SsdCacheStore.prototype, "scan").mockImplementation(function (this: SsdCacheStore) { store = this; return scan.call(this); });
+        let cache: KvCacheService;
+        try { ({ cache } = await createCacheServices(context, binding, { ssdCacheDir: dir, generationCheckpointTokens: interval })); }
+        finally { spy.mockRestore(); }
+        try { return store!.findGenerationCheckpoint(prompt, key, ""); }
+        finally { expect((await cache.close()).durable).toBe(true); }
       };
 
       const controlDir = join(root, `${name}-control`), restartDir = join(root, `${name}-restart`);

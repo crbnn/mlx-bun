@@ -2,11 +2,12 @@ import {captureSpeculativeOptions, speculativePrefixNamespace} from "../generati
 import type { MlxTokenGraph } from "../models/graph";
 import type { GenerateOptions } from "../generation/index";
 import type { FillSession, Proposal } from "../generation/fill/session";
-import type { DraftProvider, DraftRowGroup, DraftPrefillGroup } from "../generation/speculative/source";
+import type { DraftProvider, DraftRowGroup, DraftPrefillGroup, DraftSelection } from "../generation/speculative/source";
 import type { DraftRowCheckpoint } from "../contracts/mlx/draft-checkpoint";
 import { makeSampler, makeStepSampler, readStepExtras, type NumberStepSampler, type Sampler } from "../sampling/index";
-import { draftSamplerOptions, greedyDraftPolicy } from "../generation/speculative/draft-policy";
-import { configuredDraftVocabulary, makeSubsetDraftSampler, type DraftVocabularyHead, type SubsetDraftSampler } from "../generation/speculative/draft-vocab";
+import { draftSamplerOptions } from "../generation/speculative/draft-policy";
+import { COMPOSITION_DEFAULTS } from "../contracts/portable/composition";
+import { makeSubsetDraftSampler, type DraftVocabularyHead, type SubsetDraftSampler } from "../generation/speculative/draft-vocab";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import { clearCache } from "@mlx-bun/mlx/ffi";
@@ -19,12 +20,12 @@ import { leaseCacheStates } from "../state/leases";
 import { bindSpeculativeTargetModel, type MlxSpeculativeTargetBinding } from "../generation/speculative/bindings/binding";
 import { bindLegacyDraftTarget } from "../generation/speculative/bindings/draft-target";
 import { bindRowCacheRollback } from "../state/rollback";
-import { createKvMaintenance } from "../state/kv-maintenance";
 import { disposeAttachments } from "../state/checkpoint";
 import { type CheckpointAttachment } from "../contracts/mlx/checkpoint";
 import { advanceSpeculativeOutputs } from "../generation/speculative/round";
 import { AdaptiveDraftGate } from "../generation/speculative/adaptive-draft-gate";
 import { MlxPrefillRows, type MlxPrefillState } from "./prefill-rows";
+import { prefillPhase } from "../contracts/portable/prefill";
 import type { MlxForwardWork } from "../contracts/mlx/forward-work";
 import type { MlxGroupMethodHost, MlxGroupMethodRequest, MlxGroupPreparation, MlxGroupedMethod, Row } from "./batch-types";
 
@@ -51,21 +52,37 @@ export function bindSpeculativeGroupRequests(model: MlxTokenGraph, provider: Pic
   if (adaptiveDepth && !model.verifyRoundCosts)
     throw new Error("adaptive draft depth needs a graph that declares its measured verify costs (verifyRoundCosts)");
   const binding = bindSpeculativeTargetModel(model);
+  // The target's ports, viewed only for a provider that asks about them.
+  let view: ReturnType<typeof bindLegacyDraftTarget> | undefined;
+  const target = () => view ??= bindLegacyDraftTarget(model, []);
   // Resolved once for this target into a snapshot the binding owns: the checked
   // list cannot change afterwards, and prefill and decode rows must tap exactly it.
-  const taps = Object.freeze([...(provider.grouped?.targetTapLayers?.(bindLegacyDraftTarget(model, [])) ?? [])]);
+  const taps = Object.freeze([...(provider.grouped.targetTapLayers?.(target()) ?? [])]);
   if (!binding.supportsTapLayers(taps)) return undefined;
+  // The selection's composition facts, resolved once for this target: argmax
+  // drafts (the composition's `greedyDraft`), else the vocabulary the provider
+  // declares for it.
+  const greedy = (model.composition ?? COMPOSITION_DEFAULTS).greedyDraft;
+  const listed = greedy ? null : provider.grouped.draftVocabulary?.(target()) ?? null;
   return (input: GenerateOptions): MlxGroupMethodRequest => {
     const options = captureSpeculativeOptions(input);
+    // The request's selection, resolved once here: the listed vocabulary only
+    // when its draft sampler reproduces there. Rows sharing a group share it, so
+    // the draft rows bind one selection operation when they open.
+    const selection: GroupSelection = greedy ? { kind: "greedy" }
+      : listed && makeSubsetDraftSampler(draftSamplerOptions(options, false)) ? { kind: "listed", ids: listed } : { kind: "sampled" };
     return {
-      key: JSON.stringify(["speculative", provider.id, depth, adaptiveDepth, options.kvBits ?? null,
-        options.kvGroupSize ?? 64, options.quantizedKvStart ?? null, options.turboQuant ?? null,
-        ...(options.kvConfig?.length ? [options.kvConfig] : [])]),
+      // The KV scheme is the composition's, shared by every request.
+      key: JSON.stringify(["speculative", provider.id, depth, adaptiveDepth, selection.kind]),
       data: options,
-      open: host => new SpeculativeGroup(host, model, provider, binding, depth, taps, adaptiveDepth),
+      open: host => new SpeculativeGroup(host, model, provider, binding, depth, taps, adaptiveDepth, selection),
     };
   };
 }
+
+/** The draft selection one group's requests share, before the group binds its rows' draws. */
+type GroupSelection = { readonly kind: "sampled" } | { readonly kind: "greedy" } |
+  { readonly kind: "listed"; readonly ids: readonly number[] };
 
 /** Rows must tap exactly the target layers resolved for their provider at binding time. */
 function declaredTaps<Rows extends { readonly tapLayers: readonly number[]; dispose(): void }>(
@@ -88,7 +105,7 @@ class SpeculativeGroup implements MlxGroupedMethod {
 
   constructor(readonly host: MlxGroupMethodHost, readonly model: MlxTokenGraph,
     readonly provider: Pick<DraftProvider, "id" | "grouped">, readonly binding: MlxSpeculativeTargetBinding, readonly depth: number,
-    readonly taps: readonly number[], adaptiveDepth: boolean) {
+    readonly taps: readonly number[], adaptiveDepth: boolean, readonly selection: GroupSelection) {
     this.#gate = adaptiveDepth ? new AdaptiveDraftGate(model.verifyRoundCosts!, { maxDraftTokens: depth }) : null;
   }
 
@@ -105,8 +122,7 @@ class SpeculativeGroup implements MlxGroupedMethod {
 
   prepare(first: Row): MlxGroupPreparation {
     const method = this;
-    const options = first.req.method!.data as GenerateOptions;
-    const maintain = createKvMaintenance(options);
+    const maintain = this.host.kvMaintenance;
     interface Preparation extends MlxPrefillState {
       request: RequestState;
       end: number;
@@ -137,13 +153,13 @@ class SpeculativeGroup implements MlxGroupedMethod {
       let caches: Cache[] = [], attachments: CheckpointAttachment[] = [];
       try {
         caches = snapshot(); attachments.push(prefix!.capture(index).attachment);
-        method.host.promptCache!.put(state.row.req.promptIds.slice(0, state.pos), caches,
-          state.request.namespace, undefined, attachments, state.row.req.cacheSessionId);
+        method.host.cache.publish(state.row.req, state.request.namespace, state.row.req.promptIds.slice(0, state.pos),
+          { caches, attachments });
         caches = []; attachments = [];
       } finally { disposeResources([...caches, { dispose: () => disposeAttachments(attachments) }]); }
     };
     const target = new MlxPrefillRows<Preparation>({
-      maintain,
+      maintain, codecs: method.host.cache.codecs,
       open(row) {
         const options = row.req.method!.data as GenerateOptions;
         row.spec = { drafted: 0, accepted: 0, targetCalls: 0, rejected: 0, rounds: 0,
@@ -152,11 +168,12 @@ class SpeculativeGroup implements MlxGroupedMethod {
         // The verifier accepts a draft only when the TARGET's own sample equals
         // it, so the output distribution never depends on how drafts are chosen;
         // the argmax of the head's estimate maximizes the expected match.
-        const sampler = makeSampler(draftSamplerOptions(options));
-        const request: RequestState = { draftSampling: sampler, draftSubset: makeSubsetDraftSampler(draftSamplerOptions(options)),
+        const draftOptions = draftSamplerOptions(options, method.selection.kind === "greedy");
+        const sampler = makeSampler(draftOptions);
+        const request: RequestState = { draftSampling: sampler, draftSubset: makeSubsetDraftSampler(draftOptions),
           namespace: "", prefixLength: 0,
-          fill: method.provider.grouped?.supportsExternalTokens ? options.fill : undefined,
-          processed: method.host.promptCache ? [] : undefined,
+          fill: method.provider.grouped.supportsExternalTokens ? options.fill : undefined,
+          processed: method.host.cache.keeps(row.req) ? [] : undefined,
           sampling: makeStepSampler(options, { tokenRepresentation: "number", grammarWait: "before-sample",
             historyUpdate: "after-sample", initialHistory: row.req.promptIds, acceptGrammar: true,
             eosTokenIds: row.req.eosTokenIds, captureSelectedLogprob: options.logprobs === true,
@@ -166,35 +183,39 @@ class SpeculativeGroup implements MlxGroupedMethod {
         let appended = false;
         const previous = prefix?.rowCount ?? 0;
         try {
-          caches = method.binding.makeCache();
-          prefix ??= declaredTaps(method.provider, method.taps,
-            method.provider.grouped!.openPrefill({ target: bindLegacyDraftTarget(method.model, caches), checkpoints: [] }));
+          if (!prefix) {
+            // The draft prefill binds its target view once per preparation, over
+            // fresh caches of the graph that bind and are released.
+            const probe = method.binding.makeCache();
+            try {
+              prefix = declaredTaps(method.provider, method.taps,
+                method.provider.grouped.openPrefill({ target: bindLegacyDraftTarget(method.model, probe), checkpoints: [] }));
+            } finally { disposeResources(probe); }
+          }
           const prompt = row.req.promptIds;
           const pendingPrompt = prefix.prefillMode !== "full" && method.binding.prefillTailSplit && prompt.length > 1;
           request.prefixLength = prompt.length - Number(pendingPrompt);
           request.namespace = speculativePrefixNamespace(prefix.namespace, row.cacheNamespace ?? "", options);
-          const hit = method.host.promptCache?.take(prompt, request.namespace, row.req.cacheSessionId);
-          if (hit) {
+          // The request's state from the cache service: a reused prefix with its
+          // draft state, else fresh state (paged when the composition pages).
+          const acquired = method.host.cache.acquire(row.req, request.namespace);
+          caches = acquired.caches; retained = acquired.retain;
+          if (acquired.reusedTokens) {
             try {
-              disposeResources(caches); caches = hit.caches.splice(0);
-              retained = hit.retain; hit.retain = undefined;
-              prefix.append([{ processedTokens: hit.tokens.length, attachment: hit.attachments![0]! }]);
+              prefix.append([{ processedTokens: acquired.reusedTokens, attachment: acquired.attachments![0]! }]);
               appended = true;
               // Target membership later releases backing leases after its own
               // copies resolve. Settle companion copies under the same lease.
               if (retained) prefix.materialize();
-              row.cachedTokens = hit.tokens.length;
-            } finally { disposeResources([...hit.caches, { dispose: () => disposeAttachments(hit.attachments) },
-              { dispose: () => hit.retain?.() }]); }
+              row.cachedTokens = acquired.reusedTokens;
+            } finally { disposeAttachments(acquired.attachments); }
           } else { prefix.append([null]); appended = true; }
-          // The first forward must read maintained state. A stored prefix can
-          // still owe the conversion its final append reached (a round without
-          // drafts maintains only before its append), so maintain it here.
-          maintain(caches);
+          // The graph's composed caches, or a stored prefix composed again by
+          // the cache service: either converts inside its own appends.
           return { row, request, solo: caches, retain: retained, pos: row.cachedTokens,
             end: request.prefixLength, pendingPrompt, transferred: false, closed: false,
             chunkSize: options.prefillChunkSize ?? row.req.prefillChunkSize ?? method.host.prefillChunkSize,
-            boundary: method.host.promptCache ? Math.min(row.req.snapshotAt ?? prompt.length, prompt.length - 1) : -1 };
+            boundary: method.host.cache.keeps(row.req) ? Math.min(row.req.snapshotAt ?? prompt.length, prompt.length - 1) : -1 };
         } catch (error) {
           return cleanupFailure(error, () => disposeResources([
             { dispose: () => { if (appended) prefix!.filterRows(Array.from({ length: previous }, (_, i) => i)); } },
@@ -203,13 +224,16 @@ class SpeculativeGroup implements MlxGroupedMethod {
         }
       },
       plan(state) {
-        const end = Math.min(state.pos + state.chunkSize, state.end, state.boundary > state.pos ? state.boundary : Infinity);
+        const limit = Math.min(state.end, state.boundary > state.pos ? state.boundary : Infinity);
+        const whole = state.pos + state.chunkSize <= limit;
+        const end = whole ? state.pos + state.chunkSize : limit;
         return { start: state.pos, end, kind: end === state.end ? "final" : "drain",
-          snapshot: end === state.boundary && end > state.row.cachedTokens, batchYield: true, maintain: true };
+          snapshot: end === state.boundary && end > state.row.cachedTokens, batchYield: true, maintain: true,
+          phase: prefillPhase(state.pos, end, whole) };
       },
-      async forward(ids, caches, _states, work) {
+      async forward(ids, caches, _states, step, work) {
         const taps = prefix!.tapLayers;
-        const output = await method.binding.forward(ids, caches, taps.length ? [...taps] : undefined, work);
+        const output = await method.binding.prefill(ids, caches, step, taps.length ? taps : undefined, work);
         context = output.ctxML;
         return output.hidden;
       },
@@ -223,10 +247,10 @@ class SpeculativeGroup implements MlxGroupedMethod {
         } catch (error) { captured?.dispose(); throw error; }
         captured?.dispose();
       },
-      project(hidden, _caches, completed) {
+      project(hidden, _caches, completed, step) {
         if (completed.every(state => state.pendingPrompt)) return null;
         using last = hidden.slice([0, hidden.shape[1]! - 1, 0], [hidden.shape[0]!, hidden.shape[1]!, hidden.shape[2]!]);
-        return method.binding.projectLogits(last);
+        return method.binding.projectLogits(last, step.sequences);
       },
       checkpoint: capture,
       async complete(state, logits, index) {
@@ -238,14 +262,14 @@ class SpeculativeGroup implements MlxGroupedMethod {
           const sampled = await state.request.sampling.sample(scores, 0);
           row.current = sampled.token; row.generated = row.sampled = 1;
           if (row.req.eosTokenIds.includes(row.current)) {
-            if (method.host.promptCache) capture(state, () => cloneKvCaches(state.solo), index);
+            if (method.host.cache.keeps(row.req)) capture(state, () => cloneKvCaches(state.solo, method.host.cache.codecs), index);
             disposeResources(state.solo.splice(0)); state.retain?.(); state.retain = undefined;
             method.host.finish(row, "stop"); return;
           }
           const more = await method.host.publish(row, row.current, readStepExtras(sampled.extras));
           state.request.fill?.observe(row.current);
           if (more === false || row.req.grammar?.isTerminated || row.generated >= row.req.maxTokens) {
-            if (method.host.promptCache && !row.req.signal?.aborted) capture(state, () => cloneKvCaches(state.solo), index);
+            if (method.host.cache.keeps(row.req) && !row.req.signal?.aborted) capture(state, () => cloneKvCaches(state.solo, method.host.cache.codecs), index);
             disposeResources(state.solo.splice(0)); state.retain?.(); state.retain = undefined;
             method.host.finish(row, more === false || row.req.grammar?.isTerminated ? "stop" : "length"); return;
           }
@@ -283,11 +307,10 @@ class SpeculativeGroup implements MlxGroupedMethod {
                 state.row.reject(state.row.req.signal.reason);
                 continue;
               }
-              maintain.prepareBatch?.(state.caches);
+              maintain?.prepareBatch?.(state.caches);
               this.#target ??= new MlxStateRows(state.caches.map(targetCacheLayout));
-              this.#draft ??= declaredTaps(this.provider, this.taps, this.provider.grouped!.open({ target: bindLegacyDraftTarget(this.model, this.#target.caches),
-                checkpoints: [], sampling: { sample: (lp, steps) => this.#sampleDraftRows(lp, steps), greedy: greedyDraftPolicy(),
-                  vocabulary: this.#draftVocabulary() },
+              this.#draft ??= declaredTaps(this.provider, this.taps, this.provider.grouped.open({ target: bindLegacyDraftTarget(this.model, this.#target.caches),
+                checkpoints: [], sampling: { sample: (lp, steps) => this.#sampleDraftRows(lp, steps), selection: this.#draftSelection() },
                 constraints: { propose: async (row, maxTokens) => this.host.rows[row]!.req.grammar?.proposeTokens(maxTokens) ?? [] } }));
               applyStateChanges([() => this.#target!.prepareAppend(state.caches),
                 () => this.#draft!.prepareAppend([state.draft]), () => ({ commit: () => {
@@ -311,14 +334,14 @@ class SpeculativeGroup implements MlxGroupedMethod {
     catch (error) { return cleanupFailure(error, () => preparation.dispose()); }
   }
 
-  /** Frequency-ranked draft vocabulary for this model, when configured. */
-  #draftVocabulary() {
-    const vocabSize = (this.model as { config?: { text?: { vocabSize?: number } } }).config?.text?.vocabSize;
-    const ids = vocabSize && !greedyDraftPolicy() ? configuredDraftVocabulary(vocabSize, this.provider.grouped?.artifactDir) : null;
-    if (!ids) return undefined;
-    return { ids, sample: (logits: MlxArray, head: DraftVocabularyHead, steps: readonly number[]): MlxArray | null => {
+  /** The selection this group's requests resolved when they were bound. Under
+   *  `listed` every row's draft sampler reproduces on the subset (the request
+   *  binding keyed its group on that), so each row draws its own coupled token. */
+  #draftSelection(): DraftSelection {
+    const selection = this.selection;
+    if (selection.kind !== "listed") return selection;
+    return { kind: "listed", ids: selection.ids, sample: (logits: MlxArray, head: DraftVocabularyHead, steps: readonly number[]): MlxArray => {
       const rows = this.host.rows.map(row => this.#requests.get(row)!);
-      if (rows.some(request => !request.draftSubset)) return null;
       const tokens: MlxArray[] = [];
       try {
         for (let row = 0; row < rows.length; row++) {
@@ -367,7 +390,6 @@ class SpeculativeGroup implements MlxGroupedMethod {
       return proposals[index]!.length ? [request.fill!] : [];
     }) : [];
     const halted = new Set<Row>();
-    const pin = this.binding.pinVerify?.();
     try {
       const completed = await advanceSpeculativeOutputs(rows.map(row => ({ pending: row.current,
         step: row.sampled, remaining: row.req.maxTokens - row.generated, eosTokenIds: row.req.eosTokenIds,
@@ -398,13 +420,12 @@ class SpeculativeGroup implements MlxGroupedMethod {
             for (const fill of fills) fill.stats.checkpointMs += elapsed;
           },
         },
-        forward: async ids => {
+        forward: async (ids, window) => {
           if (echoDepth) externalTokens = ops.copyOf(ids);
           const taps = this.#draft!.tapLayers;
-          const result = await this.binding.forward(ids, this.#target!.caches, taps.length ? [...taps] : undefined,
-            work ? (tokens, caches, options) => work(tokens, caches, { ...options, preserveTokenGeometry: true }) : undefined);
+          const result = await this.binding.verify(ids, this.#target!.caches, window, taps.length ? taps : undefined, work);
           const context = result.ctxML ?? result.hidden;
-          try { return { logits: this.binding.projectLogits(result.hidden), context }; }
+          try { return { logits: this.binding.projectLogits(result.hidden, window.sequences * window.positions), context }; }
           catch (error) { context.dispose(); throw error; }
           finally { if (result.ctxML) result.hidden.dispose(); }
         },
@@ -475,7 +496,7 @@ class SpeculativeGroup implements MlxGroupedMethod {
       }
       if (keep.length !== rows.length) this.host.filterRows(keep);
       if (++this.#steps % 256 === 0) clearCache();
-    } finally { externalTokens?.dispose(); pin?.close(); }
+    } finally { externalTokens?.dispose(); }
   }
 
   #proposeEcho(row: Row, request: RequestState): void {
@@ -493,13 +514,13 @@ class SpeculativeGroup implements MlxGroupedMethod {
   /** The method aligns token coverage and captures its state. The cache owns
    * RAM retention and eventual SSD persistence; no storage work is awaited. */
   #publishCheckpoint(row: Row, index: number, request: RequestState): void {
-    if (!this.host.promptCache || !request.processed) return;
+    if (!this.host.cache.keeps(row.req) || !request.processed) return;
     let target: Cache[] = [], attachments: CheckpointAttachment[] = [];
     try {
       target = this.#target!.extractRow(index);
       attachments.push(this.#draft!.capture(index).attachment);
-      this.host.promptCache.put([...row.req.promptIds.slice(0, request.prefixLength), ...request.processed], target,
-        request.namespace, undefined, attachments, row.req.cacheSessionId);
+      this.host.cache.publish(row.req, request.namespace,
+        [...row.req.promptIds.slice(0, request.prefixLength), ...request.processed], { caches: target, attachments });
       target = []; attachments = [];
     } finally { disposeResources([...target, { dispose: () => disposeAttachments(attachments) }]); }
   }

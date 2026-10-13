@@ -13,11 +13,15 @@
 // the REAL MlxBatchExecutionGroup with a stub model and asserts finished rows'
 // caches land in the prompt cache keyed by exactly [promptIds + fed].
 
+import { unfusedAffineKernels } from "../../src/state/affine-attention";
 import { afterEach, describe, expect, test } from "bun:test";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import { Dtype } from "@mlx-bun/mlx/ffi";
-import type { Cache } from "../../src/contracts/mlx/cache";
+import type { AttentionCache, Cache } from "../../src/contracts/mlx/cache";
+import { AttentionMasks } from "../../src/state/attention-read";
+import { composedFullAttentionCache } from "../../src/state/bf16-first-kv";
+import { denseTurboQuantKernels } from "../../src/state/turboquant-attention";
 import { KVCache } from "../../src/state/kv";
 import { QuantizedKVCache } from "../../src/state/quantized-kv";
 import { RotatingKVCache } from "../../src/state/rotating-kv";
@@ -27,10 +31,21 @@ import { mergeQuantRows, extractQuantRow, type QuantRow } from "../../src/state/
 import { BatchedRotatingCache } from "../../src/state/batched-rotating";
 import { BatchedRotatingQuantCache } from "../../src/state/batched-rotating-quant";
 import { SSMCache } from "../../src/state/ssm";
-import { KvScheme, resolveKvScheme } from "../../src/state/kv-scheme";
-import { MlxBatchExecutionGroup, type RowPromptCache } from "../../src/execution/batch-group";
+import { resolveKvScheme } from "../../src/state/kv-scheme";
+import { testComposition } from "../models/test-composition";
+import { MlxBatchExecutionGroup } from "../../src/execution/batch-group";
+import { KvCacheService } from "../../src/state/cache-service";
+import type { PromptCache } from "../../src/state/prefix-cache";
+
+/** The prefix store a test observes: what the cache service keeps. */
+type RowPromptCache = Pick<PromptCache, "take" | "put">;
+/** A cache service over `model` keeping prefixes in `prefixes`. */
+const keeping = (model: RuntimeModel, prefixes: RowPromptCache) =>
+  new KvCacheService(model, { prefixes: { reclaim() {}, ...prefixes } as unknown as PromptCache });
 import type { RuntimeModel } from "../../src/models/factory";
 import { declareGraph } from "../../src/models/capabilities";
+import { stubPhases } from "../models/phase-forward";
+import { kvStorage } from "../../src/state/kv-storage";
 
 /** Contiguous raw bytes of a (possibly strided) view, as a plain array. */
 const bytes = (a: MlxArray): number[] => {
@@ -112,7 +127,7 @@ describe("per-row extraction from batched caches (model-free)", () => {
       const k = grid(L, D, (t, d) => val(b, t, d));
       const [rk, rv] = c.updateAndFetch(k, k);
       rk.dispose(); rv.dispose(); k.dispose();
-      return c.toQuantized(GS, BITS);
+      return c.toQuantized(GS, BITS, unfusedAffineKernels);
     });
 
     const dispose3 = (t: QuantRow) => {
@@ -125,7 +140,7 @@ describe("per-row extraction from batched caches (model-free)", () => {
     });
     const m = mergeQuantRows(rows);
     for (const r of rows) dispose3(r);
-    const batched = new QuantizedKVCache(GS, BITS);
+    const batched = new QuantizedKVCache(GS, BITS, unfusedAffineKernels(BITS, GS, Dtype.bfloat16));
     batched.restoreState(m.keys, m.values, m.width);
 
     for (let s = 0; s < 3; s++) {
@@ -237,7 +252,7 @@ describe("per-row extraction from batched caches (model-free)", () => {
       const k = grid(L, D, (t, d) => val(b, t, d));
       const [rk, rv] = c.updateAndFetch(k, k);
       rk.dispose(); rv.dispose(); k.dispose();
-      return c.toQuantized(GS, BITS);
+      return c.toQuantized(GS, BITS, unfusedAffineKernels);
     });
     const dispose3 = (t: QuantRow) => {
       for (const x of [t.keys, t.values])
@@ -247,7 +262,7 @@ describe("per-row extraction from batched caches (model-free)", () => {
       const [tk, tv] = c.temporalView();
       return { keys: tk, values: tv };
     });
-    const batched = BatchedRotatingQuantCache.merge(rows, [...lens], W, GS, BITS);
+    const batched = BatchedRotatingQuantCache.merge(rows, [...lens], W, GS, BITS, unfusedAffineKernels(BITS, GS, Dtype.bfloat16));
     for (const r of rows) dispose3(r);
 
     for (let s = 0; s < 8; s++) {
@@ -409,19 +424,26 @@ const kvFromIds = (ids: MlxArray): MlxArray => {
   return k;
 };
 
-const stubModel = {
+/** A stub whose one forward and head serve every phase, bound to the stub itself. */
+function phased<T extends object>(stub: T): T {
+  type Stub = { forward(ids: MlxArray, caches: Cache[]): MlxArray; logitsFromHidden(h: MlxArray): MlxArray };
+  const out = { ...stub } as T & Stub;
+  return Object.assign(out, stubPhases((ids, caches) => out.forward(ids, caches), h => out.logitsFromHidden(h)));
+}
+
+const stubModel = phased({
   config: {
     modelType: "stub",
     text: { numHiddenLayers: 1, layerTypes: ["full_attention"] },
   },
   weightsBytes: 0,
-  requiredDenseKvLayers: [0], graphCapabilities: declareGraph({ kv: { denseReads: true } }),
+  graphCapabilities: declareGraph(),
   makeCache: (): Cache[] => [new KVCache()],
-  forwardHidden(ids: MlxArray, caches: Cache[]): MlxArray {
+  forward(ids: MlxArray, caches: Cache[]): MlxArray {
     const [B, L] = ids.shape as [number, number];
     const k = kvFromIds(ids);
     for (const c of caches) {
-      const [rk, rv] = c.updateAndFetch(k, k);
+      const [rk, rv] = kvStorage(c).updateAndFetch(k, k);
       rk.dispose(); rv.dispose();
     }
     k.dispose();
@@ -431,7 +453,7 @@ const stubModel = {
     const [B, N] = h.shape as [number, number, number];
     return ops.zeros([B, N, V], Dtype.float32); // argmax → token 0 every step
   },
-} as unknown as RuntimeModel;
+}) as unknown as RuntimeModel;
 
 const soloReplay = (tokens: number[]): KVCache => {
   const c = new KVCache();
@@ -455,60 +477,40 @@ const newGroup = (model: RuntimeModel, opts: ConstructorParameters<typeof MlxBat
 afterEach(async () => { for (const group of groups.splice(0)) await group.close(); });
 
 describe("MlxBatchExecutionGroup per-row extraction (stub model)", () => {
-  test("rejects delayed affine conversion that cannot execute after rows merge", () => {
-    expect(() =>
-      new MlxBatchExecutionGroup(stubModel, {
-        maxBatch: 2,
-        kvScheme: new KvScheme("affine-uniform", { kvBits: 4, quantizedKvStart: 5 }),
-      }),
-    ).toThrow("unsupported KV scheme");
-  });
-
-  test("authoritative kvScheme converts scheduled rows before cache storage", async () => {
-    // This graph reads the quantized planes (updateAndFetchQuantized), so it
-    // declares no plain-KV reads: the scheduler may convert its rows.
-    const quantModel = {
+  test("the composition's KV scheme converts scheduled rows before cache storage", async () => {
+    const scheme = resolveKvScheme({
+      override: "config",
+      config: [{ layerIdx: 0, bits: 4, groupSize: 32 }],
+    });
+    // This graph composes the scheme's lego and reads through its window read,
+    // so it declares no plain-KV reads: the scheduler converts its rows.
+    const quantModel = phased({
       ...stubModel,
-      requiredDenseKvLayers: [],
-      graphCapabilities: declareGraph({ kv: { denseReads: false } }),
-      forwardHidden(ids: MlxArray, caches: Cache[]): MlxArray {
+      composition: testComposition(scheme.storage),
+      makeCache: () => [composedFullAttentionCache(scheme.storage, 0, new AttentionMasks(), denseTurboQuantKernels)],
+      graphCapabilities: declareGraph(),
+      forward(ids: MlxArray, caches: Cache[]): MlxArray {
         const [B, L] = ids.shape as [number, number];
         const f = ids.astype(Dtype.float32);
         const col = ops.reshape(f, [B, 1, L, 1]);
         f.dispose();
-        const k = ops.concatAxis(Array.from({ length: 32 }, () => col), 3);
+        const wide = ops.concatAxis(Array.from({ length: 32 }, () => col), 3);
         col.dispose();
-        for (const cache of caches) {
-          if (cache instanceof QuantizedKVCache) {
-            const [rk, rv] = cache.updateAndFetchQuantized(k, k);
-            for (const tensor of [rk, rv]) {
-              tensor.packed.dispose();
-              tensor.scales.dispose();
-              tensor.biases.dispose();
-            }
-          } else {
-            const [rk, rv] = cache.updateAndFetch(k, k);
-            rk.dispose();
-            rv.dispose();
-          }
-        }
+        const k = wide.astype(Dtype.bfloat16);
+        wide.dispose();
+        for (const cache of caches) (cache as unknown as AttentionCache).appendWindow(k, k).dispose();
         k.dispose();
         return ops.zeros([B, L, HD], Dtype.float32);
       },
-    } as unknown as RuntimeModel;
+    }) as unknown as RuntimeModel;
     const puts: Cache[][] = [];
     const pc: RowPromptCache = {
       take: () => null,
       put: (_tokens, caches) => { puts.push(caches); },
     };
-    const scheme = resolveKvScheme({
-      override: "config",
-      config: [{ layerIdx: 0, bits: 4, groupSize: 32 }],
-    });
     const sched = newGroup(quantModel, {
       maxBatch: 2,
-      kvScheme: scheme,
-      promptCache: pc,
+      cache: keeping(quantModel, pc),
     });
 
     const stats = await sched.submit({
@@ -521,7 +523,9 @@ describe("MlxBatchExecutionGroup per-row extraction (stub model)", () => {
 
     expect(stats.generatedTokens).toBe(1);
     expect(puts).toHaveLength(1);
-    expect(puts[0]![0]).toBeInstanceOf(QuantizedKVCache);
+    // The stored row holds converted storage (a lego's, or the storage a row
+    // layout hands back).
+    expect(puts[0]![0]!.composed?.storage() ?? puts[0]![0]).toBeInstanceOf(QuantizedKVCache);
     for (const caches of puts) for (const cache of caches) cache.dispose();
   }, 30_000);
 
@@ -531,7 +535,7 @@ describe("MlxBatchExecutionGroup per-row extraction (stub model)", () => {
       take: () => null,
       put: (tokens, caches) => { puts.push({ tokens: [...tokens], caches }); },
     };
-    const sched = newGroup(stubModel, { maxBatch: 2, promptCache: pc });
+    const sched = newGroup(stubModel, { maxBatch: 2, cache: keeping(stubModel, pc) });
 
     const promptA = Array.from({ length: 300 }, (_, i) => 1000 + i);
     const promptB = Array.from({ length: 256 }, (_, i) => 2000 + i);
@@ -588,7 +592,7 @@ describe("MlxBatchExecutionGroup per-row extraction (stub model)", () => {
         for (const c of caches) c.dispose();
       },
     };
-    const sched = newGroup(stubModel, { maxBatch: 2, promptCache: pc });
+    const sched = newGroup(stubModel, { maxBatch: 2, cache: keeping(stubModel, pc) });
     const submit = (base: number, maxTokens: number) =>
       sched.submit({
         promptIds: Array.from({ length: 8 }, (_, i) => base + i),
@@ -639,12 +643,12 @@ const ssmUpdate = (ids: MlxArray, c: SSMCache): void => {
   c.advance(L);
 };
 
-const hybridStub = {
+const hybridStub = phased({
   config: { modelType: "stub" },
   weightsBytes: 0,
-  requiredDenseKvLayers: [0], graphCapabilities: declareGraph({ kv: { denseReads: true } }),
+  graphCapabilities: declareGraph(),
   makeCache: (): Cache[] => [new KVCache(), new SSMCache()],
-  forwardHidden(ids: MlxArray, caches: Cache[]): MlxArray {
+  forward(ids: MlxArray, caches: Cache[]): MlxArray {
     const [B, L] = ids.shape as [number, number];
     for (const c of caches) {
       if (c instanceof SSMCache) {
@@ -652,7 +656,7 @@ const hybridStub = {
         continue;
       }
       const k = kvFromIds(ids);
-      const [rk, rv] = c.updateAndFetch(k, k);
+      const [rk, rv] = kvStorage(c).updateAndFetch(k, k);
       rk.dispose(); rv.dispose(); k.dispose();
     }
     return ops.zeros([B, L, HD], Dtype.float32);
@@ -661,7 +665,7 @@ const hybridStub = {
     const [B, N] = h.shape as [number, number, number];
     return ops.zeros([B, N, V], Dtype.float32); // argmax → token 0 every step
   },
-} as unknown as RuntimeModel;
+}) as unknown as RuntimeModel;
 
 describe("MlxBatchExecutionGroup per-row extraction (hybrid stub: KV + SSM)", () => {
   test("finished rows put() exact serial caches for BOTH layer kinds", async () => {
@@ -670,7 +674,7 @@ describe("MlxBatchExecutionGroup per-row extraction (hybrid stub: KV + SSM)", ()
       take: () => null,
       put: (tokens, caches) => { puts.push({ tokens: [...tokens], caches }); },
     };
-    const sched = newGroup(hybridStub, { maxBatch: 2, promptCache: pc });
+    const sched = newGroup(hybridStub, { maxBatch: 2, cache: keeping(hybridStub, pc) });
 
     const promptA = Array.from({ length: 300 }, (_, i) => 1000 + i);
     const promptB = Array.from({ length: 256 }, (_, i) => 2000 + i);

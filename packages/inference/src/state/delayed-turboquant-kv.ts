@@ -1,4 +1,3 @@
-import { turboQuantFusedDecode } from "./turboquant-codec";
 import { captureFullKvDonorRows } from "./full-kv-row-donor";
 import { decodedKvDonorAttention } from "./decoded-kv-donor";
 import { appendFullKvRows } from "./full-kv-row-append";
@@ -6,26 +5,66 @@ import type { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { unrotateValues } from "../kernels/turboquant/ops";
-import { type Cache, type DenseKvReads, type KvMaintenance, type RotatedValueAttentionState } from "../contracts/mlx/cache";
+import { type AttentionRead, type Cache, type CommittedAttentionCache } from "../contracts/mlx/cache";
+import { kvStorage, type RotatedValueAttentionState } from "./kv-storage";
 import { TurboQuantKVCache } from "./turboquant-kv";
 import { BatchedTurboQuantKVCache } from "./batched-turboquant-kv";
 import { FullTransitioningKvRows } from "./full-transitioning-kv-rows";
+import { FullPrefillRow } from "./full-prefill-row";
+import { KVCache } from "./kv";
+import { Bf16FirstTurboQuantKVCache, completeConversion, convertToTurboQuant, transitionDue } from "./bf16-first-kv";
+import type { TurboQuantKernels } from "./turboquant-attention";
 
-/** TurboQuant tensor access and value-domain handling over the shared
- * row-transition lifecycle. Model projections and attention remain batched. */
-export class DelayedTurboQuantKVCache extends FullTransitioningKvRows<BatchedTurboQuantKVCache> implements RotatedValueAttentionState {
-  #rotated: boolean[] = [];
-  /** Answered by the storage and the bound maintenance: a maintenance that
-   * cannot say what it leaves never certifies. */
-  readonly denseKvReads: DenseKvReads | undefined;
-  constructor(readonly kBits: number, readonly vBits: number, readonly start: number,
-    readonly maintain: KvMaintenance, row?: Cache,
-    readonly fusedDecode = turboQuantFusedDecode()) {
-    super({ signature: `kv:delayed-turboquant:${kBits}:${vBits}:${start}`, conversionOffset: start, maintain,
-      converted: row => row instanceof TurboQuantKVCache,
-      makeLayout: () => new BatchedTurboQuantKVCache(kBits, vBits, fusedDecode) }, row);
-    this.denseKvReads = this.denseKvReadsOf(maintain);
+/** The TurboQuant transition of `Bf16FirstTurboQuantKVCache` over
+ * full-attention rows: a bf16 row (`KVCache`, or a padded `FullPrefillRow`
+ * over one) encodes its live window once it holds `start` positions. */
+function settleTurboQuantRows(rows: Cache[], kBits: number, vBits: number, start: number, fusedDecode: boolean): void {
+  for (let index = 0; index < rows.length; index++) {
+    const row = rows[index]!;
+    if (row instanceof FullPrefillRow) {
+      const source = row.turboConversion;
+      if (!source || !transitionDue(source.offset, start)) continue;
+      const offset = source.offset;
+      rows[index] = completeConversion(source.toTurboQuantized(kBits, vBits, fusedDecode), offset, start);
+    } else if (row instanceof KVCache && transitionDue(row.offset, start)) {
+      rows[index] = convertToTurboQuant(row, kBits, vBits, start, fusedDecode);
+    }
   }
+}
+
+/** The rows of the TurboQuant bf16-first lego (`Bf16FirstTurboQuantKVCache`)
+ * for continuous batching: TurboQuant tensor access and value-domain handling
+ * over the shared row-transition lifecycle (when a row converts is described on
+ * `TransitioningKvRows`). Model projections and attention remain batched.
+ * `fusedDecode` is resolved by whoever builds the layout. `turboQuantKernels` is
+ * the read of the graph whose caches these rows hold (dense for Qwen 3.5,
+ * deferred for Gemma 4 and MiniCPM5); the rows this layout makes and the
+ * layout it packs them into carry it, and a converted row attends with its
+ * source's.
+ *
+ * The reads are the graph's call today: this layout's mask before the append
+ * (no sliding window), then the kernel set's fetch and attention. The dense set
+ * fetches every row decoded (`updateAndFetch`) and runs the fused SDPA, Qwen
+ * 3.5's call; the deferred set fetches converted rows rotated
+ * (`updateAndFetchDeferredV`), runs the fused SDPA and applies the value
+ * transform that fetch captured, Gemma 4's and MiniCPM5's. */
+export class DelayedTurboQuantKVCache extends FullTransitioningKvRows<BatchedTurboQuantKVCache>
+  implements RotatedValueAttentionState, CommittedAttentionCache {
+  #rotated: boolean[] = [];
+  constructor(readonly kBits: number, readonly vBits: number, readonly start: number,
+    readonly fusedDecode: boolean, readonly turboQuantKernels: TurboQuantKernels, row?: Cache,
+    /** How the lego these rows came from composes the rows this layout hands
+     * back to serial use (`ComposedStorage.over`). */
+    readonly compose?: (storage: Cache) => Cache) {
+    super({ signature: `kv:delayed-turboquant:${kBits}:${vBits}:${start}`, conversionOffset: start,
+      settle: rows => settleTurboQuantRows(rows, kBits, vBits, start, fusedDecode),
+      converted: row => row instanceof TurboQuantKVCache,
+      makeLayout: () => new BatchedTurboQuantKVCache(kBits, vBits, turboQuantKernels, fusedDecode),
+      lone: storage => new Bf16FirstTurboQuantKVCache(kBits, vBits, start, fusedDecode, turboQuantKernels, undefined, storage),
+      ...(compose ? { compose } : {}) }, row);
+  }
+  /** Rows made for an empty layout carry the graph's read into their conversion. */
+  protected override plainRow(): KVCache { return new KVCache(undefined, this.turboQuantKernels); }
   captureDonorRows(): import("../contracts/mlx/cache").KvDonorRows {
     return this.packed?.captureDonorRows() ?? captureFullKvDonorRows(this.rows, this.leftPad, this.offset);
   }
@@ -33,13 +72,33 @@ export class DelayedTurboQuantKVCache extends FullTransitioningKvRows<BatchedTur
     return decodedKvDonorAttention(this.captureDonorRows());
   }
   get rotatedValueAttention(): RotatedValueAttentionState { return this; }
+
+  appendDecode(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v); }
+  appendWindow(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v); }
+  /** The committed read is the window read: a committed span reads this layout
+   * through the kernel set's fetch and the fused SDPA under the mask the layout
+   * builds, as a window does. */
+  appendCommitted(k: MlxArray, v: MlxArray): AttentionRead { return this.#read(k, v); }
+  /** The read: the mask from this layout before the append (no sliding
+   * window), then the kernel set's fetch and attention. */
+  #read(k: MlxArray, v: MlxArray): AttentionRead {
+    const mask = this.makeMask(k.shape[2]!, null);
+    return this.turboQuantKernels.read({
+      decoded: () => this.updateAndFetch(k, v),
+      rotated: () => {
+        const [keys, values] = this.updateAndFetchDeferredV(k, v);
+        return { keys, values, restore: this.captureValueTransform() };
+      },
+    }, { mask, release: () => mask.arr?.dispose() });
+  }
+
   #append(k: MlxArray, v: MlxArray, deferred: boolean): [MlxArray, MlxArray] {
     this.advance();
     if (this.packed) {
       this.#rotated = Array.from({ length: this.batchSize! }, () => true);
       return deferred ? this.packed.updateAndFetchDeferredV(k, v) : this.packed.updateAndFetch(k, v);
     }
-    this.#rotated = this.rows.map(row => !!row.rotatedValueAttention);
+    this.#rotated = this.rows.map(row => !!kvStorage(row).rotatedValueAttention);
     const result = appendFullKvRows(this.rows, this.leftPad, this.offset + k.shape[2]!, k, v, deferred);
     try { this.syncPositions(true); } catch (error) { result[0].dispose(); result[1].dispose(); throw error; }
     return result;
@@ -58,5 +117,7 @@ export class DelayedTurboQuantKVCache extends FullTransitioningKvRows<BatchedTur
       return ops.where(mask, restored, output);
     };
   }
-  makeEmptyBatch(): DelayedTurboQuantKVCache { return new DelayedTurboQuantKVCache(this.kBits, this.vBits, this.start, this.maintain, undefined, this.fusedDecode); }
+  makeEmptyBatch(): DelayedTurboQuantKVCache {
+    return new DelayedTurboQuantKVCache(this.kBits, this.vBits, this.start, this.fusedDecode, this.turboQuantKernels, undefined, this.compose);
+  }
 }

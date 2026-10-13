@@ -5,11 +5,9 @@
 // execution group, as the app composes them. Checked within this tree:
 // - placement: the configured provider/target/KV combination resolves to
 //   continuous speculation (a refusal fails with the plan's reasons);
-// - B1 equals the serial producer (`specServeRun`) in tokens and draft counts
-//   when that producer serves the settings (no per-layer KV, start 0, no custom
-//   window, whose wrap ends its speculation), or repeats exactly otherwise; B4
-//   cohorts (submitted under an admission hold, released together) prefill as
-//   one cohort, repeat exactly and run real rounds;
+// - B1 (one request is a batch of one) repeats exactly in tokens and draft
+//   counts; B4 cohorts (submitted under an admission hold, released together)
+//   prefill as one cohort, repeat exactly and run real rounds;
 // - retirement in a B4 cohort: a stop, a consumer failure and an abort at exact
 //   counts, no token published after retirement, a survivor to its budget, a
 //   drained group, and EOS on the first token; a late joiner with a longer prompt and a joiner
@@ -26,9 +24,8 @@
 //   with the draft ignored; the adapter changes the B1 control's logprobs; each
 //   row equals its B1 control without a draft (greedy tokens), seeded B4 cohorts
 //   repeat, groups never mix adapter contexts, a failing row leaves its peers intact, and prefix reuse stays
-//   isolated by adapter. Drafted base rows join these checks where placement
-//   serves them; delayed affine KV on MiniCPM5 and encoded Universal graphs
-//   refuses them by design (genuine delayed speculation is excluded).
+//   isolated by adapter. Drafted base rows join these checks: placement
+//   speculates over every KV scheme, delayed affine included.
 // The first two tests require a combination placement serves; run only the
 // adapter test with --test-name-pattern "adapter rows" for such a KV setting.
 // Not covered: equality with main or an external oracle, HTTP, speed.
@@ -36,10 +33,11 @@
 // the app's model host mounts it (`apps/mlx-bun/src/engine/model-host.ts`): the
 // Colibri runtime opened with the MTP tier planned for one drafting lane, and
 // the provider the graph declares (`GraphCapabilities.nativeDraft`) at the
-// plan's draft depth (the default depth here). It takes no draft artifact and
-// only plain KV (see optIn).
-// Observers wrap the target forward the bindings call, forwardHiddenAsync where
-// the graph provides one (the streamed GLM target), otherwise forwardHidden.
+// plan's draft depth (the default depth here). It takes no draft artifact; its
+// latent caches compose the KV scheme (the latent legos).
+// Observers watch the target phases the bindings call (prompt chunks and tails,
+// decode, verify, known tokens; streamed on the GLM target): the gateway and the
+// direct generator are bound to an observed view of the graph.
 // Opt in with all of
 //   MLX_BUN_TEST_SPEC_TARGET=/target/snapshot
 //   MLX_BUN_TEST_SPEC_KIND=ngram|two-model|assistant|mtp|dspark|deepspec|glm-mtp
@@ -100,12 +98,6 @@ export function optIn(env: Record<string, string | undefined>) {
   if (kind === "glm-mtp") {
     const raw = JSON.parse(readFileSync(join(target, "config.json"), "utf8"));
     assert.equal(raw.model_type, "glm_moe_dsa", `${PREFIX}KIND=glm-mtp needs a GLM-5.2 (glm_moe_dsa) target, not ${raw.model_type}`);
-    // GLM's attention stores a compressed MLA latent cache, not plain or rotating
-    // KV: no layer has an affine or TurboQuant conversion, so the gateway's
-    // kvBatchable refuses every quantized scheme and the drafted placement these
-    // tests require is refused. The KV matrix does not apply to this cache;
-    // plain KV is its only layout.
-    if (kv !== "bf16") throw new Error(`${PREFIX}KIND=glm-mtp takes plain KV only: GLM's MLA latent cache has no affine or TurboQuant conversion`);
   }
   if (window !== undefined) {
     const raw = JSON.parse(readFileSync(join(target, "config.json"), "utf8"));
@@ -126,9 +118,9 @@ export function attachmentMatches(kind: Kind, tokens: number, attachment: A): bo
 
 // ---- shared native setup ---------------------------------------------------------------
 async function load(inputs: Inputs) {
-  const { loadModelConfig, Weights, createModel, openGlm52RuntimeModel } = await import("@mlx-bun/inference");
+  const { loadModelConfig, Weights, createModel, openGlm52RuntimeModel, resolveComposition } = await import("@mlx-bun/inference");
   const speculative = await import("@mlx-bun/inference/generation/speculative");
-  const { KvScheme, resolveKvScheme } = await import("@mlx-bun/inference/state");
+  const { kvSchemeOf } = await import("@mlx-bun/inference/state");
   const config = await loadModelConfig(inputs.target);
   if (inputs.window !== undefined) {
     // One descriptor for both the parsed config and the raw arguments the graph is built from.
@@ -137,19 +129,28 @@ async function load(inputs: Inputs) {
     raw.layer_types = [...types]; raw.sliding_window = inputs.window;
     config.text.layerTypes = [...types]; config.text.slidingWindow = inputs.window;
   }
+  // The KV scheme the graph composes, which every request stores. Its affine
+  // reads are the tiled-causal kernels (`fusedSdpa`: OptiQ's wrapper rule).
+  const turboQuant = { kBits: 8, vBits: 3 };
+  if (inputs.kv === "config") assert(config.kvQuant?.length, "the target has no kv_config.json");
+  const kvRequest = inputs.kv === "bf16" ? undefined : inputs.kv === "turbo" ? { turboQuant, quantizedKvStart: inputs.start }
+    : { override: inputs.kv === "config" ? "config" as const : Number(inputs.kv), quantizedKvStart: inputs.start, fusedSdpa: true };
+  const composition = resolveComposition(config, kvRequest ? { kv: kvRequest } : {});
   let model: A, defaultDepth: number | undefined, dispose: () => void;
   if (inputs.kind === "glm-mtp") {
     // `serve --mtp on`, as the app's model host opens it: the Colibri runtime with
-    // native MTP planned for one drafting lane (batchSize 1), its other defaults
-    // unchanged; the provider's draft depth is the plan's.
-    const opened = await openGlm52RuntimeModel(inputs.target, { batchSize: 1, enableMtp: true });
+    // native MTP planned for one drafting lane (batchSize 1), its latent caches the
+    // composition's KV scheme (the latent legos), its other defaults unchanged; the
+    // provider's draft depth is the plan's.
+    const opened = await openGlm52RuntimeModel(inputs.target, { batchSize: 1, enableMtp: true,
+      caches: { kv: composition.kv, pagedKv: composition.pagedKv } });
     model = opened.model;
     dispose = () => opened.model.dispose();
     if (!opened.plan.enableMtp) { dispose(); throw new Error("the GLM memory plan leaves native MTP disabled"); }
     defaultDepth = opened.plan.mtpDraftTokens;
   } else {
     const weights = await Weights.open(inputs.target);
-    model = createModel(weights, config) as A;
+    model = createModel(weights, config, composition) as A;
     dispose = () => {
       try { weights.dispose(); }
       finally { for (const file of weights.shards.files.values()) file.mmap.unmap(); }
@@ -166,39 +167,30 @@ async function load(inputs: Inputs) {
     return (await registry.load(inputs.kind, { dir: inputs.draft,
       target: { vocabSize: config.text.vocabSize, tokenizer: await loadTokenizer(inputs.target) } })).provider;
   };
-  const turboQuant = { kBits: 8, vBits: 3 };
-  const kv = inputs.kv === "bf16" ? { options: {}, scheme: undefined }
-    : inputs.kv === "turbo" ? { options: { turboQuant, quantizedKvStart: inputs.start },
-      scheme: resolveKvScheme({ turboQuant, quantizedKvStart: inputs.start }) }
-    : inputs.kv === "config" ? (() => {
-      const kvConfig = config.kvQuant;
-      assert(kvConfig?.length, "the target has no kv_config.json");
-      return { options: { kvConfig, quantizedKvStart: inputs.start },
-        scheme: resolveKvScheme({ override: "config", config: kvConfig, quantizedKvStart: inputs.start }) };
-    })()
-    : { options: { kvBits: Number(inputs.kv), kvGroupSize: 64, quantizedKvStart: inputs.start },
-      scheme: new KvScheme("affine-uniform", { kvBits: Number(inputs.kv), kvGroupSize: 64, quantizedKvStart: inputs.start }) };
+  const kv = { scheme: kvRequest ? kvSchemeOf(composition.kv) : undefined };
   const requirements = (extra: Record<string, boolean> = {}) => ({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false,
-    userSeed: false, kvQuant: inputs.kv === "4" || inputs.kv === "8" || inputs.kv === "config", turboQuant: inputs.kv === "turbo",
-    hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true, ...extra });
+    userSeed: false, hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true, ...extra });
   const release = async () => {
     const { clearCache } = await import("@mlx-bun/mlx/ffi");
     try { dispose(); } finally { clearCache(); }
   };
-  // The target forward the bindings call: forwardHiddenAsync where the graph
-  // provides one, as the execution group and speculative binding select it.
-  const targetForward = typeof model.forwardHiddenAsync === "function" ? "forwardHiddenAsync" as const : "forwardHidden" as const;
-  return { model, config, loadProvider, kv, requirements, release, defaultDepth, targetForward };
+  // The target phases the bindings call, observed: bind to `view`; `watch` adds a
+  // watcher of every target forward's input and caches until its returned stop.
+  const { observedPhases } = await import("../models/phase-forward");
+  const watchers = new Set<(ids: A, caches: A) => void>();
+  const view = observedPhases(model, { forward(ids, caches) { for (const watcher of [...watchers]) watcher(ids, caches); } });
+  const watch = (watcher: (ids: A, caches: A) => void) => { watchers.add(watcher); return () => { watchers.delete(watcher); }; };
+  return { model, view, watch, config, loadProvider, kv, requirements, release, defaultDepth };
 }
 type Loaded = Awaited<ReturnType<typeof load>>;
 
 /** The gateway binding for one provider, its placement and its execution group. */
 async function bindFor(loaded: Loaded, provider: A, depth: number) {
   const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
-  const binding = bindMlxGateway(loaded.model, provider ? { provider, numDraftTokens: depth } : undefined);
-  const quantizedBatch = loaded.kv.scheme ? binding.kvBatchable(loaded.kv.scheme) : false;
+  const { KvCacheService } = await import("@mlx-bun/inference/state");
+  const binding = bindMlxGateway(loaded.view, provider ? { provider, numDraftTokens: depth } : undefined);
   const place = (options: A, extra: Record<string, boolean> = {}) => binding.plan(loaded.requirements({ ...extra, hasDraft: !!provider }),
-    options, { continuous: true, quantizedBatch, checkpoints: false });
+    options, { checkpoints: false });
   /** A speculative method request; any other placement fails with its reasons. */
   const method = (options: A) => {
     const plan = place(options);
@@ -207,36 +199,30 @@ async function bindFor(loaded: Loaded, provider: A, depth: number) {
     return binding.methodRequest!(plan, options)!;
   };
   /** An execution group. `held` keeps admission closed until `release()`, so
-   * rows submitted meanwhile enter as one cohort. */
+   * rows submitted meanwhile enter as one cohort. `promptCache` is the prefix
+   * store of the group's cache service. */
   const group = (options: { maxBatch?: number; promptCache?: A; held?: boolean } = {}) => {
     let held = options.held ?? false;
     const created: A = binding.createBatchGroup({ maxBatch: options.maxBatch ?? 4, admissionHeld: () => held,
-      ...(loaded.kv.scheme && quantizedBatch ? { kvScheme: loaded.kv.scheme } : {}),
-      ...(options.promptCache ? { promptCache: options.promptCache } : {}) });
+      ...(options.promptCache ? { cache: new KvCacheService(binding.graph, { prefixes: options.promptCache }, { runtime: binding.runtime }) } : {}) });
     return Object.assign(created, { release() { held = false; created.kick(); } });
   };
   return { binding, place, method, group };
 }
 
 /** Target forward shapes while no row has produced a token: the prefill cohort. */
-function watchPrefill(model: A, method: "forwardHidden" | "forwardHiddenAsync", outputs: number[][]) {
+function watchPrefill(loaded: Loaded, outputs: number[][]) {
   const shapes: number[][] = [];
-  const forward = model[method].bind(model);
-  const spy = spyOn(model, method).mockImplementation((ids: A, ...rest: A[]) => {
-    if (outputs.every(tokens => tokens.length === 0)) shapes.push([...ids.shape]);
-    return forward(ids, ...rest);
-  });
-  return { shapes, restore: () => spy.mockRestore() };
+  const restore = loaded.watch((ids: A) => { if (outputs.every(tokens => tokens.length === 0)) shapes.push([...ids.shape]); });
+  return { shapes, restore };
 }
 
 const inputs = optIn(Bun.env);
 
-test.skipIf(!inputs)("grouped speculation: placement, the serial producer at B1, B4 rounds, retirement, joins and RAM prefix reuse", async () => {
-  const { specServeRun } = await import("@mlx-bun/inference/generation/speculative");
+test.skipIf(!inputs)("grouped speculation: placement, B1 repeats, B4 rounds, retirement, joins and RAM prefix reuse", async () => {
   const { PromptCache } = await import("@mlx-bun/inference/state");
   const { clearCache } = await import("@mlx-bun/mlx/ffi");
   const loaded = await load(inputs!);
-  const { model } = loaded;
   // Full-prefill providers feed the whole prompt; tail-split ones hold its last token for the first round.
   const prefillLength = (prompt: number[]) => prompt.length - (FULL_PREFILL.includes(inputs!.kind) ? 0 : 1);
   let provider: A;
@@ -244,20 +230,15 @@ test.skipIf(!inputs)("grouped speculation: placement, the serial producer at B1,
     provider = await loaded.loadProvider();
     const depth = inputs!.depth ?? loaded.defaultDepth ?? 2;
     const { method, group: groupOf } = await bindFor(loaded, provider, depth);
-    const options: A = { temperature: 0, maxTokens: 24, eosTokenIds: [], ...loaded.kv.options };
+    const options: A = { temperature: 0, maxTokens: 24, eosTokenIds: [] };
     const prompt = [1, 2, 3, 4, 5, 6, 7];
     const reference: number[] = [];
-    // The serial producer serves uniform KV4/KV8 or TurboQuant from start 0 only,
-    // and stops speculating once a sliding ring wraps (the custom window does).
-    const old = inputs!.kv !== "config" && inputs!.start === 0 && inputs!.window === undefined
-      ? await specServeRun(model, provider, depth, prompt, options, token => { reference.push(token); }) : undefined;
-    clearCache();
     // Rows submitted under an admission hold, released together: one prefill cohort.
     const run = async (count: number) => {
       const group = groupOf({ held: true });
       let maxRows = 0;
       const tokens = Array.from({ length: count }, () => [] as number[]);
-      const prefill = watchPrefill(model, loaded.targetForward, tokens);
+      const prefill = watchPrefill(loaded, tokens);
       try {
         const pending = tokens.map(output => group.submit({
           method: method(options), promptIds: prompt, maxTokens: options.maxTokens, eosTokenIds: [],
@@ -272,18 +253,12 @@ test.skipIf(!inputs)("grouped speculation: placement, the serial producer at B1,
         return { tokens, stats, maxRows };
       } finally { prefill.restore(); await group.close(); clearCache(); }
     };
+    // One request is a batch of one: it repeats exactly.
     const single = await run(1);
-    if (old) {
-      expect(single.tokens[0]).toEqual(reference);
-      expect(single.stats[0]!.generatedTokens).toBe(old.generatedTokens);
-      expect(single.stats[0]!.spec?.drafted).toBe(old.spec?.drafted);
-      expect(single.stats[0]!.spec?.accepted).toBe(old.spec?.accepted);
-    } else {
-      reference.push(...single.tokens[0]!);
-      const repeated = await run(1);
-      expect(repeated.tokens).toEqual(single.tokens);
-      expect(repeated.stats.map(stat => stat.spec)).toEqual(single.stats.map(stat => stat.spec));
-    }
+    reference.push(...single.tokens[0]!);
+    const repeated = await run(1);
+    expect(repeated.tokens).toEqual(single.tokens);
+    expect(repeated.stats.map(stat => stat.spec)).toEqual(single.stats.map(stat => stat.spec));
     const batch = await run(4), repeat = await run(4);
     expect(batch.maxRows).toBe(4);
     expect(repeat.maxRows).toBe(4);
@@ -296,6 +271,10 @@ test.skipIf(!inputs)("grouped speculation: placement, the serial producer at B1,
       expect(stats.spec!.drafted).toBeGreaterThanOrEqual(inputs!.kind === "ngram" ? 0 : stats.spec!.rounds!);
     }
     console.log(JSON.stringify({ kind: inputs!.kind, kv: inputs!.kv, start: inputs!.start, single: single.stats, batch: batch.stats }));
+    // The trajectories' digest and draft counts, for comparing trees.
+    console.log(`[spec-digest] ${JSON.stringify({ kv: inputs!.kv, start: inputs!.start, single: Bun.hash(JSON.stringify(single.tokens)).toString(16),
+      batch: Bun.hash(JSON.stringify(batch.tokens)).toString(16),
+      spec: [...single.stats, ...batch.stats].map(stat => stat.spec && [stat.spec.drafted, stat.spec.accepted, stat.spec.rounds]) })}`);
 
     // Retirement: stop, consumer failure and abort inside a four-row cohort.
     const retiring = groupOf({ held: true });
@@ -358,8 +337,7 @@ test.skipIf(!inputs)("grouped speculation: placement, the serial producer at B1,
       const chunked = { ...options, prefillChunkSize: 4 };
       const output: number[][] = [[], []], shapes: number[][] = [];
       let joiner: Promise<unknown> | undefined, submitted = false, sharedBeforeOutput = false;
-      const original = model[loaded.targetForward].bind(model);
-      const probe = spyOn(model, loaded.targetForward).mockImplementation((ids: A, caches: A, ...rest: A[]) => {
+      const stopProbe = loaded.watch((ids: A) => {
         if (ids.shape[1] === 4) {
           shapes.push([...ids.shape]);
           if (ids.shape[0] === 2 && output.every(tokens => !tokens.length)) sharedBeforeOutput = true;
@@ -369,7 +347,6 @@ test.skipIf(!inputs)("grouped speculation: placement, the serial producer at B1,
               maxTokens: 8, eosTokenIds: [], onToken(token: number) { output[1]!.push(token); } });
           }
         }
-        return original(ids, caches, ...rest);
       });
       try {
         await group.submit({ method: method(chunked), promptIds: [...prompt, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
@@ -380,7 +357,7 @@ test.skipIf(!inputs)("grouped speculation: placement, the serial producer at B1,
         expect(output.map(tokens => tokens.length)).toEqual([8, 8]);
         expect(group.activeRows + group.pendingRows).toBe(0);
         return output;
-      } finally { probe.mockRestore(); await group.close(); clearCache(); }
+      } finally { stopProbe(); await group.close(); clearCache(); }
     };
     expect(await prefillJoin()).toEqual(await prefillJoin());
 
@@ -428,7 +405,7 @@ test.skipIf(!inputs)("generated prefixes: retired rows publish their companion s
   const { model } = loaded;
   const kind = inputs!.kind, depth = inputs!.depth ?? loaded.defaultDepth ?? 3;
   const directory = mkdtempSync(join(tmpdir(), "speculative-prefix-"));
-  const options: A = { temperature: 0, seed: 42, maxTokens: 20, ...loaded.kv.options };
+  const options: A = { temperature: 0, seed: 42, maxTokens: 20 };
   const storeOptions = { dir: directory, maxBytes: 4 * 1024 ** 3, modelId: inputs!.target,
     configFingerprint: "speculative-prefix", tokenizerHash: "speculative-prefix", verify: true, storage: { layout: "blocks" as const } };
   const tier = (store: A, async: boolean) => ({
@@ -452,7 +429,7 @@ test.skipIf(!inputs)("generated prefixes: retired rows publish their companion s
     }
     return put(...args);
   });
-  const prefill = watchPrefill(model, loaded.targetForward, outputs);
+  const prefill = watchPrefill(loaded, outputs);
   try {
     provider = await loaded.loadProvider();
     const bound = await bindFor(loaded, provider, depth);
@@ -558,16 +535,12 @@ test.skipIf(!inputs?.adapter)("adapter rows with a configured draft: placement, 
     return put(...args);
   });
   const frames: { batch: number; adapters: string[] }[] = [];
-  const forward = model[loaded.targetForward].bind(model);
-  const probe = spyOn(model, loaded.targetForward).mockImplementation((ids: A, caches: A, ...rest: A[]) => {
-    frames.push({ batch: ids.shape[0]!, adapters: [...model.loraState.active] });
-    return forward(ids, caches, ...rest);
-  });
+  const stopProbe = loaded.watch((ids: A) => { frames.push({ batch: ids.shape[0]!, adapters: [...model.loraState.active] }); });
   type Request = { adapters: string[]; tokens?: number; fail?: boolean };
   try {
     provider = await loaded.loadProvider();
     await manager.mount("upper", inputs!.adapter!);
-    const optionsFor = ({ adapters, tokens = 12 }: Request, promptIds: number[], seeded = false) => ({ ...loaded.kv.options,
+    const optionsFor = ({ adapters, tokens = 12 }: Request, promptIds: number[], seeded = false) => ({
       logprobs: true, topLogprobs: 3, adapters, maxTokens: tokens, temperature: seeded ? 0.7 : 0, seed: 42, eosTokenIds: [],
       snapshotAt: promptIds.length - 1 });
     const upper = { adapters: ["upper"] }, base = { adapters: [] };
@@ -580,10 +553,9 @@ test.skipIf(!inputs?.adapter)("adapter rows with a configured draft: placement, 
       .toEqual({ mechanism: "continuous", reasons: [] });
     if (provider.grouped?.supportsTargetAdapters !== true) expect(adapterPlan.method).toBe("autoregressive");
     const adapterSpeculates = adapterPlan.method === "speculative";
-    // Drafted base rows: served, or refused where genuine delayed speculation is excluded.
+    // Drafted base rows are served over every cache lego.
     const basePlan = probeBinding.place(optionsFor(base, prompt), { wantsLogprobs: true });
-    const baseServed = basePlan.mechanism === "continuous";
-    if (!baseServed) expect(basePlan.reasons).toContain("continuous-unavailable");
+    expect(basePlan.mechanism).toBe("continuous");
     const expectedMethod = (adapters: string[]) => adapters.length ? adapterPlan.method : basePlan.method;
     const run = async (batch: number, requests: Request[], promptIds = prompt, cached = false, seeded = false) => {
       frames.length = 0;
@@ -598,7 +570,7 @@ test.skipIf(!inputs?.adapter)("adapter rows with a configured draft: placement, 
       // B1 control: the direct generator without a draft.
       if (batch === 1) return { frames: [...frames], results: await Promise.all(requests.map(async request => {
         const out = collect();
-        const generation = generate(model, promptIds, optionsFor(request, promptIds, seeded));
+        const generation = generate(loaded.view, promptIds, optionsFor(request, promptIds, seeded));
         for await (const value of generation) out.sink(value.token, value.logprobs);
         return { ...out, stats: generation.stats! };
       })) };
@@ -649,7 +621,7 @@ test.skipIf(!inputs?.adapter)("adapter rows with a configured draft: placement, 
     expect(four.frames.some(frame => frame.batch === 4)).toBe(true);
     expect((await run(4, [upper, upper, upper, upper], prompt, false, true)).results.map(({ output, metadata }) => ({ output, metadata })))
       .toEqual(four.results.map(({ output, metadata }) => ({ output, metadata })));
-    const baseAlone = baseServed ? await run(4, [base]) : undefined;
+    const baseAlone = await run(4, [base]);
     if (baseAlone) {
       expect(baseAlone.results[0]!.output).toEqual(baseSerial.results[0]!.output);
       const mixed = await run(4, [upper, upper, base, upper]);
@@ -687,9 +659,9 @@ test.skipIf(!inputs?.adapter)("adapter rows with a configured draft: placement, 
       expect(warmBase.results[0]!.output).toEqual(coldBase.results[0]!.output);
     }
     console.log(`[speculative-group] adapter rows ${adapterSpeculates ? "speculate" : "decode ordinarily, draft ignored"}; ` +
-      `drafted base rows ${baseServed ? basePlan.method : "refused"}: B1 controls, grouped contexts, failure cleanup and isolated prefix reuse pass`);
+      `drafted base rows ${basePlan.method}: B1 controls, grouped contexts, failure cleanup and isolated prefix reuse pass`);
   } finally {
-    probe.mockRestore(); publication.mockRestore(); cache.clear();
+    stopProbe(); publication.mockRestore(); cache.clear();
     try { manager.unmount("upper"); provider?.dispose(); } finally { await loaded.release(); clearCache(); }
   }
 }, 900_000);
@@ -708,7 +680,7 @@ test("opt-in: none skips; partial, blank or inconsistent settings fail (CPU only
   expect(() => optIn(env({ TARGET: "/t", KIND: "ngram", KV_START: "8" }))).toThrow("needs a quantized");
   expect(() => optIn(env({ TARGET: "/t", KIND: "ngram", DEPTH: "0" }))).toThrow("integer >= 1");
   expect(() => optIn(env({ TARGET: "/nonexistent-spec-target", KIND: "ngram" }))).toThrow("no config.json");
-  // GLM-5.2 native MTP: no draft artifact, a glm_moe_dsa target, plain KV only, no custom window.
+  // GLM-5.2 native MTP: no draft artifact, a glm_moe_dsa target, any KV scheme, no custom window.
   expect(() => optIn(env({ TARGET: "/t", KIND: "glm-mtp", DRAFT: "/d" }))).toThrow("checkpoint-native");
   const dir = mkdtempSync(join(tmpdir(), "spec-glm-target-"));
   try {
@@ -716,7 +688,7 @@ test("opt-in: none skips; partial, blank or inconsistent settings fail (CPU only
     expect(() => optIn(env({ TARGET: dir, KIND: "glm-mtp" }))).toThrow("glm_moe_dsa");
     writeFileSync(join(dir, "config.json"), JSON.stringify({ model_type: "glm_moe_dsa" }));
     expect(optIn(env({ TARGET: dir, KIND: "glm-mtp" }))).toMatchObject({ kind: "glm-mtp", kv: "bf16", draft: undefined, depth: undefined });
-    for (const kv of ["4", "8", "turbo", "config"]) expect(() => optIn(env({ TARGET: dir, KIND: "glm-mtp", KV: kv }))).toThrow("plain KV only");
+    for (const kv of ["4", "8", "turbo", "config"]) expect(optIn(env({ TARGET: dir, KIND: "glm-mtp", KV: kv }))).toMatchObject({ kind: "glm-mtp", kv });
     expect(() => optIn(env({ TARGET: dir, KIND: "glm-mtp", WINDOW: "8" }))).toThrow("Llama-family");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

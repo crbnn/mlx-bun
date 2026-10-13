@@ -7,7 +7,7 @@ import { join } from "node:path";
 import type { ModelRecord } from "@mlx-bun/hub/registry";
 import { commandInvocation, parseCommand } from "../src/cli/args";
 import { resolveKvScheme } from "@mlx-bun/inference/state/kv-scheme";
-import { browserUrl, focusTabScript, installShutdownHandlers, openChatUi, parseServeOptions, probeServer, resolveServingLimits, runServe, validatePagedServingOptions, type ServeDependencies, type ServeOptions } from "../src/cli/serve";
+import { browserUrl, focusTabScript, installShutdownHandlers, openChatUi, parseServeOptions, probeServer, resolveServingLimits, runServe, type ServeDependencies, type ServeOptions } from "../src/cli/serve";
 import { decodeLaunch, encodeLaunch } from "../src/jobs/worker-process";
 
 const parse = (...args: string[]) => parseServeOptions(parseCommand("serve", args));
@@ -110,7 +110,7 @@ test("serving parses main's TurboQuant spec into the cache scheme, through the i
   // Cache services resolve it as main's standalone scheme: TurboQuant from decode start.
   const { cache } = parse("--kv-quant", "turbo:k5v4");
   expect(resolveKvScheme({ override: cache.kvQuant, turboQuant: cache.turboQuant, quantizedKvStart: cache.quantizedKvStart })
-    .generationOptions).toEqual({ turboQuant: { kBits: 5, vBits: 4 }, quantizedKvStart: 0 });
+    .storage).toEqual({ kind: "turbo", kBits: 5, vBits: 4 });
   // An isolated worker receives the parent's resolved options as its launch record.
   expect((decodeLaunch(encodeLaunch({ ...parse("--isolate", "--kv-quant", "turbo:k4v3"), isolate: false })) as ServeOptions).cache)
     .toMatchObject({ turboQuant: { kBits: 4, vBits: 3 } });
@@ -118,10 +118,8 @@ test("serving parses main's TurboQuant spec into the cache scheme, through the i
     ["turbo:k8v6", "vBits must be one of 2,3,4,5,8 (got 6)"], ["turbo:8", 'must look like "turbo:k<bits>v<bits>"'],
     ["turbo8", "--kv-quant expects off|config|4|8|turbo[:k<bits>v<bits>]"]] as const)
     expect(() => parse("--kv-quant", spec)).toThrow(message);
-  // Paging keeps refusing TurboQuant at startup.
-  const paged = parse("--paged-kv", "--kv-quant", "turbo");
-  expect(() => validatePagedServingOptions(paged.request.pagedKv, resolveKvScheme({ turboQuant: paged.cache.turboQuant }).generationOptions, false))
-    .toThrow("per-layer and TurboQuant pages are not implemented");
+  // Paging is a KV flag the composition resolves with the scheme (the resolver refuses pages it cannot store).
+  expect(parse("--paged-kv", "--kv-quant", "turbo").cache).toMatchObject({ turboQuant: { kBits: 8, vBits: 3 }, pagedKv: {} });
 });
 
 test("invalid serving input fails before model selection", async () => {
@@ -138,18 +136,30 @@ test("invalid serving input fails before model selection", async () => {
 function runtime(interactive = true) {
   const signals = new EventEmitter(), opens: string[] = [], exits: number[] = [], errors: unknown[] = [], starts: ServeOptions[] = [];
   const downloads: string[] = [], logs: string[] = [], transcriptionStarts: [ModelRecord, ServeOptions][] = [];
+  /** The install step and model starts in the order they ran. */
+  const steps: string[] = [];
   let closes = 0;
   const dependencies: ServeDependencies = {
     resolve: async () => ({ m: model, picked: true }),
-    start: async (m, options) => { expect(m).toBe(model); starts.push(options); return { port: 4321,
+    installAne: async () => { steps.push("install"); },
+    start: async (m, options) => { expect(m).toBe(model); steps.push("start"); starts.push(options); return { port: 4321,
       downloads: { start: repo => { downloads.push(repo); }, active: [] }, close: async () => { closes++; } }; },
-    startTranscription: async (m, options) => { transcriptionStarts.push([m, options]); return { port: 4321,
+    startTranscription: async (m, options) => { steps.push("transcription"); transcriptionStarts.push([m, options]); return { port: 4321,
       downloads: { start() { throw new Error("no downloads"); }, active: [] }, close: async () => { closes++; } }; },
     interactive, probe: async () => null, open: url => { opens.push(url); }, log: message => { logs.push(message); }, signals,
     exit: code => { exits.push(code); }, error: error => { errors.push(error); },
   };
-  return { dependencies, signals, opens, exits, errors, starts, transcriptionStarts, downloads, logs, closes: () => closes };
+  return { dependencies, signals, opens, exits, errors, starts, transcriptionStarts, downloads, logs, steps, closes: () => closes };
 }
+
+test("the Neural Engine install step runs before a chat model starts, and not for the transcription-only server", async () => {
+  const run = runtime(false);
+  const app = await runServe(parseCommand("serve", ["--port", "0"]), run.dependencies);
+  await app.close();
+  const whisper = { repoId: "mlx-community/whisper-large-v3-turbo", path: "/whisper", modelType: "whisper" } as ModelRecord;
+  await runServe(parseCommand("serve", ["whisper"]), { ...run.dependencies, resolve: async () => ({ m: whisper, picked: false }) });
+  expect(run.steps).toEqual(["install", "start", "transcription"]);
+});
 
 test("isolated model workers are the default; --in-process opts out, --isolate is a deprecated no-op, and --model-budget is a positive number of GB", async () => {
   expect(parse()).not.toHaveProperty("inProcess");
@@ -416,12 +426,13 @@ for (const [sessionDir, jobPaths, expectedStore] of [
     const context = { modelId: "test", model: { config: { text: { maxPositionEmbeddings: 65536 } } },
       memoryPlan: { contextTokens: 8192, maxGenerationTokens: 2048, totalBytes: 1e9 }, tokenizer: {},
       template: { supportsThinking: false }, genDefaults: {}, dispose() { events.push("model close"); } };
-    const cache = { promptCache: { totalBytes: 0 }, resolvedKvScheme: { mode: "off" }, kvScheme: {}, stateCodecs: {},
-      adapterNamespace() {}, checkpoints: { tokenPrefixes: () => [[1, 2]] }, continuationServices: {},
+    // The loaded model's cache service, as createCacheServices builds it: saved prefixes seed the token history.
+    let onPut;
+    const service = { savedPrefixes: () => [[1, 2]], set onPut(observe) { onPut = observe; },
+      report: () => ({ prefixes: { entries: 0, bytes: 0, maxBytes: 0, hits: 0, misses: 0 }, saved: null, kv: { projectedBytes: 0, budgetBytes: null } }),
       stopIdleDemotion() { events.push("timer stop"); }, async close() { events.push("cache close"); return { durable: true }; } };
-    const binding = { discovery: { embeddings: false }, gateway: { configureContinuation(services) {
-      assert.equal(services, cache.continuationServices); events.push("continuation");
-    } } };
+    const cache = { cache: service, resolvedKvScheme: { mode: "off" }, adapterNamespace() {} };
+    const binding = { discovery: { embeddings: false }, gateway: {} };
     // The host reads two numbers from the native library to size its budget.
     mock.module("@mlx-bun/mlx/ffi", () => ({ maxRecommendedWorkingSetSize: () => 32e9, activeMemory: () => 0 }));
     let engine, listenerInput, memoryCallback;
@@ -429,22 +440,19 @@ for (const [sessionDir, jobPaths, expectedStore] of [
       loadContext: async () => context, modelServingBinding: async () => binding, createCacheServices: async () => cache,
       createAppEngine: async (supplied, options) => {
         assert.equal(supplied, context); assert.equal(options.binding, binding);
-        assert.equal(options.gateway.promptCache, cache.promptCache);
-        assert.equal(options.gateway.stateCodecs, cache.stateCodecs);
-        assert.equal(options.gateway.kvScheme, cache.resolvedKvScheme);
+        assert.equal(options.gateway.cache, service);
         assert.equal(options.gateway.adapterNamespace, cache.adapterNamespace);
-        assert.equal(options.gateway.checkpoints, true);
-        assert.deepEqual(events, ["continuation"]); events.push("engine");
-        return engine = { gateway: { activeRows: 0, kvBytes: { projected: 0, budget: null } }, async close() { await options.beforeModelDispose(); context.dispose(); } };
+        assert.deepEqual(events, []); events.push("engine");
+        return engine = { gateway: { activeRows: 0 }, async close() { await options.beforeModelDispose(); context.dispose(); } };
       }
     }));
     mock.module(app + "src/server/generated-token-history.ts", () => ({ GeneratedTokenHistory: class {
       remember(tokens) { remembered.push(tokens); }
     } }));
     mock.module(app + "src/server/routes.ts", () => ({ createCompletionRoutes(supplied, options) {
-      assert.equal(supplied, engine); assert.equal(options.promptCache, cache.promptCache);
+      assert.equal(supplied, engine); assert.equal(options.promptCache, service);
       assert.equal(options.contextLimit, 8192); assert.equal(options.defaultGeneratedTokens, 2048);
-      assert.deepEqual(remembered, [[1, 2]]); cache.promptCache.onPut([3, 4]);
+      assert.deepEqual(remembered, [[1, 2]]); onPut([3, 4]);
       assert.deepEqual(remembered, [[1, 2], [3, 4]]); assert.ok(options.tokenHistory);
       events.push("routes"); return { handle: async () => null, invalidateLibrary() {} };
     } }));
@@ -478,7 +486,7 @@ for (const [sessionDir, jobPaths, expectedStore] of [
     });
     assert.equal(running.port, 1234);
     assert.equal(typeof running.downloads.start, "function");
-    assert.deepEqual(events, ["continuation", "engine", "routes", "listener"]);
+    assert.deepEqual(events, ["engine", "routes", "listener"]);
     // A chat connects through the listener's module sockets.
     await listenerInput.sockets.websocket.open({ data: { path: "/ws/chat", request: new Request("http://127.0.0.1/ws/chat") }, send() {}, close() {} });
     assert.equal(piOptions.readOnly, true);
@@ -562,18 +570,19 @@ test("startup wires the memory budget, runtime context, allocator limit, expert 
     const context = { modelId: "test", model: { config, weightsBytes: 2e9 }, memoryPlan: null, tokenizer: {},
       template: { supportsThinking: false }, genDefaults: {}, dispose() { events.push("model close"); },
       adapters: { async mount(id, dir) { events.push("mount " + id + " " + dir); if (mountFails) throw new Error("adapter_config.json missing"); return { id, mountedLayers: 3 }; } } };
-    const cache = { promptCache: { totalBytes: 0 }, resolvedKvScheme: { mode: "off", fitOptions: undefined }, kvScheme: {}, stateCodecs: {},
-      adapterNamespace() {}, checkpoints: null, continuationServices: {},
-      stopIdleDemotion() {}, async close() { return { durable: true }; } };
+    const cache = { cache: { savedPrefixes: () => [], set onPut(_observe) {},
+        report: () => ({ prefixes: { entries: 0, bytes: 0, maxBytes: 0, hits: 0, misses: 0 }, saved: null, kv: { projectedBytes: 0, budgetBytes: null } }),
+        stopIdleDemotion() {}, async close() { return { durable: true }; } },
+      resolvedKvScheme: { mode: "off", fitOptions: undefined, storage: { kind: "bf16" } }, adapterNamespace() {} };
     const expected = fit(config, 2e9, 1, undefined, undefined, 0, 8e9, undefined).maxSafeContext;
     let loadOptions, cacheOptions, statusBudget, contextLimit, defaultAdapter;
-    const routes = [];
-    const route = seam => routes.push(seam + ":" + runtimeValue("MLX_BUN_NO_FUSED_SDPA"));
+    const seams = [];
+    const seam = name => seams.push(name);
     mock.module(app + "src/engine/index.ts", () => ({
-      loadContext: async (path, id, options) => { loadOptions = options; route("load"); events.push("load wire=" + runtimeValue("MLX_BUN_FORCE_WIRE") + " media=" + runtimeValue("MLX_BUN_ALLOW_PRIVATE_MEDIA")); return context; },
-      modelServingBinding: async () => { route("binding"); return { discovery: { embeddings: false }, gateway: { configureContinuation() {} } }; },
-      createCacheServices: async (_context, _binding, options) => { cacheOptions = options; route("cache"); return cache; },
-      createAppEngine: async () => { route("engine"); return { gateway: { activeRows: 0, kvBytes: { projected: 0, budget: null } }, async close() { route("close"); context.dispose(); } }; },
+      loadContext: async (path, id, options) => { loadOptions = options; seam("load"); events.push("load wire=" + runtimeValue("MLX_BUN_FORCE_WIRE") + " media=" + runtimeValue("MLX_BUN_ALLOW_PRIVATE_MEDIA")); return context; },
+      modelServingBinding: async () => { seam("binding"); return { discovery: { embeddings: false }, gateway: {} }; },
+      createCacheServices: async (_context, _binding, options) => { cacheOptions = options; seam("cache"); return cache; },
+      createAppEngine: async () => { seam("engine"); return { gateway: { activeRows: 0 }, async close() { seam("close"); context.dispose(); } }; },
     }));
     let limit = 77;
     mock.module("@mlx-bun/mlx/ffi", () => ({ setMemoryLimit(bytes) { events.push("allocator " + bytes); const previous = limit; limit = bytes; return previous; } }));
@@ -584,7 +593,7 @@ test("startup wires the memory budget, runtime context, allocator limit, expert 
     mock.module(app + "src/server/generated-token-history.ts", () => ({ GeneratedTokenHistory: class { remember() {} } }));
     mock.module(app + "src/server/routes.ts", () => ({ createCompletionRoutes(_engine, options) {
       contextLimit = options.contextLimit; defaultAdapter = options.defaultAdapter;
-      assert.deepEqual(options.pagedKv, { blockSize: 128 });
+      assert.equal(options.pagedKv, undefined);
       return { handle: async () => null, invalidateLibrary() {} };
     } }));
     mock.module(app + "src/server/status-routes.ts", () => ({ createStatusRoutes(input) { statusBudget = input.memoryBudgetBytes; return { handle: async () => null }; } }));
@@ -600,24 +609,24 @@ test("startup wires the memory budget, runtime context, allocator limit, expert 
     assert.deepEqual(events, ["offload /unused", "activate /offload", "load wire=1 media=1", "mount my-lora /unused/adapters/my-lora", "allocator 8000000000"]);
     assert.equal(defaultAdapter, "my-lora");
     assert.deepEqual(loadOptions, { memoryBudgetBytes: 8e9, runtime: { batchSize: 2, maxGenerationTokens: 128, memoryBudgetBytes: 8e9, contextTokens: 4096, nativeDraft: false },
-      draftKind: "ngram", numDraftTokens: 4, ngramMax: 5, ngramMin: 2 });
+      kv: { override: "off", fusedSdpa: true }, adapters: true, maxRows: 2, pagedKv: { blockSize: 128 }, draftKind: "ngram", numDraftTokens: 4, ngramMax: 5, ngramMin: 2 });
     assert.equal(cacheOptions.allocatorLimitBytes, 8e9);
     assert.equal(statusBudget, 8e9);
     assert.equal(contextLimit, expected);
     await running.close();
-    assert.deepEqual(routes, ["load:0", "binding:0", "cache:0", "engine:0", "close:0"]);
-    assert.equal(runtimeValue("MLX_BUN_NO_FUSED_SDPA"), undefined);
+    // --fused-sdpa composes with the KV flags at load (loadOptions.kv above); the seams run in order.
+    assert.deepEqual(seams, ["load", "binding", "cache", "engine", "close"]);
     // Process settings restore only after the engine released the model.
     assert.deepEqual(events.slice(5), ["model close", "restore offload", "allocator 77"]);
     assert.equal(limit, 77);
     assert.equal(runtimeValue("MLX_BUN_FORCE_WIRE"), undefined);
     assert.equal(runtimeValue("MLX_BUN_ALLOW_PRIVATE_MEDIA"), undefined);
     // A bad adapter fails startup with main's message and releases the model before anything else was created.
-    events.length = 0; mountFails = true; routes.length = 0; options.fusedSdpa = false; options.cache.kvQuant = "config";
+    events.length = 0; mountFails = true; seams.length = 0; options.fusedSdpa = false; options.cache.kvQuant = "config";
     await assert.rejects(startModelServer({ path: "/unused", repoId: "test", expertsBytes: 0 }, options), /adapter mount failed: adapter_config.json missing/);
     assert.deepEqual(events, ["load wire=1 media=1", "mount my-lora /unused/adapters/my-lora", "model close"]);
-    assert.deepEqual(routes, ["load:1"]);
-    assert.equal(runtimeValue("MLX_BUN_NO_FUSED_SDPA"), undefined);
+    assert.deepEqual(seams, ["load"]);
+    assert.deepEqual(loadOptions.kv, { override: "config", fusedSdpa: false });
     mountFails = false; options.cache.kvQuant = "off";
     events.length = 0;
     const dense = await startModelServer({ path: "/dense", repoId: "dense", expertsBytes: 0 }, options);
@@ -733,71 +742,17 @@ test("a draft model query resolves through model selection before startup and re
 });
 
 test("paged KV follows main's flag and env mirror, with the block size only alongside paging", () => {
-  expect(parse("--paged-kv").request.pagedKv).toEqual({});
-  expect(parse("--paged-kv", "--paged-kv-block-size", "512").request.pagedKv).toEqual({ blockSize: 512 });
-  expect(parse().request).not.toHaveProperty("pagedKv");
+  expect(parse("--paged-kv").cache.pagedKv).toEqual({});
+  expect(parse("--paged-kv", "--paged-kv-block-size", "512").cache.pagedKv).toEqual({ blockSize: 512 });
+  expect(parse().cache).not.toHaveProperty("pagedKv");
+  expect(parse("--paged-kv").request).not.toHaveProperty("pagedKv");
   expect(() => parse("--paged-kv-block-size", "512")).toThrow("--paged-kv-block-size requires --paged-kv");
   expect(() => parse("--paged-kv", "--paged-kv-block-size", "0")).toThrow();
+  expect(parse("--paged-kv", "--paged-kv-direct").cache.pagedKv).toEqual({ direct: true });
+  expect(() => parse("--paged-kv-direct")).toThrow("--paged-kv-direct requires --paged-kv");
   const restore = configureRuntime({ MLX_BUN_PAGED_KV: "1" });
-  try { expect(parse().request.pagedKv).toEqual({}); expect(parse("--paged-kv-block-size", "128").request.pagedKv).toEqual({ blockSize: 128 }); }
+  try { expect(parse().cache.pagedKv).toEqual({}); expect(parse("--paged-kv-block-size", "128").cache.pagedKv).toEqual({ blockSize: 128 }); }
   finally { restore(); }
-});
-
-test("paged startup validates the resolved KV codec and loaded draft, preserving explicit overrides", () => {
-  const config = [{ layerIdx: 0, bits: 4, groupSize: 64 }];
-  const validate = (input: Parameters<typeof resolveKvScheme>[0], hasDraft = false, paged = true) =>
-    validatePagedServingOptions(paged ? {} : undefined, resolveKvScheme(input).generationOptions, hasDraft);
-  for (const override of ["off", 4, 8] as const)
-    expect(() => validate({ override, config })).not.toThrow();
-  // Config mode without a sidecar resolves to bf16, just as on main.
-  expect(() => validate({ override: "config", config: null })).not.toThrow();
-  expect(() => validate({ override: "config", config: [] })).not.toThrow();
-  expect(() => validate({ override: "config", config })).toThrow("per-layer and TurboQuant pages are not implemented");
-  expect(() => validate({ turboQuant: { kBits: 4, vBits: 3 } })).toThrow("per-layer and TurboQuant pages are not implemented");
-  expect(() => validate({ override: "off" }, true)).toThrow("cannot combine with --draft-model");
-  expect(() => validate({ override: "config", config }, true, false)).not.toThrow();
-  expect(() => validate({ turboQuant: { kBits: 4, vBits: 3 } }, true, false)).not.toThrow();
-});
-
-test("incompatible paged startup closes caches and the loaded model before engine or listener ownership", async () => {
-  // Keep native-free startup mocks private to this process.
-  const app = new URL("../", import.meta.url).pathname;
-  const script = `
-    import { mock } from "bun:test";
-    import { strict as assert } from "node:assert";
-    import { resolveKvScheme } from "@mlx-bun/inference/state/kv-scheme";
-    import { runtimeValue } from "@mlx-bun/inference/runtime/config";
-    const app = ${JSON.stringify(app)}, events = [];
-    const context = { modelId: "test", model: { config: { modelType: "gemma4" } },
-      template: {}, draft: null, dispose() { events.push("model close"); } };
-    let scheme;
-    mock.module(app + "src/engine/index.ts", () => ({
-      loadContext: async () => context,
-      modelServingBinding: async () => ({ gateway: { configureContinuation() { events.push("continuation"); } } }),
-      createCacheServices: async () => ({ resolvedKvScheme: scheme, kvScheme: scheme.generationOptions,
-        async close() { events.push("cache close"); return { durable: true }; } }),
-      createAppEngine: async () => { events.push("engine"); throw new Error("must not construct engine"); },
-    }));
-    mock.module(app + "src/web/assets.ts", () => ({ createWebHandler: async () => () => null }));
-    mock.module(app + "src/server/start.ts", () => ({ startServer() { events.push("listener"); throw new Error("must not bind"); } }));
-    const { parseServeOptions, startModelServer } = await import(app + "src/cli/serve.ts");
-    const options = parseServeOptions({ values: { "paged-kv": true, "force-wire": true, "in-process": true }, positionals: [] });
-    const beforeWire = runtimeValue("MLX_BUN_FORCE_WIRE");
-    for (const [input, draft, message] of [
-      [{ override: "config", config: [{ layerIdx: 0, bits: 4, groupSize: 64 }] }, null, /per-layer and TurboQuant/],
-      [{ turboQuant: { kBits: 4, vBits: 3 } }, null, /per-layer and TurboQuant/],
-      [{ override: "off" }, { provider: {}, numDraftTokens: 3 }, /cannot combine with --draft-model/],
-    ]) {
-      scheme = resolveKvScheme(input); context.draft = draft; events.length = 0;
-      await assert.rejects(startModelServer({ path: "/unused", repoId: "test" }, options), message);
-      assert.deepEqual(events, ["cache close", "model close"]);
-      assert.equal(runtimeValue("MLX_BUN_FORCE_WIRE"), beforeWire);
-    }
-  `;
-  const child = Bun.spawn([process.execPath, "--eval", script], { stdout: "pipe", stderr: "pipe", cwd: app,
-    env: { ...process.env, MLX_BUN_LIBMLXC: "/nonexistent" } });
-  const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
-  expect({ code, stdout, stderr }).toEqual({ code: 0, stdout: "", stderr: "" });
 });
 
 test("startup composes the lazy Whisper companion with the parsed policy, shares it with discovery, audio routes, and web chat, and closes it before the model", async () => {
@@ -810,10 +765,12 @@ test("startup composes the lazy Whisper companion with the parsed policy, shares
     let found = null, discovery, listenerInput, drain;
     const context = { modelId: "test", model: { config: { text: { maxPositionEmbeddings: 4096 } }, weightsBytes: 1e9 }, memoryPlan: null, tokenizer: {},
       template: { supportsThinking: false }, genDefaults: {}, dispose() { events.push("model close"); } };
-    const cache = { promptCache: { totalBytes: 0 }, resolvedKvScheme: { mode: "off", fitOptions: undefined }, kvScheme: {}, stateCodecs: {},
-      adapterNamespace() {}, checkpoints: null, continuationServices: {}, stopIdleDemotion() {}, async close() { return { durable: true }; } };
+    const cache = { cache: { savedPrefixes: () => [], set onPut(_observe) {},
+        report: () => ({ prefixes: { entries: 0, bytes: 0, maxBytes: 0, hits: 0, misses: 0 }, saved: null, kv: { projectedBytes: 0, budgetBytes: null } }),
+        stopIdleDemotion() {}, async close() { return { durable: true }; } },
+      resolvedKvScheme: { mode: "off", fitOptions: undefined, storage: { kind: "bf16" } }, adapterNamespace() {} };
     // Every decode pauses the resident models, which is each engine's execution lease.
-    const gateway = { activeRows: 0, kvBytes: { projected: 0, budget: null }, async acquireExecutionLease(signal) { events.push("lock"); signal?.throwIfAborted(); return { dispose() {} }; } };
+    const gateway = { activeRows: 0, async acquireExecutionLease(signal) { events.push("lock"); signal?.throwIfAborted(); return { dispose() {} }; } };
     mock.module("@mlx-bun/mlx/ffi", () => ({ maxRecommendedWorkingSetSize: () => 32e9, activeMemory: () => 0 }));
     // The Whisper checkpoint and the local catalog are the only seams behind the model host; everything else is the real composition.
     mock.module(lib + "whisper-backend.ts", () => ({ nativeWhisperBackend: { async load(dir) { events.push("load " + dir); return { promptTokenBudget: 3, encode: () => [],
@@ -823,7 +780,7 @@ test("startup composes the lazy Whisper companion with the parsed policy, shares
       find: async query => { throw new Error("unused " + query); }, resolve: async () => undefined, estimate: async () => undefined, register: async () => {}, download: async () => {} }) }));
     mock.module("@mlx-bun/inference/input/audio", () => ({ isRiffWave: () => true, decodeWav: () => ({ samples: new Float32Array(16000), sampleRate: 16000 }), resampleTo16k: samples => samples }));
     mock.module(app + "src/engine/index.ts", () => ({
-      loadContext: async () => context, modelServingBinding: async () => ({ discovery: { embeddings: false }, gateway: { configureContinuation() {} } }),
+      loadContext: async () => context, modelServingBinding: async () => ({ discovery: { embeddings: false }, gateway: {} }),
       createCacheServices: async () => cache,
       createAppEngine: async () => ({ gateway, async close() { events.push("engine close"); context.dispose(); } }),
     }));

@@ -28,7 +28,8 @@ Responses, and embeddings when the loaded model supports them; the
 explains the interfaces and their limits. A loaded graph does not imply
 that every modality or serving combination is supported.
 
-Continuous batching is the serving default, including for one request.
+Every request runs on the continuous batching scheduler; one request is a batch
+of one.
 Generation can be stopped and chats reopened in the browser. For a single
 generation without a server, use `mlx-bun generate e4b "Hello!"`.
 

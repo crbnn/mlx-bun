@@ -20,12 +20,8 @@
 import { runtimeFlag, runtimeValue } from "../../runtime/config";
 import type { SamplerOptions } from "../../sampling/index";
 
-/** Argmax drafts (`MLX_BUN_SPEC_GREEDY_DRAFT=1`). Drops the key coupling. */
-export function greedyDraftPolicy(): boolean {
-  return runtimeFlag("MLX_BUN_SPEC_GREEDY_DRAFT", false);
-}
-
-/** Sampler options for the DRAFT of a request.
+/** Sampler options for the DRAFT of a request. `greedy` is the composition's
+ *  `greedyDraft`: argmax drafts, which drop the key coupling.
  *  `MLX_BUN_SPEC_DRAFT_TEMPERATURE=<t>` samples the draft at its own
  *  temperature: a head flatter than its target matches more often when
  *  sharpened (t < request temperature); t=0 is argmax.
@@ -33,8 +29,8 @@ export function greedyDraftPolicy(): boolean {
  *  the coupled inverse-CDF draw over the full vocabulary, a quarter of the
  *  per-step sampling cost, which at low temperature rarely leaves the
  *  filtered set. */
-export function draftSamplerOptions<T extends SamplerOptions>(options: T): T {
-  if (greedyDraftPolicy()) return { ...options, temperature: 0 };
+export function draftSamplerOptions<T extends SamplerOptions>(options: T, greedy: boolean): T {
+  if (greedy) return { ...options, temperature: 0 };
   let next = options;
   const temperature = runtimeValue("MLX_BUN_SPEC_DRAFT_TEMPERATURE");
   if (temperature !== undefined && Number.isFinite(Number(temperature)) && Number(temperature) >= 0)

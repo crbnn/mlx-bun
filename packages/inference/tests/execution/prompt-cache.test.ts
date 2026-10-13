@@ -23,8 +23,6 @@ function stubCache(
   return {
     offset: 0,
     signature: () => signature,
-    updateAndFetch: () => { throw new Error("unused"); },
-    makeMask: () => ({ mode: "", arr: null }),
     state: () => [{ nbytes } as never],
     isTrimmable: () => trimmable,
     trim: (n) => { trims.push(n); },

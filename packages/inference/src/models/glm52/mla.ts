@@ -14,7 +14,7 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { Glm52Config } from "../../artifacts/glm52-config";
 import type { ColibriGlm52Weights } from "../../artifacts/glm52/weights";
-import type { MLACache,MLACompressedState } from "../../state/glm52-cache";
+import type { LatentAttentionCache, LatentAttentionState } from "../../contracts/mlx/cache";
 
 export interface Glm52MlaProjection {
   /** [B,T,H,qk_nope_head_dim]. */
@@ -27,7 +27,31 @@ export interface Glm52MlaProjection {
   rope: MlxArray;
 }
 
-export type Glm52MlaPath = "auto" | "reconstructed" | "absorbed";
+/** How an MLA read attends the stored latent state, which the phase names (the
+ * graph's per-phase reads, `Glm52PhaseReads`): `reconstructed` rebuilds per-head
+ * no-PE keys and values through `kv_b_proj` for a window; `absorbed` folds the
+ * key and value projections around attention for one query per sequence. */
+export type Glm52MlaPath = "reconstructed" | "absorbed";
+
+/** How one phase's MLA reads attend (`Glm52MlaPath`), fixed per phase when the
+ * graph builds its phase table. `window` is the path of the phase's own reads
+ * (every query of a sequence's window at once); `tokenSerial` is the path of the
+ * DSA loops that read a window one query at a time (a sparse verify window, a
+ * prompt past `index_topk`), each read being one query of one sequence. */
+export interface Glm52PhaseReads {
+  readonly window: Glm52MlaPath;
+  readonly tokenSerial: Glm52MlaPath;
+}
+
+/** The phase reads of GLM-5.2's graph, as data: a phase whose forwards carry one
+ * token per sequence (decode, one known token, a one-token scoring row) reads
+ * absorbed; a phase of windows (a prompt chunk or tail, a verify window, several
+ * known tokens) reconstructs, and its token-serial DSA loops read absorbed. This
+ * is the token-count rule the block applied per call before, stated per phase. */
+export const GLM52_PHASE_READS: Readonly<{ readonly oneToken: Glm52PhaseReads; readonly window: Glm52PhaseReads }> = Object.freeze({
+  oneToken: Object.freeze({ window: "absorbed", tokenSerial: "absorbed" }),
+  window: Object.freeze({ window: "reconstructed", tokenSerial: "absorbed" }),
+});
 export interface Glm52MlaBatchedSelection {
   readonly rows: readonly (MlxArray | null)[];
 }
@@ -246,18 +270,32 @@ function disposeProjection(projection: Glm52MlaProjection): void {
   projection.rope.dispose();
 }
 
-function disposeState(state: MLACompressedState): void {
+function disposeState(state: LatentAttentionState): void {
   state.latent.dispose();
   state.rope.dispose();
-  state.dsa?.dispose();
+  state.indexKeys?.dispose();
 }
+
+/** How an MLA block reads its compressed cache, fixed when the block is built:
+ * the append of its projected state and the state read back. */
+export interface LatentAttentionReads {
+  append(cache: LatentAttentionCache, latent: MlxArray, rope: MlxArray, indexKeys: MlxArray | null): LatentAttentionState;
+}
+
+/** The cache's own read (`LatentAttentionCache.appendLatent`): the default. */
+export const latentCacheRead: LatentAttentionReads = Object.freeze({
+  append: (cache: LatentAttentionCache, latent: MlxArray, rope: MlxArray, indexKeys: MlxArray | null) =>
+    cache.appendLatent(latent, rope, indexKeys),
+});
 
 /**
  * MLX correctness implementation of GLM-5.2 MLA.
  *
  * This is deliberately independent from the future fused MLA kernel. It loads
  * the existing Colibri artifact directly through ColibriGlm52Weights and pins
- * the mathematical contract used by that optimized path.
+ * the mathematical contract used by that optimized path. `reads` is how the
+ * block reads its compressed cache (`LatentAttentionCache`), fixed when the
+ * block is built.
  */
 export class Glm52Mla {
   readonly config: Glm52Config;
@@ -268,6 +306,7 @@ export class Glm52Mla {
     config: Glm52Config,
     weights: ColibriGlm52Weights | Glm52MlaWeightSource,
     layerIndex: number,
+    readonly reads: LatentAttentionReads = latentCacheRead,
   ) {
     if (!Number.isSafeInteger(layerIndex) || layerIndex < 0 ||
         layerIndex > config.numHiddenLayers) {
@@ -381,15 +420,16 @@ export class Glm52Mla {
   /**
    * Append the compressed state and execute attention.
    *
-   * `auto` reconstructs K/V for a multi-token block and selects absorbed MLA
-   * for single-token decode. DSA state, when present, is cached atomically with
-   * the MLA state but DSA selection itself is owned by the indexer primitive.
+   * `path` is the phase's read: the caller names it, the block never derives it
+   * from its input (`absorbed` takes one token per sequence and refuses more).
+   * DSA state, when present, is cached atomically with the MLA state but DSA
+   * selection itself is owned by the indexer primitive.
    */
   forward(
     input: MlxArray,
-    cache: MLACache,
-    dsa: MlxArray | null = null,
-    path: Glm52MlaPath = "auto",
+    cache: LatentAttentionCache,
+    dsa: MlxArray | null,
+    path: Glm52MlaPath,
     selectedPositions: Glm52MlaSelectedPositions = null,
   ): MlxArray {
     if (cache.kvLoraRank !== this.config.kvLoraRank ||
@@ -406,18 +446,11 @@ export class Glm52Mla {
           : new Array(batch).fill(0) as number[])
       : cache.offset;
     const projection = this.project(input, positionOffset);
-    const state = cache.appendCompressed(
-      projection.latent,
-      projection.rope,
-      dsa,
-    );
-    const selectedPath = path === "auto"
-      ? (tokens === 1 ? "absorbed" : "reconstructed")
-      : path;
-    if (selectedPositions !== null && selectedPath !== "absorbed")
+    const state = this.reads.append(cache, projection.latent, projection.rope, dsa);
+    if (selectedPositions !== null && path !== "absorbed")
       throw new Error("DSA-selected MLA requires single-token absorbed decode");
     try {
-      if (selectedPath === "absorbed") {
+      if (path === "absorbed") {
         if (batch > 1) {
           const selections = isBatchedSelection(selectedPositions)
             ? selectedPositions.rows
@@ -478,7 +511,7 @@ export class Glm52Mla {
   /** Reconstruct no-PE keys and values for the complete cached prefix. */
   attendReconstructed(
     projection: Pick<Glm52MlaProjection, "qNope" | "qRope">,
-    state: Pick<MLACompressedState, "latent" | "rope">,
+    state: Pick<LatentAttentionState, "latent" | "rope">,
     leftPadding: readonly number[] = [],
   ): MlxArray {
     const [batch, tokens] = projection.qNope.shape;
@@ -616,7 +649,7 @@ export class Glm52Mla {
    */
   attendAbsorbed(
     projection: Pick<Glm52MlaProjection, "qNope" | "qRope">,
-    state: Pick<MLACompressedState, "latent" | "rope">,
+    state: Pick<LatentAttentionState, "latent" | "rope">,
     selectedPositions: Glm52MlaSelectedPositions = null,
   ): MlxArray {
     const [batch, tokens] = projection.qNope.shape;

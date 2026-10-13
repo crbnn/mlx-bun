@@ -9,7 +9,7 @@ export function snapshotGenerationPolicy<T extends GenerateOptions & { stopSeque
     Object.freeze(value);
   };
   for (const key of ["stopSequences", "eosTokenIds", "adapters", "xtcSpecialTokens", "logitBias",
-    "kvConfig", "turboQuant", "pagedKv", "hlg", "curve", "decodePolicy"] as const) {
+    "hlg", "curve", "decodePolicy"] as const) {
     if (snapshot[key] === undefined) continue;
     const value = structuredClone(snapshot[key]);
     freeze(value);

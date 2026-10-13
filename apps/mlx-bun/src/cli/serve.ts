@@ -6,20 +6,19 @@ import { numericalPolicy } from "./numerical-policy";
 import { storagePath } from "../storage/paths";
 import { resolveModelAuto } from "./model-selection";
 import type { ModelRecord } from "@mlx-bun/hub/registry";
-import type { CacheServiceOptions } from "../engine/cache-services";
 import type { RequestPrepOptions } from "../server/request-prep";
 import type { DraftKind } from "../engine/model-host";
 import { installedModules, locateTaskModel, MEMORY_TASK_MODEL, type ModuleSettings } from "../modules";
 import { createAppState, type AppState, type AppStateOptions, type AppStoragePaths, type ModelHostLink } from "./serve-state";
 import type { ModelHostHooks } from "./serve-host";
-import { resolveServingLimits, shutdownTimeoutMs, validatePagedServingOptions, type RunningApp, type ServeOptions } from "./serve-options";
+import { resolveServingLimits, shutdownTimeoutMs, type RunningApp, type ServeOptions } from "./serve-options";
 
 // The composition lives in two halves: serve-state (persistent, CPU-only) and
 // serve-host (model-scoped). This module parses flags, composes both, and owns
 // the process (signals, browser, shutdown deadline). The model half is
 // imported only by the composition that runs it, so an isolated parent
 // (serve-isolated.ts) never loads the engine.
-export { resolveServingLimits, shutdownTimeoutMs, validatePagedServingOptions, type RunningApp, type ServeOptions };
+export { resolveServingLimits, shutdownTimeoutMs, type RunningApp, type ServeOptions };
 
 /** The saved-state root's default byte budget, across every model's directory (`--ssd-cache-max` overrides). */
 export const DEFAULT_SAVED_STATE_BYTES = 20 * 2 ** 30;
@@ -50,7 +49,7 @@ export function parseServeOptions(args: CommandArgs): ServeOptions {
   // Main's TurboQuant spec, turbo (k8v3) or turbo:k<bits>v<bits>, is its own scheme beside affine KV.
   const turboQuant = parseTurboQuantScheme(kv);
   if (!turboQuant && !["off", "config", "4", "8"].includes(kv)) throw new Error("--kv-quant expects off|config|4|8|turbo[:k<bits>v<bits>]");
-  const cache: CacheServiceOptions = turboQuant ? { turboQuant }
+  const cache: ServeOptions["cache"] = turboQuant ? { turboQuant }
     : { kvQuant: kv === "4" || kv === "8" ? Number(kv) : kv as "off" | "config" };
   const promptCache = number("prompt-cache");
   if (promptCache !== undefined) cache.promptCacheBytes = promptCache * 2 ** 30;
@@ -131,11 +130,13 @@ export function parseServeOptions(args: CommandArgs): ServeOptions {
     ? { ...(draftModel !== undefined ? { model: draftModel } : {}), ...(draftKind ? { kind: draftKind } : {}),
       ...(numDraftTokens !== undefined ? { numTokens: numDraftTokens } : {}), ...(adaptiveDepth ? { adaptiveDepth } : {}),
       ...(ngramMax !== undefined ? { ngramMax } : {}), ...(ngramMin !== undefined ? { ngramMin } : {}) } : undefined;
-  // Main's paged KV: the flag or its env mirror; the block size only with paging.
+  // Main's paged KV: the flag or its env mirror; the block size and the direct read only with paging.
   const pagedKv = args.values["paged-kv"] === true || runtimeValue("MLX_BUN_PAGED_KV") === "1";
   const blockSize = number("paged-kv-block-size", 1, Number.MAX_SAFE_INTEGER, true);
+  const direct = args.values["paged-kv-direct"] === true;
   if (blockSize !== undefined && !pagedKv) throw new Error("--paged-kv-block-size requires --paged-kv");
-  if (pagedKv) request.pagedKv = blockSize !== undefined ? { blockSize } : {};
+  if (direct && !pagedKv) throw new Error("--paged-kv-direct requires --paged-kv");
+  if (pagedKv) cache.pagedKv = { ...(blockSize !== undefined ? { blockSize } : {}), ...(direct ? { direct } : {}) };
   const memoryBudget = number("memory-budget");
   const modelBudget = number("model-budget");
   if (modelBudget !== undefined && modelBudget <= 0) throw new Error("--model-budget expects a number of GB above 0");
@@ -150,7 +151,7 @@ export function parseServeOptions(args: CommandArgs): ServeOptions {
   return {
     query: value("model") ?? args.positionals[0] ?? value("query") ?? null,
     hostname: host, port: number("port", 0, 65535, true) ?? 8080,
-    // Main's --decode-concurrency is an alias of --batch: the same continuous capacity, never a serial lane.
+    // Main's --decode-concurrency is an alias of --batch: the same cap on the continuous scheduler's rows.
     capacity: number("batch", 1, Number.MAX_SAFE_INTEGER, true) ?? number("decode-concurrency", 1, Number.MAX_SAFE_INTEGER, true) ?? 8,
     contextLimit: profileLimit,
     defaultGeneratedTokens: maxTokens === undefined ? undefined : Math.floor(maxTokens),
@@ -389,6 +390,9 @@ export async function probeServer(hostname: string, port: number, timeoutMs = 15
 
 export interface ServeDependencies {
   resolve: typeof resolveModelAuto;
+  /** The startup step, every launch before the chat model loads: compile any Neural Engine program the system
+   * cache lacks (`ensureAneInstall`). */
+  installAne(): Promise<void>;
   start: typeof startModelServer;
   startTranscription: typeof startTranscriptionServer;
   interactive: boolean;
@@ -401,7 +405,8 @@ export interface ServeDependencies {
   error(error: unknown): void;
 }
 const defaults: ServeDependencies = {
-  resolve: resolveModelAuto, start: startModelServer, startTranscription: startTranscriptionServer, interactive: !!process.stdout.isTTY,
+  resolve: resolveModelAuto, installAne: async () => (await import("./ane-install")).ensureAneInstall(),
+  start: startModelServer, startTranscription: startTranscriptionServer, interactive: !!process.stdout.isTTY,
   probe: (hostname, port) => probeServer(hostname, port), open: url => openChatUi(url),
   log: message => console.log(message), signals: process, exit: code => process.exit(code),
   error: error => console.error(error instanceof Error ? error.message : String(error)),
@@ -460,6 +465,8 @@ export async function runServe(args: CommandArgs, supplied: Partial<ServeDepende
           throw new Error(`--whisper-model ${options.whisper.model} resolved to ${whisper.m.repoId} (model_type ${whisper.m.modelType}), not a Whisper checkpoint`);
         options = { ...options, whisper: { ...options.whisper, modelDir: whisper.m.path, modelId: whisper.m.repoId } };
       }
+      await deps.installAne();
+      startup.signal.throwIfAborted();
       deps.log(`Loading ${selection.m.repoId}${selection.picked ? " (auto-selected)" : ""}`);
       running = await deps.start(selection.m, options);
     }

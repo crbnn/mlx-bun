@@ -1,17 +1,7 @@
 import type { KvQuantSpec, ModelConfig, TurboQuantScheme } from "../artifacts/config";
-import { TURBOQUANT_HEAD_DIMS } from "../kernels/turboquant/tables";
+import type { AffineKernelChoice, KvStorageScheme } from "../contracts/portable/composition";
 
 const BF16_BYTES = 2;
-
-/** Head dimensions the TurboQuant codec encodes (its generated tables). */
-export { TURBOQUANT_HEAD_DIMS };
-
-/** TurboQuant converts full-attention layers only (sliding layers stay bf16),
- * so a model can take the scheme when its full-attention head dimension is
- * one the codec encodes. */
-export function supportsTurboQuantHeadDim(config: Pick<ModelConfig, "text">): boolean {
-  return (TURBOQUANT_HEAD_DIMS as readonly number[]).includes(config.text.globalHeadDim);
-}
 
 export type KvQuantOverride = "off" | "config" | number | undefined;
 
@@ -144,11 +134,46 @@ export function sdpaFallbackBytes(config: ModelConfig, chunk: number, ctx: numbe
   return peak;
 }
 
+/** The conversion start a scheme's caches keep bf16 for: the explicit
+ * `quantizedKvStart`, else immediately for a per-layer config and TurboQuant
+ * and after 5000 tokens for uniform bits (mlx-lm's default). */
+function conversionStart(kind: KvSchemeKind, options: Readonly<ResolvedKvSchemeOptions>): number {
+  return options.quantizedKvStart ?? (kind === "affine-uniform" ? 5000 : 0);
+}
+
+/** The composition record's form of a scheme: what the graph's `makeCache`
+ * composes, with the affine read kernels and the conversion start (carried
+ * only when nonzero). */
+function storageOf(kind: KvSchemeKind, options: Readonly<ResolvedKvSchemeOptions>, kernels: AffineKernelChoice): KvStorageScheme {
+  const tokens = conversionStart(kind, options);
+  const start = tokens > 0 ? { quantizedKvStart: tokens } : {};
+  switch (kind) {
+    case "bf16": return Object.freeze({ kind: "bf16" });
+    case "affine-uniform":
+      return Object.freeze({ kind: "affine", bits: options.kvBits!, groupSize: options.kvGroupSize ?? 64, ...start, kernels });
+    case "affine-config":
+      return Object.freeze({ kind: "affine-layers", layers: Object.freeze(options.kvConfig!.map(entry =>
+        Object.freeze({ layer: entry.layerIdx, bits: entry.bits, groupSize: entry.groupSize }))), ...start, kernels });
+    case "turbo":
+      return Object.freeze({ kind: "turbo", kBits: options.turboQuant!.kBits, vBits: options.turboQuant!.vBits, ...start });
+  }
+}
+
+/** The kernels a scheme composes when `--fused-sdpa` is unset: OptiQ's
+ * tiled-causal rule for a per-layer config, mlx-lm's unfused port otherwise. */
+function defaultKernels(kind: KvSchemeKind): AffineKernelChoice {
+  return kind === "affine-config" ? "tiled-causal" : "unfused";
+}
+
 export class KvScheme {
   readonly kind: KvSchemeKind;
   readonly options: Readonly<ResolvedKvSchemeOptions>;
+  /** The composition record's form (`Composition.kv`): the storage every
+   * attention cache of the graph composes and the read kernels of its affine
+   * caches. */
+  readonly storage: KvStorageScheme;
 
-  constructor(kind: KvSchemeKind, options: KvSchemeOptions) {
+  constructor(kind: KvSchemeKind, options: KvSchemeOptions, kernels: AffineKernelChoice = defaultKernels(kind)) {
     this.kind = kind;
     const kvConfig = options.kvConfig?.map((entry) =>
       Object.freeze({ ...entry }),
@@ -161,6 +186,7 @@ export class KvScheme {
       ...(kvConfig ? { kvConfig: Object.freeze(kvConfig) } : {}),
       ...(turboQuant ? { turboQuant } : {}),
     });
+    this.storage = storageOf(kind, this.options, kernels);
   }
 
   get quantized(): boolean {
@@ -222,60 +248,31 @@ export class KvScheme {
     return kvBytesAt(config, tokens, this.fitOptions);
   }
 
-  /** Mutable compatibility value for the numerical generator. The scheme
-   *  keeps its declaration immutable and hands legacy consumers owned copies. */
-  get generationOptions(): KvSchemeOptions {
-    const { kvConfig, turboQuant, ...scalar } = this.options;
-    return {
-      ...scalar,
-      ...(kvConfig
-        ? { kvConfig: kvConfig.map((entry) => ({ ...entry })) }
-        : {}),
-      ...(turboQuant
-        ? { turboQuant: { ...turboQuant } }
-        : {}),
-    };
-  }
-
+  /** Owned copies of the options for memory fit; TurboQuant fits as bf16. */
   get fitOptions(): KvSchemeOptions {
-    return this.kind === "turbo" ? {} : this.generationOptions;
-  }
-
-  /** Affine layouts convert during solo prefill. TQ also has a transitional
-   * row layout that preserves each request's delayed conversion boundary. */
-  batchable(config: ModelConfig, canConvert?: (layerIdx: number) => boolean,
-    cacheLayerCount = config.text.numHiddenLayers, capabilities: { delayedAffine?: boolean } = {}): boolean {
-    if (this.kind === "bf16") return true;
-    if (this.kind !== "affine-config" && this.kind !== "affine-uniform" && this.kind !== "turbo") return false;
-    if (!canConvert) return false;
-    const start = this.options.quantizedKvStart ?? (this.kind === "affine-uniform" ? 5000 : 0);
-    if (start > 0 && this.kind !== "turbo" && !capabilities.delayedAffine) return false;
-    if (this.kind === "affine-uniform" || this.kind === "turbo") {
-      // Some models share the donor prefix's KV in later layers. Probe the
-      // actual cache list, just as uniform conversion does.
-      for (let layer = 0; layer < cacheLayerCount; layer++) {
-        if (cacheLayerKind(config, layer) === "recurrent") continue;
-        if (!canConvert(layer)) return false;
-      }
-      return true;
-    }
-    return this.options.kvConfig!.every((entry) => {
-      if (entry.layerIdx < 0 || entry.layerIdx >= config.text.numHiddenLayers) return false;
-      return cacheLayerKind(config, entry.layerIdx) !== "recurrent" && canConvert(entry.layerIdx);
-    });
+    if (this.kind === "turbo") return {};
+    const { kvConfig, turboQuant: _turbo, ...scalar } = this.options;
+    return { ...scalar, ...(kvConfig ? { kvConfig: kvConfig.map((entry) => ({ ...entry })) } : {}) };
   }
 }
 
+/** Resolve the KV flags (`--kv-quant`, its TurboQuant spelling,
+ * `--quantized-kv-start`, `--fused-sdpa`) against the artifact's
+ * `kv_config.json`. `fusedSdpa` picks the affine read kernels (on:
+ * tiled-causal, off: unfused); unset, they follow the scheme's kind. */
 export function resolveKvScheme(input: {
   override?: KvQuantOverride;
   turboQuant?: TurboQuantScheme;
   config?: readonly KvQuantSpec[] | null;
   missingConfig?: "bf16" | "error";
   quantizedKvStart?: number;
+  fusedSdpa?: boolean;
 }): KvScheme {
   const start = input.quantizedKvStart;
   if (start !== undefined && (!Number.isSafeInteger(start) || start < 0))
     throw new Error("quantizedKvStart must be a nonnegative integer");
+  const kernels = (kind: KvSchemeKind): AffineKernelChoice =>
+    input.fusedSdpa === undefined ? defaultKernels(kind) : input.fusedSdpa ? "tiled-causal" : "unfused";
   if (input.turboQuant) {
     return new KvScheme("turbo", {
       turboQuant: input.turboQuant,
@@ -291,10 +288,28 @@ export function resolveKvScheme(input: {
       return new KvScheme("bf16", {});
     }
     return new KvScheme("affine-config", { kvConfig: [...input.config],
-      ...(start === undefined ? {} : { quantizedKvStart: start }) });
+      ...(start === undefined ? {} : { quantizedKvStart: start }) }, kernels("affine-config"));
   }
   return new KvScheme("affine-uniform", {
     kvBits: input.override,
     quantizedKvStart: start ?? 0,
-  });
+  }, kernels("affine-uniform"));
+}
+
+/** The scheme a composition record names (`Composition.kv`): the inverse of
+ * `KvScheme.storage`, for what describes, bills and keys the composed caches. */
+export function kvSchemeOf(kv: KvStorageScheme): KvScheme {
+  switch (kv.kind) {
+    case "bf16": return new KvScheme("bf16", {});
+    case "affine":
+      return new KvScheme("affine-uniform", { kvBits: kv.bits, kvGroupSize: kv.groupSize,
+        quantizedKvStart: kv.quantizedKvStart ?? 0 }, kv.kernels);
+    case "affine-layers":
+      return new KvScheme("affine-config", { kvConfig: kv.layers.map(entry =>
+        ({ layerIdx: entry.layer, bits: entry.bits, groupSize: entry.groupSize })),
+        quantizedKvStart: kv.quantizedKvStart ?? 0 }, kv.kernels);
+    case "turbo":
+      return new KvScheme("turbo", { turboQuant: { kBits: kv.kBits, vBits: kv.vBits },
+        quantizedKvStart: kv.quantizedKvStart ?? 0 });
+  }
 }

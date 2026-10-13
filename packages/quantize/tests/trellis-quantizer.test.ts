@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { MlxArray, cpuStream } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import { Weights, createModel, generate, loadModelConfig } from "@mlx-bun/inference";
-import { writeShardedSafetensors, type NamedTensor } from "@mlx-bun/inference/artifacts";
+import { readTurboQuantFold, writeShardedSafetensors, type NamedTensor } from "@mlx-bun/inference/artifacts";
 import { TRELLIS_L, TRELLIS_T, lut1mad, unpackDecodeHost } from "../src/trellis";
 import { quantizeTrellisModelDir } from "../src/trellis-quantizer";
 
@@ -156,7 +156,17 @@ describe("packed-Trellis quantization of a synthetic Qwen3.5-layout checkpoint",
     const meta = JSON.parse(readFileSync(join(base, "optiq_metadata.json"), "utf8"));
     expect(meta.trellis).toMatchObject({ L: 12, block: 256, k: 3, modules: 6, tail_biting: true, ldlq: null, k_map: null, reused_from: null });
     expect(meta.affine_modules).toBe(result.nAffine);
-    expect(JSON.parse(readFileSync(join(base, "turboquant_fold.json"), "utf8"))).toMatchObject({ seed: 42, r1: true, r2: false, hiddenSize: H });
+    const fold = JSON.parse(readFileSync(join(base, "turboquant_fold.json"), "utf8"));
+    expect(fold).toMatchObject({ seed: 42, r1: true, r2: false, hiddenSize: H,
+      final_gain_convention: "effective final-norm gain gamma = stored + 1 of the source model`s final norm, the value folded into lm_head; " +
+        "a drafter that enters the folded head divides by it",
+      final_gain_source: `${source.dir} ${LM}norm.weight (stored + 1 in float32, as folded into lm_head.weight)` });
+    // The gain folded into lm_head: γ = stored + 1 of the source's final norm, in float32 (the source stores bf16).
+    const finalGain = new Float32Array(source.tensors.get(`${LM}norm.weight`)!.map(v => bf16(v) + 1));
+    expect(fold.final_gain).toHaveLength(H);
+    expect(Float32Array.from(fold.final_gain)).toEqual(finalGain);
+    // The inference package's reader returns the same record.
+    expect(readTurboQuantFold(base)).toEqual({ seed: 42, r1: true, hiddenSize: H, finalGain });
     expect(existsSync(join(base, "tokenizer.json"))).toBe(true);
   });
 

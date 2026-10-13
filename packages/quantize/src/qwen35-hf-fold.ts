@@ -21,6 +21,8 @@ export interface Qwen35HfFoldPlan {
   gammaNames: string[];
   /** Norm tensors written back as zeros (every folded γ, plus `mtp.norm.weight`). */
   zeroNorms: Set<string>;
+  /** The γ folded into `lm_head.weight`: the final norm's. */
+  headGamma: string;
 }
 
 export interface Qwen35HfFoldSource {
@@ -97,5 +99,5 @@ export function planQwen35HfFold(
       source.info(n).shape.length === 2 && !n.includes("_norm.") && !n.endsWith("attn.norm.weight"),
   );
   if (unplanned.length) throw new Error(`fold plan: unplanned 2-D trunk tensors ${unplanned.join(", ")}`);
-  return { ops, gammaNames, zeroNorms };
+  return { ops, gammaNames, zeroNorms, headGamma: finalNorm };
 }

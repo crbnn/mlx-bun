@@ -5,6 +5,8 @@
 // successive chunks and in-place wrap, then the owners that consume the view:
 // batched merge and extraction (the shared join path), aligned rows, clone,
 // SSD restore, conversion to quantized storage and donor capture.
+import { Dtype } from "@mlx-bun/mlx/ffi";
+import { unfusedAffineKernels } from "../../src/state/affine-attention";
 import { afterAll, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,6 +23,7 @@ import { plainRowStorage, quantizedRowStorage, temporalStorageView } from "../..
 import { cloneKvCaches, loadKvCache, saveKvCache } from "../../src/state/persistence";
 import { disposeTriple } from "../../src/state/quantized-tensor";
 import { KVCache } from "../../src/state/kv";
+import { deferredTurboQuantKernels } from "../../src/state/turboquant-attention";
 import { TurboQuantKVCache } from "../../src/state/turboquant-kv";
 
 const W = 8, H = 2, D = 64, GROUP = 64, BITS = 8;
@@ -118,7 +121,7 @@ function viewTags(cache: RotatingKVCache | RotatingQuantizedKVCache, label: stri
 }
 const STORAGE = {
   plain: () => new RotatingKVCache(W),
-  quantized: () => new RotatingQuantizedKVCache(W, GROUP, BITS),
+  quantized: () => new RotatingQuantizedKVCache(W, GROUP, BITS, unfusedAffineKernels(BITS, GROUP, Dtype.bfloat16)),
 } as const;
 /** A writer that tags every newly written position with its generation. */
 function history(cache: RotatingKVCache | RotatingQuantizedKVCache) {
@@ -164,7 +167,7 @@ test("plain storage: the view is the newest window after every write, as the sha
 
 test("quantized storage: the view is the quantized newest window after every write", () => {
   for (const [name, writes] of Object.entries(CASES)) {
-    const cache = drive(() => new RotatingQuantizedKVCache(W, GROUP, BITS), writes, (c, offset, step) => {
+    const cache = drive(() => new RotatingQuantizedKVCache(W, GROUP, BITS, unfusedAffineKernels(BITS, GROUP, Dtype.bfloat16)), writes, (c, offset, step) => {
       quantizedView(c, `${name}: ${step}`, offset);
       const state = rotatingSourcePosition(c), range = { from: Math.max(0, state.activeLength - Math.min(offset, W)), to: state.activeLength };
       const k = temporalStorageView(quantizedRowStorage, c.keys!, state, range);
@@ -197,7 +200,7 @@ test("conversion, clone, SSD restore and donor capture keep the newest window", 
     plainView(loaded.caches[0] as RotatingKVCache, `${name}: SSD restore`, offset);
     for (const c of loaded.caches) c.dispose();
     // Conversion quantizes the ring as laid out; its view is the quantized window.
-    const quantized = cache.toQuantized(GROUP, BITS);
+    const quantized = cache.toQuantized(GROUP, BITS, unfusedAffineKernels);
     quantizedView(quantized, `${name}: converted`, offset);
     const attention = quantized.captureDonorAttention();
     expect({ name, width: attention.width }).toEqual({ name, width: Math.min(offset, W) });
@@ -213,12 +216,12 @@ test("TurboQuant conversion encodes the newest window of a rotating cache", () =
   // window's rows, built from the history alone.
   for (const [name, writes] of Object.entries(CASES)) {
     const [from, to] = windowOf(writes.reduce((a, b) => a + b, 0));
-    const turbo = TurboQuantKVCache.fromKVCache(drive(() => new RotatingKVCache(W), writes, () => {}), 8, 3);
+    const turbo = TurboQuantKVCache.fromKVCache(drive(() => new RotatingKVCache(W), writes, () => {}), 8, 3, deferredTurboQuantKernels);
     const reference = new KVCache();
     using k = block(from, to, 1);
     using v = block(from, to, -1);
     for (const a of reference.updateAndFetch(k, v)) a.dispose();
-    const expected = TurboQuantKVCache.fromKVCache(reference, 8, 3);
+    const expected = TurboQuantKVCache.fromKVCache(reference, 8, 3, deferredTurboQuantKernels);
     expect({ name, state: turbo.state().map(sha) }).toEqual({ name, state: expected.state().map(sha) });
     turbo.dispose();
     expected.dispose();
@@ -339,10 +342,10 @@ test("verify rounds that keep different prefixes per row leave every row's windo
 
 test("quantized rows merge through their newest windows", () => {
   const names = ["initial oversize", "successive chunks"];
-  const solos = names.map(name => drive(() => new RotatingQuantizedKVCache(W, GROUP, BITS), CASES[name]!, () => {}));
+  const solos = names.map(name => drive(() => new RotatingQuantizedKVCache(W, GROUP, BITS, unfusedAffineKernels(BITS, GROUP, Dtype.bfloat16)), CASES[name]!, () => {}));
   const offsets = names.map(name => CASES[name]!.reduce((a, b) => a + b, 0));
   const views = solos.map(solo => solo.temporalView());
-  const batched = BatchedRotatingQuantCache.merge(views.map(([keys, values]) => ({ keys, values })), offsets, W, GROUP, BITS);
+  const batched = BatchedRotatingQuantCache.merge(views.map(([keys, values]) => ({ keys, values })), offsets, W, GROUP, BITS, unfusedAffineKernels(BITS, GROUP, Dtype.bfloat16));
   for (const [keys, values] of views) { disposeTriple(keys); disposeTriple(values); }
   for (const solo of solos) solo.dispose();
   for (const [row, offset] of offsets.entries()) {

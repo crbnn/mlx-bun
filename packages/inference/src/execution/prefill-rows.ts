@@ -3,6 +3,7 @@ import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import { clearCache } from "@mlx-bun/mlx/ffi";
 import type { PrefillStep } from "../contracts/portable/prefill";
+import type { MlxPromptStep } from "../generation/phase-dispatch";
 import { cloneKvCaches } from "../state/persistence";
 import { type CacheCodecProvider } from "../state/persistence-types";
 import { disposeResources, cleanupFailure } from "../runtime/resources";
@@ -12,8 +13,7 @@ import { prefillCacheLayout } from "../state/layout";
 import { MlxStateRows } from "../state/rows";
 import type { P2RTracePhase, P2RTraceAttributes } from "../runtime/trace";
 import type { MlxForwardWork, MlxPreparationWork } from "../contracts/mlx/forward-work";
-import type { KvMaintenance } from "../state/kv-maintenance";
-import { DenseKvReadError, unreadableRows } from "../state/dense-kv-reads";
+import type { KvMaintenance } from "../contracts/mlx/cache";
 
 // Shared work is recorded on every participating request. workId identifies
 // duplicates when constructing a process timeline; row spans are not additive.
@@ -40,18 +40,25 @@ export interface MlxPrefillState {
   planned?: MlxPrefillStep;
 }
 
+/** One cohort forward: the rows' common phase and their positions per row. */
+export type MlxPrefillForward = MlxPromptStep;
+
 /** The method owns initialization, planning, companion state, snapshots and
  * completion. This driver owns common target batching and work boundaries.
  * Checkpoint factories return owned cache state; close/dispose are idempotent. */
 export interface MlxPrefillRowsHost<State extends MlxPrefillState> {
-  stateCodecs?: CacheCodecProvider;
+  /** The snapshot form of the composition's caches (the cache service's), for a single row's boundary snapshot. */
+  codecs?: CacheCodecProvider;
   maintain?: KvMaintenance;
   open(row: Row): State;
   plan(state: State): MlxPrefillStep;
   /** Already prepared state can complete without any target forward. */
   ready?(state: State): boolean;
-  forward(ids: MlxArray, caches: Cache[], states: readonly State[], work?: MlxForwardWork): Promise<MlxArray>;
-  project(hidden: MlxArray, caches: Cache[], completed: readonly State[]): MlxArray | null;
+  /** Run one cohort forward of `ids` [sequences, tokens] in `step.phase`. */
+  forward(ids: MlxArray, caches: Cache[], states: readonly State[], step: MlxPrefillForward,
+    work?: MlxForwardWork): Promise<MlxArray>;
+  /** Project the cohort forward `step` produced (its rows: sequences times tokens). */
+  project(hidden: MlxArray, caches: Cache[], completed: readonly State[], step: MlxPrefillForward): MlxArray | null;
   /** Consume method context after target maintenance, before snapshots. */
   afterForward?(ids: MlxArray, caches: Cache[], states: readonly State[], hidden: MlxArray): void | Promise<void>;
   checkpoint(state: State, capture: () => Cache[], row: number): void;
@@ -60,9 +67,6 @@ export interface MlxPrefillRowsHost<State extends MlxPrefillState> {
   close(state: State): void;
   filterRows?(keep: readonly number[]): void;
   dispose?(): void;
-  /** Layers the graph reads plain; a row whose next append is not certified
-   * plain-readable there is rejected before the forward. */
-  denseKvReads?: readonly number[];
 }
 
 /** One target preparation lifecycle at B1/B>1. Late joins retain each row's
@@ -154,23 +158,20 @@ export class MlxPrefillRows<State extends MlxPrefillState> implements MlxGroupPr
     if (keep.length !== this.#states.length) this.#filter(keep);
     if (!this.#states.length) { this.dispose(); return true; }
     while (this.#states.length) {
-      if (this.operations.denseKvReads) {
-        const unreadable = new Set(unreadableRows(this.#stateRows?.caches ?? this.#states[0]!.solo,
-          this.operations.denseKvReads, this.#states.length));
-        if (unreadable.size) {
-          const keep: number[] = [];
-          for (const [index, state] of this.#states.entries()) {
-            if (!unreadable.has(index)) { keep.push(index); continue; }
-            this.#release(state); this.operations.reject(state.row, new DenseKvReadError());
-          }
-          this.#filter(keep);
-          if (!this.#states.length) { this.dispose(); return true; }
-        }
-      }
       for (const state of this.#states) state.planned ??= this.operations.plan(state);
       const count = Math.min(this.#states.some(state => state.planned!.atomic) ? Infinity
         : Math.max(1, Math.floor(remaining / this.#states.length)),
         ...this.#states.map(state => state.planned!.end - state.pos));
+      // A planned step stays the unit of maintenance: a row whose step is longer
+      // than this forward (a sibling's step is shorter, or the budget is) runs
+      // `count` of its positions now and is maintained at the step's planned end,
+      // so its caches convert where its own plan put the boundary, whatever rows
+      // it shares the forward with. Only every row's whole planned chunk is a
+      // chunk forward; any other piece of more than one position is a tail.
+      const whole = this.#states.every(state => state.planned!.phase === "chunk" &&
+        state.pos === state.planned!.start && state.pos + count === state.planned!.end);
+      const step: MlxPrefillForward = { sequences: this.#states.length, tokens: count,
+        phase: count === 1 ? "decode" : whole ? "chunk" : "tail" };
       const work = { workId: ++nextWorkId, batchSize: this.#states.length, tokensPerRow: count };
       const closes = this.#states.map(state => state.row.req.trace?.begin("prefill.chunk", {
         mechanism: "continuous", startToken: state.pos, ...work,
@@ -182,7 +183,7 @@ export class MlxPrefillRows<State extends MlxPrefillState> implements MlxGroupPr
         let forwarded: MlxArray | null;
         {
           using span = traceRows(this.#states, "prefill.forward", work);
-          forwarded = ids ? await this.operations.forward(ids, caches, this.#states, workLimit?.forward) : null;
+          forwarded = ids ? await this.operations.forward(ids, caches, this.#states, step, workLimit?.forward) : null;
         }
         using hidden = forwarded;
         const drains: number[] = [], finals: number[] = [];
@@ -201,9 +202,9 @@ export class MlxPrefillRows<State extends MlxPrefillState> implements MlxGroupPr
             evalCacheState(caches);
           }
           using span = traceRows(this.#states, "prefill.kv_maintenance", work);
-          if (this.#stateRows) {
-            for (const cache of caches) cache.prefillMaintenance?.commitPrefill(maintained);
-          } else if (maintained.length) this.operations.maintain?.(this.#states[0]!.solo);
+          // Cohort rows convert at their planned boundaries; a single row's
+          // composed caches converted inside their own appends.
+          if (this.#stateRows) for (const cache of caches) cache.prefillMaintenance?.commitPrefill(maintained);
           // A scheduler budget can split one planned chunk into many pieces.
           // Resolve state at each yield, but retain allocator reuse until the
           // method's maintenance boundary instead of purging it every piece.
@@ -219,14 +220,14 @@ export class MlxPrefillRows<State extends MlxPrefillState> implements MlxGroupPr
           if (state.planned!.snapshot) {
             using span = traceRows([state], "prefill.checkpoint", { ...work, row });
             this.operations.checkpoint(state, () =>
-              this.#stateRows ? this.#stateRows.extractRow(row) : cloneKvCaches(state.solo, this.operations.stateCodecs), row);
+              this.#stateRows ? this.#stateRows.extractRow(row) : cloneKvCaches(state.solo, this.operations.codecs), row);
           }
           if (!finals.includes(row)) state.planned = undefined;
         }
         let projected: MlxArray | null = null;
         if (hidden && finals.length) {
           using span = traceRows(this.#states, "prefill.project", work);
-          projected = this.operations.project(hidden, caches, finals.map(row => this.#states[row]!));
+          projected = this.operations.project(hidden, caches, finals.map(row => this.#states[row]!), step);
         }
         using logits = projected;
         for (const row of finals) {

@@ -1,8 +1,16 @@
 // Opt-in real packed Qwen artifact; no timing, oracle startup or downloads.
 // MLX_BUN_TEST_TRELLIS_MODEL selects it; AB_VARIANT/AB_BASELINE retain main defaults.
+// TrellisLinear passes one decode variant, so this test builds the variants it
+// compares: each Qwen MLP is replaced by one that runs the variant-selected
+// dispatch TrellisLinear used before it fixed variant 13, with the variant
+// explicit, over the loaded weights. It uses the generic Qwen3.5 graph, which
+// reads each layer's MLP per forward; the generated Trellis graphs bind their MLP
+// kernels when they are constructed.
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
+import type { MlxArray } from "@mlx-bun/mlx/array";
+import type { ReadPhase } from "../../src/models/graph";
 
 const artifact = process.env.MLX_BUN_TEST_TRELLIS_MODEL;
 if (artifact && !existsSync(`${artifact}/config.json`)) throw new Error(`unavailable packed artifact: ${artifact}`);
@@ -12,18 +20,72 @@ const baselineVariant = Number(process.env.MLX_BUN_TRELLIS_AB_BASELINE ?? "6");
 if (![6, 7, 8, 9, 10, 11, 12].includes(baselineVariant)) throw new Error("baseline variant must be 6..12");
 
 test.skipIf(!artifact)("shared-M kernels preserve full Qwen logits, recurrent state and KV continuation", async () => {
-  const { createModel } = await import("@mlx-bun/inference/models");
   const { loadModelConfig } = await import("@mlx-bun/inference/artifacts");
   const { Weights } = await import("@mlx-bun/inference/artifacts");
-  const { Qwen35Model } = await import("@mlx-bun/inference/models/qwen3_5");
-  const { TrellisLinear, setTrellisVariant } = await import("@mlx-bun/inference/layers");
+  const { Qwen35Model } = await import("@mlx-bun/inference/models/qwen3_5"), { resolveComposition } = await import("@mlx-bun/inference");
+  const { TrellisLinear, compiledSwiglu, fusedGateUpEligible } = await import("@mlx-bun/inference/layers");
+  const kernels = await import("@mlx-bun/inference/kernels/trellis");
   const { cloneKvCaches } = await import("@mlx-bun/inference/state");
   const { clearCache } = await import("@mlx-bun/mlx/ffi");
   const ops = await import("@mlx-bun/mlx/ops");
+  const { phaseHidden, phaseLogits } = await import("../models/phase-forward");
+  type Trellis = InstanceType<typeof TrellisLinear>;
+
+  /** TrellisLinear.forward before it fixed variant 13, with the variant explicit. */
+  const project = (lin: Trellis, x: MlxArray, variant: number, inputRowContiguous: boolean): MlxArray => {
+    const g = lin.geometry, lead = x.shape.slice(0, -1), M = lead.reduce((a, b) => a * b, 1);
+    const x2 = ops.reshape(x, [M, g.inFeatures]);
+    let y: MlxArray, expanded = false;
+    if (M <= kernels.TRELLIS_MATVEC_MAX_M) y = g.axis === 1 ? kernels.trellisReduce(x2, lin.codes, lin.scales, g, variant)
+      : kernels.trellisScatter(x2, lin.codes, lin.scales, g, variant, lin.useSharedScatterCodebook, lin.representations.scatter);
+    else if (variant >= 11 && variant <= 13 && inputRowContiguous && kernels.wideTrellisPrefillEligible(g, M, x.dtype, lin.representations.widePrefill))
+      y = kernels.wideTrellisPrefill(x2, lin.codes, lin.scales, g);
+    else if (variant >= 11 && variant <= 13 && kernels.tiledTrellisPrefillEligible(g, M, x.dtype, lin.representations.widePrefill))
+      y = kernels.tiledTrellisPrefill(x2, lin.codes, lin.scales, g);
+    else if ((variant === 12 || variant === 13) && kernels.splitKTrellisPrefillEligible(g, M, x.dtype))
+      y = kernels.splitKTrellisPrefill(x2, lin.codes, lin.scales, g);
+    else {
+      expanded = true;
+      using stored = kernels.expandTrellis(lin.codes, lin.scales, g, x.dtype, variant);
+      if (g.axis === 1) {
+        using wt = ops.transposeAxes(stored, [1, 0]);
+        y = ops.matmul(x2, wt);
+      } else y = ops.matmul(x2, stored);
+    }
+    x2.dispose();
+    const out = ops.reshape(y, [...lead, g.outFeatures]);
+    y.dispose();
+    if (expanded && variant !== 9) out.eval();
+    return out;
+  };
+  /** Qwen3MLP.forward over packed gate/up/down, with the variant explicit. */
+  const variantMlp = (mlp: { gate: unknown; up: unknown; down: unknown }, variant: number) => {
+    const gate = mlp.gate as Trellis, up = mlp.up as Trellis, down = mlp.down as Trellis;
+    return {
+      // Every phase computes the same rows; the layer hands the MLP its row-contiguous RMSNorm output.
+      forward(x: MlxArray, _phase: ReadPhase): MlxArray {
+        if (fusedGateUpEligible(gate, up) && x.shape.slice(0, -1).reduce((a, b) => a * b, 1) <= kernels.TRELLIS_MATVEC_MAX_M) {
+          using hidden = kernels.fusedGateUpSwiglu(x, gate, up, variant, gate.representations.gateUpCodebook);
+          return project(down, hidden, variant, false);
+        }
+        using g = project(gate, x, variant, true);
+        using u = project(up, x, variant, true);
+        using hidden = compiledSwiglu(g, u);
+        return project(down, hidden, variant, false);
+      },
+    };
+  };
+
   const weights = await Weights.open(artifact!);
   const config = await loadModelConfig(artifact!);
-  const model = createModel(weights, config);
-  if (!(model instanceof Qwen35Model)) { weights.dispose(); throw new Error("test requires dense Qwen3.5/3.8"); }
+  const model = new Qwen35Model(weights, config, resolveComposition(config));
+  const loaded = model.layers.map((layer) => layer.mlp);
+  const installed = new Map<number, ReturnType<typeof variantMlp>[]>();
+  const install = (variant: number) => {
+    if (!installed.has(variant)) installed.set(variant, loaded.map((mlp) => variantMlp(mlp, variant)));
+    const mlps = installed.get(variant)!;
+    model.layers.forEach((layer, i) => { (layer as unknown as { mlp: unknown }).mlp = mlps[i]; });
+  };
   const prefix = model.makeCache();
   const digest = (data: Uint8Array) => createHash("sha256").update(data).digest("hex");
   const stateHashes = (caches: typeof prefix) => caches.map((cache) => ({
@@ -43,15 +105,15 @@ test.skipIf(!artifact)("shared-M kernels preserve full Qwen logits, recurrent st
     const caches = cloneKvCaches(prefix);
     try {
       ops.evalAll(caches.flatMap((cache) => cache.state()));
-      setTrellisVariant(variant);
+      install(variant);
       const logits = (() => {
-        if (!lastOnly) return model.forward(tokens, caches);
+        if (!lastOnly) return phaseLogits(model, tokens, caches);
         const ids = ops.fromInt32(tokens, [1, tokens.length]);
         let hidden;
-        try { hidden = model.forwardHidden(ids, caches); }
+        try { hidden = phaseHidden(model, ids, caches); }
         finally { ids.dispose(); }
         const last = hidden.slice([0, tokens.length - 1, 0], [1, tokens.length, hidden.shape[2]!]);
-        try { return model.logitsFromHidden(last); }
+        try { return model.logits.one(last); }
         finally { last.dispose(); hidden.dispose(); }
       })();
       try {
@@ -59,7 +121,7 @@ test.skipIf(!artifact)("shared-M kernels preserve full Qwen logits, recurrent st
         const hashes = { logits: digest(logits.rawBytesView()), state: stateHashes(caches) };
         let continuation: string | undefined;
         if (follow) {
-          const next = model.forward([911], caches);
+          const next = phaseLogits(model, [911], caches);
           try { continuation = digest(next.rawBytesView()); }
           finally { next.dispose(); }
         }
@@ -72,10 +134,10 @@ test.skipIf(!artifact)("shared-M kernels preserve full Qwen logits, recurrent st
 
   try {
     expect(model.layers.filter((layer) => layer.mlp.gate instanceof TrellisLinear).length).toBe(64);
-    setTrellisVariant(6);
+    install(6);
     const ids = ops.fromInt32(Array.from({ length: 32 }, (_, i) => 100 + i * 7), [1, 32]);
     try {
-      const hidden = model.forwardHidden(ids, prefix);
+      const hidden = phaseHidden(model, ids, prefix);
       try { ops.evalAll([hidden, ...prefix.flatMap((cache) => cache.state())]); }
       finally { hidden.dispose(); }
     } finally { ids.dispose(); }
@@ -107,7 +169,7 @@ test.skipIf(!artifact)("shared-M kernels preserve full Qwen logits, recurrent st
     }
 
   } finally {
-    setTrellisVariant(null);
+    model.layers.forEach((layer, i) => { (layer as unknown as { mlp: unknown }).mlp = loaded[i]; });
     for (const cache of prefix) cache.dispose();
     weights.dispose(); clearCache();
   }

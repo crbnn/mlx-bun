@@ -1,5 +1,29 @@
 import type { SpeculativeTransaction } from "../contracts/portable/rollback";
 import type { Cache } from "../contracts/mlx/cache";
+import type { KvStorageScheme } from "../contracts/portable/composition";
+import { isRotatingPlainCache } from "./capabilities";
+
+/** Whether a serial run's caches, composed with the KV scheme `kv`, can drop
+ * the rejected tail of a verify block (`rollbackVerifyBlock`): bf16 storage
+ * that trims, a plain ring, or a recurrence that restores and replays. */
+export function rollsBackVerifyBlock(kv: KvStorageScheme, caches: readonly Cache[]): boolean {
+  return kv.kind === "bf16" && caches.every(cache =>
+    cache.isTrimmable() || isRotatingPlainCache(cache) || typeof cache.specRoundRollback === "function");
+}
+
+/** Drop the rejected tail of a verify block of `block` positions that one
+ * concat write appended, keeping `accepted`: a recurrence restores its
+ * pre-round snapshot and bit-exactly replays the accepted prefix; other storage
+ * trims the rest. A plain ring stops being trimmable once it wraps, but the
+ * block was one concat write that keeps the newest window-1 positions plus the
+ * block in temporal order, so its rollback trim drops the tail physically
+ * (at least the window remains: `accepted` >= 1). */
+export function rollbackVerifyBlock(caches: readonly Cache[], accepted: number, block: number): void {
+  for (const cache of caches) {
+    if (cache.specRoundRollback) cache.specRoundRollback(accepted);
+    else cache.trim(block - accepted, isRotatingPlainCache(cache));
+  }
+}
 
 interface TransactionLayer<Acceptance> {
   fits(drafts: number): boolean;

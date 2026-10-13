@@ -29,6 +29,7 @@ const modelDir = process.env.MLX_BUN_TRAINING_MODEL ?? "";
 const optIn = native && modelDir !== "";
 const { loadModelConfig, Weights } = optIn ? await import("@mlx-bun/inference/artifacts") : {} as typeof import("@mlx-bun/inference/artifacts");
 const { createModel } = optIn ? await import("@mlx-bun/inference/models") : {} as typeof import("@mlx-bun/inference/models");
+const { generate } = optIn ? await import("@mlx-bun/inference") : {} as typeof import("@mlx-bun/inference");
 const { loadTokenizer, ChatTemplate } = optIn ? await import("@mlx-bun/inference/input") : {} as typeof import("@mlx-bun/inference/input");
 const { AdapterManager } = optIn ? await import("@mlx-bun/inference/adapters") : {} as typeof import("@mlx-bun/inference/adapters");
 const { trainLora, DEFAULT_TRAIN_CONFIG } = optIn ? await import("@mlx-bun/training") : {} as typeof import("@mlx-bun/training");
@@ -120,12 +121,15 @@ describe.skipIf(!optIn)("LoRA SFT training e2e (cached model snapshot)", () => {
       const ids = tok.encode(prompt);
       const eos = tok.eosTokenId != null ? [tok.eosTokenId] : [];
 
-      model.loraState.active = [];
-      const baseOut = model.generate(ids, 16, eos);
-
-      model.loraState.active = ["trained"];
-      const adaptedOut = model.generate(ids, 16, eos);
-      model.loraState.active = [];
+      // Greedy generation through the library's autoregressive method, the adapter selected per request.
+      const greedy = async (adapters: string[]) => {
+        const out: number[] = [];
+        for await (const { token } of generate(model, ids, { temperature: 0, maxTokens: 16, eosTokenIds: eos,
+          ...(adapters.length ? { adapters } : {}) })) out.push(token);
+        return out;
+      };
+      const baseOut = await greedy([]);
+      const adaptedOut = await greedy(["trained"]);
 
       expect(adaptedOut).not.toEqual(baseOut);
 

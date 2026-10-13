@@ -42,17 +42,19 @@ const preamble = `
   const until = async (check, what) => { const end = Date.now() + 5000; while (!check()) { if (Date.now() > end) throw new Error("timed out waiting for " + what); await Bun.sleep(5); } };
   const context = { modelId: "org/model", model: { config: { text: { maxPositionEmbeddings: 4096 } }, weightsBytes: 1e9 }, memoryPlan: null, tokenizer: {},
     template: { supportsThinking: false }, genDefaults: {}, draft: null, dispose() { events.push("model close"); } };
-  const cache = { promptCache: { totalBytes: 0 }, resolvedKvScheme: { mode: "off", fitOptions: undefined }, kvScheme: {}, stateCodecs: {}, adapterNamespace() {},
-    checkpoints: null, continuationServices: {}, stopIdleDemotion() { events.push("timer stop"); }, async close() { events.push("cache close"); return { durable: true }; } };
-  const gateway = { held: 0, activeRows: 0, kvBytes: { projected: 0, budget: null }, async acquireExecutionLease(signal) { signal.throwIfAborted(); gateway.held++; events.push("lease");
+  const cache = { cache: { savedPrefixes: () => [], set onPut(_observe) {},
+      report: () => ({ prefixes: { entries: 0, bytes: 0, maxBytes: 0, hits: 0, misses: 0 }, saved: null, kv: { projectedBytes: 0, budgetBytes: null } }),
+      stopIdleDemotion() { events.push("timer stop"); }, async close() { events.push("cache close"); return { durable: true }; } },
+    resolvedKvScheme: { mode: "off", fitOptions: undefined }, adapterNamespace() {} };
+  const gateway = { held: 0, activeRows: 0, async acquireExecutionLease(signal) { signal.throwIfAborted(); gateway.held++; events.push("lease");
     return { dispose() { gateway.held--; events.push("release"); } }; }, async runExclusive(fn) { return fn(); } };
   // The host reads two numbers from the native library to size its budget; nothing else may load it.
   mock.module("@mlx-bun/mlx/ffi", () => ({ maxRecommendedWorkingSetSize: () => 32e9, activeMemory: () => 0 }));
   mock.module(app + "src/engine/index.ts", () => ({
     loadContext: async () => { if (process.env.WORKER_LOAD_FAILS) throw new Error("load failed"); events.push("load"); return context; },
-    modelServingBinding: async () => ({ discovery: { embeddings: false }, gateway: { configureContinuation() {} } }),
+    modelServingBinding: async () => ({ discovery: { embeddings: false }, gateway: {} }),
     createCacheServices: async () => cache,
-    createAppEngine: async () => ({ gateway, async close() { events.push("engine close"); await cache.close(); context.dispose(); } }),
+    createAppEngine: async () => ({ gateway, async close() { events.push("engine close"); await cache.cache.close(); context.dispose(); } }),
   }));
   mock.module(app + "src/server/routes.ts", () => ({ createCompletionRoutes(_engine, options) { events.push("routes " + (options.responseHistory?.size ?? "?"));
     return { async handle(request) { const path = new URL(request.url).pathname;
@@ -510,11 +512,13 @@ test("the app form composes the real app over the socket with private storage: p
     mock.module("@mlx-bun/mlx/ffi", () => ({ maxRecommendedWorkingSetSize: () => 32e9, activeMemory: () => 0 }));
     const context = { modelId: "org/model", model: { config: { text: { maxPositionEmbeddings: 4096 } }, weightsBytes: 1e9 }, memoryPlan: null, tokenizer: {},
       template: { supportsThinking: false }, genDefaults: {}, draft: null, dispose() { events.push("model close"); } };
-    const cache = { promptCache: { totalBytes: 0 }, resolvedKvScheme: { mode: "off", fitOptions: undefined }, kvScheme: {}, stateCodecs: {}, adapterNamespace() {},
-      checkpoints: null, continuationServices: {}, stopIdleDemotion() {}, async close() { return { durable: true }; } };
-    const gateway = { activeRows: 0, kvBytes: { projected: 0, budget: null }, async acquireExecutionLease(signal) { signal.throwIfAborted(); events.push("lease"); return { dispose() { events.push("release"); } }; }, async runExclusive(fn) { return fn(); } };
+    const cache = { cache: { savedPrefixes: () => [], set onPut(_observe) {},
+        report: () => ({ prefixes: { entries: 0, bytes: 0, maxBytes: 0, hits: 0, misses: 0 }, saved: null, kv: { projectedBytes: 0, budgetBytes: null } }),
+        stopIdleDemotion() {}, async close() { return { durable: true }; } },
+      resolvedKvScheme: { mode: "off", fitOptions: undefined }, adapterNamespace() {} };
+    const gateway = { activeRows: 0, async acquireExecutionLease(signal) { signal.throwIfAborted(); events.push("lease"); return { dispose() { events.push("release"); } }; }, async runExclusive(fn) { return fn(); } };
     mock.module(app + "src/engine/index.ts", () => ({
-      loadContext: async () => context, modelServingBinding: async () => ({ discovery: { embeddings: false }, gateway: { configureContinuation() {} } }),
+      loadContext: async () => context, modelServingBinding: async () => ({ discovery: { embeddings: false }, gateway: {} }),
       createCacheServices: async () => cache,
       createAppEngine: async () => ({ gateway, async close() { events.push("engine close"); context.dispose(); } }),
     }));

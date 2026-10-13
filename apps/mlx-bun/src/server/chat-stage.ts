@@ -4,7 +4,7 @@
 // controller, and the token→text pipeline the model needs. Every chat-shaped
 // surface (OpenAI chat, Anthropic Messages, Responses) runs this stage; the
 // wire format is not its business.
-import type { PromptCache } from "@mlx-bun/inference/state";
+import type { KvCacheService } from "@mlx-bun/inference/state";
 import {
   applyGrammarDegrade,
   type ChatRequest,
@@ -23,7 +23,7 @@ export class ChatStage {
   constructor(
     private readonly ctx: ModelContext,
     private readonly prep: RequestPrep,
-    private readonly promptCache: Pick<PromptCache, "peekPrefixLen"> & Partial<Pick<PromptCache, "objects">>,
+    private readonly promptCache: Pick<KvCacheService, "peekPrefixLen"> & Partial<Pick<KvCacheService, "objects">>,
     /** Admission ceiling (fit() / a runtime memory plan), resolved once. */
     private readonly contextLimit: number | null,
     /** `serve --adapter <dir>` startup default; a request's explicit
@@ -137,8 +137,8 @@ export class ChatStage {
     // Token fast-forwarding (K3, MLX_BUN_FILL=strict): the determined-span
     // table for this request's tools. Refused for the shapes only this stage
     // can see — a compiled grammar (forced tokens are its job), media prompts
-    // (embeddings prefill / mRoPE). Provider and cache-format support
-    // are declared by the engine's method binding. The
+    // (embeddings prefill / mRoPE). Provider support
+    // is declared by the engine's method binding. The
     // body-level refusals live in prep.fillPlanFor.
     let fillSession: import("@mlx-bun/inference/generation/fill").FillSession | null = null;
     if (!grammarCtrl && !vision && !diffusionPixels) {

@@ -10,6 +10,10 @@ import type { MlxTokenGraph } from "../../src/models/graph";
 import { createRuntimeConfig } from "../../src/runtime/config";
 import { KVCache } from "../../src/state/kv";
 import type { Cache } from "../../src/contracts/mlx/cache";
+import type { KvStorageScheme } from "../../src/contracts/portable/composition";
+import { stubPhases } from "../models/phase-forward";
+import { kvStorage } from "../../src/state/kv-storage";
+import { testComposition } from "../models/test-composition";
 
 // A graph that is none of the model classes and declares its own compiled step:
 // the scheduler and the autoregressive binding reach it only through that
@@ -20,24 +24,23 @@ function graph(declared: Parameters<typeof declareGraph>[0], extra: Partial<MlxT
   const forwards: number[] = [];
   const append = (caches: Cache[], width: number) => {
     using kv = ops.zeros([1, 1, width, 4], Dtype.float32);
-    for (const cache of caches) { const [k, v] = cache.updateAndFetch(kv, kv); k.dispose(); v.dispose(); }
+    for (const cache of caches) { const [k, v] = kvStorage(cache).updateAndFetch(kv, kv); k.dispose(); v.dispose(); }
   };
   const model: MlxTokenGraph = {
     weightsBytes: 0,
     config: { modelType: "fixture", eosTokenIds: [], text: { numHiddenLayers: 1, layerTypes: ["full_attention"],
       numGlobalKeyValueHeads: 1, globalHeadDim: 4, slidingWindow: 0 } } as never,
-    makeCache: () => [new KVCache()], requiredDenseKvLayers: [], graphCapabilities: declareGraph(declared),
-    forwardHidden(ids, caches) { forwards.push(ids.shape[1]!); append(caches, ids.shape[1]!); return ops.zeros([1, ids.shape[1]!, VOCAB], Dtype.float32); },
-    logitsFromHidden: hidden => ops.copyOf(hidden),
+    makeCache: () => [new KVCache()], graphCapabilities: declareGraph(declared), dispose() {},
+    ...stubPhases((ids, caches) => { forwards.push(ids.shape[1]!); append(caches, ids.shape[1]!); return ops.zeros([1, ids.shape[1]!, VOCAB], Dtype.float32); },
+      hidden => ops.copyOf(hidden)),
     ...extra,
   };
   return { model, forwards, append };
 }
 
-function countingStep(model: { append: (caches: Cache[], width: number) => void }, options: { accepts?: boolean; failAt?: number } = {}) {
-  const calls = { accepts: 0, steps: 0 };
+function countingStep(model: { append: (caches: Cache[], width: number) => void }, options: { failAt?: number } = {}) {
+  const calls = { steps: 0 };
   const step: MlxCompiledDecodeStep = {
-    accepts() { calls.accepts++; return options.accepts ?? true; },
     step(_token: MlxArray, caches: Cache[]) {
       if (calls.steps++ === options.failAt) throw new Error("compiled step failed");
       model.append(caches, 1);
@@ -48,9 +51,9 @@ function countingStep(model: { append: (caches: Cache[], width: number) => void 
   return { step, calls };
 }
 
-async function decode(model: MlxTokenGraph, options: { compiledDecode?: boolean; env?: Record<string, string> } = {}) {
-  const group = new MlxBatchExecutionGroup(model, { maxBatch: 2, runtime: createRuntimeConfig(options.env ?? {}) });
-  const tokens: number[] = [];
+async function decode(model: MlxTokenGraph, options: { compiledDecode?: boolean } = {},
+  tokens: number[] = []) {
+  const group = new MlxBatchExecutionGroup(model, { maxBatch: 2, runtime: createRuntimeConfig({}) });
   try {
     await group.submit({ promptIds: [1, 2, 3], maxTokens: 6, eosTokenIds: [], sample: logits => ops.argmaxAxis(logits, -1),
       ...(options.compiledDecode === undefined ? {} : { compiledDecode: options.compiledDecode }),
@@ -58,6 +61,9 @@ async function decode(model: MlxTokenGraph, options: { compiledDecode?: boolean;
   } finally { await group.close(); }
   return tokens;
 }
+
+const TURBO: KvStorageScheme = { kind: "turbo", kBits: 8, vBits: 3 };
+const DELAYED_AFFINE: KvStorageScheme = { kind: "affine", bits: 4, groupSize: 64, quantizedKvStart: 40, kernels: "unfused" };
 
 test("a lone row decodes through the step its graph declares, and other graphs never get one", async () => {
   const fixture = graph({ compiledDecode: true });
@@ -73,29 +79,45 @@ test("a lone row decodes through the step its graph declares, and other graphs n
   const undeclared = graph({});
   const unused = countingStep(undeclared);
   expect(await decode({ ...undeclared.model, compiledDecodeStep: () => unused.step })).toEqual(Array(6).fill(0));
-  expect(unused.calls).toEqual({ accepts: 0, steps: 0 });
+  expect(unused.calls).toEqual({ steps: 0 });
   expect(undeclared.forwards.length).toBeGreaterThan(1);
 });
 
-test("the request, the kill switch and the step's own acceptance keep decoding on the ordinary forward", async () => {
-  for (const [name, options, accepts] of [
-    ["request opt-out", { compiledDecode: false }, true],
-    ["kill switch", { env: { MLX_BUN_COMPILED_DECODE: "0" } }, true],
-    ["state not accepted", {}, false],
+test("the request and the composition keep decoding on the decode operation", async () => {
+  for (const [name, options, extra] of [
+    ["request opt-out", { compiledDecode: false }, {}],
+    ["composition off", {}, { composition: testComposition(undefined, { compiledDecode: false }) }],
   ] as const) {
-    const fixture = graph({ compiledDecode: true });
-    const declared = countingStep(fixture, { accepts });
+    const fixture = graph({ compiledDecode: true }, extra);
+    const declared = countingStep(fixture);
     expect(await decode({ ...fixture.model, compiledDecodeStep: () => declared.step }, options), name).toEqual(Array(6).fill(0));
     expect(declared.calls.steps, name).toBe(0);
   }
 });
 
-test("a step that fails is retired and the same token continues on the ordinary forward", async () => {
+test("every KV scheme and paging keeps the compiled step: each cache lego has its compiled form", async () => {
+  for (const [name, extra] of [
+    ["TurboQuant storage", { composition: testComposition(TURBO) }],
+    ["delayed affine storage", { composition: testComposition(DELAYED_AFFINE) }],
+    ["paged storage", { composition: testComposition(undefined, { pagedKv: { blockSize: 16, direct: false } }) }],
+  ] as const) {
+    const fixture = graph({ compiledDecode: true }, extra);
+    const declared = countingStep(fixture);
+    const tokens = await decode({ ...fixture.model, compiledDecodeStep: () => declared.step });
+    expect(tokens.slice(1), name).toEqual(Array(5).fill(COMPILED_TOKEN));
+    expect(declared.calls.steps, name).toBeGreaterThan(0);
+  }
+});
+
+test("a step that fails fails its request: the compiled step has no fallback", async () => {
   const fixture = graph({ compiledDecode: true });
   const declared = countingStep(fixture, { failAt: 2 });
-  const tokens = await decode({ ...fixture.model, compiledDecodeStep: () => declared.step });
-  expect(tokens).toEqual([0, COMPILED_TOKEN, COMPILED_TOKEN, 0, 0, 0]);
+  const tokens: number[] = [];
+  await expect(decode({ ...fixture.model, compiledDecodeStep: () => declared.step }, {}, tokens)).rejects.toThrow("compiled step failed");
+  // Decode is pipelined: the second step's token is read only after the third step dispatches, which fails.
+  expect(tokens).toEqual([0, COMPILED_TOKEN]);
   expect(declared.calls.steps).toBe(3);
+  expect(fixture.forwards).toEqual([2, 1]); // no decode forward replayed the token
 });
 
 test("a graph that promises a compiled step and provides none is refused where it binds", () => {
@@ -105,22 +127,30 @@ test("a graph that promises a compiled step and provides none is refused where i
   expect(compiledDecodeStepOf(graph({}).model)).toBeNull();
 });
 
-test("the autoregressive binding offers the declared step unless adapters or paging rule replay out", () => {
+test("the autoregressive binding offers the declared step where the composition keeps it, unless adapters rule replay out", () => {
   const fixture = graph({ compiledDecode: true });
   const declared = countingStep(fixture);
   const binding = bindMlxAutoregressiveGraph({ ...fixture.model, compiledDecodeStep: () => declared.step });
-  expect(binding.createDecode!({ hasAdapters: true, pagedKv: false })).toBeNull();
-  expect(binding.createDecode!({ hasAdapters: false, pagedKv: true })).toBeNull();
-  const decoder = binding.createDecode!({ hasAdapters: false, pagedKv: false })!;
   const caches = fixture.model.makeCache();
   try {
-    using token = MlxArray.fromFloat32(new Float32Array([0]), [1]);
-    const result = decoder.tryStep(token, caches)!;
-    expect(result.logits.shape).toEqual([1, 1, VOCAB]);
-    result.logits.dispose();
-    expect(caches[0]!.offset).toBe(1);
-    expect(declared.calls.steps).toBe(1);
-  } finally { for (const cache of caches) cache.dispose(); void decoder.close(); }
+    expect(binding.createDecode!({ hasAdapters: true })).toBeNull();
+    // Every KV scheme keeps the step; a composition that turns it off does not.
+    for (const composition of [testComposition(TURBO), testComposition(DELAYED_AFFINE)])
+      expect(bindMlxAutoregressiveGraph({ ...fixture.model, composition, compiledDecodeStep: () => declared.step })
+        .createDecode!({ hasAdapters: false })).not.toBeNull();
+    expect(bindMlxAutoregressiveGraph({ ...fixture.model, composition: testComposition(TURBO, { compiledDecode: false }),
+      compiledDecodeStep: () => declared.step }).createDecode!({ hasAdapters: false })).toBeNull();
+    const decoder = binding.createDecode!({ hasAdapters: false })!;
+    try {
+      using token = MlxArray.fromFloat32(new Float32Array([0]), [1]);
+      const result = decoder.step(token, caches);
+      expect(result.logits.shape).toEqual([1, 1, VOCAB]);
+      result.logits.dispose();
+      expect(caches[0]!.offset).toBe(1);
+      expect(declared.calls.steps).toBe(1);
+    } finally { void decoder.close(); }
+  } finally { for (const cache of caches) cache.dispose(); }
   // A graph declaring nothing has no decoder, whatever methods it carries.
-  expect(bindMlxAutoregressiveGraph({ ...graph({}).model, compiledDecodeStep: () => declared.step }).createDecode!({ hasAdapters: false, pagedKv: false })).toBeNull();
+  expect(bindMlxAutoregressiveGraph({ ...graph({}).model, compiledDecodeStep: () => declared.step })
+    .createDecode!({ hasAdapters: false })).toBeNull();
 });

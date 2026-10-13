@@ -1,0 +1,211 @@
+# Performance check: the paired serve benchmark (scripts/bench-serve.ts) of a pull
+# request's head against its base on the M1 Max runner, through the server's scheduler: the Trellis 27B artifact in
+# the default configuration and with the DFlash 2 drafter over 4-bit KV, e4b in the default, two
+# alternating server sessions per tree. main's M1 Max graph declares no verify costs and refuses adaptive
+# depth, so the DFlash 2 pair is main at depth 7 against the head adaptive (dflash2-d7-baseline), shown as
+# context and never gated. Gated by the machine preflight and decided from the saved run record by
+# scripts/bench/perf-check.ts. A numerical check follows on the same artifacts (app-path digests and the
+# teacher-forced decode KL, packages/inference/scripts/), reported and not gated.
+# The repository is public, so the job runs only for branches of this repository or a manual
+# dispatch: a fork's pull request must never execute its code on the self-hosted runner.
+name: Performance check
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - packages/inference/src/kernels/**
+      - packages/inference/src/layers/**
+      - packages/inference/src/models/**
+      - packages/inference/src/state/**
+      - packages/inference/src/execution/**
+      - packages/inference/native/**
+      - packages/mlx/**
+      - scripts/bench-serve.ts
+      - scripts/bench/**
+      - packages/inference/scripts/digest.ts
+      - packages/inference/scripts/teacher-forced-kl.ts
+      - .github/workflows/perf.yml
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Baseline ref the dispatched ref is measured against
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+# One measurement at a time on the one GPU; a run that is measuring is never cancelled for a newer one.
+concurrency:
+  group: perf-m1max
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  paired-serve:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS, ARM64, m1max]
+    timeout-minutes: 300
+    env:
+      HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || inputs.base }}
+    steps:
+      - name: Runner environment
+        run: |
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+          if [ -d /opt/homebrew/bin ]; then echo /opt/homebrew/bin >> "$GITHUB_PATH"; fi
+          export PATH="$HOME/.bun/bin:/opt/homebrew/bin:$PATH"
+          [ "$(bun --version)" = 1.4.2 ] || { echo "::error::bun $(bun --version) is not 1.4.2"; exit 1; }
+          echo "$(sysctl -n machdep.cpu.brand_string), $(( $(sysctl -n hw.memsize) / 1073741824 )) GB, macOS $(sw_vers -productVersion)"
+          echo "developer dir: $(xcode-select -p); cmake: $(command -v cmake || echo absent); brew: $(command -v brew || echo absent)"
+          df -h "$HOME"
+          rm -rf "$RUNNER_TEMP/perf" && mkdir -p "$RUNNER_TEMP/perf"
+
+      - name: Check out the candidate
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          path: head
+          persist-credentials: false
+
+      - name: Check out the baseline
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.BASE_REF }}
+          path: base
+          persist-credentials: false
+
+      - name: Install both trees
+        run: |
+          (cd head && bun install --frozen-lockfile)
+          (cd base && bun install --frozen-lockfile)
+
+      - name: Build native libraries for both trees
+        run: |
+          command -v cmake >/dev/null || brew install cmake
+          # bench-serve runs both trees on one pinned MLX runtime, so both must pin the same one.
+          cmp head/packages/mlx/scripts/build-native.sh base/packages/mlx/scripts/build-native.sh ||
+            { echo "::error::the trees pin different MLX runtimes; bench-serve measures both on one pinned runtime"; exit 1; }
+          bun run --cwd head/packages/mlx build:native "$RUNNER_TEMP/perf/mlx-native"
+          for tree in head base; do
+            bun run --cwd "$tree/packages/mlx" stage:native "$RUNNER_TEMP/perf/mlx-native/lib"
+            bun run --cwd "$tree/packages/inference" build:native
+            bun run --cwd "$tree/packages/module-transcription" build:native
+          done
+
+      # Pins the artifacts, trees and runtime and records the candidate's graph; measures nothing.
+      - name: Plan the paired run
+        run: |
+          W="$RUNNER_TEMP/perf" NATIVE="$RUNNER_TEMP/perf/mlx-native/lib/libmlxc.dylib" BUN="$(command -v bun)"
+          snapshot() { # the artifact's snapshot in the hub cache, read in place
+            local repo="$HOME/.cache/huggingface/hub/models--${1//\//--}" rev
+            if [ -f "$repo/refs/main" ]; then rev="$(cat "$repo/refs/main")"; else rev="$(ls "$repo/snapshots" 2>/dev/null || true)"; fi
+            if [ -z "$rev" ] || [ "$(echo "$rev" | wc -l)" -ne 1 ] || [ ! -f "$repo/snapshots/$rev/config.json" ]; then
+              echo "::error::$1: no single snapshot in $repo" >&2; return 1
+            fi
+            echo "$repo/snapshots/$rev"
+          }
+          graph() { MLX_BUN_LIBMLXC="$NATIVE" bun head/scripts/bench/perf-check.ts graph --model "$1" | tail -n 1; }
+          QWEN="$(snapshot mlx-bun/Qwen3.8-27B-Trellis-3.2bpw)"
+          E4B="$(snapshot mlx-community/gemma-4-e4b-it-OptiQ-4bit)"
+          DFLASH2="$(snapshot incoai/Qwen3.8-27B-DFlash2)"
+          # The Trellis target's DFlash 2 rotation basis: main reads it from MLX_BUN_DFLASH2_TARGET_BASIS, this tree
+          # declares it from the artifact's sidecar; bench-serve hands it to both servers.
+          BASIS="$HOME/mlx-bun-perf/models/Qwen3.8-27B-Trellis-3.2bpw-dflash2-basis.json"
+          [ -f "$BASIS" ] || { echo "::error::no DFlash 2 basis at $BASIS"; exit 1; }
+          QWEN_GRAPH="$(graph "$QWEN")"
+          E4B_GRAPH="$(graph "$E4B")"
+          echo "candidate graphs on this machine: qwen27b $QWEN_GRAPH, e4b $E4B_GRAPH"
+          { echo "QWEN=$QWEN"; echo "E4B=$E4B"; echo "NATIVE=$NATIVE"; } >> "$GITHUB_ENV"
+          # DFlash 2 as dflash2-d7-baseline, not dflash2: main's M1 Max graph (its hand-written Trellis graph) declares no
+          # verifyRoundCosts and refuses --num-draft-tokens adaptive (run 38244416727), so main drafts 7 every round
+          # and the head adapts over the costs its generated graph declares. Context, never gated. Once the base
+          # branch's M1 Max graph declares verify costs, this becomes dflash2: both trees adaptive, gated.
+          bun head/scripts/bench-serve.ts plan --out "$W/plan.json" --profile scoped --configurations default,dflash2-d7-baseline --sessions 2 \
+            --baseline-root "$PWD/base" --baseline-command "[\"$BUN\",\"$PWD/base/apps/mlx-bun/bin/mlx-bun.mjs\",\"serve\"]" \
+            --candidate-root "$PWD/head" --candidate-command "[\"$BUN\",\"$PWD/head/apps/mlx-bun/bin/mlx-bun.mjs\",\"serve\"]" \
+            --native "$NATIVE" \
+            --model "qwen27b=$QWEN=mlx-bun/Qwen3.8-27B-Trellis-3.2bpw, candidate graph $QWEN_GRAPH" \
+            --model "e4b=$E4B=mlx-community/gemma-4-e4b-it-OptiQ-4bit, candidate graph $E4B_GRAPH" \
+            --dflash2-draft "qwen27b=$DFLASH2=$BASIS"
+
+      - name: Preflight
+        id: preflight
+        continue-on-error: true
+        run: bun head/scripts/bench/perf-check.ts preflight --out "$RUNNER_TEMP/perf/preflight-before.json" --wait-minutes 30
+
+      - name: Paired serve benchmark, candidate against baseline
+        if: steps.preflight.outcome == 'success'
+        run: |
+          bun head/scripts/bench-serve.ts run --plan "$RUNNER_TEMP/perf/plan.json" --out "$RUNNER_TEMP/perf/run" ||
+            echo "bench-serve run exited $?; the decision reads its saved record"
+
+      - name: Preflight after the run
+        if: ${{ !cancelled() && steps.preflight.outcome == 'success' }}
+        continue-on-error: true
+        run: bun head/scripts/bench/perf-check.ts preflight --out "$RUNNER_TEMP/perf/preflight-after.json"
+
+      - name: Decide
+        if: ${{ !cancelled() }}
+        run: |
+          W="$RUNNER_TEMP/perf" status=0
+          bun head/scripts/bench/perf-check.ts decide --preflight-before "$W/preflight-before.json" \
+            --preflight-after "$W/preflight-after.json" --run "$W/run/run.json" > "$W/summary.md" || status=$?
+          tee -a "$GITHUB_STEP_SUMMARY" < "$W/summary.md"
+          exit "$status"
+
+      # Report only: a digest that differs can be an accepted numerical change, which the KL then sizes.
+      # After the benchmark (the GPU is free) and only on a clear machine.
+      - name: Numerical check, candidate against baseline (digests and teacher-forced KL, not gated)
+        if: ${{ !cancelled() && steps.preflight.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          N="$RUNNER_TEMP/perf/numerics" && mkdir -p "$N"
+          digest() { MLX_BUN_LIBMLXC="$NATIVE" bun head/packages/inference/scripts/digest.ts --root "$PWD/$1" --rows 1,4 "${@:2}"; }
+          status=0
+          for tree in base head; do
+            digest "$tree" --model "$QWEN" bf16 kv-quant=4 > "$N/digest-qwen27b-$tree.txt" || status=1
+            digest "$tree" --model "$E4B" bf16 > "$N/digest-e4b-$tree.txt" || status=1
+            MLX_BUN_LIBMLXC="$NATIVE" bun head/packages/inference/scripts/teacher-forced-kl.ts capture --root "$PWD/$tree" \
+              --model "$QWEN" --cell kv-quant=4 --out "$N/tf-qwen27b-kv4-$tree" > "$N/tf-qwen27b-kv4-$tree.log" 2>&1 || status=1
+          done
+          MLX_BUN_LIBMLXC="$NATIVE" bun head/packages/inference/scripts/teacher-forced-kl.ts compare --reference "$N/tf-qwen27b-kv4-base" \
+            --candidate "$N/tf-qwen27b-kv4-head" --label "qwen27b kv-quant=4, candidate against baseline" > "$N/kl-qwen27b-kv4.txt" 2>&1 || status=1
+          rm -f "$N"/*.f32
+          {
+            echo "## Numerical check (reported, not gated)"; echo
+            echo "App-path digests: token ids and top-8 logprobs of 32 greedy tokens through generate (packages/inference/scripts/digest.ts), one and four rows."
+            for model in qwen27b e4b; do
+              echo; echo "### $model"; echo
+              bun head/packages/inference/scripts/digest.ts compare "$N/digest-$model-base.txt" "$N/digest-$model-head.txt" || true
+            done
+            echo; echo "Teacher-forced decode KL (packages/inference/scripts/teacher-forced-kl.ts: 16 prompts cut to 256 tokens, the last 32 forced):"; echo
+            echo '```'; cat "$N/kl-qwen27b-kv4.txt"; echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      - name: Upload the run record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-run-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/perf/*.json
+            ${{ runner.temp }}/perf/summary.md
+            ${{ runner.temp }}/perf/run/run.json
+            ${{ runner.temp }}/perf/run/report.md
+            ${{ runner.temp }}/perf/run/logs/
+            ${{ runner.temp }}/perf/numerics/
+          if-no-files-found: warn
+
+      - name: Leave nothing behind on the runner host
+        if: always()
+        run: |
+          # A cancelled run can orphan servers (bench-serve starts each in its own process group).
+          pkill -TERM -f "$GITHUB_WORKSPACE/(head|base)/" && sleep 10 || true
+          pkill -KILL -f "$GITHUB_WORKSPACE/(head|base)/" || true
+          rm -rf "$RUNNER_TEMP/perf" "$GITHUB_WORKSPACE/head" "$GITHUB_WORKSPACE/base"

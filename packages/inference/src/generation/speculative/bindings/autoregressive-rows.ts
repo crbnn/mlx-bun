@@ -1,6 +1,6 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
-import type { AutoregressiveGraph } from "../../../contracts/portable/graph";
+import type { MlxPhaseDispatch } from "../../phase-dispatch";
 import type { Cache, BatchableCache, PaddedPrefillCache } from "../../../contracts/mlx/cache";
 import type { DraftRowSampling } from "../source";
 import { toLogprobs } from "../../../sampling/index";
@@ -20,7 +20,7 @@ export class MlxAutoregressiveDraftRows {
   #drafts: number[][] = [];
   #depth = 0;
   #pendingLast: Array<number | null>;
-  constructor(readonly graph: AutoregressiveGraph<MlxArray, Cache[], MlxArray>,
+  constructor(readonly phases: MlxPhaseDispatch,
     readonly state: MlxStateRows<MlxDraftLayout>, readonly sampling: DraftRowSampling | null) {
     this.#pendingLast = Array.from({ length: state.rowCount }, () => null);
   }
@@ -33,12 +33,14 @@ export class MlxAutoregressiveDraftRows {
     this.state.filterRows(keep); this.#pendingLast = keep.map(row => this.#pendingLast[row]!);
   }
 
-  async #forward(ids: MlxArray, lengths?: readonly number[]): Promise<MlxArray> {
-    const width = ids.shape[1]!, padded = lengths?.some(length => length !== width);
+  /** One draft-model forward of `sequences` rows of `width` positions: a block of
+   *  known tokens (`prefillTail`), or one position per row (`decode`). */
+  async #forward(ids: MlxArray, sequences: number, width: number, lengths?: readonly number[]): Promise<MlxArray> {
+    const padded = lengths?.some(length => length !== width);
     if (padded) for (const cache of this.state.caches) cache.preparePrefill({
       lengths: [...lengths!], rightPadding: lengths!.map(length => width - length),
     });
-    const hidden = await this.graph.forwardHidden(ids, this.state.caches);
+    const hidden = await this.phases.prompt(width === 1 ? "decode" : "tail", sequences, width)(ids, this.state.caches, null);
     try {
       if (padded) for (const cache of this.state.caches) cache.finalizePrefill();
       return hidden;
@@ -56,8 +58,8 @@ export class MlxAutoregressiveDraftRows {
       using indices = ops.fromInt32(lengths.flatMap(length => Array.from({ length: N + 1 },
         (_, position) => length === N + 1 ? position : Math.min(position + 1, N))), [B, N + 1]);
       using inputs = ops.takeAlongAxis(joined, indices, 1);
-      (await this.#forward(inputs, lengths)).dispose();
-    } else (await this.#forward(tokens)).dispose();
+      (await this.#forward(inputs, B, N + 1, lengths)).dispose();
+    } else (await this.#forward(tokens, B, N)).dispose();
     this.#pendingLast.fill(null); this.materialize();
   }
   materialize(): void { evalCacheState(this.state.caches); }
@@ -74,12 +76,14 @@ export class MlxAutoregressiveDraftRows {
       // coverage aligned with the target's one-token verification.
       for (let position = 0; position < Math.max(1, depth); position++) {
         const padded = position === 0 && lengths.some(length => length !== width);
-        using hidden = await this.#forward(ids, position === 0 ? lengths : undefined);
+        const positions = position === 0 ? width : 1;
+        using hidden = await this.#forward(ids, pending.length, positions, position === 0 ? lengths : undefined);
         this.#history.push(this.state.clone());
         if (depth === 0) break;
         using selection = padded ? ops.fromInt32(lengths.map(length => length - 1), [pending.length, 1, 1]) : null;
-        using selected = selection ? ops.takeAlongAxis(hidden, selection, 1) : null;
-        using logits = this.graph.projectLogits(selected ?? hidden, { type: "last" });
+        using selected = selection ? ops.takeAlongAxis(hidden, selection, 1)
+          : hidden.slice([0, positions - 1, 0], [pending.length, positions, hidden.shape[2]!]);
+        using logits = this.phases.logits(pending.length)(selected);
         using flat = ops.reshape(logits, [pending.length, logits.shape.at(-1)!]);
         using logprobs = toLogprobs(flat);
         const token = this.sampling!.sample(logprobs, steps.map(step => step + position));

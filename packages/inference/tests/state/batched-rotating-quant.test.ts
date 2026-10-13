@@ -15,6 +15,7 @@
 // divergence is a ring-mechanics bug, not noise. Real-model coverage:
 // `02d723a:tests/parity/batched-kv-quant-parity.test.ts` (gemma gate).
 
+import { unfusedAffineKernels } from "../../src/state/affine-attention";
 import { describe, expect, test } from "bun:test";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
@@ -73,7 +74,7 @@ describe("BatchedRotatingQuantCache (milestone 2, model-free)", () => {
     const PREFILL = 5, STEPS = 18; // wraps MAX=8 twice over
 
     // Serial oracle: prefill (concat path) then merge the twin from its view.
-    const serial = new RotatingQuantizedKVCache(MAX, GROUP, BITS);
+    const serial = new RotatingQuantizedKVCache(MAX, GROUP, BITS, unfusedAffineKernels(BITS, GROUP, Dtype.bfloat16));
     {
       const k = bf16Row(rngQ, PREFILL), v = bf16Row(rngQ, PREFILL);
       const [fk, fv] = serial.updateAndFetchQuantized(k, v);
@@ -81,7 +82,7 @@ describe("BatchedRotatingQuantCache (milestone 2, model-free)", () => {
       k.dispose(); v.dispose();
     }
     const [sk0, sv0] = serial.temporalView();
-    const twin = BatchedRotatingQuantCache.merge([{ keys: sk0, values: sv0 }], [serial.offset], MAX, GROUP, BITS);
+    const twin = BatchedRotatingQuantCache.merge([{ keys: sk0, values: sv0 }], [serial.offset], MAX, GROUP, BITS, unfusedAffineKernels(BITS, GROUP, Dtype.bfloat16));
     disposeTriple(sk0); disposeTriple(sv0);
 
     // bf16 control with the same geometry (content irrelevant — we compare
@@ -137,7 +138,7 @@ describe("BatchedRotatingQuantCache (milestone 2, model-free)", () => {
   test("B=2 uneven rows: each row byte-identical to its serial oracle through wrap; filter() drops a row", () => {
     const mk = (seed: number, prefill: number) => {
       const rng = lcg(seed);
-      const c = new RotatingQuantizedKVCache(MAX, GROUP, BITS);
+      const c = new RotatingQuantizedKVCache(MAX, GROUP, BITS, unfusedAffineKernels(BITS, GROUP, Dtype.bfloat16));
       const k = bf16Row(rng, prefill), v = bf16Row(rng, prefill);
       const [fk, fv] = c.updateAndFetchQuantized(k, v);
       disposeTriple(fk); disposeTriple(fv);
@@ -150,7 +151,7 @@ describe("BatchedRotatingQuantCache (milestone 2, model-free)", () => {
     const [bk, bv] = B.c.temporalView();
     const twin = BatchedRotatingQuantCache.merge(
       [{ keys: ak, values: av }, { keys: bk, values: bv }],
-      [A.c.offset, B.c.offset], MAX, GROUP, BITS,
+      [A.c.offset, B.c.offset], MAX, GROUP, BITS, unfusedAffineKernels(BITS, GROUP, Dtype.bfloat16),
     );
     for (const t of [ak, av, bk, bv]) disposeTriple(t);
     expect(twin.leftPad).toEqual([0, 3]);

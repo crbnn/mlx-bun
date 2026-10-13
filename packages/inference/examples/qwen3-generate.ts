@@ -1,4 +1,4 @@
-import { loadModelConfig, Weights, loadTokenizer, generate } from "@mlx-bun/inference";
+import { loadModelConfig, Weights, loadTokenizer, generate, resolveComposition } from "@mlx-bun/inference";
 import { Qwen3Model } from "@mlx-bun/inference/models/qwen3";
 
 /** The caller chooses a Qwen3 checkpoint and owns its weights. */
@@ -7,7 +7,7 @@ export async function generateText(directory: string, prompt: string, maxTokens 
   const tokenizer = await loadTokenizer(directory);
   const weights = await Weights.open(directory);
   try {
-    const graph = new Qwen3Model(weights, config);
+    const graph = new Qwen3Model(weights, config, resolveComposition(config));
     const generation = generate(graph, tokenizer.encode(prompt), {
       maxTokens, temperature: 0, eosTokenIds: config.eosTokenIds,
     });

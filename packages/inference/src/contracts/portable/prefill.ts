@@ -12,17 +12,31 @@ export interface PrefillPosition {
   readonly snapshotAt?: number | null;
 }
 
+/** The phase a prompt step runs in, named by the planner that cut it: a whole
+ * planned `chunk` (exactly the step's chunk size), a `tail` (any other number
+ * of positions above one: what is left after the whole chunks, or a piece a
+ * snapshot boundary cuts short), or `decode`, a single position, which appends
+ * through the one-position read. */
+export type PrefillPhase = "chunk" | "tail" | "decode";
+
 export interface PrefillStep {
   readonly start: number;
   readonly end: number;
   readonly kind: "drain" | "final";
   readonly snapshot: boolean;
   /** Batch admission may finish a short last drain and token zero in one tick.
-   * Serial execution still yields between every drain and the next forward. */
+   * Otherwise execution yields between every drain and the next forward. */
   readonly batchYield: boolean;
+  readonly phase: PrefillPhase;
 }
 
-/** Shared serial/solo-batch prefill program. No tensors, runtime policy reads,
+/** The phase of a step the planner made `whole` (a full chunk) or not, from
+ * `start` to `end`. */
+export function prefillPhase(start: number, end: number, whole: boolean): PrefillPhase {
+  return end - start === 1 ? "decode" : whole ? "chunk" : "tail";
+}
+
+/** The prefill program a row follows, alone or in a batch. No tensors, runtime policy reads,
  * or sampling. Advance position only after executing the returned step. */
 export function nextPrefillStep(input: PrefillPosition): PrefillStep {
   const { length, position, chunkSize, tailSplit, snapshotAt } = input;
@@ -32,14 +46,18 @@ export function nextPrefillStep(input: PrefillPosition): PrefillStep {
   if (snapshotAt != null && (!Number.isSafeInteger(snapshotAt) || snapshotAt < 0 || snapshotAt > length))
     throw new Error("invalid prefill snapshot boundary");
   if (snapshotAt != null && snapshotAt > position && snapshotAt < length) {
-    const end = Math.min(position + chunkSize, snapshotAt);
-    return { start: position, end, kind: "drain", snapshot: end === snapshotAt, batchYield: true };
+    const whole = position + chunkSize <= snapshotAt;
+    const end = whole ? position + chunkSize : snapshotAt;
+    return { start: position, end, kind: "drain", snapshot: end === snapshotAt, batchYield: true,
+      phase: prefillPhase(position, end, whole) };
   }
   const remaining = length - position;
   if (remaining > (tailSplit ? 1 : chunkSize)) {
-    const end = position + (tailSplit ? Math.min(chunkSize, remaining - 1) : chunkSize);
+    const whole = !tailSplit || chunkSize <= remaining - 1;
+    const end = position + (whole ? chunkSize : remaining - 1);
     return { start: position, end, kind: "drain", snapshot: false,
-      batchYield: !tailSplit || remaining - 1 > chunkSize };
+      batchYield: !tailSplit || remaining - 1 > chunkSize, phase: prefillPhase(position, end, whole) };
   }
-  return { start: position, end: length, kind: "final", snapshot: false, batchYield: false };
+  return { start: position, end: length, kind: "final", snapshot: false, batchYield: false,
+    phase: prefillPhase(position, length, remaining === chunkSize) };
 }
