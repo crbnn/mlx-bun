@@ -319,28 +319,6 @@ const sharesRows = (selected: number) => selected >= 10 && selected <= 13;
 const sharedCodebookShape = (g: TrellisGeometry, M: number, dtype: Dtype, selected: number) => selected === 13 &&
   (M === 3 || M === 4) && dtype === Dtype.bfloat16 && g.k === 3 && g.L === 12 && g.T === 256 && g.blockInterleave === 2;
 
-/** One activation row of axis-0 codes the balanced kernels do not take (`scatterRow`'s kernel, `SCATTER_SOURCE`):
- * borrow [1, inFeatures]; return owned lazy [1, outFeatures]. `representation` applies where
- * `scatterBitsEligible` holds; layers pass the one they resolved at construction. */
-export function scatterRow(x2: MlxArray, codes: MlxArray, scales: MlxArray, g: TrellisGeometry, selected: number,
-  representation: ScatterRepresentation): MlxArray {
-  if (x2.shape[0] !== 1) throw new Error("scatterRow: expects one activation row");
-  if (balancedFor(g, selected)) throw new Error("scatterRow: 3-bit codes at T 256 take balancedScatterRow");
-  const qualified = scatterBitsEligible(g, 1, x2.dtype, selected);
-  return launch(scatterKernel(), x2, codes, scales, g, selected, false,
-    qualified && (g.k === 2 || g.k === 4) && representation.genericBits, qualified && representation.floatCodebook, false);
-}
-
-/** One activation row of 3-bit axis-0 codes at T 256 (`BALANCED_SCATTER_SOURCE`, variants 8..13). */
-export function balancedScatterRow(x2: MlxArray, codes: MlxArray, scales: MlxArray, g: TrellisGeometry, selected: number,
-  representation: ScatterRepresentation): MlxArray {
-  if (x2.shape[0] !== 1) throw new Error("balancedScatterRow: expects one activation row");
-  if (!balancedFor(g, selected)) throw new Error("balancedScatterRow: needs 3-bit codes at T 256, L <= 12 (variants 8..13)");
-  const qualified = scatterBitsEligible(g, 1, x2.dtype, selected);
-  return launch(balancedScatterKernel(), x2, codes, scales, g, selected, false,
-    qualified && representation.bits, qualified && representation.floatCodebook, false);
-}
-
 /** 2..4 activation rows sharing each decoded weight (variants 10..13) of axis-0 codes the balanced kernels do not take. */
 export function scatterRows(x2: MlxArray, codes: MlxArray, scales: MlxArray, g: TrellisGeometry, selected: number): MlxArray {
   const M = x2.shape[0]!;

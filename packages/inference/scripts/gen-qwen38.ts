@@ -54,13 +54,11 @@ export interface Qwen38Composition {
   /** The most rows per forward the table entry admits; null admits any number. */
   readonly maxRows: number | null;
   readonly aneBridge: boolean;
-  /** Layers whose gate and up widths differ, at one to four rows, on the reduce kernels. `"split"`, the default and
-   *  measured best: `ReduceMixedGateUp` with MLX's compiled-SwiGLU tail, bit-identical to the two projections plus a
-   *  separate SwiGLU and one kernel instead of three (about 1 ms less per verify forward on the M1 Max over the
-   *  artifact's ten such layers). `"fused"`:
-   *  the same kernel with the same-width kernel's float32 sigmoid (last bits differ). `"off"`: those layers keep the
-   *  generic blocks' two projections and separate SwiGLU, the A/B control. Only a device whose table names
-   *  `ReduceMixedGateUp` reads it. */
+  /** Layers whose gate and up widths differ, at one row, on the codebook kernel. `"split"`, the default and measured
+   *  best: `CodebookGateUpRow` with MLX's compiled-SwiGLU tail, bit-identical to the two projections plus a separate
+   *  SwiGLU and one kernel instead of three. `"fused"`: the same kernel with the same-width kernel's float32 sigmoid
+   *  (last bits differ). `"off"`: those layers keep the generic blocks' two projections and separate SwiGLU, the A/B
+   *  control. Only a device whose table names a layer that takes the tail (`TAILED`) reads it. */
   readonly mixedGateUp?: "split" | "fused" | "off";
   /** A verify round's cost by its rows (draft depth + 1) relative to one plain decode step, measured for this
    *  composition on `host`: the DFlash 2 drafter's round time at each fixed depth over the plain decode step's time,
@@ -153,16 +151,6 @@ const CLASS_ROWS: Readonly<Record<Narrow, readonly [number, number]>> = { one: [
 const ROW_WORDS = ["", "one", "two", "three", "four", "five", "six", "seven", "eight"];
 const rowsText = ([fewest, most]: readonly [number, number]) => fewest === most
   ? `${ROW_WORDS[fewest]} row${fewest === 1 ? "" : "s"}` : `${ROW_WORDS[fewest]} to ${ROW_WORDS[most]} rows`;
-/** `text` as `//` comment lines of at most 118 characters. */
-function commentLines(text: string): string {
-  const lines: string[] = [];
-  let line = "//";
-  for (const word of text.split(/\s+/)) {
-    if (line.length + 1 + word.length > 118 && line !== "//") { lines.push(line); line = "//"; }
-    line += ` ${word}`;
-  }
-  return [...lines, line].join("\n");
-}
 
 /** One width class's one-kernel MLP layers. */
 interface MlpLayers {
@@ -204,10 +192,11 @@ const LAYER_MODULES: Readonly<Record<string, string>> = Object.freeze({
   MmaGateUp: "trellis-gate-up",
   FactoredDownRow: "trellis-down", FactoredDownRows: "trellis-down", FactoredDownK3iRow: "trellis-down",
   FactoredDownK3iRows: "trellis-down", MmaDown: "trellis-down", MmaDownK3i: "trellis-down",
-  ReduceGateUpRow: "trellis-reduce-gate-up", ReduceGateUpRows: "trellis-reduce-gate-up", ReduceMixedGateUp: "trellis-reduce-gate-up",
-  ScatterDownRow: "trellis-scatter-down", ScatterDownRows: "trellis-scatter-down", ScatterDownK3iRow: "trellis-scatter-down",
-  ScatterDownK3iRows: "trellis-scatter-down",
+  CodebookGateUpRow: "trellis-reduce-gate-up", CodebookDownRow: "trellis-scatter-down", CodebookDownK3iRow: "trellis-scatter-down",
 });
+
+/** Gate/up layers that take the composition's mixed-width SwiGLU tail (`mixedGateUp`) as their third argument. */
+const TAILED = new Set(["CodebookGateUpRow"]);
 
 const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
   applegpu_g16s: {
@@ -238,17 +227,18 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
       projections: ["in_proj_z", "out_proj", "o_proj"] },
   },
   // The M1 Max GPU's kernels and evaluation, measured there per class (forward + head, one sequence, bf16 KV, each
-  // layer's per-call shader time and the whole forward): the reduce gate/up and scatter down kernels at one row (the
-  // representations qualified on this GPU family, through TrellisLinear) with MLX's QuantizedLinear; at two to three
-  // rows the factored kernels and the affine row kernels, which beat the matrix-unit ones there; at four the
-  // matrix-unit gate/up and affine set (the shared-row gate/up and affine row kernels fall behind at four rows here)
-  // with the factored down; at five to eight the matrix-unit set, about 5.6x faster than the generic blocks' prefill
-  // tiles and 1.2x than QuantizedLinear for the projections and head. Graph submission every 4 layers takes about 4 ms
-  // off every width (2 and 8 within noise of it); mixed rows packed on the generic blocks; known tokens as windows.
+  // layer's per-call shader time and the whole forward): the threadgroup-codebook gate/up and down kernels at one row,
+  // with MLX's QuantizedLinear; at two to three rows the factored kernels and the affine row kernels, which beat the
+  // matrix-unit ones there; at four the matrix-unit gate/up and affine set (the shared-row gate/up and affine row
+  // kernels fall behind at four rows here) with the factored down; at five to eight the matrix-unit set, about 5.6x
+  // faster than the generic blocks' prefill tiles and 1.2x than QuantizedLinear for the projections and head. Graph
+  // submission every 4 layers takes about 4 ms off every width (2 and 8 within noise of it); wider verify windows one
+  // lazy graph (1.8% faster than bounded at 12 and 16 rows); mixed rows packed on the generic blocks; known tokens as
+  // windows (the committed read's attention boundaries are qualified on the M4 Pro only).
   applegpu_g13s: {
     label: "M1 Max GPU",
     mlp: {
-      one: { sameGateUp: "ReduceGateUpRow", mixedGateUp: "ReduceMixedGateUp", rowMajorDown: "ScatterDownRow", k3InterleavedDown: "ScatterDownK3iRow" },
+      one: { sameGateUp: "CodebookGateUpRow", mixedGateUp: "CodebookGateUpRow", rowMajorDown: "CodebookDownRow", k3InterleavedDown: "CodebookDownK3iRow" },
       twoToThree: { sameGateUp: "FactoredGateUpRows", mixedGateUp: "FactoredMixedGateUp", rowMajorDown: "FactoredDownRows", k3InterleavedDown: "FactoredDownK3iRows" },
       four: { sameGateUp: "MmaGateUp", mixedGateUp: "MmaGateUp", rowMajorDown: "FactoredDownRows", k3InterleavedDown: "FactoredDownK3iRows" },
       fiveToEight: { sameGateUp: "MmaGateUp", mixedGateUp: "MmaGateUp", rowMajorDown: "MmaDown", k3InterleavedDown: "MmaDownK3i" },
@@ -268,6 +258,15 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     ane: null,
   },
 });
+
+/** Break a `// ` comment sentence onto further `// ` lines at 120 columns. */
+function wrapComment(text: string): string {
+  const lines = [""];
+  for (const word of text.split(" "))
+    if (lines.at(-1)!.length && 3 + lines.at(-1)!.length + 1 + word.length > 120) lines.push(word);
+    else lines[lines.length - 1] = lines.at(-1)!.length ? `${lines.at(-1)} ${word}` : word;
+  return lines.join("\n// ");
+}
 
 // ── Description: the artifact facts the template needs ────────────────────────
 
@@ -373,8 +372,8 @@ export function emitQwen38Graph(description: Qwen38Description, stem: string,
     throw new Error(`${stem}: ${c.device}'s Neural Engine programs ascend from at least the fewest positions a piece runs`);
   const one = k.mlp.one;
   if (!one) throw new Error(`${stem}: ${c.device}'s table names no one-row MLP layers`);
-  if (c.mixedGateUp !== undefined && !NARROW.some(cls => k.mlp[cls]?.mixedGateUp === "ReduceMixedGateUp"))
-    throw new Error(`${stem}: mixedGateUp chooses the reduce kernels' mixed-width layer, which ${c.device}'s table does not name`);
+  if (c.mixedGateUp !== undefined && !NARROW.some(cls => TAILED.has(k.mlp[cls]?.mixedGateUp ?? "")))
+    throw new Error(`${stem}: mixedGateUp chooses the tail of a mixed-width layer, which ${c.device}'s table does not name`);
   const mixedTail = c.mixedGateUp ?? "split";
   const layers = description.layers;
   const interleaved = layers.filter(layer => layer.downLayout === "k3Interleaved").length;
@@ -388,7 +387,7 @@ export function emitQwen38Graph(description: Qwen38Description, stem: string,
   const generic = (cls: Narrow) => k.mlp[cls] === null;
   const sets = NARROW.flatMap(cls => k.mlp[cls] ? [k.mlp[cls]!] : []);
   /** The reduce mixed-width layer with `mixedGateUp: "off"`: those layers keep the generic blocks. */
-  const offMixed = (m: MlpLayers) => m.mixedGateUp === "ReduceMixedGateUp" && mixedTail === "off";
+  const offMixed = (m: MlpLayers) => TAILED.has(m.mixedGateUp) && mixedTail === "off";
   const mlpLayerNames = [...new Set(sets.flatMap(m =>
     [m.sameGateUp, ...(offMixed(m) ? [] : [m.mixedGateUp]), m.rowMajorDown, m.k3InterleavedDown]))];
   for (const name of mlpLayerNames) if (!LAYER_MODULES[name]) throw new Error(`${stem}: no module for layer ${name}`);
@@ -412,9 +411,11 @@ export function emitQwen38Graph(description: Qwen38Description, stem: string,
   const projectionSets = [...new Map(NARROW.flatMap(cls => k.projections[cls] ? [[blocksName(k.projections[cls]!), k.projections[cls]!] as const] : [])).entries()];
   const headName = (layer: string) => `${layer[0]!.toLowerCase()}${layer.slice(1).replace(/Linear$/, "")}Head`;
   const heads = head ? [...new Set(Object.values(head).filter((layer): layer is string => layer !== null))] : [];
-  const mixedExpr = (m: MlpLayers) => m.mixedGateUp === "ReduceMixedGateUp"
-    ? `new ReduceMixedGateUp(gate, up, ${JSON.stringify(mixedTail)})` : `new ${m.mixedGateUp}(gate, up)`;
-  const gateUpExpr = (m: MlpLayers) => m.sameGateUp === m.mixedGateUp || offMixed(m) ? `new ${m.sameGateUp}(gate, up)`
+  /** A layer's construction; a tailed layer takes the mixed-width tail (the split one where those layers are off). */
+  const construct = (layer: string) => TAILED.has(layer)
+    ? `new ${layer}(gate, up, ${JSON.stringify(mixedTail === "off" ? "split" : mixedTail)})` : `new ${layer}(gate, up)`;
+  const mixedExpr = (m: MlpLayers) => construct(m.mixedGateUp);
+  const gateUpExpr = (m: MlpLayers) => m.sameGateUp === m.mixedGateUp || offMixed(m) ? construct(m.sameGateUp)
     : `spec.gate === spec.up ? new ${m.sameGateUp}(gate, up) : ${mixedExpr(m)}`;
   const narrowSet = (cls: Narrow, indent: string) => {
     const m = k.mlp[cls], p = k.projections[cls];
@@ -461,37 +462,44 @@ ${NARROW.map(cls => narrowSet(cls, "      ")).join("\n")}
     return row(cls === "one" ? "decode.one, verify.one" : `decode/verify.${cls}`, m ? `${m.sameGateUp} + ${m.rowMajorDown}/K3i`
       : "the generic blocks (TrellisMlp)", p ? `${p[3]}/${p[4]}` : "QuantizedLinear");
   }).join("\n");
-  /** Each run of consecutive classes whose mixed-width layer is not their same-width one (the table row names that),
-   *  with its layer and rows. */
+  /** Each run of consecutive classes whose mixed-width layer takes the composition's tail or is not their same-width
+   *  one (the table row names that), with its layer and rows. */
   const mixedRuns: { layer: string; rows: [number, number] }[] = [];
   for (const cls of NARROW) {
     const m = k.mlp[cls], last = mixedRuns.at(-1);
-    if (!m || m.mixedGateUp === m.sameGateUp) continue;
+    if (!m || (m.mixedGateUp === m.sameGateUp && !TAILED.has(m.mixedGateUp))) continue;
     if (last?.layer === m.mixedGateUp && last.rows[1] + 1 === CLASS_ROWS[cls][0]) last.rows[1] = CLASS_ROWS[cls][1];
     else mixedRuns.push({ layer: m.mixedGateUp, rows: [...CLASS_ROWS[cls]] });
   }
   /** Each run as a verb and its object; a run whose verb is the previous run's omits it. */
-  const mixedPhrases = mixedRuns.map(({ layer, rows }) => layer !== "ReduceMixedGateUp" ? ["takes", `${layer} at ${rowsText(rows)}`]
+  const mixedPhrases = mixedRuns.map(({ layer, rows }) => !TAILED.has(layer) ? ["takes", `${layer} at ${rowsText(rows)}`]
     : mixedTail === "off" ? ["keeps", `the generic blocks (two projections, a separate SwiGLU) at ${rowsText(rows)}`]
-    : ["takes", `ReduceMixedGateUp at ${rowsText(rows)}, ${mixedTail === "split"
+    : ["takes", `${layer} at ${rowsText(rows)}, ${mixedTail === "split"
       ? "split tail (MLX's compiled SwiGLU bit for bit)" : "fused tail (the same-width kernel's float32 sigmoid)"}`]);
   const mixedSentence = `Mixed-width gate/up ${mixedPhrases.map(([verb, object], j) =>
     j > 0 && mixedPhrases[j - 1]![0] === verb ? object : `${verb} ${object}`).join(", and ")}.`;
   /** The most rows the graph's own block sets take (the generic blocks above). */
   const widest = generic("fiveToEight") ? "four" : "eight";
-  const summary = kvLego && head && asyncEvery !== null ? `// ${mixedSentence} Every attention block reads
+  const summary = kvLego && head && asyncEvery !== null ? `// ${wrapComment(mixedSentence)} Every attention block reads
 // through the cache (${kvLego}: bf16 through its first append, then the fused 4-bit decode
 // kernel and the folded-GQA window kernel; the bf16 cache: the stock SDPA). The head is part of each phase: logits.twoToThree ${head.twoToThree}, logits.four
 // ${head.four}, logits.fiveToEight ${head.fiveToEight}, QuantizedLinear otherwise. Decode and verify up to 8 rows submit
 // the graph every ${asyncEvery} layers; prompt chunks, tails and wider verify windows evaluate each layer
-// and its recurrent state.` : commentLines(`${mixedSentence} Every attention block reads through the cache the
-composition's KV scheme names (composedFullAttentionCache: the plain cache with the stock SDPA, bf16-first affine or
-per-layer affine with the composition's read kernels, or bf16-first TurboQuant with the dense read). ${head
-  ? `The head is part of each phase: ${NARROW.filter(cls => cls !== "one").map(cls => `logits.${cls} ${head[cls as Exclude<Narrow, "one">] ?? "QuantizedLinear"}`).join(", ")}, QuantizedLinear otherwise.`
-  : "The head is QuantizedLinear at every width."} Decode and verify up to ${widest} rows ${asyncEvery !== null
-  ? `submit the graph every ${asyncEvery} layers` : "are one lazy graph"}; wider decode${k.widerVerify === "lazy" ? " and verify windows" : ""}${
-  k.knownSpans ? "" : " and known-token appends"} are one lazy graph; prompt chunks, and prompt tails and embeddings above ${widest} rows${
-  k.widerVerify === "bounded" ? ", and wider verify windows" : ""}, evaluate each layer and its recurrent state.`);
+// and its recurrent state.` : `// ${wrapComment([
+    mixedSentence,
+    "Every attention block reads through the cache the composition's KV scheme names (composedFullAttentionCache: the",
+    "plain cache with the stock SDPA, bf16-first affine or per-layer affine with the composition's read kernels, or",
+    "bf16-first TurboQuant with the dense read).",
+    head ? `The head is part of each phase: ${NARROW.filter(cls => cls !== "one").map(cls =>
+      `logits.${cls} ${head[cls as Exclude<Narrow, "one">] ?? "QuantizedLinear"}`).join(", ")}, QuantizedLinear otherwise.`
+      : "The head is QuantizedLinear at every width.",
+    asyncEvery !== null ? `Decode and verify up to ${widest} rows submit the graph every ${asyncEvery} layers; wider decode${
+      k.widerVerify === "lazy" ? " and verify windows" : ""}${k.knownSpans ? "" : " and known-token appends"} are one lazy graph;`
+      : `Decode${k.widerVerify === "lazy" ? ", verify" : ` and verify up to ${widest} rows`}${k.knownSpans ? "" : " and known-token appends"
+      } are one lazy graph${k.widerVerify === "lazy" ? " at every width" : ""};`,
+    `prompt chunks, and prompt tails and embeddings above ${widest} rows${k.widerVerify === "bounded" ? ", and wider verify windows" : ""},`,
+    "evaluate each layer and its recurrent state.",
+  ].join(" "))}`;
   const kvText = c.kv === "every" ? "every scheme, each composing its own cache lego (composedFullAttentionCache)"
     : `bf16, or affine ${c.kv.bits}-bit group ${c.kv.groupSize} (composes ${kvLego})`;
   const composition = c.kv === "every" ? `/** The composition this file was generated and gated for, its entry in the loader's table: the artifact's graph

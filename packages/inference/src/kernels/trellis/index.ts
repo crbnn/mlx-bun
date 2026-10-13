@@ -17,15 +17,15 @@
 //               window shift a compile-time constant); simd_sum.
 //   - scatter  (M <= 4, axis=0): lane-per-WORD of a block, running sums per
 //               position in the word, split-K over input rows (partials folded
-//               by one mlx sum). One kernel each: scatterRow / balancedScatterRow
-//               (one row; balanced = 3-bit codes at T 256) and scatterRows /
-//               balancedScatterRows (2..4 rows sharing each decoded weight);
-//               trellisScatter chooses among them by row count and geometry.
+//               by one mlx sum). trellisScatter chooses among the one-row and
+//               shared-row kernels (balanced = 3-bit codes at T 256) by row
+//               count and geometry; scatterRows / balancedScatterRows are the
+//               2..4-row ones (rows sharing each decoded weight).
 //   - expand   (M > 4 fallback): decode the whole tensor to bf16, then a stock
 //               matmul; the transient is one tensor.
 //   - gate-up / mixed-gate-up: fused gate+up+SwiGLU for M <= 4 rows
-//               (gateUpReduceRow one row, gateUpReduceRows 2..4 shared rows;
-//               fusedGateUpSwiglu chooses between them by row count). The mixed
+//               (gateUpReduceRows 2..4 shared rows; fusedGateUpSwiglu chooses
+//               it or the per-row kernel by row count). The mixed
 //               kernel serves layers whose gate and up bit widths differ (one
 //               word layout and bit offset each); TAIL "split" reproduces MLX's
 //               compiled swiglu over two bf16 projections bit for bit (no output
@@ -50,6 +50,13 @@
 //       expand), and the shared scatter codebook for M=3..4 bf16 on the
 //       interleaved k3 layout
 //
+// Threadgroup-codebook one-row kernels (every code value of the 2^L states
+// generated once per threadgroup), the variant-13 output of the kernels above
+// bit for bit:
+//   - gate-up-codebook: gate/up/SwiGLU, the same or different widths
+//   - down-codebook: lanes owning word-aligned runs of positions (every window
+//     shift a constant), row-major 2/4-bit and 3-bit block-interleaved codes
+//
 // Factored-scale kernels: weights contribute their code value y and the scale
 // (with 1/147.8) applies once per output (gate/up) or per input row (down);
 // one kernel per row form and code layout:
@@ -67,9 +74,11 @@ export type { TrellisGeometry, TrellisWeights } from "./geometry";
 export { vectorTrellisExpand, vectorTrellisExpandEligible } from "./vector-expand";
 export { expandTrellis } from "./expand";
 export { trellisReduce, TRELLIS_MATVEC_MAX_M } from "./reduce";
-export { trellisScatter, scatterRow, scatterRows, balancedScatterRow, balancedScatterRows } from "./scatter";
+export { trellisScatter, scatterRows, balancedScatterRows } from "./scatter";
 export { qualifiedRepresentations, type ScatterRepresentation, type TrellisRepresentations } from "./qualified";
-export { fusedGateUpSwiglu, gateUpReduceRow, gateUpReduceRows } from "./gate-up";
+export { fusedGateUpSwiglu, gateUpReduceRows } from "./gate-up";
+export { gateUpCodebookRow } from "./gate-up-codebook";
+export { downCodebookRow, downK3InterleavedCodebookRow } from "./down-codebook";
 export { fusedGateUpSwigluMixed, type MixedGateUpTail } from "./mixed-gate-up";
 export { tiledTrellisPrefill, tiledTrellisPrefillEligible } from "./tiled-prefill";
 export { splitKTrellisPrefill, splitKTrellisPrefillEligible } from "./splitk-prefill";

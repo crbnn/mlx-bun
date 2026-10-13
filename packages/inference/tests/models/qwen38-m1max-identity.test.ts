@@ -7,7 +7,7 @@
 // runs the generic blocks (a whole prompt chunk, prompt tails and verify windows wider than eight rows, every
 // operation under the adapters composition) it is held to the generic Qwen 3.5 graph of its family over the same
 // weights under bf16, affine 4- and 8-bit and TurboQuant KV, hidden, logits and every cache tensor, at maxDiff 0. Its
-// row kernels (reduce and scatter at one row; factored, simdgroup-matrix and affine verify kernels at two to eight)
+// row kernels (threadgroup-codebook at one row; factored, simdgroup-matrix and affine verify kernels at two to eight)
 // have no generic counterpart: the generator's drift test (qwen38-generated-sync), the kernel tests, the
 // real-artifact parity suite on the M1 Max (tests/parity/qwen-trellis-parity.test.ts) and the app digests are their
 // gates. No model, no download.

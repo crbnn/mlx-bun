@@ -19,21 +19,21 @@
 // 15, 21, 35, 36, 43, 50, 51, 53, 56, 62) and the device's one-kernel layers:
 //
 //   operation                      MLP gate/up + down (row-major/interleaved)  affine projections (3/4-bit)
-//   decode.one, verify.one         ReduceGateUpRow + ScatterDownRow/K3i        QuantizedLinear
+//   decode.one, verify.one         CodebookGateUpRow + CodebookDownRow/K3i     QuantizedLinear
 //   decode/verify.twoToThree       FactoredGateUpRows + FactoredDownRows/K3i   Affine3RowsLinear/Affine4RowsLinear
 //   decode/verify.four             MmaGateUp + FactoredDownRows/K3i            Affine3MmaLinear/Affine4MmaLinear
 //   decode/verify.fiveToEight      MmaGateUp + MmaDown/K3i                     Affine3MmaLinear/Affine4MmaLinear
 //   decode/verify.wider,           the generic blocks (TrellisMlp)             QuantizedLinear
 //   prefillChunk.gpu, prefillTail
 //
-// Mixed-width gate/up takes ReduceMixedGateUp at one row, split tail (MLX's compiled SwiGLU bit for bit), and
+// Mixed-width gate/up takes CodebookGateUpRow at one row, split tail (MLX's compiled SwiGLU bit for bit), and
 // FactoredMixedGateUp at two to three rows. Every attention block reads through the cache the composition's KV scheme
 // names (composedFullAttentionCache: the plain cache with the stock SDPA, bf16-first affine or per-layer affine with
 // the composition's read kernels, or bf16-first TurboQuant with the dense read). The head is part of each phase:
 // logits.twoToThree Affine4RowsLinear, logits.four Affine4MmaLinear, logits.fiveToEight Affine4MmaLinear,
 // QuantizedLinear otherwise. Decode and verify up to eight rows submit the graph every 4 layers; wider decode and
-// verify windows and known-token appends are one lazy graph; prompt chunks, and prompt tails and embeddings above
-// eight rows, evaluate each layer and its recurrent state.
+// verify windows and known-token appends are one lazy graph; prompt chunks, and prompt tails and embeddings above eight
+// rows, evaluate each layer and its recurrent state.
 //
 // Request shapes this graph serves:
 //   - prompt chunks of exactly the composition's chunk size (prefillChunk.gpu) and prompt tails (prefillTail);
@@ -77,8 +77,8 @@ import { QuantizedLinear } from "../../layers/quantized-linear";
 import { mropeInvFreq } from "../../layers/qwen-mrope";
 import { FactoredDownK3iRows, FactoredDownRows, MmaDown, MmaDownK3i } from "../../layers/trellis-down";
 import { FactoredGateUpRows, FactoredMixedGateUp, MmaGateUp } from "../../layers/trellis-gate-up";
-import { ReduceGateUpRow, ReduceMixedGateUp } from "../../layers/trellis-reduce-gate-up";
-import { ScatterDownK3iRow, ScatterDownRow } from "../../layers/trellis-scatter-down";
+import { CodebookGateUpRow } from "../../layers/trellis-reduce-gate-up";
+import { CodebookDownK3iRow, CodebookDownRow } from "../../layers/trellis-scatter-down";
 import { AttentionMasks } from "../../state/attention-read";
 import { composedFullAttentionCache } from "../../state/bf16-first-kv";
 import { SSMCache } from "../../state/ssm";
@@ -317,8 +317,8 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
       const affine4MmaBlocks = LAYERS.map((_, i) => blockOf(i, (linear, _path, width) => width === 3 ? new Affine3MmaLinear(linear) : new Affine4MmaLinear(linear)));
       this.#one = generic.map((layer, i) => {
         const spec = LAYERS[i]!, { gate, up, down } = mlpOf(i);
-        const gateUp = spec.gate === spec.up ? new ReduceGateUpRow(gate, up) : new ReduceMixedGateUp(gate, up, "split");
-        const project = spec.downLayout === "k3Interleaved" ? new ScatterDownK3iRow(down) : new ScatterDownRow(down);
+        const gateUp = new CodebookGateUpRow(gate, up, "split");
+        const project = spec.downLayout === "k3Interleaved" ? new CodebookDownK3iRow(down) : new CodebookDownRow(down);
         return layerStep(layer, mixerOf((layer.linearAttn ?? layer.selfAttn)!, spec.kind), post => {
           using mid = gateUp.forward(post);
           return project.forward(mid);

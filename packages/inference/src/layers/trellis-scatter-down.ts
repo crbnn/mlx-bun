@@ -1,17 +1,17 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
-import { balancedScatterRow, balancedScatterRows, scatterRow, scatterRows } from "../kernels/trellis/scatter";
-import type { ScatterRepresentation } from "../kernels/trellis/qualified";
+import { balancedScatterRows, scatterRows } from "../kernels/trellis/scatter";
+import { downCodebookRow, downK3InterleavedCodebookRow } from "../kernels/trellis/down-codebook";
 import type { TrellisLinear } from "./trellis-linear";
 
 // Packed down-projection layers over a Qwen MLP's axis-0 Trellis codes on the
-// scatter kernels (lane per code word, split-K partials folded by one sum;
-// kernels/trellis/index.ts). Each layer runs one kernel for one row form and one
-// code layout (row-major 2- or 4-bit codes, or the 3-bit block interleave, which
-// the balanced kernels decode) and takes everything that kernel varies on at
-// construction: the projection's decode variant, the single-row representations
-// its GPU family qualifies and whether its shared-row codebook was composed
-// (`TrellisLinear.useSharedScatterCodebook`). forward(x) keeps x's leading dimensions.
+// scatter kernels (lanes over a block's code words, split-K partials folded by
+// one sum; kernels/trellis/index.ts). Each layer runs one kernel for one row
+// form and one code layout (row-major 2- or 4-bit codes, or the 3-bit block
+// interleave, which the balanced kernels decode) and takes everything that
+// kernel varies on at construction: the projection's decode variant and whether
+// its shared-row codebook was composed (`TrellisLinear.useSharedScatterCodebook`).
+// forward(x) keeps x's leading dimensions.
 
 function project(lin: TrellisLinear, x: MlxArray, kernel: (x2: MlxArray) => MlxArray): MlxArray {
   const g = lin.geometry, lead = x.shape.slice(0, -1);
@@ -30,20 +30,18 @@ function k3Interleaved(name: string, lin: TrellisLinear): void {
     throw new Error(`${name}: needs 3-bit block-interleaved axis-0 codes`);
 }
 
-/** One activation row; row-major codes. */
-export class ScatterDownRow {
-  readonly #variant: number;
-  readonly #representation: ScatterRepresentation;
-
+/** One activation row; row-major 2- or 4-bit codes at T 256, decoding through a threadgroup codebook with
+ *  word-aligned lanes (kernels/trellis/down-codebook.ts): trellisScatter's single-row output bit for bit. */
+export class CodebookDownRow {
   constructor(readonly down: TrellisLinear) {
-    rowMajor("ScatterDownRow", down);
-    this.#variant = down.variant;
-    this.#representation = down.representations.scatter;
+    rowMajor("CodebookDownRow", down);
+    const g = down.geometry;
+    if ((g.k !== 2 && g.k !== 4) || g.T !== 256 || g.L > 12) throw new Error("CodebookDownRow: needs 2- or 4-bit codes at T 256, L <= 12");
   }
 
   forward(x: MlxArray): MlxArray {
     const { codes, scales, geometry } = this.down;
-    return project(this.down, x, x2 => scatterRow(x2, codes, scales, geometry, this.#variant, this.#representation));
+    return project(this.down, x, x2 => downCodebookRow(x2, codes, scales, geometry));
   }
 }
 
@@ -62,20 +60,13 @@ export class ScatterDownRows {
   }
 }
 
-/** One activation row; 3-bit block-interleaved codes. */
-export class ScatterDownK3iRow {
-  readonly #variant: number;
-  readonly #representation: ScatterRepresentation;
-
-  constructor(readonly down: TrellisLinear) {
-    k3Interleaved("ScatterDownK3iRow", down);
-    this.#variant = down.variant;
-    this.#representation = down.representations.scatter;
-  }
+/** One activation row; 3-bit block-interleaved codes, the same way: trellisScatter's single-row output bit for bit. */
+export class CodebookDownK3iRow {
+  constructor(readonly down: TrellisLinear) { k3Interleaved("CodebookDownK3iRow", down); }
 
   forward(x: MlxArray): MlxArray {
     const { codes, scales, geometry } = this.down;
-    return project(this.down, x, x2 => balancedScatterRow(x2, codes, scales, geometry, this.#variant, this.#representation));
+    return project(this.down, x, x2 => downK3InterleavedCodebookRow(x2, codes, scales, geometry));
   }
 }
 

@@ -14,8 +14,6 @@ export interface ScatterRepresentation {
 export interface TrellisRepresentations {
   /** Threadgroup codebook in the same-width gate/up decode. */
   gateUpCodebook: boolean;
-  /** Exact float32 bits in the mixed-width gate/up decoder. */
-  mixedExactBits: boolean;
   scatter: ScatterRepresentation;
   /** The bundled runtime reduces M=5..15 matmuls with GemvWide on this GPU, so
    *  wide prefill matches it there and tiled prefill steps aside. */
@@ -28,7 +26,7 @@ export interface TrellisRepresentations {
  *  the kernels on every call. */
 export function qualifiedRepresentations(architecture: string): TrellisRepresentations {
   const qualified = architecture === "applegpu_g13s";
-  return { gateUpCodebook: qualified, mixedExactBits: qualified,
+  return { gateUpCodebook: qualified,
     scatter: { bits: qualified, genericBits: qualified, floatCodebook: qualified },
     widePrefill: Number(/^applegpu_[a-z](\d{2})/.exec(architecture)?.[1] ?? 0) >= 15 };
 }
