@@ -413,7 +413,7 @@ export class DeepspecDrafter implements DeepspecDrafterModel {
   }
 
   /** The context projection per width class of the B·L rows projected: one kernel at every class (`matmulW`:
-   *  MLX's quantized matmul, matmul for a BF16 checkpoint), as main ran it at every row count. */
+   *  MLX's quantized matmul, matmul for a BF16 checkpoint). */
   readonly projectContext: MlxWidthTable<DrafterContextProjection> =
     atEveryWidth((targetHiddens: MlxArray) => this.#projectContext(targetHiddens));
 

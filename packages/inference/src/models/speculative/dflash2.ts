@@ -32,10 +32,10 @@
 // when the first draft group binds), and every call runs the kernel the width
 // class of its rows names: five to eight rows (the fiveToEight class, one block
 // of 8) on the simdgroup matrix unit, every other width on MLX's quantized
-// matmul. Main chose the same per call from the input's row count. The context
-// projection (fc, then each layer's k and v, over the B × L rows a prefill or a
-// commit appends) and the draft block (B anchors × G columns) are width tables;
-// the caller indexes them by the rows it projects or drafts.
+// matmul. The context projection (fc, then each layer's k and v, over the B × L
+// rows a prefill or a commit appends) and the draft block (B anchors × G
+// columns) are width tables; the caller indexes them by the rows it projects or
+// drafts.
 
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
