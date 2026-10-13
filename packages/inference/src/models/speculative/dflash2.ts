@@ -464,21 +464,25 @@ export class Dflash2Drafter implements Dflash2DrafterModel {
     } finally { x.dispose(); }
   }
 
-  /** Greedy candidate-path walk (fp32 scores, as vLLM requires). */
+  /** Greedy candidate-path walk (fp32 scores, as vLLM requires). Every position's top-K candidates and their
+   *  scores come from one partition over all positions (each row partitions alone, as one position's would);
+   *  only the path term walks position by position. */
   #select(logits: MlxArray, z: MlxArray, anchors: readonly number[], steps: number): MlxArray {
-    const B = anchors.length, V = logits.shape[2]!, R = z.shape[2]!, K = this.cfg.topK;
+    const B = anchors.length, R = z.shape[2]!, K = this.cfg.topK;
     const tokens: MlxArray[] = [];
+    using scoresAll = logits.astype(Dtype.float32);
+    using negatedAll = ops.mulScalar(scoresAll, -1);
+    using orderAll = ops.argpartitionAxis(negatedAll, K - 1, -1);
+    using localAll = orderAll.slice([0, 0, 0], [B, steps, K]);
+    using unaryAll = ops.takeAlongAxis(scoresAll, localAll, -1); // [B, steps, K]
     using anchorIds = ops.fromInt32([...anchors], [B]);
     let previous = anchorIds.astype(Dtype.uint32);
     try {
       for (let p = 0; p < steps; p++) {
-        using row = logits.slice([0, p, 0], [B, p + 1, V]);
-        using flat = ops.reshape(row, [B, V]);
-        using scores = flat.astype(Dtype.float32);
-        using negated = ops.mulScalar(scores, -1);
-        using order = ops.argpartitionAxis(negated, K - 1, -1);
-        using local = order.slice([0, 0], [B, K]);
-        using unary = ops.takeAlongAxis(scores, local, -1);
+        using localRow = localAll.slice([0, p, 0], [B, p + 1, K]);
+        using local = ops.reshape(localRow, [B, K]);
+        using unaryRow = unaryAll.slice([0, p, 0], [B, p + 1, K]);
+        using unary = ops.reshape(unaryRow, [B, K]);
         const candidates = local;
         using zRow = z.slice([0, p, 0], [B, p + 1, R]);
         using zFlat = ops.reshape(zRow, [B, R]);
