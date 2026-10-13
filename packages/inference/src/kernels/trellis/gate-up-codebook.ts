@@ -3,14 +3,14 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { MetalKernel } from "@mlx-bun/mlx/metal-kernel";
 import type { TrellisWeights } from "./geometry";
 import { CODEBOOK_WINDOW, HEADER } from "./codebook";
-import { TRELLIS_CODEBOOK_THREADS, TRELLIS_CODEBOOK_SG_PER_TG } from "./launch";
+import { TRELLIS_CODEBOOK_ROW_THREADS, TRELLIS_CODEBOOK_ROW_SG_PER_TG } from "./launch";
 import type { MixedGateUpTail } from "./mixed-gate-up";
 
 // Fused gate/up/SwiGLU for one activation row over axis-1 Trellis codes whose
 // gate and up widths may differ (KG, KU), decoding through a threadgroup
 // codebook: every code value y·(1/147.8) of the 2^L states, generated once per
-// threadgroup and shared by the rows its sixteen SIMD groups take in turn (at
-// most THREADGROUPS threadgroups, so each table serves several rows). Same
+// threadgroup and shared by the rows its 32 SIMD groups take in turn (at most
+// THREADGROUPS threadgroups, so each table serves several rows). Same
 // lanes, runs, accumulation order and f32 code·scale weights as
 // fusedGateUpSwiglu (same widths) and fusedGateUpSwigluMixed (different
 // widths), bit for bit; TAIL selects the mixed kernel's SwiGLU arithmetic (1:
@@ -19,8 +19,8 @@ import type { MixedGateUpTail } from "./mixed-gate-up";
 //
 // The threadgroup also stages the activation row, in 16-byte chunks ordered
 // so the 32 lanes of one load read consecutive chunks; a lane reads each
-// chunk of 8 positions just before it uses them (two threadgroups of 512
-// threads fit an M1 Max core only below 53 registers per thread). Each window
+// chunk of 8 positions just before it uses them (a threadgroup of 1024
+// threads fits an M1 Max core only below 53 registers per thread). Each window
 // is one bit-field extract (CODEBOOK_WINDOW, codebook.ts); code words are
 // addressed by 32-bit offsets.
 const SOURCE = String.raw`
@@ -53,10 +53,13 @@ const SOURCE = String.raw`
       const uint uW0 = ((uint)BT - 32u - t0) * (uint)KU / 32u;
       uint g[KG + 1], gv[KG + 1];
       uint u[KU + 1], uv[KU + 1];
+      // Words W0 .. W0 + K - 1 stay in the block; the next word wraps to the block's first for its last run.
       #pragma clang loop unroll(full)
-      for (uint i = 0; i <= (uint)KG; ++i) { const uint wi = gW0 + i; g[i] = gcodes[gw + (wi >= gWpb ? wi - gWpb : wi)]; }
+      for (uint i = 0; i < (uint)KG; ++i) g[i] = gcodes[gw + gW0 + i];
+      g[KG] = gcodes[gw + (t0 == 0u ? 0u : gW0 + (uint)KG)];
       #pragma clang loop unroll(full)
-      for (uint i = 0; i <= (uint)KU; ++i) { const uint wi = uW0 + i; u[i] = ucodes[uw + (wi >= uWpb ? wi - uWpb : wi)]; }
+      for (uint i = 0; i < (uint)KU; ++i) u[i] = ucodes[uw + uW0 + i];
+      u[KU] = ucodes[uw + (t0 == 0u ? 0u : uW0 + (uint)KU)];
       // Virtual words: bits [32i - 16, 32i + 16) of the run's words (only the ignored bits below word 0 are absent).
       gv[0] = g[0] << 16;
       uv[0] = u[0] << 16;
@@ -67,12 +70,11 @@ const SOURCE = String.raw`
       #pragma clang loop unroll(full)
       for (uint q = 0; q < 4u; ++q) {
         const uint4 chunk = xs[q * N_RUNS + run];
-        const float4 xlo = float4(as_type<metal::vec<T, 4>>(chunk.xy));
-        const float4 xhi = float4(as_type<metal::vec<T, 4>>(chunk.zw));
         #pragma clang loop unroll(full)
         for (uint p = 0; p < 8u; ++p) {
           const uint j = q * 8u + p;
-          const float xv = p < 4u ? xlo[p] : xhi[p - 4u];
+          // The bf16 in either half of a word, as the float of its bits.
+          const float xv = as_type<float>((p & 1u) ? chunk[p >> 1] & 0xFFFF0000u : chunk[p >> 1] << 16);
           const float gWeight = trellis_codebook_window(table, g, gv, (31u - j) * (uint)KG, (uint)L) * gScale;
           const float uWeight = trellis_codebook_window(table, u, uv, (31u - j) * (uint)KU, (uint)L) * uScale;
           if (j & 1u) { gAcc2 = metal::fma(gWeight, xv, gAcc2); uAcc2 = metal::fma(uWeight, xv, uAcc2); }
@@ -99,9 +101,9 @@ const SOURCE = String.raw`
   }
 `;
 
-/** Threadgroups at most: ten per M1 Max GPU core, measured against one per sixteen rows (the codebook generated
- *  1088 times per projection at the artifact's 17408 rows). */
-const THREADGROUPS = 320;
+/** Threadgroups at most: five per M1 Max GPU core, measured against 128 to 256 (the codebook generated 544 times per
+ *  projection at the artifact's 17408 rows otherwise). */
+const THREADGROUPS = 160;
 
 let kernel: MetalKernel | undefined;
 
@@ -122,11 +124,11 @@ export function gateUpCodebookRow(x: MlxArray, gate: TrellisWeights, up: Trellis
   const x2 = ops.reshape(x, [1, g.inFeatures]);
   const [mid] = kernel.apply([x2, gate.codes, gate.scales, up.codes, up.scales], {
     outputs: [{ shape: [1, g.rows], dtype: x.dtype }],
-    grid: [TRELLIS_CODEBOOK_THREADS, Math.min(THREADGROUPS, Math.ceil(g.rows / TRELLIS_CODEBOOK_SG_PER_TG)), 1],
-    threadGroup: [TRELLIS_CODEBOOK_THREADS, 1, 1],
+    grid: [TRELLIS_CODEBOOK_ROW_THREADS, Math.min(THREADGROUPS, Math.ceil(g.rows / TRELLIS_CODEBOOK_ROW_SG_PER_TG)), 1],
+    threadGroup: [TRELLIS_CODEBOOK_ROW_THREADS, 1, 1],
     templateDtypes: { T: x.dtype },
-    templateInts: { R: g.rows, C: g.cols, BT: g.T, KG: g.k, KU: u.k, L: g.L, ROWS_TG: TRELLIS_CODEBOOK_SG_PER_TG,
-      THREADS: TRELLIS_CODEBOOK_THREADS, TAIL: g.k !== u.k && tail === "split" ? 1 : 0 },
+    templateInts: { R: g.rows, C: g.cols, BT: g.T, KG: g.k, KU: u.k, L: g.L, ROWS_TG: TRELLIS_CODEBOOK_ROW_SG_PER_TG,
+      THREADS: TRELLIS_CODEBOOK_ROW_THREADS, TAIL: g.k !== u.k && tail === "split" ? 1 : 0 },
   });
   x2.dispose();
   const out = ops.reshape(mid!, [...lead, g.rows]);

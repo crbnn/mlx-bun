@@ -155,7 +155,7 @@ test("explicit single-row representations preserve output bits on any GPU", () =
 }, 60_000);
 
 test("one-row codebook kernels reproduce the shipped one-row kernels on small synthetic shapes", () => {
-  // Gate/up: rows not a multiple of a threadgroup's sixteen, and more than its threadgroups take at once (SIMD groups
+  // Gate/up: rows not a multiple of a threadgroup's 32, and more than its threadgroups take at once (SIMD groups
   // loop over rows). Down: 128 splits of which some are empty and the others hold an odd number of rows (the two-row
   // steps and their remainder), and SIMD groups only partly over blocks.
   let seed = 4099;
