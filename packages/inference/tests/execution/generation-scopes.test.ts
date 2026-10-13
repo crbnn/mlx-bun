@@ -7,18 +7,23 @@ import {
 
 describe("generation wired-limit policy", () => {
   test("uses resident weights for ordinary models", () => {
-    const model = { weightsBytes: 10 };
-    expect(wiredWorkingSetBytes(model)).toBe(10);
+    const model = { weightsBytes: 8 };
+    expect(wiredWorkingSetBytes(model)).toBe(8);
     expect(modelNeedsWiredLimit(model, 20, false)).toBe(false);
   });
 
-  test("wires models above half the recommended set", () => {
-    expect(modelNeedsWiredLimit({ weightsBytes: 11 }, 20, false)).toBe(true);
+  test("wires models above 0.4 of the recommended set", () => {
+    expect(modelNeedsWiredLimit({ weightsBytes: 9 }, 20, false)).toBe(true);
+  });
+
+  test("on the M1 Max's 26.8e9 B set: wires the Qwen3.8 Trellis, not a 9 GiB model", () => {
+    expect(modelNeedsWiredLimit({ weightsBytes: 11_964_927_575 }, 26.8e9, false)).toBe(true);
+    expect(modelNeedsWiredLimit({ weightsBytes: 9 * 2 ** 30 }, 26.8e9, false)).toBe(false);
   });
 
   test("uses the complete streamed execution plan when present", () => {
     const model = {
-      weightsBytes: 10,
+      weightsBytes: 8,
       expertRuntime: { plan: { plannedBytes: 21 } },
     };
     expect(wiredWorkingSetBytes(model)).toBe(21);
