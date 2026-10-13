@@ -979,8 +979,13 @@ a whole chunk or a tail, of 640 to 2048 positions on the one whose programs (102
 1536 or 2048 positions) hold it, as main's M4 Pro graph did; a
 composition that mounts adapters builds every operation on the generic blocks. On
 the M1 Max: the reduce and scatter kernels at one to four rows and the generic
-blocks above. On both, wider windows, prompt chunks on the GPU, tails and vision
-positions run the generic blocks inside the graph; known-token spans do too on the
+blocks above; prompt pieces above eight rows with their attention and DeltaNet
+projections on `layers/dequantized-linear` (from 640 rows the weight dequantized to
+bf16 and MLX's dense GEMM, MLX's quantized matmul bit for bit and about 1.35x faster
+there). With adapters mounted those blocks are not built and the adapters apply at
+every width; without, the graph mounts none. On both, wider windows, prompt chunks on the GPU, tails and
+vision positions run the generic blocks inside the graph (the M1 Max's prompt
+pieces with those projections); known-token spans do too on the
 M4 Pro, and append as windows on the block set of their width on the M1 Max. Each
 generated file's header lists its operations and the request shapes it serves.
 Each declares `verifyRoundCosts`, the verify cost by row count measured for

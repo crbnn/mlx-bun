@@ -2,12 +2,15 @@
 // composition) on small synthetic weights laid out by the generated quant table: 48 DeltaNet and 16 attention layers
 // with the artifact's 3- and 4-bit affine projections, Trellis gate/up at the artifact's widths (mixed in its ten
 // layers) and its 3-bit block-interleaved and row-major downs, scaled down in width. The composition facts it
-// declares (LoRA targets, no committed spans, no Neural Engine operation, its measured verify costs, the residual
-// basis its fold record names, the caches of each KV scheme). From five rows the graph runs the generic blocks: there
-// it is held to the generic Qwen 3.5 graph of its family over the same weights under bf16, affine 4- and 8-bit and
-// TurboQuant KV, hidden, logits and every cache tensor, at maxDiff 0. Its reduce and scatter layers at one to four
-// rows have no generic counterpart: the generator's drift test (qwen38-generated-sync), the real-artifact parity suite
-// on the M1 Max (tests/parity/qwen-trellis-parity.test.ts) and the app digests are their gates. No model, no download.
+// declares (LoRA targets only when it mounts adapters, no committed spans, no Neural Engine operation, its measured
+// verify costs, the residual basis its fold record names, the caches of each KV scheme). From five rows the graph
+// runs the generic blocks, prompt pieces with their projections on DequantizedLinear: there it is held to the generic
+// Qwen 3.5 graph of its family over the same weights under bf16, affine 4- and 8-bit and TurboQuant KV, hidden, logits
+// and every cache tensor, at maxDiff 0. Its reduce and scatter layers at one to four rows have no generic counterpart,
+// and DequantizedLinear's dense GEMM from 640 rows is MLX's quantized matmul bit for bit at the artifact's projection
+// shapes, not these scaled-down ones: the generator's drift test (qwen38-generated-sync), the layer's own test at the
+// artifact's shapes (dequantized-linear), the real-artifact parity suite on the M1 Max
+// (tests/parity/qwen-trellis-parity.test.ts) and the app digests are their gates. No model, no download.
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -231,11 +234,16 @@ function graphs(scheme: string, overrides: Partial<Composition> = {}): { current
 afterAll(() => { for (const { current } of built.values()) current.dispose(); });
 
 describe("the composition the generated graph declares", () => {
-  test("LoRA targets, caches, no committed spans, no Neural Engine operation, the verify costs its composition measured", () => {
+  test("LoRA targets only with adapters, caches, no committed spans, no Neural Engine operation, the verify costs its composition measured", () => {
     for (const scheme of Object.keys(SCHEMES)) {
       const { current, generic } = graphs(scheme);
-      expect([...current.loraTargets().keys()].sort()).toEqual([...generic.loraTargets().keys()].sort());
-      expect(current.loraTargets().size).toBe(48 * 5 + 16 * 4);
+      expect(current.loraTargets().size).toBe(0);
+      expect(current.graphCapabilities.adapters).toEqual({ batched: false, mountable: false });
+      const adapted = graphs(scheme, { adapters: true, aneBridge: true }).current;
+      expect([...adapted.loraTargets().keys()].sort()).toEqual([...generic.loraTargets().keys()].sort());
+      expect(adapted.loraTargets().size).toBe(48 * 5 + 16 * 4);
+      expect(adapted.graphCapabilities.adapters).toEqual({ batched: true, mountable: true });
+      expect(adapted.prefillChunk.ane).toBeUndefined();
       expect((current as { knownSpans?: unknown }).knownSpans).toBeUndefined();
       expect([...current.verifyRoundCosts]).toEqual(QWEN38_COMPOSITIONS["qwen38-27b-trellis-m1max"]!.verifyRoundCosts!.costs.map(([rows, cost]) => [rows, cost]));
       expect(current.prefillChunk.ane).toBeUndefined();

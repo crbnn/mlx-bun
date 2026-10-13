@@ -23,8 +23,8 @@
 //   decode/verify.twoToThree       ReduceGateUpRows + ScatterDownRows/K3i      QuantizedLinear
 //   decode/verify.four             ReduceGateUpRows + ScatterDownRows/K3i      QuantizedLinear
 //   decode/verify.fiveToEight      the generic blocks (TrellisMlp)             QuantizedLinear
-//   decode/verify.wider,           the generic blocks (TrellisMlp)             QuantizedLinear
-//   prefillChunk.gpu, prefillTail
+//   decode/verify.wider            the generic blocks (TrellisMlp)             QuantizedLinear
+//   prefillChunk.gpu/Tail.wider    the generic blocks (TrellisMlp)             DequantizedLinear
 //
 // Mixed-width gate/up takes ReduceMixedGateUp at one to four rows, split tail (MLX's compiled SwiGLU bit for bit).
 // Every attention block reads through the cache the composition's KV scheme names (composedFullAttentionCache: the
@@ -45,9 +45,11 @@
 //   - mixed groups of rows in one forward (mixed) on the generic blocks: each group's attention and recurrence over
 //     its own caches, the prompt and decode groups' MLP rows packed into one call (the composition's packedMixedMlp);
 //   - the scoring forward over a whole sequence (sequenceHidden, prefillTail's operation for its width);
-//   - mounted LoRA adapters: the attention and DeltaNet projections are the generic blocks' QuantizedLinear at
-//     every width, which apply them (the Trellis MLP is no adapter target);
+//   - mounted LoRA adapters when the composition mounts them: the attention and DeltaNet projections are the generic
+//     blocks' QuantizedLinear at every width, which apply them, and the prompt blocks are not built;
 //   - paged KV (the paged legos' own reads in place of the plain full-attention storage).
+// The planner refuses, from the declared capabilities and never by routing to another graph, adapter requests
+// when the composition mounts none (adapter-batch-unsupported).
 
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
@@ -64,6 +66,7 @@ import type { MropeForwardState } from "../../contracts/mlx/positions";
 import type { Composition } from "../../contracts/portable/composition";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import { mapTokenGroups } from "../../input/token-groups";
+import { DequantizedLinear } from "../../layers/dequantized-linear";
 import { disposing } from "../../layers/helpers";
 import { LoraState } from "../../layers/lora";
 import { RMSNorm } from "../../layers/normalization";
@@ -79,7 +82,9 @@ import { denseTurboQuantKernels } from "../../state/turboquant-attention";
 import { declareGraph } from "../capabilities";
 import { atEveryWidth, byWidth, type ReadPhase } from "../graph";
 import type { ServedComposition } from "../implementation";
-import { Qwen3Layer, type AttentionLinear, type GatedDeltaNet, type Qwen3Attention, type TrellisMlp } from "./blocks";
+import {
+  GatedDeltaNet, Qwen3Attention, Qwen3Layer, type AttentionLinear, type AttentionLinearLoader, type TrellisMlp,
+} from "./blocks";
 import { qwen35WeightsView } from "./checkpoint";
 import { bindQwenMediaInput, qwenDraftTarget, qwenMediaEncoders, qwenResidualBasis } from "./media-input";
 
@@ -219,8 +224,8 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
   readonly finalNorm: RMSNorm;
   readonly lmHead: QuantizedLinear;
   /** Prepared image and video embeddings with request mRoPE positions, layer
-   *  taps for drafts (verify's capture), bounded prefill workspace; adapters at
-   *  every width. */
+   *  taps for drafts (verify's capture), bounded prefill workspace; adapters only
+   *  when the composition mounts them. */
   readonly graphCapabilities: GraphCapabilities;
   /** Verify forward cost by rows relative to one decode step (M1 Max 32 GB). */
   readonly verifyRoundCosts: ReadonlyMap<number, number> = new Map([
@@ -234,7 +239,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
   readonly appendKnown: MlxWidthTable<MlxPhaseForward>;
   readonly logits: MlxWidthTable<MlxHeadForward>;
 
-  /** The generic blocks: prompt chunks, every operation above four rows, media positions, mixed rows. */
+  /** The generic blocks: every operation above four rows (prompt pieces with the prompt blocks' projections), media positions, mixed rows. */
   readonly #generic: Step[];
   /** The generic layers, which a mixed forward drives block by block. */
   readonly #layers: readonly Qwen3Layer[];
@@ -280,6 +285,17 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
     for (const layer of generic) if (layer.linearAttn) layer.linearAttn.qkScale = qkScale;
     this.#owned.push(qkScale.q, qkScale.k, this.#mrope.invFreq);
 
+    /** The block of layer `i` whose projections `project` builds from each one's stored width. */
+    const blockOf = (i: number, project: (linear: QuantizedLinear, path: string, width: number) => AttentionLinear) => {
+      const spec = LAYERS[i]!, block = `${PREFIX}.layers.${i}.${spec.kind === "deltanet" ? "linear_attn" : "self_attn"}`;
+      const names = spec.kind === "deltanet" ? DELTANET_PROJECTIONS : ATTENTION_PROJECTIONS;
+      const widths = new Map<string, number>(names.map((name, j) => [`${block}.${name}`, spec.projections[j]!]));
+      const load: AttentionLinearLoader<AttentionLinear> = (w, path, c) => project(QuantizedLinear.load(w, path, c), path, widths.get(path)!);
+      if (spec.kind === "attention") return new Qwen3Attention(weights, config, block, load);
+      const delta = new GatedDeltaNet(weights, config, block, load);
+      delta.qkScale = qkScale;
+      return delta;
+    };
     const mlpOf = (i: number) => generic[i]!.mlp as TrellisMlp;
     const genericStep = (layer: Qwen3Layer): Step => (x, cache, phase, mrope, width) => layer.forward(x, cache, phase, mrope, width);
     this.#generic = generic.map(genericStep);
@@ -317,8 +333,12 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
     });
     this.#fiveToEight = this.#generic;
 
+    // The attention and DeltaNet blocks of the prompt operations: every projection on DequantizedLinear, unless
+    // the composition mounts adapters (then the generic blocks', whose QuantizedLinear applies them).
+    const promptBlocks = composition.adapters ? null : LAYERS.map((_, i) => blockOf(i, linear => new DequantizedLinear(linear)));
+
     const targets = new Map<string, QuantizedLinear>();
-    generic.forEach((layer, i) => {
+    if (composition.adapters) generic.forEach((layer, i) => {
       const p = `${PREFIX}.layers.${i}`;
       if (layer.selfAttn) for (const name of ATTENTION_PROJECTIONS) targets.set(`${p}.self_attn.${name}`, layer.selfAttn[projectionMember[name]]);
       if (layer.linearAttn) for (const name of DELTANET_PROJECTIONS) targets.set(`${p}.linear_attn.${name}`, layer.linearAttn[projectionMember[name]]);
@@ -328,6 +348,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
     this.graphCapabilities = declareGraph({
       media: { input: "embeddings+positions", video: true }, hiddenLayerTaps: true,
       prefill: { boundedWorkspace: true },
+      adapters: composition.adapters ? {} : { batched: false, mountable: false },
     });
 
     // The attention cache the composition's KV scheme names: that scheme's own lego, with the dense TurboQuant read
@@ -338,8 +359,11 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
     this.#narrow = Object.freeze({ one: this.#one, twoToThree: this.#twoToThree, four: this.#four, fiveToEight: this.#fiveToEight });
     const one = this.#one, twoToThree = this.#twoToThree, four = this.#four, wide = this.#generic;
     const embed = this.embed;
+    // Prompt pieces above eight rows: the prompt blocks, then the generic blocks' MLP.
+    const prompt = promptBlocks ? generic.map((layer, i) => layerStep(layer, mixerOf(promptBlocks[i]!, LAYERS[i]!.kind),
+      post => mlpOf(i).forward(post, "window", "wider"))) : wide;
     const gpu: RowsForward = (ids, state, capture) =>
-      this.#bounded(wide, embed.encode(ids), state, "window", capture, null, "wider");
+      this.#bounded(prompt, embed.encode(ids), state, "window", capture, null, "wider");
     this.prefillChunk = Object.freeze({ gpu });
     this.prefillTail = Object.freeze({
       one: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
@@ -396,7 +420,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
     return LAYERS.map((layer, i) => layer.kind === "deltanet" ? new SSMCache() : this.#attentionCache(masks, i));
   }
 
-  /** The LoRA-applying projections: every attention and DeltaNet projection (the Trellis MLP is no adapter target). */
+  /** The LoRA-applying projections, when the composition mounts adapters; none otherwise. */
   loraTargets(): Map<string, QuantizedLinear> { return new Map(this.#loraTargets); }
 
   bindMediaInput(input: Vision): MlxPromptInput { return bindQwenMediaInput(this, input.embeddings, input.mrope!); }
