@@ -98,7 +98,8 @@ while that machine is in use (swap above 512 MB).
   alone do not close this. Done so far: the
   [generated Gemma4 graph test](packages/inference/tests/parity/gemma4-generated.test.ts)
   passed on e4b and 12B (identity within this tree; 26B-A4B not run). Packed Trellis now matches main in 96 full greedy logit vectors, three shared
-  B1/depth-two MTP runs, and the 18-case plain-KV runtime grid with restored
+  B1/depth-two MTP runs (since 2026-10-13 held by KL and greedy agreement on the M1 Max, whose verify
+  windows reassociate), and the 18-case plain-KV runtime grid with restored
   continuation ([evidence](packages/inference/README.md#packed-qwen-trellis-parity)).
   Open: published references and broader Trellis shapes;
   [runtime-oracle](packages/inference/tests/parity/runtime-oracle.test.ts) references

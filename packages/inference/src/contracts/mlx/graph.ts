@@ -12,6 +12,9 @@ export { widthClass, type MlxWidthClass, type MlxWidthTable } from "./width";
 /** Weight and expert-residency facts the wired-limit scope reads. */
 export interface MlxModelMemory {
   readonly weightsBytes: number;
+  /** The graph's composition measured that its weights are wired for a generation whatever their share of the
+   *  recommended working set; absent: the share decides. */
+  readonly wiredWeights?: boolean;
   readonly expertRuntime?: {
     readonly plan: { readonly plannedBytes: number };
     flushUsage?: () => void;

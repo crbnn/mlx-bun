@@ -26,7 +26,8 @@ import { loadModelConfig, quantFor } from "../src/artifacts/config";
  * layer and kernel tables written into the file; `kv` names the scheme whose
  * cache lego `makeCache` composes, or every scheme; `mixedGateUp` chooses the
  * mixed-width gate/up layer where the device's table names the reduce kernels;
- * `verifyRoundCosts` are the numbers measured for this composition on its host.
+ * `verifyRoundCosts` are the numbers measured for this composition on its host,
+ * `wiredWeights` a residency it measured there.
  * `draftDepth`, `prefillChunkTokens`, `maxRows` and `aneBridge` record what the
  * file was generated and gated for (the device's table writes the Neural Engine
  * chunk operation, which the constructor builds when the record it is handed has
@@ -66,6 +67,10 @@ export interface Qwen38Composition {
    *  against the decayed acceptance rate. Absent: the graph declares none, and `--num-draft-tokens adaptive` is
    *  refused on it. */
   readonly verifyRoundCosts?: { readonly host: string; readonly costs: readonly (readonly [number, number])[] };
+  /** The graph declares its weights wired for each generation (`MlxModelMemory.wiredWeights`), measured for this
+   *  composition on its host, where their share of the recommended working set alone would leave them unwired.
+   *  Absent: the share decides. */
+  readonly wiredWeights?: true;
 }
 
 export const QWEN38_COMPOSITIONS: Readonly<Record<string, Qwen38Composition>> = Object.freeze({
@@ -106,6 +111,11 @@ export const QWEN38_COMPOSITIONS: Readonly<Record<string, Qwen38Composition>> = 
     // the depth-0 plain arm (58.6 ms per token), bf16 KV, greedy, two prompts, 128 tokens, four repetitions, whose
     // ratios span under 2.5% at every width but eight rows (5%).
     verifyRoundCosts: { host: "M1 Max 32 GB", costs: [[1, 1], [2, 1.93], [3, 2.35], [4, 2.51], [5, 2.57], [6, 2.63], [7, 2.73], [8, 2.81]] },
+    // Measured 2026-10-13 on the M1 Max 32 GB, where the 11.96e9 B weights are under half the 26.8e9 B recommended
+    // set: wired, bit-identical, paired A/B, GPU prefill 1k/8k 136/142 -> 143/145 tok/s; with the Neural Engine
+    // split 171/173 -> 172/177 and the first GPU step after the split 0.15-1.4 s -> 61-69 ms; one-row decode
+    // unchanged (60.0 ms).
+    wiredWeights: true,
   },
 });
 
@@ -613,7 +623,7 @@ export const COMPOSITION: ServedComposition = Object.freeze({
 //   draft depth  ${depthText(c.draftDepth)}
 //   prefill      ${c.prefillChunkTokens}-token chunks
 //   rows         ${c.maxRows === null ? "any number" : `up to ${c.maxRows}`} per forward
-//   Neural Engine bridge ${c.aneBridge ? "present" : "absent"}
+//   Neural Engine bridge ${c.aneBridge ? "present" : "absent"}${c.wiredWeights ? "\n//   weights      wired for each generation" : ""}
 //
 // An entire graph: built once at construction from the composition record it is
 // handed, it inherits from no class and never calls another graph. Every phase and
@@ -836,7 +846,10 @@ export class ${c.className} implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
   readonly composition: Composition;
   readonly weightsBytes: number;
-  /** Base path for LoRA target keys (weights carry the language_model prefix). */
+${c.wiredWeights ? `  /** Its weights are wired for each generation, whatever their share of the working set (measured for this
+   *  composition). */
+  readonly wiredWeights = true;
+` : ""}  /** Base path for LoRA target keys (weights carry the language_model prefix). */
   readonly prefixBase = PREFIX;
   readonly loraState = new LoraState();
   /** The full-attention layer whose cache supplies logical positions. */
