@@ -84,7 +84,7 @@ export function observedPhases<Model extends object>(model: Model, observer: Pha
   const ane = phases.prefillChunk.ane;
   const overrides: Record<string, unknown> = {
     prefillChunk: Object.freeze({ gpu: watch("prefillChunk", phases.prefillChunk.gpu),
-      ...(ane ? { ane: watch("prefillChunk", ane) } : {}) }),
+      ...(ane ? { ane: Object.freeze(ane.map(unit => Object.freeze({ ...unit, forward: watch("prefillChunk", unit.forward) }))) } : {}) }),
     prefillTail: forwards(phases.prefillTail, "prefillTail"),
     decode: forwards(phases.decode, "decode"),
     verify: forwards(phases.verify, "verify"),

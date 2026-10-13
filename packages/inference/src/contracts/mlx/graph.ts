@@ -63,19 +63,31 @@ export type MlxHeadForward = (hidden: MlxArray) => MlxArray;
  * class of its rows. Returns the post-final-norm hidden the caller owns. */
 export type MlxSequenceForward = (ids: MlxArray, state: Cache[], width: MlxWidthClass) => MlxArray;
 
+/** A Neural Engine operation (`MlxCapturingForward`), which splits each layer's
+ * channels between the Neural Engine and the GPU, for one sequence's prompt
+ * piece of `minRows` to `rows` positions: a whole planned chunk or a tail. Its
+ * programs are built for `rows` positions; a shorter piece fills their front,
+ * and nothing behind it reaches its output. */
+export interface MlxNeuralEngineChunk {
+  readonly minRows: number;
+  readonly rows: number;
+  readonly forward: MlxCapturingForward;
+}
+
 /** The prompt-chunk operation for each execution unit the composition built.
- * Both follow `MlxCapturingForward` and append the same positions. The
- * scheduler owns the units: it reads which operations exist once when it binds
- * the graph (`ane` is a declared fact, like `verifyRoundCosts`) and chooses per
- * chunk; the graph never picks between them. */
+ * Every operation follows `MlxCapturingForward` and appends the same positions.
+ * The scheduler owns the units: it reads which operations exist once when it
+ * binds the graph (`ane` is a declared fact, like `verifyRoundCosts`) and
+ * chooses per prompt piece; the graph never picks between them. */
 export interface MlxPrefillChunk {
   /** The GPU operation. Every graph supplies it. */
   readonly gpu: MlxCapturingForward;
-  /** The Neural Engine operation, which splits each layer's channels between
-   * the Neural Engine and the GPU, for one sequence's chunk of exactly the
-   * composition's prefill chunk size (`Composition.prefillChunkTokens`).
-   * Present only when the composition built it. */
-  readonly ane?: MlxCapturingForward;
+  /** The Neural Engine operations, by ascending `rows`, their row ranges
+   * disjoint: the one whose range holds a one-sequence piece's positions runs
+   * it, a chunk or a tail alike; a piece no range holds runs on the GPU
+   * (`gpu`, or `MlxTokenPhases.prefillTail`). Present only when the composition
+   * built them. The ranges are the composition's, from its machine's kernel table. */
+  readonly ane?: readonly MlxNeuralEngineChunk[];
 }
 
 

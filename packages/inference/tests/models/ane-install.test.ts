@@ -16,20 +16,19 @@ const record = (fields: Partial<Composition> = {}): Composition => ({ ...machine
 const labels = (composition: Composition) => aneInstallPrograms({ composition }).map(program => [program.spec.label, program.graphs]);
 
 describe("the install table", () => {
-  test("on an M4 Pro the shipped table lists the Qwen3.8 graph's three programs at the default chunk, from the composition alone", () => {
+  test("on an M4 Pro the shipped table lists the Qwen3.8 graph's three programs for each of its Neural Engine row ranges, from the composition alone", () => {
     expect(machineComposition().prefillChunkTokens).toBe(2048);
-    expect(labels(record())).toEqual([
-      ["MLP slice 5120×9600, 2048 rows", [QWEN38_TRELLIS_M4PRO_GRAPH]],
-      ["projection 5120→3392, 2048 rows", [QWEN38_TRELLIS_M4PRO_GRAPH]],
-      ["projection 6144→2816, 2048 rows", [QWEN38_TRELLIS_M4PRO_GRAPH]],
-    ]);
+    expect(labels(record())).toEqual([1024, 1536, 2048].flatMap(rows => [
+      [`MLP slice 5120×9600, ${rows} rows`, [QWEN38_TRELLIS_M4PRO_GRAPH]],
+      [`projection 5120→3392, ${rows} rows`, [QWEN38_TRELLIS_M4PRO_GRAPH]],
+      [`projection 6144→2816, ${rows} rows`, [QWEN38_TRELLIS_M4PRO_GRAPH]],
+    ]));
     // The artifact's widths, as its description gives them (the generator fixture).
     expect(ANE_WIDTHS).toEqual({ hidden: 5120, intermediate: 17408, projections: [[5120, 6144], [6144, 5120]] });
   });
 
-  test("the programs follow the composition: its chunk size, the bridge, mounted adapters and the device", () => {
-    expect(labels(record({ prefillChunkTokens: 128 })).map(([label]) => label))
-      .toEqual(["MLP slice 5120×9600, 128 rows", "projection 5120→3392, 128 rows", "projection 6144→2816, 128 rows"]);
+  test("the programs follow the composition: the bridge, mounted adapters and the device, not the chunk size", () => {
+    expect(labels(record({ prefillChunkTokens: 128 }))).toEqual(labels(record()));
     expect(labels(record({ aneBridge: false }))).toEqual([]);
     expect(labels(record({ adapters: true }))).toEqual([]);
     expect(labels(record({ device: M1_MAX }))).toEqual([]);

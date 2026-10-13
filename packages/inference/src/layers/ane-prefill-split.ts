@@ -7,23 +7,27 @@ import type { TrellisGeometry } from "../kernels/trellis/geometry";
 import { QuantizedLinear } from "./quantized-linear";
 import { TrellisLinear, trellisRows, trellisStoredRows } from "./trellis-linear";
 
-// Prompt-chunk channel splits between the Apple Neural Engine and the GPU.
+// Prompt-piece channel splits between the Apple Neural Engine and the GPU.
 // The ANE computes the first n output channels from streamed fp16 weights the
 // GPU writes into its program's buffers (zero-copy IOSurface wraps), the GPU
 // computes the rest at the same time, and the results combine. Each layer holds
-// one program, built for exactly the chunk size the layer is constructed with,
-// and serves inputs of exactly that many rows; dispose releases it. Layers that
-// never run at once may share, named at construction (`share`): a layer whose
-// program is identical to the other's holds that same loaded program, otherwise
-// its program loads on the other's buffers; either lives until every layer
-// holding it is disposed. Loaded programs are a machine-wide resource
-// (AneProgram), so a graph's layers of one shape share one. Not bit-identical
-// to the GPU path (fp16 weights and activations on the ANE); gate by KL.
+// one program, built for the row count the layer is constructed with, and serves
+// inputs of up to that many rows: it writes the rows it is given at the front of
+// the program's input and reads as many back. The rows behind them hold whatever
+// the last evaluation left; no row it returns reads them (each output row of the
+// program depends only on its own input row). dispose releases the program.
+// Layers that never run at once may share, named at construction (`share`): a
+// layer whose program is identical to the other's holds that same loaded
+// program, otherwise its program loads on the other's buffers (each at least as
+// large); either lives until every layer holding it is disposed. Loaded programs
+// are a machine-wide resource (AneProgram), so a graph's layers of one shape
+// share one. Not bit-identical to the GPU path (fp16 weights and activations on
+// the ANE); gate by KL.
 //
-// A layer's program depends only on its widths, the fraction and the chunk
-// size, never on the weights it streams, so the program each split loads is
-// named here as a function of those (`aneMlpSplitProgram`,
-// `aneAffineSplitProgram`): the install step compiles exactly what `build` loads.
+// A layer's program depends only on its widths, the fraction and its row count,
+// never on the weights it streams, so the program each split loads is named
+// here as a function of those (`aneMlpSplitProgram`, `aneAffineSplitProgram`):
+// the install step compiles exactly what `build` loads.
 
 /** Channels the ANE takes of R rows at `fraction` (64-aligned, at least 64 left on each side). */
 export function aneChannels(R: number, fraction: number): number {
@@ -31,13 +35,13 @@ export function aneChannels(R: number, fraction: number): number {
 }
 
 /** The program either whole-MLP split of hidden width D and intermediate width R
- *  loads at `fraction` for chunks of exactly `rows` rows. */
+ *  loads at `fraction` for pieces of up to `rows` rows. */
 export function aneMlpSplitProgram(D: number, R: number, fraction: number, rows: number): AneProgramSpec {
   return mlpSliceProgram(D, aneChannels(R, fraction), rows);
 }
 
 /** The program an affine projection split of K inputs and N outputs loads at
- *  `fraction` for chunks of exactly `rows` rows. */
+ *  `fraction` for pieces of up to `rows` rows. */
 export function aneAffineSplitProgram(K: number, N: number, fraction: number, rows: number): AneProgramSpec {
   return streamedMatmulProgram(K, aneChannels(N, fraction), rows);
 }
@@ -49,12 +53,13 @@ type Rest = { gate: TrellisLinear; up: TrellisLinear; down: TrellisLinear };
 /** Whole Trellis MLP: the ANE computes the first n intermediate channels end
  *  to end (gate and up rows, SwiGLU, and the down projection's partial sum over
  *  those channels); the GPU computes channels [n, R) through TrellisLinear; the
- *  two [rows, D] partials add. Measured on M4 Pro: one fused slice program at
- *  10.2 TFLOPS (D 5120, n 9600, S 2048). */
+ *  two [M, D] partials add. Measured on M4 Pro: one fused slice program at
+ *  10.2 TFLOPS (D 5120, n 9600, S 2048). `hidden` holds M <= `rows` rows. */
 function mlpSplit(program: AneProgram, rows: number, n: number, gate: TrellisLinear, up: TrellisLinear, down: TrellisLinear,
   rest: Rest, fillDown: Fill, hidden: MlxArray, swiglu: Swiglu): MlxArray {
   const D = gate.geometry.inFeatures;
-  const lead = hidden.shape.slice(0, -1);
+  const lead = hidden.shape.slice(0, -1), M = lead.reduce((a, b) => a * b, 1);
+  if (M > rows) throw new Error(`ANE MLP split: ${M} rows exceed its program's ${rows}`);
   {
     // Inputs in symbol order: wd, wg, wu, x. Filled before any GPU share is
     // queued, so the ANE starts at once.
@@ -62,7 +67,7 @@ function mlpSplit(program: AneProgram, rows: number, n: number, gate: TrellisLin
     using wg = program.inputArray(1, [n * D], Dtype.float16);
     using wu = program.inputArray(2, [n * D], Dtype.float16);
     using x = program.inputArray(3, [rows * D], Dtype.float16);
-    using h2 = ops.reshape(hidden, [rows * D]);
+    using h2 = ops.reshape(hidden, [M * D]);
     using d0 = fillDown(down.codes, down.scales, down.geometry, n, wd, 0);
     using d1 = trellisFillHalf(gate.codes, gate.scales, gate.geometry, n, wg, 0);
     using d2 = trellisFillHalf(up.codes, up.scales, up.geometry, n, wu, 0);
@@ -80,8 +85,9 @@ function mlpSplit(program: AneProgram, rows: number, n: number, gate: TrellisLin
   } finally { program.wait(); }
   try {
     using out = program.output([rows, D], Dtype.float16);  // zero-copy partial [rows, D]
-    using b = out.astype(hidden.dtype);
-    using g2 = ops.reshape(gpuOut, [rows, D]);
+    using used = out.slice([0, 0], [M, D]);
+    using b = used.astype(hidden.dtype);
+    using g2 = ops.reshape(gpuOut, [M, D]);
     using sum = ops.add(b, g2);
     const result = ops.reshape(sum, [...lead, D]);
     result.eval();                                          // consume the ANE output before a program sharing it runs
@@ -107,7 +113,7 @@ export class AneTrellisMlpSplit implements Disposable {
   private constructor(readonly program: AneProgram, readonly rows: number, readonly channels: number, readonly gate: TrellisLinear,
     readonly up: TrellisLinear, readonly down: TrellisLinear, readonly rest: Rest) {}
 
-  /** Loads `aneMlpSplitProgram(D, R, fraction, rows)` for chunks of exactly
+  /** Loads `aneMlpSplitProgram(D, R, fraction, rows)` for pieces of up to
    *  `rows` rows now, from the compile cache the install step filled (a program
    *  not compiled on this Mac throws `AneBridgeError`). `share`: a split that
    *  never runs at the same time as this one; this split holds its program when
@@ -121,7 +127,7 @@ export class AneTrellisMlpSplit implements Disposable {
     return new AneTrellisMlpSplit(program, rows, n, gate, up, down,
       { gate: trellisRows(gate, n, R), up: trellisRows(up, n, R), down: trellisStoredRows(down, n, R) });
   }
-  /** hidden [.., rows, D] → MLP(hidden) [.., rows, D]. */
+  /** hidden [.., M, D], M <= rows → MLP(hidden) [.., M, D]. */
   forward(hidden: MlxArray, swiglu: Swiglu): MlxArray {
     return mlpSplit(this.program, this.rows, this.channels, this.gate, this.up, this.down, this.rest, trellisFillHalf, hidden, swiglu);
   }
@@ -144,7 +150,7 @@ export class AneTrellisMlpSplitK3i implements Disposable {
     return new AneTrellisMlpSplitK3i(program, rows, n, gate, up, down,
       { gate: trellisRows(gate, n, R), up: trellisRows(up, n, R), down: trellisStoredRows(down, n, R) });
   }
-  /** hidden [.., rows, D] → MLP(hidden) [.., rows, D]. */
+  /** hidden [.., M, D], M <= rows → MLP(hidden) [.., M, D]. */
   forward(hidden: MlxArray, swiglu: Swiglu): MlxArray {
     return mlpSplit(this.program, this.rows, this.channels, this.gate, this.up, this.down, this.rest, trellisFillHalfK3Interleaved,
       hidden, swiglu);
@@ -162,7 +168,7 @@ export class AneAffineSplit implements Disposable {
   private constructor(readonly program: AneStreamedMatmul, readonly head: { w: MlxArray; scales: MlxArray; biases: MlxArray },
     readonly rest: QuantizedLinear, readonly spec: ops.QuantSpec) {}
 
-  /** Loads `aneAffineSplitProgram(K, N, fraction, rows)` for chunks of exactly
+  /** Loads `aneAffineSplitProgram(K, N, fraction, rows)` for pieces of up to
    *  `rows` rows now, as AneTrellisMlpSplit.build loads its program. `share`: as
    *  AneTrellisMlpSplit.build. */
   static build(lin: QuantizedLinear, fraction: number, rows: number, share?: AneAffineSplit): AneAffineSplit {
@@ -176,17 +182,18 @@ export class AneAffineSplit implements Disposable {
     return new AneAffineSplit(program, head, rest, lin.spec);
   }
 
-  /** x [.., rows, K] → [.., rows, N]. */
+  /** x [.., M, K], M <= rows → [.., M, N]. */
   forward(x: MlxArray): MlxArray {
     const ane = this.program, K = ane.cin, n = ane.cout, rows = ane.seq;
-    const lead = x.shape.slice(0, -1);
+    const lead = x.shape.slice(0, -1), M = lead.reduce((a, b) => a * b, 1);
+    if (M > rows) throw new Error(`AneAffineSplit: ${M} rows exceed its program's ${rows}`);
     ane.prepare();
     {
       using w = MlxArray.fromPointer(ane.weightsPointer, [n * K], Dtype.float16);
       using xs = MlxArray.fromPointer(ane.inputPointer, [rows * K], Dtype.float16);
       using dense = ops.dequantize(this.head.w, this.head.scales, this.head.biases, this.spec);
       using flat = ops.reshape(dense, [n * K]);
-      using x2 = ops.reshape(x, [rows * K]);
+      using x2 = ops.reshape(x, [M * K]);
       using d0 = writeHalf(w, flat, 0);
       using d1 = writeHalf(xs, x2, 0);
       ops.evalAll([d0, d1]);
@@ -197,8 +204,9 @@ export class AneAffineSplit implements Disposable {
     finally { ane.wait(); }
     try {
       using out = ane.output();                               // [rows, n] fp16
-      using b = out.astype(x.dtype);
-      using g2 = ops.reshape(gpu, [rows, this.rest.outFeatures]);
+      using used = out.slice([0, 0], [M, n]);
+      using b = used.astype(x.dtype);
+      using g2 = ops.reshape(gpu, [M, this.rest.outFeatures]);
       using both = ops.concatAxis([b, g2], -1);
       const result = ops.reshape(both, [...lead, n + this.rest.outFeatures]);
       result.eval();

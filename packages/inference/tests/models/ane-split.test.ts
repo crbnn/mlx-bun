@@ -1,7 +1,7 @@
 // ANE prefill channel splits (layers/ane-prefill-split) on small synthetic
 // layers against the GPU-only result: the ANE computes its channels in fp16
 // from weights the GPU writes into its buffers, so the outputs agree to fp16
-// precision. Each layer owns one program built for exactly its chunk size and
+// precision. Each layer owns one program built for the most rows it takes and
 // loads it from the compile cache, so the file first compiles the programs its
 // layers load (the install step for these synthetic widths).
 // Opt-in: set MLX_BUN_TEST_ANE=1 on a real Apple Silicon machine (every
@@ -21,8 +21,8 @@ const D = 512, R = 1024, M = 96;
 
 beforeAll(() => {
   if (!process.env.MLX_BUN_TEST_ANE) return;
-  for (const spec of [aneAffineSplitProgram(D, 256, 0.5, M), aneMlpSplitProgram(D, R, 0.5, M), aneMlpSplitProgram(D, R, 0.5, 2 * M),
-    aneMlpSplitProgram(2 * D, 2 * R, 0.5, 2 * M)]) AneProgram.compile(spec);
+  for (const spec of [aneAffineSplitProgram(D, 256, 0.5, M), aneAffineSplitProgram(D, 256, 0.5, 2 * M), aneMlpSplitProgram(D, R, 0.5, M),
+    aneMlpSplitProgram(D, R, 0.5, 2 * M), aneMlpSplitProgram(2 * D, 2 * R, 0.5, 2 * M)]) AneProgram.compile(spec);
 });
 
 function relErr(actual: MlxArray, expected: MlxArray): number {
@@ -140,4 +140,50 @@ test.skipIf(!process.env.MLX_BUN_TEST_ANE)("a split built on another's buffers k
   expect(relErr(outB, b.expected)).toBeLessThan(2e-2);
   expect(relErr(againB, b.expected)).toBeLessThan(2e-2);
   a.expected.dispose(); b.expected.dispose();
+}, 120_000);
+
+/** Largest absolute difference of two equal-shaped arrays. */
+function maxDiff(a: MlxArray, b: MlxArray): number {
+  expect(a.shape).toEqual(b.shape);
+  const x = a.astype(Dtype.float32).toFloat32(), y = b.astype(Dtype.float32).toFloat32();
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff = Math.max(diff, Math.abs(x[i]! - y[i]!));
+  return diff;
+}
+
+test.skipIf(!process.env.MLX_BUN_TEST_ANE)("a piece shorter than the program fills its front: what an earlier, longer piece left behind it never reaches its rows", () => {
+  using piece = hidden(M);
+  using left = hidden(2 * M), wide = left.astype(Dtype.float32);
+  using scaled = ops.mulScalar(wide, -0.5);
+  using different = scaled.astype(Dtype.bfloat16);
+  const { gate, up, down, expected } = mlp(D, R, false, 11, piece);
+  using split = AneTrellisMlpSplit.build(gate, up, down, 0.5, 2 * M);
+  const lin = affine(256, D, 1);
+  using gpuProjection = lin.forward(piece);
+  using projection = AneAffineSplit.build(lin, 0.5, 2 * M);
+  const after = (longer: MlxArray) => {
+    split.forward(longer, compiledSwiglu).dispose();
+    projection.forward(longer).dispose();
+    return { mlp: split.forward(piece, compiledSwiglu), projection: projection.forward(piece) };
+  };
+  const first = after(left), second = after(different);
+  try {
+    expect(maxDiff(first.mlp, second.mlp)).toBe(0);
+    expect(maxDiff(first.projection, second.projection)).toBe(0);
+    expect(relErr(first.mlp, expected)).toBeLessThan(2e-2);
+    expect(relErr(first.projection, gpuProjection)).toBeLessThan(2e-2);
+  } finally { for (const out of [first, second]) { out.mlp.dispose(); out.projection.dispose(); } expected.dispose(); }
+}, 120_000);
+
+test.skipIf(!process.env.MLX_BUN_TEST_ANE)("a split of fewer rows built on a longer split's buffers serves its pieces, and keeps them after the lender is disposed", () => {
+  using piece = hidden(M - 7);
+  const { gate, up, down, expected } = mlp(D, R, true, 53, piece);
+  const lender = AneTrellisMlpSplitK3i.build(gate, up, down, 0.5, 2 * M);
+  using borrower = AneTrellisMlpSplitK3i.build(gate, up, down, 0.5, M, lender);
+  using out = borrower.forward(piece, compiledSwiglu);
+  lender.dispose();
+  using again = borrower.forward(piece, compiledSwiglu);
+  expect(relErr(out, expected)).toBeLessThan(2e-2);
+  expect(maxDiff(again, out)).toBe(0);
+  expected.dispose();
 }, 120_000);
