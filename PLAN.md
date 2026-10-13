@@ -18,15 +18,16 @@ Decisions that govern all work:
 
 ## Graph files
 
-A graph is a file, written before the version is published. Someone imports the layers (which import
-their kernels), arranges them into the model's layers, and exports that arrangement. Every served
-composition has its file; the loader selects the file for the composition and attaches the weights
-to the layers the file names; the scheduler routes the work: the phase, the row count, a prompt piece
-to the Neural Engine operation whose range the file lists, an adapter request to the file's
-adapter-capable operations. Nothing is checked at load or at run time. The checks happened before
-publishing: profiling decided which kernel each layer runs at each width on each machine, and the
-bit gates recorded what the file produces. Users who write their own graph import the same layers
-and arrange whatever they want; nothing registers them and nothing generates for them.
+A graph is a file in the repo, written before anyone runs it. Someone imports the layers (which
+import their kernels), arranges them into the model's layers, and exports that arrangement. A model
+may have more than one graph; the loader selects the most specific one for the model, the flags and
+the machine, and attaches the weights to the layers the file names; a model with no graph of its
+own runs on its family's generic graph. The scheduler routes the work: the phase, the row count, a
+prompt piece to the Neural Engine operation whose range the file lists, a request's adapter to that
+request's rows. Nothing is checked at load or at run time. The checks happened before the user
+installed mlx-bun: profiling decided which kernel each layer runs at each width on each machine,
+and the bit gates recorded what the file produces. Users who write their own graph import the same
+layers and arrange whatever they want; nothing registers them and nothing generates for them.
 
 This is loop unrolling and branch removal applied to the graph. The file states what runs, so
 reading it is the proof of what runs; nothing can be constructed in a state nobody gated; the
@@ -61,7 +62,7 @@ Binding for every graph file in the tree, held by the architecture gate where me
   out in order, and every (phase, row count) binding names its layer classes literally. A log line is
   not exempt.
 - Nothing writes graph files. The file is the only place its bindings live; what holds it is the
-  bit gate run before publishing (its recorded digests on its artifact), not a script it must match.
+  bit gate run in the repo (its recorded digests on its artifact), not a script it must match.
 - Routing is the scheduler's: the phase, the row count, the prompt piece's position range, the
   adapter context, the rows-per-forward cap. The file declares facts the scheduler reads once when it
   binds the graph (the Neural Engine ranges, the verify round costs, the known-span chunk sizes, the
@@ -80,20 +81,23 @@ Binding for every graph file in the tree, held by the architecture gate where me
   picks a kernel by row count, width, compiled form or adapter state, it becomes one class per
   kernel and the file names the class per binding.
 - A family's generic graph is a file too, and the loader can choose it: the table's least
-  constrained entry, serving any artifact of the family. Because its layer count is the artifact's,
-  it loops over the layers; it is never a published composition, and every artifact a version
-  publishes has its own file.
-- An adapter is a lego. It is a separately trained file, composed with the graph when it mounts:
-  the loader wraps the projections the graph names as adapter targets with the adapter's delta,
-  which adds to the projection's output and so composes with any projection kernel; the scheduler
-  sets which adapters are active for the rows of each forward. No graph file knows about adapters,
-  no graph declares whether it "supports" them, and nothing refuses an adapter for a graph.
-- The winning combination is what a file assembles. A kernel choice the composition carries as a
-  flag today (compiled GEGLU, compiled SwiGLU, packed mixed MLP, compiled decode, mixed gate/up) is
-  the file's line at the value profiling chose; the other forms stay importable layers anyone can
-  assemble into their own graph, and the flags go.
-- A file may bind the same operation at every row count, or different operations at certain row
-  counts; both are the same table, read the same way.
+  constrained entry, serving any model of the family that has no graph of its own. Because its
+  layer count is the model's, it loops over the layers.
+- An adapter is a file a request names. LoRA fine-tuning writes a new file; the first request that
+  names it loads it (the mount), and the scheduler applies it to that request's rows, per request,
+  as today. Applying it adds the adapter's delta to the outputs of the projections it was trained
+  on, which works with any projection kernel a graph file names, so no graph file knows about
+  adapters, no graph declares whether it "supports" them, and nothing refuses an adapter.
+- The graph assembles the combination that runs that model best on that hardware. There is no
+  need to expose worse options as flags: a kernel choice the composition carries as a flag today
+  (compiled GEGLU, compiled SwiGLU, packed mixed MLP, compiled decode, mixed gate/up) is the file's
+  line at the value profiling chose, and the flag goes; the other kernels and layers stay
+  importable for anyone's own graph. Each module keeps exposing its own configuration (the
+  cache's KV scheme and paging, the scheduler's rows cap, the drafter and its depth, the sampler):
+  those are the flags.
+- There are no hard-coded widths. Profiling chooses what each row count runs, and the file is that
+  lookup table: the same operation at every row count, or different operations at certain row
+  counts, read the same way.
 - Bit identity with main (3ea6ba5e) on every served composition where main served it: the digests,
   the parity suites, the captured texts. Performance is unchanged (paired, preflight-gated) and is
   not the subject of this program.
@@ -110,14 +114,14 @@ matrix runs once at the end. Agents do the work; Josh reviews the plan, I review
       composition's cap; `prompt` as an ordered list of `{ from, to, operation }` position ranges for
       one-sequence pieces (replacing `prefillChunk.gpu`, `prefillChunk.ane` and `prefillTail`), plus
       the multi-sequence chunk operation. `phase-dispatch.ts` indexes by rows and by range.
-      `widthClass`, `MlxWidthClass`, `byWidth`, `atEveryWidth` go. The adapter lego: the delta that
-      `QuantizedLinear` applies inside its forward today becomes a wrapper layer the loader composes
-      around any projection the graph names as a target (the delta adds to the projection's output,
-      so the one-kernel affine layers and the Neural Engine splits take it like the plain linear);
-      the scheduler keeps setting the active adapters per execution context as it does now;
-      `GraphCapabilities.adapters`, the `adapter-batch-unsupported` refusal and every "adapters
-      are off for this graph" branch go. Compiled decode under adapters stays the scheduler's
-      routing, as today.
+      `widthClass`, `MlxWidthClass`, `byWidth`, `atEveryWidth` go. Adapters: the delta that
+      `QuantizedLinear` applies inside its forward today becomes a layer applied after any
+      projection the graph names as a target (it adds to the projection's output, so the one-kernel
+      affine layers and the Neural Engine splits take it like the plain linear); the request's
+      adapter is loaded on first use and applied to that request's rows by the scheduler, as now;
+      `GraphCapabilities.adapters`, the `adapter-batch-unsupported` refusal and every "adapters are
+      off for this graph" branch go. Compiled decode under adapters stays the scheduler's routing,
+      as today.
       The install step compiles the programs the selected file lists (`anePrograms()` takes no
       composition). The cache composer moves to the loader: a file declares each layer's cache kind
       (attention full or sliding, recurrent) as data, and the loader composes the lego from the
