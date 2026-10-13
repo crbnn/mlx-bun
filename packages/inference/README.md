@@ -985,10 +985,14 @@ composition that mounts adapters builds every operation on the generic blocks. O
 the M1 Max: the threadgroup-codebook kernels at one row; at two to three rows the
 factored Trellis kernels with the affine row kernels for the projections and head;
 at four the matrix-unit gate/up and affine set with the factored down; the
-matrix-unit set at five to eight; adapters as on the M4 Pro. On both, decode and
-verify up to eight rows submit the graph every four layers; wider windows, prompt
-chunks on the GPU, tails above eight rows and vision
-positions run the generic blocks inside the graph; known-token spans do too on the
+matrix-unit set at five to eight; prompt pieces above eight rows with their
+attention and DeltaNet projections on `layers/dequantized-linear` (from 640 rows the
+weight dequantized to bf16 and MLX's dense GEMM, MLX's quantized matmul bit for bit
+at the artifact's shapes and about 1.35x faster there); adapters as on the M4 Pro.
+On both, decode and verify up to eight rows submit the graph every four layers;
+wider windows, prompt chunks on the GPU, tails above eight rows and vision
+positions run the generic blocks inside the graph (the M1 Max's prompt pieces with
+those projections); known-token spans do too on the
 M4 Pro, and append as windows on the block set of their width on the M1 Max. Each
 generated file's header lists its operations and the request shapes it serves.
 Each declares `verifyRoundCosts`, the verify cost by row count measured for
