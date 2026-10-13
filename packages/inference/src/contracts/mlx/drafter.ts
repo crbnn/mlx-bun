@@ -86,8 +86,12 @@ export interface DeepspecDrafterModel {
   /** The trained block width. */
   readonly gamma: number;
   readonly hidden: number;
-  projectContext(targetHiddens: MlxArray): MlxArray;
-  projectContextKVRows(contextHidden: MlxArray, position: number | MlxArray): ContextKV[];
+  /** The context projection per width class of the rows projected (B × L), indexed by the caller
+   *  (`widthClass(B × L)`): MLX's quantized matmul (matmul for a BF16 checkpoint) at every class. */
+  readonly projectContext: MlxWidthTable<DrafterContextProjection>;
+  /** Each layer's context K/V per width class of the context rows (B × L), indexed like `projectContext`:
+   *  the same kernel at every class. */
+  readonly projectContextKVRows: MlxWidthTable<DrafterContextKV>;
   draftRows(context: DeepspecContextAttention, anchors: readonly number[], position: number | MlxArray,
     collectLogits?: boolean): DeepspecDraftRows;
   dispose(): void;
