@@ -31,18 +31,6 @@ synthetic digests, the real-weight parity suites, `packages/inference/scripts/di
 
 ### Open
 
-- [ ] The M4 Pro paired measurement before #323 merges: on this machine after a reboot (its
-      preflight refuses while swap is above 512 MB), main 9593d881 against `refactor/composition`,
-      the default configuration through `scripts/bench-serve.ts` with `perf-check.ts decide`,
-      and the ladder's DFlash 2 adaptive command (`serve --model
-      mlx-bun/Qwen3.8-27B-Trellis-3.2bpw --kv-quant 4 --draft-model incoai/Qwen3.8-27B-DFlash2
-      --num-draft-tokens adaptive`; main needs `MLX_BUN_DFLASH2_TARGET_BASIS` pointing at the
-      basis JSON on the M1 Max share) with the harness kept under `.claude/bench-dflash2/`,
-      alternating sessions. The M1 Max's measurement of record (2026-10-12, clean machine):
-      Trellis default decode 14.1 → 14.0 tok/s (1.000 [0.995, 1.006]), e4b default 64.4 → 64.3
-      (0.998 [0.997, 1.000]), DFlash 2 main at depth 7 → head adaptive 3.8 → 12.1 tok/s; the
-      earlier M4 Pro reproduction of the DFlash 2 command: main 29.2 / 30.5, the branch 29.4 /
-      29.0 tok/s. Exit: no regression outside the band on either composition; #323 merges.
 - [ ] A teacher-forced KL of a request decoded at four rows against the same request at one row
       on the M4 Pro composition, the number the bit-stability decision promised to record
       (`teacher-forced-kl.ts` over a four-row group needs a capture mode for batched rows).
@@ -66,6 +54,29 @@ Engine bridge and prefills at 121 tok/s against 200 on the M4 Pro; the paired ch
 narrower than session drift for sub-percent decode differences (the clean M1 Max run is the null);
 the TurboQuant fused decode kernel covers head dimensions 64, 128, 256 and 512 and 96 decodes on
 the plain path.
+
+The measurements of record before the merge. M1 Max (2026-10-12, clean machine, `perf.yml`):
+Trellis default decode 14.1 → 14.0 tok/s (1.000 [0.995, 1.006]), e4b default 64.4 → 64.3 (0.998
+[0.997, 1.000]), DFlash 2 main at depth 7 → head adaptive 3.8 → 12.1 tok/s. M4 Pro (2026-10-12,
+rebooted, preflight clear before and after, main 9593d881 against 5fb5e380, the tree #323
+merges): Trellis default decode 14.5 → 14.5 tok/s (1.001 [1.000, 1.002]), prefill of the 1k
+prompt 175.1 → 176.6 (1.005 [0.999, 1.011]), cold TTFT 4326 → 4291 ms (0.995 [0.989, 1.001]);
+e4b default decode 59.3 → 59.2 (0.999 [0.998, 1.000], which `perf-check.ts decide` flags as a
+regression: a tenth of a percent, the same class as the M1 Max's 0.998), prefill and TTFT 1.000;
+the ladder's DFlash 2 adaptive command over two alternating rounds: decode 30.5 / 31.4 → 31.5 /
+31.3 tok/s, TTFT 169 / 167 → 173 / 168 ms, and the greedy text of five captured requests
+identical to main's. Server ready time is about 100 ms longer than main's (1.54 against 1.44 s:
+the Neural Engine programs load in 850 against 795 ms, the worker is ready 40 ms later); the
+first request's TTFT is equal; a server's first start from a fresh checkout path costs about
+500 ms more on either tree (a per-path cache), which is what the first candidate session of each
+paired run showed. The clean M4 Pro exposed two regressions the dirty machine had hidden, both
+fixed before the merge: the generated M4 Pro graph had stopped running one-sequence prompt pieces
+of 640 to 2048 positions on the Neural Engine (#349: main's ranges are the composition's data,
+the scheduler picks the operation by row count, which reverses C3's exact-chunk rule), and the
+DFlash 2 drafter's context projections had lost main's 5..8-row simdgroup-matrix kernel rule,
+which diverged the greedy text through the adaptive depth trajectory (#348); a sha bisection
+could not see either, the captured texts could. The M1 Max paired check fails its preflight
+while that machine is in use (swap above 512 MB).
 
 ## Verify the migrated library
 
