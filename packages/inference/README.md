@@ -978,8 +978,12 @@ declaring the row range it takes: the scheduler runs any one-sequence prompt pie
 a whole chunk or a tail, of 640 to 2048 positions on the one whose programs (1024,
 1536 or 2048 positions) hold it, as main's M4 Pro graph did; a
 composition that mounts adapters builds every operation on the generic blocks. On
-the M1 Max: the reduce and scatter kernels at one to four rows and the generic
-blocks above. On both, wider windows, prompt chunks on the GPU, tails and vision
+the M1 Max: the reduce and scatter kernels at one row; at two to three rows the
+factored Trellis kernels with the affine row kernels for the projections and head;
+at four the matrix-unit gate/up and affine set with the factored down; the
+matrix-unit set at five to eight; adapters as on the M4 Pro. On both, decode and
+verify up to eight rows submit the graph every four layers; wider windows, prompt
+chunks on the GPU, tails above eight rows and vision
 positions run the generic blocks inside the graph; known-token spans do too on the
 M4 Pro, and append as windows on the block set of their width on the M1 Max. Each
 generated file's header lists its operations and the request shapes it serves.
