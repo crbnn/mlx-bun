@@ -73,7 +73,7 @@ test("fused gate/up schedules and mixed kernel preserve the fused activation tai
       using x = input(m, gate.geometry.inFeatures, Dtype.bfloat16, true);
       using expected = fusedGateUpSwiglu(x, gate, up, 6, shipped.gateUpCodebook);
       using shared = fusedGateUpSwiglu(x, gate, up, 13, shipped.gateUpCodebook);
-      using mixed = fusedGateUpSwigluMixed(x, gate, up, 13, "fused", shipped.mixedExactBits);
+      using mixed = fusedGateUpSwigluMixed(x, gate, up, 13, "fused");
       same(shared, expected);
       same(mixed, expected);
     }
@@ -95,7 +95,7 @@ test("different gate/up bit widths preserve the split compiled activation tail",
         using g = trellisReduce(x, gate.codes, gate.scales, gate.geometry, 13);
         using u = trellisReduce(x, up.codes, up.scales, up.geometry, 13);
         using expected = swiglu.apply([g, u])[0]!;
-        using actual = fusedGateUpSwigluMixed(x, gate, up, 13, "split", shipped.mixedExactBits);
+        using actual = fusedGateUpSwigluMixed(x, gate, up, 13, "split");
         same(actual, expected);
       }
     }

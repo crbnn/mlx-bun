@@ -5,9 +5,10 @@
 // declares (LoRA targets, no committed spans, no Neural Engine operation, its measured verify costs, the residual
 // basis its fold record names, the caches of each KV scheme). From five rows the graph runs the generic blocks: there
 // it is held to the generic Qwen 3.5 graph of its family over the same weights under bf16, affine 4- and 8-bit and
-// TurboQuant KV, hidden, logits and every cache tensor, at maxDiff 0. Its reduce and scatter layers at one to four
-// rows have no generic counterpart: the generator's drift test (qwen38-generated-sync), the real-artifact parity suite
-// on the M1 Max (tests/parity/qwen-trellis-parity.test.ts) and the app digests are their gates. No model, no download.
+// TurboQuant KV, hidden, logits and every cache tensor, at maxDiff 0. Its codebook, reduce and scatter layers at one
+// to four rows have no generic counterpart: the generator's drift test (qwen38-generated-sync), the real-artifact
+// parity suite on the M1 Max (tests/parity/qwen-trellis-parity.test.ts) and the app digests are their gates. No model,
+// no download.
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";

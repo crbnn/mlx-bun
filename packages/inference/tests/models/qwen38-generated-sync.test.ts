@@ -53,6 +53,7 @@ test("the M1 Max composition's mixedGateUp chooses the mixed-width layer the gen
   expect(base.mixedGateUp).toBe("split");
   expect(emit("split")).toBe(readFileSync(join(GENERATED_DIR, `${stem}.ts`), "utf8"));
   expect(emit("fused")).toContain(`new ReduceMixedGateUp(gate, up, "fused")`);
+  expect(emit("fused")).toContain(`new CodebookGateUpRow(gate, up, "fused")`);
   // The A/B control: those layers keep the generic blocks at one to four rows, and the mixed kernel is not imported.
   const off = emit("off");
   expect(off).toContain("if (spec.gate !== spec.up) return genericStep(layer);");

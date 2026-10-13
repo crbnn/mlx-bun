@@ -1,7 +1,6 @@
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import { MetalKernel } from "@mlx-bun/mlx/metal-kernel";
-import { Dtype } from "@mlx-bun/mlx/ffi";
 import type { TrellisWeights } from "./geometry";
 import { HEADER, lutFor, decoderVariant } from "./codebook";
 import { TRELLIS_THREADS, TRELLIS_SG_PER_TG } from "./launch";
@@ -70,8 +69,8 @@ const MIXED_GATEUP_SOURCE = String.raw`
         if (uoff + (uint)L > 32u) uwin |= u[uwi + 1] << (32u - uoff);
         gwin &= (1u << (uint)L) - 1u;
         uwin &= (1u << (uint)L) - 1u;
-        const float gv = TRELLIS_ROUND((BITS_Y ? trellis_unrefined_bits_y(trellis_y(gwin)) : TRELLIS_DECODE(gwin, lutTG, lut)) * gScale);
-        const float uv = TRELLIS_ROUND((BITS_Y ? trellis_unrefined_bits_y(trellis_y(uwin)) : TRELLIS_DECODE(uwin, lutTG, lut)) * uScale);
+        const float gv = TRELLIS_ROUND(TRELLIS_DECODE(gwin, lutTG, lut) * gScale);
+        const float uv = TRELLIS_ROUND(TRELLIS_DECODE(uwin, lutTG, lut) * uScale);
         #pragma clang loop unroll(full)
         for (uint m = 0; m < (uint)M; ++m) {
           const float xv = xv4[m][q];
@@ -117,19 +116,13 @@ export type MixedGateUpTail = "split" | "fused";
 
 /** silu(gate(x)) * up(x) for M <= 4 rows in one kernel when gate and up are coded
  *  at different k. Same lanes, accumulation order and bf16 SwiGLU boundaries as
- *  fusedGateUpSwiglu; each projection keeps its own word layout. `exactBits`
- *  applies at the qualified single-row bf16 geometry, where the decoder builds
- *  its value from exact float32 bits: layers pass the choice they resolved at
- *  construction (`qualifiedRepresentations`), benches and tests the one they compare. */
+ *  fusedGateUpSwiglu; each projection keeps its own word layout. */
 export function fusedGateUpSwigluMixed(x: MlxArray, gate: TrellisWeights, up: TrellisWeights, selected: number,
-  tail: MixedGateUpTail, exactBits: boolean): MlxArray {
+  tail: MixedGateUpTail): MlxArray {
   const g = gate.geometry, u = up.geometry;
   const lead = x.shape.slice(0, -1);
   const M = lead.reduce((a, b) => a * b, 1);
   if (M > MATVEC_MAX_M) throw new Error(`fusedGateUpSwigluMixed: M=${M} > ${MATVEC_MAX_M}`);
-  const bitsY = selected === 13 && M === 1 && x.dtype === Dtype.bfloat16 &&
-    g.T === 256 && g.L === 12 && g.rows === 17408 && g.cols === 5120 &&
-    [2, 3, 4].includes(g.k) && [2, 3, 4].includes(u.k) && exactBits;
   const x2 = ops.reshape(x, [M, g.inFeatures]);
   const [mid] = mixedGateUpKernel().apply([x2, gate.codes, gate.scales, up.codes, up.scales, lutFor(g.L)], {
     outputs: [{ shape: [M, g.rows], dtype: x.dtype }],
@@ -137,7 +130,7 @@ export function fusedGateUpSwigluMixed(x: MlxArray, gate: TrellisWeights, up: Tr
     threadGroup: [TRELLIS_THREADS, 1, 1],
     templateDtypes: { T: x.dtype },
     templateInts: { M, R: g.rows, C: g.cols, BT: g.T, KG: g.k, KU: u.k, L: g.L, ROWS_TG: TRELLIS_SG_PER_TG,
-      VARIANT: decoderVariant(selected), TAIL: tail === "split" ? 1 : 0, BITS_Y: Number(bitsY) },
+      VARIANT: decoderVariant(selected), TAIL: tail === "split" ? 1 : 0 },
   });
   x2.dispose();
   const out = ops.reshape(mid!, [...lead, g.rows]);

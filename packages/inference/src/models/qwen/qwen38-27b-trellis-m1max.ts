@@ -19,14 +19,15 @@
 // 15, 21, 35, 36, 43, 50, 51, 53, 56, 62) and the device's one-kernel layers:
 //
 //   operation                      MLP gate/up + down (row-major/interleaved)  affine projections (3/4-bit)
-//   decode.one, verify.one         ReduceGateUpRow + ScatterDownRow/K3i        QuantizedLinear
+//   decode.one, verify.one         CodebookGateUpRow + CodebookDownRow/K3i     QuantizedLinear
 //   decode/verify.twoToThree       ReduceGateUpRows + ScatterDownRows/K3i      QuantizedLinear
 //   decode/verify.four             ReduceGateUpRows + ScatterDownRows/K3i      QuantizedLinear
 //   decode/verify.fiveToEight      the generic blocks (TrellisMlp)             QuantizedLinear
 //   decode/verify.wider,           the generic blocks (TrellisMlp)             QuantizedLinear
 //   prefillChunk.gpu, prefillTail
 //
-// Mixed-width gate/up takes ReduceMixedGateUp at one to four rows, split tail (MLX's compiled SwiGLU bit for bit).
+// Mixed-width gate/up takes CodebookGateUpRow at one row and ReduceMixedGateUp at two to four rows, split tail (MLX's
+// compiled SwiGLU bit for bit).
 // Every attention block reads through the cache the composition's KV scheme names (composedFullAttentionCache: the
 // plain cache with the stock SDPA, bf16-first affine or per-layer affine with the composition's read kernels, or
 // bf16-first TurboQuant with the dense read). The head is QuantizedLinear at every width. Decode, verify and
@@ -70,8 +71,8 @@ import { RMSNorm } from "../../layers/normalization";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import { QuantizedLinear } from "../../layers/quantized-linear";
 import { mropeInvFreq } from "../../layers/qwen-mrope";
-import { ReduceGateUpRow, ReduceGateUpRows, ReduceMixedGateUp } from "../../layers/trellis-reduce-gate-up";
-import { ScatterDownK3iRow, ScatterDownK3iRows, ScatterDownRow, ScatterDownRows } from "../../layers/trellis-scatter-down";
+import { CodebookGateUpRow, ReduceGateUpRows, ReduceMixedGateUp } from "../../layers/trellis-reduce-gate-up";
+import { CodebookDownK3iRow, CodebookDownRow, ScatterDownK3iRows, ScatterDownRows } from "../../layers/trellis-scatter-down";
 import { AttentionMasks } from "../../state/attention-read";
 import { composedFullAttentionCache } from "../../state/bf16-first-kv";
 import { SSMCache } from "../../state/ssm";
@@ -290,8 +291,8 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
     // mounted adapters: no class changes with them.
     this.#one = generic.map((layer, i) => {
       const spec = LAYERS[i]!, { gate, up, down } = mlpOf(i);
-      const gateUp = spec.gate === spec.up ? new ReduceGateUpRow(gate, up) : new ReduceMixedGateUp(gate, up, "split");
-      const project = spec.downLayout === "k3Interleaved" ? new ScatterDownK3iRow(down) : new ScatterDownRow(down);
+      const gateUp = new CodebookGateUpRow(gate, up, "split");
+      const project = spec.downLayout === "k3Interleaved" ? new CodebookDownK3iRow(down) : new CodebookDownRow(down);
       return layerStep(layer, mixerOf((layer.linearAttn ?? layer.selfAttn)!, spec.kind), post => {
         using mid = gateUp.forward(post);
         return project.forward(mid);
