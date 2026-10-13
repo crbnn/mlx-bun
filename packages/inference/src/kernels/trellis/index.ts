@@ -65,6 +65,8 @@
 //   - down-factored: row-major axis-0 codes, one row / 2..4 rows
 //   - down-k3-interleaved-factored: 3-bit block-interleaved axis-0 codes
 //   - gate-up-mma / down-mma: 1..8 rows on the simdgroup matrix unit
+//   - gate-up-mma-wide / down-mma-wide: the same fragments for any number of
+//     rows, each decoded fragment feeding the MMAs of several 8-row blocks
 //
 // ExpandedTrellisLinear (layers/trellis-linear.ts) decodes a trellis tensor at
 // construction into 8-bit g64 affine (the eval-carrier numerics, about -45 dB)
@@ -90,3 +92,5 @@ export { downFactoredRow, downFactoredRows } from "./down-factored";
 export { downK3InterleavedFactoredRow, downK3InterleavedFactoredRows } from "./down-k3-interleaved-factored";
 export { gateUpMma } from "./gate-up-mma";
 export { downMma, downK3InterleavedMma } from "./down-mma";
+export { gateUpMmaWide } from "./gate-up-mma-wide";
+export { downMmaWide, downK3InterleavedMmaWide } from "./down-mma-wide";

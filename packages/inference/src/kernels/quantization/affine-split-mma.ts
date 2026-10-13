@@ -1,8 +1,10 @@
 import { MlxArray } from "@mlx-bun/mlx/array";
+import * as ops from "@mlx-bun/mlx/ops";
 import { MetalKernel } from "@mlx-bun/mlx/metal-kernel";
 
-// Verify-width matmul over MLX affine 3- or 4-bit, group-64 weights on the
-// simdgroup matrix unit: y = x · Wᵀ for 1..8 activation rows (one block of 8).
+// Matmul over MLX affine 3- or 4-bit, group-64 weights on the simdgroup matrix
+// unit: y = x · Wᵀ for any number of activation rows, in blocks of 8 (grid z;
+// the row count is read at run time, one pipeline per projection shape).
 // The A/B layout of affine{3,4}-mma: A is 8 output rows x 8 k with the k index
 // permuted so that A column i at step s is position base + 32·i + s (every lane
 // dequantizes one 64-value group of its row over a 256-value K step); B is xᵀ.
@@ -12,19 +14,23 @@ import { MetalKernel } from "@mlx-bun/mlx/metal-kernel";
 // through threadgroup memory, and a weight dequantizes as fma(1 + q/2^BITS,
 // 2^BITS·scale, bias − 2^BITS·scale), q shifted into the mantissa of 1.0f.
 // B columns past the last activation row repeat it; those columns of C are
-// never written, so the cost does not depend on the rows. Summation order
-// differs from MLX's qmv (not bit-identical; gate by KL).
+// never written, so a block's cost does not depend on its rows. Summation order
+// differs from MLX's qmv and qmm (not bit-identical; gate by KL). Measured on
+// the M1 Max above eight rows (3-bit 5120 -> 10240): 9 rows 0.50 ms, 16 0.38,
+// 32 0.66, 64 1.25, against MLX's quantized matmul at 0.74, 0.75, 0.67, 1.27.
 
 const SOURCE = String.raw`
   const uint lane = thread_index_in_simdgroup;
   const uint sg = simdgroup_index_in_threadgroup;
   const uint fm = ((lane / 4u) & 4u) + ((lane / 2u) % 4u);
   const uint fn = ((lane / 4u) & 2u) * 2u + (lane % 2u) * 2u;
+  const uint M = (uint)x_shape[0];
   const uint n0 = threadgroup_position_in_grid.y * 8u * (uint)TILES;
+  const uint m0 = threadgroup_position_in_grid.z * 8u;
   const uint groups = (uint)K / 64u;
   const uint groupWords = 2u * (uint)BITS;
-  const device T* x0 = x + (ulong)metal::min(fn, (uint)M - 1u) * (ulong)K + fm * 32u;
-  const device T* x1 = x + (ulong)metal::min(fn + 1u, (uint)M - 1u) * (ulong)K + fm * 32u;
+  const device T* x0 = x + (ulong)metal::min(m0 + fn, M - 1u) * (ulong)K + fm * 32u;
+  const device T* x1 = x + (ulong)metal::min(m0 + fn + 1u, M - 1u) * (ulong)K + fm * 32u;
   const device uint32_t* wRow[TILES];
   metal::simdgroup_float8x8 acc[TILES];
   #pragma clang loop unroll(full)
@@ -78,10 +84,10 @@ const SOURCE = String.raw`
   threadgroup_barrier(metal::mem_flags::mem_threadgroup);
   for (uint e = sg * 32u + lane; e < 64u * (uint)TILES; e += 32u * (uint)SPLITS) {
     const uint t = e / 64u, r = (e % 64u) / 8u, m = e % 8u;
-    if (m >= (uint)M) continue;
+    if (m0 + m >= M) continue;
     float sum = 0.0f;
     for (uint s = 0; s < (uint)SPLITS; ++s) sum += part[s][t][r * 8u + m];
-    y[(ulong)m * (ulong)N + n0 + 8u * t + r] = T(sum);
+    y[(ulong)(m0 + m) * (ulong)N + n0 + 8u * t + r] = T(sum);
   }
 `;
 
@@ -111,25 +117,28 @@ export function affineSplitMmaPlan(N: number): AffineSplitMmaPlan {
   return N >= 2048 && N % 16 === 0 ? { tiles: 2, splits: 2 } : { tiles: 1, splits: 8 };
 }
 
-/** Eligible: affine 3- or 4-bit, group 64, K a multiple of 256, N of 8, 1..8 rows. */
+/** Eligible: affine 3- or 4-bit, group 64, K a multiple of 256, N of 8, at least one row. */
 export function affineSplitMmaEligible(rows: number, w: MlxArray, scales: MlxArray, spec: { bits: number; groupSize: number; mode: string }): boolean {
   if (spec.mode !== "affine" || spec.groupSize !== 64 || (spec.bits !== 3 && spec.bits !== 4)) return false;
   const N = scales.shape[0]!, K = scales.shape[1]! * 64;
-  return rows >= 1 && rows <= 8 && K % 256 === 0 && N % 8 === 0 && w.shape.length === 2;
+  return rows >= 1 && K % 256 === 0 && N % 8 === 0 && w.shape.length === 2;
 }
 
-/** x [..., K] (1..8 rows) · Wᵀ → [..., N] in x's dtype, for `bits`-bit weights under `plan`. Borrows inputs. */
+/** x [..., K] (any number of rows) · Wᵀ → [..., N] in x's dtype, for `bits`-bit weights under `plan`. Borrows
+ *  inputs. */
 export function affineSplitMma(x: MlxArray, w: MlxArray, scales: MlxArray, biases: MlxArray, bits: 3 | 4,
   plan: AffineSplitMmaPlan): MlxArray {
   const K = x.shape.at(-1)!, M = x.size / K, N = scales.shape[0]!;
-  if (M < 1 || M > 8) throw new Error(`affineSplitMma: M=${M} outside 1..8`);
+  if (M < 1) throw new Error("affineSplitMma: no rows");
   kernel ??= new MetalKernel({ name: "mlx_bun_affine_split_mma", inputNames: ["x", "w", "scales", "biases"],
     outputNames: ["y"], source: SOURCE, header: HEADER, ensureRowContiguous: true });
-  const [y] = kernel.apply([x, w, scales, biases], {
-    outputs: [{ shape: [...x.shape.slice(0, -1), N], dtype: x.dtype }],
-    grid: [32 * plan.splits, N / (8 * plan.tiles), 1], threadGroup: [32 * plan.splits, 1, 1],
+  using x2 = ops.reshape(x, [M, K]);
+  const [y] = kernel.apply([x2, w, scales, biases], {
+    outputs: [{ shape: [M, N], dtype: x.dtype }],
+    grid: [32 * plan.splits, N / (8 * plan.tiles), Math.ceil(M / 8)], threadGroup: [32 * plan.splits, 1, 1],
     templateDtypes: { T: x.dtype },
-    templateInts: { M, N, K, BITS: bits, TILES: plan.tiles, SPLITS: plan.splits },
+    templateInts: { N, K, BITS: bits, TILES: plan.tiles, SPLITS: plan.splits },
   });
-  return y!;
+  using y2 = y!;
+  return ops.reshape(y2, [...x.shape.slice(0, -1), N]);
 }

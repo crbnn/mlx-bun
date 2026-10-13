@@ -1,7 +1,8 @@
 // 3- and 4-bit verify-width affine kernels (simdgroup-matrix, split
 // simdgroup-matrix and shared multi-row) against MLX's quantized_matmul over
-// the same group-64 weights. All reorder the reduction relative to MLX, so they
-// agree to bf16 precision.
+// the same group-64 weights (the split kernel, at any number of rows, against
+// the float32 product of the dequantized weights). All reorder the reduction
+// relative to MLX, so they agree to bf16 precision.
 import { expect, test } from "bun:test";
 import { Dtype, MlxArray, ops } from "@mlx-bun/mlx";
 import { affineSplitMma, affineSplitMmaEligible, affineSplitMmaPlan } from "../../src/kernels/quantization/affine-split-mma";
@@ -48,7 +49,7 @@ test("3- and 4-bit affine MMA and multi-row kernels match quantized_matmul at ve
   }
 }, 60_000);
 
-test("3- and 4-bit split simdgroup-matrix kernel matches quantized_matmul", () => {
+test("3- and 4-bit split simdgroup-matrix kernel matches quantized_matmul, in blocks of eight rows at any rows", () => {
   // N 128 takes the narrow launch (one tile over eight K splits, more splits than K steps), N 2048 the wide one.
   for (const [K, N] of [[1024, 128], [1536, 128], [1024, 2048]] as const) {
     using w32 = MlxArray.fromFloat32(Float32Array.from({ length: N * K }, (_, i) => Math.sin(i * 0.137) * 0.05), [N, K]);
@@ -58,13 +59,29 @@ test("3- and 4-bit split simdgroup-matrix kernel matches quantized_matmul", () =
     for (const bits of [3, 4] as const) {
       const q = ops.quantize(wb, 64, bits), spec = { bits, groupSize: 64, mode: "affine" };
       try {
-        for (const m of [1, 2, 3, 4, 5, 8]) {
+        for (const m of [1, 2, 3, 4, 5, 8, 9, 16, 21]) {
           using x32 = MlxArray.fromFloat32(Float32Array.from({ length: m * K }, (_, i) => ((i * 73 + 19) % 257 - 128) / 64), [1, m, K]);
           using x = x32.astype(Dtype.bfloat16);
-          using expected = ops.quantizedMatmul(x, q.packed, q.scales, q.biases, spec, true);
+          // MLX's quantized matmul above five rows rounds its products differently (its matrix kernel); the float32
+          // product of the dequantized weights is the reference at every row count.
+          using scales32 = q.scales.astype(Dtype.float32);
+          using biases32 = q.biases!.astype(Dtype.float32);
+          using dense32 = ops.dequantize(q.packed, scales32, biases32, spec);
+          using weightT = ops.transposeAxes(dense32, [1, 0]);
+          using x32b = x.astype(Dtype.float32);
+          using expected = ops.matmul(x32b, weightT);
           expect(affineSplitMmaEligible(m, q.packed, q.scales, spec)).toBe(true);
           using split = affineSplitMma(x, q.packed, q.scales, q.biases!, bits, plan);
           expect(relErr(split, expected), `split mma ${bits}-bit K${K} N${N} m${m}`).toBeLessThan(1e-2);
+          // Each block of eight rows is that block's own launch bit for bit.
+          for (let lo = 8; lo < m; lo += 8) {
+            using block = x.slice([0, lo, 0], [1, Math.min(m, lo + 8), K]);
+            using alone = affineSplitMma(block, q.packed, q.scales, q.biases!, bits, plan);
+            using part = split.slice([0, lo, 0], [1, Math.min(m, lo + 8), N]);
+            using same = ops.equal(alone, part);
+            using all = ops.allReduce(same);
+            expect(all.toFloat32()[0], `split mma ${bits}-bit K${K} N${N} m${m} rows ${lo}+`).toBe(1);
+          }
         }
       } finally { q.packed.dispose(); q.scales.dispose(); q.biases?.dispose(); }
     }

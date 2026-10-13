@@ -4,6 +4,7 @@ import type { TrellisGeometry } from "../kernels/trellis/geometry";
 import { downFactoredRow, downFactoredRows } from "../kernels/trellis/down-factored";
 import { downK3InterleavedFactoredRow, downK3InterleavedFactoredRows } from "../kernels/trellis/down-k3-interleaved-factored";
 import { downK3InterleavedMma, downMma } from "../kernels/trellis/down-mma";
+import { downK3InterleavedMmaWide, downMmaWide } from "../kernels/trellis/down-mma-wide";
 import { TrellisLinear } from "./trellis-linear";
 
 // Down-projection layers over a Qwen MLP's axis-0 Trellis codes. Each layer
@@ -66,4 +67,20 @@ export class MmaDown {
 export class MmaDownK3i {
   constructor(readonly down: TrellisLinear) { k3Interleaved("MmaDownK3i", down); }
   forward(x: MlxArray): MlxArray { return project(this.down, downK3InterleavedMma, x); }
+}
+
+/** Any number of activation rows on the simdgroup matrix unit, each decoded fragment feeding two 8-row blocks;
+ *  row-major codes. */
+export class MmaDownWide {
+  constructor(readonly down: TrellisLinear) {
+    rowMajor("MmaDownWide", down);
+    if (down.geometry.T !== 256 || down.geometry.L > 12) throw new Error("MmaDownWide: needs T 256, L <= 12");
+  }
+  forward(x: MlxArray): MlxArray { return project(this.down, downMmaWide, x); }
+}
+
+/** Any number of activation rows on the simdgroup matrix unit; 3-bit block-interleaved codes. */
+export class MmaDownWideK3i {
+  constructor(readonly down: TrellisLinear) { k3Interleaved("MmaDownWideK3i", down); }
+  forward(x: MlxArray): MlxArray { return project(this.down, downK3InterleavedMmaWide, x); }
 }
