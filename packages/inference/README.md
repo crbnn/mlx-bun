@@ -913,8 +913,7 @@ matrix unit with output tiles sharing each activation fragment and K split acros
 the threadgroup (the M1 Max form); `kernels/attention/kvq4-decode` is one-row attention
 over a 4-bit group-64 KV cache with head dim 256, reading each packed row once
 for all query heads of its KV head, the tokens per threadgroup the caller's (512 on
-the M4 Pro, 128 on the M1 Max); `kernels/attention/multi-query` is causal
-flash decoding for 2..8 query rows over a BF16 cache. `kernels/ane` holds the
+the M4 Pro, 128 on the M1 Max). `kernels/ane` holds the
 Neural Engine programs (`linear`) and the GPU kernels that fill their buffers
 (`fill`). The layers in `layers/trellis-gate-up`, `layers/trellis-down`,
 `layers/affine-verify-linear`, `layers/kv4-decode-attention` and
