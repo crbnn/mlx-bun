@@ -238,7 +238,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
   readonly graphCapabilities: GraphCapabilities;
   /** Verify forward cost by rows relative to one decode step (M1 Max 32 GB). */
   readonly verifyRoundCosts: ReadonlyMap<number, number> = new Map([
-    [1, 1], [2, 1.92], [3, 2.34], [4, 2.76], [5, 3.04], [6, 3.23], [7, 3.44], [8, 3.65],
+    [1, 1], [2, 1.93], [3, 2.35], [4, 2.51], [5, 2.57], [6, 2.63], [7, 2.73], [8, 2.81],
   ]);
 
   readonly prefillChunk: MlxPrefillChunk;
