@@ -3,10 +3,12 @@
 // with the artifact's 3- and 4-bit affine projections, Trellis gate/up at the artifact's widths (mixed in its ten
 // layers) and its 3-bit block-interleaved and row-major downs, scaled down in width. The composition facts it
 // declares (no LoRA targets unless the composition mounts adapters, no committed spans, no Neural Engine operation
-// without the bridge or with adapters, its measured verify costs, the residual basis its fold record names, the caches of each KV scheme). Where the graph
+// without the bridge or with adapters, its measured verify costs, the residual basis its fold record names, the caches of each KV scheme:
+// the KV4 lego for affine 4-bit group 64, the generic graph's for every other). Where the graph
 // runs the generic blocks (a whole prompt chunk, prompt tails and verify windows wider than eight rows, every
 // operation under the adapters composition) it is held to the generic Qwen 3.5 graph of its family over the same
-// weights under bf16, affine 4- and 8-bit and TurboQuant KV, hidden, logits and every cache tensor, at maxDiff 0. Its
+// weights under bf16, affine 4- and 8-bit and TurboQuant KV (affine 4-bit over the KV4 lego in both, whose window
+// reads are not the generic graph's unfused port), hidden, logits and every cache tensor, at maxDiff 0. Its
 // row kernels (threadgroup-codebook at one row; factored, simdgroup-matrix and affine verify kernels at two to eight)
 // have no generic counterpart: the generator's drift test (qwen38-generated-sync), the kernel tests, the
 // real-artifact parity suite on the M1 Max (tests/parity/qwen-trellis-parity.test.ts) and the app digests are their
@@ -32,6 +34,8 @@ import { LAYERS, Qwen38TrellisM1Max } from "../../src/models/qwen/qwen38-27b-tre
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
 import { Affine4RowsLinear, AffineSplitMmaLinear } from "../../src/layers/affine-verify-linear";
 import { QuantizedLinear } from "../../src/layers/quantized-linear";
+import { unfusedAffineKernels } from "../../src/state/affine-attention";
+import { Bf16FirstKv4Head256Cache } from "../../src/state/bf16-first-kv";
 import { QWEN38_COMPOSITIONS } from "../../scripts/gen-qwen38";
 
 const HIDDEN = 512, INTER = 256, VOCAB = 256, HEADS = 4, KV_HEADS = 2, HEAD_DIM = 256;
@@ -152,6 +156,17 @@ const SCHEMES: Readonly<Record<string, KvStorageScheme>> = Object.freeze({
   kv8: { kind: "affine", bits: 8, groupSize: 64, kernels: "unfused" },
   turbo: { kind: "turbo", kBits: 8, vBits: 3 },
 });
+/** Affine 4-bit group 64's attention cache: the KV4 lego, bf16 through its first append, its decode kernel at the
+ *  128 tokens per threadgroup the M1 Max's table names, its several-row reads the composition's affine set (`plain`:
+ *  the unfused set, or null for another). */
+function kv4Lego(cache: Cache, plain: typeof unfusedAffineKernels | null): void {
+  expect(cache).toBeInstanceOf(Bf16FirstKv4Head256Cache);
+  const lego = cache as Bf16FirstKv4Head256Cache;
+  expect(lego.start).toBe(0);
+  expect(lego.decodeBlock).toBe(128);
+  if (plain) expect(lego.plain).toBe(plain);
+  else expect(lego.plain).not.toBe(unfusedAffineKernels);
+}
 // ── Comparison ──────────────────────────────────────────────────────────────
 
 const results = new Map<string, { worst: number; tensors: number }>();
@@ -250,9 +265,17 @@ describe("the composition the generated graph declares", () => {
       expect(current.wiredWeights).toBe(QWEN38_COMPOSITIONS["qwen38-27b-trellis-m1max"]!.wiredWeights!);
       expect(current.prefillChunk.ane).toBeUndefined();
       const a = current.makeCache(), b = generic.makeCache();
-      try { expect(a.map(cache => `${cache.constructor.name} ${cache.signature()}`)).toEqual(b.map(cache => `${cache.constructor.name} ${cache.signature()}`)); }
-      finally { disposeAll(a, b); }
+      try {
+        expect(a.map(cache => cache.signature())).toEqual(b.map(cache => cache.signature()));
+        for (const [layer, cache] of a.entries())
+          if (scheme !== "kv4" || LAYERS[layer]!.kind !== "attention") expect(cache.constructor).toBe(b[layer]!.constructor);
+          else kv4Lego(cache, unfusedAffineKernels);
+      } finally { disposeAll(a, b); }
     }
+    // The KV4 lego under the tiled-causal read kernels too, its several-row reads that set.
+    const tiled = graphs("kv4", { kv: { kind: "affine", bits: 4, groupSize: 64, kernels: "tiled-causal" } }).current.makeCache();
+    try { for (const [layer, cache] of tiled.entries()) if (LAYERS[layer]!.kind === "attention") kv4Lego(cache, null); }
+    finally { disposeAll(tiled); }
   });
 
   test("the kernels a bound drafter's own 4-bit projections run, one per width class, the same table on every view", () => {
@@ -302,7 +325,9 @@ describe("the composition the generated graph declares", () => {
 for (const scheme of Object.keys(SCHEMES)) {
   test(`${scheme} KV: where both run the generic blocks, the M1 Max graph equals the generic Qwen 3.5 graph (a prompt chunk, a tail and a verify window wider than eight rows)`, () => {
     const { current, generic } = graphs(scheme);
-    const mine = current.makeCache(), theirs = generic.makeCache();
+    // Affine 4-bit group 64 composes the KV4 lego, whose quantized window reads are not the generic graph's unfused
+    // port: there the generic graph reads through the caches the M1 Max graph composes.
+    const mine = current.makeCache(), theirs = scheme === "kv4" ? current.makeCache() : generic.makeCache();
     const step = (label: string, width: MlxWidthClass, rows: number[][],
       run: (graph: Qwen38TrellisM1Max | Qwen35Model, input: MlxArray, caches: Cache[]) => MlxArray | Promise<MlxArray>) => {
       using input = ids(rows);

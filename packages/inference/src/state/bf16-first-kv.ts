@@ -17,6 +17,7 @@ import type { KvStorageScheme } from "../contracts/portable/composition";
 import { composedAffineKernels, type AffineKernels, type AffineKernelSet } from "./affine-attention";
 import { AttentionMasks, decodeByPosition } from "./attention-read";
 import { KVCache } from "./kv";
+import { KV4_DECODE_BLOCK } from "../kernels/attention/kvq4-decode";
 import { kv4Head256Kernels } from "./kv4-head256-cache";
 import { QuantizedKVCache } from "./quantized-kv";
 import { RotatingKVCache } from "./rotating-kv";
@@ -581,17 +582,19 @@ export class Bf16FirstTurboQuantKVCache implements CommittedAttentionCache, Bidi
   }
 }
 
-/** The KV4 kernel set over the composition's affine set `plain`: the M4 Pro
- * composition's 4-bit group-64 head-dim-256 reads (`kv4Head256Kernels`) for one
- * sequence, and `plain`'s kernels for a row layout holding more. */
-export function kv4Head256KernelSet(plain: AffineKernelSet): AffineKernelSet {
-  return (bits, groupSize, dtype) => kv4Head256Kernels(plain(bits, groupSize, dtype));
+/** The KV4 kernel set over the composition's affine set `plain`: the 4-bit
+ * group-64 head-dim-256 reads (`kv4Head256Kernels`, the decode kernel at
+ * `decodeBlock` tokens per threadgroup) for one sequence, and `plain`'s kernels
+ * for a row layout holding more. */
+export function kv4Head256KernelSet(plain: AffineKernelSet, decodeBlock: number): AffineKernelSet {
+  return (bits, groupSize, dtype) => kv4Head256Kernels(plain(bits, groupSize, dtype), decodeBlock);
 }
 
 /**
- * The 4-bit group-64 full-attention lego of the Qwen3.8-27B Trellis M4 Pro
- * composition, bf16 first: {@link Bf16FirstQuantizedKVCache} whose quantized
- * storage reads with `Kv4Head256Cache`'s kernels. The first append is bf16, as
+ * The 4-bit group-64 full-attention lego of the Qwen3.8-27B Trellis M4 Pro and
+ * M1 Max compositions, bf16 first: {@link Bf16FirstQuantizedKVCache} whose
+ * quantized storage reads with `Kv4Head256Cache`'s kernels, the decode kernel at
+ * the composition's `decodeBlock`. The first append is bf16, as
  * the old graph's conversion after the first forward kept it; every later
  * decode reads with the fused one-row KV4 kernel and every window with the
  * folded-GQA kernel, the cores the old graph injected for one sequence. Its
@@ -601,9 +604,11 @@ export function kv4Head256KernelSet(plain: AffineKernelSet): AffineKernelSet {
  * several sequences through the generic path.
  */
 export class Bf16FirstKv4Head256Cache extends Bf16FirstQuantizedKVCache {
-  /** `plain`: the composition's affine kernel set (`composedAffineKernels`). */
-  constructor(start: number, readonly plain: AffineKernelSet, masks = new AttentionMasks(), storage?: Cache) {
-    super(64, 4, start, kv4Head256KernelSet(plain), masks, storage);
+  /** `plain`: the composition's affine kernel set (`composedAffineKernels`); `decodeBlock`: the decode kernel's
+   *  tokens per threadgroup its device's table names (the M4 Pro's by default). */
+  constructor(start: number, readonly plain: AffineKernelSet, masks = new AttentionMasks(),
+    readonly decodeBlock = KV4_DECODE_BLOCK, storage?: Cache) {
+    super(64, 4, start, kv4Head256KernelSet(plain, decodeBlock), masks, storage);
   }
 }
 

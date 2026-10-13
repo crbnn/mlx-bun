@@ -47,8 +47,9 @@ export interface Qwen38Composition {
   readonly artifact: string;
   readonly fingerprint: string;
   readonly device: string;
-  /** bf16 and one affine scheme, whose cache lego the device's table names (`kvLego`); or `"every"`: each scheme
-   *  composes its own lego (`composedFullAttentionCache`) and the table entry constrains none. */
+  /** bf16 and one affine scheme, whose cache lego the device's table names (`kvLego`); or `"every"`: the table entry
+   *  constrains none, the scheme of the device's `kvLego` composes that lego and each other scheme its own
+   *  (`composedFullAttentionCache`). */
   readonly kv: { readonly kind: "affine"; readonly bits: number; readonly groupSize: number } | "every";
   readonly draftDepth: { readonly adaptive: true; readonly max: number } | number;
   readonly prefillChunkTokens: number;
@@ -188,8 +189,10 @@ interface DeviceKernels {
   /** Mixed rows: each group on its own phase's operation for its width (`perGroup`), or the generic blocks with the
    *  prompt and decode groups' MLP rows packed into one call (`packed`). */
   readonly mixed: "perGroup" | "packed";
-  /** The cache lego a composition's affine scheme composes; `null` for compositions serving every scheme. */
-  readonly kvLego: string | null;
+  /** The cache lego the affine scheme it serves (`KV_LEGOS`) composes, the scheme of a composition naming one or
+   *  that scheme among every scheme, and the tokens per threadgroup of its one-row decode kernel (absent: the lego's
+   *  own); `null`: each scheme composes its own lego (`composedFullAttentionCache`). */
+  readonly kvLego: { readonly name: string; readonly decodeBlock?: number } | null;
   /** The Neural Engine operations: the channel fraction, the split layers, and the row counts their programs are built
    *  for (ascending), the smallest of which a one-sequence prompt piece of `minRows` positions or more runs. `affine`
    *  splits the named `projections`; none (`null`, `[]`): the MLP alone is split. */
@@ -204,6 +207,11 @@ interface DeviceKernels {
    *  the graph declares none and the drafter keeps its own rule. */
   readonly drafter: Readonly<Record<Narrow, string | null>> | null;
 }
+
+/** The affine scheme each KV cache lego of state/bf16-first-kv serves. */
+const KV_LEGOS: Readonly<Record<string, { readonly bits: number; readonly groupSize: number }>> = Object.freeze({
+  Bf16FirstKv4Head256Cache: { bits: 4, groupSize: 64 },
+});
 
 /** The module under src/layers each prompt projection layer lives in. */
 const PROMPT_PROJECTION_MODULES: Readonly<Record<string, string>> = Object.freeze({ DequantizedLinear: "dequantized-linear" });
@@ -241,7 +249,7 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     widerVerify: "bounded",
     knownSpans: true,
     mixed: "perGroup",
-    kvLego: "Bf16FirstKv4Head256Cache",
+    kvLego: { name: "Bf16FirstKv4Head256Cache" },
     // Main's Neural Engine prefill plan (9593d881, from a8a5ba45): every one-sequence prompt piece of 640 to 2048
     // positions, a chunk or a tail, on the smallest of the programs built every 512 positions up to 2048.
     ane: { fraction: 0.55, minRows: 640, rows: [1024, 1536, 2048],
@@ -279,7 +287,13 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     widerVerify: "lazy",
     knownSpans: false,
     mixed: "packed",
-    kvLego: null,
+    // Affine 4-bit group 64 KV on the KV4 lego (one-row decode kernel, folded-GQA windows) in place of the unfused
+    // port, measured 2026-10-13 (forward + head, one sequence, 16 steps, two sessions each) at 512, 4K, 8.5K and 16K
+    // positions: decode 60.3/63.4/67.8/74.3 -> 59.9/61.3/63.5/66.9 ms, verify windows of 4 rows
+    // 128.4/143.5/159.9/190.9 -> 125.6/131.9/136.3/145.6, of 8 rows 146.4/154.4/165.0/188.2 -> 144.0/147.4/153.4/164.5.
+    // Its decode kernel at 128 tokens per threadgroup (the M4 Pro's 512 leaves four threadgroups per layer at 512
+    // positions): decode 61.3/62.0/64.0/65.1 ms at 512 -> 59.9/61.4/63.5/66.9 at 128 (256: 60.4/61.8/63.2/66.0).
+    kvLego: { name: "Bf16FirstKv4Head256Cache", decodeBlock: 128 },
     // Measured 2026-10-13 on one layer's MLP at 1024 and 2048 rows: the Neural Engine's 34% of the channels (5888,
     // 23 tiles of 256, which it runs faster than 5760) beside the GPU's 66% in 0.70 of the GPU-only time (fractions
     // 0.25 to 0.45 swept; the Neural Engine at about 4 TFLOPS against the GPU's 8; 2% faster prompts than 0.31).
@@ -396,10 +410,14 @@ export function emitQwen38Graph(description: Qwen38Description, stem: string,
   if (!k) throw new Error(`${stem}: no kernel table for device ${c.device}`);
   if (description.fingerprint !== c.fingerprint)
     throw new Error(`${stem}: the source's graph fingerprint ${description.fingerprint} is not the composition's ${c.fingerprint}`);
-  const kvLego = k.kvLego, ane = k.ane, head = k.head, asyncEvery = k.asyncEvery;
-  if ((c.kv === "every") !== (kvLego === null))
-    throw new Error(`${stem}: ${c.kv === "every" ? "a composition serving every KV scheme composes no lego of its own"
-      : "an affine KV composition composes the lego its device's table names"} (${c.device}: ${kvLego ?? "none"})`);
+  const kvLego = k.kvLego?.name ?? null, ane = k.ane, head = k.head, asyncEvery = k.asyncEvery;
+  /** The lego's decode block argument, where the device's table names one. */
+  const decodeBlock = k.kvLego?.decodeBlock === undefined ? "" : `, ${k.kvLego.decodeBlock}`;
+  /** The affine scheme the device's KV lego serves. */
+  const legoKv = kvLego === null ? null : KV_LEGOS[kvLego];
+  if (legoKv === undefined) throw new Error(`${stem}: no KV scheme for cache lego ${kvLego}`);
+  if (c.kv !== "every" && (legoKv?.bits !== c.kv.bits || legoKv.groupSize !== c.kv.groupSize))
+    throw new Error(`${stem}: an affine KV composition composes the lego its device's table names for that scheme (${c.device}: ${kvLego ?? "none"})`);
   if ((c.kv === "every") !== (c.maxRows === null))
     throw new Error(`${stem}: this template constrains the KV schemes and the rows together, or neither`);
   if (c.aneBridge && !ane) throw new Error(`${stem}: ${c.device}'s table builds no Neural Engine operation`);
@@ -529,16 +547,22 @@ ${NARROW.map(cls => narrowSet(cls, "      ")).join("\n")}
     j > 0 && mixedPhrases[j - 1]![0] === verb ? object : `${verb} ${object}`).join(", and ")}.`;
   /** The most rows the graph's own block sets take (the generic blocks above). */
   const widest = generic("fiveToEight") ? "four" : "eight";
-  const summary = kvLego && head && asyncEvery !== null ? `// ${wrapComment(mixedSentence)} Every attention block reads
+  const summary = c.kv !== "every" && head && asyncEvery !== null ? `// ${wrapComment(mixedSentence)} Every attention block reads
 // through the cache (${kvLego}: bf16 through its first append, then the fused 4-bit decode
 // kernel and the folded-GQA window kernel; the bf16 cache: the stock SDPA). The head is part of each phase: logits.twoToThree ${head.twoToThree}, logits.four
 // ${head.four}, logits.fiveToEight ${head.fiveToEight}, QuantizedLinear otherwise. Decode and verify up to 8 rows submit
 // the graph every ${asyncEvery} layers; prompt chunks, tails and wider verify windows evaluate each layer
 // and its recurrent state.` : `// ${wrapComment([
     mixedSentence,
-    "Every attention block reads through the cache the composition's KV scheme names (composedFullAttentionCache: the",
-    "plain cache with the stock SDPA, bf16-first affine or per-layer affine with the composition's read kernels, or",
-    "bf16-first TurboQuant with the dense read).",
+    ...(legoKv ? [`Every attention block reads through the cache the composition's KV scheme names: affine ${legoKv.bits}-bit`,
+      `group ${legoKv.groupSize} composes ${kvLego} (bf16 through its first append, then the fused 4-bit decode kernel${
+        k.kvLego?.decodeBlock === undefined ? "" : ` at ${k.kvLego.decodeBlock} tokens per threadgroup`} and the`,
+      "folded-GQA window kernel), every other scheme its own lego (composedFullAttentionCache: the plain cache with the stock",
+      "SDPA, bf16-first affine or per-layer affine with the composition's read kernels, or bf16-first TurboQuant with the",
+      "dense read)."] : [
+      "Every attention block reads through the cache the composition's KV scheme names (composedFullAttentionCache: the",
+      "plain cache with the stock SDPA, bf16-first affine or per-layer affine with the composition's read kernels, or",
+      "bf16-first TurboQuant with the dense read)."]),
     head ? `The head is part of each phase: ${NARROW.filter(cls => cls !== "one").map(cls =>
       `logits.${cls} ${head[cls as Exclude<Narrow, "one">] ?? "QuantizedLinear"}`).join(", ")}, QuantizedLinear otherwise.`
       : "The head is QuantizedLinear at every width.",
@@ -551,8 +575,10 @@ ${NARROW.map(cls => narrowSet(cls, "      ")).join("\n")}
     `prompt chunks, and prompt tails and embeddings above ${widest} rows${k.widerVerify === "bounded" ? ", and wider verify windows" : ""},`,
     "evaluate each layer and its recurrent state.",
   ].join(" "))}`;
-  const kvText = c.kv === "every" ? "every scheme, each composing its own cache lego (composedFullAttentionCache)"
-    : `bf16, or affine ${c.kv.bits}-bit group ${c.kv.groupSize} (composes ${kvLego})`;
+  const kvText = c.kv !== "every" ? `bf16, or affine ${c.kv.bits}-bit group ${c.kv.groupSize} (composes ${kvLego})`
+    : legoKv ? `every scheme: affine ${legoKv.bits}-bit group ${legoKv.groupSize} composing ${kvLego}, each other its own cache lego
+//                (composedFullAttentionCache)`
+    : "every scheme, each composing its own cache lego (composedFullAttentionCache)";
   const composition = c.kv === "every" ? `/** The composition this file was generated and gated for, its entry in the loader's table: the artifact's graph
  *  fingerprint on this GPU. KV scheme, rows per forward, draft depth, prefill chunk, adapters and the Neural Engine
  *  bridge constrain nothing: the constructor builds them from the record it is handed. */
@@ -950,12 +976,13 @@ ${splitsProjections ? `        const block = blockOf(i, (linear, path) => {
       prefill: { boundedWorkspace: true },
 ${adapterSafe ? "" : "      adapters: composition.adapters ? {} : { batched: false, mountable: false },\n"}    });
 
-${kvLego ? `    // The attention cache the composition's KV scheme names, chosen once: affine ${(c.kv as { bits: number }).bits}-bit group ${(c.kv as { groupSize: number }).groupSize}
-    // composes ${kvLego}; bf16, the table's other scheme for this graph, the plain cache with the dense
-    // TurboQuant read (\`composedFullAttentionCache\`).
+${legoKv ? `    // The attention cache the composition's KV scheme names, chosen once: affine ${legoKv.bits}-bit group ${legoKv.groupSize}
+    // composes ${kvLego}; ${c.kv === "every" ? `every other scheme its own lego, with the dense TurboQuant read
+    // (\`composedFullAttentionCache\`).` : `bf16, the table's other scheme for this graph, the plain cache with the dense
+    // TurboQuant read (\`composedFullAttentionCache\`).`}
     const kv = composition.kv;
-    this.#attentionCache = kv.kind === "affine" && kv.bits === ${(c.kv as { bits: number }).bits} && kv.groupSize === ${(c.kv as { groupSize: number }).groupSize}
-      ? (masks: AttentionMasks) => new ${kvLego}(kv.quantizedKvStart ?? 0, composedAffineKernels(kv.kernels), masks)
+    this.#attentionCache = kv.kind === "affine" && kv.bits === ${legoKv.bits} && kv.groupSize === ${legoKv.groupSize}
+      ? (masks: AttentionMasks) => new ${kvLego}(kv.quantizedKvStart ?? 0, composedAffineKernels(kv.kernels), masks${decodeBlock})
       : (masks: AttentionMasks, layer: number) => composedFullAttentionCache(kv, layer, masks, denseTurboQuantKernels);`
   : `    // The attention cache the composition's KV scheme names: that scheme's own lego, with the dense TurboQuant read
     // (\`composedFullAttentionCache\`).
@@ -1018,9 +1045,11 @@ ${NARROW.filter(cls => cls !== "one").map(cls => {
    *  after the last forward. */
   dispose(): void { for (const resource of this.#owned.splice(0)) resource.dispose(); }
 
-${kvLego ? `  /** One cache per layer, the attention caches sharing one mask memo: the cache the composition's KV scheme names
-   *  (affine ${(c.kv as { bits: number }).bits}-bit group ${(c.kv as { groupSize: number }).groupSize}: ${kvLego}, bf16 through its first append, then the KV4 decode
-   *  and folded window reads; bf16: \`composedFullAttentionCache\`'s plain cache with the dense TurboQuant read). */`
+${legoKv ? `  /** One cache per layer, the attention caches sharing one mask memo: the cache the composition's KV scheme names
+   *  (affine ${legoKv.bits}-bit group ${legoKv.groupSize}: ${kvLego}, bf16 through its first append, then the KV4 decode
+   *  and folded window reads; ${c.kv === "every" ? `every other scheme: \`composedFullAttentionCache\`, the plain cache,
+   *  bf16-first affine or per-layer affine with the composition's read kernels, or bf16-first TurboQuant with the
+   *  dense read). */` : `bf16: \`composedFullAttentionCache\`'s plain cache with the dense TurboQuant read). */`}`
   : `  /** One cache per layer, the attention caches sharing one mask memo: the cache the composition's KV scheme names
    *  (\`composedFullAttentionCache\`: the plain cache, bf16-first affine or per-layer affine with the composition's read
    *  kernels, or bf16-first TurboQuant with the dense read). */`}
