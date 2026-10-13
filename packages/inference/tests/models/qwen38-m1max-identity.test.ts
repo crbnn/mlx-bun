@@ -28,6 +28,8 @@ import type { MlxWidthClass } from "../../src/contracts/mlx/graph";
 import type { Composition, KvStorageScheme } from "../../src/contracts/portable/composition";
 import { LAYERS, Qwen38TrellisM1Max } from "../../src/models/qwen/qwen38-27b-trellis-m1max";
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
+import { Affine4RowsLinear, AffineSplitMmaLinear } from "../../src/layers/affine-verify-linear";
+import { QuantizedLinear } from "../../src/layers/quantized-linear";
 import { QWEN38_COMPOSITIONS } from "../../scripts/gen-qwen38";
 
 const HIDDEN = 512, INTER = 256, VOCAB = 256, HEADS = 4, KV_HEADS = 2, HEAD_DIM = 256;
@@ -248,6 +250,30 @@ describe("the composition the generated graph declares", () => {
       try { expect(a.map(cache => `${cache.constructor.name} ${cache.signature()}`)).toEqual(b.map(cache => `${cache.constructor.name} ${cache.signature()}`)); }
       finally { disposeAll(a, b); }
     }
+  });
+
+  test("the kernels a bound drafter's own 4-bit projections run, one per width class, the same table on every view", () => {
+    const { current } = graphs(Object.keys(SCHEMES)[0]!);
+    const table = current.draftTarget([]).draftProjections!;
+    expect(current.draftTarget([]).draftProjections).toBe(table);
+    // A drafter's 4-bit, group-64 projection (64 outputs over 512 inputs) and its rows at every class.
+    using source = ops.randomNormal([64, 512], Dtype.bfloat16, 0, 0.05, null);
+    const q = ops.quantize(source, 64, 4);
+    const linear = new QuantizedLinear(q.packed, q.scales, q.biases, { bits: 4, groupSize: 64, mode: "affine" });
+    const named: Record<MlxWidthClass, [number, { forward(x: MlxArray): MlxArray }]> = {
+      one: [1, linear], twoToThree: [3, new Affine4RowsLinear(linear)], four: [4, new AffineSplitMmaLinear(linear)],
+      fiveToEight: [8, new AffineSplitMmaLinear(linear)], wider: [12, linear],
+    };
+    try {
+      for (const [width, [rows, layer]] of Object.entries(named) as [MlxWidthClass, [number, { forward(x: MlxArray): MlxArray }]][]) {
+        using x = ops.randomNormal([1, rows, 512], Dtype.bfloat16, 0, 1, null);
+        using declared = table[width](q.packed, q.scales, q.biases)(x);
+        using expected = layer.forward(x);
+        using same = ops.equal(declared, expected);
+        using all = ops.allReduce(same);
+        expect(all.toFloat32()[0]).toBe(1);
+      }
+    } finally { q.packed.dispose(); q.scales.dispose(); q.biases.dispose(); }
   });
 
   test("the residual basis its fold record declares, read once at construction", () => {

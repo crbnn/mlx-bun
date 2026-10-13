@@ -8,7 +8,9 @@
 // to the width its composer passes (the draft registry passes 4: 1.0 GB
 // resident instead of the 3.85 GB BF16 checkpoint). A target whose residual
 // stream carries a TurboQuant R1 fold declares it on its draft target
-// (`residualBasis`); binding a draft group applies it before the first draft.
+// (`residualBasis`), and one whose composition measured them the kernels of
+// those projections (`draftProjections`); binding a draft group applies both
+// before the first draft.
 
 import { artifactIdentity } from "../../../artifacts/identity";
 import { projectedDraftGroups, type ProjectedDraftMethod } from "../bindings/projected-draft-rows";
@@ -36,7 +38,7 @@ export class Dflash2Provider implements DraftProvider {
       if (target.hiddenLayerTaps.layerCount !== layers) throw new Error(
         `DFlash 2 drafter was trained for a ${layers}-layer target; this model has ` +
         `${target.hiddenLayerTaps.layerCount} layers — wrong (target, drafter) pairing`);
-      drafter.bindResidualBasis(target.residualBasis ?? null);
+      drafter.bindTarget(target.residualBasis ?? null, target.draftProjections ?? null);
       const projection = target.hiddenLayerTaps.projection;
       // The block for the rows drafted this round: anchors × columns rows index the drafter's draft table.
       const draftDevice: NonNullable<ProjectedDraftMethod["draftDevice"]> = (context, pending, positions, depth) => {

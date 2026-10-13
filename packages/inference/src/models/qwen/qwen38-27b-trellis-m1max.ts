@@ -31,7 +31,9 @@
 // names (composedFullAttentionCache: the plain cache with the stock SDPA, bf16-first affine or per-layer affine with
 // the composition's read kernels, or bf16-first TurboQuant with the dense read). The head is part of each phase:
 // logits.twoToThree Affine4RowsLinear, logits.four AffineSplitMmaLinear, logits.fiveToEight AffineSplitMmaLinear,
-// QuantizedLinear otherwise. Decode, verify, prompt tails and embeddings up to eight rows submit the graph every 4
+// QuantizedLinear otherwise. A bound drafter's own 4-bit projections take Affine4RowsLinear at twoToThree,
+// AffineSplitMmaLinear at four, AffineSplitMmaLinear at fiveToEight, QuantizedLinear otherwise
+// (TargetView.draftProjections). Decode, verify, prompt tails and embeddings up to eight rows submit the graph every 4
 // layers; wider decode and verify windows and known-token appends are one lazy graph; prompt chunks, and prompt tails
 // and embeddings above eight rows, evaluate each layer and its recurrent state.
 //
@@ -58,7 +60,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
 import type { Cache, GatedDeltaCache } from "../../contracts/mlx/cache";
-import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
+import type { DraftProjectionKernel, ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
 import type {
   MlxDeclaredGraph, MlxHeadForward, MlxLayerCapture, MlxMixedForward, MlxPhaseForward, MlxPrefillChunk,
   MlxTokenPhases, MlxWidthClass, MlxWidthTable,
@@ -262,6 +264,8 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
   readonly #mrope: { readonly invFreq: MlxArray; readonly rotaryDims: number };
   /** The artifact's R1 basis, from its fold record (read once, here). */
   readonly #residualBasis: ResidualBasis | undefined;
+  /** The kernels a bound drafter's own 4-bit projections run, per width class of their rows. */
+  readonly #draftProjections: MlxWidthTable<DraftProjectionKernel>;
   /** What this graph created and frees in `dispose`: its constants. */
   readonly #owned: { dispose(): void }[] = [];
   /** The attention cache of layer `layer` the composition's KV scheme names, over one `makeCache` call's masks. */
@@ -276,6 +280,16 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
     this.config = config;
     this.composition = composition;
     this.#residualBasis = qwenResidualBasis(this.graph, config.modelDir);
+    // A bound drafter's own 4-bit, group-64 projections, over the weights it quantized (borrowed).
+    const draftAffine = (w: MlxArray, scales: MlxArray, biases: MlxArray) =>
+      new QuantizedLinear(w, scales, biases, { bits: 4, groupSize: 64, mode: "affine" });
+    this.#draftProjections = Object.freeze<MlxWidthTable<DraftProjectionKernel>>({
+      one: (w, scales, biases) => { const kernel = draftAffine(w, scales, biases); return x => kernel.forward(x); },
+      twoToThree: (w, scales, biases) => { const kernel = new Affine4RowsLinear(draftAffine(w, scales, biases)); return x => kernel.forward(x); },
+      four: (w, scales, biases) => { const kernel = new AffineSplitMmaLinear(draftAffine(w, scales, biases)); return x => kernel.forward(x); },
+      fiveToEight: (w, scales, biases) => { const kernel = new AffineSplitMmaLinear(draftAffine(w, scales, biases)); return x => kernel.forward(x); },
+      wider: (w, scales, biases) => { const kernel = draftAffine(w, scales, biases); return x => kernel.forward(x); },
+    });
     this.weightsBytes = [...weights.shards.files.values()].reduce((a, f) => a + f.mmap.size, 0);
     this.faIdx = t.fullAttentionInterval - 1;
     this.embed = QuantizedEmbedding.load(weights, `${PREFIX}.embed_tokens`, config);
@@ -456,9 +470,9 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
 
   bindMediaInput(input: Vision): MlxPromptInput { return bindQwenMediaInput(this, input.embeddings, input.mrope!); }
   mediaEncoders(modelDir: string): Promise<MediaEncoders> { return qwenMediaEncoders(this, modelDir); }
-  /** The drafter's ports: its hidden-layer taps (verify's capture), embedding and head, and the residual basis
-   *  (R1 seed, final-norm gain) the artifact's fold record declares. */
-  draftTarget(_caches: Cache[]): TargetView { return qwenDraftTarget(this, this.#residualBasis); }
+  /** The drafter's ports: its hidden-layer taps (verify's capture), embedding and head, the residual basis
+   *  (R1 seed, final-norm gain) the artifact's fold record declares, and the kernels of its own projections. */
+  draftTarget(_caches: Cache[]): TargetView { return qwenDraftTarget(this, this.#residualBasis, this.#draftProjections); }
 
   // ── The layer loops. Each consumes h0 and returns the post-final-norm hidden,
   // owned by the caller; `capture` sees every layer's output, then the final hidden.
