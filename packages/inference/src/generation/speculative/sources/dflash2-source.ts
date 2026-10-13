@@ -45,9 +45,11 @@ export class Dflash2Provider implements DraftProvider {
       };
       return {
         namespace, schema: "dflash2-context-v1", layers: drafter.cfg.layers,
+        // The B × L context rows a prefill or a commit appends index the drafter's context tables.
         project(hidden, positions) {
-          using context = drafter.projectContext(hidden);
-          return drafter.projectContextKVRows(context, positions);
+          const width = widthClass(hidden.shape[0]! * hidden.shape[1]!);
+          using context = drafter.projectContext[width](hidden);
+          return drafter.projectContextKVRows[width](context, positions);
         },
         draft(context, pending, positions, depth) {
           const steps = drafter.blockColumns(depth) - 1;

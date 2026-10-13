@@ -1,9 +1,11 @@
 // The DFlash 2 drafter loaded in its trained basis and given the target's basis
 // when a draft group binds, on small synthetic weights whose 4-bit projections
 // fit the simdgroup matrix unit: every proposal holds its depth's tokens, the
-// 4-bit drafter runs the matrix unit for exactly one block width and context
-// projection never does, and a drafter keeps the basis it was first bound to.
-// Context chunks are 12 and 2×12 rows, plus a commit of 4 or 2×5 rows. The
+// 4-bit drafter runs the matrix unit exactly where the width class of the rows
+// names it (main's per-call row rule: five to eight rows), for a draft block and
+// for a context projection (fc, each layer's k and v) alike, and a drafter keeps
+// the basis it was first bound to. Context chunks are 12 and 2×12 rows, plus a
+// commit of 4, 2×5 or 6 rows. The
 // rotated Trellis graphs' declaration (the basis their constructor reads once
 // from turboquant_fold.json and the ports their draftTarget hands out), over a
 // synthetic artifact's graph, carries the basis the record holds, and the
@@ -28,6 +30,7 @@ import { qwenDraftTarget, qwenResidualBasis } from "../../src/models/qwen/media-
 import { Affine4MmaLinear } from "../../src/layers/affine-verify-linear";
 import type { DraftProjection } from "../../src/contracts/mlx/draft-projection";
 import { atEveryWidth } from "../../src/models/graph";
+import { widthClass } from "../../src/contracts/mlx/graph";
 import type { ResidualBasis, TargetView } from "../../src/contracts/mlx/draft-target";
 import type { DraftPrefillGroup, GroupedDraftProvider } from "../../src/generation/speculative/source";
 import { Dflash2Provider } from "../../src/generation/speculative/sources/dflash2-source";
@@ -166,17 +169,18 @@ function maxDiff(a: Float32Array, b: Float32Array): number {
 
 const DEPTHS = [1, 3, 7];
 const CASES = [
-  { anchors: [5], accepted: [3] }, // blocks of 2, 4, 8 rows; commit of 4
-  { anchors: [5, 11], accepted: [4, 1] }, // blocks of 4, 8, 16 rows; commit of 2×5, rows end apart
+  { anchors: [5], accepted: [3], contextOnMatrixUnit: false }, // blocks of 2, 4, 8 rows; commit of 4
+  { anchors: [5, 11], accepted: [4, 1], contextOnMatrixUnit: false }, // blocks of 4, 8, 16 rows; commit of 2×5, rows end apart
+  { anchors: [5], accepted: [5], contextOnMatrixUnit: true }, // blocks of 2, 4, 8 rows; commit of 6
 ];
 
 for (const [bits, folded] of [[4, true], [4, false], [0, true], [0, false]] as const) {
-  test(`basis at bind (${bits ? "4-bit" : "BF16"}, ${folded ? "R1 fold" : "trained basis"}): every proposal holds its depth, the matrix unit runs for one block width, depths 1, 3, 7`, async () => {
+  test(`basis at bind (${bits ? "4-bit" : "BF16"}, ${folded ? "R1 fold" : "trained basis"}): every proposal holds its depth, the matrix unit runs for one block width and a commit of five to eight rows, depths 1, 3, 7`, async () => {
     const provider = await Dflash2Provider.load(dir, { bits });
     const mma = spyOn(Affine4MmaLinear.prototype, "forward");
     try {
       const target = targetOf(folded ? basis : undefined);
-      for (const { anchors, accepted } of CASES) {
+      for (const { anchors, accepted, contextOnMatrixUnit } of CASES) {
         const B = anchors.length, width = Math.max(...accepted) + 1;
         using taps = bf16([B, CONTEXT, TAPS.length * H], 1);
         using commit = bf16([B, width, TAPS.length * H], 1);
@@ -187,8 +191,10 @@ for (const [bits, folded] of [[4, true], [4, false], [0, true], [0, false]] as c
           expect(runs[i]!.tokens.every(row => row.length === depth)).toBe(true);
           expect(runs[i]!.logits.length).toBe(B * depth * V);
         }
-        // The 4-bit drafter ran the matrix unit for exactly one block width: B·G = 8 rows.
-        expect(mma.mock.calls.length - calls).toBe(bits ? LAYERS * 7 : 0);
+        // The 4-bit drafter ran the matrix unit for exactly one block width (B·G = 8 rows: q, k, v, o, gate, up
+        // and down per layer) and, where the commit appended five to eight rows, for its context projection
+        // (fc, then each layer's k and v); the prefill chunks (12 and 24 rows) and the other commits never do.
+        expect(mma.mock.calls.length - calls).toBe(bits ? LAYERS * 7 + (contextOnMatrixUnit ? 1 + 2 * LAYERS : 0) : 0);
       }
     } finally {
       mma.mockRestore();
@@ -209,21 +215,27 @@ test("a drafter keeps the basis it was first bound to and refuses another", asyn
   } finally { drafter.dispose(); }
 });
 
-test("context projection runs MLX's quantized matmul at every row count (the matrix unit only drafts)", async () => {
-  const drafter = await Dflash2Drafter.load(dir, { bits: 4 });
-  drafter.bindResidualBasis(null);
-  const mma = spyOn(Affine4MmaLinear.prototype, "forward");
-  try {
-    // A 6-row chunk sits in the one range (5..8 rows) where a row-count switch would pick the matrix unit.
-    using taps = bf16([1, 6, TAPS.length * H], 1);
-    using context = drafter.projectContext(taps);
-    const kv = drafter.projectContextKVRows(context, 0);
-    ops.evalAll(kv.flatMap(pair => [pair.k, pair.v]));
-    for (const pair of kv) { pair.k.dispose(); pair.v.dispose(); }
-    expect(mma.mock.calls.length).toBe(0);
-  } finally {
-    mma.mockRestore();
-    drafter.dispose();
+test("context projection runs the matrix unit at five to eight rows and MLX's quantized matmul at every other width; BF16 never runs it", async () => {
+  for (const bits of [4, 0]) {
+    const drafter = await Dflash2Drafter.load(dir, { bits });
+    drafter.bindResidualBasis(null);
+    const mma = spyOn(Affine4MmaLinear.prototype, "forward");
+    try {
+      // B × L context rows in every class: 1, 2, 4, 6 (one row of six and two of three), 8, 9 and 12.
+      for (const [B, L] of [[1, 1], [1, 2], [1, 4], [1, 6], [2, 3], [1, 8], [1, 9], [2, 6]] as const) {
+        const width = widthClass(B * L), calls = mma.mock.calls.length;
+        using taps = bf16([B, L, TAPS.length * H], 1);
+        using context = drafter.projectContext[width](taps);
+        const kv = drafter.projectContextKVRows[width](context, 0);
+        ops.evalAll(kv.flatMap(pair => [pair.k, pair.v]));
+        for (const pair of kv) { pair.k.dispose(); pair.v.dispose(); }
+        // fc, then each layer's k and v.
+        expect(mma.mock.calls.length - calls).toBe(bits && width === "fiveToEight" ? 1 + 2 * LAYERS : 0);
+      }
+    } finally {
+      mma.mockRestore();
+      drafter.dispose();
+    }
   }
 });
 
