@@ -101,11 +101,10 @@ export const QWEN38_COMPOSITIONS: Readonly<Record<string, Qwen38Composition>> = 
     maxRows: null,
     aneBridge: false,
     mixedGateUp: "split",
-    // Measured 2026-10-12 on this graph and artifact: scripts/bench-mtp.ts, the DFlash 2 drafter at depths 1..7
-    // against the depth-0 plain arm (69.7 ms per token), bf16 KV, greedy, two prompts, 128 tokens, four
-    // repetitions, whose ratios span under 1% at every width. Five to eight rows run the generic blocks, whose
-    // Trellis MLP takes the prefill kernels above four rows.
-    verifyRoundCosts: { host: "M1 Max 32 GB", costs: [[1, 1], [2, 1.89], [3, 2.35], [4, 2.97], [5, 12.22], [6, 13.16], [7, 13.02], [8, 12.88]] },
+    // Measured 2026-10-13 on this graph and artifact: scripts/bench-mtp.ts, the DFlash 2 drafter at depths 1..7
+    // against the depth-0 plain arm (59.4 ms per token), bf16 KV, greedy, two prompts, 128 tokens, four
+    // repetitions, whose ratios span under 4.5% at every width (under 1% at two and five rows).
+    verifyRoundCosts: { host: "M1 Max 32 GB", costs: [[1, 1], [2, 1.92], [3, 2.34], [4, 2.76], [5, 3.04], [6, 3.23], [7, 3.44], [8, 3.65]] },
   },
 });
 
@@ -494,7 +493,7 @@ ${NARROW.map(cls => narrowSet(cls, "      ")).join("\n")}
     head ? `The head is part of each phase: ${NARROW.filter(cls => cls !== "one").map(cls =>
       `logits.${cls} ${head[cls as Exclude<Narrow, "one">] ?? "QuantizedLinear"}`).join(", ")}, QuantizedLinear otherwise.`
       : "The head is QuantizedLinear at every width.",
-    asyncEvery !== null ? `Decode and verify up to ${widest} rows submit the graph every ${asyncEvery} layers; wider decode${
+    asyncEvery !== null ? `Decode, verify, prompt tails and embeddings up to ${widest} rows submit the graph every ${asyncEvery} layers; wider decode${
       k.widerVerify === "lazy" ? " and verify windows" : ""}${k.knownSpans ? "" : " and known-token appends"} are one lazy graph;`
       : `Decode${k.widerVerify === "lazy" ? ", verify" : ` and verify up to ${widest} rows`}${k.knownSpans ? "" : " and known-token appends"
       } are one lazy graph${k.widerVerify === "lazy" ? " at every width" : ""};`,

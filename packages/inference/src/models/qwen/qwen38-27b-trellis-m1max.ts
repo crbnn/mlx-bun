@@ -31,9 +31,9 @@
 // names (composedFullAttentionCache: the plain cache with the stock SDPA, bf16-first affine or per-layer affine with
 // the composition's read kernels, or bf16-first TurboQuant with the dense read). The head is part of each phase:
 // logits.twoToThree Affine4RowsLinear, logits.four AffineSplitMmaLinear, logits.fiveToEight AffineSplitMmaLinear,
-// QuantizedLinear otherwise. Decode and verify up to eight rows submit the graph every 4 layers; wider decode and
-// verify windows and known-token appends are one lazy graph; prompt chunks, and prompt tails and embeddings above eight
-// rows, evaluate each layer and its recurrent state.
+// QuantizedLinear otherwise. Decode, verify, prompt tails and embeddings up to eight rows submit the graph every 4
+// layers; wider decode and verify windows and known-token appends are one lazy graph; prompt chunks, and prompt tails
+// and embeddings above eight rows, evaluate each layer and its recurrent state.
 //
 // Request shapes this graph serves:
 //   - prompt chunks of exactly the composition's chunk size (prefillChunk.gpu) and prompt tails (prefillTail);
@@ -235,7 +235,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
   readonly graphCapabilities: GraphCapabilities;
   /** Verify forward cost by rows relative to one decode step (M1 Max 32 GB). */
   readonly verifyRoundCosts: ReadonlyMap<number, number> = new Map([
-    [1, 1], [2, 1.89], [3, 2.35], [4, 2.97], [5, 12.22], [6, 13.16], [7, 13.02], [8, 12.88],
+    [1, 1], [2, 1.92], [3, 2.34], [4, 2.76], [5, 3.04], [6, 3.23], [7, 3.44], [8, 3.65],
   ]);
 
   readonly prefillChunk: MlxPrefillChunk;

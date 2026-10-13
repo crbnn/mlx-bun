@@ -46,9 +46,10 @@ synthetic digests, the real-weight parity suites, `packages/inference/scripts/di
       any other host until recorded there (`scripts/synthetic-digests.ts record`).
 
 Facts recorded for the program after the merge, not planned here: on the M1 Max a two-row verify
-round costs 1.89 plain decode steps (1.30 on the M4 Pro) and five or more rows cost 12 to 13
-because the generic Trellis MLP takes the prefill kernels there; DFlash 2 at depth 2 beats plain
-decode by about 12% on that chip; the adaptive gate never drafts fewer than one token; its
+round costs 1.92 plain decode steps (1.30 on the M4 Pro) and eight rows 3.65 (1.94), on the
+factored and matrix-unit kernels since 2026-10-13; verify windows above eight rows still take the
+generic blocks (about 0.9 s at 12 to 16 rows); DFlash 2 at depth 5 beats plain decode by about 12%
+on that chip (18.8 against 16.8 tok/s); the adaptive gate never drafts fewer than one token; its
 per-row verify costs ignore how many requests are batched; the M1 Max composition has no Neural
 Engine bridge and prefills at 121 tok/s against 200 on the M4 Pro; the paired check's band is
 narrower than session drift for sub-percent decode differences (the clean M1 Max run is the null);
