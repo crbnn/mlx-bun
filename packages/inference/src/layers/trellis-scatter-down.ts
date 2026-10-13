@@ -1,17 +1,13 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
-import { balancedScatterRows, scatterRows } from "../kernels/trellis/scatter";
 import { downCodebookRow, downK3InterleavedCodebookRow } from "../kernels/trellis/down-codebook";
 import type { TrellisLinear } from "./trellis-linear";
 
-// Packed down-projection layers over a Qwen MLP's axis-0 Trellis codes on the
-// scatter kernels (lanes over a block's code words, split-K partials folded by
-// one sum; kernels/trellis/index.ts). Each layer runs one kernel for one row
-// form and one code layout (row-major 2- or 4-bit codes, or the 3-bit block
-// interleave, which the balanced kernels decode) and takes everything that
-// kernel varies on at construction: the projection's decode variant and whether
-// its shared-row codebook was composed (`TrellisLinear.useSharedScatterCodebook`).
-// forward(x) keeps x's leading dimensions.
+// Packed down-projection layers over a Qwen MLP's axis-0 Trellis codes at one
+// row, with the scatter kernels' output bits (trellisScatter; kernels/trellis/index.ts)
+// through a threadgroup codebook. Each layer runs one kernel for one code layout
+// (row-major 2- or 4-bit codes, or the 3-bit block interleave) and checks the
+// projection at construction. forward(x) keeps x's leading dimensions.
 
 function project(lin: TrellisLinear, x: MlxArray, kernel: (x2: MlxArray) => MlxArray): MlxArray {
   const g = lin.geometry, lead = x.shape.slice(0, -1);
@@ -45,21 +41,6 @@ export class CodebookDownRow {
   }
 }
 
-/** 2..4 activation rows sharing each decoded weight; row-major codes. */
-export class ScatterDownRows {
-  readonly #variant: number;
-
-  constructor(readonly down: TrellisLinear) {
-    rowMajor("ScatterDownRows", down);
-    this.#variant = down.variant;
-  }
-
-  forward(x: MlxArray): MlxArray {
-    const { codes, scales, geometry } = this.down;
-    return project(this.down, x, x2 => scatterRows(x2, codes, scales, geometry, this.#variant));
-  }
-}
-
 /** One activation row; 3-bit block-interleaved codes, the same way: trellisScatter's single-row output bit for bit. */
 export class CodebookDownK3iRow {
   constructor(readonly down: TrellisLinear) { k3Interleaved("CodebookDownK3iRow", down); }
@@ -67,23 +48,5 @@ export class CodebookDownK3iRow {
   forward(x: MlxArray): MlxArray {
     const { codes, scales, geometry } = this.down;
     return project(this.down, x, x2 => downK3InterleavedCodebookRow(x2, codes, scales, geometry));
-  }
-}
-
-/** 2..4 activation rows sharing each decoded weight; 3-bit block-interleaved codes, with the shared-row codebook at
- *  three and four rows when the projection composed it. */
-export class ScatterDownK3iRows {
-  readonly #variant: number;
-  readonly #sharedCodebook: boolean;
-
-  constructor(readonly down: TrellisLinear) {
-    k3Interleaved("ScatterDownK3iRows", down);
-    this.#variant = down.variant;
-    this.#sharedCodebook = down.useSharedScatterCodebook;
-  }
-
-  forward(x: MlxArray): MlxArray {
-    const { codes, scales, geometry } = this.down;
-    return project(this.down, x, x2 => balancedScatterRows(x2, codes, scales, geometry, this.#variant, this.#sharedCodebook));
   }
 }

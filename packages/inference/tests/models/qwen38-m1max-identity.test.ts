@@ -2,13 +2,15 @@
 // composition) on small synthetic weights laid out by the generated quant table: 48 DeltaNet and 16 attention layers
 // with the artifact's 3- and 4-bit affine projections, Trellis gate/up at the artifact's widths (mixed in its ten
 // layers) and its 3-bit block-interleaved and row-major downs, scaled down in width. The composition facts it
-// declares (LoRA targets, no committed spans, no Neural Engine operation, its measured verify costs, the residual
-// basis its fold record names, the caches of each KV scheme). From five rows the graph runs the generic blocks: there
-// it is held to the generic Qwen 3.5 graph of its family over the same weights under bf16, affine 4- and 8-bit and
-// TurboQuant KV, hidden, logits and every cache tensor, at maxDiff 0. Its codebook, reduce and scatter layers at one
-// to four rows have no generic counterpart: the generator's drift test (qwen38-generated-sync), the real-artifact
-// parity suite on the M1 Max (tests/parity/qwen-trellis-parity.test.ts) and the app digests are their gates. No model,
-// no download.
+// declares (no LoRA targets unless the composition mounts adapters, no committed spans, no Neural Engine operation,
+// its measured verify costs, the residual basis its fold record names, the caches of each KV scheme). Where the graph
+// runs the generic blocks (a whole prompt chunk, prompt tails and verify windows wider than eight rows, every
+// operation under the adapters composition) it is held to the generic Qwen 3.5 graph of its family over the same
+// weights under bf16, affine 4- and 8-bit and TurboQuant KV, hidden, logits and every cache tensor, at maxDiff 0. Its
+// row kernels (threadgroup-codebook at one row; factored, simdgroup-matrix and affine verify kernels at two to eight)
+// have no generic counterpart: the generator's drift test (qwen38-generated-sync), the kernel tests, the
+// real-artifact parity suite on the M1 Max (tests/parity/qwen-trellis-parity.test.ts) and the app digests are their
+// gates. No model, no download.
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -232,11 +234,11 @@ function graphs(scheme: string, overrides: Partial<Composition> = {}): { current
 afterAll(() => { for (const { current } of built.values()) current.dispose(); });
 
 describe("the composition the generated graph declares", () => {
-  test("LoRA targets, caches, no committed spans, no Neural Engine operation, the verify costs its composition measured", () => {
+  test("no LoRA targets without adapters, caches, no committed spans, no Neural Engine operation, the verify costs its composition measured", () => {
     for (const scheme of Object.keys(SCHEMES)) {
       const { current, generic } = graphs(scheme);
-      expect([...current.loraTargets().keys()].sort()).toEqual([...generic.loraTargets().keys()].sort());
-      expect(current.loraTargets().size).toBe(48 * 5 + 16 * 4);
+      expect(current.graphCapabilities.adapters).toEqual({ batched: false, mountable: false });
+      expect(current.loraTargets().size).toBe(0);
       expect((current as { knownSpans?: unknown }).knownSpans).toBeUndefined();
       expect([...current.verifyRoundCosts]).toEqual(QWEN38_COMPOSITIONS["qwen38-27b-trellis-m1max"]!.verifyRoundCosts!.costs.map(([rows, cost]) => [rows, cost]));
       expect(current.prefillChunk.ane).toBeUndefined();
@@ -267,7 +269,7 @@ describe("the composition the generated graph declares", () => {
 });
 
 for (const scheme of Object.keys(SCHEMES)) {
-  test(`${scheme} KV: from five rows, the M1 Max graph equals the generic Qwen 3.5 graph (prompt chunk, tails, verify, decode of several sequences)`, () => {
+  test(`${scheme} KV: where both run the generic blocks, the M1 Max graph equals the generic Qwen 3.5 graph (a prompt chunk, a tail and a verify window wider than eight rows)`, () => {
     const { current, generic } = graphs(scheme);
     const mine = current.makeCache(), theirs = generic.makeCache();
     const step = (label: string, width: MlxWidthClass, rows: number[][],
@@ -279,10 +281,30 @@ for (const scheme of Object.keys(SCHEMES)) {
     };
     try {
       step(`prefillChunk.gpu ${CHUNK}`, "wider", [prompt(CHUNK, 1)], (g, input, caches) => g.prefillChunk.gpu(input, caches, null));
-      step("prefillTail.fiveToEight 6", "fiveToEight", [prompt(6, 2)], (g, input, caches) => g.prefillTail.fiveToEight(input, caches, null));
       step("prefillTail.wider 13", "wider", [prompt(13, 3)], (g, input, caches) => g.prefillTail.wider(input, caches, null));
-      step("verify.fiveToEight 8", "fiveToEight", [prompt(8, 4)], (g, input, caches) => g.verify.fiveToEight(input, caches, null));
       step("verify.wider 12", "wider", [prompt(12, 5)], (g, input, caches) => g.verify.wider(input, caches, null));
     } finally { disposeAll(mine, theirs); }
   }, 180_000);
 }
+
+test("the adapters composition: every operation runs the generic blocks", () => {
+  const { current: adapted, generic } = graphs("bf16", { adapters: true });
+  expect(adapted.graphCapabilities.adapters).toEqual({ batched: true, mountable: true });
+  expect(adapted.loraTargets().size).toBe(48 * 5 + 16 * 4);
+  expect([...adapted.loraTargets().keys()].sort()).toEqual([...generic.loraTargets().keys()].sort());
+  const mine = adapted.makeCache(), theirs = generic.makeCache();
+  try {
+    const steps: [string, MlxWidthClass, number[][], (graph: Qwen38TrellisM1Max | Qwen35Model, input: MlxArray, caches: Cache[]) => MlxArray][] = [
+      ["prefillChunk.gpu", "wider", [prompt(CHUNK, 90)], (g, input, caches) => g.prefillChunk.gpu(input, caches, null) as MlxArray],
+      ["decode.one", "one", [[7]], (g, input, caches) => g.decode.one(input, caches, null) as MlxArray],
+      ["verify.twoToThree 3", "twoToThree", [prompt(3, 91)], (g, input, caches) => g.verify.twoToThree(input, caches, null) as MlxArray],
+      ["verify.four 4", "four", [prompt(4, 93)], (g, input, caches) => g.verify.four(input, caches, null) as MlxArray],
+      ["verify.fiveToEight 6", "fiveToEight", [prompt(6, 92)], (g, input, caches) => g.verify.fiveToEight(input, caches, null) as MlxArray],
+    ];
+    for (const [label, width, rows, run] of steps) {
+      using input = ids(rows);
+      outputDiff(`adapters ${label}`, run(adapted, input, mine), run(generic, input, theirs), adapted.logits[width], generic.logits[width]);
+      stateDiff(`adapters ${label}`, mine, theirs);
+    }
+  } finally { disposeAll(mine, theirs); }
+}, 180_000);
