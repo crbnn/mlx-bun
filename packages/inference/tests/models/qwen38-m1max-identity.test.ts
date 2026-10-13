@@ -240,13 +240,14 @@ function graphs(scheme: string, overrides: Partial<Composition> = {}): { current
 afterAll(() => { for (const { current } of built.values()) current.dispose(); });
 
 describe("the composition the generated graph declares", () => {
-  test("no LoRA targets without adapters, caches, no committed spans, no Neural Engine operation, the verify costs its composition measured", () => {
+  test("no LoRA targets without adapters, caches, no committed spans, no Neural Engine operation, the verify costs and wired weights its composition measured", () => {
     for (const scheme of Object.keys(SCHEMES)) {
       const { current, generic } = graphs(scheme);
       expect(current.graphCapabilities.adapters).toEqual({ batched: false, mountable: false });
       expect(current.loraTargets().size).toBe(0);
       expect((current as { knownSpans?: unknown }).knownSpans).toBeUndefined();
       expect([...current.verifyRoundCosts]).toEqual(QWEN38_COMPOSITIONS["qwen38-27b-trellis-m1max"]!.verifyRoundCosts!.costs.map(([rows, cost]) => [rows, cost]));
+      expect(current.wiredWeights).toBe(QWEN38_COMPOSITIONS["qwen38-27b-trellis-m1max"]!.wiredWeights!);
       expect(current.prefillChunk.ane).toBeUndefined();
       const a = current.makeCache(), b = generic.makeCache();
       try { expect(a.map(cache => `${cache.constructor.name} ${cache.signature()}`)).toEqual(b.map(cache => `${cache.constructor.name} ${cache.signature()}`)); }
