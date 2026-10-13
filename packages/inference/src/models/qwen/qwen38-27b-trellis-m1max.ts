@@ -10,6 +10,7 @@
 //   prefill      2048-token chunks
 //   rows         any number per forward
 //   Neural Engine bridge present
+//   weights      wired for each generation
 //
 // An entire graph: built once at construction from the composition record it is
 // handed, it inherits from no class and never calls another graph. Every phase and
@@ -260,6 +261,9 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
   readonly composition: Composition;
   readonly weightsBytes: number;
+  /** Its weights are wired for each generation, whatever their share of the working set (measured for this
+   *  composition). */
+  readonly wiredWeights = true;
   /** Base path for LoRA target keys (weights carry the language_model prefix). */
   readonly prefixBase = PREFIX;
   readonly loraState = new LoraState();

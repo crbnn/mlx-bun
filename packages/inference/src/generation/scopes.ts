@@ -37,6 +37,8 @@ import { runtimeValue } from "../runtime/config";
 // fraction stopped wiring the 13-16 GiB Qwen/GLM models even though they
 // page heavily without an explicit wired limit.
 // Keep smaller 8-9 GiB models unwired while covering the large-model class.
+// A graph whose composition measured a gain below the line declares
+// `wiredWeights` and is wired whatever its share.
 const WIRE_THRESHOLD = 0.5;
 let wiredScopeDepth = 0;
 let wiredOldLimit = 0;
@@ -56,7 +58,7 @@ export function modelNeedsWiredLimit(
   recommendedBytes = maxRecommendedWorkingSetSize(),
   force = runtimeValue("MLX_BUN_FORCE_WIRE") === "1",
 ): boolean {
-  return force ||
+  return force || model.wiredWeights === true ||
     wiredWorkingSetBytes(model) > WIRE_THRESHOLD * recommendedBytes;
 }
 

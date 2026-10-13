@@ -353,7 +353,17 @@ On M1 Max 32 GB, MLX 0.32.2 (`applegpu_g13s`), Bun 1.4.2, the candidate
 matched main `02d723a2875153196f8c6c10bce2daf6f0044655`: 96 complete
 last-position float32 logit vectors and greedy tokens across three prompts;
 three 64-token MTP runs with every target input and speculation counter equal.
-Both MTP runs use the shared gateway with batch capacity one, depth two, plain
+Since 2026-10-13 the M1 Max graph verifies two to three rows on the factored and
+affine row kernels, which reassociate relative to its one-row decode (the
+width-class decision, KL-gated), so the test teacher-forces main's MTP windows
+and holds each window row to the one-row decode of its position instead: 192
+rows, mean KL 2.4e-4, largest 1.1e-2, one argmax difference at an exact bf16
+tie; the one-row decode still selects all 192 of main's emitted tokens. Two runs
+still equal main's in every token, target input and counter; the third emits
+974 for main's 303 at token 8, where the one-row logits tie exactly. The test
+keeps the exact MTP comparison wherever the windows are bit-identical to
+one-row decode.
+The MTP runs use the shared gateway with batch capacity one, depth two, plain
 KV, greedy sampling and stopping tokens disabled. The reference SHA-256 is
 `15421eb8c691fab7eabeb6e13c9a5c2a2eeed5caf5832f57e3575ef0119780f9`.
 An earlier comparison against main's single-request MTP loop kept all 192
