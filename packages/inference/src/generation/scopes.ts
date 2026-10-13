@@ -19,9 +19,9 @@ type MlxModelMemory
 } from "./bindings/autoregressive";
 import { runtimeValue } from "../runtime/config";
 
-// Scoped wired limit, raised only for models above WIRE_THRESHOLD of the
-// recommended working set. mlx-lm's wired_limit context wires
-// unconditionally per generation; we deviate with a measured justification:
+// Scoped wired limit, raised only for near-ceiling models. mlx-lm's
+// wired_limit context wires unconditionally per generation; we deviate
+// with a measured justification:
 // - 26B-A4B (16.4 GB = 92% of the 17.8 GiB working set) NEEDS wiring —
 //   8.6 tok/s without, 32.3 with (Metal evicts weight buffers per token).
 // - 12B/e4b (≤47%) hit reference parity WITHOUT wiring, and wiring in a
@@ -36,15 +36,10 @@ import { runtimeValue } from "../runtime/config";
 // wrong — 24.96 GiB exceeds a 24 GB box's RAM). At 0.75 × that the old
 // fraction stopped wiring the 13-16 GiB Qwen/GLM models even though they
 // page heavily without an explicit wired limit.
-// 0.4, not 0.5 (Josh, 2026-10-13): 0.5 is 13.4e9 B on that M1 Max, which
-// left the 11.96e9 B Qwen3.8-27B Trellis unwired. Wired there, bit-identical,
-// paired A/B: GPU prefill 1k/8k 136/142 -> 143/145 tok/s; with the Neural
-// Engine split 171/173 -> 172/177, its first GPU step after the split
-// 0.15-1.4 s -> 61-69 ms; one-row decode unchanged (60.0 ms). 0.4 is 10.7e9 B
-// there: the 12.7-13.0e9 B Qwen3.8 3-bit artifacts are wired too, the 8-9 GiB
-// models stay unwired. Where the set is 17.8 GiB (the 26B-A4B line above) it
-// is 7.1 GiB, which wires those as well.
-const WIRE_THRESHOLD = 0.4;
+// Keep smaller 8-9 GiB models unwired while covering the large-model class.
+// A graph whose composition measured a gain below the line declares
+// `wiredWeights` and is wired whatever its share.
+const WIRE_THRESHOLD = 0.5;
 let wiredScopeDepth = 0;
 let wiredOldLimit = 0;
 
@@ -63,7 +58,7 @@ export function modelNeedsWiredLimit(
   recommendedBytes = maxRecommendedWorkingSetSize(),
   force = runtimeValue("MLX_BUN_FORCE_WIRE") === "1",
 ): boolean {
-  return force ||
+  return force || model.wiredWeights === true ||
     wiredWorkingSetBytes(model) > WIRE_THRESHOLD * recommendedBytes;
 }
 
