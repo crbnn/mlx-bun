@@ -23,8 +23,8 @@
 //   decode/verify.twoToThree       FactoredGateUpRows + FactoredDownRows/K3i   Affine3RowsLinear/Affine4RowsLinear
 //   decode/verify.four             MmaGateUp + FactoredDownRows/K3i            AffineSplitMmaLinear
 //   decode/verify.fiveToEight      MmaGateUp + MmaDown/K3i                     AffineSplitMmaLinear
-//   decode/verify.wider,           the generic blocks (TrellisMlp)             QuantizedLinear
-//   prefillChunk.gpu, prefillTail
+//   decode/verify.wider            the generic blocks (TrellisMlp)             QuantizedLinear
+//   prefillChunk.gpu/Tail.wider    the generic blocks (TrellisMlp)             DequantizedLinear
 //
 // Mixed-width gate/up takes CodebookGateUpRow at one row, split tail (MLX's compiled SwiGLU bit for bit), and
 // FactoredMixedGateUp at two to three rows. Every attention block reads through the cache the composition's KV scheme
@@ -69,6 +69,7 @@ import type { Composition } from "../../contracts/portable/composition";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import { mapTokenGroups } from "../../input/token-groups";
 import { Affine3RowsLinear, Affine4RowsLinear, AffineSplitMmaLinear } from "../../layers/affine-verify-linear";
+import { DequantizedLinear } from "../../layers/dequantized-linear";
 import { disposing } from "../../layers/helpers";
 import { LoraState } from "../../layers/lora";
 import { RMSNorm } from "../../layers/normalization";
@@ -245,7 +246,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
   readonly appendKnown: MlxWidthTable<MlxPhaseForward>;
   readonly logits: MlxWidthTable<MlxHeadForward>;
 
-  /** The generic blocks: prompt chunks, every operation above eight rows, media positions, mixed rows. */
+  /** The generic blocks: every operation above eight rows (prompt pieces with the prompt blocks' projections), media positions, mixed rows. */
   readonly #generic: Step[];
   /** The generic layers, which a mixed forward drives block by block. */
   readonly #layers: readonly Qwen3Layer[];
@@ -353,6 +354,10 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
       });
     }
 
+    // The attention and DeltaNet blocks of the prompt operations: every projection on DequantizedLinear, unless
+    // the composition mounts adapters (then the generic blocks', whose QuantizedLinear applies them).
+    const promptBlocks = composition.adapters ? null : LAYERS.map((_, i) => blockOf(i, linear => new DequantizedLinear(linear)));
+
     const targets = new Map<string, QuantizedLinear>();
     if (composition.adapters) generic.forEach((layer, i) => {
       const p = `${PREFIX}.layers.${i}`;
@@ -375,8 +380,11 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
     this.#narrow = Object.freeze({ one: this.#one, twoToThree: this.#twoToThree, four: this.#four, fiveToEight: this.#fiveToEight });
     const one = this.#one, twoToThree = this.#twoToThree, four = this.#four, fiveToEight = this.#fiveToEight, wide = this.#generic;
     const embed = this.embed;
+    // Prompt pieces above eight rows: the prompt blocks, then the generic blocks' MLP.
+    const prompt = promptBlocks ? generic.map((layer, i) => layerStep(layer, mixerOf(promptBlocks[i]!, LAYERS[i]!.kind),
+      post => mlpOf(i).forward(post, "window", "wider"))) : wide;
     const gpu: RowsForward = (ids, state, capture) =>
-      this.#bounded(wide, embed.encode(ids), state, "window", capture, null, "wider");
+      this.#bounded(prompt, embed.encode(ids), state, "window", capture, null, "wider");
     this.prefillChunk = Object.freeze({ gpu });
     this.prefillTail = Object.freeze({
       one: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>

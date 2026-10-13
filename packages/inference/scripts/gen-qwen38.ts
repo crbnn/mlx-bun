@@ -180,10 +180,18 @@ interface DeviceKernels {
   /** The cache lego a composition's affine scheme composes; `null` for compositions serving every scheme. */
   readonly kvLego: string | null;
   /** The Neural Engine operations: the channel fraction, the split layers, and the row counts their programs are built
-   *  for (ascending), the smallest of which a one-sequence prompt piece of `minRows` positions or more runs. */
+   *  for (ascending), the smallest of which a one-sequence prompt piece of `minRows` positions or more runs. `affine`
+   *  splits the named `projections`; none (`null`, `[]`): the MLP alone is split. */
   readonly ane: { readonly fraction: number; readonly minRows: number; readonly rows: readonly number[];
-    readonly rowMajorMlp: string; readonly k3InterleavedMlp: string; readonly affine: string; readonly projections: readonly string[] } | null;
+    readonly rowMajorMlp: string; readonly k3InterleavedMlp: string; readonly affine: string | null; readonly projections: readonly string[] } | null;
+  /** The attention and DeltaNet projections of the prompt operations (prefillChunk.gpu, prefillTail.wider, and the
+   *  Neural Engine operations' projections it does not split), when the composition mounts no adapters: a layer of
+   *  `PROMPT_PROJECTION_MODULES`; `null` keeps the generic blocks' QuantizedLinear. */
+  readonly promptProjection: string | null;
 }
+
+/** The module under src/layers each prompt projection layer lives in. */
+const PROMPT_PROJECTION_MODULES: Readonly<Record<string, string>> = Object.freeze({ DequantizedLinear: "dequantized-linear" });
 
 /** The module under src/layers each one-kernel MLP layer lives in. */
 const LAYER_MODULES: Readonly<Record<string, string>> = Object.freeze({
@@ -224,6 +232,7 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     ane: { fraction: 0.55, minRows: 640, rows: [1024, 1536, 2048],
       rowMajorMlp: "AneTrellisMlpSplit", k3InterleavedMlp: "AneTrellisMlpSplitK3i", affine: "AneAffineSplit",
       projections: ["in_proj_z", "out_proj", "o_proj"] },
+    promptProjection: null,
   },
   // The M1 Max GPU's kernels and evaluation, measured there per class (forward + head, one sequence, bf16 KV, each
   // layer's per-call shader time and the whole forward): the threadgroup-codebook gate/up and down kernels at one row,
@@ -233,7 +242,8 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
   // faster than the generic blocks' prefill tiles and 1.2x than QuantizedLinear for the projections and head. Graph
   // submission every 4 layers takes about 4 ms off every width (2 and 8 within noise of it); wider verify windows one
   // lazy graph (1.8% faster than bounded at 12 and 16 rows); mixed rows packed on the generic blocks; known tokens as
-  // windows (the committed read's attention boundaries are qualified on the M4 Pro only).
+  // windows (the committed read's attention boundaries are qualified on the M4 Pro only); prompt pieces with their
+  // projections on the dense GEMM.
   applegpu_g13s: {
     label: "M1 Max GPU",
     mlp: {
@@ -255,6 +265,8 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     mixed: "packed",
     kvLego: null,
     ane: null,
+    // MLX's quantized matmul bit for bit from 640 rows, 1.27x to 1.38x faster (DequantizedLinear).
+    promptProjection: "DequantizedLinear",
   },
 });
 
@@ -364,6 +376,13 @@ export function emitQwen38Graph(description: Qwen38Description, stem: string,
   if ((c.kv === "every") !== (c.maxRows === null))
     throw new Error(`${stem}: this template constrains the KV schemes and the rows together, or neither`);
   if (c.aneBridge && !ane) throw new Error(`${stem}: ${c.device}'s table builds no Neural Engine operation`);
+  if (ane && (ane.affine === null) !== (ane.projections.length === 0))
+    throw new Error(`${stem}: ${c.device}'s Neural Engine table names a projection split layer exactly when it splits projections`);
+  /** The Neural Engine operations split projections as well as the MLP. */
+  const splitsProjections = !!ane && ane.projections.length > 0;
+  const promptProjection = k.promptProjection;
+  if (promptProjection !== null && !PROMPT_PROJECTION_MODULES[promptProjection])
+    throw new Error(`${stem}: no module for prompt projection layer ${promptProjection}`);
   /** Each Neural Engine operation's row range: from the device's fewest positions, or one above the previous
    *  program's, up to its own program's. */
   const aneRanges = (ane?.rows ?? []).map((rows, j, all) => [j === 0 ? ane!.minRows : all[j - 1]! + 1, rows] as const);
@@ -393,9 +412,9 @@ export function emitQwen38Graph(description: Qwen38Description, stem: string,
   const mlpImports = [...new Set(mlpLayerNames.map(name => LAYER_MODULES[name]!))].sort().map(module =>
     `import { ${mlpLayerNames.filter(name => LAYER_MODULES[name] === module).sort().join(", ")} } from "../../layers/${module}";`);
   const affineLayers = [...new Set([...Object.values(k.projections).flatMap(p => p ? [p[3], p[4]] : []), ...(head ? Object.values(head).filter((layer): layer is string => layer !== null) : [])])];
-  /** The attention and DeltaNet projections are QuantizedLinear in every class and nothing else is built: mounted
-   *  adapters apply everywhere, so no class changes with them. */
-  const adapterSafe = NARROW.every(cls => k.projections[cls] === null) && head === null && ane === null;
+  /** The attention and DeltaNet projections are QuantizedLinear in every class and nothing else is built (no prompt
+   *  blocks, no Neural Engine operation): mounted adapters apply everywhere, so no class changes with them. */
+  const adapterSafe = NARROW.every(cls => k.projections[cls] === null) && head === null && ane === null && promptProjection === null;
   /** Each distinct [inputs, outputs] shape of the split projections, with the projections that have it (none where
    *  the device's table builds no Neural Engine operation). */
   const aneShapes = [...(ane?.projections ?? []).reduce((shapes, name) => {
@@ -539,9 +558,12 @@ export const COMPOSITION: ServedComposition = Object.freeze({
 //
 ${row("operation", "MLP gate/up + down (row-major/interleaved)", "affine projections (3/4-bit)")}
 ${classRows}
-${row("decode/verify.wider,", "the generic blocks (TrellisMlp)", "QuantizedLinear")}
-${row("prefillChunk.gpu, prefillTail", "", "")}${ane ? `
-${row(`prefillChunk.ane, ${ane.minRows}..${ane.rows.at(-1)}`, `${ane.rowMajorMlp}/K3i`, `${ane.projections.join(", ")} split`)}` : ""}
+${promptProjection ? `${row("decode/verify.wider", "the generic blocks (TrellisMlp)", "QuantizedLinear")}
+${row("prefillChunk.gpu/Tail.wider", "the generic blocks (TrellisMlp)", promptProjection)}`
+  : `${row("decode/verify.wider,", "the generic blocks (TrellisMlp)", "QuantizedLinear")}
+${row("prefillChunk.gpu, prefillTail", "", "")}`}${ane ? `
+${row(`prefillChunk.ane, ${ane.minRows}..${ane.rows.at(-1)}`, `${ane.rowMajorMlp}/K3i`,
+  splitsProjections ? `${ane.projections.join(", ")} split` : promptProjection ?? "QuantizedLinear")}` : ""}
 //
 ${summary}
 //
@@ -592,9 +614,12 @@ ${[
     ...(k.mixed === "packed" ? [`import { mapTokenGroups } from "../../input/token-groups";`] : []),
     ...(ane ? [`import type { AneProgramSpec } from "../../kernels/ane/linear";`] : []),
     ...(affineLayers.length ? [`import { ${affineLayers.sort().join(", ")} } from "../../layers/affine-verify-linear";`] : []),
-    ...(ane ? [`import {
-  ${[ane.affine, ane.rowMajorMlp, ane.k3InterleavedMlp].sort().join(", ")}, aneAffineSplitProgram, aneMlpSplitProgram, type AneMlpSplit,
+    ...(ane ? [splitsProjections ? `import {
+  ${[ane.affine!, ane.rowMajorMlp, ane.k3InterleavedMlp].sort().join(", ")}, aneAffineSplitProgram, aneMlpSplitProgram, type AneMlpSplit,
+} from "../../layers/ane-prefill-split";` : `import {
+  ${[ane.rowMajorMlp, ane.k3InterleavedMlp].sort().join(", ")}, aneMlpSplitProgram, type AneMlpSplit,
 } from "../../layers/ane-prefill-split";`] : []),
+    ...(promptProjection ? [`import { ${promptProjection} } from "../../layers/${PROMPT_PROJECTION_MODULES[promptProjection]}";`] : []),
     `import { disposing } from "../../layers/helpers";`,
     `import { LoraState } from "../../layers/lora";`,
     `import { RMSNorm } from "../../layers/normalization";`,
@@ -613,7 +638,7 @@ import { denseTurboQuantKernels } from "../../state/turboquant-attention";
 import { declareGraph } from "../capabilities";
 import { atEveryWidth, byWidth, type ReadPhase } from "../graph";
 import type { ServedComposition } from "../implementation";
-${projectionSets.length || ane ? `import {
+${projectionSets.length || ane || promptProjection ? `import {
   GatedDeltaNet, Qwen3Attention, Qwen3Layer, type AttentionLinear, type AttentionLinearLoader, type TrellisMlp,
 } from "./blocks";` : `import { Qwen3Layer, type AttentionLinear, type GatedDeltaNet, type Qwen3Attention, type TrellisMlp } from "./blocks";`}
 import { qwen35WeightsView } from "./checkpoint";
@@ -642,7 +667,7 @@ ${table}
 const PREFIX = "language_model.model";
 const DELTANET_PROJECTIONS = ${list(DELTANET_PROJECTIONS)} as const;
 const ATTENTION_PROJECTIONS = ${list(ATTENTION_PROJECTIONS)} as const;
-${ane ? `const ANE_PROJECTIONS: ReadonlySet<string> = new Set(${list(ane.projections)});
+${splitsProjections ? `const ANE_PROJECTIONS: ReadonlySet<string> = new Set(${list(ane!.projections)});
 ` : ""}${asyncEvery !== null ? `/** Submit the graph every ${asyncEvery} layers at decode and verify widths up to 8 (measured best on this GPU). */
 const ASYNC_EVERY = ${asyncEvery};
 ` : ""}${ane ? `/** The Neural Engine's channel fraction in each split. */
@@ -653,7 +678,7 @@ const ANE_RANGES: readonly { readonly minRows: number; readonly rows: number }[]
   ${aneRanges.map(([minRows, rows]) => `{ minRows: ${minRows}, rows: ${rows} }`).join(", ")},
 ]);
 
-/** The widths a graph's Neural Engine programs are built at: the MLP's hidden and intermediate widths, and the input
+${splitsProjections ? `/** The widths a graph's Neural Engine programs are built at: the MLP's hidden and intermediate widths, and the input
  *  and output widths of each distinct split projection shape. */
 export interface AneWidths {
   readonly hidden: number;
@@ -678,7 +703,26 @@ export function anePrograms(composition: Composition, widths: AneWidths = ANE_WI
   return ANE_RANGES.flatMap(({ rows }) => [aneMlpSplitProgram(widths.hidden, widths.intermediate, ANE_FRACTION, rows),
     ...widths.projections.map(([inputs, outputs]) => aneAffineSplitProgram(inputs, outputs, ANE_FRACTION, rows))]);
 }
-` : ""}
+` : `/** The widths a graph's Neural Engine programs are built at: the MLP's hidden and intermediate widths (no projection
+ *  is split). */
+export interface AneWidths {
+  readonly hidden: number;
+  readonly intermediate: number;
+}
+
+/** The artifact's widths, from its description. */
+export const ANE_WIDTHS: AneWidths = Object.freeze({ hidden: ${description.widths.hidden}, intermediate: ${description.widths.intermediate} });
+
+/** The distinct Neural Engine programs this graph loads for \`composition\`, at the artifact's widths unless
+ *  \`widths\` names others (a synthetic artifact laid out like it): none without the bridge or with adapters mounted,
+ *  otherwise the whole-MLP slice every layer shares, for each range in \`ANE_RANGES\` at that range's rows. The
+ *  install step compiles them into the system cache (\`compileAnePrograms\`, models/ane-install); the constructor
+ *  only loads them, so one missing there fails construction with \`AneBridgeError\`. */
+export function anePrograms(composition: Composition, widths: AneWidths = ANE_WIDTHS): AneProgramSpec[] {
+  if (!composition.aneBridge || composition.adapters) return [];
+  return ANE_RANGES.map(({ rows }) => aneMlpSplitProgram(widths.hidden, widths.intermediate, ANE_FRACTION, rows));
+}
+`}` : ""}
 /** One layer: input norm, mixer, residual, post-attention norm, MLP, residual. Consumes nothing; returns an owned output.
  *  \`width\` is the class of \`x\`'s rows the calling operation names (the generic blocks' MLP reads it). */
 type Step = (x: MlxArray, cache: Cache, phase: ReadPhase, mrope: MropeForwardState | null, width: MlxWidthClass) => MlxArray;
@@ -742,6 +786,7 @@ ${k.knownSpans ? `  /** Committed known-token spans: the append keeps the native
   });
 ` : ""}
   /** The generic blocks: ${k.knownSpans ? "prompt chunks and tails on the GPU, wide windows, media positions, committed appends"
+    : promptProjection ? `every operation above ${widest} rows (prompt pieces with the prompt blocks' projections), media positions${k.mixed === "packed" ? ", mixed rows" : ""}`
     : `prompt chunks, every operation above ${widest} rows, media positions${k.mixed === "packed" ? ", mixed rows" : ""}`}. */
   readonly #generic: Step[];
 ${k.mixed === "packed" ? `  /** The generic layers, which a mixed forward drives block by block. */
@@ -787,7 +832,7 @@ ${k.mixed === "packed" ? `  /** The generic layers, which a mixed forward drives
     const qkScale = { q: ops.filledBf16(invScale * invScale, t.linearKeyHeadDim), k: ops.filledBf16(invScale, t.linearKeyHeadDim) };
     for (const layer of generic) if (layer.linearAttn) layer.linearAttn.qkScale = qkScale;
     this.#owned.push(qkScale.q, qkScale.k, this.#mrope.invFreq);
-${projectionSets.length || ane ? `
+${projectionSets.length || ane || promptProjection ? `
     /** The block of layer \`i\` whose projections \`project\` builds from each one's stored width. */
     const blockOf = (i: number, project: (linear: QuantizedLinear, path: string, width: number) => AttentionLinear) => {
       const spec = LAYERS[i]!, block = \`\${PREFIX}.layers.\${i}.\${spec.kind === "deltanet" ? "linear_attn" : "self_attn"}\`;
@@ -806,32 +851,41 @@ ${k.mixed === "packed" ? `    this.#layers = generic;
     this.#packMixedMlp = composition.packedMixedMlp;
 ` : ""}
 ${narrowBlock}
-
-${ane ? `    // The Neural Engine operations, one per range in ANE_RANGES, built largest
+${promptProjection ? `
+    // The attention and DeltaNet blocks of the prompt operations: every projection on ${promptProjection}, unless
+    // the composition mounts adapters (then the generic blocks', whose QuantizedLinear applies them).
+    const promptBlocks = composition.adapters ? null : LAYERS.map((_, i) => blockOf(i, linear => new ${promptProjection}(linear)));
+` : ""}
+${ane ? `${splitsProjections ? `    // The Neural Engine operations, one per range in ANE_RANGES, built largest
     // first. Layers run one at a time and the scheduler runs one operation at a
     // time, so each MLP split shares the previous split's program (identical
     // within a range) or its buffers (the largest range's), and projections of
     // one shape share theirs: one loaded program per shape and range, the
     // programs \`anePrograms\` lists, loaded from the compile cache the install
-    // step filled (nothing compiles here).
+    // step filled (nothing compiles here).` : `    // The Neural Engine operations, one per range in ANE_RANGES, built largest
+    // first. Layers run one at a time and the scheduler runs one operation at a
+    // time, so each MLP split shares the previous split's program (identical
+    // within a range) or its buffers (the largest range's): one loaded program
+    // per range, the programs \`anePrograms\` lists, loaded from the compile
+    // cache the install step filled (nothing compiles here).`}
     let ane: { readonly minRows: number; readonly rows: number; readonly steps: Step[] }[] | null = null;
     if (composition.aneBridge && !composition.adapters) {
       const started = performance.now();
-      const affineShares = new Map<string, ${ane.affine}>();
-      let mlpShare: AneMlpSplit | undefined;
+${splitsProjections ? `      const affineShares = new Map<string, ${ane.affine}>();
+` : ""}      let mlpShare: AneMlpSplit | undefined;
       ane = [...ANE_RANGES].reverse().map(({ minRows, rows }) => ({ minRows, rows, steps: generic.map((layer, i) => {
         const spec = LAYERS[i]!, { gate, up, down } = mlpOf(i);
         const split = mlpShare = (spec.downLayout === "k3Interleaved" ? ${ane.k3InterleavedMlp} : ${ane.rowMajorMlp})
           .build(gate, up, down, ANE_FRACTION, rows, mlpShare);
         this.#owned.push(split);
-        const block = blockOf(i, (linear, path) => {
-          if (!ANE_PROJECTIONS.has(path.slice(path.lastIndexOf(".") + 1))) return linear;
+${splitsProjections ? `        const block = blockOf(i, (linear, path) => {
+          if (!ANE_PROJECTIONS.has(path.slice(path.lastIndexOf(".") + 1))) return ${promptProjection ? `new ${promptProjection}(linear)` : "linear"};
           const shape = \`\${linear.inFeatures}:\${linear.outFeatures}\`;
           const projection = ${ane.affine}.build(linear, ANE_FRACTION, rows, affineShares.get(shape));
           affineShares.set(shape, projection);
           this.#owned.push(projection);
           return projection;
-        });
+        });` : `        const block = ${promptProjection ? "promptBlocks![i]!" : "(layer.linearAttn ?? layer.selfAttn)!"};`}
         return layerStep(layer, mixerOf(block, spec.kind), post => split.forward(post, compiledSwiglu));
       }) })).reverse();
       console.error(\`[ane] prefill programs ready in \${Math.round(performance.now() - started)} ms\`);
@@ -865,8 +919,13 @@ ${kvLego ? `    // The attention cache the composition's KV scheme names, chosen
     this.#narrow = Object.freeze({ ${NARROW.map(cls => `${cls}: this.#${cls}`).join(", ")} });
     const ${NARROW.filter(cls => !generic(cls)).map(cls => `${cls} = this.#${cls}`).join(", ")}, wide = this.#generic;
     const embed = this.embed${ane ? ", split = ane" : ""};
+${promptProjection ? `    // Prompt pieces above eight rows: the prompt blocks, then the generic blocks' MLP.
+    const prompt = promptBlocks ? generic.map((layer, i) => layerStep(layer, mixerOf(promptBlocks[i]!, LAYERS[i]!.kind),
+      post => mlpOf(i).forward(post, "window", "wider"))) : wide;
     const gpu: RowsForward = (ids, state, capture) =>
-      this.#bounded(wide, embed.encode(ids), state, "window", capture, null, "wider");
+      this.#bounded(prompt, embed.encode(ids), state, "window", capture, null, "wider");`
+  : `    const gpu: RowsForward = (ids, state, capture) =>
+      this.#bounded(wide, embed.encode(ids), state, "window", capture, null, "wider");`}
 ${ane ? `    this.prefillChunk = Object.freeze(split
       ? { gpu, ane: Object.freeze(split.map(({ minRows, rows, steps }) => Object.freeze({ minRows, rows,
         forward: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>

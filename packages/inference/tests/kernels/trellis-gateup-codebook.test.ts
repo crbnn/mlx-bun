@@ -155,8 +155,9 @@ test("explicit single-row representations preserve output bits on any GPU", () =
 }, 60_000);
 
 test("one-row codebook kernels reproduce the shipped one-row kernels on small synthetic shapes", () => {
-  // Rows not a multiple of a threadgroup's sixteen, 128 splits of which some are empty and the others hold an odd
-  // number of rows (the down kernels' two-row steps and their remainder), and SIMD groups only partly over blocks.
+  // Gate/up: rows not a multiple of a threadgroup's sixteen, and more than its threadgroups take at once (SIMD groups
+  // loop over rows). Down: 128 splits of which some are empty and the others hold an odd number of rows (the two-row
+  // steps and their remainder), and SIMD groups only partly over blocks.
   let seed = 4099;
   const codes = (shape: number[]) => {
     using signed = MlxArray.fromInt32(Int32Array.from({ length: shape.reduce((a, b) => a * b, 1) },
@@ -165,15 +166,16 @@ test("one-row codebook kernels reproduce the shipped one-row kernels on small sy
   };
   const same = (actual: MlxArray, expected: MlxArray) =>
     expect(Buffer.from(actual.rawBytes()).equals(Buffer.from(expected.rawBytes()))).toBe(true);
-  const rows = 300, cols = 512;
-  using s32 = MlxArray.fromFloat32(Float32Array.from({ length: rows }, (_, i) => (i % 31 + 1) / 256), [rows]);
-  using scales = s32.astype(Dtype.float16);
-  const up: TrellisGeometry = { k: 3, L: 12, T: 256, axis: 1, rows, cols, inFeatures: cols, outFeatures: rows };
+  const rows = 300, cols = 512, upRows = 5300;
+  using s32 = MlxArray.fromFloat32(Float32Array.from({ length: upRows }, (_, i) => (i % 31 + 1) / 256), [upRows]);
+  using upScales = s32.astype(Dtype.float16);
+  using scales = upScales.slice([0], [rows]);
+  const up: TrellisGeometry = { k: 3, L: 12, T: 256, axis: 1, rows: upRows, cols, inFeatures: cols, outFeatures: upRows };
   using rawUp = MlxArray.fromFloat32(Float32Array.from({ length: cols }, (_, i) => Math.cos(i * 0.21)), [1, cols]);
   using xUp = rawUp.astype(Dtype.bfloat16);
   for (const [kg, ku] of [[2, 2], [3, 3], [4, 4], [2, 3], [4, 3]] as const) {
-    using gc = codes([rows, cols * kg / 32]), uc = codes([rows, cols * ku / 32]);
-    const gate = { geometry: { ...up, k: kg }, codes: gc, scales }, upw = { geometry: { ...up, k: ku }, codes: uc, scales };
+    using gc = codes([upRows, cols * kg / 32]), uc = codes([upRows, cols * ku / 32]);
+    const gate = { geometry: { ...up, k: kg }, codes: gc, scales: upScales }, upw = { geometry: { ...up, k: ku }, codes: uc, scales: upScales };
     for (const tail of kg === ku ? ["split"] as const : ["split", "fused"] as const) {
       using expected = kg === ku ? fusedGateUpSwiglu(xUp, gate, upw, 13, false) : fusedGateUpSwigluMixed(xUp, gate, upw, 13, tail);
       using actual = gateUpCodebookRow(xUp, gate, upw, tail);

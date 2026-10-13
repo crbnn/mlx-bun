@@ -10,7 +10,9 @@
 // row kernels (threadgroup-codebook at one row; factored, simdgroup-matrix and affine verify kernels at two to eight)
 // have no generic counterpart: the generator's drift test (qwen38-generated-sync), the kernel tests, the
 // real-artifact parity suite on the M1 Max (tests/parity/qwen-trellis-parity.test.ts) and the app digests are their
-// gates. No model, no download.
+// gates. Its prompt pieces take their projections on DequantizedLinear: MLX's quantized matmul below 640 rows (the
+// pieces here), and above it the dense GEMM, that matmul bit for bit at the artifact's projection shapes but not at
+// these scaled-down ones, which the layer's own test (dequantized-linear) holds. No model, no download.
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
