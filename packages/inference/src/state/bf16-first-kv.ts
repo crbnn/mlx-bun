@@ -15,7 +15,7 @@ import type {
 } from "../contracts/mlx/cache";
 import type { KvStorageScheme } from "../contracts/portable/composition";
 import { composedAffineKernels, type AffineKernels, type AffineKernelSet } from "./affine-attention";
-import { AttentionMasks, decodeByPosition } from "./attention-read";
+import { AttentionMasks, decodeByPosition, sdpaRead, type DenseRead } from "./attention-read";
 import { KVCache } from "./kv";
 import { KV4_DECODE_BLOCK } from "../kernels/attention/kvq4-decode";
 import { kv4Head256Kernels } from "./kv4-head256-cache";
@@ -617,20 +617,22 @@ let warnedTurboRotating = false;
 
 /** The cache a composition's KV scheme names for one full-attention layer
  * (cache index `layer`) of a graph whose TurboQuant read is
- * `turboQuantKernels`: plain bf16 for `bf16` and for a layer a per-layer scheme
- * does not list, the bf16-first affine lego for affine schemes (the scheme's
- * read kernels, `composedAffineKernels`), the bf16-first TurboQuant lego for
- * `turbo`. Every cache of one `makeCache` call shares `masks`. */
+ * `turboQuantKernels` and whose bf16 window read is `windowRead` (the stock
+ * fused SDPA unless it names another): plain bf16 for `bf16` and for a layer a
+ * per-layer scheme does not list, the bf16-first affine lego for affine schemes
+ * (the scheme's read kernels, `composedAffineKernels`), the bf16-first
+ * TurboQuant lego for `turbo`. Every cache of one `makeCache` call shares
+ * `masks`. */
 export function composedFullAttentionCache(kv: KvStorageScheme, layer: number, masks: AttentionMasks,
-  turboQuantKernels: TurboQuantKernels): AttentionCache {
+  turboQuantKernels: TurboQuantKernels, windowRead: DenseRead = sdpaRead): AttentionCache {
   const start = kv.kind === "bf16" ? 0 : kv.quantizedKvStart ?? 0;
   switch (kv.kind) {
-    case "bf16": return new KVCache(masks, turboQuantKernels);
+    case "bf16": return new KVCache(masks, turboQuantKernels, windowRead);
     case "affine": return new Bf16FirstQuantizedKVCache(kv.groupSize, kv.bits, start, composedAffineKernels(kv.kernels), masks);
     case "affine-layers": {
       const entry = kv.layers.find(item => item.layer === layer);
       return entry ? new Bf16FirstQuantizedKVCache(entry.groupSize, entry.bits, start, composedAffineKernels(kv.kernels), masks)
-        : new KVCache(masks, turboQuantKernels);
+        : new KVCache(masks, turboQuantKernels, windowRead);
     }
     case "turbo": return new Bf16FirstTurboQuantKVCache(kv.kBits, kv.vBits, start, turboQuantFusedDecode(), turboQuantKernels, masks);
   }

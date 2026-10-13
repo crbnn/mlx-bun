@@ -1006,7 +1006,8 @@ at the artifact's shapes and about 1.35x faster there); with the bridge and no
 adapters, Neural Engine operations over the M4 Pro's ranges and program sizes that
 split only the MLP, 34% of its channels on the Neural Engine; adapters as on the M4
 Pro; affine 4-bit group-64 KV on the M4 Pro's KV4 lego, its decode kernel at 128 tokens
-per threadgroup.
+per threadgroup; bf16 KV on the plain cache whose verify windows of six to eight rows
+fold GQA into rows (`foldedWindowRead`, MLX's fused SDPA bit for bit).
 On both, decode and verify up to eight rows submit the graph every four layers;
 wider windows, prompt chunks on the GPU, tails above eight rows and vision
 positions run the generic blocks inside the graph (the M1 Max's prompt pieces with
@@ -1078,6 +1079,12 @@ checks below.
   port, OptiQ's tiled port, the folded and grouped-heads forms). An affine lego
   takes its kernel set at construction (`state/affine-attention`: unfused or
   tiled-causal as the composition names, or the opt-in always-tiled set).
+- `layers/folded-attention.ts`: bf16 causal windows of up to eight queries that MLX's
+  fused SDPA hands to its unfused fallback (more than 32 query vectors per KV head),
+  with GQA folded into rows: that fallback bit for bit, each KV head's keys and values
+  read once instead of once per query head. A bf16 storage reads its windows with the
+  read its composition names (`KVCache.windowRead`: `sdpaRead`, or `foldedWindowRead`),
+  and its row layouts and clones with the same.
 - `kernels/turboquant/`: packing, rotation, codebooks, and packed decode kernels.
 - `kernels/delta/gated.ts`: DeltaNet kernels; recurrent storage and its
   `recurDecode`/`recurWindow` live in `state/ssm.ts`. The training cache

@@ -33,14 +33,14 @@
 // FactoredMixedGateUp at two to three rows. Every attention block reads through the cache the composition's KV scheme
 // names: affine 4-bit group 64 composes Bf16FirstKv4Head256Cache (bf16 through its first append, then the fused 4-bit
 // decode kernel at 128 tokens per threadgroup and the folded-GQA window kernel), every other scheme its own lego
-// (composedFullAttentionCache: the plain cache with the stock SDPA, bf16-first affine or per-layer affine with the
-// composition's read kernels, or bf16-first TurboQuant with the dense read). The head is part of each phase:
-// logits.twoToThree Affine4RowsLinear, logits.four AffineSplitMmaLinear, logits.fiveToEight AffineSplitMmaLinear,
-// QuantizedLinear otherwise. A bound drafter's own 4-bit projections take Affine4RowsLinear at twoToThree,
-// AffineSplitMmaLinear at four, AffineSplitMmaLinear at fiveToEight, QuantizedLinear otherwise
-// (TargetView.draftProjections). Decode, verify, prompt tails and embeddings up to eight rows submit the graph every 4
-// layers; wider decode and verify windows and known-token appends are one lazy graph; prompt chunks, and prompt tails
-// and embeddings above eight rows, evaluate each layer and its recurrent state.
+// (composedFullAttentionCache: the plain cache with the stock SDPA, its windows of six to eight rows folding GQA into
+// rows (foldedWindowRead), bf16-first affine or per-layer affine with the composition's read kernels, or bf16-first
+// TurboQuant with the dense read). The head is part of each phase: logits.twoToThree Affine4RowsLinear, logits.four
+// AffineSplitMmaLinear, logits.fiveToEight AffineSplitMmaLinear, QuantizedLinear otherwise. A bound drafter's own 4-bit
+// projections take Affine4RowsLinear at twoToThree, AffineSplitMmaLinear at four, AffineSplitMmaLinear at fiveToEight,
+// QuantizedLinear otherwise (TargetView.draftProjections). Decode, verify, prompt tails and embeddings up to eight rows
+// submit the graph every 4 layers; wider decode and verify windows and known-token appends are one lazy graph; prompt
+// chunks, and prompt tails and embeddings above eight rows, evaluate each layer and its recurrent state.
 //
 // Request shapes this graph serves:
 //   - prompt chunks of exactly the composition's chunk size (prefillChunk.gpu) and prompt tails (prefillTail),
@@ -98,7 +98,7 @@ import { FactoredGateUpRows, FactoredMixedGateUp, MmaGateUp } from "../../layers
 import { CodebookGateUpRow } from "../../layers/trellis-reduce-gate-up";
 import { CodebookDownK3iRow, CodebookDownRow } from "../../layers/trellis-scatter-down";
 import { composedAffineKernels } from "../../state/affine-attention";
-import { AttentionMasks } from "../../state/attention-read";
+import { AttentionMasks, foldedWindowRead } from "../../state/attention-read";
 import { Bf16FirstKv4Head256Cache, composedFullAttentionCache } from "../../state/bf16-first-kv";
 import { SSMCache } from "../../state/ssm";
 import { denseTurboQuantKernels } from "../../state/turboquant-attention";
@@ -459,7 +459,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
     const kv = composition.kv;
     this.#attentionCache = kv.kind === "affine" && kv.bits === 4 && kv.groupSize === 64
       ? (masks: AttentionMasks) => new Bf16FirstKv4Head256Cache(kv.quantizedKvStart ?? 0, composedAffineKernels(kv.kernels), masks, 128)
-      : (masks: AttentionMasks, layer: number) => composedFullAttentionCache(kv, layer, masks, denseTurboQuantKernels);
+      : (masks: AttentionMasks, layer: number) => composedFullAttentionCache(kv, layer, masks, denseTurboQuantKernels, foldedWindowRead);
 
     this.#narrow = Object.freeze({ one: this.#one, twoToThree: this.#twoToThree, four: this.#four, fiveToEight: this.#fiveToEight });
     const one = this.#one, twoToThree = this.#twoToThree, four = this.#four, fiveToEight = this.#fiveToEight, wide = this.#generic;
@@ -534,8 +534,8 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
   /** One cache per layer, the attention caches sharing one mask memo: the cache the composition's KV scheme names
    *  (affine 4-bit group 64: Bf16FirstKv4Head256Cache, bf16 through its first append, then the KV4 decode
    *  and folded window reads; every other scheme: `composedFullAttentionCache`, the plain cache,
-   *  bf16-first affine or per-layer affine with the composition's read kernels, or bf16-first TurboQuant with the
-   *  dense read). */
+   *  its windows foldedWindowRead, bf16-first affine or per-layer affine with the composition's read kernels,
+   *  or bf16-first TurboQuant with the dense read). */
   makeCache(): Cache[] {
     const masks = new AttentionMasks();
     return LAYERS.map((layer, i) => layer.kind === "deltanet" ? new SSMCache() : this.#attentionCache(masks, i));

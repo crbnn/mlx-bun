@@ -193,6 +193,9 @@ interface DeviceKernels {
    *  that scheme among every scheme, and the tokens per threadgroup of its one-row decode kernel (absent: the lego's
    *  own); `null`: each scheme composes its own lego (`composedFullAttentionCache`). */
   readonly kvLego: { readonly name: string; readonly decodeBlock?: number } | null;
+  /** The causal window read of the composition's bf16 caches, a `DenseRead` of state/attention-read; `null`: the
+   *  stock fused SDPA (`sdpaRead`). */
+  readonly bf16WindowRead: string | null;
   /** The Neural Engine operations: the channel fraction, the split layers, and the row counts their programs are built
    *  for (ascending), the smallest of which a one-sequence prompt piece of `minRows` positions or more runs. `affine`
    *  splits the named `projections`; none (`null`, `[]`): the MLP alone is split. */
@@ -250,6 +253,7 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     knownSpans: true,
     mixed: "perGroup",
     kvLego: { name: "Bf16FirstKv4Head256Cache" },
+    bf16WindowRead: null,
     // Main's Neural Engine prefill plan (9593d881, from a8a5ba45): every one-sequence prompt piece of 640 to 2048
     // positions, a chunk or a tail, on the smallest of the programs built every 512 positions up to 2048.
     ane: { fraction: 0.55, minRows: 640, rows: [1024, 1536, 2048],
@@ -294,6 +298,11 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     // Its decode kernel at 128 tokens per threadgroup (the M4 Pro's 512 leaves four threadgroups per layer at 512
     // positions): decode 61.3/62.0/64.0/65.1 ms at 512 -> 59.9/61.4/63.5/66.9 at 128 (256: 60.4/61.8/63.2/66.0).
     kvLego: { name: "Bf16FirstKv4Head256Cache", decodeBlock: 128 },
+    // bf16 verify windows of six to eight rows (36 to 48 query vectors per KV head, more than MLX's vector kernel takes)
+    // with GQA folded into rows, bit for bit MLX's fallback, which reads every KV head once per query head: eight rows
+    // 146.7/159.3/177.7/207.9 -> 142.9/149.8/159.3/172.1 ms at 512/4K/8.5K/16K positions (forward + head, two
+    // sessions each; logits bit-identical at every width).
+    bf16WindowRead: "foldedWindowRead",
     // Measured 2026-10-13 on one layer's MLP at 1024 and 2048 rows: the Neural Engine's 34% of the channels (5888,
     // 23 tiles of 256, which it runs faster than 5760) beside the GPU's 66% in 0.70 of the GPU-only time (fractions
     // 0.25 to 0.45 swept; the Neural Engine at about 4 TFLOPS against the GPU's 8; 2% faster prompts than 0.31).
@@ -413,6 +422,11 @@ export function emitQwen38Graph(description: Qwen38Description, stem: string,
   const kvLego = k.kvLego?.name ?? null, ane = k.ane, head = k.head, asyncEvery = k.asyncEvery;
   /** The lego's decode block argument, where the device's table names one. */
   const decodeBlock = k.kvLego?.decodeBlock === undefined ? "" : `, ${k.kvLego.decodeBlock}`;
+  /** The bf16 caches' window read argument, where the device's table names one. */
+  const windowRead = k.bf16WindowRead === null ? "" : `, ${k.bf16WindowRead}`;
+  /** The bf16 cache's read, in the header's prose. */
+  const plainRead = k.bf16WindowRead === null ? "the stock SDPA"
+    : `the stock SDPA, its windows of six to eight rows folding GQA into rows (${k.bf16WindowRead})`;
   /** The affine scheme the device's KV lego serves. */
   const legoKv = kvLego === null ? null : KV_LEGOS[kvLego];
   if (legoKv === undefined) throw new Error(`${stem}: no KV scheme for cache lego ${kvLego}`);
@@ -557,11 +571,11 @@ ${NARROW.map(cls => narrowSet(cls, "      ")).join("\n")}
     ...(legoKv ? [`Every attention block reads through the cache the composition's KV scheme names: affine ${legoKv.bits}-bit`,
       `group ${legoKv.groupSize} composes ${kvLego} (bf16 through its first append, then the fused 4-bit decode kernel${
         k.kvLego?.decodeBlock === undefined ? "" : ` at ${k.kvLego.decodeBlock} tokens per threadgroup`} and the`,
-      "folded-GQA window kernel), every other scheme its own lego (composedFullAttentionCache: the plain cache with the stock",
-      "SDPA, bf16-first affine or per-layer affine with the composition's read kernels, or bf16-first TurboQuant with the",
+      `folded-GQA window kernel), every other scheme its own lego (composedFullAttentionCache: the plain cache with ${plainRead},`,
+      "bf16-first affine or per-layer affine with the composition's read kernels, or bf16-first TurboQuant with the",
       "dense read)."] : [
       "Every attention block reads through the cache the composition's KV scheme names (composedFullAttentionCache: the",
-      "plain cache with the stock SDPA, bf16-first affine or per-layer affine with the composition's read kernels, or",
+      `plain cache with ${plainRead}, bf16-first affine or per-layer affine with the composition's read kernels, or`,
       "bf16-first TurboQuant with the dense read)."]),
     head ? `The head is part of each phase: ${NARROW.filter(cls => cls !== "one").map(cls =>
       `logits.${cls} ${head[cls as Exclude<Narrow, "one">] ?? "QuantizedLinear"}`).join(", ")}, QuantizedLinear otherwise.`
@@ -688,7 +702,7 @@ ${[
     ...(ane ? [`import { compiledSwiglu } from "../../layers/swiglu";`] : []),
     ...mlpImports,
     ...(kvLego ? [`import { composedAffineKernels } from "../../state/affine-attention";`] : []),
-    `import { AttentionMasks } from "../../state/attention-read";`,
+    `import { AttentionMasks${windowRead} } from "../../state/attention-read";`,
     `import { ${kvLego ? `${kvLego}, ` : ""}composedFullAttentionCache } from "../../state/bf16-first-kv";`,
   ].join("\n")}
 import { SSMCache } from "../../state/ssm";
@@ -983,11 +997,11 @@ ${legoKv ? `    // The attention cache the composition's KV scheme names, chosen
     const kv = composition.kv;
     this.#attentionCache = kv.kind === "affine" && kv.bits === ${legoKv.bits} && kv.groupSize === ${legoKv.groupSize}
       ? (masks: AttentionMasks) => new ${kvLego}(kv.quantizedKvStart ?? 0, composedAffineKernels(kv.kernels), masks${decodeBlock})
-      : (masks: AttentionMasks, layer: number) => composedFullAttentionCache(kv, layer, masks, denseTurboQuantKernels);`
+      : (masks: AttentionMasks, layer: number) => composedFullAttentionCache(kv, layer, masks, denseTurboQuantKernels${windowRead});`
   : `    // The attention cache the composition's KV scheme names: that scheme's own lego, with the dense TurboQuant read
     // (\`composedFullAttentionCache\`).
     const kv = composition.kv;
-    this.#attentionCache = (masks: AttentionMasks, layer: number) => composedFullAttentionCache(kv, layer, masks, denseTurboQuantKernels);`}
+    this.#attentionCache = (masks: AttentionMasks, layer: number) => composedFullAttentionCache(kv, layer, masks, denseTurboQuantKernels${windowRead});`}
 
     this.#narrow = Object.freeze({ ${NARROW.map(cls => `${cls}: this.#${cls}`).join(", ")} });
     const ${NARROW.filter(cls => !generic(cls)).map(cls => `${cls} = this.#${cls}`).join(", ")}, wide = this.#generic;
@@ -1048,8 +1062,8 @@ ${NARROW.filter(cls => cls !== "one").map(cls => {
 ${legoKv ? `  /** One cache per layer, the attention caches sharing one mask memo: the cache the composition's KV scheme names
    *  (affine ${legoKv.bits}-bit group ${legoKv.groupSize}: ${kvLego}, bf16 through its first append, then the KV4 decode
    *  and folded window reads; ${c.kv === "every" ? `every other scheme: \`composedFullAttentionCache\`, the plain cache,
-   *  bf16-first affine or per-layer affine with the composition's read kernels, or bf16-first TurboQuant with the
-   *  dense read). */` : `bf16: \`composedFullAttentionCache\`'s plain cache with the dense TurboQuant read). */`}`
+   *  ${k.bf16WindowRead === null ? "" : `its windows ${k.bf16WindowRead}, `}bf16-first affine or per-layer affine with the composition's read kernels,
+   *  or bf16-first TurboQuant with the dense read). */` : `bf16: \`composedFullAttentionCache\`'s plain cache with the dense TurboQuant read). */`}`
   : `  /** One cache per layer, the attention caches sharing one mask memo: the cache the composition's KV scheme names
    *  (\`composedFullAttentionCache\`: the plain cache, bf16-first affine or per-layer affine with the composition's read
    *  kernels, or bf16-first TurboQuant with the dense read). */`}

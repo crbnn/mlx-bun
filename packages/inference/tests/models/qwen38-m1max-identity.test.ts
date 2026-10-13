@@ -4,7 +4,7 @@
 // layers) and its 3-bit block-interleaved and row-major downs, scaled down in width. The composition facts it
 // declares (no LoRA targets unless the composition mounts adapters, no committed spans, no Neural Engine operation
 // without the bridge or with adapters, its measured verify costs, the residual basis its fold record names, the caches of each KV scheme:
-// the KV4 lego for affine 4-bit group 64, the generic graph's for every other). Where the graph
+// the KV4 lego for affine 4-bit group 64, the generic graph's for every other, bf16 windows on the folded read). Where the graph
 // runs the generic blocks (a whole prompt chunk, prompt tails and verify windows wider than eight rows, every
 // operation under the adapters composition) it is held to the generic Qwen 3.5 graph of its family over the same
 // weights under bf16, affine 4- and 8-bit and TurboQuant KV (affine 4-bit over the KV4 lego in both, whose window
@@ -35,7 +35,9 @@ import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
 import { Affine4RowsLinear, AffineSplitMmaLinear } from "../../src/layers/affine-verify-linear";
 import { QuantizedLinear } from "../../src/layers/quantized-linear";
 import { unfusedAffineKernels } from "../../src/state/affine-attention";
+import { foldedWindowRead, sdpaRead } from "../../src/state/attention-read";
 import { Bf16FirstKv4Head256Cache } from "../../src/state/bf16-first-kv";
+import { KVCache } from "../../src/state/kv";
 import { QWEN38_COMPOSITIONS } from "../../scripts/gen-qwen38";
 
 const HIDDEN = 512, INTER = 256, VOCAB = 256, HEADS = 4, KV_HEADS = 2, HEAD_DIM = 256;
@@ -270,6 +272,11 @@ describe("the composition the generated graph declares", () => {
         for (const [layer, cache] of a.entries())
           if (scheme !== "kv4" || LAYERS[layer]!.kind !== "attention") expect(cache.constructor).toBe(b[layer]!.constructor);
           else kv4Lego(cache, unfusedAffineKernels);
+        // bf16: the plain cache, its windows through the folded read (bit for bit the generic graph's stock read).
+        if (scheme === "bf16") for (const [layer, cache] of a.entries()) if (LAYERS[layer]!.kind === "attention") {
+          expect((cache as KVCache).windowRead).toBe(foldedWindowRead);
+          expect((b[layer] as KVCache).windowRead).toBe(sdpaRead);
+        }
       } finally { disposeAll(a, b); }
     }
     // The KV4 lego under the tiled-causal read kernels too, its several-row reads that set.
