@@ -13,7 +13,176 @@ Decisions that govern all work:
   performance regressions. Knowledge benchmark scores characterize the candidate
   quant for its Hugging Face model card; that publication work has its own criteria.
 - Legos compose at load. A graph never contains a fallback to another graph, the cache owns its read, and the
-  scheduler calls named phases. The composition refactor below is the current structural work.
+  scheduler calls named phases. The graph files program below is the current structural work; the composition
+  refactor after it is closed except for its listed items.
+
+## Graph files
+
+A graph is a file, written before the version is published. Someone imports the layers (which import
+their kernels), arranges them into the model's layers, and exports that arrangement. Every served
+composition has its file; the loader selects the file for the composition and attaches the weights
+to the layers the file names; the scheduler routes the work: the phase, the row count, a prompt piece
+to the Neural Engine operation whose range the file lists, an adapter request to the file's
+adapter-capable operations. Nothing is checked at load or at run time. The checks happened before
+publishing: profiling decided which kernel each layer runs at each width on each machine, and the
+bit gates recorded what the file produces. Users who write their own graph import the same layers
+and arrange whatever they want; nothing registers them and nothing generates for them.
+
+This is loop unrolling and branch removal applied to the graph. The file states what runs, so
+reading it is the proof of what runs; nothing can be constructed in a state nobody gated; the
+numerics are a property of the text, and a diff of two files is a diff of kernels; a change to one
+machine's file cannot touch another's; the per-layer call sites are monomorphic; and a proof of the
+file composes from the proofs of the pieces it imports, so changing one kernel for one machine
+re-proves that kernel and nothing above it.
+
+What the tree has instead today (the inventory of 2026-10-13, every line listed in the PR that
+opens this program): the five per-composition graphs are emitted by two scripts under
+`packages/inference/scripts/` from descriptions under `tests/fixtures/`, and each emitted file is a
+class whose constructor takes the composition record and finishes the deciding at load. The M4 Pro
+file alone has 14 `if`s, 23 ternaries, 8 maps that build a different class per layer and 9 reads
+of the composition (adapters in seven places, the Neural Engine bridge in two, the KV kernel
+choice), all over facts that were known when the file was written. The M1 Max file has 8 and 12,
+the three Gemma 4 files 4 to 7 each, plus their composition reads (`compiledGeglu`,
+`packedMixedMlp`, `kv`). The five width names and the function that maps a row count to a name live
+in the shared contract, so a measured boundary of one composition is every graph's vocabulary. The
+layers one level down decide again by row count at call time (the Trellis linear's prefill kernel
+by `M`, the Trellis MLP's fused gate/up by width, the quantized linear's row path and adapter path,
+the GEGLU's compiled form, the MoE sort threshold).
+
+### Rules
+
+Binding for every graph file in the tree, held by the architecture gate where mechanical:
+
+- A graph file takes no composition record and reads no composition field. Its load takes the
+  weights and the artifact config, attaches the weights to the layers it names, and exports its
+  phase tables and declared facts. The composition is the loader's key, nothing else's.
+- A graph file contains no `if`, `switch`, ternary, `??` that picks a class, loop over layers, or
+  map that builds a different class per layer, in its load or in its phases. Every layer is written
+  out in order, and every (phase, row count) binding names its layer classes literally. A log line is
+  not exempt.
+- Nothing writes graph files. The file is the only place its bindings live; what holds it is the
+  bit gate run before publishing (its recorded digests on its artifact), not a script it must match.
+- Routing is the scheduler's: the phase, the row count, the prompt piece's position range, the
+  adapter context, the rows-per-forward cap. The file declares facts the scheduler reads once when it
+  binds the graph (the Neural Engine ranges, the verify round costs, the known-span chunk sizes, the
+  adapter-capable operations) and never looks at a request.
+- Platform facts are not conditions. Every Apple Silicon chip has a Neural Engine; a file for an
+  M4 Pro exports its Neural Engine operations the way it exports any layer, the install step compiles
+  the programs that file lists, and a program missing at load is an install that did not finish,
+  which fails loudly. The composition's bridge field goes.
+- A phase table is keyed by the row count itself: decode, verify, logits and known appends by
+  exact rows from one up to the composition's cap, several rows naming the same operation where the
+  kernels are the same; prompt pieces by contiguous position ranges (the Neural Engine entries are
+  already this). The scheduler describes the work as N rows and indexes, choosing nothing. The five
+  width names and `widthClass` leave the contract. New kernels change lines in a file, never what the
+  scheduler understands.
+- A layer binds exactly one kernel and decides nothing at call time either. Where a layer today
+  picks a kernel by row count, width, compiled form or adapter state, it becomes one class per
+  kernel and the file names the class per binding.
+- Bit identity with main (3ea6ba5e) on every served composition where main served it: the digests,
+  the parity suites, the captured texts. Performance is unchanged (paired, preflight-gated) and is
+  not the subject of this program.
+
+### Items
+
+One PR per item, targeting `refactor/graph-files` and merged there as its gate passes; one PR from
+`refactor/graph-files` to `main` when the program closes green. Per-item gates are model-free
+(typecheck, the architecture gate, unit and identity tests on synthetic weights); the real-weight
+matrix runs once at the end. Agents do the work; Josh reviews the plan, I review and merge the PRs.
+
+- [ ] **G1. The contract and the scheduler.** `MlxTokenPhases` becomes row-keyed: `decode`,
+      `verify`, `logits`, `appendKnown` as tables from exact row count to operation, up to the
+      composition's cap; `prompt` as an ordered list of `{ from, to, operation }` position ranges for
+      one-sequence pieces (replacing `prefillChunk.gpu`, `prefillChunk.ane` and `prefillTail`), plus
+      the multi-sequence chunk operation. A graph exports two operation sets of that shape: its plain
+      one and, when it serves adapters, its adapter-capable one (`adapters?: MlxTokenPhases`);
+      `GraphCapabilities.adapters` is derived from the second set's presence, never from the
+      composition. `phase-dispatch.ts` indexes by rows and by range and is built per execution
+      context (the batch group selects the adapter set when it enters an adapter context; the direct
+      path when the request carries adapters); adapter rows never take a Neural Engine operation
+      because the adapter set lists none. `widthClass`, `MlxWidthClass`, `byWidth`, `atEveryWidth` go.
+      The install step compiles the programs the selected file lists (`anePrograms()` takes no
+      composition). The cache composer moves to the loader: a file declares each layer's cache kind
+      (attention full or sliding, recurrent) as data, and the loader composes the lego from the
+      composition's KV scheme over that declaration (`makeCache` leaves the graphs). The
+      composition record drops `aneBridge`. Exit: typecheck, the dispatch unit tests, the
+      conformance suites unchanged, the generic graphs ported to the row-keyed tables (their
+      loops stay until G7 decides their fate).
+- [ ] **G2. The M4 Pro file.** `models/qwen/qwen38-27b-trellis-m4pro.ts` rewritten as a file: the
+      64 layers listed in order with their attention or DeltaNet block and, per binding, the literal
+      MLP and projection classes (rows 1 through 8, every row written; the prompt ranges 1..639 on the
+      GPU prompt layers, 640..1024, 1025..1536, 1537..2048 on the Neural Engine layers, the
+      multi-sequence chunk); the adapter-capable set with the quantized-linear projections at every
+      row; the head per row; the declared facts (verify round costs, known-span chunk sizes, layer
+      cache kinds). No composition parameter, no branch, no loop. Exit: digests identical to main on
+      the artifact (bf16, kv4, config; default and 128-token chunks; one and four rows; the long
+      prompt), the identity test against the generic graph at maxDiff 0, the five captured texts
+      identical, and the real-weight parity suite at its recorded numbers.
+- [ ] **G3. The M1 Max file.** `models/qwen/qwen38-27b-trellis-m1max.ts` in the same form with its
+      Reduce and Scatter layers and no Neural Engine entries. Exit: the identity test; its digests
+      on the M1 Max when that machine is clean.
+- [ ] **G4. The Gemma 4 files.** `models/gemma4/generated/gemma4-{e4b,12b,26b}.ts` rewritten as files
+      under `models/gemma4/` (the directory name goes with the scripts): every layer with its sliding
+      or full attention, its KV donor where the model shares KV, its per-layer input, its GEGLU form
+      named (the composition's compiled GEGLU and packed mixed MLP become the file's lines; see D3),
+      the MoE block for the 26B; row-keyed tables with one operation at every row where the kernels
+      are one. Exit: the identity tests, digests identical to main (e4b, 12B, 26B), the parity suite.
+- [ ] **G5. Layers decide nothing.** One class per kernel for every layer that chooses at call time:
+      the Trellis linear's prefill forward (reduce, scatter, wide, tiled, split-K by `M` and device)
+      becomes one prompt layer per kernel, which the files name per position range; the Trellis MLP's
+      fused and unfused gate/up become two classes; the quantized linear's row path and adapter path
+      become their own classes (plain, rows, adapter); the GEGLU's compiled and plain forms two
+      classes; the MoE sort threshold one class per file; the Qwen attention blocks' media-position
+      form a named variant the media phases bind. Exit: per-layer bit identity against the old layer
+      over the composition's shapes on synthetic weights, then G2 to G4's digests unchanged.
+- [ ] **G6. The loader.** `GraphTable` keys on everything a file used to read: fingerprint, device,
+      KV scheme, rows cap, draft depth (a file declaring verify costs serves adaptive depth), prompt
+      chunk size (the file's ranges). The generic Qwen 3.5 graph's device condition for known spans
+      goes: the M4 Pro file declares its known spans, the generic graph declares none. The
+      Colibri bypass and the encoder-decoder refusal in `factory.ts` become table facts or typed
+      errors at the table. Exit: `graph-table` tests; every served composition on both machines
+      selects the file this plan names.
+- [ ] **G7. The generic graphs.** Decision D1 below. If they stay as the entry for artifacts without
+      a file, they keep their loops over an unknown layer count and are documented as the library's
+      "any artifact of this family" path, never a published composition; their branches on
+      composition fields still go (G1 moved the cache composer; `packedMixedMlp`, `compiledGeglu`,
+      `compiledSwiglu`, `device` become their fixed lines or their own files).
+- [ ] **G8. Delete and gate.** `scripts/gen-qwen38.ts`, `scripts/gen-gemma4.ts`, `tests/fixtures/
+      qwen38-graphs`, `tests/fixtures/gemma4-graphs`, the two tests that compare files to script
+      output, the "GENERATED, do not edit" headers. The architecture gate gains two mechanical
+      rules over every module a graph table lists: no `Composition` type or parameter in the file,
+      and no `if`, `switch`, conditional expression, `for`, `while`, `.map`, `.forEach` or `.filter`
+      in it; the paved-road message says "write the file". Ratchet empty.
+- [ ] **G9. Documents.** ARCHITECTURE.md: the construction section says load attaches weights to a
+      written file and decides nothing; the one-way list says "add a model by writing its graph
+      file: import the layers, arrange them, export the arrangement; one file per served
+      composition"; the paragraph that describes the scripts goes; the ownership table row for
+      `models/` says files. `packages/inference/README.md` likewise. This section closes and the
+      composition refactor's paragraph is corrected ("built at load" becomes "selected at load").
+- [ ] **G10. The full gate and the merge.** Once, against main 3ea6ba5e: the app-path digest
+      matrix on every artifact in the served set, the parity suites, the captured texts on the M4
+      Pro, the identity tests on both machines, the paired serve check on the M4 Pro and on the M1
+      Max when clean. Then `refactor/graph-files` merges to `main` once.
+
+### Decisions for Josh
+
+- D1. The generic graphs. A family's generic graph serves any artifact of the family, so it cannot
+  be unrolled: its layer count is the artifact's. Keep it as the library's entry for artifacts
+  nobody wrote a file for (recommended: the drop-in promise needs a path for any model; it is not a
+  published composition, and every artifact the version publishes gets its file), or drop it and
+  serve only written files.
+- D2. Adapters as a second operation set in the same file (recommended: the plain set is unchanged,
+  the file is still one file, the scheduler picks the set by context) versus a separate adapters
+  file per composition the loader selects.
+- D3. The remaining kernel-choice fields of the composition (`compiledGeglu`, `compiledSwiglu`,
+  `packedMixedMlp`, `compiledDecode`, `mixedGateUp`): each becomes the file's line at the value
+  profiling chose (recommended; the alternative layers stay importable for anyone's own file), or
+  each value stays a flag and every served value is its own file.
+- D4. The row-keyed table's cap: the file binds rows one through the composition's rows-per-forward
+  cap and the scheduler never submits more; wider verify windows (sequences times positions above
+  the cap) bind to the file's wide operation as a last range entry.
+
+
 
 ## Composition refactor
 
@@ -256,19 +425,6 @@ on main and the refactor is only useful when investigating a behavior difference
 One line per idea: the question and the domains it touches. Picking one up makes it an item
 above with an exit; an answered one moves its finding to the owning documentation and is deleted.
 
-- **Width tables as a LUT keyed by exact row count** (graphs, scheduler; Josh, 2026-10-11). Row
-  count is a property of the work; the class boundaries (`one`, `twoToThree`, `four`,
-  `fiveToEight`, `wider`) are properties of one composition: that model, those kernels, that
-  hardware, measured once (D1, including the separate four-row path that preserved the bits).
-  Exposing them in the shared contract makes every implementation adopt vocabulary derived from
-  that experiment: local optimization results promoted into shared API structure. The durable
-  contract is "perform this named phase for work of this width"; the composition supplies the
-  prepared mapping, binding each width to the operation its kernels were measured best at, with
-  several widths aliasing one bound operation. The scheduler describes the work as N rows wide
-  and indexes, choosing nothing; new kernels change the bindings a generator emits, never what
-  the scheduler understands. The general rule behind it: a measured boundary belongs to the
-  composition, never to a contract. Pick up when a measurement first needs a boundary the named
-  classes cannot express, or when the generated graphs are the only width tables left.
 - **Formal proofs composed along the contracts** (kernels, layers, graphs, cache, scheduler; Josh,
   2026-10-11): because every piece implements a contract defined between layers and nothing crosses
   one any other way, correctness can be proven per lego (a kernel against its reference op over the
