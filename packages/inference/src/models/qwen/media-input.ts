@@ -8,7 +8,7 @@ import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { Cache } from "../../contracts/mlx/cache";
 import type { MediaEncoders, MlxDecodeState, MlxPromptInput, VisionEncoder } from "../../contracts/mlx/media";
 import type { MlxHeadForward, MlxWidthClass, MlxWidthTable } from "../../contracts/mlx/graph";
-import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
+import type { DraftProjectionKernel, ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import * as ops from "@mlx-bun/mlx/ops";
@@ -92,10 +92,14 @@ export function qwenResidualBasis(graph: string, modelDir: string): ResidualBasi
 }
 
 /** Ports draft sources read from this graph: its embedding, head, layer taps,
- * the MTP geometry a checkpoint-native draft head needs and, from a graph whose
- * residual stream carries a rotation fold, that basis (the same object on every view). */
-export function qwenDraftTarget(model: QwenMediaGraph, residualBasis?: ResidualBasis): TargetView {
-  return Object.freeze({ identity: model, ...(residualBasis ? { residualBasis } : {}), hiddenLayerTaps: Object.freeze({
+ * the MTP geometry a checkpoint-native draft head needs, from a graph whose
+ * residual stream carries a rotation fold that basis, and from a graph whose
+ * composition measured them the kernels of a drafter's own projections (each the
+ * same object on every view). */
+export function qwenDraftTarget(model: QwenMediaGraph, residualBasis?: ResidualBasis,
+  draftProjections?: MlxWidthTable<DraftProjectionKernel>): TargetView {
+  return Object.freeze({ identity: model, ...(residualBasis ? { residualBasis } : {}), ...(draftProjections ? { draftProjections } : {}),
+    hiddenLayerTaps: Object.freeze({
     layerCount: model.config.text.numHiddenLayers,
     projection: Object.freeze({ embed: model.embed, logits: model.logits }),
   }), recurrentMtp: Object.freeze({

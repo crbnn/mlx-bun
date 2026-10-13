@@ -188,6 +188,10 @@ interface DeviceKernels {
    *  Neural Engine operations' projections it does not split), when the composition mounts no adapters: a layer of
    *  `PROMPT_PROJECTION_MODULES`; `null` keeps the generic blocks' QuantizedLinear. */
   readonly promptProjection: string | null;
+  /** The layer a bound drafter's own 4-bit projections run at each width class of their rows (`null` at a class:
+   *  QuantizedLinear, as at \`wider\`), declared on the graph's draft target (\`TargetView.draftProjections\`); \`null\`:
+   *  the graph declares none and the drafter keeps its own rule. */
+  readonly drafter: Readonly<Record<Narrow, string | null>> | null;
 }
 
 /** The module under src/layers each prompt projection layer lives in. */
@@ -233,6 +237,7 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
       rowMajorMlp: "AneTrellisMlpSplit", k3InterleavedMlp: "AneTrellisMlpSplitK3i", affine: "AneAffineSplit",
       projections: ["in_proj_z", "out_proj", "o_proj"] },
     promptProjection: null,
+    drafter: null,
   },
   // The M1 Max GPU's kernels and evaluation, measured there per class (forward + head, one sequence, bf16 KV, each
   // layer's per-call shader time and the whole forward): the threadgroup-codebook gate/up and down kernels at one row,
@@ -255,10 +260,10 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     projections: {
       one: null,
       twoToThree: { 3: "Affine3RowsLinear", 4: "Affine4RowsLinear" },
-      four: { 3: "Affine3MmaLinear", 4: "Affine4MmaLinear" },
-      fiveToEight: { 3: "Affine3MmaLinear", 4: "Affine4MmaLinear" },
+      four: { 3: "AffineSplitMmaLinear", 4: "AffineSplitMmaLinear" },
+      fiveToEight: { 3: "AffineSplitMmaLinear", 4: "AffineSplitMmaLinear" },
     },
-    head: { twoToThree: "Affine4RowsLinear", four: "Affine4MmaLinear", fiveToEight: "Affine4MmaLinear" },
+    head: { twoToThree: "Affine4RowsLinear", four: "AffineSplitMmaLinear", fiveToEight: "AffineSplitMmaLinear" },
     asyncEvery: 4,
     widerVerify: "lazy",
     knownSpans: false,
@@ -273,6 +278,11 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
       rowMajorMlp: "AneTrellisMlpSplit", k3InterleavedMlp: "AneTrellisMlpSplitK3i", affine: null, projections: [] },
     // MLX's quantized matmul bit for bit from 640 rows, 1.27x to 1.38x faster (DequantizedLinear).
     promptProjection: "DequantizedLinear",
+    // The DFlash 2 drafter's 4-bit projections (its five layers' attention and MLP, fc and the context k and v), each
+    // kernel per row count: MLX's quantized matmul at one row, the affine row kernel at two to three (MLP 4.48 ->
+    // 3.57 ms at two rows), the split-K matrix-unit kernel at four to eight (MLP 8.49 -> 4.46 ms at four rows,
+    // 16.2 -> 4.45 at eight on the matrix unit before it).
+    drafter: { one: null, twoToThree: "Affine4RowsLinear", four: "AffineSplitMmaLinear", fiveToEight: "AffineSplitMmaLinear" },
   },
 });
 
@@ -417,7 +427,10 @@ export function emitQwen38Graph(description: Qwen38Description, stem: string,
   for (const name of mlpLayerNames) if (!LAYER_MODULES[name]) throw new Error(`${stem}: no module for layer ${name}`);
   const mlpImports = [...new Set(mlpLayerNames.map(name => LAYER_MODULES[name]!))].sort().map(module =>
     `import { ${mlpLayerNames.filter(name => LAYER_MODULES[name] === module).sort().join(", ")} } from "../../layers/${module}";`);
-  const affineLayers = [...new Set([...Object.values(k.projections).flatMap(p => p ? [p[3], p[4]] : []), ...(head ? Object.values(head).filter((layer): layer is string => layer !== null) : [])])];
+  const drafter = k.drafter;
+  const affineLayers = [...new Set([...Object.values(k.projections).flatMap(p => p ? [p[3], p[4]] : []),
+    ...(head ? Object.values(head).filter((layer): layer is string => layer !== null) : []),
+    ...(drafter ? Object.values(drafter).filter((layer): layer is string => layer !== null) : [])])];
   /** The attention and DeltaNet projections are QuantizedLinear in every class and nothing else is built (no prompt
    *  blocks, no Neural Engine operation): mounted adapters apply everywhere, so no class changes with them. */
   const adapterSafe = NARROW.every(cls => k.projections[cls] === null) && head === null && ane === null && promptProjection === null;
@@ -458,7 +471,8 @@ export function emitQwen38Graph(description: Qwen38Description, stem: string,
     ].map(line => indent + line).join("\n");
   };
   const blockSets = projectionSets.map(([name, p]) =>
-    `      const ${name} = LAYERS.map((_, i) => blockOf(i, (linear, _path, width) => width === 3 ? new ${p[3]}(linear) : new ${p[4]}(linear)));`).join("\n");
+    `      const ${name} = LAYERS.map((_, i) => blockOf(i, ${p[3] === p[4] ? `linear => new ${p[3]}(linear)`
+      : `(linear, _path, width) => width === 3 ? new ${p[3]}(linear) : new ${p[4]}(linear)`}));`).join("\n");
   const narrowBlock = adapterSafe ? `    // Every class's attention and DeltaNet projections are the generic blocks' QuantizedLinear, which apply
     // mounted adapters: no class changes with them.
 ${NARROW.map(cls => narrowSet(cls, "    ")).join("\n")}` : `    if (composition.adapters) {
@@ -484,7 +498,7 @@ ${NARROW.map(cls => narrowSet(cls, "      ")).join("\n")}
   const classRows = NARROW.map(cls => {
     const m = k.mlp[cls], p = k.projections[cls];
     return row(cls === "one" ? "decode.one, verify.one" : `decode/verify.${cls}`, m ? `${m.sameGateUp} + ${m.rowMajorDown}/K3i`
-      : "the generic blocks (TrellisMlp)", p ? `${p[3]}/${p[4]}` : "QuantizedLinear");
+      : "the generic blocks (TrellisMlp)", p ? (p[3] === p[4] ? p[3] : `${p[3]}/${p[4]}`) : "QuantizedLinear");
   }).join("\n");
   /** Each run of consecutive classes whose mixed-width layer takes the composition's tail or is not their same-width
    *  one (the table row names that), with its layer and rows. */
@@ -517,6 +531,8 @@ ${NARROW.map(cls => narrowSet(cls, "      ")).join("\n")}
     head ? `The head is part of each phase: ${NARROW.filter(cls => cls !== "one").map(cls =>
       `logits.${cls} ${head[cls as Exclude<Narrow, "one">] ?? "QuantizedLinear"}`).join(", ")}, QuantizedLinear otherwise.`
       : "The head is QuantizedLinear at every width.",
+    ...(drafter ? [`A bound drafter's own 4-bit projections take ${NARROW.filter(cls => drafter[cls] !== null).map(cls =>
+      `${drafter[cls]} at ${cls}`).join(", ")}, QuantizedLinear otherwise (TargetView.draftProjections).`] : []),
     asyncEvery !== null ? `Decode, verify, prompt tails and embeddings up to ${widest} rows submit the graph every ${asyncEvery} layers; wider decode${
       k.widerVerify === "lazy" ? " and verify windows" : ""}${k.knownSpans ? "" : " and known-token appends"} are one lazy graph;`
       : `Decode${k.widerVerify === "lazy" ? ", verify" : ` and verify up to ${widest} rows`}${k.knownSpans ? "" : " and known-token appends"
@@ -605,7 +621,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
 import type { Cache, GatedDeltaCache } from "../../contracts/mlx/cache";
-import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
+import type { ${drafter ? "DraftProjectionKernel, " : ""}ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
 import type {
 ${k.knownSpans ? `  MlxDeclaredGraph, MlxHeadForward, MlxKnownSpans, MlxLayerCapture, MlxMixedForward, MlxPhaseForward,
   MlxPrefillChunk, MlxTokenPhases, MlxWidthClass, MlxWidthTable,` : `  MlxDeclaredGraph, MlxHeadForward, MlxLayerCapture, MlxMixedForward, MlxPhaseForward, MlxPrefillChunk,
@@ -808,7 +824,9 @@ ${k.mixed === "packed" ? `  /** The generic layers, which a mixed forward drives
   readonly #mrope: { readonly invFreq: MlxArray; readonly rotaryDims: number };
   /** The artifact's R1 basis, from its fold record (read once, here). */
   readonly #residualBasis: ResidualBasis | undefined;
-  /** What this graph created and frees in \`dispose\`: its constants${ane ? " and the Neural Engine layers' programs" : ""}. */
+${drafter ? `  /** The kernels a bound drafter's own 4-bit projections run, per width class of their rows. */
+  readonly #draftProjections: MlxWidthTable<DraftProjectionKernel>;
+` : ""}  /** What this graph created and frees in \`dispose\`: its constants${ane ? " and the Neural Engine layers' programs" : ""}. */
   readonly #owned: { dispose(): void }[] = [];
   /** The attention cache of layer \`layer\` the composition's KV scheme names, over one \`makeCache\` call's masks. */
   readonly #attentionCache: (masks: AttentionMasks, layer: number) => Cache;
@@ -822,7 +840,16 @@ ${k.mixed === "packed" ? `  /** The generic layers, which a mixed forward drives
     this.config = config;
     this.composition = composition;
     this.#residualBasis = qwenResidualBasis(this.graph, config.modelDir);
-    this.weightsBytes = [...weights.shards.files.values()].reduce((a, f) => a + f.mmap.size, 0);
+${drafter ? `    // A bound drafter's own 4-bit, group-64 projections, over the weights it quantized (borrowed).
+    const draftAffine = (w: MlxArray, scales: MlxArray, biases: MlxArray) =>
+      new QuantizedLinear(w, scales, biases, { bits: 4, groupSize: 64, mode: "affine" });
+    this.#draftProjections = Object.freeze<MlxWidthTable<DraftProjectionKernel>>({
+${[...NARROW, "wider" as const].map(cls => {
+  const layer = cls === "wider" ? null : drafter[cls];
+  return `      ${cls}: (w, scales, biases) => { const kernel = ${layer ? `new ${layer}(draftAffine(w, scales, biases))` : "draftAffine(w, scales, biases)"}; return x => kernel.forward(x); },`;
+}).join("\n")}
+    });
+` : ""}    this.weightsBytes = [...weights.shards.files.values()].reduce((a, f) => a + f.mmap.size, 0);
     this.faIdx = t.fullAttentionInterval - 1;
     this.embed = QuantizedEmbedding.load(weights, \`\${PREFIX}.embed_tokens\`, config);
     const generic = LAYERS.map((_, i) => new Qwen3Layer(weights, config, i));
@@ -994,9 +1021,9 @@ ${kvLego ? `  /** One cache per layer, the attention caches sharing one mask mem
 
   bindMediaInput(input: Vision): MlxPromptInput { return bindQwenMediaInput(this, input.embeddings, input.mrope!); }
   mediaEncoders(modelDir: string): Promise<MediaEncoders> { return qwenMediaEncoders(this, modelDir); }
-  /** The drafter's ports: its hidden-layer taps (verify's capture), embedding and head, and the residual basis
-   *  (R1 seed, final-norm gain) the artifact's fold record declares. */
-  draftTarget(_caches: Cache[]): TargetView { return qwenDraftTarget(this, this.#residualBasis); }
+  /** The drafter's ports: its hidden-layer taps (verify's capture), embedding and head, ${drafter ? "the" : "and the"} residual basis
+   *  (R1 seed, final-norm gain) the artifact's fold record declares${drafter ? ", and the kernels of its own projections" : ""}. */
+  draftTarget(_caches: Cache[]): TargetView { return qwenDraftTarget(this, this.#residualBasis${drafter ? ", this.#draftProjections" : ""}); }
 
   // ── The layer loops. Each consumes h0 and returns the post-final-norm hidden,
   // owned by the caller; \`capture\` sees every layer's output, then the final hidden.

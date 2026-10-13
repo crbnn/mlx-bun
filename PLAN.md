@@ -50,8 +50,10 @@ round costs 1.92 plain decode steps (1.30 on the M4 Pro) and eight rows 3.65 (1.
 factored and matrix-unit kernels since 2026-10-13; verify windows above eight rows still take the
 generic blocks (about 0.9 s at 12 to 16 rows); DFlash 2 at depth 5 beats plain decode by about 12%
 on that chip (18.8 against 16.8 tok/s); the adaptive gate never drafts fewer than one token; its
-per-row verify costs ignore how many requests are batched; the M1 Max composition has no Neural
-Engine bridge and prefills at 121 tok/s against 200 on the M4 Pro; the paired check's band is
+per-row verify costs ignore how many requests are batched; the M1 Max composition prefills 1k and
+8k-token prompts at about 175 tok/s (2026-10-13, alternated sessions of the graph's own prefill
+operations, against 129 to 130 before its dense-GEMM prompt projections and Neural Engine MLP split;
+mean KL of the split 1.3e-3 to 2.0e-3) against 200 on the M4 Pro; the paired check's band is
 narrower than session drift for sub-percent decode differences (the clean M1 Max run is the null);
 the TurboQuant fused decode kernel covers head dimensions 64, 128, 256 and 512 and 96 decodes on
 the plain path.

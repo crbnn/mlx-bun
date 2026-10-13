@@ -29,9 +29,10 @@ import { QWEN38_TRELLIS_M1MAX_GRAPH } from "../../src/models/qwen/qwen38-27b-tre
 import { qwenDraftTarget, qwenResidualBasis } from "../../src/models/qwen/media-input";
 import { Affine4MmaLinear } from "../../src/layers/affine-verify-linear";
 import type { DraftProjection } from "../../src/contracts/mlx/draft-projection";
-import { atEveryWidth } from "../../src/models/graph";
-import { widthClass } from "../../src/contracts/mlx/graph";
-import type { ResidualBasis, TargetView } from "../../src/contracts/mlx/draft-target";
+import { atEveryWidth, byWidth } from "../../src/models/graph";
+import { widthClass, type MlxWidthClass } from "../../src/contracts/mlx/graph";
+import type { DraftProjectionKernel, ResidualBasis, TargetView } from "../../src/contracts/mlx/draft-target";
+import { QuantizedLinear } from "../../src/layers/quantized-linear";
 import type { DraftPrefillGroup, GroupedDraftProvider } from "../../src/generation/speculative/source";
 import { Dflash2Provider } from "../../src/generation/speculative/sources/dflash2-source";
 import { Dflash2Drafter } from "../../src/models/speculative/dflash2";
@@ -203,22 +204,60 @@ for (const [bits, folded] of [[4, true], [4, false], [0, true], [0, false]] as c
   });
 }
 
-test("a drafter keeps the basis it was first bound to and refuses another", async () => {
+test("a drafter keeps the basis and kernels it was first bound to and refuses others", async () => {
   const drafter = await Dflash2Drafter.load(dir, { bits: 4 });
   try {
-    drafter.bindResidualBasis(basis);
-    drafter.bindResidualBasis(basis);
-    expect(() => drafter.bindResidualBasis(null))
+    drafter.bindTarget(basis, null);
+    drafter.bindTarget(basis, null);
+    expect(() => drafter.bindTarget(null, null))
       .toThrow("this DFlash 2 drafter is bound to a target with a different residual basis");
-    expect(() => drafter.bindResidualBasis({ r1Seed: SEED, finalGain: basis.finalGain }))
+    expect(() => drafter.bindTarget({ r1Seed: SEED, finalGain: basis.finalGain }, null))
       .toThrow("this DFlash 2 drafter is bound to a target with a different residual basis");
+    expect(() => drafter.bindTarget(basis, declared().table))
+      .toThrow("this DFlash 2 drafter is bound to a target with different projection kernels");
   } finally { drafter.dispose(); }
+});
+
+/** A target's declared drafter kernels: one per width class, each MLX's quantized matmul over the drafter's weight,
+ *  counting the projections built and the forwards run per class. */
+function declared() {
+  const built = new Map<MlxWidthClass, number>(), runs = new Map<MlxWidthClass, number>();
+  const table = byWidth<DraftProjectionKernel>(width => (w, scales, biases) => {
+    built.set(width, (built.get(width) ?? 0) + 1);
+    const linear = new QuantizedLinear(w, scales, biases, { bits: 4, groupSize: 64, mode: "affine" });
+    return x => { runs.set(width, (runs.get(width) ?? 0) + 1); return linear.forward(x); };
+  });
+  return { table, built, runs };
+}
+
+test("a target that declares its composition's kernels runs every 4-bit projection on the one its class names, the drafter's own rule nowhere", async () => {
+  const kernels = declared();
+  const provider = await Dflash2Provider.load(dir, { bits: 4 });
+  const mma = spyOn(Affine4MmaLinear.prototype, "forward");
+  try {
+    const target = Object.freeze({ ...targetOf(basis), draftProjections: kernels.table });
+    // Built once per projection and class when the first group binds: fc and seven per layer.
+    using taps = bf16([1, CONTEXT, TAPS.length * H], 1);
+    using commit = bf16([1, 6, TAPS.length * H], 1);
+    const runs = drafts(provider.grouped, target, taps, commit, [5], [5], DEPTHS);
+    for (const [i, depth] of DEPTHS.entries()) expect(runs[i]!.tokens[0]!.length).toBe(depth);
+    for (const width of ["one", "twoToThree", "four", "fiveToEight", "wider"] as const) expect(kernels.built.get(width)).toBe(1 + 7 * LAYERS);
+    // Prefill (12 rows) and the commit (6) project the context; blocks of 2, 4 and 8 rows draft.
+    expect(kernels.runs.get("wider")).toBe(1 + 2 * LAYERS);
+    expect(kernels.runs.get("fiveToEight")).toBe(1 + 2 * LAYERS + 7 * LAYERS);
+    expect(kernels.runs.get("twoToThree")).toBe(7 * LAYERS);
+    expect(kernels.runs.get("four")).toBe(7 * LAYERS);
+    expect(mma.mock.calls.length).toBe(0);
+  } finally {
+    mma.mockRestore();
+    provider.dispose();
+  }
 });
 
 test("context projection runs the matrix unit at five to eight rows and MLX's quantized matmul at every other width; BF16 never runs it", async () => {
   for (const bits of [4, 0]) {
     const drafter = await Dflash2Drafter.load(dir, { bits });
-    drafter.bindResidualBasis(null);
+    drafter.bindTarget(null, null);
     const mma = spyOn(Affine4MmaLinear.prototype, "forward");
     try {
       // B × L context rows in every class: 1, 2, 4, 6 (one row of six and two of three), 8, 9 and 12.
