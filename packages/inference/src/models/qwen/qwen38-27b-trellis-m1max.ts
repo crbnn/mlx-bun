@@ -9,7 +9,7 @@
 //   draft depth  adaptive up to 7
 //   prefill      2048-token chunks
 //   rows         any number per forward
-//   Neural Engine bridge absent
+//   Neural Engine bridge present
 //
 // An entire graph: built once at construction from the composition record it is
 // handed, it inherits from no class and never calls another graph. Every phase and
@@ -25,6 +25,7 @@
 //   decode/verify.fiveToEight      MmaGateUp + MmaDown/K3i                     AffineSplitMmaLinear
 //   decode/verify.wider            the generic blocks (TrellisMlp)             QuantizedLinear
 //   prefillChunk.gpu/Tail.wider    the generic blocks (TrellisMlp)             DequantizedLinear
+//   prefillChunk.ane, 640..2048    AneTrellisMlpSplit/K3i                      DequantizedLinear
 //
 // Mixed-width gate/up takes CodebookGateUpRow at one row, split tail (MLX's compiled SwiGLU bit for bit), and
 // FactoredMixedGateUp at two to three rows. Every attention block reads through the cache the composition's KV scheme
@@ -38,7 +39,10 @@
 // and embeddings above eight rows, evaluate each layer and its recurrent state.
 //
 // Request shapes this graph serves:
-//   - prompt chunks of exactly the composition's chunk size (prefillChunk.gpu) and prompt tails (prefillTail);
+//   - prompt chunks of exactly the composition's chunk size (prefillChunk.gpu) and prompt tails (prefillTail),
+//     and, when the composition has the Neural Engine bridge and mounts no adapters, one sequence's chunk or tail
+//     of 640 to 2048 positions on the Neural Engine operation whose programs hold it (prefillChunk.ane:
+//     640..1024, 1025..1536, 1537..2048, programs of 1024, 1536, 2048 positions);
 //   - decode, one position per sequence, and speculative verify windows of sequences x (depth + 1) positions
 //     with the drafter's layer capture, for any number of sequences
 //     (decode[width], verify[width], logits[width]);
@@ -50,7 +54,7 @@
 //     its own caches, the prompt and decode groups' MLP rows packed into one call (the composition's packedMixedMlp);
 //   - the scoring forward over a whole sequence (sequenceHidden, prefillTail's operation for its width);
 //   - mounted LoRA adapters when the composition mounts them: every operation then runs the generic blocks,
-//     whose QuantizedLinear projections apply them;
+//     whose QuantizedLinear projections apply them, and the Neural Engine operation is not built;
 //   - paged KV (the paged legos' own reads in place of the plain full-attention storage).
 // The planner refuses, from the declared capabilities and never by routing to another graph, adapter requests
 // when the composition mounts none (adapter-batch-unsupported).
@@ -70,7 +74,11 @@ import type { MropeForwardState } from "../../contracts/mlx/positions";
 import type { Composition } from "../../contracts/portable/composition";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import { mapTokenGroups } from "../../input/token-groups";
+import type { AneProgramSpec } from "../../kernels/ane/linear";
 import { Affine3RowsLinear, Affine4RowsLinear, AffineSplitMmaLinear } from "../../layers/affine-verify-linear";
+import {
+  AneTrellisMlpSplit, AneTrellisMlpSplitK3i, aneMlpSplitProgram, type AneMlpSplit,
+} from "../../layers/ane-prefill-split";
 import { DequantizedLinear } from "../../layers/dequantized-linear";
 import { disposing } from "../../layers/helpers";
 import { LoraState } from "../../layers/lora";
@@ -78,6 +86,7 @@ import { RMSNorm } from "../../layers/normalization";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import { QuantizedLinear } from "../../layers/quantized-linear";
 import { mropeInvFreq } from "../../layers/qwen-mrope";
+import { compiledSwiglu } from "../../layers/swiglu";
 import { FactoredDownK3iRows, FactoredDownRows, MmaDown, MmaDownK3i } from "../../layers/trellis-down";
 import { FactoredGateUpRows, FactoredMixedGateUp, MmaGateUp } from "../../layers/trellis-gate-up";
 import { CodebookGateUpRow } from "../../layers/trellis-reduce-gate-up";
@@ -188,6 +197,33 @@ const DELTANET_PROJECTIONS = ["in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_
 const ATTENTION_PROJECTIONS = ["q_proj", "k_proj", "v_proj", "o_proj"] as const;
 /** Submit the graph every 4 layers at decode and verify widths up to 8 (measured best on this GPU). */
 const ASYNC_EVERY = 4;
+/** The Neural Engine's channel fraction in each split. */
+const ANE_FRACTION = 0.34;
+/** The Neural Engine operations' row ranges, ascending: a one-sequence prompt piece, a chunk or a tail, whose positions
+ *  one holds runs on it, over programs built for its `rows`. From this machine's kernel table. */
+const ANE_RANGES: readonly { readonly minRows: number; readonly rows: number }[] = Object.freeze([
+  { minRows: 640, rows: 1024 }, { minRows: 1025, rows: 1536 }, { minRows: 1537, rows: 2048 },
+]);
+
+/** The widths a graph's Neural Engine programs are built at: the MLP's hidden and intermediate widths (no projection
+ *  is split). */
+export interface AneWidths {
+  readonly hidden: number;
+  readonly intermediate: number;
+}
+
+/** The artifact's widths, from its description. */
+export const ANE_WIDTHS: AneWidths = Object.freeze({ hidden: 5120, intermediate: 17408 });
+
+/** The distinct Neural Engine programs this graph loads for `composition`, at the artifact's widths unless
+ *  `widths` names others (a synthetic artifact laid out like it): none without the bridge or with adapters mounted,
+ *  otherwise the whole-MLP slice every layer shares, for each range in `ANE_RANGES` at that range's rows. The
+ *  install step compiles them into the system cache (`compileAnePrograms`, models/ane-install); the constructor
+ *  only loads them, so one missing there fails construction with `AneBridgeError`. */
+export function anePrograms(composition: Composition, widths: AneWidths = ANE_WIDTHS): AneProgramSpec[] {
+  if (!composition.aneBridge || composition.adapters) return [];
+  return ANE_RANGES.map(({ rows }) => aneMlpSplitProgram(widths.hidden, widths.intermediate, ANE_FRACTION, rows));
+}
 
 /** One layer: input norm, mixer, residual, post-attention norm, MLP, residual. Consumes nothing; returns an owned output.
  *  `width` is the class of `x`'s rows the calling operation names (the generic blocks' MLP reads it). */
@@ -266,7 +302,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
   readonly #residualBasis: ResidualBasis | undefined;
   /** The kernels a bound drafter's own 4-bit projections run, per width class of their rows. */
   readonly #draftProjections: MlxWidthTable<DraftProjectionKernel>;
-  /** What this graph created and frees in `dispose`: its constants. */
+  /** What this graph created and frees in `dispose`: its constants and the Neural Engine layers' programs. */
   readonly #owned: { dispose(): void }[] = [];
   /** The attention cache of layer `layer` the composition's KV scheme names, over one `makeCache` call's masks. */
   readonly #attentionCache: (masks: AttentionMasks, layer: number) => Cache;
@@ -372,6 +408,27 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
     // the composition mounts adapters (then the generic blocks', whose QuantizedLinear applies them).
     const promptBlocks = composition.adapters ? null : LAYERS.map((_, i) => blockOf(i, linear => new DequantizedLinear(linear)));
 
+    // The Neural Engine operations, one per range in ANE_RANGES, built largest
+    // first. Layers run one at a time and the scheduler runs one operation at a
+    // time, so each MLP split shares the previous split's program (identical
+    // within a range) or its buffers (the largest range's): one loaded program
+    // per range, the programs `anePrograms` lists, loaded from the compile
+    // cache the install step filled (nothing compiles here).
+    let ane: { readonly minRows: number; readonly rows: number; readonly steps: Step[] }[] | null = null;
+    if (composition.aneBridge && !composition.adapters) {
+      const started = performance.now();
+      let mlpShare: AneMlpSplit | undefined;
+      ane = [...ANE_RANGES].reverse().map(({ minRows, rows }) => ({ minRows, rows, steps: generic.map((layer, i) => {
+        const spec = LAYERS[i]!, { gate, up, down } = mlpOf(i);
+        const split = mlpShare = (spec.downLayout === "k3Interleaved" ? AneTrellisMlpSplitK3i : AneTrellisMlpSplit)
+          .build(gate, up, down, ANE_FRACTION, rows, mlpShare);
+        this.#owned.push(split);
+        const block = promptBlocks![i]!;
+        return layerStep(layer, mixerOf(block, spec.kind), post => split.forward(post, compiledSwiglu));
+      }) })).reverse();
+      console.error(`[ane] prefill programs ready in ${Math.round(performance.now() - started)} ms`);
+    }
+
     const targets = new Map<string, QuantizedLinear>();
     if (composition.adapters) generic.forEach((layer, i) => {
       const p = `${PREFIX}.layers.${i}`;
@@ -393,13 +450,17 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
 
     this.#narrow = Object.freeze({ one: this.#one, twoToThree: this.#twoToThree, four: this.#four, fiveToEight: this.#fiveToEight });
     const one = this.#one, twoToThree = this.#twoToThree, four = this.#four, fiveToEight = this.#fiveToEight, wide = this.#generic;
-    const embed = this.embed;
+    const embed = this.embed, split = ane;
     // Prompt pieces above eight rows: the prompt blocks, then the generic blocks' MLP.
     const prompt = promptBlocks ? generic.map((layer, i) => layerStep(layer, mixerOf(promptBlocks[i]!, LAYERS[i]!.kind),
       post => mlpOf(i).forward(post, "window", "wider"))) : wide;
     const gpu: RowsForward = (ids, state, capture) =>
       this.#bounded(prompt, embed.encode(ids), state, "window", capture, null, "wider");
-    this.prefillChunk = Object.freeze({ gpu });
+    this.prefillChunk = Object.freeze(split
+      ? { gpu, ane: Object.freeze(split.map(({ minRows, rows, steps }) => Object.freeze({ minRows, rows,
+        forward: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
+          this.#bounded(steps, embed.encode(ids), state, "window", capture, null, "wider") }))) }
+      : { gpu });
     this.prefillTail = Object.freeze({
       one: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
         this.#submitted(one, embed.encode(ids), state, "window", capture, "one"),
@@ -450,10 +511,10 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
         wider: plain,
       });
     }
-    console.error(`[graph] ${this.graph} ${COMPOSITION.fingerprint} adapters=${composition.adapters ? "on" : "off"}`);
+    console.error(`[graph] ${this.graph} ${COMPOSITION.fingerprint} ane-prefill=${ane ? "on" : "off"} adapters=${composition.adapters ? "on" : "off"}`);
   }
 
-  /** Frees what the graph created: its constants. The weights stay the loader's. Call once,
+  /** Frees what the graph created: its constants and the Neural Engine programs. The weights stay the loader's. Call once,
    *  after the last forward. */
   dispose(): void { for (const resource of this.#owned.splice(0)) resource.dispose(); }
 

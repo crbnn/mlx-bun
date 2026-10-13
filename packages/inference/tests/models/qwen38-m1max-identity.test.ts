@@ -2,8 +2,8 @@
 // composition) on small synthetic weights laid out by the generated quant table: 48 DeltaNet and 16 attention layers
 // with the artifact's 3- and 4-bit affine projections, Trellis gate/up at the artifact's widths (mixed in its ten
 // layers) and its 3-bit block-interleaved and row-major downs, scaled down in width. The composition facts it
-// declares (no LoRA targets unless the composition mounts adapters, no committed spans, no Neural Engine operation,
-// its measured verify costs, the residual basis its fold record names, the caches of each KV scheme). Where the graph
+// declares (no LoRA targets unless the composition mounts adapters, no committed spans, no Neural Engine operation
+// without the bridge or with adapters, its measured verify costs, the residual basis its fold record names, the caches of each KV scheme). Where the graph
 // runs the generic blocks (a whole prompt chunk, prompt tails and verify windows wider than eight rows, every
 // operation under the adapters composition) it is held to the generic Qwen 3.5 graph of its family over the same
 // weights under bf16, affine 4- and 8-bit and TurboQuant KV, hidden, logits and every cache tensor, at maxDiff 0. Its
@@ -12,7 +12,9 @@
 // real-artifact parity suite on the M1 Max (tests/parity/qwen-trellis-parity.test.ts) and the app digests are their
 // gates. Its prompt pieces take their projections on DequantizedLinear: MLX's quantized matmul below 640 rows (the
 // pieces here), and above it the dense GEMM, that matmul bit for bit at the artifact's projection shapes but not at
-// these scaled-down ones, which the layer's own test (dequantized-linear) holds. No model, no download.
+// these scaled-down ones, which the layer's own test (dequantized-linear) holds. The Neural Engine operation loads
+// programs compiled for the artifact's widths: the opt-in split tests (ane-split, ane-install) and real-weight runs
+// are its gates. No model, no download.
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -316,8 +318,9 @@ for (const scheme of Object.keys(SCHEMES)) {
 }
 
 test("the adapters composition: every operation runs the generic blocks", () => {
-  const { current: adapted, generic } = graphs("bf16", { adapters: true });
+  const { current: adapted, generic } = graphs("bf16", { adapters: true, aneBridge: true });
   expect(adapted.graphCapabilities.adapters).toEqual({ batched: true, mountable: true });
+  expect(adapted.prefillChunk.ane).toBeUndefined();
   expect(adapted.loraTargets().size).toBe(48 * 5 + 16 * 4);
   expect([...adapted.loraTargets().keys()].sort()).toEqual([...generic.loraTargets().keys()].sort());
   const mine = adapted.makeCache(), theirs = generic.makeCache();
