@@ -5,3 +5,5 @@ export const TRELLIS_SG_PER_TG = 4;
 /** Amortize the 16 KiB codebook over sixteen rows in the qualified M1 decode. */
 export const TRELLIS_CODEBOOK_THREADS = 512;
 export const TRELLIS_CODEBOOK_SG_PER_TG = 16;
+/** The one-row down codebook kernel: eight SIMD groups per threadgroup (each split's lanes own 16 positions). */
+export const TRELLIS_CODEBOOK_DOWN_THREADS = 256;

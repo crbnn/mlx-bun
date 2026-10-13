@@ -75,6 +75,24 @@ static inline uint trellis_state(const device uint32_t* blk, uint wpb, uint t, u
 }
 `;
 
+/** The one-row threadgroup-codebook kernels' table read (gate-up-codebook, down-codebook): the code value of the
+ *  L-bit window at bit `off` of a lane's words w, read as the L + 2 bits [off - 2, off + L), the window's byte offset
+ *  in a float table plus two low bits that the M1 Max (applegpu_g13s) threadgroup load ignores for a 4-byte element,
+ *  so one bit-field extract serves each window; the kernels' bit-identity tests hold them to the reference bits. A
+ *  field that crosses a word, or starts below bit 0, reads the virtual words v (v[i]: the high half of w[i - 1] and
+ *  the low half of w[i], bits [32i - 16, 32i + 16)). `off` and `l` are compile-time constants at every call. */
+export const CODEBOOK_WINDOW = String.raw`
+static inline float trellis_codebook_window(const threadgroup uchar* table, thread const uint* w, thread const uint* v,
+                                            uint off, uint l) {
+  const int f = int(off) - 2;
+  const uint mask = (1u << (l + 2u)) - 1u;
+  uint bits;
+  if (f >= 0 && uint(f & 31) + l + 2u <= 32u) bits = (w[f >> 5] >> uint(f & 31)) & mask;
+  else { const uint vi = uint(f + 16) >> 5; bits = (v[vi] >> uint(f + 16 - 32 * int(vi))) & mask; }
+  return *(const threadgroup float*)(table + bits);
+}
+`;
+
 export function lut1mad(L: number): Float32Array {
   const n = 1 << L;
   const out = new Float32Array(n);

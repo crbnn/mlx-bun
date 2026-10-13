@@ -57,20 +57,25 @@ function convTail(input: MlxArray, processed: number, nKeep: number, rowLengths?
   return materializeCopy(view);
 }
 
-/** Recurrent cache for a gated-DeltaNet layer — port of mlx-lm
- *  cache.ArraysCache(size=2): slot 0 = causal-conv state [B, K-1, conv_dim],
- *  slot 1 = recurrent state [B, Hv, Dv, Dk] f32. `recurDecode` and
- *  `recurWindow` own both slots and the kernels that update them
- *  (GatedDeltaCache); the DeltaNet block hands them its projections. `advance(N)` only
- *  tracks token count for B=1 single-stream (lengths / left_padding are
- *  batched-decode concerns). Not a key/value cache: no KV scheme converts it. */
+/** The recorded recurrence inputs of a verify window: the convolution inputs and
+ *  the kernel's position-local inputs (the heads' k and v, the a and b
+ *  projections), each [B, S, ...], and the layer they came from. The state after
+ *  the first `keep` positions is the same arithmetic prefix whether or not the
+ *  rest of the window was ever processed (the kernel walks positions in order;
+ *  the convolution and the glue are per position), so a rejected tail needs no
+ *  recomputation: the retained rows fold into the pre-round state. */
+interface SsmWindowRows {
+  qkv: MlxArray;
+  k: MlxArray;
+  v: MlxArray;
+  a: MlxArray;
+  b: MlxArray;
+  layer: GatedDeltaParameters;
+}
+
 /** One armed speculative verify round on an SSMCache: the pre-round state
  *  snapshot (retained refs — MLX arrays are immutable, so this is free) plus
- *  the recorded position-local kernel inputs, which make a partial reject
- *  bit-exactly replayable: state after the first `keep` window tokens is the
- *  same arithmetic prefix whether or not the rejected tail was ever
- *  processed. `recurDecode`/`recurWindow` record and install the cache's own
- *  replay over the borrowed layer. */
+ *  the window's recorded rows. `recurDecode`/`recurWindow` record them. */
 export interface SsmSpecRound {
   /** True from specRoundBegin() until the layer's forward records. */
   armed: boolean;
@@ -78,21 +83,30 @@ export interface SsmSpecRound {
   prevRecurrent: MlxArray | null;
   prevOffset: number;
   prevOffsets: number[] | null;
-  /** Pre-conv in_proj output [B,S,convDim] — position-local. */
-  qkv: MlxArray | null;
-  /** Gate/beta projections [B,S,Hv] — position-local. */
-  a: MlxArray | null;
-  b: MlxArray | null;
+  /** The window's recorded rows; null until the verify forward records. */
+  rows: SsmWindowRows | null;
   /** Window length S of the recorded verify forward. */
   S: number;
-  /** Layer-bound prefix replay: called AFTER the snapshot is restored onto
-   *  the cache; advances conv/recurrent/offset by `keep` tokens. */
-  replay: ((cache: SSMCache, keep: number | readonly number[]) => void) | null;
 }
 
+/** Recurrent cache for a gated-DeltaNet layer — port of mlx-lm
+ *  cache.ArraysCache(size=2): slot 0 = causal-conv state [B, K-1, conv_dim],
+ *  slot 1 = recurrent state [B, Hv, Dv, Dk] f32. `recurDecode` and
+ *  `recurWindow` own both slots and the kernels that update them
+ *  (GatedDeltaCache); the DeltaNet block hands them its projections. `advance(N)` only
+ *  tracks token count for B=1 single-stream (lengths / left_padding are
+ *  batched-decode concerns). Not a key/value cache: no KV scheme converts it.
+ *
+ *  A rolled-back speculative round leaves the snapshot in the slots and its
+ *  retained window rows pending; they fold in (the state-only kernel over the
+ *  recorded rows, and the convolution tail) the next time anything reads the
+ *  state: the next forward, `state()`, the slots, row moves or persistence. The
+ *  rollback itself builds no graph. */
 export class SSMCache implements GatedDeltaCache {
-  conv: MlxArray | null = null;
-  recurrent: MlxArray | null = null;
+  #conv: MlxArray | null = null;
+  #recurrent: MlxArray | null = null;
+  /** Rows a rolled-back round retained, not yet folded into the slots, with each row's kept count. */
+  #pending: { rows: SsmWindowRows; keep: readonly number[] } | null = null;
   offset = 0;
   prefillPadding: SsmPrefillPadding | null = null;
   /** Live speculative verify round; null outside a verify transaction. */
@@ -105,6 +119,13 @@ export class SSMCache implements GatedDeltaCache {
    *  merged rows carry different totals. Seeded by mergeRows, advanced in
    *  lockstep by advance(), row-filtered by filter(). */
   offsets: number[] | null = null;
+
+  /** The causal-conv state, with any retained rows folded in. */
+  get conv(): MlxArray | null { this.#fold(); return this.#conv; }
+  set conv(value: MlxArray | null) { this.#fold(); this.#conv = value; }
+  /** The recurrent state, with any retained rows folded in. */
+  get recurrent(): MlxArray | null { this.#fold(); return this.#recurrent; }
+  set recurrent(value: MlxArray | null) { this.#fold(); this.#recurrent = value; }
 
   signature(): string { return "ssm"; }
   bytesPerToken(): number { return 0; }
@@ -143,6 +164,7 @@ export class SSMCache implements GatedDeltaCache {
     padding: SsmPrefillPadding | null): MlxArray {
     const [B, S, convDim] = qkv.shape as [number, number, number];
     const nKeep = layer.convWeight.shape[1]! - 1;
+    this.#fold();
 
     const spec = this.specRound;
     if (spec) {
@@ -150,7 +172,6 @@ export class SSMCache implements GatedDeltaCache {
         throw new Error("SSMCache: spec round already recorded this round");
       spec.armed = false;
       spec.S = S;
-      spec.replay = (_cache, keep) => this.#replayPrefix(spec, keep, layer);
     }
 
     using mask = padding?.makeMask(S) ?? null;
@@ -160,90 +181,55 @@ export class SSMCache implements GatedDeltaCache {
       qkv = disposing(qkv, ops.where(expanded, qkv, zero));
     }
     // Convolution keeps each row's last real-token tail, including empty rows.
-    const convState = this.conv ?? ops.zeros([B, nKeep, convDim], qkv.dtype);
+    const convState = this.#conv ?? ops.zeros([B, nKeep, convDim], qkv.dtype);
     const [conv, newConv] = convolve(qkv, convState, layer.convWeight, padding?.convolutionLengths(S));
-    if (!this.conv) convState.dispose();
-    if (spec) spec.qkv = qkv;
-    else qkv.dispose();
-    if (spec) spec.prevConv = this.conv;
-    else this.conv?.dispose();
-    this.conv = newConv;
+    if (!this.#conv) convState.dispose();
+    if (spec) spec.prevConv = this.#conv;
+    else this.#conv?.dispose();
+    this.#conv = newConv;
 
     const { q, k, v } = layer.heads(conv);
     conv.dispose();
-    const [out, newState] = gatedDeltaUpdate(q, k, v, a, b, layer.aLog, layer.dtBias, this.recurrent, mask);
+    const [out, newState] = gatedDeltaUpdate(q, k, v, a, b, layer.aLog, layer.dtBias, this.#recurrent, mask);
     q.dispose();
-    k.dispose();
-    v.dispose();
     if (spec) {
-      spec.a = a;
-      spec.b = b;
-      spec.prevRecurrent = this.recurrent;
+      spec.rows = { qkv, k, v, a, b, layer };
+      spec.prevRecurrent = this.#recurrent;
     } else {
-      a.dispose();
-      b.dispose();
-      this.recurrent?.dispose();
+      for (const array of [qkv, k, v, a, b]) array.dispose();
+      this.#recurrent?.dispose();
     }
-    this.recurrent = newState;
+    this.#recurrent = newState;
     this.advance(S);
     return out;
   }
 
-  /** Speculative rollback replay, copied from GatedDeltaNet's
-   *  `#replaySpecPrefix`: with the pre-round snapshot restored, re-advance the
-   *  first `keep` window positions from the round's recorded inputs. Every op
-   *  repeats the recorded call on the same values (conv windows, the glue's
-   *  per-position activation and norms, the kernel's serial prefix), and none
-   *  depends on the rejected tail, so the states are bit for bit those of a
-   *  call over only the accepted prefix. The output is not needed; unequal row
-   *  prefixes use the state-only kernel, which reads no queries. */
-  #replayPrefix(round: SsmSpecRound, keep: number | readonly number[], layer: GatedDeltaParameters): void {
-    const recorded = round.qkv!;
-    const [B, , convDim] = recorded.shape as [number, number, number];
-    const Hv = round.a!.shape[2]!;
-    const count = typeof keep === "number" ? keep : Math.max(...keep);
-    const rowLengths = typeof keep === "number" ? undefined : keep;
-    const nKeep = layer.convWeight.shape[1]! - 1;
-
-    const qkvPfxView = recorded.slice([0, 0, 0], [B, count, convDim]);
-    const qkvPfx = ops.contiguous(qkvPfxView);
-    qkvPfxView.dispose();
-    const convState = this.conv ?? ops.zeros([B, nKeep, convDim], qkvPfx.dtype);
-    const [conv, newConv] = convolve(qkvPfx, convState, layer.convWeight, rowLengths);
-    if (!this.conv) convState.dispose();
-    qkvPfx.dispose();
-    this.conv?.dispose();
-    this.conv = newConv;
-
-    const { q, k, v } = layer.heads(conv);
-    conv.dispose();
-
-    const aPfxView = round.a!.slice([0, 0, 0], [B, count, Hv]);
-    const aPfx = ops.contiguous(aPfxView);
-    aPfxView.dispose();
-    const bPfxView = round.b!.slice([0, 0, 0], [B, count, Hv]);
-    const bPfx = ops.contiguous(bPfxView);
-    bPfxView.dispose();
-
-    let newState: MlxArray;
-    if (rowLengths) {
-      // Unequal prefixes need a row-length-aware recurrence. The state-only
-      // kernel omits query/output work. Uniform replay retains its measured
-      // kernel until the separate optimization demonstrates a serving win.
-      newState = gatedDeltaState(k, v, aPfx, bPfx, layer.aLog, layer.dtBias, this.recurrent, rowLengths);
-    } else {
-      const [output, state] = gatedDeltaUpdate(q, k, v, aPfx, bPfx, layer.aLog, layer.dtBias, this.recurrent);
-      output.dispose(); newState = state;
-    }
-    q.dispose();
-    k.dispose();
-    v.dispose();
-    aPfx.dispose();
-    bPfx.dispose();
-    this.recurrent?.dispose();
-    this.recurrent = newState;
-    if (typeof keep === "number") this.advance(keep);
-    else this.advanceRows(keep);
+  /** Fold a rolled-back round's retained rows into the slots: each row's
+   *  convolution tail ends at its kept count, and the state-only kernel walks the
+   *  kept positions of the recorded k, v, a and b from the restored state. The
+   *  values are the verify window's own, and the kernel's recurrence is the
+   *  update kernel's, so both slots are bit for bit those of a call over only
+   *  the retained positions. */
+  #fold(): void {
+    const pending = this.#pending;
+    if (!pending) return;
+    this.#pending = null;
+    const { rows, keep } = pending;
+    try {
+      const [B, , convDim] = rows.qkv.shape as [number, number, number];
+      const nKeep = rows.layer.convWeight.shape[1]! - 1;
+      const uniform = keep.every(count => count === keep[0]);
+      using zeros = this.#conv ? null : ops.zeros([B, nKeep, convDim], rows.qkv.dtype);
+      using input = ops.concatAxis([this.#conv ?? zeros!, rows.qkv], 1);
+      const conv = convTail(input, keep[0]!, nKeep, uniform ? undefined : keep);
+      let recurrent: MlxArray;
+      try { recurrent = gatedDeltaState(rows.k, rows.v, rows.a, rows.b, rows.layer.aLog, rows.layer.dtBias, this.#recurrent, keep); }
+      catch (error) { conv.dispose(); throw error; }
+      this.#conv?.dispose();
+      this.#recurrent?.dispose();
+      this.#conv = conv;
+      this.#recurrent = recurrent;
+    } finally { for (const array of [rows.qkv, rows.k, rows.v, rows.a, rows.b]) array.dispose(); }
   }
 
   advance(n: number): void {
@@ -263,9 +249,10 @@ export class SSMCache implements GatedDeltaCache {
   }
 
   state(): MlxArray[] {
+    this.#fold();
     const out: MlxArray[] = [];
-    if (this.conv) out.push(this.conv);
-    if (this.recurrent) out.push(this.recurrent);
+    if (this.#conv) out.push(this.#conv);
+    if (this.#recurrent) out.push(this.#recurrent);
     return out;
   }
 
@@ -280,24 +267,23 @@ export class SSMCache implements GatedDeltaCache {
   // --- speculative verify-round support -----------------------------------
   // The serve loop arms a round before the verify forward and resolves it
   // after the accept walk. The layer's forward, seeing an armed round, hands
-  // its replaced state slots to the round instead of disposing them, records
-  // qkv/a/b, and installs the replay. Cache/interface contract:
-  // rollback(keep) restores the snapshot then replays `keep` window tokens
-  // bit-exactly; commit frees the snapshot + recordings.
+  // its replaced state slots to the round instead of disposing them and
+  // records the window's rows. Cache/interface contract: rollback(keep)
+  // restores the snapshot and retains the first `keep` window rows, which fold
+  // in bit-exactly before the state is next read; commit frees the snapshot
+  // and the recordings.
 
   specRoundBegin(): void {
     this.#dropSpecRound(); // defensive: a mid-round throw left a stale round
+    this.#fold();
     this.specRound = {
       armed: true,
       prevConv: null,
       prevRecurrent: null,
       prevOffset: this.offset,
       prevOffsets: this.offsets ? [...this.offsets] : null,
-      qkv: null,
-      a: null,
-      b: null,
+      rows: null,
       S: 0,
-      replay: null,
     };
   }
 
@@ -312,19 +298,24 @@ export class SSMCache implements GatedDeltaCache {
       throw new Error("SSMCache.specRoundRollback before the verify forward recorded");
     if (typeof keep === "number" ? keep < 0 || keep > r.S : keep.some(count => count < 0 || count > r.S))
       throw new Error(`SSMCache.specRoundRollback keep=${keep} outside window S=${r.S}`);
+    if (!r.rows) throw new Error("SSMCache.specRoundRollback with no recorded window");
     // Restore the pre-round snapshot (ownership moves back to the cache).
-    this.conv?.dispose();
-    this.recurrent?.dispose();
-    this.conv = r.prevConv;
-    this.recurrent = r.prevRecurrent;
+    this.#conv?.dispose();
+    this.#recurrent?.dispose();
+    this.#conv = r.prevConv;
+    this.#recurrent = r.prevRecurrent;
     r.prevConv = null;
     r.prevRecurrent = null;
     this.offset = r.prevOffset;
     this.offsets = r.prevOffsets;
-    if (typeof keep === "number" ? keep > 0 : keep.some(count => count > 0)) {
-      if (!r.replay) throw new Error("SSMCache.specRoundRollback with no recorded replay");
-      r.replay(this, keep); // advances conv/recurrent/offset by `keep`
+    const rows = typeof keep === "number" ? Array<number>(r.rows.qkv.shape[0]!).fill(keep) : keep;
+    if (rows.some(count => count > 0)) {
+      // The kept rows move to the cache, which folds them in before the next read.
+      this.#pending = { rows: r.rows, keep: [...rows] };
+      r.rows = null;
     }
+    if (typeof keep === "number") this.advance(keep);
+    else this.advanceRows(keep);
     this.#dropSpecRound();
   }
 
@@ -333,18 +324,19 @@ export class SSMCache implements GatedDeltaCache {
     if (!r) return;
     r.prevConv?.dispose();
     r.prevRecurrent?.dispose();
-    r.qkv?.dispose();
-    r.a?.dispose();
-    r.b?.dispose();
+    if (r.rows) for (const array of [r.rows.qkv, r.rows.k, r.rows.v, r.rows.a, r.rows.b]) array.dispose();
     this.specRound = null;
   }
 
   dispose(): void {
     this.#dropSpecRound();
-    this.conv?.dispose();
-    this.recurrent?.dispose();
-    this.conv = null;
-    this.recurrent = null;
+    const pending = this.#pending?.rows;
+    this.#pending = null;
+    if (pending) for (const array of [pending.qkv, pending.k, pending.v, pending.a, pending.b]) array.dispose();
+    this.#conv?.dispose();
+    this.#recurrent?.dispose();
+    this.#conv = null;
+    this.#recurrent = null;
     this.prefillPadding = null;
   }
 
