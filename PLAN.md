@@ -54,8 +54,10 @@ against 17.1 tok/s plain, 20.5 against 16.8 under Qwen's instruct sampling and 1
 under its thinking sampling, the MTP head at 18.1, 16.4 and 15.8; the adaptive gate never drafts
 fewer than one token (a round without drafts costs about 1.1 plain steps there: it is not
 pipelined like plain decode); its
-per-row verify costs ignore how many requests are batched; the M1 Max composition has no Neural
-Engine bridge and prefills at 121 tok/s against 200 on the M4 Pro; the paired check's band is
+per-row verify costs ignore how many requests are batched; the M1 Max composition prefills 1k and
+8k-token prompts at about 175 tok/s (2026-10-13, alternated sessions of the graph's own prefill
+operations, against 129 to 130 before its dense-GEMM prompt projections and Neural Engine MLP split;
+mean KL of the split 1.3e-3 to 2.0e-3) against 200 on the M4 Pro; the paired check's band is
 narrower than session drift for sub-percent decode differences (the clean M1 Max run is the null);
 the TurboQuant fused decode kernel covers head dimensions 64, 128, 256 and 512 and 96 decodes on
 the plain path.
