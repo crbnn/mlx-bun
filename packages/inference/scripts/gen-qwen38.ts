@@ -101,10 +101,11 @@ export const QWEN38_COMPOSITIONS: Readonly<Record<string, Qwen38Composition>> = 
     maxRows: null,
     aneBridge: true,
     mixedGateUp: "split",
-    // Measured 2026-10-13 on this graph and artifact: scripts/bench-mtp.ts, the DFlash 2 drafter at depths 1..7
-    // against the depth-0 plain arm (59.4 ms per token), bf16 KV, greedy, two prompts, 128 tokens, four
-    // repetitions, whose ratios span under 4.5% at every width (under 1% at two and five rows).
-    verifyRoundCosts: { host: "M1 Max 32 GB", costs: [[1, 1], [2, 1.92], [3, 2.34], [4, 2.76], [5, 3.04], [6, 3.23], [7, 3.44], [8, 3.65]] },
+    // Measured 2026-10-13 on this graph and artifact, with the split-K affine kernels at four to eight rows and the
+    // drafter's own kernels this graph declares: scripts/bench-mtp.ts, the DFlash 2 drafter at depths 1..7 against
+    // the depth-0 plain arm (58.6 ms per token), bf16 KV, greedy, two prompts, 128 tokens, four repetitions, whose
+    // ratios span under 2.5% at every width but eight rows (5%).
+    verifyRoundCosts: { host: "M1 Max 32 GB", costs: [[1, 1], [2, 1.93], [3, 2.35], [4, 2.51], [5, 2.57], [6, 2.63], [7, 2.73], [8, 2.81]] },
   },
 });
 
