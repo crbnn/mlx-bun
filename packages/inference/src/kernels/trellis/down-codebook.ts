@@ -4,6 +4,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { MetalKernel } from "@mlx-bun/mlx/metal-kernel";
 import type { TrellisGeometry } from "./geometry";
 import { CODEBOOK_WINDOW, HEADER } from "./codebook";
+import { TRELLIS_CODEBOOK_DOWN_THREADS } from "./launch";
 
 // Axis-0 (down) projection of one activation row over T 256 Trellis codes,
 // decoding through a threadgroup codebook (every code value y·(1/147.8) of the
@@ -19,7 +20,7 @@ import { CODEBOOK_WINDOW, HEADER } from "./codebook";
 // rows in the same order as trellisScatter's single-row kernels at variant 13
 // (the balanced one for the 3-bit block interleave), so the output is theirs
 // bit for bit.
-const SPLITS = 128, THREADS = 256, P = 16, U = 2;
+const SPLITS = 128, P = 16, U = 2;
 
 const SOURCE = String.raw`
   threadgroup float codebook[1 << L];
@@ -117,11 +118,11 @@ function launch(x2: MlxArray, codes: MlxArray, scales: MlxArray, g: TrellisGeome
     outputNames: ["partial"], source: SOURCE, header: HEADER + CODEBOOK_WINDOW, ensureRowContiguous: true });
   const [partial] = kernel.apply([x2, codes, scales], {
     outputs: [{ shape: [1, SPLITS, g.cols], dtype: Dtype.float32 }],
-    grid: [THREADS, SPLITS * groupsPerSplit / (THREADS / 32), 1],
-    threadGroup: [THREADS, 1, 1],
+    grid: [TRELLIS_CODEBOOK_DOWN_THREADS, SPLITS * groupsPerSplit / (TRELLIS_CODEBOOK_DOWN_THREADS / 32), 1],
+    threadGroup: [TRELLIS_CODEBOOK_DOWN_THREADS, 1, 1],
     templateDtypes: { T: x2.dtype },
-    templateInts: { R: g.rows, C: g.cols, K: g.k, L: g.L, P, U, SPLITS, SG_TG: THREADS / 32, THREADS,
-      INTERLEAVE: Number(interleave) },
+    templateInts: { R: g.rows, C: g.cols, K: g.k, L: g.L, P, U, SPLITS, SG_TG: TRELLIS_CODEBOOK_DOWN_THREADS / 32,
+      THREADS: TRELLIS_CODEBOOK_DOWN_THREADS, INTERLEAVE: Number(interleave) },
   });
   const sum = ops.sumAxis(partial!, 1, false);
   partial!.dispose();
