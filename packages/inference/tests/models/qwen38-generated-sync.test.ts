@@ -52,11 +52,12 @@ test("the M1 Max composition's mixedGateUp chooses the mixed-width layer the gen
   // The committed default: the split tail, bit-identical to the two projections plus a separate SwiGLU.
   expect(base.mixedGateUp).toBe("split");
   expect(emit("split")).toBe(readFileSync(join(GENERATED_DIR, `${stem}.ts`), "utf8"));
-  expect(emit("fused")).toContain(`new ReduceMixedGateUp(gate, up, "fused")`);
-  // The A/B control: those layers keep the generic blocks at one to four rows, and the mixed kernel is not imported.
+  expect(emit("fused")).toContain(`new CodebookGateUpRow(gate, up, "fused")`);
+  // The A/B control: those layers keep the generic blocks at one row, the same-width ones the split tail.
   const off = emit("off");
   expect(off).toContain("if (spec.gate !== spec.up) return genericStep(layer);");
-  expect(off).not.toContain("ReduceMixedGateUp");
+  expect(off).toContain(`new CodebookGateUpRow(gate, up, "split")`);
+  expect(off).not.toContain(`"fused"`);
   const m4pro = "qwen38-27b-trellis-m4pro";
   expect(() => emitQwen38Graph(description, m4pro, { [m4pro]: { ...QWEN38_COMPOSITIONS[m4pro]!, mixedGateUp: "split" } }))
     .toThrow("does not name");

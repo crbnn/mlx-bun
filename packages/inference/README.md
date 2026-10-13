@@ -877,11 +877,13 @@ row-contiguous input. These profiles and numerical
 contracts are unchanged; they are not universal dispatch rules for every shape.
 
 Single-purpose kernels from the same entry point: each runs one algorithm for
-one row form and one code layout, takes no options, and checks its inputs. The
-factored kernels decode each weight's code value y and apply the row scale
-(with 1/147.8) once per output, or fold it into each input row's activation;
-the matrix kernels run on the simdgroup matrix unit. Both reassociate relative
-to variant 6 and agree with it to bf16 precision, not bit for bit.
+one row form and one code layout, takes no options beyond the mixed-width
+SwiGLU tail, and checks its inputs. The factored kernels decode each weight's
+code value y and apply the row scale (with 1/147.8) once per output, or fold it
+into each input row's activation; the matrix kernels run on the simdgroup matrix
+unit. Both reassociate relative to variant 6 and agree with it to bf16
+precision, not bit for bit. The codebook kernels look each code value up in a
+threadgroup table and keep variant 13's one-row output bits.
 
 | Operation | Input and purpose |
 | --- | --- |
@@ -890,6 +892,8 @@ to variant 6 and agree with it to bf16 precision, not bit for bit.
 | `downFactoredRow` / `downFactoredRows(x2, codes, scales, geometry)` | Axis-0 projection over row-major codes; one row / 2..4 rows |
 | `downK3InterleavedFactoredRow` / `downK3InterleavedFactoredRows(...)` | The same over 3-bit block-interleaved codes (T 256, L 12) |
 | `gateUpMma(x, gate, up)` | Gate/up/SwiGLU for 1..8 rows; widths may differ |
+| `gateUpCodebookRow(x, gate, up, tail)` | One-row gate/up/SwiGLU through a threadgroup codebook; widths may differ; the reduce kernels' bits |
+| `downCodebookRow` / `downK3InterleavedCodebookRow(x2, codes, scales, geometry)` | One-row axis-0 projection through a threadgroup codebook, row-major 2/4-bit / 3-bit interleaved codes; the scatter kernels' bits |
 | `downMma` / `downK3InterleavedMma(x2, codes, scales, geometry)` | Axis-0 projection for 1..8 rows, row-major / 3-bit interleaved codes |
 
 Outside the Trellis family, `kernels/quantization/affine{3,4}-{rows,mma}` run
@@ -978,14 +982,17 @@ declaring the row range it takes: the scheduler runs any one-sequence prompt pie
 a whole chunk or a tail, of 640 to 2048 positions on the one whose programs (1024,
 1536 or 2048 positions) hold it, as main's M4 Pro graph did; a
 composition that mounts adapters builds every operation on the generic blocks. On
-the M1 Max: the reduce and scatter kernels at one to four rows and the generic
-blocks above; prompt pieces above eight rows with their attention and DeltaNet
-projections on `layers/dequantized-linear` (from 640 rows the weight dequantized to
-bf16 and MLX's dense GEMM, MLX's quantized matmul bit for bit and about 1.35x faster
-there). With adapters mounted those blocks are not built and the adapters apply at
-every width; without, the graph mounts none. On both, wider windows, prompt chunks on the GPU, tails and
-vision positions run the generic blocks inside the graph (the M1 Max's prompt
-pieces with those projections); known-token spans do too on the
+the M1 Max: the threadgroup-codebook kernels at one row; at two to three rows the
+factored Trellis kernels with the affine row kernels for the projections and head;
+at four the matrix-unit gate/up and affine set with the factored down; the
+matrix-unit set at five to eight; prompt pieces above eight rows with their
+attention and DeltaNet projections on `layers/dequantized-linear` (from 640 rows the
+weight dequantized to bf16 and MLX's dense GEMM, MLX's quantized matmul bit for bit
+at the artifact's shapes and about 1.35x faster there); adapters as on the M4 Pro.
+On both, decode and verify up to eight rows submit the graph every four layers;
+wider windows, prompt chunks on the GPU, tails above eight rows and vision
+positions run the generic blocks inside the graph (the M1 Max's prompt pieces with
+those projections); known-token spans do too on the
 M4 Pro, and append as windows on the block set of their width on the M1 Max. Each
 generated file's header lists its operations and the request shapes it serves.
 Each declares `verifyRoundCosts`, the verify cost by row count measured for

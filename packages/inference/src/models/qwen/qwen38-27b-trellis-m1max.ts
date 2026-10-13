@@ -19,19 +19,21 @@
 // 15, 21, 35, 36, 43, 50, 51, 53, 56, 62) and the device's one-kernel layers:
 //
 //   operation                      MLP gate/up + down (row-major/interleaved)  affine projections (3/4-bit)
-//   decode.one, verify.one         ReduceGateUpRow + ScatterDownRow/K3i        QuantizedLinear
-//   decode/verify.twoToThree       ReduceGateUpRows + ScatterDownRows/K3i      QuantizedLinear
-//   decode/verify.four             ReduceGateUpRows + ScatterDownRows/K3i      QuantizedLinear
-//   decode/verify.fiveToEight      the generic blocks (TrellisMlp)             QuantizedLinear
+//   decode.one, verify.one         CodebookGateUpRow + CodebookDownRow/K3i     QuantizedLinear
+//   decode/verify.twoToThree       FactoredGateUpRows + FactoredDownRows/K3i   Affine3RowsLinear/Affine4RowsLinear
+//   decode/verify.four             MmaGateUp + FactoredDownRows/K3i            Affine3MmaLinear/Affine4MmaLinear
+//   decode/verify.fiveToEight      MmaGateUp + MmaDown/K3i                     Affine3MmaLinear/Affine4MmaLinear
 //   decode/verify.wider            the generic blocks (TrellisMlp)             QuantizedLinear
 //   prefillChunk.gpu/Tail.wider    the generic blocks (TrellisMlp)             DequantizedLinear
 //
-// Mixed-width gate/up takes ReduceMixedGateUp at one to four rows, split tail (MLX's compiled SwiGLU bit for bit).
-// Every attention block reads through the cache the composition's KV scheme names (composedFullAttentionCache: the
-// plain cache with the stock SDPA, bf16-first affine or per-layer affine with the composition's read kernels, or
-// bf16-first TurboQuant with the dense read). The head is QuantizedLinear at every width. Decode, verify and
-// known-token appends are one lazy graph at every width; prompt chunks, and prompt tails and embeddings above four
-// rows, evaluate each layer and its recurrent state.
+// Mixed-width gate/up takes CodebookGateUpRow at one row, split tail (MLX's compiled SwiGLU bit for bit), and
+// FactoredMixedGateUp at two to three rows. Every attention block reads through the cache the composition's KV scheme
+// names (composedFullAttentionCache: the plain cache with the stock SDPA, bf16-first affine or per-layer affine with
+// the composition's read kernels, or bf16-first TurboQuant with the dense read). The head is part of each phase:
+// logits.twoToThree Affine4RowsLinear, logits.four Affine4MmaLinear, logits.fiveToEight Affine4MmaLinear,
+// QuantizedLinear otherwise. Decode, verify, prompt tails and embeddings up to eight rows submit the graph every 4
+// layers; wider decode and verify windows and known-token appends are one lazy graph; prompt chunks, and prompt tails
+// and embeddings above eight rows, evaluate each layer and its recurrent state.
 //
 // Request shapes this graph serves:
 //   - prompt chunks of exactly the composition's chunk size (prefillChunk.gpu) and prompt tails (prefillTail);
@@ -45,8 +47,8 @@
 //   - mixed groups of rows in one forward (mixed) on the generic blocks: each group's attention and recurrence over
 //     its own caches, the prompt and decode groups' MLP rows packed into one call (the composition's packedMixedMlp);
 //   - the scoring forward over a whole sequence (sequenceHidden, prefillTail's operation for its width);
-//   - mounted LoRA adapters when the composition mounts them: the attention and DeltaNet projections are the generic
-//     blocks' QuantizedLinear at every width, which apply them, and the prompt blocks are not built;
+//   - mounted LoRA adapters when the composition mounts them: every operation then runs the generic blocks,
+//     whose QuantizedLinear projections apply them;
 //   - paged KV (the paged legos' own reads in place of the plain full-attention storage).
 // The planner refuses, from the declared capabilities and never by routing to another graph, adapter requests
 // when the composition mounts none (adapter-batch-unsupported).
@@ -66,6 +68,7 @@ import type { MropeForwardState } from "../../contracts/mlx/positions";
 import type { Composition } from "../../contracts/portable/composition";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import { mapTokenGroups } from "../../input/token-groups";
+import { Affine3MmaLinear, Affine3RowsLinear, Affine4MmaLinear, Affine4RowsLinear } from "../../layers/affine-verify-linear";
 import { DequantizedLinear } from "../../layers/dequantized-linear";
 import { disposing } from "../../layers/helpers";
 import { LoraState } from "../../layers/lora";
@@ -73,8 +76,10 @@ import { RMSNorm } from "../../layers/normalization";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import { QuantizedLinear } from "../../layers/quantized-linear";
 import { mropeInvFreq } from "../../layers/qwen-mrope";
-import { ReduceGateUpRow, ReduceGateUpRows, ReduceMixedGateUp } from "../../layers/trellis-reduce-gate-up";
-import { ScatterDownK3iRow, ScatterDownK3iRows, ScatterDownRow, ScatterDownRows } from "../../layers/trellis-scatter-down";
+import { FactoredDownK3iRows, FactoredDownRows, MmaDown, MmaDownK3i } from "../../layers/trellis-down";
+import { FactoredGateUpRows, FactoredMixedGateUp, MmaGateUp } from "../../layers/trellis-gate-up";
+import { CodebookGateUpRow } from "../../layers/trellis-reduce-gate-up";
+import { CodebookDownK3iRow, CodebookDownRow } from "../../layers/trellis-scatter-down";
 import { AttentionMasks } from "../../state/attention-read";
 import { composedFullAttentionCache } from "../../state/bf16-first-kv";
 import { SSMCache } from "../../state/ssm";
@@ -179,6 +184,8 @@ export const LAYERS: readonly Qwen38Layer[] = Object.freeze([
 const PREFIX = "language_model.model";
 const DELTANET_PROJECTIONS = ["in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj"] as const;
 const ATTENTION_PROJECTIONS = ["q_proj", "k_proj", "v_proj", "o_proj"] as const;
+/** Submit the graph every 4 layers at decode and verify widths up to 8 (measured best on this GPU). */
+const ASYNC_EVERY = 4;
 
 /** One layer: input norm, mixer, residual, post-attention norm, MLP, residual. Consumes nothing; returns an owned output.
  *  `width` is the class of `x`'s rows the calling operation names (the generic blocks' MLP reads it). */
@@ -229,7 +236,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
   readonly graphCapabilities: GraphCapabilities;
   /** Verify forward cost by rows relative to one decode step (M1 Max 32 GB). */
   readonly verifyRoundCosts: ReadonlyMap<number, number> = new Map([
-    [1, 1], [2, 1.89], [3, 2.35], [4, 2.97], [5, 12.22], [6, 13.16], [7, 13.02], [8, 12.88],
+    [1, 1], [2, 1.92], [3, 2.34], [4, 2.76], [5, 3.04], [6, 3.23], [7, 3.44], [8, 3.65],
   ]);
 
   readonly prefillChunk: MlxPrefillChunk;
@@ -239,7 +246,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
   readonly appendKnown: MlxWidthTable<MlxPhaseForward>;
   readonly logits: MlxWidthTable<MlxHeadForward>;
 
-  /** The generic blocks: every operation above four rows (prompt pieces with the prompt blocks' projections), media positions, mixed rows. */
+  /** The generic blocks: every operation above eight rows (prompt pieces with the prompt blocks' projections), media positions, mixed rows. */
   readonly #generic: Step[];
   /** The generic layers, which a mixed forward drives block by block. */
   readonly #layers: readonly Qwen3Layer[];
@@ -302,36 +309,50 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
     this.#layers = generic;
     this.#packMixedMlp = composition.packedMixedMlp;
 
-    // Every class's attention and DeltaNet projections are the generic blocks' QuantizedLinear, which apply
-    // mounted adapters: no class changes with them.
-    this.#one = generic.map((layer, i) => {
-      const spec = LAYERS[i]!, { gate, up, down } = mlpOf(i);
-      const gateUp = spec.gate === spec.up ? new ReduceGateUpRow(gate, up) : new ReduceMixedGateUp(gate, up, "split");
-      const project = spec.downLayout === "k3Interleaved" ? new ScatterDownK3iRow(down) : new ScatterDownRow(down);
-      return layerStep(layer, mixerOf((layer.linearAttn ?? layer.selfAttn)!, spec.kind), post => {
-        using mid = gateUp.forward(post);
-        return project.forward(mid);
+    if (composition.adapters) {
+      // Every class runs the generic blocks: their QuantizedLinear projections
+      // apply the mounted adapters (the one-kernel layers do not).
+      this.#one = this.#twoToThree = this.#four = this.#fiveToEight = this.#generic;
+    } else {
+      const affine4RowsBlocks = LAYERS.map((_, i) => blockOf(i, (linear, _path, width) => width === 3 ? new Affine3RowsLinear(linear) : new Affine4RowsLinear(linear)));
+      const affine4MmaBlocks = LAYERS.map((_, i) => blockOf(i, (linear, _path, width) => width === 3 ? new Affine3MmaLinear(linear) : new Affine4MmaLinear(linear)));
+      this.#one = generic.map((layer, i) => {
+        const spec = LAYERS[i]!, { gate, up, down } = mlpOf(i);
+        const gateUp = new CodebookGateUpRow(gate, up, "split");
+        const project = spec.downLayout === "k3Interleaved" ? new CodebookDownK3iRow(down) : new CodebookDownRow(down);
+        return layerStep(layer, mixerOf((layer.linearAttn ?? layer.selfAttn)!, spec.kind), post => {
+          using mid = gateUp.forward(post);
+          return project.forward(mid);
+        });
       });
-    });
-    this.#twoToThree = generic.map((layer, i) => {
-      const spec = LAYERS[i]!, { gate, up, down } = mlpOf(i);
-      const gateUp = spec.gate === spec.up ? new ReduceGateUpRows(gate, up) : new ReduceMixedGateUp(gate, up, "split");
-      const project = spec.downLayout === "k3Interleaved" ? new ScatterDownK3iRows(down) : new ScatterDownRows(down);
-      return layerStep(layer, mixerOf((layer.linearAttn ?? layer.selfAttn)!, spec.kind), post => {
-        using mid = gateUp.forward(post);
-        return project.forward(mid);
+      this.#twoToThree = generic.map((layer, i) => {
+        const spec = LAYERS[i]!, { gate, up, down } = mlpOf(i);
+        const gateUp = spec.gate === spec.up ? new FactoredGateUpRows(gate, up) : new FactoredMixedGateUp(gate, up);
+        const project = spec.downLayout === "k3Interleaved" ? new FactoredDownK3iRows(down) : new FactoredDownRows(down);
+        return layerStep(layer, mixerOf(affine4RowsBlocks[i]!, spec.kind), post => {
+          using mid = gateUp.forward(post);
+          return project.forward(mid);
+        });
       });
-    });
-    this.#four = generic.map((layer, i) => {
-      const spec = LAYERS[i]!, { gate, up, down } = mlpOf(i);
-      const gateUp = spec.gate === spec.up ? new ReduceGateUpRows(gate, up) : new ReduceMixedGateUp(gate, up, "split");
-      const project = spec.downLayout === "k3Interleaved" ? new ScatterDownK3iRows(down) : new ScatterDownRows(down);
-      return layerStep(layer, mixerOf((layer.linearAttn ?? layer.selfAttn)!, spec.kind), post => {
-        using mid = gateUp.forward(post);
-        return project.forward(mid);
+      this.#four = generic.map((layer, i) => {
+        const spec = LAYERS[i]!, { gate, up, down } = mlpOf(i);
+        const gateUp = new MmaGateUp(gate, up);
+        const project = spec.downLayout === "k3Interleaved" ? new FactoredDownK3iRows(down) : new FactoredDownRows(down);
+        return layerStep(layer, mixerOf(affine4MmaBlocks[i]!, spec.kind), post => {
+          using mid = gateUp.forward(post);
+          return project.forward(mid);
+        });
       });
-    });
-    this.#fiveToEight = this.#generic;
+      this.#fiveToEight = generic.map((layer, i) => {
+        const spec = LAYERS[i]!, { gate, up, down } = mlpOf(i);
+        const gateUp = new MmaGateUp(gate, up);
+        const project = spec.downLayout === "k3Interleaved" ? new MmaDownK3i(down) : new MmaDown(down);
+        return layerStep(layer, mixerOf(affine4MmaBlocks[i]!, spec.kind), post => {
+          using mid = gateUp.forward(post);
+          return project.forward(mid);
+        });
+      });
+    }
 
     // The attention and DeltaNet blocks of the prompt operations: every projection on DequantizedLinear, unless
     // the composition mounts adapters (then the generic blocks', whose QuantizedLinear applies them).
@@ -357,7 +378,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
     this.#attentionCache = (masks: AttentionMasks, layer: number) => composedFullAttentionCache(kv, layer, masks, denseTurboQuantKernels);
 
     this.#narrow = Object.freeze({ one: this.#one, twoToThree: this.#twoToThree, four: this.#four, fiveToEight: this.#fiveToEight });
-    const one = this.#one, twoToThree = this.#twoToThree, four = this.#four, wide = this.#generic;
+    const one = this.#one, twoToThree = this.#twoToThree, four = this.#four, fiveToEight = this.#fiveToEight, wide = this.#generic;
     const embed = this.embed;
     // Prompt pieces above eight rows: the prompt blocks, then the generic blocks' MLP.
     const prompt = promptBlocks ? generic.map((layer, i) => layerStep(layer, mixerOf(promptBlocks[i]!, LAYERS[i]!.kind),
@@ -367,35 +388,35 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
     this.prefillChunk = Object.freeze({ gpu });
     this.prefillTail = Object.freeze({
       one: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
-        this.#lazy(one, embed.encode(ids), state, "window", capture, null, "one"),
+        this.#submitted(one, embed.encode(ids), state, "window", capture, "one"),
       twoToThree: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
-        this.#lazy(twoToThree, embed.encode(ids), state, "window", capture, null, "twoToThree"),
+        this.#submitted(twoToThree, embed.encode(ids), state, "window", capture, "twoToThree"),
       four: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
-        this.#lazy(four, embed.encode(ids), state, "window", capture, null, "four"),
+        this.#submitted(four, embed.encode(ids), state, "window", capture, "four"),
       fiveToEight: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
-        this.#bounded(wide, embed.encode(ids), state, "window", capture, null, "fiveToEight"),
+        this.#submitted(fiveToEight, embed.encode(ids), state, "window", capture, "fiveToEight"),
       wider: gpu,
     });
     this.decode = Object.freeze({
       one: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
-        this.#lazy(one, embed.encode(ids), state, "decode", capture, null, "one"),
+        this.#submitted(one, embed.encode(ids), state, "decode", capture, "one"),
       twoToThree: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
-        this.#lazy(twoToThree, embed.encode(ids), state, "decode", capture, null, "twoToThree"),
+        this.#submitted(twoToThree, embed.encode(ids), state, "decode", capture, "twoToThree"),
       four: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
-        this.#lazy(four, embed.encode(ids), state, "decode", capture, null, "four"),
+        this.#submitted(four, embed.encode(ids), state, "decode", capture, "four"),
       fiveToEight: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
-        this.#lazy(wide, embed.encode(ids), state, "decode", capture, null, "fiveToEight"),
+        this.#submitted(fiveToEight, embed.encode(ids), state, "decode", capture, "fiveToEight"),
       wider: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) => this.#lazy(wide, embed.encode(ids), state, "decode", capture, null, "wider"),
     });
     this.verify = Object.freeze({
       one: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
-        this.#lazy(one, embed.encode(ids), state, "window", capture, null, "one"),
+        this.#submitted(one, embed.encode(ids), state, "window", capture, "one"),
       twoToThree: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
-        this.#lazy(twoToThree, embed.encode(ids), state, "window", capture, null, "twoToThree"),
+        this.#submitted(twoToThree, embed.encode(ids), state, "window", capture, "twoToThree"),
       four: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
-        this.#lazy(four, embed.encode(ids), state, "window", capture, null, "four"),
+        this.#submitted(four, embed.encode(ids), state, "window", capture, "four"),
       fiveToEight: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
-        this.#lazy(wide, embed.encode(ids), state, "window", capture, null, "fiveToEight"),
+        this.#submitted(fiveToEight, embed.encode(ids), state, "window", capture, "fiveToEight"),
       wider: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) => this.#lazy(wide, embed.encode(ids), state, "window", capture, null, "wider"),
     });
     // Known tokens append as windows (no committed spans) on the block set of their width, one lazy graph.
@@ -404,7 +425,17 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
       return (ids, state) => this.#lazy(steps, embed.encode(ids), state, "window", null, null, width);
     });
     const head = this.lmHead, plain: MlxHeadForward = hidden => head.forward(hidden);
-    this.logits = atEveryWidth(plain);
+    if (composition.adapters) this.logits = atEveryWidth(plain);
+    else {
+      const affine4RowsHead = new Affine4RowsLinear(head), affine4MmaHead = new Affine4MmaLinear(head);
+      this.logits = Object.freeze<MlxWidthTable<MlxHeadForward>>({
+        one: plain,
+        twoToThree: hidden => affine4RowsHead.forward(hidden),
+        four: hidden => affine4MmaHead.forward(hidden),
+        fiveToEight: hidden => affine4MmaHead.forward(hidden),
+        wider: plain,
+      });
+    }
     console.error(`[graph] ${this.graph} ${COMPOSITION.fingerprint} adapters=${composition.adapters ? "on" : "off"}`);
   }
 
@@ -431,6 +462,26 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
 
   // ── The layer loops. Each consumes h0 and returns the post-final-norm hidden,
   // owned by the caller; `capture` sees every layer's output, then the final hidden.
+
+  /** Every layer, the graph submitted every ASYNC_EVERY layers. */
+  #submitted(steps: Step[], h0: MlxArray, cache: Cache[], phase: ReadPhase, capture: MlxLayerCapture | null,
+    width: MlxWidthClass): MlxArray {
+    let h: MlxArray | null = h0;
+    try {
+      for (let i = 0; i < steps.length; i++) {
+        const next = steps[i]!(h, cache[i]!, phase, null, width);
+        h.dispose();
+        h = next;
+        if (i % ASYNC_EVERY === ASYNC_EVERY - 1 && i + 1 < steps.length) ops.asyncEvalAll([h]);
+        capture?.(i, h);
+      }
+      const out = this.finalNorm.forward(h);
+      h.dispose();
+      h = null;
+      capture?.(steps.length, out);
+      return out;
+    } finally { h?.dispose(); }
+  }
 
   /** Every layer, each layer's output and recurrent state evaluated before the next. */
   #bounded(steps: Step[], h0: MlxArray, cache: Cache[], phase: ReadPhase, capture: MlxLayerCapture | null,
@@ -531,13 +582,12 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
   }
 
   /** The vision prefill phase for direct generation: spliced embeddings (borrowed) at the cache's own positions, on
-   *  the block set of their width (the one-sequence row sets up to four rows, one lazy graph; the generic blocks
-   *  above, each layer evaluated before the next). */
+   *  the block set of their width (the one-sequence row sets up to eight rows, the generic blocks above). */
   prefillEmbeddings(embeds: MlxArray, cache: Cache[], _bidir: MlxArray | null, _ids: MlxArray | null,
     _multimodal: MlxArray | null, width: MlxWidthClass): MlxArray {
     const h0 = ops.contiguous(embeds);
-    return width === "fiveToEight" || width === "wider" ? this.#bounded(this.#generic, h0, cache, "window", null, null, width)
-      : this.#lazy(this.#narrow[width], h0, cache, "window", null, null, width);
+    return width === "wider" ? this.#bounded(this.#generic, h0, cache, "window", null, null, width)
+      : this.#submitted(this.#narrow[width], h0, cache, "window", null, width);
   }
 
   /** Every layer over `h0` (consumed) on the generic blocks at request positions: a window above four rows

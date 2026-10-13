@@ -194,16 +194,6 @@ export function gateUpCodebookEligible(g: TrellisGeometry, m: number, dtype: Dty
 /** Variants 7..13 share each decoded weight across rows (`GATEUP_SHARED_M_SOURCE`). */
 const sharesRows = (selected: number) => selected >= 7 && selected <= 13;
 
-/** silu(gate(x))·up(x) for exactly one activation row, gate and up at the same
- * width: the per-row kernel. `codebook` applies at the measured shape; layers
- * pass the choice they resolved at construction (`qualifiedRepresentations`).
- * Borrows x and the weights; returns owned lazy output with x's leading dimensions. */
-export function gateUpReduceRow(x: MlxArray, gate: TrellisWeights, up: TrellisWeights, selected: number,
-  codebook: boolean): MlxArray {
-  if (x.size !== x.shape.at(-1)) throw new Error("gateUpReduceRow: expects one activation row");
-  return launch(gateUpKernel(), x, gate, up, selected, codebook, 1, false);
-}
-
 /** silu(gate(x))·up(x) for 2..4 activation rows sharing each decoded weight
  * (variants 7..13), gate and up at the same width. Borrows x and the weights;
  * returns owned lazy output with x's leading dimensions. */
