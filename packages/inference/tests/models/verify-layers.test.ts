@@ -15,7 +15,9 @@ import { CodebookGateUpRow } from "../../src/layers/trellis-reduce-gate-up";
 import { CodebookDownK3iRow, CodebookDownRow } from "../../src/layers/trellis-scatter-down";
 import { FactoredGateUpRow, FactoredGateUpRows, FactoredMixedGateUp, MmaGateUp } from "../../src/layers/trellis-gate-up";
 import { FactoredDownK3iRow, FactoredDownK3iRows, FactoredDownRow, FactoredDownRows, MmaDown, MmaDownK3i } from "../../src/layers/trellis-down";
-import { Affine3MmaLinear, Affine3RowsLinear, Affine4MmaLinear, Affine4RowsLinear } from "../../src/layers/affine-verify-linear";
+import {
+  Affine3MmaLinear, Affine3RowsLinear, Affine4MmaLinear, Affine4RowsLinear, AffineSplitMmaLinear,
+} from "../../src/layers/affine-verify-linear";
 
 const D = 512, R = 256;
 
@@ -144,6 +146,20 @@ describe("affine verify layers", () => {
         expect(relErr(b, expected), `mma ${bits}-bit m${m}`).toBeLessThan(1e-2);
       }
       expect(() => bits === 3 ? new Affine4RowsLinear(lin) : new Affine3RowsLinear(lin)).toThrow();
+      // The M1 Max layer takes either width, as stored.
+      const splitLayer = new AffineSplitMmaLinear(lin);
+      for (const m of [1, 3, 8]) {
+        using x = rows(m, D);
+        using expected = lin.forward(x);
+        using split = splitLayer.forward(x);
+        expect(relErr(split, expected), `split mma ${bits}-bit m${m}`).toBeLessThan(1e-2);
+      }
     }
+    // It takes no 8-bit weights.
+    const q8 = ops.quantize(wb, 64, 8);
+    try {
+      const lin8 = new QuantizedLinear(q8.packed, q8.scales, q8.biases, { bits: 8, groupSize: 64, mode: "affine" });
+      expect(() => new AffineSplitMmaLinear(lin8)).toThrow();
+    } finally { q8.packed.dispose(); q8.scales.dispose(); q8.biases?.dispose(); }
   }, 60_000);
 });

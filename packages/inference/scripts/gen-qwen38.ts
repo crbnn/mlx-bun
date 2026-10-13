@@ -246,10 +246,10 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     projections: {
       one: null,
       twoToThree: { 3: "Affine3RowsLinear", 4: "Affine4RowsLinear" },
-      four: { 3: "Affine3MmaLinear", 4: "Affine4MmaLinear" },
-      fiveToEight: { 3: "Affine3MmaLinear", 4: "Affine4MmaLinear" },
+      four: { 3: "AffineSplitMmaLinear", 4: "AffineSplitMmaLinear" },
+      fiveToEight: { 3: "AffineSplitMmaLinear", 4: "AffineSplitMmaLinear" },
     },
-    head: { twoToThree: "Affine4RowsLinear", four: "Affine4MmaLinear", fiveToEight: "Affine4MmaLinear" },
+    head: { twoToThree: "Affine4RowsLinear", four: "AffineSplitMmaLinear", fiveToEight: "AffineSplitMmaLinear" },
     asyncEvery: 4,
     widerVerify: "lazy",
     knownSpans: false,
@@ -434,7 +434,8 @@ export function emitQwen38Graph(description: Qwen38Description, stem: string,
     ].map(line => indent + line).join("\n");
   };
   const blockSets = projectionSets.map(([name, p]) =>
-    `      const ${name} = LAYERS.map((_, i) => blockOf(i, (linear, _path, width) => width === 3 ? new ${p[3]}(linear) : new ${p[4]}(linear)));`).join("\n");
+    `      const ${name} = LAYERS.map((_, i) => blockOf(i, ${p[3] === p[4] ? `linear => new ${p[3]}(linear)`
+      : `(linear, _path, width) => width === 3 ? new ${p[3]}(linear) : new ${p[4]}(linear)`}));`).join("\n");
   const narrowBlock = adapterSafe ? `    // Every class's attention and DeltaNet projections are the generic blocks' QuantizedLinear, which apply
     // mounted adapters: no class changes with them.
 ${NARROW.map(cls => narrowSet(cls, "    ")).join("\n")}` : `    if (composition.adapters) {
@@ -460,7 +461,7 @@ ${NARROW.map(cls => narrowSet(cls, "      ")).join("\n")}
   const classRows = NARROW.map(cls => {
     const m = k.mlp[cls], p = k.projections[cls];
     return row(cls === "one" ? "decode.one, verify.one" : `decode/verify.${cls}`, m ? `${m.sameGateUp} + ${m.rowMajorDown}/K3i`
-      : "the generic blocks (TrellisMlp)", p ? `${p[3]}/${p[4]}` : "QuantizedLinear");
+      : "the generic blocks (TrellisMlp)", p ? (p[3] === p[4] ? p[3] : `${p[3]}/${p[4]}`) : "QuantizedLinear");
   }).join("\n");
   /** Each run of consecutive classes whose mixed-width layer takes the composition's tail or is not their same-width
    *  one (the table row names that), with its layer and rows. */
