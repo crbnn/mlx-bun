@@ -31,6 +31,14 @@ export interface ContextKV {
   v: MlxArray; // [1, nKvHeads, ctxLen, headDim]
 }
 
+/** A projected-context drafter's context projection over B × L rows: the target's tapped hiddens
+ *  [B, L, taps × H] (borrowed) to context rows [B, L, H] (owned). */
+export type DrafterContextProjection = (targetHiddens: MlxArray) => MlxArray;
+
+/** Each drafter layer's context K/V [B, kvHeads, L, headDim] (owned) of B × L context rows [B, L, H] (borrowed),
+ *  at absolute positions from `position` (one shared, or [B] when the rows start apart). */
+export type DrafterContextKV = (context: MlxArray, position: number | MlxArray) => ContextKV[];
+
 /** Confidence-scheduled draft-length pruning and logits collection of one DSpark block. */
 export interface DsparkDraftOptions {
   thresholds?: number[];
@@ -78,8 +86,12 @@ export interface DeepspecDrafterModel {
   /** The trained block width. */
   readonly gamma: number;
   readonly hidden: number;
-  projectContext(targetHiddens: MlxArray): MlxArray;
-  projectContextKVRows(contextHidden: MlxArray, position: number | MlxArray): ContextKV[];
+  /** The context projection per width class of the rows projected (B × L), indexed by the caller
+   *  (`widthClass(B × L)`): MLX's quantized matmul (matmul for a BF16 checkpoint) at every class. */
+  readonly projectContext: MlxWidthTable<DrafterContextProjection>;
+  /** Each layer's context K/V per width class of the context rows (B × L), indexed like `projectContext`:
+   *  the same kernel at every class. */
+  readonly projectContextKVRows: MlxWidthTable<DrafterContextKV>;
   draftRows(context: DeepspecContextAttention, anchors: readonly number[], position: number | MlxArray,
     collectLogits?: boolean): DeepspecDraftRows;
   dispose(): void;
@@ -133,12 +145,22 @@ export interface Dflash2DrafterModel {
   /** Apply the target's declared residual basis (null: the trained basis) before any projection.
    *  The first call applies it; every later call must pass the same declaration. */
   bindResidualBasis(basis: ResidualBasis | null): void;
-  projectContext(taps: MlxArray): MlxArray;
-  projectContextKVRows(context: MlxArray, position: number | MlxArray): { k: MlxArray; v: MlxArray }[];
+  /** The context projection (fc over the target's taps, then the hidden norm) per width class of the rows
+   *  projected (B × L: a prompt's rows at prefill, a commit's accepted rows), indexed by the caller
+   *  (`widthClass(B × L)`). A 4-bit fc runs the simdgroup matrix unit (`Affine4MmaLinear`, where the weight's
+   *  shape fits it) at `fiveToEight` and MLX's quantized matmul (`QuantizedLinear`) at every other class; a BF16
+   *  fc runs one matmul at every class. No entry runs before `bindResidualBasis`. */
+  readonly projectContext: MlxWidthTable<DrafterContextProjection>;
+  /** Each layer's k and v over the context rows (k norm, RoPE), per width class of those rows (B × L), indexed
+   *  like `projectContext` and on the kernel it names for the class. */
+  readonly projectContextKVRows: MlxWidthTable<DrafterContextKV>;
   /** The columns of a block drafting `depth` tokens: its anchor and up to `depth` mask positions, at most the
    *  trained block size. */
   blockColumns(depth: number): number;
-  /** The draft block per width class of its rows (anchors times columns), indexed by the scheduler. */
+  /** The draft block per width class of its rows (anchors times columns), indexed by the scheduler: every 4-bit
+   *  projection on the simdgroup matrix unit (`Affine4MmaLinear`, where the weight's shape fits it) at
+   *  `fiveToEight` and MLX's quantized matmul (`QuantizedLinear`) at every other class; BF16 projections run one
+   *  matmul at every class. */
   readonly draft: MlxWidthTable<Dflash2DraftBlock>;
   dispose(): void;
 }
