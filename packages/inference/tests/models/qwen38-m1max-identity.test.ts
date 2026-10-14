@@ -22,7 +22,9 @@ import type { Weights } from "../../src/artifacts/weights";
 import type { BatchableCache, Cache } from "../../src/contracts/mlx/cache";
 
 import type { Composition, KvStorageScheme } from "../../src/contracts/portable/composition";
-import { LAYERS, Qwen38TrellisM1Max } from "../../src/models/qwen/qwen38-27b-trellis-m1max";
+import { Qwen38TrellisM1Max } from "../../src/models/qwen/qwen38-27b-trellis-m1max";
+import { LAYERS } from "./qwen38-layout";
+import { bindGraphCaches } from "../../src/models/cache-composition";
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
 
 const HIDDEN = 512, INTER = 256, VOCAB = 256, HEADS = 4, KV_HEADS = 2, HEAD_DIM = 256;
@@ -215,26 +217,27 @@ const disposeAll = (...sets: Cache[][]) => { for (const set of sets) for (const 
 
 let synthetic: { weights: Weights; config: ModelConfig } | null = null;
 const source = () => synthetic ??= artifact();
-const built = new Map<string, { current: Qwen38TrellisM1Max; generic: Qwen35Model }>();
-function graphs(scheme: string, overrides: Partial<Composition> = {}): { current: Qwen38TrellisM1Max; generic: Qwen35Model } {
+type BoundM1=Qwen38TrellisM1Max & {makeCache():Cache[]};
+const built = new Map<string, { current: BoundM1; generic: Qwen35Model }>();
+function graphs(scheme: string, overrides: Partial<Composition> = {}): { current: BoundM1; generic: Qwen35Model } {
   const key = `${scheme} ${JSON.stringify(overrides)}`;
   let found = built.get(key);
   if (!found) {
     const { weights, config } = source();
     const facts = composition({ kv: SCHEMES[scheme]!, ...overrides });
-    found = { current: new Qwen38TrellisM1Max(weights, config, facts), generic: new Qwen35Model(weights, config, facts) };
+    found = { current: bindGraphCaches(new Qwen38TrellisM1Max(weights, config), facts), generic: new Qwen35Model(weights, config, facts) };
     built.set(key, found);
   }
   return found;
 }
-afterAll(() => { for (const { current } of built.values()) current.dispose(); });
+afterAll(() => { for (const { current,generic } of built.values()) {current.dispose();generic.dispose();} });
 
 describe("the composition the generated graph declares", () => {
   test("LoRA targets, caches, no committed spans, no Neural Engine operation, the verify costs its composition measured", () => {
     for (const scheme of Object.keys(SCHEMES)) {
       const { current, generic } = graphs(scheme);
       expect([...current.loraTargets().keys()].sort()).toEqual([...generic.loraTargets().keys()].sort());
-      expect(current.loraTargets().size).toBe(48 * 5 + 16 * 4);
+      expect(current.loraTargets().size).toBe(48 * 5 + 16 * 4 + 64 * 3);
       expect((current as { knownSpans?: unknown }).knownSpans).toBeUndefined();
       expect([...current.verifyRoundCosts]).toEqual([[1,1],[2,1.89],[3,2.35],[4,2.97],[5,12.22],[6,13.16],[7,13.02],[8,12.88]]);
       expect(current.prompt.filter(range => range.unit === "ane")).toEqual([]);
@@ -252,12 +255,12 @@ describe("the composition the generated graph declares", () => {
     try {
       const at = { ...config, modelDir: dir } as ModelConfig;
       const declared = (graph: { draftTarget(caches: Cache[]): { residualBasis?: unknown } }) => graph.draftTarget([]).residualBasis;
-      const without = new Qwen38TrellisM1Max(weights, at, composition());
+      const without = new Qwen38TrellisM1Max(weights, at);
       expect(declared(without)).toBeUndefined();
       without.dispose();
       writeFileSync(join(dir, TURBOQUANT_FOLD_FILE), JSON.stringify({ seed: 7, r1: true, hiddenSize: HIDDEN,
         final_gain: Array.from({ length: HIDDEN }, (_, i) => 1 + i / HIDDEN) }));
-      const current = new Qwen38TrellisM1Max(weights, at, composition());
+      const current = new Qwen38TrellisM1Max(weights, at);
       expect(declared(current)).toEqual({ r1Seed: 7, finalGain: Float32Array.from({ length: HIDDEN }, (_, i) => 1 + i / HIDDEN) });
       current.dispose();
     } finally { console.error = quiet; rmSync(dir, { recursive: true, force: true }); }
@@ -277,10 +280,10 @@ for (const scheme of Object.keys(SCHEMES)) {
     };
     try {
       step(`prefillChunk.gpu ${CHUNK}`, 9, [prompt(CHUNK, 1)], (g, input, caches) => g.multiSequencePrompt.at(-1)!.operation(input, caches, null));
-      step("prefillTail.fiveToEight 6", 5, [prompt(6, 2)], (g, input, caches) => new MlxPhaseDispatch(g).prompt("tail", 1, 5)(input, caches, null));
-      step("prefillTail.wider 13", 9, [prompt(13, 3)], (g, input, caches) => new MlxPhaseDispatch(g).prompt("tail", 1, 9)(input, caches, null));
-      step("verify.fiveToEight 8", 5, [prompt(8, 4)], (g, input, caches) => g.verify[5]!(input, caches, null));
-      step("verify.wider 12", 9, [prompt(12, 5)], (g, input, caches) => g.verify[9]!(input, caches, null));
+      step("prefillTail.fiveToEight 6", 6, [prompt(6, 2)], (g, input, caches) => new MlxPhaseDispatch(g).prompt("tail", 1, 6)(input, caches, null));
+      step("prefillTail.wider 13", 13, [prompt(13, 3)], (g, input, caches) => new MlxPhaseDispatch(g).prompt("tail", 1, 13)(input, caches, null));
+      step("verify.fiveToEight 8", 8, [prompt(8, 4)], (g, input, caches) => g.verify[8]!(input, caches, null));
+      step("verify.wider 12", 12, [prompt(12, 5)], (g, input, caches) => g.verify[12]!(input, caches, null));
     } finally { disposeAll(mine, theirs); }
   }, 180_000);
 }
