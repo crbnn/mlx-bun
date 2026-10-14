@@ -26,8 +26,6 @@ import { DRAFT_VOCAB_FILE, readDraftVocabulary } from "../../artifacts/draft-voc
 import { runtimeValue } from "../../runtime/config";
 import { applyMinP, applyTopK, applyTopP, stepKey, toLogprobs, type SamplerOptions } from "../../sampling/index";
 
-export { DRAFT_VOCAB_FILE };
-
 export interface QuantizedHeadState {
   readonly w: MlxArray;
   readonly scales: MlxArray;
