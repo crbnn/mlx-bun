@@ -45,3 +45,47 @@ export function loraInputDropout(x: MlxArray, p: number, seed: number, id: numbe
   for (const a of [u, pArr, keep, scaleX, zeroX, mask]) a.dispose();
   return xd;
 }
+
+/** Adapter delta after any projection. Borrows x and consumes the projection
+ * output, returning its owned replacement (or the same handle with no delta).
+ * Request routing sets the shared active state before the operation runs. */
+export class LoraDelta {
+  adapters: Map<string, LoraWeights> | null = null;
+  loraState: LoraState | null = null;
+  dropoutId = 0;
+
+  forward(x: MlxArray, out: MlxArray): MlxArray {
+    // LoRA residual — composition is mlx-lm LoRALinear / optiq apply.py:
+    //   y + (scale · ((x @ A) @ B)).astype(x.dtype)
+    // (optiq mount.py omits the astype, leaking the f32 residual into the
+    // bf16 stream; the
+    // cast form is what the adapters were trained behind.)
+    const st = this.loraState;
+    if (st && st.active.length > 0 && this.adapters && this.adapters.size > 0) {
+      // Training-only LoRA-input dropout (PEFT applies dropout to x before A;
+      // the base quantized path is untouched). Keyed by (seed, dropoutId) so the
+      // backward recompute reproduces the exact mask.
+      let xLora = x;
+      let xDrop: MlxArray | null = null;
+      if (st.dropoutSeed !== null && st.dropoutRate > 0) {
+        xDrop = loraInputDropout(x, st.dropoutRate, st.dropoutSeed, this.dropoutId);
+        xLora = xDrop;
+      }
+      for (const id of st.active) {
+        const lw = this.adapters.get(id);
+        if (!lw) continue;
+        const xa = ops.matmul(xLora, lw.a);
+        const z = ops.matmul(xa, lw.b);
+        xa.dispose();
+        const zs = ops.mulScalar(z, lw.scale);
+        z.dispose();
+        const zc = zs.astype(x.dtype);
+        zs.dispose();
+        const previous = out; out = ops.add(out, zc); previous.dispose();
+        zc.dispose();
+      }
+      xDrop?.dispose();
+    }
+    return out;
+  }
+}

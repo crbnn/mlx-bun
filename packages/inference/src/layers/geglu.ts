@@ -78,3 +78,39 @@ export class GegluMLP {
     return out;
   }
 }
+
+/** Plain GeGLU consumes both activation inputs. */
+export class PlainGeglu {
+  forward(gate: MlxArray, up: MlxArray): MlxArray {
+    using act = ops.geluApprox(gate);
+    const out = ops.mul(act, up);
+    gate.dispose(); up.dispose();
+    return out;
+  }
+}
+
+/** Compiled GeGLU consumes both activation inputs. */
+export class CompiledGeglu {
+  forward(gate: MlxArray, up: MlxArray): MlxArray {
+    const out = compiledGeglu(gate, up);
+    gate.dispose(); up.dispose();
+    return out;
+  }
+}
+
+export class PlainGegluMLP {
+  readonly #activation = new PlainGeglu();
+  constructor(readonly base: GegluMLP) {}
+  forward(x: MlxArray): MlxArray {
+    using hidden = this.#activation.forward(this.base.gate.forward(x), this.base.up.forward(x));
+    return this.base.down.forward(hidden);
+  }
+}
+export class CompiledGegluMLP {
+  readonly #activation = new CompiledGeglu();
+  constructor(readonly base: GegluMLP) {}
+  forward(x: MlxArray): MlxArray {
+    using hidden = this.#activation.forward(this.base.gate.forward(x), this.base.up.forward(x));
+    return this.base.down.forward(hidden);
+  }
+}
