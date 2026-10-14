@@ -118,6 +118,7 @@ export class Attention {
     hasKv = true,
     /** How a donor layer reads its cache (the cache's own read). */
     readonly reads: Gemma4ReadStrategy = gemma4CacheRead,
+    kEqV?: boolean,
   ) {
     const t = config.text;
     this.hasKv = hasKv;
@@ -125,7 +126,7 @@ export class Attention {
     this.windowSize = t.slidingWindow;
     this.headDim = this.isSliding ? t.headDim : t.globalHeadDim;
     this.nHeads = t.numAttentionHeads;
-    this.useKEqV = t.attentionKEqV && !this.isSliding;
+    this.useKEqV = kEqV ?? (t.attentionKEqV && !this.isSliding);
     this.nKvHeads = this.useKEqV ? t.numGlobalKeyValueHeads : t.numKeyValueHeads;
 
     const rp = t.ropeParameters[this.isSliding ? "sliding_attention" : "full_attention"]!;

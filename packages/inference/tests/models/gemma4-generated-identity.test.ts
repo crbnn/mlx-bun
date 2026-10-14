@@ -263,9 +263,30 @@ for (const c of COMPOSITIONS) {
         both("decode after", model, generic, mine, theirs, [[19]]);
       } finally { disposeAll(mine, theirs); }
     }, 120_000);
+
+    if (c.stem !== "gemma4-26b") test(`${c.stem}: the literal plain trace preserves compiled decode logits and cache`, async () => {
+      const { model, generic } = await pair();
+      const compiled = model as Graph & { compiledDecodeStep(): MlxCompiledDecodeStep; releaseCompiledDecode(): void };
+      const control = generic as Graph & { compiledDecodeStep(): MlxCompiledDecodeStep; releaseCompiledDecode(): void };
+      const mine = model.makeCache(), theirs = generic.makeCache();
+      try {
+        both("compiled prefix", model, generic, mine, theirs, [prompt(37, 9)]);
+        const left = compiled.compiledDecodeStep(), right = control.compiledDecodeStep();
+        for (const token of [200, 201, 202]) {
+          using raw = ops.fromInt32([token], [1]);
+          using id = raw.astype(Dtype.uint32);
+          const candidate = left.step(id, mine), expected = right.step(id, theirs);
+          ops.evalAll([candidate.logits, ...candidate.evalWith]); ops.evalAll([expected.logits, ...expected.evalWith]);
+          try { maxDiff(candidate.logits, expected.logits, `${c.stem} compiled logits`); stateDiff(`${c.stem} compiled state`, mine, theirs); }
+          finally { candidate.logits.dispose(); expected.logits.dispose(); }
+        }
+      } finally { compiled.releaseCompiledDecode(); control.releaseCompiledDecode(); disposeAll(mine, theirs); }
+    }, 120_000);
   });
 }
 
 import type { MlxCacheLayer } from "../../src/contracts/mlx/graph";
 
 import { bindGraphCaches } from "../../src/models/cache-composition";
+
+import type { MlxCompiledDecodeStep } from "../../src/contracts/mlx/graph";

@@ -10,23 +10,23 @@ import { Attention, Router, SwitchGLU, SortedSwitchGLU, UnsortedSwitchGLU, Fixed
 import { disposing } from "../../layers/helpers";
 
 export class SlidingAttention extends Attention {
-  constructor(weights: Weights, config: ModelConfig, prefix: string) { super(weights, config, prefix, "sliding_attention", true); }
+  constructor(weights: Weights, config: ModelConfig, prefix: string) { super(weights, config, prefix, "sliding_attention", true, undefined, false); }
   override forward(x: MlxArray, cache: Cache | null, phase: Gemma4Phase, _donor: DonorRead | null) { return this.forwardSeparate(x, cache!, phase); }
 }
 export class FullAttention extends Attention {
-  constructor(weights: Weights, config: ModelConfig, prefix: string) { super(weights, config, prefix, "full_attention", true); }
+  constructor(weights: Weights, config: ModelConfig, prefix: string) { super(weights, config, prefix, "full_attention", true, undefined, false); }
   override forward(x: MlxArray, cache: Cache | null, phase: Gemma4Phase, _donor: DonorRead | null) { return this.forwardSeparate(x, cache!, phase); }
 }
 export class FullKEqVAttention extends Attention {
-  constructor(weights: Weights, config: ModelConfig, prefix: string) { super(weights, config, prefix, "full_attention", true); }
+  constructor(weights: Weights, config: ModelConfig, prefix: string) { super(weights, config, prefix, "full_attention", true, undefined, true); }
   override forward(x: MlxArray, cache: Cache | null, phase: Gemma4Phase, _donor: DonorRead | null) { return this.forwardKEqV(x, cache!, phase); }
 }
 export class SharedSlidingAttention extends Attention {
-  constructor(weights: Weights, config: ModelConfig, prefix: string) { super(weights, config, prefix, "sliding_attention", false); }
+  constructor(weights: Weights, config: ModelConfig, prefix: string) { super(weights, config, prefix, "sliding_attention", false, undefined, false); }
   override forward(x: MlxArray, _cache: Cache | null, _phase: Gemma4Phase, donor: DonorRead | null) { return this.forwardShared(x, donor!); }
 }
 export class SharedFullAttention extends Attention {
-  constructor(weights: Weights, config: ModelConfig, prefix: string) { super(weights, config, prefix, "full_attention", false); }
+  constructor(weights: Weights, config: ModelConfig, prefix: string) { super(weights, config, prefix, "full_attention", false, undefined, false); }
   override forward(x: MlxArray, _cache: Cache | null, _phase: Gemma4Phase, donor: DonorRead | null) { return this.forwardShared(x, donor!); }
 }
 
@@ -54,11 +54,15 @@ export class GemmaLayerWeights {
     this.mlp = new GemmaMlpWeights(weights, config, `${prefix}.mlp`);
   }
   forwardAttn(x: MlxArray, cache: Cache | null, phase: Gemma4Phase, donor: DonorRead | null): { h: MlxArray; donor: DonorRead | null } {
-    using normed = this.inputNorm.forward(x);
-    const { out, donor: made } = this.attn.forward(normed, cache, phase, donor);
-    using projected = out;
-    using hidden = this.postAttnNorm.forward(projected);
-    return { h: ops.add(x, hidden), donor: made };
+    const normed = this.inputNorm.forward(x);
+    let result: { out: MlxArray; donor: DonorRead | null };
+    try { result = this.attn.forward(normed, cache, phase, donor); } finally { normed.dispose(); }
+    let hidden = result.out;
+    try {
+      hidden = disposing(hidden, this.postAttnNorm.forward(hidden));
+      hidden = disposing(hidden, ops.add(x, hidden));
+      return { h: hidden, donor: result.donor };
+    } catch (error) { hidden.dispose(); result.donor?.dispose(); throw error; }
   }
   scaled(x: MlxArray): MlxArray { return disposing(x, ops.mul(x, this.layerScalar)); }
 }
@@ -108,10 +112,11 @@ export class GemmaDenseLayer {
   get layerType(): string { return this.weights.layerType; }
   forwardAttn(x: MlxArray, cache: Cache | null, phase: Gemma4Phase, donor: DonorRead | null) { return this.weights.forwardAttn(x, cache, phase, donor); }
   feedforward(h: MlxArray): MlxArray {
-    using normed = this.weights.preFfNorm.forward(h);
-    using feedforward = this.mlp.forward(normed);
-    using projected = this.weights.postFfNorm.forward(feedforward);
-    return this.weights.scaled(ops.add(h, projected));
+    let feedforward = this.weights.preFfNorm.forward(h);
+    feedforward = disposing(feedforward, this.mlp.forward(feedforward));
+    feedforward = disposing(feedforward, this.weights.postFfNorm.forward(feedforward));
+    const output = ops.add(h, feedforward); feedforward.dispose();
+    return this.weights.scaled(output);
   }
   forward(x: MlxArray, cache: Cache | null, phase: Gemma4Phase, donor: DonorRead | null, _input: MlxArray | null = null) {
     const { h, donor: made } = this.forwardAttn(x, cache, phase, donor);
@@ -126,10 +131,11 @@ export class GemmaInputLayer {
   get layerType(): string { return this.weights.layerType; }
   forwardAttn(x: MlxArray, cache: Cache | null, phase: Gemma4Phase, donor: DonorRead | null) { return this.weights.forwardAttn(x, cache, phase, donor); }
   feedforward(h: MlxArray, input: MlxArray): MlxArray {
-    using normed = this.weights.preFfNorm.forward(h);
-    using feedforward = this.mlp.forward(normed);
-    using projected = this.weights.postFfNorm.forward(feedforward);
-    return this.weights.scaled(this.weights.perLayerGated(ops.add(h, projected), input));
+    let feedforward = this.weights.preFfNorm.forward(h);
+    feedforward = disposing(feedforward, this.mlp.forward(feedforward));
+    feedforward = disposing(feedforward, this.weights.postFfNorm.forward(feedforward));
+    const output = ops.add(h, feedforward); feedforward.dispose();
+    return this.weights.scaled(this.weights.perLayerGated(output, input));
   }
   forward(x: MlxArray, cache: Cache | null, phase: Gemma4Phase, donor: DonorRead | null, input: MlxArray | null) {
     const { h, donor: made } = this.forwardAttn(x, cache, phase, donor);
