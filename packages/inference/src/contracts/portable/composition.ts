@@ -69,23 +69,12 @@ export interface Composition {
    * tail. Its per-prompt halving for a graph with a bounded prefill workspace
    * is the planner's business and does not change what the composition built. */
   readonly prefillChunkTokens: number;
-  /** LoRA adapters are mounted when the model loads. */
-  readonly adapters: boolean;
   /** The most rows one forward carries (`--batch`, mlx-lm's `--batch-size`). */
   readonly maxRows: number;
-  /** The groups of a mixed forward share one MLP pass (default on); off, each
-   * group runs its own. */
-  readonly packedMixedMlp: boolean;
   /** A decode step whose live rows are all plain greedy samples them with one
    * argmax over the batch instead of one sampler call per row (default on): the
    * same per-row arithmetic in one graph. Off, every row samples alone. */
   readonly vectorGreedySampling: boolean;
-  /** A lone ordinary row decodes through the graph's compiled step where the
-   * graph builds one (default on). The step is bit-identical to the ordinary
-   * decode forward over every cache lego that has a compiled form; off, every
-   * row decodes through the forward. Direct pages have none (`pagedKv.direct`),
-   * so their composition resolves it off. */
-  readonly compiledDecode: boolean;
   /** One forward carries a decode group and a prefill group where the graph
    * declares mixed rows (default off). */
   readonly mixedPrefill: boolean;
@@ -102,27 +91,16 @@ export interface Composition {
    * coupled draw (default off). The draft moves acceptance and draft cost, not
    * the output distribution (see `generation/speculative/draft-policy`). */
   readonly greedyDraft: boolean;
-  /** The GeGLU activations (and a Gemma head's logit softcap) run the compiled
-   * closures, the reference's `mx.compile`d geglu and softcap (default on); off,
-   * the spelled-out ops, which compute the same bits. */
-  readonly compiledGeglu: boolean;
-  /** The SwiGLU activations run the compiled closure, mlx-lm's `mx.compile`d
-   * swiglu (default on); off, separate silu and multiply kernels. */
-  readonly compiledSwiglu: boolean;
 }
 
 /** The value of each composition fact a caller leaves unstated: what
  * `resolveComposition` resolves, and what a graph built without a record runs. */
 export const COMPOSITION_DEFAULTS = Object.freeze({
   pagedKv: null,
-  packedMixedMlp: true,
   vectorGreedySampling: true,
-  compiledDecode: true,
   mixedPrefill: false,
   mixedTokenBudget: 256,
   prefillTailSplit: true,
   grammarJump: false,
   greedyDraft: false,
-  compiledGeglu: true,
-  compiledSwiglu: true,
 } satisfies Partial<Composition>);

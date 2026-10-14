@@ -23,19 +23,22 @@ export interface MlxTokenGraph extends MlxDeclaredGraph, Partial<MlxTokenPhases>
   makeCache(): Cache[];
   /** The vision prefill phase over a prompt's prepared embeddings (borrowed), for
    *  direct generation: image tokens attending each other both ways where
-   *  `imageMask` marks them, `ids` feeding per-layer inputs; `width` is the class
+   *  `imageMask` marks them, `ids` feeding per-layer inputs; `width` is the actual number
    *  of the prompt's rows. */
   prefillEmbeddings?(embeddings: MlxArray, state: Cache[], imageMask: MlxArray | null,
     ids: MlxArray, multimodalMask: MlxArray | null, width: number): MlxArray;
 }
 
+/** Exact table extent for an unconfigured scheduler. */
+export const DEFAULT_PHASE_ROWS = DEFAULT_MAX_ROWS * PREFILL_CHUNK_TOKENS;
+
 /** Materialize the exact row keys the caller's scheduler can supply. */
-export function rowTable<Operation>(operation: Operation, rows: number = DEFAULT_MAX_ROWS * PREFILL_CHUNK_TOKENS): MlxRowTable<Operation> {
+export function rowTable<Operation>(operation: Operation, rows: number = DEFAULT_PHASE_ROWS): MlxRowTable<Operation> {
   return Object.freeze(Object.fromEntries(Array.from({ length: rows }, (_, i) => [i + 1, operation])));
 }
 
 /** Generic graphs bind their row-specific operations once, before execution. */
-export function rowTableFrom<Operation>(build: (rows: number) => Operation, rows: number = DEFAULT_MAX_ROWS * PREFILL_CHUNK_TOKENS): MlxRowTable<Operation> {
+export function rowTableFrom<Operation>(build: (rows: number) => Operation, rows: number = DEFAULT_PHASE_ROWS): MlxRowTable<Operation> {
   return Object.freeze(Object.fromEntries(Array.from({ length: rows }, (_, i) => [i + 1, build(i + 1)])));
 }
 

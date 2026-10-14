@@ -16,7 +16,7 @@ function compositionWire(composition: Composition): unknown {
  * supply a binding explicitly and need no forward/makeCache methods. */
 export async function modelServingBinding(context: LoadedModelContext, supplied?: ModelBinding): Promise<ModelBinding> {
   if (supplied) return supplied;
-  const [{ declaredGraph, embeddingDeclarationFor }, { embedMany, embeddingTerminatorId, isEmbeddingModel }, { bindMlxGateway }, { MLX_VERSION, deviceArchitecture }, ops, { sequenceHiddenOperation }] = await Promise.all([
+  const [{ declaredGraph, embeddingDeclarationFor }, { embedMany, embeddingTerminatorId, isEmbeddingModel }, { bindMlxGateway }, { MLX_VERSION, deviceArchitecture }, ops, { sequenceHiddenOperation, sequenceLogitsOperation }] = await Promise.all([
     import("@mlx-bun/inference/models"), import("@mlx-bun/inference/embeddings"),
     import("@mlx-bun/inference/execution"), import("@mlx-bun/mlx/ffi"), import("@mlx-bun/mlx/ops"), import("@mlx-bun/inference/scoring"),
   ]);
@@ -43,7 +43,7 @@ export async function modelServingBinding(context: LoadedModelContext, supplied?
         let hidden;
         try { hidden = sequenceHiddenOperation(scoring, input, caches, ids.length); } finally { input.dispose(); }
         let logits;
-        try { logits = model.logitsFromHidden(hidden); } finally { hidden.dispose(); }
+        try { logits = sequenceLogitsOperation(model, hidden); } finally { hidden.dispose(); }
         let f: Float32Array;
         let vocab: number;
         try {

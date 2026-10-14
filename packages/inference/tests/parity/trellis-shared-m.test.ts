@@ -1,3 +1,5 @@
+import { testGraph } from "../models/test-composition";
+import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
 // Opt-in real packed Qwen artifact; no timing, oracle startup or downloads.
 // MLX_BUN_TEST_TRELLIS_MODEL selects it; AB_VARIANT/AB_BASELINE retain main defaults.
 // TrellisLinear passes one decode variant, so this test builds the variants it
@@ -78,7 +80,7 @@ test.skipIf(!artifact)("shared-M kernels preserve full Qwen logits, recurrent st
 
   const weights = await Weights.open(artifact!);
   const config = await loadModelConfig(artifact!);
-  const model = new Qwen35Model(weights, config, resolveComposition(config));
+  const model = testGraph(new Qwen35Model(weights, config, phaseRowLimit(resolveComposition(config))), resolveComposition(config));
   const loaded = model.layers.map((layer) => layer.mlp);
   const installed = new Map<number, ReturnType<typeof variantMlp>[]>();
   const install = (variant: number) => {

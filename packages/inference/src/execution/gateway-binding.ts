@@ -1,3 +1,4 @@
+import { pagedDecodeCompiles } from "../state/layout";
 import { speculativePrefixNamespace, captureSpeculativeOptions } from "../generation/speculative/cache-identity";
 import { createOrdinaryContinuationRequest } from "./continuation-request";
 import type { ExecutionContext } from "../contracts/portable/scheduling";
@@ -167,7 +168,7 @@ export function bindMlxGateway(model: MlxTokenGraph,
         // masks come from the shared sampler, so no graph qualifies or declines
         // them. Denoising samples canvases, which an AR token mask cannot apply to.
         grammarBatch: !denoising,
-      }, { fill: !!options.fill, compiledDecode: facts.compiledDecode, grammarJump: facts.grammarJump });
+      }, { fill: !!options.fill, compiledDecode: (!model.composition?.pagedKv || pagedDecodeCompiles(model.composition.pagedKv, model.composition.kv)), grammarJump: facts.grammarJump });
     },
     createBatchGroup: (options) => new MlxBatchExecutionGroup(model, options),
   };

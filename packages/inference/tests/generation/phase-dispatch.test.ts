@@ -92,3 +92,21 @@ test("prepared embedding dispatch selects total rows and preserves every borrowe
   expect(binding.prefillEmbeddings!(embeddings,state,imageMask,ids,multimodalMask,40)).toBe(embeddings);
   expect(calls).toEqual([["narrow",embeddings,state,imageMask,ids,multimodalMask],["wide",embeddings,state,imageMask,ids,multimodalMask]]);
 });
+
+test("literal row tables can reuse one operation, alternate operations, or declare eight distinct operations",()=>{
+  const shared=op("shared"),odd=op("odd"),even=op("even");
+  const one=op("one"),two=op("two"),three=op("three"),four=op("four"),five=op("five"),six=op("six"),seven=op("seven"),eight=op("eight");
+  const uniform={1:shared,2:shared,3:shared,4:shared,5:shared,6:shared,7:shared,8:shared};
+  const alternating={1:odd,2:even,3:odd,4:even,5:odd,6:even,7:odd,8:even};
+  const distinct={1:one,2:two,3:three,4:four,5:five,6:six,7:seven,8:eight};
+  const rows=[1,2,3,4,5,6,7,8];
+  const repeated=new MlxPhaseDispatch({...graph(),decode:uniform});
+  const parity=new MlxPhaseDispatch({...graph(),decode:alternating});
+  const individual=new MlxPhaseDispatch({...graph(),decode:distinct});
+  expect(rows.map(row=>repeated.decode(row))).toEqual([shared,shared,shared,shared,shared,shared,shared,shared]);
+  expect(rows.map(row=>parity.decode(row))).toEqual([odd,even,odd,even,odd,even,odd,even]);
+  expect(rows.map(row=>individual.decode(row))).toEqual([one,two,three,four,five,six,seven,eight]);
+  expect(parity.decode(3)).toBe(parity.decode(7));
+  expect(parity.decode(2)).toBe(parity.decode(8));
+  expect(individual.decode(2)).not.toBe(individual.decode(3));
+});

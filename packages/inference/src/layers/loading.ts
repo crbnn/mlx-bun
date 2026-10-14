@@ -26,10 +26,10 @@ export type AnyLinear = QuantizedLinear | DenseLinear | TrellisLinear;
  *  bf16/f16/f32. Both flavors carry the optional ADDITIVE
  *  `.bias` term (qwen2 qkv, starcoder2, …). */
 export function loadLinear(
-  weights: Weights, path: string, config: ModelConfig, audit: WeightAudit,
+  weights: Weights, path: string, config: ModelConfig, audit: WeightAudit, representations?: import("../kernels/trellis/index").TrellisRepresentations,
 ): AnyLinear {
   if (TrellisLinear.isTrellis(config, path)) {
-    const lin = TrellisLinear.load(weights, path, config);
+    const lin = TrellisLinear.load(weights, path, config, false, representations);
     audit.use(`${path}.weight`);
     audit.use(`${path}.scales`);
     return lin;

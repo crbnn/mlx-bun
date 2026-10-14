@@ -13,3 +13,9 @@ export * from "./graph";
 export * from "./cache-composition";
 export * from "./capabilities";
 export * from "./media-input";
+
+export { bindGraphCaches, composeGraphCaches } from "./cache-composition";
+
+export { Qwen35WideModel } from "./qwen/qwen3_5-wide";
+
+export { UniversalDenseWideModel } from "./universal/dense-wide";

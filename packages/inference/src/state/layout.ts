@@ -273,3 +273,5 @@ export function createKvMaintenance(kv: KvStorageScheme): KvMaintenance {
 function routeStorage(cache: Cache[]): void {
   for (let layer = 0; layer < cache.length; layer++) cache[layer] = released(cache[layer]!).row;
 }
+
+export { pagedDecodeCompiles } from "./paged/cache";

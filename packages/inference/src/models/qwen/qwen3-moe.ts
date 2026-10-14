@@ -1,5 +1,4 @@
-import { bindGraphCaches } from "../cache-composition";
-import type { MlxCacheLayer, MlxMixedRange } from "../../contracts/mlx/graph";
+import type { MlxCacheLayer, MlxMixedRange, MlxSequenceRange } from "../../contracts/mlx/graph";
 // Concrete model graph for Qwen3-MoE (model_type `qwen3_moe`,
 // Qwen3MoeForCausalLM). A STRAIGHT op-for-op transcription of the oracle
 // (`mlx_lm/models/qwen3_moe.py` +
@@ -25,18 +24,13 @@ import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import { disposing } from "../../layers/helpers";
 import { compiledSwiglu } from "../../layers/swiglu";
-import { isCompiledTrace } from "../../runtime/compiled-trace";
-import { composedFullAttentionCache } from "../../state/bf16-first-kv";
-import type { Composition } from "../../contracts/portable/composition";
-import { AttentionMasks } from "../../state/attention-read";
-import { denseTurboQuantKernels } from "../../state/turboquant-attention";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import type { MlxRowTable, MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPromptRange, MlxTokenPhases, MlxVerifyForward } from "../../contracts/mlx/graph";
 import { declareGraph } from "../capabilities";
-import { phaseRowLimit,  rowTable, type ReadPhase  } from "../graph";
+import { DEFAULT_PHASE_ROWS, rowTableFrom, rowTable, type ReadPhase   } from "../graph";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
-import { QuantizedLinear } from "../../layers/quantized-linear";
+import { QuantizedLinear, QuantizedLinearPlain } from "../../layers/quantized-linear";
 import { QuantizedSwitchLinear } from "../../layers/quantized-switch-linear";
 import { RMSNorm } from "../../layers/normalization";
 import { type Cache } from "../../contracts/mlx/cache";
@@ -53,18 +47,25 @@ class MLP {
   readonly upProj: QuantizedLinear;
   readonly downProj: QuantizedLinear;
 
+  readonly #gate: QuantizedLinearPlain;
+  readonly #up: QuantizedLinearPlain;
+  readonly #down: QuantizedLinearPlain;
+
   constructor(weights: Weights, config: ModelConfig, prefix: string) {
     this.gateProj = QuantizedLinear.load(weights, `${prefix}.gate_proj`, config); // nn.Linear(dim, hidden_dim, bias=False)
     this.upProj = QuantizedLinear.load(weights, `${prefix}.up_proj`, config);
     this.downProj = QuantizedLinear.load(weights, `${prefix}.down_proj`, config);
+    this.#gate = new QuantizedLinearPlain(this.gateProj);
+    this.#up = new QuantizedLinearPlain(this.upProj);
+    this.#down = new QuantizedLinearPlain(this.downProj);
   }
 
   forward(x: MlxArray): MlxArray {
-    const g = this.gateProj.forward(x);                                // self.gate_proj(x)
-    const u = this.upProj.forward(x);                                  // self.up_proj(x)
+    const g = this.#gate.forward(x);                                // self.gate_proj(x)
+    const u = this.#up.forward(x);                                  // self.up_proj(x)
     const s = compiledSwiglu(g, u);                                    // swiglu(gate, x)  (mx.compile)
     g.dispose(); u.dispose();
-    const y = this.downProj.forward(s); s.dispose();                  // self.down_proj(...)
+    const y = this.#down.forward(s); s.dispose();                  // self.down_proj(...)
     return y;
   }
 }
@@ -72,7 +73,7 @@ class MLP {
 // ── switch_layers.py SwitchGLU (swiglu activation, quantized experts) ─────────
 // The three per-expert projections are the stacked switch_mlp.{gate,up,down}_proj
 // tensors; the activation is the SAME @mx.compile swiglu as activations.py.
-class SwitchGLU {
+export class Qwen3SwitchWeights {
   readonly gateProj: QuantizedSwitchLinear;
   readonly upProj: QuantizedSwitchLinear;
   readonly downProj: QuantizedSwitchLinear;
@@ -82,61 +83,53 @@ class SwitchGLU {
     this.upProj = QuantizedSwitchLinear.load(weights, `${prefix}.up_proj`, config);
     this.downProj = QuantizedSwitchLinear.load(weights, `${prefix}.down_proj`, config);
   }
+}
 
-  /** x [B, L, H], indices [B, L, k] → [B, L, k, H]. */
+interface ExpertForward { forward(x: MlxArray, indices: MlxArray): MlxArray }
+
+/** Gather projections over the original token order. */
+export class Qwen3UnsortedExperts implements ExpertForward {
+  constructor(readonly weights: Qwen3SwitchWeights) {}
   forward(x: MlxArray, indices: MlxArray): MlxArray {
-    // x = mx.expand_dims(x, (-2, -3))  → [B, L, 1, 1, H]
-    let h = ops.expandDims(x, -2);
-    h = disposing(h, ops.expandDims(h, -3));
-
-    // do_sort = indices.size >= 64
-    const doSort = indices.size >= 64;
-    let idx = indices;
-    let invOrder: MlxArray | null = null;
-    let order: MlxArray | null = null;
-    if (doSort) {
-      // _gather_sort(x, indices): flatten indices, argsort → order, argsort(order) →
-      // inv_order, gather rows by order // M (M = k = last dim of indices).
-      const M = indices.shape[indices.ndim - 1]!;                      // *_, M = indices.shape
-      const idxFlat = ops.reshape(indices, [indices.size]);           // indices.flatten()
-      order = ops.argsortAxis(idxFlat, 0);                            // order = mx.argsort(indices)
-      invOrder = ops.argsortAxis(order, 0);                          // inv_order = mx.argsort(order)
-      const mScalar = ops.scalarLike(M, order);
-      const rowIdx = ops.floorDivide(order, mScalar);                // order // M
-      mScalar.dispose();
-      const [, , , , H] = h.shape as number[];
-      const flat = ops.reshape(h, [-1, 1, H!]);                      // x.flatten(0, -3)
-      h.dispose();
-      h = ops.takeAxis(flat, rowIdx, 0);                             // x.flatten(0,-3)[order // M]
-      flat.dispose(); rowIdx.dispose();
-      idx = ops.takeAxis(idxFlat, order, 0);                         // indices[order]
-      idxFlat.dispose();
-    }
-    // (self.training path — mx.stop_gradient(idx) — is inference-irrelevant here)
-    const xUp = this.upProj.forward(h, idx, doSort);                  // x_up = self.up_proj(x, idx, sorted_indices=do_sort)
-    const xGate = this.gateProj.forward(h, idx, doSort);             // x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
-    h.dispose();
-    // self.activation(x_up, x_gate) == SwiGLU()(x_up, x_gate) == swiglu(x_gate, x_up)
-    // (SwiGLU.__call__(self, x, gate) returns swiglu(gate, x); called (x_up, x_gate)).
-    const mid = compiledSwiglu(xGate, xUp);                           // swiglu(gate=x_gate, x=x_up)  (mx.compile)
-    xGate.dispose(); xUp.dispose();
-    let y = this.downProj.forward(mid, idx, doSort);                 // x = self.down_proj(activation, idx, sorted_indices=do_sort)
-    mid.dispose();
-    if (idx !== indices) idx.dispose();
-
-    if (doSort) {
-      // _scatter_unsort(x, inv_order, indices.shape): x[inv_order], unflatten to
-      // indices.shape (+ the trailing [1, H] the squeeze(-2) below removes).
-      y = disposing(y, ops.takeAxis(y, invOrder!, 0));               // x = x[inv_order]
-      invOrder!.dispose(); order!.dispose();
-      const [B, L, k] = indices.shape as number[];
-      const H = y.shape[y.ndim - 1]!;
-      y = disposing(y, ops.reshape(y, [B!, L!, k!, 1, H]));          // mx.unflatten(x, 0, shape)
-    }
-    // return x.squeeze(-2)
-    const shape = y.shape;
+    using rows = ops.expandDims(x, -2);
+    using expanded = ops.expandDims(rows, -3);
+    using up = this.weights.upProj.forward(expanded, indices, false);
+    using gate = this.weights.gateProj.forward(expanded, indices, false);
+    using hidden = compiledSwiglu(gate, up);
+    const output = this.weights.downProj.forward(hidden, indices, false);
+    const shape = output.shape;
     shape.splice(shape.length - 2, 1);
-    return disposing(y, ops.reshape(y, shape));
+    return disposing(output, ops.reshape(output, shape));
+  }
+}
+
+/** Sorted gather followed by the reference inverse permutation. */
+export class Qwen3SortedExperts implements ExpertForward {
+  constructor(readonly weights: Qwen3SwitchWeights) {}
+  forward(x: MlxArray, indices: MlxArray): MlxArray {
+    const topK = indices.shape[indices.ndim - 1]!;
+    using rows = ops.expandDims(x, -2);
+    using expanded = ops.expandDims(rows, -3);
+    using flatIndices = ops.reshape(indices, [indices.size]);
+    using order = ops.argsortAxis(flatIndices, 0);
+    using inverse = ops.argsortAxis(order, 0);
+    using count = ops.scalarLike(topK, order);
+    using rowIndices = ops.floorDivide(order, count);
+    const width = expanded.shape[4]!;
+    using flat = ops.reshape(expanded, [-1, 1, width]);
+    using sortedRows = ops.takeAxis(flat, rowIndices, 0);
+    using sortedIndices = ops.takeAxis(flatIndices, order, 0);
+    using up = this.weights.upProj.forward(sortedRows, sortedIndices, true);
+    using gate = this.weights.gateProj.forward(sortedRows, sortedIndices, true);
+    using hidden = compiledSwiglu(gate, up);
+    using sortedOutput = this.weights.downProj.forward(hidden, sortedIndices, true);
+    using output = ops.takeAxis(sortedOutput, inverse, 0);
+    const [batch, length, selected] = indices.shape;
+    const outputWidth = output.shape[output.ndim - 1]!;
+    using unflattened = ops.reshape(output, [batch!, length!, selected!, 1, outputWidth]);
+    const shape = unflattened.shape;
+    shape.splice(shape.length - 2, 1);
+    return ops.reshape(unflattened, shape);
   }
 }
 
@@ -144,10 +137,12 @@ class SwitchGLU {
 class Qwen3MoeSparseMoeBlock {
   readonly kind = "moe";
   readonly gate: QuantizedLinear;
-  readonly switchMlp: SwitchGLU;
+  readonly switchMlp: Qwen3SwitchWeights;
   readonly numExperts: number;
   readonly topK: number;
   readonly normTopkProb: boolean;
+  readonly #gate: QuantizedLinearPlain;
+  readonly #normalize: (scores: MlxArray) => MlxArray;
 
   constructor(weights: Weights, config: ModelConfig, prefix: string) {
     const t = config.text;
@@ -155,36 +150,30 @@ class Qwen3MoeSparseMoeBlock {
     this.topK = t.topKExperts;                                        // self.top_k
     this.normTopkProb = t.normTopkProb;                              // self.norm_topk_prob
     this.gate = QuantizedLinear.load(weights, `${prefix}.gate`, config); // nn.Linear(dim, num_experts, bias=False)
-    this.switchMlp = new SwitchGLU(weights, config, `${prefix}.switch_mlp`); // SwitchGLU(dim, moe_inter, num_experts)
+    this.switchMlp = new Qwen3SwitchWeights(weights, config, `${prefix}.switch_mlp`); // SwitchGLU(dim, moe_inter, num_experts)
+    this.#gate = new QuantizedLinearPlain(this.gate);
+    this.#normalize = this.normTopkProb ? scores => {
+      using denominator = ops.sumAxis(scores, -1, true);
+      return disposing(scores, ops.div(scores, denominator));
+    } : scores => scores;
   }
 
-  forward(x: MlxArray): MlxArray {
-    let gates = this.gate.forward(x);                                 // gates = self.gate(x)
+  forward(x: MlxArray, experts: ExpertForward): MlxArray {
+    let gates = this.#gate.forward(x);                                 // gates = self.gate(x)
     gates = disposing(gates, ops.softmaxAxis(gates, -1, true));      // gates = mx.softmax(gates, axis=-1, precise=True)
 
     const k = this.topK;
     const [B, L] = gates.shape as [number, number, number];
     // inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
     const part = ops.argpartitionAxis(gates, this.numExperts - k, -1); // argpartition(..., kth=-k)
-    let inds: MlxArray;
-    if (isCompiledTrace()) {
-      const start = ops.fromInt32([this.numExperts - k], [1]);
-      inds = ops.sliceDynamic(part, start, [2], [B, L, k]);
-      start.dispose();
-    } else {
-      inds = part.slice([0, 0, this.numExperts - k], [B, L, this.numExperts]); // [..., -k:]
-    }
+    const inds = part.slice([0, 0, this.numExperts - k], [B, L, this.numExperts]);
     part.dispose();
 
     let scores = ops.takeAlongAxis(gates, inds, -1);                 // scores = mx.take_along_axis(gates, inds, axis=-1)
     gates.dispose();
-    if (this.normTopkProb) {
-      const denom = ops.sumAxis(scores, -1, true);                  // mx.sum(scores, axis=-1, keepdims=True)
-      scores = disposing(scores, ops.div(scores, denom));           // scores /= ...
-      denom.dispose();
-    }
+    scores = this.#normalize(scores);
 
-    const y = this.switchMlp.forward(x, inds);                       // y = self.switch_mlp(x, inds)
+    const y = experts.forward(x, inds);                       // y = self.switch_mlp(x, inds)
     inds.dispose();
     // y = (y * scores[..., None]).sum(axis=-2)
     const sExp = ops.expandDims(scores, -1);                        // scores[..., None]
@@ -217,14 +206,24 @@ class Qwen3MoeDecoderLayer {
       ? new Qwen3MoeSparseMoeBlock(weights, config, `${prefix}.mlp`)
       : new MLP(weights, config, `${prefix}.mlp`);
   }
+}
 
+class FixedMoeBlock {
+  constructor(readonly weights: Qwen3MoeSparseMoeBlock, readonly experts: ExpertForward) {}
+  forward(x: MlxArray): MlxArray { return this.weights.forward(x, this.experts); }
+}
+class Qwen3MoeLayerView {
+  readonly #mlp: MLP | FixedMoeBlock;
+  constructor(readonly base: Qwen3MoeDecoderLayer, Experts: new (weights: Qwen3SwitchWeights) => ExpertForward) {
+    this.#mlp = base.mlp.kind === "dense" ? base.mlp : new FixedMoeBlock(base.mlp, new Experts(base.mlp.switchMlp));
+  }
   forward(x: MlxArray, cache: Cache, phase: ReadPhase): MlxArray {
-    const xn = this.inputLayernorm.forward(x);                       // self.input_layernorm(x)
-    const r1 = this.selfAttn.forward(xn, cache, phase);             // r = self.self_attn(..., mask, cache)
+    const xn = this.base.inputLayernorm.forward(x);                       // self.input_layernorm(x)
+    const r1 = this.base.selfAttn.forward(xn, cache, phase);             // r = self.self_attn(..., mask, cache)
     xn.dispose();
     const h = ops.add(x, r1); r1.dispose();                        // h = x + r
-    const hn = this.postAttentionLayernorm.forward(h);             // self.post_attention_layernorm(h)
-    const r2 = this.mlp.forward(hn); hn.dispose();                 // r = self.mlp(...)
+    const hn = this.base.postAttentionLayernorm.forward(h);             // self.post_attention_layernorm(h)
+    const r2 = this.#mlp.forward(hn); hn.dispose();                 // r = self.mlp(...)
     const out = ops.add(h, r2); h.dispose(); r2.dispose();        // out = h + r
     return out;
   }
@@ -233,8 +232,6 @@ class Qwen3MoeDecoderLayer {
 // ── qwen3_moe.py Qwen3MoeModel + Model ───────────────────────────────────────
 export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
-  /** The served configuration this graph was built for: its KV scheme is what `makeCache` composes. */
-  readonly composition: Composition;
   readonly weightsBytes: number;
   readonly prefixBase = "model";
   readonly loraState = new LoraState();
@@ -245,10 +242,10 @@ export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
   readonly finalNorm: RMSNorm;
   /** Untied lm_head (tie_word_embeddings=false for this family). */
   readonly lmHead: QuantizedLinear | null;
+  readonly #head: (hidden: MlxArray) => MlxArray;
 
-  constructor(weights: Weights, config: ModelConfig, composition: Composition) {
+  constructor(weights: Weights, config: ModelConfig, maxPhaseRows = DEFAULT_PHASE_ROWS) {
     this.config = config;
-    this.composition = composition;
     this.weightsBytes = [...weights.shards.files.values()]
       .reduce((a, f) => a + f.mmap.size, 0);
     this.embed = QuantizedEmbedding.load(weights, "model.embed_tokens", config); // nn.Embedding
@@ -261,19 +258,30 @@ export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
       ? null
       : QuantizedLinear.load(weights, "lm_head", config);           // self.lm_head
 
-    const multiSequencePrompt: MlxCapturingForward = (ids, cache) =>
-    this.forwardLayers(this.embed.encode(ids), cache, "window");
-    this.prompt = [{ from: 1, to: Infinity, operation: multiSequencePrompt }];
+    const head = this.lmHead && new QuantizedLinearPlain(this.lmHead);
+    this.#head = head ? hidden => head.forward(hidden) : hidden => this.embed.asLinear(hidden);
+    const unsorted = this.layers.map(layer => new Qwen3MoeLayerView(layer, Qwen3UnsortedExperts));
+    const sorted = this.layers.map(layer => new Qwen3MoeLayerView(layer, Qwen3SortedExperts));
+    const sortFrom = Math.ceil(64 / config.text.topKExperts);
+    const decodeUnsorted = (ids: MlxArray, cache: Cache[]) => this.forwardLayers(this.embed.encode(ids), cache, "decode", unsorted);
+    const decodeSorted = (ids: MlxArray, cache: Cache[]) => this.forwardLayers(this.embed.encode(ids), cache, "decode", sorted);
+    const windowUnsorted = (ids: MlxArray, cache: Cache[]) => this.forwardLayers(this.embed.encode(ids), cache, "window", unsorted);
+    const windowSorted = (ids: MlxArray, cache: Cache[]) => this.forwardLayers(this.embed.encode(ids), cache, "window", sorted);
+    this.prompt = [{ from: 1, to: sortFrom - 1, operation: windowUnsorted }, { from: sortFrom, to: Infinity, operation: windowSorted }]
+      .filter(range => range.from <= range.to);
     this.multiSequencePrompt = this.prompt;
-    this.appendKnown = rowTable<MlxPhaseForward>((ids, cache) =>
-    this.forwardLayers(this.embed.encode(ids), cache, "window"), phaseRowLimit(composition));
-    this.logits = rowTable<MlxHeadForward>(hidden => this.logitsFromHidden(hidden), phaseRowLimit(composition));
-    this.decode = rowTable<MlxPhaseForward>((ids, cache) =>
-    this.forwardLayers(this.embed.encode(ids), cache, "decode"), phaseRowLimit(composition));
-    this.verify = rowTable<MlxVerifyForward>((ids, cache) =>
-    this.forwardLayers(this.embed.encode(ids), cache, "window"), phaseRowLimit(composition));
+    this.decode = rowTableFrom(rows => rows < sortFrom ? decodeUnsorted : decodeSorted, maxPhaseRows);
+    const windows = rowTableFrom(rows => rows < sortFrom ? windowUnsorted : windowSorted, maxPhaseRows);
+    this.verify = windows;
+    this.logits = rowTable(hidden => this.#head(hidden), maxPhaseRows);
+    const sequence: MlxSequenceRange[] = [
+      { from: 1, to: sortFrom - 1, operation: (ids, cache) => windowUnsorted(ids, cache) },
+      { from: sortFrom, to: Infinity, operation: (ids, cache) => windowSorted(ids, cache) },
+    ];
+    this.sequence = sequence.filter(range => range.from <= range.to);
+    this.appendKnown = this.sequence;
 
-    bindGraphCaches(this, composition);
+    this.cacheLayers = this.layers.map(() => ({kind:"full" as const,turboQuant:"dense" as const}));
   }
 
   loraTargets(): Map<string, QuantizedLinear> {
@@ -290,8 +298,8 @@ export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
         out.set(`${p}.mlp.up_proj`, l.mlp.upProj);
         out.set(`${p}.mlp.down_proj`, l.mlp.downProj);
       }
-      // MoE switch_mlp / gate are QuantizedSwitchLinear (stacked experts) — not
-      // LoRA targets under our per-linear adapter machinery.
+      else out.set(`${p}.mlp.gate`, l.mlp.gate);
+      // Stacked expert weights are separate from the two-dimensional router target.
     }
     return out;
   }
@@ -303,14 +311,9 @@ export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
    * mask per forward, built by the caches). Their TurboQuant read is dense
    * (`denseTurboQuantKernels`): the read decodes keys and values, then runs the
    * fused SDPA. */
-  get cacheLayers(): readonly MlxCacheLayer[] { return this.layers.map(() => ({kind:"full" as const,turboQuant:"dense" as const})); }
+  readonly cacheLayers: readonly MlxCacheLayer[];
+  readonly sequence: readonly MlxSequenceRange[];
 
-  makeCache!: () => Cache[];
-
-  /** The scoring forward (`MlxSequenceForward`): the window read at every width. */
-  sequenceHidden(ids: MlxArray, cache: Cache[], _width: number): MlxArray {
-    return this.forwardLayers(this.embed.encode(ids), cache, "window"); // self.embed_tokens(inputs)
-  }
 
   /** One whole chunk of a prompt; rows are sequences times the chunk size. The GPU is this graph's one unit. */
   readonly prompt: readonly MlxPromptRange[];
@@ -319,7 +322,7 @@ export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
   /** A prompt's positions that are not a whole chunk: the window read at every width. */
 
   /** Known tokens: this graph declares no committed spans, so they read as a window. */
-  readonly appendKnown: MlxRowTable<MlxPhaseForward>;
+  readonly appendKnown: import("../../contracts/mlx/graph").MlxKnownOperations;
 
   /** The one output head at every width. */
   readonly logits: MlxRowTable<MlxHeadForward>;
@@ -332,10 +335,10 @@ export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
   readonly verify: MlxRowTable<MlxCapturingForward>;
 
   /** The decoder over `h0` (consumed), every block reading its cache for `phase`. */
-  protected forwardLayers(h0: MlxArray, cache: Cache[], phase: ReadPhase): MlxArray {
+  protected forwardLayers(h0: MlxArray, cache: Cache[], phase: ReadPhase, layers: readonly Qwen3MoeLayerView[]): MlxArray {
     let cur = h0;
-    for (let i = 0; i < this.layers.length; i++) {                  // for layer, c in zip(self.layers, cache)
-      const next = this.layers[i]!.forward(cur, cache[i]!, phase);  // h = layer(h, mask, c)
+    for (let i = 0; i < layers.length; i++) {                  // for layer, c in zip(self.layers, cache)
+      const next = layers[i]!.forward(cur, cache[i]!, phase);  // h = layer(h, mask, c)
       cur.dispose();
       cur = next;
     }
@@ -343,6 +346,6 @@ export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
   }
 
   logitsFromHidden(h: MlxArray): MlxArray {
-    return this.lmHead ? this.lmHead.forward(h) : this.embed.asLinear(h); // self.lm_head(out)
+    return this.#head(h); // self.lm_head(out)
   }
 }

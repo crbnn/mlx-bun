@@ -1,3 +1,5 @@
+import { testGraph, type TestGraph } from "./test-composition";
+import { phaseRowLimit } from "../../src/models/graph";
 import { MlxPhaseDispatch } from "../../src/generation/phase-dispatch";
 import { bindMlxAutoregressiveGraph } from "../../src/generation/bindings/autoregressive";
 // Written M1 operations on a small synthetic artifact with all 64 quantization
@@ -40,7 +42,7 @@ const tensor = (values: Float32Array, shape: number[], dtype = Dtype.bfloat16): 
   return keep(wide.astype(dtype));
 };
 
-/** The synthetic artifact: every layer laid out as the generated table lists it. */
+/** The synthetic artifact: every layer laid out from the independent artifact layout. */
 function artifact(): { weights: Weights; config: ModelConfig } {
   const tensors = new Map<string, MlxArray>();
   const quant: Record<string, unknown> = { bits: 4, group_size: 64, mode: "affine" };
@@ -128,9 +130,9 @@ function artifact(): { weights: Weights; config: ModelConfig } {
 
 const composition = (overrides: Partial<Composition> = {}): Composition => Object.freeze<Composition>({
   device: "applegpu_g13s", kv: { kind: "bf16" }, pagedKv: null, draftDepth: { adaptive: true, max: 7 },
-  prefillChunkTokens: CHUNK, adapters: false, maxRows: 8, packedMixedMlp: true,
-  vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
-  grammarJump: false, greedyDraft: false, compiledGeglu: true, compiledSwiglu: true, ...overrides,
+  prefillChunkTokens: CHUNK, maxRows: 8,
+  vectorGreedySampling: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
+  grammarJump: false, greedyDraft: false, ...overrides,
 });
 
 /** The KV schemes the composition serves, as `--kv-quant` composes them (fused SDPA unset). */
@@ -214,14 +216,14 @@ const disposeAll = (...sets: Cache[][]) => { for (const set of sets) for (const 
 let synthetic: { weights: Weights; config: ModelConfig } | null = null;
 const source = () => synthetic ??= artifact();
 type BoundM1=Qwen38TrellisM1Max & {makeCache():Cache[]};
-const built = new Map<string, { current: BoundM1; generic: Qwen35Model }>();
-function graphs(scheme: string, overrides: Partial<Composition> = {}): { current: BoundM1; generic: Qwen35Model } {
+const built = new Map<string, { current: BoundM1; generic: TestGraph<Qwen35Model> }>();
+function graphs(scheme: string, overrides: Partial<Composition> = {}): { current: BoundM1; generic: TestGraph<Qwen35Model> } {
   const key = `${scheme} ${JSON.stringify(overrides)}`;
   let found = built.get(key);
   if (!found) {
     const { weights, config } = source();
     const facts = composition({ kv: SCHEMES[scheme]!, ...overrides });
-    found = { current: bindGraphCaches(new Qwen38TrellisM1Max(weights, config), facts), generic: new Qwen35Model(weights, config, facts) };
+    found = { current: bindGraphCaches(new Qwen38TrellisM1Max(weights, config), facts), generic: testGraph(new Qwen35Model(weights, config, phaseRowLimit(facts)), facts) };
     built.set(key, found);
   }
   return found;
