@@ -475,15 +475,15 @@ export type QwenMlp = TrellisMlp | AffineMlp;
 /** The MLP block the written-down quant table names for `prefix`: Trellis when
  *  its gate, up and down entries are `mode: "trellis"`, affine when none is.
  *  A table that mixes the two in one MLP has no block here and is refused. */
-export function loadQwenMlp(weights: Weights, config: ModelConfig, prefix: string): QwenMlp {
+export function loadQwenMlp(weights: Weights, config: ModelConfig, prefix: string, representations?: import("../../kernels/trellis/index").TrellisRepresentations): QwenMlp {
   const paths = [`${prefix}.gate_proj`, `${prefix}.up_proj`, `${prefix}.down_proj`] as const;
   const trellis = paths.map(path => TrellisLinear.isTrellis(config, path));
   if (trellis.every(Boolean)) {
     // M4 Pro measurements support the 27B down projection at M3/4. The
     // operation also checks variant, dtype and packed-code layout eligibility.
     const sharedScatterCodebook = config.text.hiddenSize === 5120 && config.text.intermediateSize === 17408;
-    return new TrellisMlp(TrellisLinear.load(weights, paths[0], config), TrellisLinear.load(weights, paths[1], config),
-      TrellisLinear.load(weights, paths[2], config, sharedScatterCodebook));
+    return new TrellisMlp(TrellisLinear.load(weights, paths[0], config, false, representations), TrellisLinear.load(weights, paths[1], config, false, representations),
+      TrellisLinear.load(weights, paths[2], config, sharedScatterCodebook, representations));
   }
   if (!trellis.some(Boolean))
     return new AffineMlp(QuantizedLinear.load(weights, paths[0], config), QuantizedLinear.load(weights, paths[1], config),
@@ -500,13 +500,13 @@ export class Qwen3Layer {
   readonly inputNorm: RMSNorm;
   readonly postAttnNorm: RMSNorm;
 
-  constructor(weights: Weights, config: ModelConfig, layerIdx: number) {
+  constructor(weights: Weights, config: ModelConfig, layerIdx: number, representations?: import("../../kernels/trellis/index").TrellisRepresentations) {
     const prefix = `${PREFIX}.model.layers.${layerIdx}`;
     this.isLinear = (layerIdx + 1) % config.text.fullAttentionInterval !== 0;
     if (this.isLinear)
       this.linearAttn = new GatedDeltaNet(weights, config, `${prefix}.linear_attn`);
     else this.selfAttn = new Qwen3Attention(weights, config, `${prefix}.self_attn`);
-    this.mlp = loadQwenMlp(weights, config, `${prefix}.mlp`);
+    this.mlp = loadQwenMlp(weights, config, `${prefix}.mlp`, representations);
     this.inputNorm = new RMSNorm(weights.tensor(`${prefix}.input_layernorm.weight`), config.text.rmsNormEps);
     this.postAttnNorm = new RMSNorm(weights.tensor(`${prefix}.post_attention_layernorm.weight`), config.text.rmsNormEps);
   }

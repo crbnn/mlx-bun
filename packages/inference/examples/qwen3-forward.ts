@@ -1,3 +1,5 @@
+import { bindGraphCaches } from "@mlx-bun/inference/models";
+import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
 import { MlxPhaseDispatch } from "../src/generation/phase-dispatch";
 import { loadModelConfig, Weights } from "@mlx-bun/inference/artifacts";
 import { resolveComposition } from "@mlx-bun/inference";
@@ -13,7 +15,7 @@ export async function forwardTokens(directory: string, promptTokens: number[]) {
   const config = await loadModelConfig(directory);
   const weights = await Weights.open(directory);
   try {
-    const graph = new Qwen3Model(weights, config, resolveComposition(config));
+    const graph = bindGraphCaches(new Qwen3Model(weights, config, phaseRowLimit(resolveComposition(config))), resolveComposition(config));
     const state = graph.makeCache();
     try {
       using prompt = ops.fromInt32(promptTokens, [1, promptTokens.length]);

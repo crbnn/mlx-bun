@@ -1,3 +1,5 @@
+import { testGraph } from "../models/test-composition";
+import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { Weights, loadModelConfig } from "@mlx-bun/inference/artifacts";
@@ -53,7 +55,7 @@ test.skipIf(!artifact || deviceArchitecture() !== "applegpu_g13s")(
     const weights = await Weights.open(artifact!);
     // The generic graph reads each layer's MLP per forward, so the representations below reach it.
     const config = await loadModelConfig(artifact!);
-    const model = new Qwen35Model(weights, config, resolveComposition(config));
+    const model = testGraph(new Qwen35Model(weights, config, phaseRowLimit(resolveComposition(config))), resolveComposition(config));
     expect(model.layers.length).toBe(64);
     expect(model.layers.filter(layer => layer.mlp.gate instanceof TrellisLinear &&
       gateUpCodebookEligible(layer.mlp.gate.geometry, 1, Dtype.bfloat16, 13, deviceArchitecture())).length).toBeGreaterThan(0);

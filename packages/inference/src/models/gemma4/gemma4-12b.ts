@@ -4,7 +4,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
 import type { Cache } from "../../contracts/mlx/cache";
-import type { MlxDeclaredGraph, MlxTokenPhases, MlxRowTable, MlxCapturingForward, MlxHeadForward, MlxPhaseForward, MlxLayerCapture, MlxPromptRange, MlxMixedRange, MlxPhaseGroup, MlxCacheLayer } from "../../contracts/mlx/graph";
+import type { MlxDeclaredGraph, MlxTokenPhases, MlxRowTable, MlxCapturingForward, MlxHeadForward, MlxPhaseForward, MlxKnownOperations, MlxLayerCapture, MlxPromptRange, MlxMixedRange, MlxPhaseGroup, MlxCacheLayer } from "../../contracts/mlx/graph";
 import type { Vision, MediaSidecarProbes } from "../../contracts/mlx/media";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import { RMSNorm } from "../../layers/normalization";
@@ -181,7 +181,7 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
   readonly multiSequencePrompt: readonly MlxPromptRange[];
   readonly decode: MlxRowTable<MlxCapturingForward>;
   readonly verify: MlxRowTable<MlxCapturingForward>;
-  readonly appendKnown: MlxRowTable<MlxPhaseForward>;
+  readonly appendKnown: MlxKnownOperations;
   readonly logits: MlxRowTable<MlxHeadForward>;
   readonly mixed: readonly MlxMixedRange[];
   readonly #l0: GemmaDenseLayer;
@@ -489,7 +489,7 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
     this.multiSequencePrompt = this.prompt;
     this.decode = Object.freeze({ 1: this.#decode, 2: this.#decode, 3: this.#decode, 4: this.#decode, 5: this.#decode, 6: this.#decode, 7: this.#decode, 8: this.#decode });
     this.verify = Object.freeze({ 1: this.#window, 2: this.#window, 3: this.#window, 4: this.#window, 5: this.#window, 6: this.#window, 7: this.#window, 8: this.#window, 9: this.#window, 10: this.#window, 11: this.#window, 12: this.#window, 13: this.#window, 14: this.#window, 15: this.#window, 16: this.#window, 17: this.#window, 18: this.#window, 19: this.#window, 20: this.#window, 21: this.#window, 22: this.#window, 23: this.#window, 24: this.#window, 25: this.#window, 26: this.#window, 27: this.#window, 28: this.#window, 29: this.#window, 30: this.#window, 31: this.#window, 32: this.#window, 33: this.#window, 34: this.#window, 35: this.#window, 36: this.#window, 37: this.#window, 38: this.#window, 39: this.#window, 40: this.#window, 41: this.#window, 42: this.#window, 43: this.#window, 44: this.#window, 45: this.#window, 46: this.#window, 47: this.#window, 48: this.#window, 49: this.#window, 50: this.#window, 51: this.#window, 52: this.#window, 53: this.#window, 54: this.#window, 55: this.#window, 56: this.#window, 57: this.#window, 58: this.#window, 59: this.#window, 60: this.#window, 61: this.#window, 62: this.#window, 63: this.#window, 64: this.#window });
-    this.appendKnown = Object.freeze({ 1: this.#known, 2: this.#known, 3: this.#known, 4: this.#known, 5: this.#known, 6: this.#known, 7: this.#known, 8: this.#known, 9: this.#known, 10: this.#known, 11: this.#known, 12: this.#known, 13: this.#known, 14: this.#known, 15: this.#known, 16: this.#known, 17: this.#known, 18: this.#known, 19: this.#known, 20: this.#known, 21: this.#known, 22: this.#known, 23: this.#known, 24: this.#known, 25: this.#known, 26: this.#known, 27: this.#known, 28: this.#known, 29: this.#known, 30: this.#known, 31: this.#known, 32: this.#known, 33: this.#known, 34: this.#known, 35: this.#known, 36: this.#known, 37: this.#known, 38: this.#known, 39: this.#known, 40: this.#known, 41: this.#known, 42: this.#known, 43: this.#known, 44: this.#known, 45: this.#known, 46: this.#known, 47: this.#known, 48: this.#known, 49: this.#known, 50: this.#known, 51: this.#known, 52: this.#known, 53: this.#known, 54: this.#known, 55: this.#known, 56: this.#known, 57: this.#known, 58: this.#known, 59: this.#known, 60: this.#known, 61: this.#known, 62: this.#known, 63: this.#known, 64: this.#known });
+    this.appendKnown = [{ from: 1, to: Infinity, operation: this.#known }];
     this.logits = Object.freeze({ 1: this.#head, 2: this.#head, 3: this.#head, 4: this.#head, 5: this.#head, 6: this.#head, 7: this.#head, 8: this.#head, 9: this.#head, 10: this.#head, 11: this.#head, 12: this.#head, 13: this.#head, 14: this.#head, 15: this.#head, 16: this.#head, 17: this.#head, 18: this.#head, 19: this.#head, 20: this.#head, 21: this.#head, 22: this.#head, 23: this.#head, 24: this.#head, 25: this.#head, 26: this.#head, 27: this.#head, 28: this.#head, 29: this.#head, 30: this.#head, 31: this.#head, 32: this.#head, 33: this.#head, 34: this.#head, 35: this.#head, 36: this.#head, 37: this.#head, 38: this.#head, 39: this.#head, 40: this.#head, 41: this.#head, 42: this.#head, 43: this.#head, 44: this.#head, 45: this.#head, 46: this.#head, 47: this.#head, 48: this.#head, 49: this.#head, 50: this.#head, 51: this.#head, 52: this.#head, 53: this.#head, 54: this.#head, 55: this.#head, 56: this.#head, 57: this.#head, 58: this.#head, 59: this.#head, 60: this.#head, 61: this.#head, 62: this.#head, 63: this.#head, 64: this.#head });
     this.mixed = Object.freeze([{ from: 1, to: Infinity, operation: this.#mixed }]);
   }

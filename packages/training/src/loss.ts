@@ -1,3 +1,4 @@
+import { sequenceLogitsOperation } from "@mlx-bun/inference/scoring";
 // Training losses: masked cross-entropy (SFT) and DPO.
 //
 // SFT — port of mlx_lm/tuner/trainer.py default_loss:
@@ -131,16 +132,16 @@ export function sftLoss(model: RuntimeModel, batch: SftBatch): MlxArray {
  *  rows' cotangents are exactly zero (slice adjoint), and the internal vjp
  *  then runs at M=4 where the kernel is correct. */
 export function logitsFromHiddenPadM(
-  model: { logitsFromHidden(h: MlxArray): MlxArray },
+  model: object,
   hSpan: MlxArray, // [1, M, hidden]
 ): MlxArray {
   const M = hSpan.shape[1]!;
-  if (M !== 2 && M !== 3) return model.logitsFromHidden(hSpan);
+  if (M !== 2 && M !== 3) return sequenceLogitsOperation(model, hSpan);
   const [B, , H] = hSpan.shape as [number, number, number];
   const pad = ops.zeros([B, 4 - M, H], hSpan.dtype);
   const hPad = ops.concatAxis([hSpan, pad], 1);
   pad.dispose();
-  const lgPad = model.logitsFromHidden(hPad); // [1, 4, V]
+  const lgPad = sequenceLogitsOperation(model, hPad); // [1, 4, V]
   hPad.dispose();
   const start = MlxArray.fromInt32(new Int32Array([0]), [1]);
   const lg = ops.sliceDynamic(lgPad, start, [1], [B, M, lgPad.shape[2]!]);
@@ -505,7 +506,7 @@ export function respSpanFromMask(mask: number[], T: number): HeadSpan {
  *  sft_scope:"full". Whole-vocab autograd head. Returns [1] (caller owns);
  *  disposes nothing it didn't create. */
 export function spanLogpMeanFromHidden(
-  model: { logitsFromHidden(h: MlxArray): MlxArray },
+  model: object,
   h: MlxArray, // [1, T, hidden] post-finalNorm
   ids: number[],
   s0: number,
