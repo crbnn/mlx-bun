@@ -481,7 +481,7 @@ async function inspectWorkspaces(root: string): Promise<string[]> {
 //   phase-by-shape   `forwardHidden`/`forwardHiddenMixed` reached from `execution/` and `generation/`.
 // ---------------------------------------------------------------------------------------------
 type RatchetRule = "model-class" | "family-subpath" | "family-identity" | "cache-class" | "model-env-flag" | "scheduler-core" |
-  "graph-extends" | "hot-path-read" | "cache-escape" | "phase-by-shape";
+  "graph-extends" | "hot-path-read" | "cache-escape" | "phase-by-shape" | "graph-composition" | "graph-control-flow";
 interface Finding { rule: RatchetRule; file: string; line: number; text: string }
 type RatchetTable = Partial<Record<RatchetRule, Record<string, number>>>;
 
@@ -521,10 +521,12 @@ const nodeModules = new Set([...builtinModules, ...builtinModules.map(name => `n
 
 /** What to do instead, printed with a composition rule's failure. */
 const pavedRoad: Partial<Record<RatchetRule, string>> = {
-  "graph-extends": "Every graph is an entire graph built for a composition; add one by generating it with the family's generator under `packages/inference/scripts/` and compose shared blocks, never inherit a graph.",
+  "graph-extends": "Write the file: import layers, arrange them and export the graph; never inherit a graph.",
   "hot-path-read": "This fact was fixed when the composition was built; read it in the constructor or the loader and store the result, or make the alternative a separately constructed layer or kernel.",
   "cache-escape": "The cache owns its read; append through `appendDecode`/`appendWindow` (or the named committed, bidirectional and block reads) and call `attend` on what it returns.",
-  "phase-by-shape": "The scheduler names the phase it is in: call `prefillChunk`, `prefillTail`, `decode[width]` or `verify[width]` from `MlxTokenPhases`.",
+  "phase-by-shape": "The scheduler names the phase and exact rows: index the graph's prompt ranges or decode[rows] and verify[rows] tables.",
+  "graph-composition": "Write the file: the loader selects it and attaches weights; a graph takes no Composition record.",
+  "graph-control-flow": "Write the file: name every layer and kernel binding literally, in execution order; route dynamic work in the scheduler.",
 };
 
 const lineOf = (source: ts.SourceFile, node: ts.Node) => source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1;
@@ -593,6 +595,153 @@ function graphExtensions(sources: ReadonlyMap<string, ts.SourceFile>, modelsRoot
   return classes.filter(item => item.base && graphs.has(item.base))
     .map(item => ({ file: item.file, line: item.line, text: `${item.name} extends ${item.base}` }));
 }
+
+/** Follow the loader table's imports and entry declarations to the files that
+ * implement its graphs. No separately maintained graph inventory is needed.
+ * The table's unconstrained generic entries retain their layer-count loops. */
+function listedGraphFiles(sources: ReadonlyMap<string, ts.SourceFile>, factory: string): Map<string, boolean> {
+  const listed = new Map<string, boolean>();
+  const visited = new Set<string>();
+  const isGraph = (source: ts.SourceFile) => {
+    let graph = false;
+    const visit = (node: ts.Node) => {
+      if ((ts.isPropertyDeclaration(node) || ts.isGetAccessorDeclaration(node) || ts.isPropertyAssignment(node)) &&
+          node.name && ts.isIdentifier(node.name) && node.name.text === "graphCapabilities") graph = true;
+      ts.forEachChild(node, visit);
+    };
+    visit(source); return graph;
+  };
+  const imports = (source: ts.SourceFile) => {
+    const result = new Map<string, { file: string; name?: string }>();
+    for (const node of source.statements) {
+      if (!ts.isImportDeclaration(node) || !ts.isStringLiteral(node.moduleSpecifier) ||
+          !node.moduleSpecifier.text.startsWith(".") || node.importClause?.isTypeOnly) continue;
+      const target = resolve(dirname(source.fileName), node.moduleSpecifier.text);
+      const file = [target, `${target}.ts`, join(target, "index.ts")].find(file => sources.has(file));
+      if (!file) continue;
+      const clause = node.importClause;
+      if (clause?.name) result.set(clause.name.text, { file, name: "default" });
+      const bindings = clause?.namedBindings;
+      if (bindings && ts.isNamespaceImport(bindings)) result.set(bindings.name.text, { file });
+      if (bindings && ts.isNamedImports(bindings)) for (const item of bindings.elements)
+        if (!item.isTypeOnly) result.set(item.name.text, { file, name: (item.propertyName ?? item.name).text });
+    }
+    return result;
+  };
+  const walk = (source: ts.SourceFile, node: ts.Node, generic: boolean) => {
+    const imported = imports(source);
+    const visit = (node: ts.Node, generic: boolean) => {
+      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "generic") generic = true;
+      if (ts.isIdentifier(node)) {
+        const binding = imported.get(node.text);
+        if (binding) follow(binding.file, binding.name, generic);
+      }
+      ts.forEachChild(node, child => visit(child, generic));
+    };
+    visit(node, generic);
+  };
+  const follow = (file: string, name: string | undefined, generic: boolean) => {
+    const source = sources.get(file);
+    if (!source) return;
+    if (isGraph(source)) {
+      listed.set(file, (listed.get(file) ?? true) && generic);
+      return;
+    }
+    const key = `${file}\0${name ?? "*"}\0${generic}`;
+    if (visited.has(key)) return;
+    visited.add(key);
+    if (name === undefined) { walk(source, source, generic); return; }
+    const visit = (node: ts.Node) => {
+      if ((ts.isVariableDeclaration(node) || ts.isFunctionDeclaration(node)) && node.name &&
+          ts.isIdentifier(node.name) && node.name.text === name) walk(source, node, generic);
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+  };
+  const source = sources.get(factory);
+  if (source) {
+    const visit = (node: ts.Node) => {
+      if (ts.isNewExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "GraphTable")
+        for (const argument of node.arguments ?? []) walk(source, argument, false);
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+  }
+  return listed;
+}
+
+/** Authoring rules apply to repository graphs, including constructors and
+ * disposal, independently of the graphs a caller chooses to run. */
+function graphFileFindings(source: ts.SourceFile, generic: boolean): { rule: RatchetRule; node: ts.Node; text: string }[] {
+  const found: { rule: RatchetRule; node: ts.Node; text: string }[] = [];
+  const compositionNames = new Set(["Composition"]);
+  for (const statement of source.statements) {
+    const bindings = ts.isImportDeclaration(statement) ? statement.importClause?.namedBindings : undefined;
+    if (bindings && ts.isNamedImports(bindings)) for (const item of bindings.elements)
+      if ((item.propertyName ?? item.name).text === "Composition") compositionNames.add(item.name.text);
+  }
+  const visit = (node: ts.Node) => {
+    if (ts.isImportSpecifier(node) && (node.propertyName ?? node.name).text === "Composition")
+      found.push({ rule: "graph-composition", node, text: "imports Composition" });
+    if (ts.isTypeReferenceNode(node)) {
+      const name = ts.isIdentifier(node.typeName) ? node.typeName.text : node.typeName.right.text;
+      if (compositionNames.has(name)) found.push({ rule: "graph-composition", node, text: "uses Composition" });
+    }
+    if (!generic) {
+      if (ts.isIfStatement(node) || ts.isSwitchStatement(node) || ts.isConditionalExpression(node) ||
+          ts.isForStatement(node) || ts.isForOfStatement(node) || ts.isForInStatement(node) ||
+          ts.isWhileStatement(node) || ts.isDoStatement(node))
+        found.push({ rule: "graph-control-flow", node, text: ts.SyntaxKind[node.kind] });
+      if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken)
+        found.push({ rule: "graph-control-flow", node, text: "nullish alternative" });
+      if (ts.isCallExpression(node)) {
+        const expression = node.expression;
+        const name = ts.isPropertyAccessExpression(expression) ? expression.name.text :
+          ts.isElementAccessExpression(expression) && ts.isStringLiteralLike(expression.argumentExpression) ? expression.argumentExpression.text : undefined;
+        if (name && ["map", "forEach", "filter"].includes(name))
+          found.push({ rule: "graph-control-flow", node, text: `.${name}()` });
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source); return found;
+}
+
+test("written graph gate follows loader entries and permits generic layer loops", () => {
+  const root = resolve(tmpdir(), "graph-gate-synthetic");
+  const sources = new Map<string, ts.SourceFile>();
+  const write = (name: string, code: string) => {
+    const file = resolve(root, name);
+    sources.set(file, ts.createSourceFile(file, code, ts.ScriptTarget.Latest, true));
+    return file;
+  };
+  const factory = write("factory.ts", 'import { Chosen } from "./chosen"; import { Default } from "./generic"; ' +
+    'import { graphs } from "./list"; export const tables = { family: new GraphTable([' +
+    '{ create: () => new Chosen() }, ...graphs, generic("family", () => new Default())]) };');
+  const chosen = write("chosen.ts", "export class Chosen { readonly graphCapabilities = {}; }");
+  const generic = write("generic.ts", 'import type { Composition as C } from "./contract"; ' +
+    "export class Default { readonly graphCapabilities = {}; constructor(c: C) { for (const layer of []) {} } }");
+  write("list.ts", 'import * as next from "./next"; export const graphs = [{ create: () => new next.Graph() }];');
+  const next = write("next.ts", "export class Graph { readonly graphCapabilities = {}; }");
+  expect([...listedGraphFiles(sources, factory)]).toEqual([[chosen, false], [next, false], [generic, true]]);
+  expect(graphFileFindings(sources.get(generic)!, true).map(item => item.rule)).toEqual(["graph-composition", "graph-composition"]);
+  write("generic.ts", "export class Default { readonly graphCapabilities = {}; constructor() { for (const layer of []) {} } }");
+  expect(graphFileFindings(sources.get(generic)!, true)).toEqual([]);
+  // Constructor, operation and cleanup all obey the same straight-line rule.
+  for (const body of ["if (x) run();", "switch (x) { case 1: run(); }", "x ? run() : other();",
+    "for (const layer of x) run();", "for (let i = 0; i < 2; i++) run();", "while (x) run();",
+    "do run(); while (x);", "x.map(run);", 'x["forEach"](run);', "x.filter(run);", "x ?? other;"]) {
+    write("chosen.ts", `export class Chosen { readonly graphCapabilities = {}; constructor() { ${body} } ` +
+      `forward() { ${body} } dispose() { ${body} } }`);
+    const findings = graphFileFindings(sources.get(chosen)!, false);
+    expect(findings.map(item => item.rule), body).toEqual(Array(3).fill("graph-control-flow"));
+    expect(checkRatchet(findings.map(item => ({ ...item, file: chosen, line: lineOf(sources.get(chosen)!, item.node) })), {}).failures)
+      .toHaveLength(1);
+  }
+  write("chosen.ts", "export class Chosen { readonly graphCapabilities = {}; " +
+    "forward() { const first = this.layer0.forward(); return this.layer1.forward(first); } dispose() { this.layer0.dispose(); } }");
+  expect(graphFileFindings(sources.get(chosen)!, false)).toEqual([]);
+});
 
 /** The class names declared at the top level of the files under `roots`. */
 function declaredClasses(sources: ReadonlyMap<string, ts.SourceFile>, roots: readonly string[]): string[] {
@@ -763,6 +912,9 @@ async function seamFindings(root: string): Promise<Finding[]> {
   const found: Finding[] = [];
   if (inference) for (const { file, line, text } of graphExtensions(sources, resolve(inference.source, "models")))
     found.push({ rule: "graph-extends", file: relative(root, file), line, text });
+  if (inference) for (const [file, generic] of listedGraphFiles(sources, resolve(inference.source, "models/factory.ts")))
+    for (const { rule, node, text } of graphFileFindings(sources.get(file)!, generic))
+      found.push({ rule, file: relative(root, file), line: lineOf(sources.get(file)!, node), text });
   for (const [file, source] of sources) {
     const owner = libraries.find(item => file.startsWith(`${item.source}/`))!;
     if (owner.name === "mlx-bun-website" || owner.name === "@mlx-bun/mlx") continue;
