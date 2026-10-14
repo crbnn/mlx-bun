@@ -209,9 +209,7 @@ export class AneProgram implements Disposable {
   /** Zero-copy fp16 MLX wrap of input i's whole buffer (at least its
    *  `inputBytes`), locked for writes until the next evaluation (the GPU writes
    *  it through a kernel). Borrowed: the buffers own it, and every program
-   *  loaded on them returns the same array, so a caller never disposes it. Made
-   *  per call, these no-copy wraps cost the M1 Max's Neural Engine prompt pieces
-   *  1 to 4%. */
+   *  loaded on them returns the same array, so a caller never disposes it. */
   inputArray(i: number): MlxArray { return this.#surfaces.input(i, this.input(i)); }
   /** Zero-copy fp16 MLX wrap of the whole output buffer, valid until the next
    *  evaluation; borrowed as {@link inputArray}. */

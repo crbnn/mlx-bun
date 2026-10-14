@@ -352,24 +352,23 @@ bun --no-env-file test packages/inference/tests/parity/qwen-trellis-parity.test.
 On M1 Max 32 GB, MLX 0.32.2 (`applegpu_g13s`), Bun 1.4.2, the candidate
 matched main `02d723a2875153196f8c6c10bce2daf6f0044655`: 96 complete
 last-position float32 logit vectors and greedy tokens across three prompts;
-three 64-token MTP runs with every target input and speculation counter equal.
-Since 2026-10-13 the M1 Max graph verifies two to three rows on kernels that
-reassociate relative to its one-row decode (the width-class decision, KL-gated;
-since 2026-10-14 the matrix-unit Trellis kernels that read code values from a
-threadgroup codebook, with the affine row kernels), so the test teacher-forces
-main's MTP windows and holds each window row to the one-row decode of its
-position instead: 192 rows, mean KL 3.1e-4, largest 1.2e-2, every window's
-argmax the one-row top or tied with it (on the factored kernels before: 2.4e-4,
-1.1e-2 and one argmax difference at an exact bf16 tie); the one-row decode
-still selects all 192 of main's emitted tokens. Two runs emit main's tokens
-(one with main's counters), the third differs from main's at token 17. The test
-keeps the exact MTP comparison wherever the windows are bit-identical to
-one-row decode. Since 2026-10-13 the M1 Max graph also runs prompt pieces of nine
-to 256 positions (these prompts' 23 to 32) on its wider layers, which reassociate:
-the test then holds each prompt's last-position logits by KL and argmax to the
-graph's generic blocks' over the same prompt (`prefillEmbeddings` at the caches'
-positions, then the plain head), which are main's bytes, and decodes the
-trajectory and the teacher-forced windows on that prompt state, main's to the bit.
+three 64-token MTP runs with every target input and speculation counter equal,
+where the graph's operations are bit-identical to main's. The M1 Max graph's are
+not everywhere: it verifies the MTP runs' two- and three-row windows on kernels that
+reassociate relative to its one-row decode (the width-class decision, KL-gated:
+the matrix-unit Trellis kernels that read code values from a threadgroup
+codebook, with the affine row kernels), so the test teacher-forces main's MTP
+windows and holds each window row to the one-row decode of its position
+instead: 192 rows, mean KL 3.1e-4, largest 1.2e-2, every window's argmax the
+one-row top or tied with it; the one-row decode still selects all 192 of
+main's emitted tokens. Two runs emit main's tokens (one with main's counters),
+the third differs from main's at token 17. The M1 Max graph also runs prompt
+pieces of nine to 256 positions (these prompts' 23 to 32) on its wider layers,
+which reassociate: the test then holds each prompt's last-position logits by KL
+and argmax to the graph's generic blocks' over the same prompt
+(`prefillEmbeddings` at the caches' positions, then the plain head), which are
+main's bytes, and decodes the trajectory and the teacher-forced windows on that
+prompt state, main's to the bit.
 The MTP runs use the shared gateway with batch capacity one, depth two, plain
 KV, greedy sampling and stopping tokens disabled. The reference SHA-256 is
 `15421eb8c691fab7eabeb6e13c9a5c2a2eeed5caf5832f57e3575ef0119780f9`.
@@ -1022,7 +1021,7 @@ verify windows, prompt tails, known-token appends and a mixed forward's packed M
 rows) on the any-row matrix-unit Trellis kernels (`gateUpMmaWide`, `downMmaWide`)
 with the split affine kernel for the projections and head, which decode each weight
 once per one to three blocks of 8 rows where the generic blocks re-decode or expand
-every weight (16 rows 0.89 s -> 0.19 s per forward); prompt pieces above 256 rows with their
+every weight (at 16 rows 0.19 s per forward against 0.89 s); prompt pieces above 256 rows with their
 attention and DeltaNet projections on `layers/dequantized-linear` (from 128 rows, and
 above MLX's split-K GEMM range at k_proj and v_proj's outputs, from 513, the weight
 dequantized to bf16 and MLX's dense GEMM, MLX's quantized matmul bit for bit at the

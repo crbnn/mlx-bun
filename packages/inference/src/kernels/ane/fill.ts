@@ -48,9 +48,10 @@ export function trellisFillK3InterleavedEligible(g: TrellisGeometry): boolean {
   return g.L === 12 && g.T === 256 && g.k === 3 && g.cols % 512 === 0 && g.blockInterleave === 2;
 }
 
-/** Weights per thread by code width, measured on the M1 Max on one layer's 5888 rows against four weights and four
- *  half stores per thread (the same values): 2-bit gate 0.57 -> 0.45 ms, 3-bit gate 0.95 -> 0.79, 3-bit interleaved
- *  down 1.01 -> 0.72 at 16; 4-bit gate 0.97 -> 0.51 at 8 (0.70 at 16). */
+/** Weights per thread by code width, measured on the M1 Max over one layer's 5888 rows: at 16, the 2-bit gate fills
+ *  in 0.45 ms, the 3-bit gate in 0.79 and the 3-bit interleaved down in 0.72, against 0.57, 0.95 and 1.01 at four
+ *  weights and four half stores per thread (the same values); the 4-bit gate in 0.51 at 8, against 0.97 at four and
+ *  0.70 at 16. */
 const perThread = (g: TrellisGeometry) => g.k === 4 ? 8 : 16;
 
 function launch(kernel: MetalKernel, codes: MlxArray, scales: MlxArray, g: TrellisGeometry, rows: number, dst: MlxArray, offset: number): MlxArray {

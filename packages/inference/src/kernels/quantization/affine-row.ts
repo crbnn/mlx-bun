@@ -15,11 +15,11 @@ import { MetalKernel } from "@mlx-bun/mlx/metal-kernel";
 //   is float(q) exactly (q < 2^23), in place of an integer convert;
 // - R = 4 rows per simdgroup and S = 16 simdgroups per threadgroup (MLX: 4
 //   and 2), so 64 rows share one threadgroup's x.
-// Measured on the M1 Max against MLX's quantized matmul at one row, each layer's
-// weights back to back: 3-bit 5120 -> 10240 0.100 -> 0.082 ms, 5120 -> 6144
-// 0.062 -> 0.053, 6144 -> 5120 0.062 -> 0.054, 4-bit 5120 -> 248320 (the head)
-// 2.26 -> 1.96; 4-bit projections of 1024 to 12288 outputs level or up to 3%
-// slower (left on MLX's).
+// Measured on the M1 Max, each layer's weights back to back, against MLX's
+// quantized matmul at one row: 3-bit 5120 to 10240 outputs 0.082 ms against
+// 0.100, 5120 to 6144 0.053 against 0.062, 6144 to 5120 0.054 against 0.062,
+// 4-bit 5120 to 248320 (the head) 1.96 against 2.26; 4-bit projections of 1024
+// to 12288 outputs level or up to 3% slower (left on MLX's).
 const R = 4, S = 16;
 
 const HEADER = String.raw`

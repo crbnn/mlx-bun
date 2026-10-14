@@ -21,10 +21,11 @@ import type { TrellisGeometry } from "./geometry";
 // pipeline per geometry and launch). SPLITS f32 partials [M, SPLITS, C] fold
 // in one MLX sum. Two kernels, one per code layout: row-major [rows, cols·K/32]
 // and the 3-bit block interleave [cols/512, rows, 48]. Measured on the M1 Max at
-// the Qwen down shape (17408 -> 5120, real weights), 3-bit interleaved: 8 rows
-// 0.24 ms, 16 0.44, 24 0.64, 32 0.84, 64 1.65 (the 1MAD arithmetic before:
-// 0.66, 0.67, 0.87, 1.24, 2.39; downMma at 8 rows 0.45); 2-bit row-major: 0.24,
-// 0.40, 0.58, 0.76, 1.49 (0.62, 0.64, 0.88, 1.08, 2.13; downMma 0.43).
+// the Qwen down shape (17408 x 5120, real weights) at 8, 16, 24, 32 and 64 rows,
+// 3-bit interleaved: 0.24, 0.44, 0.64, 0.84 and 1.65 ms, against 0.66, 0.67,
+// 0.87, 1.24 and 2.39 decoding with the 1MAD arithmetic (downMma at 8 rows
+// 0.45); 2-bit row-major: 0.24, 0.40, 0.58, 0.76 and 1.49, against 0.62, 0.64,
+// 0.88, 1.08 and 2.13 (downMma 0.43).
 const SG_TG = 4, SPLITS = 8;
 
 /** One pass of the kernel: S sub-tiles per simdgroup, MT blocks of 8 rows per decoded fragment. */
