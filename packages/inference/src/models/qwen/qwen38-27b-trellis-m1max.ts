@@ -25,8 +25,9 @@
 //   decode/verify.twoToThree       FactoredGateUpRows + FactoredDownRows/K3i   Affine3RowsLinear/Affine4RowsLinear
 //   decode/verify.four             MmaGateUp + FactoredDownRows/K3i            AffineSplitMmaLinear
 //   decode/verify.fiveToEight      MmaGateUp + MmaDown/K3i                     AffineSplitMmaLinear
-//   decode/verify.wider            the generic blocks (TrellisMlp)             QuantizedLinear
-//   prefillChunk.gpu/Tail.wider    the generic blocks (TrellisMlp)             DequantizedLinear
+//   every operation 9..256         MmaGateUpWide + MmaDownWide/K3i             AffineSplitMmaLinear
+//   decode/verify.wider 257+       the generic blocks (TrellisMlp)             QuantizedLinear
+//   prefillChunk.gpu/Tail 257+     the generic blocks (TrellisMlp)             DequantizedLinear
 //   prefillChunk.ane, 640..2048    AneTrellisMlpSplit/K3i                      DequantizedLinear
 //
 // Mixed-width gate/up takes CodebookGateUpRow at one row, split tail (MLX's compiled SwiGLU bit for bit), and
@@ -35,12 +36,16 @@
 // decode kernel at 128 tokens per threadgroup and the folded-GQA window kernel), every other scheme its own lego
 // (composedFullAttentionCache: the plain cache with the stock SDPA, its windows of six to eight rows folding GQA into
 // rows (foldedWindowRead), bf16-first affine or per-layer affine with the composition's read kernels, or bf16-first
-// TurboQuant with the dense read). The head is part of each phase: logits.twoToThree Affine4RowsLinear, logits.four
-// AffineSplitMmaLinear, logits.fiveToEight AffineSplitMmaLinear, QuantizedLinear otherwise. A bound drafter's own 4-bit
-// projections take Affine4RowsLinear at twoToThree, AffineSplitMmaLinear at four, AffineSplitMmaLinear at fiveToEight,
-// QuantizedLinear otherwise (TargetView.draftProjections). Decode, verify, prompt tails and embeddings up to eight rows
-// submit the graph every 4 layers; wider decode and verify windows and known-token appends are one lazy graph; prompt
-// chunks, and prompt tails and embeddings above eight rows, evaluate each layer and its recurrent state.
+// TurboQuant with the dense read). Every operation of nine to 256 rows (decode and verify windows, prompt tails,
+// known-token appends, a mixed forward's packed MLP rows) runs the wider layers in the table; more rows run the generic
+// blocks. The head is part of each phase: logits.twoToThree Affine4RowsLinear, logits.four AffineSplitMmaLinear,
+// logits.fiveToEight AffineSplitMmaLinear, logits.wider AffineSplitMmaLinear up to 256 rows, QuantizedLinear otherwise.
+// A bound drafter's own 4-bit projections take Affine4RowsLinear at twoToThree, AffineSplitMmaLinear at four,
+// AffineSplitMmaLinear at fiveToEight, AffineSplitMmaLinear at wider, QuantizedLinear otherwise
+// (TargetView.draftProjections). Decode, verify, prompt tails and embeddings up to eight rows, and decode, verify
+// windows and prompt tails on the wider layers, submit the graph every 4 layers; wider decode and verify windows and
+// known-token appends are otherwise one lazy graph; prompt chunks, prompt tails above 256 rows and embeddings above
+// eight rows, evaluate each layer and its recurrent state.
 //
 // Request shapes this graph serves:
 //   - prompt chunks of exactly the composition's chunk size (prefillChunk.gpu) and prompt tails (prefillTail),
@@ -93,8 +98,8 @@ import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import { QuantizedLinear } from "../../layers/quantized-linear";
 import { mropeInvFreq } from "../../layers/qwen-mrope";
 import { compiledSwiglu } from "../../layers/swiglu";
-import { FactoredDownK3iRows, FactoredDownRows, MmaDown, MmaDownK3i } from "../../layers/trellis-down";
-import { FactoredGateUpRows, FactoredMixedGateUp, MmaGateUp } from "../../layers/trellis-gate-up";
+import { FactoredDownK3iRows, FactoredDownRows, MmaDown, MmaDownK3i, MmaDownWide, MmaDownWideK3i } from "../../layers/trellis-down";
+import { FactoredGateUpRows, FactoredMixedGateUp, MmaGateUp, MmaGateUpWide } from "../../layers/trellis-gate-up";
 import { CodebookGateUpRow } from "../../layers/trellis-reduce-gate-up";
 import { CodebookDownK3iRow, CodebookDownRow } from "../../layers/trellis-scatter-down";
 import { composedAffineKernels } from "../../state/affine-attention";
@@ -204,6 +209,9 @@ const DELTANET_PROJECTIONS = ["in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_
 const ATTENTION_PROJECTIONS = ["q_proj", "k_proj", "v_proj", "o_proj"] as const;
 /** Submit the graph every 4 layers at decode and verify widths up to 8 (measured best on this GPU). */
 const ASYNC_EVERY = 4;
+/** Every operation above eight rows of at most WIDER_ROWS rows runs this GPU's wider layers, more rows the generic
+ *  blocks: the boundary measured on the whole forward, from this machine's kernel table. */
+export const WIDER_ROWS = 256;
 /** The Neural Engine's channel fraction in each split. */
 const ANE_FRACTION = 0.34;
 /** The Neural Engine operations' row ranges, ascending: a one-sequence prompt piece, a chunk or a tail, whose positions
@@ -252,6 +260,13 @@ function layerStep(layer: Qwen3Layer, mixer: Mixer, mlp: (post: MlxArray) => Mlx
   };
 }
 
+/** A layer's MLP block over `hidden` (borrowed): the post-attention norm, `mlp`, the residual. Returns an owned output. */
+function mlpBlock(layer: Qwen3Layer, hidden: MlxArray, mlp: (post: MlxArray) => MlxArray): MlxArray {
+  using post = layer.postAttnNorm.forward(hidden);
+  using out = mlp(post);
+  return ops.add(hidden, out);
+}
+
 /** The mixer of a layer's DeltaNet or attention block. */
 function mixerOf(block: GatedDeltaNet<AttentionLinear> | Qwen3Attention<AttentionLinear>, kind: Qwen38Layer["kind"]): Mixer {
   if (kind === "deltanet") {
@@ -294,7 +309,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
   readonly appendKnown: MlxWidthTable<MlxPhaseForward>;
   readonly logits: MlxWidthTable<MlxHeadForward>;
 
-  /** The generic blocks: every operation above eight rows (prompt pieces with the prompt blocks' projections), media positions, mixed rows. */
+  /** The generic blocks: every operation above 256 rows (prompt pieces with the prompt blocks' projections), media positions, mixed rows. */
   readonly #generic: Step[];
   /** The generic layers, which a mixed forward drives block by block. */
   readonly #layers: readonly Qwen3Layer[];
@@ -304,6 +319,12 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
   readonly #twoToThree: Step[];
   readonly #four: Step[];
   readonly #fiveToEight: Step[];
+  /** Operations above eight rows of at most WIDER_ROWS rows: every layer on the wider layers (the generic blocks when
+   *  the composition mounts adapters). */
+  readonly #wider: Step[];
+  /** Each layer's MLP on the wider layers (the post-attention-normed hidden to its output, owned), for a mixed
+   *  forward's packed MLP rows. */
+  readonly #widerMlp: ((post: MlxArray) => MlxArray)[];
   /** The block sets of the classes up to eight rows, by class. */
   readonly #narrow: Readonly<Record<Exclude<MlxWidthClass, "wider">, Step[]>>;
   readonly #loraTargets: ReadonlyMap<string, QuantizedLinear>;
@@ -334,7 +355,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
       twoToThree: (w, scales, biases) => { const kernel = new Affine4RowsLinear(draftAffine(w, scales, biases)); return x => kernel.forward(x); },
       four: (w, scales, biases) => { const kernel = new AffineSplitMmaLinear(draftAffine(w, scales, biases)); return x => kernel.forward(x); },
       fiveToEight: (w, scales, biases) => { const kernel = new AffineSplitMmaLinear(draftAffine(w, scales, biases)); return x => kernel.forward(x); },
-      wider: (w, scales, biases) => { const kernel = draftAffine(w, scales, biases); return x => kernel.forward(x); },
+      wider: (w, scales, biases) => { const kernel = new AffineSplitMmaLinear(draftAffine(w, scales, biases)); return x => kernel.forward(x); },
     });
     this.weightsBytes = [...weights.shards.files.values()].reduce((a, f) => a + f.mmap.size, 0);
     this.faIdx = t.fullAttentionInterval - 1;
@@ -372,7 +393,8 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
     if (composition.adapters) {
       // Every class runs the generic blocks: their QuantizedLinear projections
       // apply the mounted adapters (the one-kernel layers do not).
-      this.#one = this.#twoToThree = this.#four = this.#fiveToEight = this.#generic;
+      this.#one = this.#twoToThree = this.#four = this.#fiveToEight = this.#wider = this.#generic;
+      this.#widerMlp = generic.map((_, i) => (post: MlxArray) => mlpOf(i).forward(post, "window", "wider"));
     } else {
       const affine4RowsBlocks = LAYERS.map((_, i) => blockOf(i, (linear, _path, width) => width === 3 ? new Affine3RowsLinear(linear) : new Affine4RowsLinear(linear)));
       const affineSplitMmaBlocks = LAYERS.map((_, i) => blockOf(i, linear => new AffineSplitMmaLinear(linear)));
@@ -412,6 +434,17 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
           return project.forward(mid);
         });
       });
+      const widerMlp = generic.map((_, i) => {
+        const spec = LAYERS[i]!, { gate, up, down } = mlpOf(i);
+        const gateUp = new MmaGateUpWide(gate, up);
+        const project = spec.downLayout === "k3Interleaved" ? new MmaDownWideK3i(down) : new MmaDownWide(down);
+        return (post: MlxArray) => {
+          using mid = gateUp.forward(post);
+          return project.forward(mid);
+        };
+      });
+      this.#wider = generic.map((layer, i) => layerStep(layer, mixerOf(affineSplitMmaBlocks[i]!, LAYERS[i]!.kind), widerMlp[i]!));
+      this.#widerMlp = widerMlp;
     }
 
     // The attention and DeltaNet blocks of the prompt operations: every projection on DequantizedLinear, unless
@@ -462,13 +495,14 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
       : (masks: AttentionMasks, layer: number) => composedFullAttentionCache(kv, layer, masks, denseTurboQuantKernels, foldedWindowRead);
 
     this.#narrow = Object.freeze({ one: this.#one, twoToThree: this.#twoToThree, four: this.#four, fiveToEight: this.#fiveToEight });
-    const one = this.#one, twoToThree = this.#twoToThree, four = this.#four, fiveToEight = this.#fiveToEight, wide = this.#generic;
+    const one = this.#one, twoToThree = this.#twoToThree, four = this.#four, fiveToEight = this.#fiveToEight, wide = this.#generic, wider = this.#wider;
     const embed = this.embed, split = ane;
-    // Prompt pieces above eight rows: the prompt blocks, then the generic blocks' MLP.
+    // Prompt pieces above WIDER_ROWS rows: the prompt blocks, then the generic blocks' MLP.
     const prompt = promptBlocks ? generic.map((layer, i) => layerStep(layer, mixerOf(promptBlocks[i]!, LAYERS[i]!.kind),
       post => mlpOf(i).forward(post, "window", "wider"))) : wide;
-    const gpu: RowsForward = (ids, state, capture) =>
-      this.#bounded(prompt, embed.encode(ids), state, "window", capture, null, "wider");
+    const gpu: RowsForward = (ids, state, capture) => ids.size <= WIDER_ROWS
+      ? this.#submitted(wider, embed.encode(ids), state, "window", capture, "wider")
+      : this.#bounded(prompt, embed.encode(ids), state, "window", capture, null, "wider");
     this.prefillChunk = Object.freeze(split
       ? { gpu, ane: Object.freeze(split.map(({ minRows, rows, steps }) => Object.freeze({ minRows, rows,
         forward: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
@@ -494,7 +528,9 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
         this.#submitted(four, embed.encode(ids), state, "decode", capture, "four"),
       fiveToEight: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
         this.#submitted(fiveToEight, embed.encode(ids), state, "decode", capture, "fiveToEight"),
-      wider: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) => this.#lazy(wide, embed.encode(ids), state, "decode", capture, null, "wider"),
+      wider: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) => ids.size <= WIDER_ROWS
+        ? this.#submitted(wider, embed.encode(ids), state, "decode", capture, "wider")
+        : this.#lazy(wide, embed.encode(ids), state, "decode", capture, null, "wider"),
     });
     this.verify = Object.freeze({
       one: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
@@ -505,11 +541,16 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
         this.#submitted(four, embed.encode(ids), state, "window", capture, "four"),
       fiveToEight: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
         this.#submitted(fiveToEight, embed.encode(ids), state, "window", capture, "fiveToEight"),
-      wider: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) => this.#lazy(wide, embed.encode(ids), state, "window", capture, null, "wider"),
+      wider: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) => ids.size <= WIDER_ROWS
+        ? this.#submitted(wider, embed.encode(ids), state, "window", capture, "wider")
+        : this.#lazy(wide, embed.encode(ids), state, "window", capture, null, "wider"),
     });
-    // Known tokens append as windows (no committed spans) on the block set of their width, one lazy graph.
+    // Known tokens append as windows (no committed spans) on the block set of their width (above eight rows the
+    // wider layers' up to WIDER_ROWS rows, the generic blocks above), one lazy graph.
     this.appendKnown = byWidth<MlxPhaseForward>(width => {
-      const steps = width === "wider" ? wide : this.#narrow[width];
+      if (width === "wider")
+        return (ids, state) => this.#lazy(ids.size <= WIDER_ROWS ? wider : wide, embed.encode(ids), state, "window", null, null, width);
+      const steps = this.#narrow[width];
       return (ids, state) => this.#lazy(steps, embed.encode(ids), state, "window", null, null, width);
     });
     const head = this.lmHead, plain: MlxHeadForward = hidden => head.forward(hidden);
@@ -521,7 +562,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
         twoToThree: hidden => affine4RowsHead.forward(hidden),
         four: hidden => affineSplitMmaHead.forward(hidden),
         fiveToEight: hidden => affineSplitMmaHead.forward(hidden),
-        wider: plain,
+        wider: hidden => hidden.size / hidden.shape.at(-1)! <= WIDER_ROWS ? affineSplitMmaHead.forward(hidden) : plain(hidden),
       });
     }
     console.error(`[graph] ${this.graph} ${COMPOSITION.fingerprint} ane-prefill=${ane ? "on" : "off"} adapters=${composition.adapters ? "on" : "off"}`);
@@ -615,7 +656,8 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
   /** Mixed rows in one forward on the generic blocks: each group's attention and DeltaNet read its own caches in its
    *  own phase (a verify group reads a window); the MLP rows of the groups that may share it run as one call at
    *  `width`, the class of the groups' rows, when the composition packs mixed MLP, a verify group keeping its own
-   *  geometry (`mapTokenGroups`). A prompt group above four rows evaluates each layer and the groups' recurrent state
+   *  geometry (`mapTokenGroups`); a call above eight rows of at most WIDER_ROWS rows runs the wider
+   *  layers' MLP. A prompt group above four rows evaluates each layer and the groups' recurrent state
    *  before the next, as the prompt tail does. */
   readonly mixed: MlxMixedForward = (groups, width) => {
     const hidden: MlxArray[] = [];
@@ -628,7 +670,9 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
         try {
           for (const [row, group] of groups.entries())
             mids.push(layer.forwardAttn(hidden[row]!, group.state[i]!, group.phase === "decode" ? "decode" : "window"));
-          const outputs = mapTokenGroups(groups, mids, (h, w) => layer.forwardMlp(h, "window", w), width, this.#packMixedMlp);
+          const mlp = this.#widerMlp[i]!;
+          const outputs = mapTokenGroups(groups, mids, (h, w) => w === "wider" && h.size / h.shape.at(-1)! <= WIDER_ROWS
+            ? mlpBlock(layer, h, mlp) : layer.forwardMlp(h, "window", w), width, this.#packMixedMlp);
           for (const row of groups.keys()) { hidden[row]!.dispose(); hidden[row] = outputs[row]!; }
           // Materialize every layer's recurrent tail as well as the residual: it is not a dependency of the hidden
           // and otherwise pins prefill buffers.

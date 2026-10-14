@@ -49,8 +49,9 @@ export class Affine3MmaLinear {
   forward(x: MlxArray): MlxArray { return affine3Mma(x, this.linear.w, this.linear.scales, this.linear.biases!); }
 }
 
-/** 1..8 activation rows (3- or 4-bit, the stored width) on the simdgroup matrix unit, output tiles sharing each
- *  activation fragment and K split across the threadgroup (M1 Max); the launch follows the output width. */
+/** Any number of activation rows, in blocks of 8 (3- or 4-bit, the stored width), on the simdgroup matrix unit,
+ *  output tiles sharing each activation fragment and K split across the threadgroup (M1 Max); the launch follows
+ *  the output width. */
 export class AffineSplitMmaLinear {
   readonly #bits: 3 | 4;
   readonly #plan: AffineSplitMmaPlan;

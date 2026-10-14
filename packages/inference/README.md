@@ -193,8 +193,8 @@ is the real-weight test above.
 
 What says a generated graph is numerically right: the identity tests compare each generated
 graph against its family's generic graph at maxDiff 0 wherever both serve the composition (the
-M4 Pro graph's chunk, tail and verify, the M1 Max graph's every phase from five rows, each
-generated Gemma graph under its `kv_config`); the real-weight parity suites and the app-path
+M4 Pro graph's chunk, tail and verify, the M1 Max graph's chunk, tail and verify above 256 rows,
+each generated Gemma graph under its `kv_config`); the real-weight parity suites and the app-path
 digests (`scripts/digest.ts`) hold the served numbers; recorded synthetic digests
 (`scripts/synthetic-digests.ts`) hold the cases no artifact covers. The tree keeps no frozen
 copy of replaced code.
@@ -362,7 +362,12 @@ tie; the one-row decode still selects all 192 of main's emitted tokens. Two runs
 still equal main's in every token, target input and counter; the third emits
 974 for main's 303 at token 8, where the one-row logits tie exactly. The test
 keeps the exact MTP comparison wherever the windows are bit-identical to
-one-row decode.
+one-row decode. Since 2026-10-13 the M1 Max graph also runs prompt pieces of nine
+to 256 positions (these prompts' 23 to 32) on its wider layers, which reassociate:
+the test then holds each prompt's last-position logits by KL and argmax to the
+graph's generic blocks' over the same prompt (`prefillEmbeddings` at the caches'
+positions, then the plain head), which are main's bytes, and decodes the
+trajectory and the teacher-forced windows on that prompt state, main's to the bit.
 The MTP runs use the shared gateway with batch capacity one, depth two, plain
 KV, greedy sampling and stopping tokens disabled. The reference SHA-256 is
 `15421eb8c691fab7eabeb6e13c9a5c2a2eeed5caf5832f57e3575ef0119780f9`.
@@ -905,12 +910,14 @@ threadgroup table and keep variant 13's one-row output bits.
 | `gateUpCodebookRow(x, gate, up, tail)` | One-row gate/up/SwiGLU through a threadgroup codebook; widths may differ; the reduce kernels' bits |
 | `downCodebookRow` / `downK3InterleavedCodebookRow(x2, codes, scales, geometry)` | One-row axis-0 projection through a threadgroup codebook, row-major 2/4-bit / 3-bit interleaved codes; the scatter kernels' bits |
 | `downMma` / `downK3InterleavedMma(x2, codes, scales, geometry)` | Axis-0 projection for 1..8 rows, row-major / 3-bit interleaved codes |
+| `gateUpMmaWide(x, gate, up)` | Gate/up/SwiGLU for any number of rows, each decoded fragment feeding several 8-row blocks (threadgroup codebook, activations staged in threadgroup memory); each row the bits `gateUpMma` gives its block of 8 |
+| `downMmaWide` / `downK3InterleavedMmaWide(x2, codes, scales, geometry)` | Axis-0 projection for any number of rows, each decoded fragment feeding several 8-row blocks; each row the bits `downMma` gives its block of 8 |
 
 Outside the Trellis family, `kernels/quantization/affine{3,4}-{rows,mma}` run
 3- and 4-bit group-64 affine projections for 2..8 rows (shared decode) and
-1..8 rows (matrix unit), and `affine-split-mma` 1..8 rows of either width on the
-matrix unit with output tiles sharing each activation fragment and K split across
-the threadgroup (the M1 Max form); `kernels/attention/kvq4-decode` is one-row attention
+1..8 rows (matrix unit), and `affine-split-mma` any number of rows of either width,
+in blocks of 8, on the matrix unit with output tiles sharing each activation
+fragment and K split across the threadgroup (the M1 Max form); `kernels/attention/kvq4-decode` is one-row attention
 over a 4-bit group-64 KV cache with head dim 256, reading each packed row once
 for all query heads of its KV head, the tokens per threadgroup the caller's (512 on
 the M4 Pro, 128 on the M1 Max); `kernels/attention/multi-query` is causal
@@ -999,7 +1006,12 @@ the M1 Max: the threadgroup-codebook kernels at one row; at two to three rows th
 factored Trellis kernels with the affine row kernels for the projections and head;
 at four the matrix-unit gate/up with the factored down; the matrix-unit Trellis set
 at five to eight; the split matrix-unit affine kernel for the projections and head
-at four to eight; prompt pieces above eight rows with their
+at four to eight; every operation of nine to 256 rows (`WIDER_ROWS`: decode and
+verify windows, prompt tails, known-token appends and a mixed forward's packed MLP
+rows) on the any-row matrix-unit Trellis kernels (`gateUpMmaWide`, `downMmaWide`)
+with the split affine kernel for the projections and head, which decode each weight
+once per two or three blocks of 8 rows where the generic blocks re-decode or expand
+every weight (16 rows 0.89 s -> 0.19 s per forward); prompt pieces above 256 rows with their
 attention and DeltaNet projections on `layers/dequantized-linear` (from 640 rows the
 weight dequantized to bf16 and MLX's dense GEMM, MLX's quantized matmul bit for bit
 at the artifact's shapes and about 1.35x faster there); with the bridge and no
@@ -1008,10 +1020,11 @@ split only the MLP, 34% of its channels on the Neural Engine; adapters as on the
 Pro; affine 4-bit group-64 KV on the M4 Pro's KV4 lego, its decode kernel at 128 tokens
 per threadgroup; bf16 KV on the plain cache whose verify windows of six to eight rows
 fold GQA into rows (`foldedWindowRead`, MLX's fused SDPA bit for bit).
-On both, decode and verify up to eight rows submit the graph every four layers;
-wider windows, prompt chunks on the GPU, tails above eight rows and vision
-positions run the generic blocks inside the graph (the M1 Max's prompt pieces with
-those projections); known-token spans do too on the
+On both, decode and verify up to eight rows submit the graph every four layers (on
+the M1 Max also the operations of its wider layers); wider windows, prompt chunks
+on the GPU, tails above eight rows (above 256 on the M1 Max) and vision positions
+run the generic blocks inside the graph (the M1 Max's prompt pieces with those
+projections); known-token spans do too on the
 M4 Pro, and append as windows on the block set of their width on the M1 Max. Each
 generated file's header lists its operations and the request shapes it serves.
 Each declares `verifyRoundCosts`, the verify cost by row count measured for
@@ -1262,8 +1275,8 @@ steps that follow compare it with their samples; any other drafter verifies one 
 carries a TurboQuant R1 fold declares it on its draft target (`residualBasis`: the R1 seed and the
 final-norm gain the fold moved into the head); the drafter loads unrotated and applies it when a draft group binds.
 A graph whose composition measured them declares the kernels of a drafter's own 4-bit projections per width class
-(`draftProjections`; the M1 Max graph: the affine row kernel at two to three rows, the split matrix-unit kernel at
-four to eight, MLX's quantized matmul otherwise); the DFlash 2 drafter builds them when its first group binds and
+(`draftProjections`; the M1 Max graph: the affine row kernel at two to three rows, the split matrix-unit kernel from
+four, MLX's quantized matmul at one); the DFlash 2 drafter builds them when its first group binds and
 otherwise keeps its own rule (the simdgroup matrix unit at five to eight rows, MLX's quantized matmul otherwise).
 A library caller speculates as the app does: `binding.plan` with `hasDraft`, then
 `binding.methodRequest` and `submit` on `binding.createBatchGroup({ maxBatch: 1 })`

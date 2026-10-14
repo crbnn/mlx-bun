@@ -13,8 +13,10 @@ import { compiledSwiglu } from "../../src/layers/swiglu";
 import { fusedGateUpSwigluMixed as mixedGateUpKernel } from "../../src/kernels/trellis/mixed-gate-up";
 import { CodebookGateUpRow } from "../../src/layers/trellis-reduce-gate-up";
 import { CodebookDownK3iRow, CodebookDownRow } from "../../src/layers/trellis-scatter-down";
-import { FactoredGateUpRow, FactoredGateUpRows, FactoredMixedGateUp, MmaGateUp } from "../../src/layers/trellis-gate-up";
-import { FactoredDownK3iRow, FactoredDownK3iRows, FactoredDownRow, FactoredDownRows, MmaDown, MmaDownK3i } from "../../src/layers/trellis-down";
+import { FactoredGateUpRow, FactoredGateUpRows, FactoredMixedGateUp, MmaGateUp, MmaGateUpWide } from "../../src/layers/trellis-gate-up";
+import {
+  FactoredDownK3iRow, FactoredDownK3iRows, FactoredDownRow, FactoredDownRows, MmaDown, MmaDownK3i, MmaDownWide, MmaDownWideK3i,
+} from "../../src/layers/trellis-down";
 import {
   Affine3MmaLinear, Affine3RowsLinear, Affine4MmaLinear, Affine4RowsLinear, AffineSplitMmaLinear,
 } from "../../src/layers/affine-verify-linear";
@@ -55,6 +57,14 @@ describe("Trellis verify layers", () => {
         using actual = layer.forward(x);
         expect(relErr(actual, expected), `k${kg}/${ku} m${m}`).toBeLessThan(2e-2);
       }
+      const wide = new MmaGateUpWide(gate, up);
+      for (const m of [1, 9, 16, 40]) {
+        using x = rows(m, D);
+        using g = gate.forward(x, true), u = up.forward(x, true);
+        using expected = compiledSwiglu(g, u);
+        using actual = wide.forward(x);
+        expect(relErr(actual, expected), `wide k${kg}/${ku} m${m}`).toBeLessThan(2e-2);
+      }
     }
   }, 60_000);
 
@@ -70,6 +80,13 @@ describe("Trellis verify layers", () => {
         using actual = layer.forward(x);
         expect(relErr(actual, expected), `${interleave ? "k3i" : "row-major"} m${m}`).toBeLessThan(2e-2);
       }
+      const wide = interleave ? new MmaDownWideK3i(down) : new MmaDownWide(down);
+      for (const m of [1, 9, 16, 40]) {
+        using x = rows(m, R);
+        using expected = down.forward(x, true);
+        using actual = wide.forward(x);
+        expect(relErr(actual, expected), `wide ${interleave ? "k3i" : "row-major"} m${m}`).toBeLessThan(2e-2);
+      }
     }
   }, 60_000);
 
@@ -80,6 +97,9 @@ describe("Trellis verify layers", () => {
     expect(() => new FactoredDownK3iRows(rowMajor)).toThrow();
     expect(() => new FactoredGateUpRows(gate, up)).toThrow();
     expect(() => new FactoredMixedGateUp(gate, gate)).toThrow();
+    expect(() => new MmaDownWide(interleaved)).toThrow();
+    expect(() => new MmaDownWideK3i(rowMajor)).toThrow();
+    expect(() => new MmaGateUpWide(gate, rowMajor)).toThrow();
   });
 });
 
@@ -148,9 +168,15 @@ describe("affine verify layers", () => {
       expect(() => bits === 3 ? new Affine4RowsLinear(lin) : new Affine3RowsLinear(lin)).toThrow();
       // The M1 Max layer takes either width, as stored.
       const splitLayer = new AffineSplitMmaLinear(lin);
-      for (const m of [1, 3, 8]) {
+      // Against the float32 product of the dequantized weights: from 14 rows MLX's quantized matmul here is its
+      // matrix kernel, which rounds its weights to bf16.
+      using scales32 = q.scales.astype(Dtype.float32), biases32 = q.biases!.astype(Dtype.float32);
+      using dense32 = ops.dequantize(q.packed, scales32, biases32, { bits, groupSize: 64, mode: "affine" });
+      using weightT = ops.transposeAxes(dense32, [1, 0]);
+      for (const m of [1, 3, 8, 9, 16, 40]) {
         using x = rows(m, D);
-        using expected = lin.forward(x);
+        using x32 = x.astype(Dtype.float32);
+        using expected = ops.matmul(x32, weightT);
         using split = splitLayer.forward(x);
         expect(relErr(split, expected), `split mma ${bits}-bit m${m}`).toBeLessThan(1e-2);
       }
