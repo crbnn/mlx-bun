@@ -20,9 +20,12 @@ Decisions that govern all work:
 
 A graph is a file in the repo, written before anyone runs it. Someone imports the layers (which
 import their kernels), arranges them into the model's layers, and exports that arrangement. A model
-may have more than one graph; the loader selects the most specific one for the model, the flags and
-the machine, and attaches the weights to the layers the file names; a model with no graph of its
-own runs on its family's generic graph. The scheduler routes the work: the phase, the row count, a
+may have more than one graph; when the caller supplies none, the loader selects our recommended
+default for the model, the flags and the machine, and attaches the weights to the layers the file
+names; a model with no graph of its own defaults to its family's generic graph. A caller can choose
+the generic graph, a graph tuned for another machine, or a graph they wrote from the exported
+layers. Device matching guides default selection and does not restrict that choice. These rules
+govern the code we write, not which graphs people may use. The scheduler routes the work: the phase, the row count, a
 prompt piece to the Neural Engine operation whose range the file lists, a request's adapter to that
 request's rows. Nothing is checked at load or at run time. The checks happened before the user
 installed mlx-bun: profiling decided which kernel each layer runs at each width on each machine,
@@ -155,13 +158,15 @@ matrix runs once at the end. Agents do the work; Josh reviews the plan, I review
       classes; the MoE sort threshold one class per file; the Qwen attention blocks' media-position
       form a named variant the media phases bind. Exit: per-layer bit identity against the old layer
       over the composition's shapes on synthetic weights, then G2 to G4's digests unchanged.
-- [ ] **G6. The loader.** `GraphTable` keys on everything a file used to read: fingerprint, device,
+- [ ] **G6. The loader.** For default selection, `GraphTable` keys on everything a file used to read: fingerprint, device,
       KV scheme, rows cap, draft depth (a file declaring verify costs serves adaptive depth), prompt
       chunk size (the file's ranges). The generic Qwen 3.5 graph's device condition for known spans
       goes: the M4 Pro file declares its known spans, the generic graph declares none. The
       Colibri bypass and the encoder-decoder refusal in `factory.ts` become table facts or typed
-      errors at the table. Exit: `graph-table` tests; every served composition on both machines
-      selects the file this plan names.
+      errors at the table. Explicit graph choices bypass default selection, including generic,
+      custom and differently tuned graphs. Exit: `graph-table` tests; every default served
+      composition on both machines selects the file this plan names, and an explicit graph
+      remains the caller's choice.
 - [ ] **G7. The generic graphs.** They stay as each family's entry for artifacts without a file:
       the loop over the artifact's layer count stays, and the ownership documentation says so; their
       branches on composition fields go (G1 moved the cache composer; `packedMixedMlp`,
@@ -172,7 +177,9 @@ matrix runs once at the end. Agents do the work; Josh reviews the plan, I review
       output, the "GENERATED, do not edit" headers. The architecture gate gains two mechanical
       rules over every module a graph table lists: no `Composition` type or parameter in the file,
       and no `if`, `switch`, conditional expression, `for`, `while`, `.map`, `.forEach` or `.filter`
-      in it; the paved-road message says "write the file". Ratchet empty.
+      in a specialized graph file. Generic family graphs retain the artifact-layer-count loops
+      allowed by G7. The gate applies to repository graph code, not callers' graphs; the
+      paved-road message says "write the file". Ratchet empty.
 - [ ] **G9. Documents.** ARCHITECTURE.md: the construction section says load attaches weights to a
       written file and decides nothing; the one-way list says "add a model by writing its graph
       file: import the layers, arrange them, export the arrangement; one file per served
