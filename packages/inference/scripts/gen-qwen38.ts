@@ -21,6 +21,7 @@
 
 import { parseArgs } from "node:util";
 import { loadModelConfig, quantFor } from "../src/artifacts/config";
+import type { AdaptiveDraftGateSettings } from "../src/contracts/mlx/graph";
 
 /** The facts that fix one generated graph. The fingerprint and device choose the
  * layer and kernel tables written into the file; `kv` names the scheme whose
@@ -72,6 +73,10 @@ export interface Qwen38Composition {
    *  (\`MlxDeclaredGraph.adaptiveDraftWidths\`): an adaptive drafter of a listed kind drafts up to it instead of its own
    *  width. Absent: every drafter its own width. */
   readonly adaptiveDraftWidths?: readonly (readonly [string, number])[];
+  /** The adaptive draft gate's settings per draft provider kind, measured for this composition on its host
+   *  (\`MlxDeclaredGraph.adaptiveDraftGates\`): an adaptive drafter of a listed kind gates with them. Absent: every
+   *  drafter the gate's defaults. */
+  readonly adaptiveDraftGates?: readonly (readonly [string, AdaptiveDraftGateSettings])[];
   /** The graph declares its weights wired for each generation (`MlxModelMemory.wiredWeights`), measured for this
    *  composition on its host, where their share of the recommended working set alone would leave them unwired.
    *  Absent: the share decides. */
@@ -127,6 +132,15 @@ export const QWEN38_COMPOSITIONS: Readonly<Record<string, Qwen38Composition>> = 
     // Measured 2026-10-13 on this graph and artifact: scripts/bench-mtp.ts, the MTP head adaptive up to 2 (its
     // trained block) 18.0 tok/s, up to 4 19.9, up to 7 19.1 (fixed depth 3 18.6), greedy, three prompts, 128 tokens.
     adaptiveDraftWidths: [["mtp", 4]],
+    // Measured 2026-10-14 on this graph and artifact: a replay of the gate over the DFlash 2 drafter's acceptance at
+    // every position of 96 texts (32 prompts, greedy and Qwen's thinking and instruct sampling, up to 192 tokens,
+    // decoded plainly), with this graph's verify costs and the measured step (51.1-52.2 ms) and probe (8.7-11.5 ms by
+    // depth): a prior that weighs three rounds instead of five, counts that age by 1% per step without drafts and
+    // probes three drafts deep gain on every prompt set (0.1-1.3%; text that loses to plain decode 1.2%), more than
+    // any other setting tried. In-process serve, bf16 KV, four prompts of 192 tokens, A B A B: DFlash 2 adaptive greedy
+    // 25.75 -> 26.04 tok/s, instruct 22.54 -> 22.88, thinking 20.91 -> 20.98. The MTP head's gate keeps the defaults:
+    // no setting gained on every prompt set.
+    adaptiveDraftGates: [["dflash2", { priorAccepted: 2.7, priorRejected: 0.3, idleDecay: 0.99, probeDepth: 3 }]],
     // Measured 2026-10-13 on the M1 Max 32 GB, where the 11.96e9 B weights are under half the 26.8e9 B recommended
     // set: wired, bit-identical, paired A/B, GPU prefill 1k/8k 136/142 -> 143/145 tok/s; with the Neural Engine
     // split 171/173 -> 172/177 and the first GPU step after the split 0.15-1.4 s -> 61-69 ms; one-row decode
@@ -1045,6 +1059,10 @@ ${c.verifyRoundCosts ? `  /** Verify forward cost by rows relative to one decode
 ` : ""}${c.adaptiveDraftWidths ? `  /** The widest adaptive round per draft provider kind${c.verifyRoundCosts ? ` (${c.verifyRoundCosts.host})` : ""}. */
   readonly adaptiveDraftWidths: ReadonlyMap<string, number> = new Map([
     ${c.adaptiveDraftWidths.map(([kind, width]) => `[${JSON.stringify(kind)}, ${width}]`).join(", ")},
+  ]);
+` : ""}${c.adaptiveDraftGates ? `  /** The adaptive draft gate's settings per draft provider kind${c.verifyRoundCosts ? ` (${c.verifyRoundCosts.host})` : ""}. */
+  readonly adaptiveDraftGates: NonNullable<MlxDeclaredGraph["adaptiveDraftGates"]> = new Map([
+${c.adaptiveDraftGates.map(([kind, settings]) => `    [${JSON.stringify(kind)}, { ${Object.entries(settings).map(([key, value]) => `${key}: ${value}`).join(", ")} }],`).join("\n")}
   ]);
 ` : ""}
   readonly prefillChunk: MlxPrefillChunk;

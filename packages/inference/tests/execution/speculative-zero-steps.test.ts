@@ -23,12 +23,13 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import { declareGraph } from "../../src/models/capabilities";
 import { stubPhases } from "../models/phase-forward";
+import type { AdaptiveDraftGateSettings } from "../../src/contracts/mlx/graph";
 
 const VOCABULARY = 256;
 
 /** A block drafter (projected context rows, as DFlash 2 drafts) that proposes `pending + 1 + offset`, ...: right at
  *  offset 0 for the successor head, wrong otherwise. Its rows draft without committing, so they can preview. */
-function successorDrafter(offset: { value: number }) {
+function successorDrafter(offset: { value: number }, depths: number[] = []) {
   return { id: "successor", grouped: projectedDraftGroups("successor-v1", [], () => ({
     namespace: "successor-v1", schema: "successor-v1", layers: 1,
     project(hidden: MlxArray) {
@@ -38,6 +39,7 @@ function successorDrafter(offset: { value: number }) {
     },
     draft: () => { throw new Error("successor drafts on the device"); },
     draftDevice(_context: unknown, pending: readonly number[], _positions: unknown, depth: number) {
+      depths.push(depth);
       return ops.fromInt32(pending.flatMap(token => Array.from({ length: depth }, (_, i) => token + 1 + i + offset.value)),
         [pending.length, depth]);
     },
@@ -45,7 +47,7 @@ function successorDrafter(offset: { value: number }) {
 }
 
 function fixture(provider: Pick<DraftProvider, "id" | "grouped"> & { dispose(): void } = new NgramProvider(),
-  costs: [number, number][] = [[1, 1], [2, 50], [3, 60]]) {
+  costs: [number, number][] = [[1, 1], [2, 50], [3, 60]], gate: AdaptiveDraftGateSettings = {}, depth = 2) {
   /** Each forward's input ids, read after the step ran (reading them earlier would end the pipelining). */
   const inputs: MlxArray[] = [];
   const puts: { tokens: number[]; offset: number }[] = [];
@@ -88,7 +90,7 @@ function fixture(provider: Pick<DraftProvider, "id" | "grouped"> & { dispose(): 
     async publish(row, token) { published.get(row)!.push(token); return row.req.onToken(token); },
     finish(row, reason) { finished.set(row, reason); },
   };
-  const binding = bindSpeculativeGroupRequests(model, provider, 2, true)!({ temperature: 0, maxTokens: 6 });
+  const binding = bindSpeculativeGroupRequests(model, provider, depth, true, gate)!({ temperature: 0, maxTokens: 6 });
   const method = binding.open(host);
   const row = (tokens: number[], options: { maxTokens?: number; eos?: number[]; signal?: AbortSignal;
     onToken?: (token: number) => boolean | void } = {}): Row => {
@@ -222,6 +224,29 @@ test("a drafter that previews probes without verify windows, and drafts again on
     expect(f.read().slice(settled).some(ids => ids.length > 1)).toBe(true);
     // Every token is the successor head's, whatever the drafts were.
     expect(f.published.get(a)).toEqual(Array.from({ length: 160 }, (_, i) => 5 + i));
+    expect(f.failures).toEqual([]);
+  } finally { f.dispose(); }
+});
+
+test("a probe drafts at the depth its gate's machine declares, and rounds at their own", async () => {
+  const depths: number[] = [];
+  // Rounds of three drafts; the gate probes two deep. Wrong drafts: the optimistic first rounds fail, then probes.
+  const offset = { value: 5 };
+  const f = fixture(successorDrafter(offset, depths), [[1, 1], [2, 1.4], [3, 1.5], [4, 1.6]], { probeDepth: 2, probeInterval: 2 }, 3);
+  const a = f.row([1, 2, 3, 4], { maxTokens: 60 });
+  try {
+    const first = f.method.prepare(a);
+    try { await drain(first); } finally { first.dispose(); }
+    for (let advance = 0; advance < 40 && f.joined.length; advance++) await f.method.advance();
+    // Verify windows carry the pending token and three drafts; the drafts that were not verified are probes of two.
+    const widths = f.read().slice(1).map(ids => ids.length);
+    expect(widths.every(width => width === 1 || width === 4)).toBe(true);
+    expect(widths.filter(width => width === 4).length).toBeGreaterThan(0);
+    expect(depths.filter(depth => depth === 3).length).toBe(widths.filter(width => width === 4).length);
+    expect(depths.filter(depth => depth === 2).length).toBeGreaterThan(0);
+    expect(depths.every(depth => depth === 2 || depth === 3)).toBe(true);
+    while (f.joined.length) await f.method.advance();
+    expect(f.published.get(a)).toEqual(Array.from({ length: 60 }, (_, i) => 5 + i));
     expect(f.failures).toEqual([]);
   } finally { f.dispose(); }
 });

@@ -109,3 +109,39 @@ describe("adaptive speculative draft gate", () => {
     }, 0)) * 3 / 12, 12);
   });
 });
+
+describe("adaptive draft gate settings a graph declares for its machine", () => {
+  // A machine whose verify rounds cost much more than a step.
+  const m1 = new Map([[1, 1], [2, 2.01], [3, 2.42], [4, 2.56], [5, 2.69], [6, 2.78], [7, 2.87], [8, 2.96]]);
+
+  test("a lighter prior backs off after fewer rejected rounds", () => {
+    const rounds = (priorAccepted: number, priorRejected: number) => {
+      const gate = new AdaptiveDraftGate(m1, { maxDraftTokens: 7, priorAccepted, priorRejected });
+      let n = 0;
+      while (gate.choose(7) > 0) { gate.observe(7, 0); n++; }
+      return n;
+    };
+    // The default prior (4.5 and 0.5) and one that weighs three rounds, both at an acceptance of 0.9.
+    expect(rounds(2.7, 0.3)).toBeLessThan(rounds(4.5, 0.5));
+    expect(rounds(2.7, 0.3)).toBeGreaterThan(0);
+  });
+
+  test("idleDecay: rounds without drafts age what the gate observed until it drafts again", () => {
+    const aging = new AdaptiveDraftGate(m1, { maxDraftTokens: 7, priorAccepted: 0.9, priorRejected: 0.1, idleDecay: 0.9,
+      probeInterval: 64, maxProbeInterval: 64 });
+    const fixed = new AdaptiveDraftGate(m1, { maxDraftTokens: 7, priorAccepted: 0.9, priorRejected: 0.1, probeInterval: 64,
+      maxProbeInterval: 64 });
+    for (const gate of [aging, fixed]) for (let i = 0; i < 6; i++) gate.observe(7, 0);
+    const before = fixed.acceptance(1);
+    const depths = (gate: AdaptiveDraftGate) => Array.from({ length: 40 }, () => gate.next(7));
+    // The rejections fade toward the prior's 0.9 until drafting pays again; without aging they hold.
+    expect(depths(aging).at(-1)).toBeGreaterThan(0);
+    expect(depths(fixed).every(depth => depth === 0)).toBe(true);
+    expect(fixed.acceptance(1)).toBe(before);
+  });
+
+  test("probeDepth: the depth a previewing drafter probes at; by default the round's budget", () => {
+    expect(new AdaptiveDraftGate(m1, { maxDraftTokens: 7 }).probeDepth).toBe(Infinity);
+    expect(new AdaptiveDraftGate(m1, { maxDraftTokens: 7, probeDepth: 3 }).probeDepth).toBe(3);
+  });
+});

@@ -22,6 +22,7 @@ import type { ExecutionRequirements, ResolvedExecution } from "../contracts/port
 import type { GraphCapabilities } from "../contracts/portable/graph";
 import { resolveExecution } from "./plan";
 import type { MlxPromptInput, Vision } from "../contracts/mlx/media";
+import type { AdaptiveDraftGateSettings } from "../contracts/mlx/graph";
 
 export interface MlxBatchGroup extends Pick<MlxBatchExecutionGroup,
   "activeRows" | "pendingRows" | "submit" | "kick" | "close"> {
@@ -65,12 +66,14 @@ export interface MlxGatewayBinding {
 
 /** `adaptiveDepth`: each round drafts up to `numDraftTokens`, chosen from the
  *  decayed acceptance rate and the graph's measured `verifyRoundCosts` (the
- *  graph must declare them); otherwise every round drafts `numDraftTokens`.
+ *  graph must declare them) by a gate with the settings `gate` (the graph's
+ *  `adaptiveDraftGates` for the drafter's kind); otherwise every round drafts
+ *  `numDraftTokens`.
  *  The graph's composition names its KV scheme and scheduler switches (a
  *  graph without one runs the defaults): every request's, so the binding
  *  reads them once, here. */
 export function bindMlxGateway(model: MlxTokenGraph,
-  draft?: { provider: DraftProvider; numDraftTokens: number; adaptiveDepth?: boolean }): MlxGatewayBinding {
+  draft?: { provider: DraftProvider; numDraftTokens: number; adaptiveDepth?: boolean; gate?: AdaptiveDraftGateSettings }): MlxGatewayBinding {
   const kv: KvStorageScheme = model.composition?.kv ?? BF16_KV;
   // The composition facts this binding plans with: the graph's record, else the defaults.
   const facts = model.composition ?? COMPOSITION_DEFAULTS;
@@ -87,7 +90,7 @@ export function bindMlxGateway(model: MlxTokenGraph,
   // captures; one that cannot bind is refused by placement rather than served
   // ordinarily.
   const speculative = !denoising && draft?.provider.grouped
-    ? bindSpeculativeGroupRequests(model, draft.provider, draft.numDraftTokens, draft.adaptiveDepth ?? false) : undefined;
+    ? bindSpeculativeGroupRequests(model, draft.provider, draft.numDraftTokens, draft.adaptiveDepth ?? false, draft.gate) : undefined;
   // Grammar jump: verified proposals where the graph's verifier qualifies them,
   // committed spans otherwise.
   const grammarProvider = caps.method === "autoregressive" && verification.grammarProposals && facts.grammarJump

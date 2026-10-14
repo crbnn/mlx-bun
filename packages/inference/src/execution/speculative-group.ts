@@ -24,6 +24,7 @@ import { disposeAttachments } from "../state/checkpoint";
 import { type CheckpointAttachment } from "../contracts/mlx/checkpoint";
 import { advanceSpeculativeOutputs } from "../generation/speculative/round";
 import { AdaptiveDraftGate } from "../generation/speculative/adaptive-draft-gate";
+import type { AdaptiveDraftGateSettings } from "../contracts/mlx/graph";
 import { MlxPrefillRows, type MlxPrefillState } from "./prefill-rows";
 import { prefillPhase } from "../contracts/portable/prefill";
 import type { MlxForwardWork } from "../contracts/mlx/forward-work";
@@ -48,7 +49,7 @@ interface RequestState {
  * key and lifecycle; sampling, checkpoints and numerical state remain ports.
  * Undefined when the target cannot capture the hidden layers the provider taps. */
 export function bindSpeculativeGroupRequests(model: MlxTokenGraph, provider: Pick<DraftProvider, "id" | "grouped">, depth: number,
-  adaptiveDepth = false) {
+  adaptiveDepth = false, gate: AdaptiveDraftGateSettings = {}) {
   if (adaptiveDepth && !model.verifyRoundCosts)
     throw new Error("adaptive draft depth needs a graph that declares its measured verify costs (verifyRoundCosts)");
   const binding = bindSpeculativeTargetModel(model);
@@ -75,7 +76,7 @@ export function bindSpeculativeGroupRequests(model: MlxTokenGraph, provider: Pic
       // The KV scheme is the composition's, shared by every request.
       key: JSON.stringify(["speculative", provider.id, depth, adaptiveDepth, selection.kind]),
       data: options,
-      open: host => new SpeculativeGroup(host, model, provider, binding, depth, taps, adaptiveDepth, selection),
+      open: host => new SpeculativeGroup(host, model, provider, binding, depth, taps, adaptiveDepth ? gate : null, selection),
     };
   };
 }
@@ -132,8 +133,8 @@ class SpeculativeGroup implements MlxGroupedMethod {
 
   constructor(readonly host: MlxGroupMethodHost, readonly model: MlxTokenGraph,
     readonly provider: Pick<DraftProvider, "id" | "grouped">, readonly binding: MlxSpeculativeTargetBinding, readonly depth: number,
-    readonly taps: readonly number[], adaptiveDepth: boolean, readonly selection: GroupSelection) {
-    this.#gate = adaptiveDepth ? new AdaptiveDraftGate(model.verifyRoundCosts!, { maxDraftTokens: depth }) : null;
+    readonly taps: readonly number[], gate: AdaptiveDraftGateSettings | null, readonly selection: GroupSelection) {
+    this.#gate = gate ? new AdaptiveDraftGate(model.verifyRoundCosts!, { ...gate, maxDraftTokens: depth }) : null;
   }
 
   get runningTokens(): number {
@@ -408,8 +409,10 @@ class SpeculativeGroup implements MlxGroupedMethod {
     // A round without drafts verifies the pending token alone (one plain decode step) and still advances the
     // drafter's context through its commit; rows that sample on the device pipeline such rounds as plain decode does.
     let depth = this.#gate && cap > 0 ? this.#gate.next(cap, rows.length) : cap;
-    // A probe from a drafter that can propose without committing is compared with the samples instead of verified.
-    const shadow = depth > 0 && this.#gate?.probing && this.#draft!.preview && !this.#shadow ? cap : 0;
+    // A probe from a drafter that can propose without committing is compared with the samples instead of verified,
+    // drafted as deep as the gate's machine measured to pay.
+    const shadow = depth > 0 && this.#gate?.probing && this.#draft!.preview && !this.#shadow
+      ? Math.min(cap, this.#gate.probeDepth) : 0;
     if ((depth === 0 || shadow) && this.#pipelinesZero(rows)) return this.#zeroStep(rows, work, shadow);
     this.#settleShadow();
     if (this.#ahead) {
