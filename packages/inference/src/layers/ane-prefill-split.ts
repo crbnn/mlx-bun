@@ -1,5 +1,4 @@
-import { MlxArray } from "@mlx-bun/mlx/array";
-import { Dtype } from "@mlx-bun/mlx/ffi";
+import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import { AneProgram, AneStreamedMatmul, mlpSliceProgram, streamedMatmulProgram, type AneProgramSpec } from "../kernels/ane/linear";
 import { trellisFillHalf, trellisFillHalfK3Interleaved, writeHalf } from "../kernels/ane/fill";
@@ -7,22 +6,22 @@ import type { TrellisGeometry } from "../kernels/trellis/geometry";
 import { QuantizedLinear } from "./quantized-linear";
 import { TrellisLinear, trellisRows, trellisStoredRows } from "./trellis-linear";
 
-// Prompt-piece channel splits between the Apple Neural Engine and the GPU.
-// The ANE computes the first n output channels from streamed fp16 weights the
-// GPU writes into its program's buffers (zero-copy IOSurface wraps), the GPU
-// computes the rest at the same time, and the results combine. Each layer holds
-// one program, built for the row count the layer is constructed with, and serves
-// inputs of up to that many rows: it writes the rows it is given at the front of
-// the program's input and reads as many back. The rows behind them hold whatever
-// the last evaluation left; no row it returns reads them (each output row of the
-// program depends only on its own input row). dispose releases the program.
-// Layers that never run at once may share, named at construction (`share`): a
-// layer whose program is identical to the other's holds that same loaded
-// program, otherwise its program loads on the other's buffers (each at least as
-// large); either lives until every layer holding it is disposed. Loaded programs
-// are a machine-wide resource (AneProgram), so a graph's layers of one shape
-// share one. Not bit-identical to the GPU path (fp16 weights and activations on
-// the ANE); gate by KL.
+// Prompt-piece channel splits between the Apple Neural Engine and the GPU. The
+// ANE computes the first n output channels from streamed fp16 weights the GPU
+// writes into its program's buffers (zero-copy IOSurface wraps, made once per
+// set of buffers), the GPU computes the rest at the same time, and the results
+// combine. Each layer holds one program, built for the row count the layer is
+// constructed with, and serves inputs of up to that many rows: it writes the
+// rows it is given at the front of the program's input and reads as many back.
+// The rows behind them hold whatever the last evaluation left; no row it returns
+// reads them (each output row of the program depends only on its own input row).
+// dispose releases the program. Layers that never run at once may share, named
+// at construction (`share`): a layer whose program is identical to the other's
+// holds that same loaded program, otherwise its program loads on the other's
+// buffers (each at least as large); either lives until every layer holding it is
+// disposed. Loaded programs are a machine-wide resource (AneProgram), so a
+// graph's layers of one shape share one. Not bit-identical to the GPU path (fp16
+// weights and activations on the ANE); gate by KL.
 //
 // A layer's program depends only on its widths, the fraction and its row count,
 // never on the weights it streams, so the program each split loads is named
@@ -54,19 +53,20 @@ type Rest = { gate: TrellisLinear; up: TrellisLinear; down: TrellisLinear };
  *  to end (gate and up rows, SwiGLU, and the down projection's partial sum over
  *  those channels); the GPU computes channels [n, R) through TrellisLinear; the
  *  two [M, D] partials add. Measured on M4 Pro: one fused slice program at
- *  10.2 TFLOPS (D 5120, n 9600, S 2048). `hidden` holds M <= `rows` rows. */
+ *  10.2 TFLOPS (D 5120, n 9600, S 2048). `hidden` holds M <= `rows` rows.
+ *  The ANE starts as soon as the GPU has filled its buffers; the GPU's share is
+ *  then queued whole (its weight expansions unbounded, one submission) while
+ *  the host waits for the ANE. The sum is returned unevaluated: it reads the
+ *  ANE output, which the program evaluates before its buffers' next run
+ *  (`AneProgram.deferOutput`), unless the caller has by then. */
 function mlpSplit(program: AneProgram, rows: number, n: number, gate: TrellisLinear, up: TrellisLinear, down: TrellisLinear,
   rest: Rest, fillDown: Fill, hidden: MlxArray, swiglu: Swiglu): MlxArray {
   const D = gate.geometry.inFeatures;
   const lead = hidden.shape.slice(0, -1), M = lead.reduce((a, b) => a * b, 1);
   if (M > rows) throw new Error(`ANE MLP split: ${M} rows exceed its program's ${rows}`);
   {
-    // Inputs in symbol order: wd, wg, wu, x. Filled before any GPU share is
-    // queued, so the ANE starts at once.
-    using wd = program.inputArray(0, [n * D], Dtype.float16);
-    using wg = program.inputArray(1, [n * D], Dtype.float16);
-    using wu = program.inputArray(2, [n * D], Dtype.float16);
-    using x = program.inputArray(3, [rows * D], Dtype.float16);
+    // Inputs in symbol order: wd, wg, wu, x (borrowed wraps).
+    const wd = program.inputArray(0), wg = program.inputArray(1), wu = program.inputArray(2), x = program.inputArray(3);
     using h2 = ops.reshape(hidden, [M * D]);
     using d0 = fillDown(down.codes, down.scales, down.geometry, n, wd, 0);
     using d1 = trellisFillHalf(gate.codes, gate.scales, gate.geometry, n, wg, 0);
@@ -77,21 +77,19 @@ function mlpSplit(program: AneProgram, rows: number, n: number, gate: TrellisLin
   program.evalAsync();
   let gpuOut: MlxArray;
   try {
-    using g = rest.gate.forward(hidden, true);
-    using u = rest.up.forward(hidden, true);
+    using g = rest.gate.forward(hidden, true, false);
+    using u = rest.up.forward(hidden, true, false);
     using mid = swiglu(g, u);
-    gpuOut = rest.down.forward(mid, true);
-    gpuOut.eval();
+    gpuOut = rest.down.forward(mid, true, false);
+    ops.asyncEvalAll([gpuOut]);
   } finally { program.wait(); }
   try {
-    using out = program.output([rows, D], Dtype.float16);  // zero-copy partial [rows, D]
-    using used = out.slice([0, 0], [M, D]);
+    using used = program.output([M, D]);                    // zero-copy partial, the piece's rows
     using b = used.astype(hidden.dtype);
     using g2 = ops.reshape(gpuOut, [M, D]);
-    using sum = ops.add(b, g2);
-    const result = ops.reshape(sum, [...lead, D]);
-    result.eval();                                          // consume the ANE output before a program sharing it runs
-    return result;
+    const sum = ops.add(b, g2);
+    program.deferOutput(sum);                               // evaluated (free once the result is) and freed by the program
+    return ops.reshape(sum, [...lead, D]);
   } finally { gpuOut.dispose(); }
 }
 
@@ -127,7 +125,7 @@ export class AneTrellisMlpSplit implements Disposable {
     return new AneTrellisMlpSplit(program, rows, n, gate, up, down,
       { gate: trellisRows(gate, n, R), up: trellisRows(up, n, R), down: trellisStoredRows(down, n, R) });
   }
-  /** hidden [.., M, D], M <= rows → MLP(hidden) [.., M, D]. */
+  /** hidden [.., M, D], M <= rows → MLP(hidden) [.., M, D], unevaluated (mlpSplit). */
   forward(hidden: MlxArray, swiglu: Swiglu): MlxArray {
     return mlpSplit(this.program, this.rows, this.channels, this.gate, this.up, this.down, this.rest, trellisFillHalf, hidden, swiglu);
   }
@@ -150,7 +148,7 @@ export class AneTrellisMlpSplitK3i implements Disposable {
     return new AneTrellisMlpSplitK3i(program, rows, n, gate, up, down,
       { gate: trellisRows(gate, n, R), up: trellisRows(up, n, R), down: trellisStoredRows(down, n, R) });
   }
-  /** hidden [.., M, D], M <= rows → MLP(hidden) [.., M, D]. */
+  /** hidden [.., M, D], M <= rows → MLP(hidden) [.., M, D], unevaluated (mlpSplit). */
   forward(hidden: MlxArray, swiglu: Swiglu): MlxArray {
     return mlpSplit(this.program, this.rows, this.channels, this.gate, this.up, this.down, this.rest, trellisFillHalfK3Interleaved,
       hidden, swiglu);
@@ -182,35 +180,32 @@ export class AneAffineSplit implements Disposable {
     return new AneAffineSplit(program, head, rest, lin.spec);
   }
 
-  /** x [.., M, K], M <= rows → [.., M, N]. */
+  /** x [.., M, K], M <= rows → [.., M, N], unevaluated as the MLP split's
+   *  (mlpSplit): the ANE starts once its buffers are written, the GPU's rows
+   *  queued after. */
   forward(x: MlxArray): MlxArray {
     const ane = this.program, K = ane.cin, n = ane.cout, rows = ane.seq;
     const lead = x.shape.slice(0, -1), M = lead.reduce((a, b) => a * b, 1);
     if (M > rows) throw new Error(`AneAffineSplit: ${M} rows exceed its program's ${rows}`);
-    ane.prepare();
     {
-      using w = MlxArray.fromPointer(ane.weightsPointer, [n * K], Dtype.float16);
-      using xs = MlxArray.fromPointer(ane.inputPointer, [rows * K], Dtype.float16);
       using dense = ops.dequantize(this.head.w, this.head.scales, this.head.biases, this.spec);
       using flat = ops.reshape(dense, [n * K]);
       using x2 = ops.reshape(x, [M * K]);
-      using d0 = writeHalf(w, flat, 0);
-      using d1 = writeHalf(xs, x2, 0);
+      using d0 = writeHalf(ane.weights(), flat, 0);
+      using d1 = writeHalf(ane.input(), x2, 0);
       ops.evalAll([d0, d1]);
     }
     ane.evalAsync();
     let gpu: MlxArray;
-    try { gpu = this.rest.forward(x); gpu.eval(); }
+    try { gpu = this.rest.forward(x); ops.asyncEvalAll([gpu]); }
     finally { ane.wait(); }
     try {
-      using out = ane.output();                               // [rows, n] fp16
-      using used = out.slice([0, 0], [M, n]);
+      using used = ane.output(M);                             // the piece's rows of [rows, n] fp16
       using b = used.astype(x.dtype);
       using g2 = ops.reshape(gpu, [M, this.rest.outFeatures]);
-      using both = ops.concatAxis([b, g2], -1);
-      const result = ops.reshape(both, [...lead, n + this.rest.outFeatures]);
-      result.eval();
-      return result;
+      const both = ops.concatAxis([b, g2], -1);
+      ane.program.deferOutput(both);                          // evaluated (free once the result is) and freed by the program
+      return ops.reshape(both, [...lead, n + this.rest.outFeatures]);
     } finally { gpu.dispose(); }
   }
 

@@ -47,7 +47,8 @@
 // verify, prompt tails and embeddings up to eight rows, and decode, verify windows and prompt tails on the wider
 // layers, submit the graph every 4 layers; wider decode and verify windows and known-token appends are otherwise one
 // lazy graph; prompt chunks, prompt tails above 256 rows and embeddings above eight rows, evaluate each layer and its
-// recurrent state.
+// recurrent state, which the Neural Engine operations queue without waiting (each split waits for the GPU before its
+// ANE run).
 //
 // Request shapes this graph serves:
 //   - prompt chunks of exactly the composition's chunk size (prefillChunk.gpu) and prompt tails (prefillTail),
@@ -521,7 +522,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
     this.prefillChunk = Object.freeze(split
       ? { gpu, ane: Object.freeze(split.map(({ minRows, rows, steps }) => Object.freeze({ minRows, rows,
         forward: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
-          this.#bounded(steps, embed.encode(ids), state, "window", capture, null, "wider") }))) }
+          this.#queued(steps, embed.encode(ids), state, "window", capture, "wider") }))) }
       : { gpu });
     this.prefillTail = Object.freeze({
       one: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
@@ -660,6 +661,28 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
         h = next;
         const state = cache[i]!.state();
         try { ops.evalAll([h, ...state]); }
+        finally { if (cache[i]!.stateNeedsDispose) for (const a of state) a.dispose(); }
+        capture?.(i, h);
+      }
+      const out = disposing(h, this.finalNorm.forward(h));
+      h = null;
+      capture?.(steps.length, out);
+      return out;
+    } finally { h?.dispose(); }
+  }
+
+  /** Every layer, each layer's output and recurrent state queued for the GPU, not waited for, before the next is
+   *  built: the Neural Engine operations, whose splits wait for the GPU before each ANE run. */
+  #queued(steps: Step[], h0: MlxArray, cache: Cache[], phase: ReadPhase, capture: MlxLayerCapture | null,
+    width: MlxWidthClass): MlxArray {
+    let h: MlxArray | null = h0;
+    try {
+      for (let i = 0; i < steps.length; i++) {
+        const next = steps[i]!(h, cache[i]!, phase, null, width);
+        h.dispose();
+        h = next;
+        const state = cache[i]!.state();
+        try { ops.asyncEvalAll([h, ...state]); }
         finally { if (cache[i]!.stateNeedsDispose) for (const a of state) a.dispose(); }
         capture?.(i, h);
       }

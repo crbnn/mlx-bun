@@ -221,8 +221,10 @@ interface DeviceKernels {
   readonly bf16WindowRead: string | null;
   /** The Neural Engine operations: the channel fraction, the split layers, and the row counts their programs are built
    *  for (ascending), the smallest of which a one-sequence prompt piece of `minRows` positions or more runs. `affine`
-   *  splits the named `projections`; none (`null`, `[]`): the MLP alone is split. */
-  readonly ane: { readonly fraction: number; readonly minRows: number; readonly rows: readonly number[];
+   *  splits the named `projections`; none (`null`, `[]`): the MLP alone is split. `loop`: each layer's output and
+   *  recurrent state evaluated before the next layer is built (`bounded`), or queued without waiting (`queued`: each
+   *  split waits for the GPU before its ANE run). */
+  readonly ane: { readonly fraction: number; readonly loop: "bounded" | "queued"; readonly minRows: number; readonly rows: readonly number[];
     readonly rowMajorMlp: string; readonly k3InterleavedMlp: string; readonly affine: string | null; readonly projections: readonly string[] } | null;
   /** The attention and DeltaNet projections of the prompt operations (prefillChunk.gpu, prefillTail.wider, and the
    *  Neural Engine operations' projections it does not split), when the composition mounts no adapters: a layer of
@@ -286,7 +288,7 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     bf16WindowRead: null,
     // Main's Neural Engine prefill plan (9593d881, from a8a5ba45): every one-sequence prompt piece of 640 to 2048
     // positions, a chunk or a tail, on the smallest of the programs built every 512 positions up to 2048.
-    ane: { fraction: 0.55, minRows: 640, rows: [1024, 1536, 2048],
+    ane: { fraction: 0.55, loop: "bounded", minRows: 640, rows: [1024, 1536, 2048],
       rowMajorMlp: "AneTrellisMlpSplit", k3InterleavedMlp: "AneTrellisMlpSplitK3i", affine: "AneAffineSplit",
       projections: ["in_proj_z", "out_proj", "o_proj"] },
     promptProjection: null,
@@ -354,7 +356,12 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     // 200, 1024 and 8192 unchanged; bit-identical but for the pieces it moves from the GPU, mean KL 3e-5 to 2.6e-3 at
     // 14 lengths from 230 to 639 tokens, since a program's rows do not depend on its size (700, 1100 and 1600 on the
     // smaller programs: bit-identical); 0.31 on the same programs gains 2-3% below 300 tokens and loses 2% at 1024).
-    ane: { fraction: 0.34, minRows: 224,
+    // The layers queue without waiting for the GPU (`queued`): each split starts the Neural Engine once the GPU has
+    // filled its buffers (wrapped once for MLX), queues its GPU share whole and leaves its sum for the next layer to
+    // evaluate. Measured 2026-10-14, alternated sessions, two each, with the fill at 16 weights a thread: pieces of
+    // 320, 1024 and 2048 positions 2.42/5.71/11.01 -> 2.25/5.50/10.78 s (each layer evaluated before the next: 1-1.5%
+    // slower).
+    ane: { fraction: 0.34, loop: "queued", minRows: 224,
       rows: [256, 320, 384, 448, 512, 576, 640, 704, 768, 896, 1024, 1280, 1536, 1792, 2048],
       rowMajorMlp: "AneTrellisMlpSplit", k3InterleavedMlp: "AneTrellisMlpSplitK3i", affine: null, projections: [] },
     // MLX's quantized matmul bit for bit from 128 rows (k_proj and v_proj from 513, above MLX's split-K GEMM),
@@ -701,7 +708,7 @@ ${NARROW.map(cls => narrowSet(cls, "      ")).join("\n")}${wider ? `\n${widerSet
       } are one lazy graph${k.widerVerify === "lazy" ? " at every width" : ""};`,
     wider ? `prompt chunks, prompt tails above ${wider.maxRows} rows and embeddings above ${widest} rows${k.widerVerify === "bounded" ? ", and wider verify windows" : ""},`
       : `prompt chunks, and prompt tails and embeddings above ${widest} rows${k.widerVerify === "bounded" ? ", and wider verify windows" : ""},`,
-    "evaluate each layer and its recurrent state.",
+    `evaluate each layer and its recurrent state${ane?.loop === "queued" ? ", which the Neural Engine operations queue without waiting (each split waits for the GPU before its ANE run)" : ""}.`,
   ].join(" "))}`;
   const kvText = c.kv !== "every" ? `bf16, or affine ${c.kv.bits}-bit group ${c.kv.groupSize} (composes ${kvLego})`
     : legoKv ? `every scheme: affine ${legoKv.bits}-bit group ${legoKv.groupSize} composing ${kvLego}, each other its own cache lego
@@ -1157,7 +1164,7 @@ ${promptProjection ? `    // Prompt pieces above ${wider ? "WIDER_ROWS" : "eight
 ${ane ? `    this.prefillChunk = Object.freeze(split
       ? { gpu, ane: Object.freeze(split.map(({ minRows, rows, steps }) => Object.freeze({ minRows, rows,
         forward: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
-          this.#bounded(steps, embed.encode(ids), state, "window", capture, null, "wider") }))) }
+          this.#${ane.loop}(steps, embed.encode(ids), state, "window", capture${ane.loop === "bounded" ? ", null" : ""}, "wider") }))) }
       : { gpu });` : "    this.prefillChunk = Object.freeze({ gpu });"}
     this.prefillTail = Object.freeze({
 ${NARROW.map(cls => entry(cls, "window", "bounded")).join("\n")}
@@ -1292,7 +1299,29 @@ ${asyncEvery !== null ? `
     } finally { h?.dispose(); }
   }
 
-  /** Every layer, nothing evaluated. */
+${ane?.loop === "queued" ? `  /** Every layer, each layer's output and recurrent state queued for the GPU, not waited for, before the next is
+   *  built: the Neural Engine operations, whose splits wait for the GPU before each ANE run. */
+  #queued(steps: Step[], h0: MlxArray, cache: Cache[], phase: ReadPhase, capture: MlxLayerCapture | null,
+    width: MlxWidthClass): MlxArray {
+    let h: MlxArray | null = h0;
+    try {
+      for (let i = 0; i < steps.length; i++) {
+        const next = steps[i]!(h, cache[i]!, phase, null, width);
+        h.dispose();
+        h = next;
+        const state = cache[i]!.state();
+        try { ops.asyncEvalAll([h, ...state]); }
+        finally { if (cache[i]!.stateNeedsDispose) for (const a of state) a.dispose(); }
+        capture?.(i, h);
+      }
+      const out = disposing(h, this.finalNorm.forward(h));
+      h = null;
+      capture?.(steps.length, out);
+      return out;
+    } finally { h?.dispose(); }
+  }
+
+` : ""}  /** Every layer, nothing evaluated. */
   #lazy(steps: Step[], h0: MlxArray, cache: Cache[], phase: ReadPhase, capture: MlxLayerCapture | null,
     mrope: MropeForwardState | null, width: MlxWidthClass): MlxArray {
     let h: MlxArray | null = h0;

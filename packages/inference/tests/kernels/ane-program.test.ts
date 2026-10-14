@@ -43,7 +43,7 @@ test.skipIf(!ANE)("create only loads: a program missing from the compile cache f
   new Uint16Array(program.inputView(1).buffer, program.inputView(1).byteOffset, seq * cin).fill(0x3c00);
   program.evalAsync();
   program.wait();
-  using out = program.output([seq, cout], Dtype.float16);
+  using out = program.output([seq, cout]);
   using wide = out.astype(Dtype.float32);
   expect(new Set(wide.toFloat32())).toEqual(new Set([cin]));
   console.error(`[ane] ${spec.label}: compile ${compileMs.toFixed(1)} ms, cache check ${cachedMs.toFixed(2)} ms, load ${loadMs.toFixed(1)} ms`);
@@ -91,4 +91,26 @@ test.skipIf(!ANE)("a shared program with the same MIL but other weights stays it
     return wide.toFloat32()[0];
   };
   expect([three, two, same, two, three].map(first)).toEqual([-3, -2, -3, -2, -3]);
+}, 60_000);
+
+test.skipIf(!ANE)("programs on one set of buffers share one wrap per buffer, made once, which outlives a disposed lender", () => {
+  // y = x · wᵀ over ones: every output is the reduction width.
+  const cin = 256, cout = 128, wide = streamedMatmulProgram(cin, cout, 64), narrow = streamedMatmulProgram(cin, cout, 32);
+  for (const spec of [wide, narrow]) AneProgram.compile(spec);
+  const lender = AneProgram.create(wide);
+  using borrower = AneProgram.create(narrow, lender);
+  const weights = lender.inputArray(0), input = lender.inputArray(1);
+  expect(borrower.inputArray(0)).toBe(weights);
+  expect(borrower.inputArray(1)).toBe(input);
+  expect(lender.inputArray(0)).toBe(weights);
+  expect(input.size * 2).toBeGreaterThanOrEqual(wide.inputBytes[1]!);
+  lender.dispose();
+  new Uint16Array(borrower.inputView(0).buffer, borrower.inputView(0).byteOffset, cout * cin).fill(0x3c00);
+  new Uint16Array(borrower.inputView(1).buffer, borrower.inputView(1).byteOffset, 32 * cin).fill(0x3c00);
+  borrower.evalAsync();
+  borrower.wait();
+  using out = borrower.output([32, cout]);
+  using f32 = out.astype(Dtype.float32);
+  expect(new Set(f32.toFloat32())).toEqual(new Set([cin]));
+  expect(borrower.inputArray(1)).toBe(input);
 }, 60_000);
