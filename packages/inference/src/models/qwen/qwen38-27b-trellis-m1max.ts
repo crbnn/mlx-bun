@@ -19,7 +19,7 @@ import { TrellisFusedMLP, TrellisUnfusedMLP, TrellisScatterPrompt as Scatter, Tr
 import { GraphForwardScope, BoundedGraphForwardScope } from "../../runtime/graph-forward";
 import { disposeResources } from "../../runtime/resources";
 import { declareGraph } from "../capabilities";
-import type { ReadPhase } from "../graph";
+import { fixedRowBindings, type ReadPhase } from "../graph";
 import { QwenDeltaLayer as Delta, QwenAttentionLayer as Attention } from "./blocks";
 import { bindQwenMediaInput, qwenDraftTarget, qwenMediaEncoders, qwenResidualBasis } from "./media-input";
 import { DeltaWeights, AttentionWeights, GateDownMLP, canonicalQwenWeights, type QwenProjectionTarget } from "./written-layers";
@@ -681,6 +681,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
     const knownTiled:MlxPhaseForward=(ids,cache)=>windowTiled(ids,cache,null);
     const knownExpanded:MlxPhaseForward=(ids,cache)=>windowExpanded(ids,cache,null);
     this.appendKnown={
+      ...fixedRowBindings(65,t.maxPositionEmbeddings,knownExpanded),
       1:knownOne,2:knownRows,3:knownRows,4:knownRows,5:knownFive,6:knownFive,7:knownFive,8:knownFive,
       9:knownTiled,10:knownTiled,11:knownTiled,12:knownTiled,13:knownTiled,14:knownTiled,15:knownTiled,16:knownTiled,
       17:knownTiled,18:knownTiled,19:knownTiled,20:knownTiled,21:knownTiled,22:knownTiled,23:knownTiled,24:knownTiled,

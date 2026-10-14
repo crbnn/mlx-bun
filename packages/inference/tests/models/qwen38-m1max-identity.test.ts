@@ -118,7 +118,7 @@ function artifact(): { weights: Weights; config: ModelConfig } {
       linearNumKeyHeads: HK, linearNumValueHeads: HV, linearKeyHeadDim: DK, linearValueHeadDim: DV,
       linearConvKernelDim: KERNEL, fullAttentionInterval: 4, partialRotaryFactor: 0.25,
       ropeParameters: { full_attention: { ropeTheta: 10_000_000, ropeType: "default", partialRotaryFactor: 0.25, factor: 1 } },
-      tieWordEmbeddings: false,
+      tieWordEmbeddings: false,maxPositionEmbeddings:4096,
     },
   } as unknown as ModelConfig;
   return { weights, config };
@@ -279,3 +279,39 @@ for (const scheme of Object.keys(SCHEMES)) {
     } finally { disposeAll(mine, theirs); }
   }, 180_000);
 }
+
+test("a long known span keeps one window and reaches beyond verify rows",()=>{
+  const {current,generic}=graphs("bf16"),mine=current.makeCache(),theirs=generic.makeCache();
+  try {
+    using input=ids([prompt(80,71)]);
+    expect(current.appendKnown[80]).toBe(current.appendKnown[4096]);
+    expect(current.appendKnown[4097]).toBeUndefined();
+    outputDiff("known span 80",new MlxPhaseDispatch(current).known(80)(input,mine) as MlxArray,
+      new MlxPhaseDispatch(generic).known(80)(input,theirs) as MlxArray,current.logitsFromHidden.bind(current),generic.logitsFromHidden.bind(generic));
+    stateDiff("known span 80",mine,theirs);
+  } finally {disposeAll(mine,theirs);}
+},180_000);
+
+test("packed prompt and decode groups preserve hidden, capture order and independent cache states",()=>{
+  const {current,generic}=graphs("bf16");
+  const mine=[current.makeCache(),current.makeCache()],theirs=[generic.makeCache(),generic.makeCache()];
+  const leftCaptures:number[][]=[[],[]],rightCaptures:number[][]=[[],[]];
+  using prefill=ids([prompt(40,81)]);
+  using decode=ids([prompt(1,82)]);
+  const left=[{phase:"window" as const,rows:40,ids:prefill,state:mine[0]!,capture:(layer:number)=>leftCaptures[0]!.push(layer)},
+    {phase:"decode" as const,rows:1,ids:decode,state:mine[1]!,capture:(layer:number)=>leftCaptures[1]!.push(layer)}];
+  const right=[{...left[0]!,state:theirs[0]!,capture:(layer:number)=>rightCaptures[0]!.push(layer)},
+    {...left[1]!,state:theirs[1]!,capture:(layer:number)=>rightCaptures[1]!.push(layer)}];
+  let a:MlxArray[]=[],b:MlxArray[]=[];
+  try {
+    a=current.mixed.at(-1)!.operation(left,41);
+    b=generic.mixed.at(-1)!.operation(right,41);
+    for (let row=0;row<2;row++) {
+      outputDiff(`packed group ${row}`,a[row]!,b[row]!,current.logitsFromHidden.bind(current),generic.logitsFromHidden.bind(generic));
+      a[row]=null as unknown as MlxArray;b[row]=null as unknown as MlxArray;
+      stateDiff(`packed group ${row}`,mine[row]!,theirs[row]!);
+      expect(leftCaptures[row]).toEqual(Array.from({length:65},(_,layer)=>layer));
+      expect(leftCaptures[row]).toEqual(rightCaptures[row]);
+    }
+  } finally {for (const hidden of [...a,...b]) hidden?.dispose();disposeAll(...mine,...theirs);}
+},180_000);
