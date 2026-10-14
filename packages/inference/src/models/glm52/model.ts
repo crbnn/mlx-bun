@@ -1,5 +1,5 @@
 import { bindGraphCaches } from "../cache-composition";
-import type { MlxCacheLayer, MlxMixedRange } from "../../contracts/mlx/graph";
+import type { MlxCacheLayer } from "../../contracts/mlx/graph";
 // Dedicated GLM-5.2 correctness graph over the direct Colibri artifact.
 //
 // G2 deliberately favors an auditable dequantize->f32 path. Routed experts are
@@ -21,11 +21,10 @@ import { ColibriGlm52Weights } from "../../artifacts/glm52/weights";
 import { type Cache, type LatentAttentionCache } from "../../contracts/mlx/cache";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
-import type { MlxRowTable, MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPromptRange, MlxTokenPhases, MlxVerifyForward } from "../../contracts/mlx/graph";
+import type { MlxRowTable, MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxKnownOperations, MlxPromptRange, MlxTokenPhases } from "../../contracts/mlx/graph";
 import { declareGraph } from "../capabilities";
-import { phaseRowLimit,  rowTable, rowTableFrom  } from "../graph";
+import { rowTableWithDefault } from "../row-table";
 import { type QuantizedLinear } from "../../layers/quantized-linear";
-import { composedLatentCache, latentLegoCodecs } from "../../state/latent-legos";
 import type { CacheCodecProvider } from "../../state/persistence-types";
 import { BF16_KV, type KvStorageScheme } from "../../contracts/portable/composition";
 import {
@@ -804,16 +803,18 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
     const multiSequencePrompt: MlxCapturingForward = (ids, cache) => this.#forward(ids, cache, GLM52_PHASE_READS.window);
     this.prompt = [{ from: 1, to: Infinity, operation: multiSequencePrompt }];
     this.multiSequencePrompt = this.prompt;
-    this.appendKnown = rowTableFrom<MlxPhaseForward>(width => (ids, cache) =>
-    this.#forward(ids, cache, width === 1 ? GLM52_PHASE_READS.oneToken : GLM52_PHASE_READS.window), this.glmConfig.maxPositionEmbeddings);
-    this.logits = rowTable<MlxHeadForward>(hidden => this.logitsFromHidden(hidden), this.glmConfig.maxPositionEmbeddings);
-    this.decode = rowTable<MlxPhaseForward>((ids, cache) => this.#forward(ids, cache, GLM52_PHASE_READS.oneToken), this.glmConfig.maxPositionEmbeddings);
-    this.verify = rowTable<MlxVerifyForward>(async (ids, cache) => {
-    const executor = this.expertRuntime?.executor;
-    executor?.setFixedKernelFamily(true);
-    try { return await this.#forward(ids, cache, GLM52_PHASE_READS.window); }
-    finally { executor?.setFixedKernelFamily(false); }
-  }, this.glmConfig.maxPositionEmbeddings);
+    this.appendKnown = [
+      { from: 1, to: 1, operation: (ids, cache) => this.#forward(ids, cache, GLM52_PHASE_READS.oneToken) },
+      { from: 2, to: Infinity, operation: (ids, cache) => this.#forward(ids, cache, GLM52_PHASE_READS.window) },
+    ];
+    this.logits = rowTableWithDefault<MlxHeadForward>({}, hidden => this.logitsFromHidden(hidden));
+    this.decode = rowTableWithDefault<MlxCapturingForward>({}, (ids, cache) => this.#forward(ids, cache, GLM52_PHASE_READS.oneToken));
+    this.verify = rowTableWithDefault<MlxCapturingForward>({}, async (ids, cache) => {
+      const executor = this.expertRuntime?.executor;
+      executor?.setFixedKernelFamily(true);
+      try { return await this.#forward(ids, cache, GLM52_PHASE_READS.window); }
+      finally { executor?.setFixedKernelFamily(false); }
+    });
 
   }
 
@@ -1002,8 +1003,8 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly prompt: readonly MlxPromptRange[];
   readonly multiSequencePrompt: readonly MlxPromptRange[];
 
-  /** Known tokens: one sequence's tokens are its rows, so the one-row class is one token. */
-  readonly appendKnown: MlxRowTable<MlxPhaseForward>;
+  /** Known tokens: one sequence's tokens are its rows, so the one-row operation is one token. */
+  readonly appendKnown: MlxKnownOperations;
   readonly logits: MlxRowTable<MlxHeadForward>;
   readonly decode: MlxRowTable<MlxCapturingForward>;
   /** A verify window on the row-independent M=1 streamed-expert kernel family
