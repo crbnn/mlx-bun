@@ -19,7 +19,7 @@ import { MlxStateRows } from "../state/rows";
 import { leaseCacheStates } from "../state/leases";
 import { bindSpeculativeTargetModel, type MlxSpeculativeTargetBinding } from "../generation/speculative/bindings/binding";
 import { bindLegacyDraftTarget } from "../generation/speculative/bindings/draft-target";
-import { bindRowCacheRollback } from "../state/rollback";
+import { bindRowCacheRollback, bindRowStepRollback } from "../state/rollback";
 import { disposeAttachments } from "../state/checkpoint";
 import { type CheckpointAttachment } from "../contracts/mlx/checkpoint";
 import { advanceSpeculativeOutputs } from "../generation/speculative/round";
@@ -80,6 +80,18 @@ export function bindSpeculativeGroupRequests(model: MlxTokenGraph, provider: Pic
   };
 }
 
+/** A step without drafts whose samples are still unread: the GPU runs it while the step before it is delivered.
+ *  Its input is kept (its window resolved, its taps committed to the drafter); `tokens` [B] are the samples the next
+ *  step reads as its input, owned, and `rows` the rows it ran, in order. */
+interface AheadStep {
+  readonly tokens: MlxArray;
+  readonly rows: readonly Row[];
+}
+
+/** How one delivered sample left its row: still decoding, or ended. */
+type StepOutcome = { readonly kind: "continue" } | { readonly kind: "stop" | "length" } |
+  { readonly kind: "cancelled"; readonly reason: unknown } | { readonly kind: "failed"; readonly error: unknown };
+
 /** The draft selection one group's requests share, before the group binds its rows' draws. */
 type GroupSelection = { readonly kind: "sampled" } | { readonly kind: "greedy" } |
   { readonly kind: "listed"; readonly ids: readonly number[] };
@@ -99,6 +111,8 @@ class SpeculativeGroup implements MlxGroupedMethod {
   #draft: DraftRowGroup | null = null;
   readonly #requests = new Map<Row, RequestState>();
   #steps = 0;
+  /** The step without drafts in flight, when the last round was one. */
+  #ahead: AheadStep | null = null;
   /** Adaptive draft depth: each round's depth comes from the decayed
    *  acceptance rate and the graph's measured verify costs. */
   readonly #gate: AdaptiveDraftGate | null;
@@ -317,6 +331,8 @@ class SpeculativeGroup implements MlxGroupedMethod {
                   state.request.retain = state.retain; state.retain = undefined;
                   this.#requests.set(state.row, state.request); state.transferred = true;
                   this.host.join(state.row);
+                  // New text: what the gate observed of the rows before says little about it.
+                  this.#gate?.reset();
                 }, dispose() {} })]);
             } finally { ready.shift(); closeReady(state); }
           }
@@ -371,11 +387,21 @@ class SpeculativeGroup implements MlxGroupedMethod {
       for (const row of active) if (row.req.signal?.aborted) row.reject(row.req.signal.reason);
       this.host.filterRows(live);
     }
-    const rows = [...this.host.rows];
+    // A row that joined since the last step has no sample in flight: deliver the ones in flight first.
+    if (this.#ahead && !sameRows(this.#ahead.rows, this.host.rows)) await this.#flushAhead();
+    let rows = [...this.host.rows];
     if (!rows.length) return;
     const cap = Math.min(this.depth, Math.max(...rows.map(row => row.req.maxTokens - row.generated)));
-    // At least one draft, so the drafter's context keeps advancing every round.
-    const depth = this.#gate && cap > 0 ? Math.max(1, this.#gate.choose(cap)) : cap;
+    // A round without drafts verifies the pending token alone (one plain decode step) and still advances the
+    // drafter's context through its commit; rows that sample on the device pipeline such rounds as plain decode does.
+    let depth = this.#gate && cap > 0 ? this.#gate.next(cap) : cap;
+    if (depth === 0 && this.#pipelinesZero(rows)) return this.#zeroStep(rows, work);
+    if (this.#ahead) {
+      await this.#flushAhead();
+      rows = [...this.host.rows];
+      if (!rows.length) return;
+      depth = Math.min(depth, Math.max(...rows.map(row => row.req.maxTokens - row.generated)));
+    }
     // The ordinary MTP round already supplies samples that can establish a
     // copied prefix. Do not verify a wide span before any sample matches it.
     const proposals = rows.map(row => {
@@ -454,7 +480,7 @@ class SpeculativeGroup implements MlxGroupedMethod {
         stats.rejected = stats.drafted - stats.accepted;
         stats.targetCalls++;
         if (!echoDepth) {
-          this.#gate?.observe(round.acceptance.accepted, round.acceptance.accepted < round.drafts.length ? 1 : 0);
+          this.#gate?.observe(round.drafts.length, round.acceptance.accepted);
           stats.rounds!++;
           stats.acceptanceLengths!.push(round.acceptance.accepted);
           for (let p = 0; p < round.drafts.length; p++) stats.draftedByPos![p] = (stats.draftedByPos![p] ?? 0) + 1;
@@ -499,6 +525,152 @@ class SpeculativeGroup implements MlxGroupedMethod {
     } finally { externalTokens?.dispose(); }
   }
 
+  /** Whether rounds without drafts pipeline for these rows: each draws its sample on the device without reading it
+   *  (no grammar or captured probabilities; processor history takes the draw unread) and none echoes proposals. */
+  #pipelinesZero(rows: readonly Row[]): boolean {
+    return rows.every(row => {
+      const request = this.#requests.get(row)!;
+      return !request.fill && (request.sampling.positional || request.sampling.unread);
+    });
+  }
+
+  /** One sample per row of a step's logits [B, 1, V], left on the device [B]: the draws `sample` would make. */
+  #sampleStep(rows: readonly Row[], logits: MlxArray): MlxArray {
+    const samplers = rows.map(row => this.#requests.get(row)!.sampling);
+    const V = logits.shape[2]!, B = rows.length;
+    const independent = samplers[0]!.independent;
+    if (independent && samplers.every(sampling => sampling.independent === independent)) {
+      using flat = ops.reshape(logits, [B, V]);
+      return independent.sample(flat);
+    }
+    const tokens: MlxArray[] = [];
+    try {
+      for (const [index, sampling] of samplers.entries()) {
+        using slice = logits.slice([index, 0, 0], [index + 1, 1, V]);
+        using scores = ops.reshape(slice, [1, V]);
+        const step = rows[index]!.sampled;
+        tokens.push(sampling.positional ? sampling.positional.sample(scores, [step]) : sampling.unread!.sample(scores, step));
+      }
+      return tokens.length === 1 ? tokens.pop()! : ops.concatAxis(tokens, 0);
+    } finally { disposeResources(tokens); }
+  }
+
+  /** One round without drafts, pipelined as plain decode is: this step's window (one position per row, fed by the
+   *  previous step's samples on the device) is built and submitted before those samples are read and delivered, so
+   *  the GPU runs it meanwhile. Until delivered, its input may still end its row: rows that continue keep it and
+   *  commit its taps to the drafter, rows that end drop it (`bindRowStepRollback`), so a finished row's state covers
+   *  exactly the tokens it processed, as after an unpipelined round. A graph or state failure throws and discards
+   *  the group. */
+  async #zeroStep(rows: readonly Row[], work: MlxForwardWork | undefined): Promise<void> {
+    // A round for every row, which delivers the sample in flight; the forward runs unless every row has drawn its last.
+    const forward = !this.#ahead || rows.some(row => row.sampled < row.req.maxTokens);
+    for (const row of rows) {
+      const stats = row.spec!;
+      stats.rounds!++; stats.acceptanceLengths!.push(0);
+      if (forward) stats.targetCalls++;
+      stats.tokensPerForward = row.generated / (stats.targetCalls - 1);
+      stats.forwardsSaved = Math.max(0, row.generated - stats.targetCalls);
+    }
+    if (!forward) return this.#flushAhead();
+    const previous = this.#ahead;
+    this.#ahead = null;
+    const B = rows.length, caches = this.#target!.caches;
+    let context: MlxArray | null = null, tokens: MlxArray | null = null;
+    try {
+      const window = previous ? bindRowStepRollback(caches, B) : null;
+      {
+        using ids = previous ? ops.reshape(previous.tokens, [B, 1]) : ops.fromInt32(rows.map(row => row.current), [B, 1]);
+        window?.begin(1);
+        const taps = this.#draft!.tapLayers;
+        const result = await this.binding.decode(ids, caches, taps.length ? taps : undefined, work);
+        context = result.ctxML ?? result.hidden;
+        try {
+          using logits = this.binding.projectLogits(result.hidden, B);
+          tokens = this.#sampleStep(rows, logits);
+        } finally { if (result.ctxML) result.hidden.dispose(); }
+      }
+      ops.asyncEvalAll([tokens]);
+      const steps = rows.map(row => row.sampled++);
+      // The previous step's samples, delivered while the GPU runs this step: this step's inputs.
+      let inputs = rows.map(row => row.current), outcomes: StepOutcome[] = rows.map(() => ({ kind: "continue" }));
+      if (previous) {
+        inputs = previous.tokens.toIntTokens();
+        outcomes = [];
+        for (const [index, row] of rows.entries()) outcomes.push(await this.#deliverSample(row, inputs[index]!));
+        window!.resolve(outcomes.map(outcome => Number(outcome.kind === "continue")));
+      }
+      const keep = this.#retire(rows, outcomes);
+      if (keep.length !== B) this.host.filterRows(keep);
+      if (keep.length) {
+        if (keep.length !== B) {
+          using index = ops.fromInt32(keep, [keep.length]);
+          const keptContext = ops.takeAxis(context, index, 0), keptTokens = ops.takeAxis(tokens, index, 0);
+          context.dispose(); tokens.dispose();
+          context = keptContext; tokens = keptTokens;
+        }
+        // The drafter takes the kept inputs as a round's pending tokens, then their taps.
+        await this.#draft!.draft(keep.map(index => inputs[index]!), 0, keep.map(index => steps[index]!));
+        await this.#draft!.commit(keep.map(() => 0), context);
+        for (const index of keep) {
+          const row = rows[index]!;
+          this.#requests.get(row)!.processed?.push(inputs[index]!);
+          row.current = inputs[index]!;
+        }
+        this.#ahead = { tokens, rows: keep.map(index => rows[index]!) };
+        tokens = null;
+      }
+      if (++this.#steps % 256 === 0) clearCache();
+    } finally { disposeResources([previous?.tokens, context, tokens].filter(value => value != null)); }
+  }
+
+  /** Read and deliver the step in flight, leaving its rows' samples pending: the rounds that follow draft from them. */
+  async #flushAhead(): Promise<void> {
+    const ahead = this.#ahead;
+    if (!ahead) return;
+    this.#ahead = null;
+    let read: number[];
+    try { read = ahead.tokens.toIntTokens(); } finally { ahead.tokens.dispose(); }
+    // Rows that joined after the step follow its rows; they have nothing in flight.
+    const rows = [...this.host.rows], outcomes: StepOutcome[] = [];
+    for (const [index, row] of rows.entries())
+      outcomes.push(index < ahead.rows.length ? await this.#deliverSample(row, read[index]!) : { kind: "continue" });
+    for (const [index, row] of ahead.rows.entries()) if (outcomes[index]!.kind === "continue") row.current = read[index]!;
+    const keep = this.#retire(rows, outcomes);
+    if (keep.length !== rows.length) this.host.filterRows(keep);
+  }
+
+  /** Deliver one verified sample of a step without drafts, as a round delivers its window: an EOS ends the row
+   *  unpublished, a consumer may stop it, and its budget ends it. */
+  async #deliverSample(row: Row, token: number): Promise<StepOutcome> {
+    if (row.req.signal?.aborted) return { kind: "cancelled", reason: row.req.signal.reason };
+    if (row.req.eosTokenIds.includes(token)) {
+      if (row.generated < row.req.maxTokens) row.generated++;
+      return { kind: "stop" };
+    }
+    try {
+      row.generated++;
+      if (await this.host.publish(row, token) === false) return { kind: "stop" };
+    } catch (error) { return { kind: "failed", error }; }
+    return row.generated >= row.req.maxTokens ? { kind: "length" } : { kind: "continue" };
+  }
+
+  /** Retire the rows a step ended (a stopped or finished row publishes its state first) and return the indices
+   *  of the rest. The caller filters the group to them. */
+  #retire(rows: readonly Row[], outcomes: readonly StepOutcome[]): number[] {
+    const keep: number[] = [];
+    for (const [index, row] of rows.entries()) {
+      const outcome = outcomes[index]!;
+      if (outcome.kind === "continue") { keep.push(index); continue; }
+      if (outcome.kind === "failed") row.reject(outcome.error);
+      else if (outcome.kind === "cancelled") row.reject(outcome.reason);
+      else {
+        if (!row.req.signal?.aborted) this.#publishCheckpoint(row, index, this.#requests.get(row)!);
+        this.host.finish(row, outcome.kind);
+      }
+    }
+    return keep;
+  }
+
   #proposeEcho(row: Row, request: RequestState): void {
     if (request.proposal || !request.fill) return;
     const value = request.fill.propose(row.req.maxTokens - row.generated, "verify");
@@ -527,6 +699,18 @@ class SpeculativeGroup implements MlxGroupedMethod {
 
   filterRows(keep: readonly number[], _discard: boolean): void {
     this.#target?.filterRows(keep); this.#draft?.filterRows(keep);
+    const ahead = this.#ahead;
+    if (ahead) {
+      // The step in flight ran a prefix of the rows: rows that joined after it follow.
+      const kept = keep.filter(index => index < ahead.rows.length);
+      if (!kept.length) { ahead.tokens.dispose(); this.#ahead = null; }
+      else if (kept.length !== ahead.rows.length) {
+        using index = ops.fromInt32(kept, [kept.length]);
+        const tokens = ops.takeAxis(ahead.tokens, index, 0);
+        ahead.tokens.dispose();
+        this.#ahead = { tokens, rows: kept.map(row => ahead.rows[row]!) };
+      }
+    }
     const retained = new Set(keep.map(index => this.host.rows[index]!));
     const releases: { dispose(): void }[] = [];
     for (const [row, request] of this.#requests) if (!retained.has(row)) {
@@ -538,10 +722,17 @@ class SpeculativeGroup implements MlxGroupedMethod {
   }
 
   dispose(): void {
+    this.#ahead?.tokens.dispose();
+    this.#ahead = null;
     for (const request of this.#requests.values()) this.#settleEcho(request);
     const resources = [...(this.#target ? [this.#target] : []), ...(this.#draft ? [this.#draft] : []),
       ...[...this.#requests.values()].flatMap(request => [request.sampling, { dispose: () => request.retain?.() }])];
     this.#target = null; this.#draft = null; this.#requests.clear();
     disposeResources(resources);
   }
+}
+
+/** Whether a step in flight ran exactly the group's current rows. */
+function sameRows(ran: readonly Row[], rows: readonly Row[]): boolean {
+  return ran.length === rows.length && ran.every((row, index) => row === rows[index]);
 }

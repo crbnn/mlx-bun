@@ -1,7 +1,7 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { Cache } from "../../../contracts/mlx/cache";
-import type { MlxLayerCapture } from "../../../contracts/mlx/graph";
+import { widthClass, type MlxLayerCapture } from "../../../contracts/mlx/graph";
 import type { MlxTokenGraph } from "../../../models/graph";
 import { declaredGraph, tokenPhasesOf } from "../../../models/capabilities";
 import type { MlxForwardWork } from "../../../contracts/mlx/forward-work";
@@ -30,6 +30,9 @@ export interface MlxSpeculativeTargetBinding {
   /** One prompt step in the phase its planner named, capturing `tapLayers`. */
   prefill(ids: MlxArray, caches: Cache[], step: MlxPromptStep, tapLayers?: readonly number[],
     work?: MlxForwardWork): Promise<MlxTargetForward>;
+  /** One new position per sequence through the graph's decode phase, capturing `tapLayers`: a round without
+   *  drafts, the step plain decode runs. */
+  decode(ids: MlxArray, caches: Cache[], tapLayers?: readonly number[], work?: MlxForwardWork): Promise<MlxTargetForward>;
   /** A verify window, capturing `tapLayers`. */
   verify(ids: MlxArray, caches: Cache[], window: MlxVerifyWindow, tapLayers?: readonly number[],
     work?: MlxForwardWork): Promise<MlxTargetForward>;
@@ -50,6 +53,11 @@ export function bindSpeculativeTargetModel(model: MlxTokenGraph): MlxSpeculative
     prefill: (ids, caches, step, tapLayers, work) => withCapture(tapLayers, layerCount, capture => {
       const own = async () => dispatch.prompt(step.phase, step.sequences, step.tokens)(ids, caches, capture);
       return work ? work(ids, caches, promptWorkStep(step, capture, own)) : own();
+    }),
+    decode: (ids, caches, tapLayers, work) => withCapture(tapLayers, layerCount, capture => {
+      const sequences = ids.shape[0]!;
+      const own = async () => dispatch.decode(sequences)(ids, caches, capture);
+      return work ? work(ids, caches, { phase: "decode", rows: sequences, width: widthClass(sequences), capture, own }) : own();
     }),
     verify: (ids, caches, window, tapLayers, work) => withCapture(tapLayers, layerCount, capture => {
       const own = async () => dispatch.verify(window.sequences, window.positions)(ids, caches, capture);

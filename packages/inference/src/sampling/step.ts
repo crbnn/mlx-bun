@@ -227,7 +227,18 @@ export function makeStepSampler(
     }
     : undefined;
 
+  const unread = !grammar && !capture
+    ? {
+      sample(scores: MlxArray, step: number): MlxArray {
+        const { token } = sampleDevice(scores, step);
+        if (config.historyUpdate === "after-sample") commitDevice(token);
+        return token;
+      },
+    }
+    : undefined;
+
   const common = {
+    unread,
     independent: isPlainGreedy(options, processors.length > 0) && !capture && !config.sampler
       ? independentGreedySampling : undefined,
     positional,

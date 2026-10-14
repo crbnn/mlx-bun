@@ -123,13 +123,14 @@ test("explicit single-row representations preserve output bits on any GPU", () =
     const g: TrellisGeometry = { ...down, k, ...(k === 3 ? { blockInterleave: 2 as const } : {}) };
     using c = codes(k === 3 ? [g.cols / 512, g.rows, 48] : [g.rows, g.cols * k / 32]);
     using expected = trellisScatter(xDown, c, scales, g, 13, false, { bits: false, genericBits: false, floatCodebook: false });
+    // Before the alternatives below free buffers already holding these output bits for the next allocation to reuse.
+    using codebook = (k === 3 ? downK3InterleavedCodebookRow : downCodebookRow)(xDown, c, scales, g);
+    same(codebook, expected);
     for (const representation of [{ bits: true, genericBits: true, floatCodebook: false },
       { bits: false, genericBits: false, floatCodebook: true }, { bits: true, genericBits: true, floatCodebook: true }, qualified.scatter]) {
       using actual = trellisScatter(xDown, c, scales, g, 13, false, representation);
       same(actual, expected);
     }
-    using codebook = (k === 3 ? downK3InterleavedCodebookRow : downCodebookRow)(xDown, c, scales, g);
-    same(codebook, expected);
   }
   using rawUp = MlxArray.fromFloat32(Float32Array.from({ length: 5120 }, (_, i) => Math.sin(i * 0.17)), [1, 1, 5120]);
   using xUp = rawUp.astype(Dtype.bfloat16);
@@ -155,9 +156,10 @@ test("explicit single-row representations preserve output bits on any GPU", () =
 }, 60_000);
 
 test("one-row codebook kernels reproduce the shipped one-row kernels on small synthetic shapes", () => {
-  // Gate/up: rows not a multiple of a threadgroup's sixteen, and more than its threadgroups take at once (SIMD groups
+  // Gate/up: rows not a multiple of a threadgroup's 32, and more than its threadgroups take at once (SIMD groups
   // loop over rows). Down: 128 splits of which some are empty and the others hold an odd number of rows (the two-row
-  // steps and their remainder), and SIMD groups only partly over blocks.
+  // steps and their remainder), SIMD groups only partly over blocks, and threadgroups with a SIMD-group pair past
+  // the last columns (512 columns) or half of one (768).
   let seed = 4099;
   const codes = (shape: number[]) => {
     using signed = MlxArray.fromInt32(Int32Array.from({ length: shape.reduce((a, b) => a * b, 1) },
@@ -185,10 +187,10 @@ test("one-row codebook kernels reproduce the shipped one-row kernels on small sy
   using rawDown = MlxArray.fromFloat32(Float32Array.from({ length: rows }, (_, i) => Math.sin(i * 0.13)), [1, rows]);
   using xDown = rawDown.astype(Dtype.bfloat16);
   const none = { bits: false, genericBits: false, floatCodebook: false };
-  for (const k of [2, 3, 4]) {
-    const g: TrellisGeometry = { k, L: 12, T: 256, axis: 0, rows, cols, inFeatures: rows, outFeatures: cols,
+  for (const [k, outCols] of [[2, cols], [3, cols], [4, cols], [2, 768], [4, 768]] as const) {
+    const g: TrellisGeometry = { k, L: 12, T: 256, axis: 0, rows, cols: outCols, inFeatures: rows, outFeatures: outCols,
       ...(k === 3 ? { blockInterleave: 2 as const } : {}) };
-    using c = codes(k === 3 ? [cols / 512, rows, 48] : [rows, cols * k / 32]);
+    using c = codes(k === 3 ? [outCols / 512, rows, 48] : [rows, outCols * k / 32]);
     using expected = trellisScatter(xDown, c, scales, g, 13, false, none);
     using actual = (k === 3 ? downK3InterleavedCodebookRow : downCodebookRow)(xDown, c, scales, g);
     same(actual, expected);

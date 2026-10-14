@@ -107,11 +107,11 @@ export const QWEN38_COMPOSITIONS: Readonly<Record<string, Qwen38Composition>> = 
     maxRows: null,
     aneBridge: true,
     mixedGateUp: "split",
-    // Measured 2026-10-13 on this graph and artifact, with the split-K affine kernels at four to eight rows and the
-    // drafter's own kernels this graph declares: scripts/bench-mtp.ts, the DFlash 2 drafter at depths 1..7 against
-    // the depth-0 plain arm (58.6 ms per token), bf16 KV, greedy, two prompts, 128 tokens, four repetitions, whose
-    // ratios span under 2.5% at every width but eight rows (5%).
-    verifyRoundCosts: { host: "M1 Max 32 GB", costs: [[1, 1], [2, 1.93], [3, 2.35], [4, 2.51], [5, 2.57], [6, 2.63], [7, 2.73], [8, 2.81]] },
+    // Measured 2026-10-13 on this graph and artifact, with the one-row codebook kernels' bit-field reads, the split-K
+    // affine kernels at four to eight rows and the drafter's own kernels this graph declares: scripts/bench-mtp.ts,
+    // the DFlash 2 drafter at depths 1..7 against the depth-0 plain arm (54.5-55.9 ms per token), bf16 KV, greedy,
+    // two prompts, 128 tokens, four sessions of two repetitions, whose ratios span under 2.5% at every width.
+    verifyRoundCosts: { host: "M1 Max 32 GB", costs: [[1, 1], [2, 2.01], [3, 2.42], [4, 2.56], [5, 2.69], [6, 2.78], [7, 2.87], [8, 2.96]] },
     // Measured 2026-10-13 on the M1 Max 32 GB, where the 11.96e9 B weights are under half the 26.8e9 B recommended
     // set: wired, bit-identical, paired A/B, GPU prefill 1k/8k 136/142 -> 143/145 tok/s; with the Neural Engine
     // split 171/173 -> 172/177 and the first GPU step after the split 0.15-1.4 s -> 61-69 ms; one-row decode
