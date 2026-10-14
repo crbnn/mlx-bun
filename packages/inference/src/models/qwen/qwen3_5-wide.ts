@@ -155,7 +155,8 @@ export class Qwen35WideModel implements MlxDeclaredGraph, MlxTokenPhases {
     };
     this.decode = exact(range => forward(range, "decode", false));
     this.verify = exact(range => forward(range, "window", false));
-    this.appendKnown = exact(range => (ids, state) => this.forwardLayers(this.embed.encode(ids), state, "window", undefined, null, range.layers, false));
+    this.appendKnown = this.#ranges.map(range => ({ from: range.from, to: range.to, operation: (ids, state) =>
+      this.forwardLayers(this.embed.encode(ids), state, "window", undefined, null, range.layers, false) }));
     this.prompt = this.#ranges.map(range => ({ from: range.from, to: range.to, operation: forward(range, "window", range.from > 4) }));
     this.multiSequencePrompt = this.prompt;
     this.logits = rowTable(hidden => this.logitsFromHidden(hidden), maxPhaseRows);
@@ -259,7 +260,7 @@ export class Qwen35WideModel implements MlxDeclaredGraph, MlxTokenPhases {
   /** Committed known-token spans, when the composition qualifies them (`#qualifiesKnownSpans`). */
   readonly knownSpans: MlxKnownSpans | undefined;
   /** Known tokens: the committed read under `knownSpans`, the window read otherwise. */
-  readonly appendKnown: MlxRowTable<MlxPhaseForward>;
+  readonly appendKnown: import("../../contracts/mlx/graph").MlxKnownOperations;
 
   /** The one output head at every width. */
   readonly logits: MlxRowTable<MlxHeadForward>;

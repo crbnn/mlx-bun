@@ -1,3 +1,4 @@
+import { knownOperationFor } from "../../../src/generation/phase-dispatch";
 import { bindGraphCaches } from "../../../src/models/cache-composition";
 import { GLM52_F32_CACHES } from "../../../src/models/glm52/model";
 import { MlxPhaseDispatch } from "../../../src/generation/phase-dispatch";
@@ -176,7 +177,7 @@ async function phase(graph: Glm52Model, which: Phase, ids: MlxArray, cache: Cach
     case "tail": return await new MlxPhaseDispatch(graph).prompt("tail", 1, width)(ids, cache, null);
     case "decode": return await graph.decode[width]!(ids, cache, null);
     case "verify": return await graph.verify[width]!(ids, cache, null);
-    case "known": return await graph.appendKnown[width]!(ids, cache);
+    case "known": return await knownOperationFor(graph.appendKnown, width)(ids, cache);
   }
 }
 const tokens = (count: number, salt: number) => Array.from({ length: count }, (_, i) => 3 + (i * 7 + salt * 5) % (VOCAB - 3));

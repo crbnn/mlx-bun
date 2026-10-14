@@ -11,4 +11,4 @@ export { acquireModelWiredLimit, wiredWorkingSetBytes, modelNeedsWiredLimit, wit
 
 export { generationCheckpointKey } from "./checkpoint-identity";
 
-export { MlxPhaseDispatch } from "./phase-dispatch";
+export { MlxPhaseDispatch, knownOperationFor } from "./phase-dispatch";

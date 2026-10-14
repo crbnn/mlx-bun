@@ -1,10 +1,19 @@
 // The scheduler's side of the graph contract: it names the phase it is in and
 // the rows it is loading, and this resolves the operation the graph built for
 // them. Bound once per graph; nothing here inspects a tensor.
-import { type MlxCapturingForward, type MlxHeadForward, type MlxLayerCapture, type MlxPromptRange, type MlxPhaseForward, type MlxTokenPhases } from "../contracts/mlx/graph";
+import { type MlxCapturingForward, type MlxHeadForward, type MlxLayerCapture, type MlxPromptRange, type MlxPhaseForward, type MlxTokenPhases, type MlxKnownOperations } from "../contracts/mlx/graph";
 import type { PrefillPhase } from "../contracts/portable/prefill";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { MlxForwardStep } from "../contracts/mlx/forward-work";
+
+/** Index the declared whole-span operation without changing its geometry. */
+export function knownOperationFor(operations: MlxKnownOperations, rows: number): MlxPhaseForward {
+  const operation = Array.isArray(operations)
+    ? operations.find(range => rows >= range.from && rows <= range.to)?.operation
+    : (operations as Readonly<Record<number, MlxPhaseForward>>)[rows];
+  if (!operation) throw new Error(`graph has no known-span operation for ${rows} rows`);
+  return operation;
+}
 
 /** One prompt step the scheduler runs: the phase its planner named and its
  *  rows, `sequences` sequences of `tokens` positions each. */
@@ -82,7 +91,7 @@ export class MlxPhaseDispatch {
   }
 
   /** `tokens` known tokens appended to one sequence. */
-  known(tokens: number): MlxPhaseForward { return this.#graph.appendKnown[tokens]!; }
+  known(tokens: number): MlxPhaseForward { return knownOperationFor(this.#graph.appendKnown, tokens); }
 
   /** The head over a hidden of `rows` rows. */
   logits(rows: number): MlxHeadForward { return this.#graph.logits[rows]!; }
