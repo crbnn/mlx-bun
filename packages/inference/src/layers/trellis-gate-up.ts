@@ -3,6 +3,7 @@ import { gateUpFactoredRow, gateUpFactoredRows } from "../kernels/trellis/gate-u
 import { mixedGateUpFactoredRows } from "../kernels/trellis/mixed-gate-up-factored";
 import { gateUpMma } from "../kernels/trellis/gate-up-mma";
 import { gateUpMmaWide } from "../kernels/trellis/gate-up-mma-wide";
+import { gateUpCodebookMma } from "../kernels/trellis/gate-up-codebook-mma";
 import { TrellisLinear } from "./trellis-linear";
 
 // Fused gate/up/SwiGLU layers over a Qwen MLP's axis-1 Trellis gate and up
@@ -55,4 +56,16 @@ export class MmaGateUpWide {
       throw new Error("MmaGateUpWide: gate/up need packed axis-1 codes of one geometry (rows % 8, cols % 256, L <= 12)");
   }
   forward(x: MlxArray): MlxArray { return gateUpMmaWide(x, this.gate, this.up); }
+}
+
+/** 1..8 activation rows on the simdgroup matrix unit, each code value read from a threadgroup codebook (MmaGateUp's
+ *  bits); widths may differ. */
+export class CodebookMmaGateUp {
+  constructor(readonly gate: TrellisLinear, readonly up: TrellisLinear) {
+    const a = gate.geometry, b = up.geometry;
+    if (a.axis !== 1 || b.axis !== 1 || a.rows !== b.rows || a.cols !== b.cols ||
+        a.T !== b.T || a.L !== b.L || a.rows % 8 !== 0 || a.cols % 256 !== 0 || a.L > 12)
+      throw new Error("CodebookMmaGateUp: gate/up need packed axis-1 codes of one geometry (rows % 8, cols % 256, L <= 12)");
+  }
+  forward(x: MlxArray): MlxArray { return gateUpCodebookMma(x, this.gate, this.up); }
 }

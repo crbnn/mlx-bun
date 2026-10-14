@@ -255,6 +255,7 @@ const LAYER_MODULES: Readonly<Record<string, string>> = Object.freeze({
   FactoredDownRow: "trellis-down", FactoredDownRows: "trellis-down", FactoredDownK3iRow: "trellis-down",
   FactoredDownK3iRows: "trellis-down", MmaDown: "trellis-down", MmaDownK3i: "trellis-down",
   MmaDownWide: "trellis-down", MmaDownWideK3i: "trellis-down",
+  CodebookMmaGateUp: "trellis-gate-up",
   CodebookGateUpRow: "trellis-reduce-gate-up", CodebookDownRow: "trellis-scatter-down", CodebookDownK3iRow: "trellis-scatter-down",
 });
 
@@ -295,22 +296,25 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
   },
   // The M1 Max GPU's kernels and evaluation, measured there per class (forward + head, one sequence, bf16 KV, each
   // layer's per-call shader time and the whole forward): the threadgroup-codebook gate/up and down kernels at one row,
-  // with the one-row affine kernel (MLX's qmv bit for bit) for the 3-bit projections and head; at two to three rows
-  // the factored kernels and the affine row kernels, which beat the matrix-unit ones there; at four the matrix-unit
-  // gate/up and affine set (the shared-row gate/up and affine row kernels fall behind at four rows here) with the
-  // factored down; at five to eight the matrix-unit set, about 5.6x faster than the generic blocks' prefill tiles and
-  // 1.2x than QuantizedLinear for the projections and head. Graph submission every 4 layers takes about 4 ms off every
-  // width (2 and 8 within noise of it); wider verify windows one lazy graph (1.8% faster than bounded at 12 and 16
-  // rows); mixed rows packed on the generic blocks; known tokens as windows (the committed read's attention boundaries
-  // are qualified on the M4 Pro only); prompt pieces with their projections on the dense GEMM and, from 224 positions,
-  // their MLP split with the Neural Engine.
+  // with the one-row affine kernel (MLX's qmv bit for bit) for the 3-bit projections and head; at two to eight rows
+  // the matrix-unit Trellis kernels that read each code value from a threadgroup codebook (one MLP, real weights,
+  // gate/up 0.45 to 0.48 ms and down 0.24 at every row count, against the factored kernels' 0.62 to 0.67 and 0.41 to
+  // 0.43 at two rows and the 1MAD-arithmetic matrix kernels' 1.08 to 1.17 and 0.43 to 0.46 at eight; the whole forward
+  // at 2/3/4/8 rows 99.8/119.5/124.3/141.2 -> 82.1/90.5/90.7/93.3 ms, A B A B, five to eight rows bit-identical, two
+  // to four mean KL 1.0e-4 to 1.4e-4), with the affine row kernels for the projections and head at two to three rows,
+  // which beat the matrix-unit ones there, and the matrix-unit affine set at four to eight (the affine row kernels fall
+  // behind at four rows here; 1.2x QuantizedLinear for the projections and head). Graph submission every 4 layers
+  // takes about 4 ms off every width (2 and 8 within noise of it); wider verify windows one lazy graph (1.8% faster
+  // than bounded at 12 and 16 rows); mixed rows packed on the generic blocks; known tokens as windows (the committed
+  // read's attention boundaries are qualified on the M4 Pro only); prompt pieces with their projections on the dense
+  // GEMM and, from 224 positions, their MLP split with the Neural Engine.
   applegpu_g13s: {
     label: "M1 Max GPU",
     mlp: {
       one: { sameGateUp: "CodebookGateUpRow", mixedGateUp: "CodebookGateUpRow", rowMajorDown: "CodebookDownRow", k3InterleavedDown: "CodebookDownK3iRow" },
-      twoToThree: { sameGateUp: "FactoredGateUpRows", mixedGateUp: "FactoredMixedGateUp", rowMajorDown: "FactoredDownRows", k3InterleavedDown: "FactoredDownK3iRows" },
-      four: { sameGateUp: "MmaGateUp", mixedGateUp: "MmaGateUp", rowMajorDown: "FactoredDownRows", k3InterleavedDown: "FactoredDownK3iRows" },
-      fiveToEight: { sameGateUp: "MmaGateUp", mixedGateUp: "MmaGateUp", rowMajorDown: "MmaDown", k3InterleavedDown: "MmaDownK3i" },
+      twoToThree: { sameGateUp: "CodebookMmaGateUp", mixedGateUp: "CodebookMmaGateUp", rowMajorDown: "MmaDownWide", k3InterleavedDown: "MmaDownWideK3i" },
+      four: { sameGateUp: "CodebookMmaGateUp", mixedGateUp: "CodebookMmaGateUp", rowMajorDown: "MmaDownWide", k3InterleavedDown: "MmaDownWideK3i" },
+      fiveToEight: { sameGateUp: "CodebookMmaGateUp", mixedGateUp: "CodebookMmaGateUp", rowMajorDown: "MmaDownWide", k3InterleavedDown: "MmaDownWideK3i" },
     },
     // One row: MLX's qmv bit for bit with x's chunks computed once per threadgroup (AffineRowLinear) for the 3-bit
     // projections and the head, measured on each layer's weights back to back: 5120 -> 10240 0.100 -> 0.082 ms,
@@ -374,7 +378,10 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     // expansion; 64 rows 3.7 + 2.5 against 5.3 + 2.9), the split-K affine kernel for the projections and head (16 rows
     // 2x MLX's quantized matmul, level with it from 32). The whole forward, one sequence's verify window, bf16 KV at
     // 512 positions: 16 rows 0.89 -> 0.19 s, 32 0.89 -> 0.34, 64 0.77 -> 0.63, 128 1.45 -> 1.22, 256 2.48 -> 2.38;
-    // past 256 rows weight expansion and MLX's GEMM win (384 rows 3.64 against 3.51 s).
+    // past 256 rows weight expansion and MLX's GEMM win (384 rows 3.64 against 3.51 s). The down kernel reading each code
+    // value from a threadgroup codebook (2026-10-14; one 3-bit interleaved down at 16/32/64 rows 0.67/1.24/2.39 ->
+    // 0.44/0.84/1.65 ms, 2-bit 0.64/1.08/2.13 -> 0.40/0.76/1.49): 16/24/32 rows 180.2/265.3/331.7 -> 158.2/242.3/291.3
+    // ms, bit-identical.
     wider: { maxRows: 256,
       mlp: { sameGateUp: "MmaGateUpWide", mixedGateUp: "MmaGateUpWide", rowMajorDown: "MmaDownWide", k3InterleavedDown: "MmaDownWideK3i" },
       projections: { 3: "AffineSplitMmaLinear", 4: "AffineSplitMmaLinear" }, head: "AffineSplitMmaLinear" },

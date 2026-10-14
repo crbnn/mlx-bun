@@ -9,38 +9,49 @@ import type { TrellisGeometry } from "./geometry";
 // rows: down-mma's splits and accumulation (each output row bit for bit the
 // same), with every decoded B fragment feeding an MMA for MT blocks of 8 rows;
 // grid z walks chunks of 8·MT rows. A simdgroup's S sub-tiles and MT follow
-// the layout and the rows (`plan`): neither changes a sum. The row count is
-// read at run time (one pipeline per geometry and launch). SPLITS f32 partials
-// [M, SPLITS, C] fold in one MLX sum. Two kernels, one per code layout:
-// row-major [rows, cols·K/32] and the 3-bit block interleave [cols/512, rows,
-// 48]. Measured on the M1 Max at the Qwen down shape (17408 -> 5120), 3-bit
-// interleaved: 16 rows 0.89 ms, 24 1.09, 32 1.34, 48 1.73, 64 2.50, 128 4.89,
-// 256 8.85; 4-bit row-major: 0.77, 0.98, 1.23, 1.85, 2.31, 4.47, 8.79; against
-// 1.67, 2.1, 2.16, 2.6, 2.89, 4.10 and about 6.5 for weight expansion and GEMM.
+// the layout and the rows (`plan`): neither changes a sum. Each code value y
+// is read from a half table of the 2^L values (exact in half) the threadgroup
+// generates once, in place of the 1MAD arithmetic (the M1 Max form, where the
+// matrix products issue on the ordinary ALU pipes and the integer decode
+// competes with them); a window is one bit-field extract (one that straddles a
+// word reads a virtual word: the high half of one word and the low half of the
+// next) and the B fragments are half. Input rows come in whole steps of 8 (the
+// rows a multiple of 8, so is every split's); activation rows past M repeat
+// the last row and are not written. The row count is read at run time (one
+// pipeline per geometry and launch). SPLITS f32 partials [M, SPLITS, C] fold
+// in one MLX sum. Two kernels, one per code layout: row-major [rows, cols·K/32]
+// and the 3-bit block interleave [cols/512, rows, 48]. Measured on the M1 Max at
+// the Qwen down shape (17408 -> 5120, real weights), 3-bit interleaved: 8 rows
+// 0.24 ms, 16 0.44, 24 0.64, 32 0.84, 64 1.65 (the 1MAD arithmetic before:
+// 0.66, 0.67, 0.87, 1.24, 2.39; downMma at 8 rows 0.45); 2-bit row-major: 0.24,
+// 0.40, 0.58, 0.76, 1.49 (0.62, 0.64, 0.88, 1.08, 2.13; downMma 0.43).
 const SG_TG = 4, SPLITS = 8;
 
-/** Each layout's sub-tiles per simdgroup and the relative cost of one pass of each row-block count it takes, measured
- *  per pass at 256 rows. The 3-bit interleave's sixteen sub-tiles hold three blocks at most in registers (the
- *  row-major 4-bit window spills there), so row-major codes take eight sub-tiles and up to four blocks. */
-const PLANS: Readonly<Record<"rowMajor" | "interleaved", { readonly S: number; readonly passCost: Readonly<Record<number, number>> }>> = {
-  interleaved: { S: 16, passCost: { 2: 1, 3: 1.31 } },
-  rowMajor: { S: 8, passCost: { 2: 1, 3: 1.4, 4: 1.79 } },
+/** Each layout's passes (sub-tiles S, row blocks MT) and their relative cost, measured per pass at 8 to 128 rows: the
+ *  3-bit interleave runs one block per pass at every row count; row-major codes take sixteen sub-tiles for one block
+ *  and eight for two or three. */
+const PLANS: Readonly<Record<"rowMajor" | "interleaved", readonly { readonly S: number; readonly MT: number; readonly cost: number }[]>> = {
+  interleaved: [{ S: 16, MT: 1, cost: 1 }],
+  rowMajor: [{ S: 16, MT: 1, cost: 0.6 }, { S: 8, MT: 2, cost: 1 }, { S: 8, MT: 3, cost: 1.44 }],
 };
 
-/** The sub-tiles and row blocks for M rows: the row-block count whose passes cost least in all (the larger on a tie). */
+/** The sub-tiles and row blocks for M rows: the pass whose passes cost least in all (the more blocks on a tie). */
 function plan(layout: keyof typeof PLANS, M: number): { S: number; MT: number } {
-  const { S, passCost } = PLANS[layout];
-  let best = { MT: 0, cost: Infinity };
-  for (const [blocks, cost] of Object.entries(passCost)) {
-    const total = Math.ceil(M / (8 * Number(blocks))) * cost;
-    if (total <= best.cost) best = { MT: Number(blocks), cost: total };
+  let best = { S: 0, MT: 0, cost: Infinity };
+  for (const { S, MT, cost } of PLANS[layout]) {
+    const total = Math.ceil(M / (8 * MT)) * cost;
+    if (total <= best.cost) best = { S, MT, cost: total };
   }
-  return { S, MT: best.MT };
+  return { S: best.S, MT: best.MT };
 }
 
 const SOURCE = String.raw`
   const uint M = (uint)x_shape[0];
   const uint lane = thread_index_in_simdgroup;
+  threadgroup half codebook[1 << L];
+  for (uint i = simdgroup_index_in_threadgroup * 32u + lane; i < (1u << (uint)L); i += 32u * (uint)SG_TG)
+    codebook[i] = half(trellis_y_f32(i));
+  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
   const uint id = threadgroup_position_in_grid.y * (uint)SG_TG + simdgroup_index_in_threadgroup;
   const uint groupsPerBlock = 32u / (uint)S;
   const uint nGroups = ((uint)C / 256u) * groupsPerBlock;
@@ -60,41 +71,42 @@ const SOURCE = String.raw`
   const uint rowsPer = (((uint)R + (uint)SPLITS - 1u) / (uint)SPLITS + 7u) & ~7u;
   const uint r0 = split * rowsPer;
   const uint r1 = metal::min((uint)R, r0 + rowsPer);
+  const device T* xm[MT];
   metal::simdgroup_float8x8 acc[S][MT];
   #pragma clang loop unroll(full)
-  for (uint s = 0; s < (uint)S; ++s)
+  for (uint bk = 0; bk < (uint)MT; ++bk) {
+    xm[bk] = x + (ulong)metal::min(mBase + 8u * bk + fm, M - 1u) * (ulong)R;
     #pragma clang loop unroll(full)
-    for (uint bk = 0; bk < (uint)MT; ++bk) acc[s][bk] = metal::make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-  for (uint r = r0; r < r1; r += 8u) {
-    const uint rw = r + fm;
-    const device uint32_t* rowCodes = words + (ulong)metal::min(rw, (uint)R - 1u) * rowWords;
+    for (uint s = 0; s < (uint)S; ++s) acc[s][bk] = metal::make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  }
+  // The window's words in a row's block (the last ones wrap to its first).
+  uint wordAt[NW + 1];
+  #pragma clang loop unroll(full)
+  for (uint i = 0; i <= (uint)NW; ++i) wordAt[i] = (w0 + i) % wpb;
+  const device uint32_t* rowCodes = words + (ulong)(r0 + fm) * rowWords;
+  for (uint r = r0; r < r1; r += 8u, rowCodes += 8u * rowWords) {
     uint raw[NW + 1];
     #pragma clang loop unroll(full)
-    for (uint i = 0; i <= (uint)NW; ++i) {
-      const uint wi = w0 + i;
-      raw[i] = rowCodes[wi % wpb];
-    }
-    uint w[NW];
+    for (uint i = 0; i <= (uint)NW; ++i) raw[i] = rowCodes[wordAt[i]];
+    uint w[NW], v[NW];
     #pragma clang loop unroll(full)
     for (uint i = 0; i < (uint)NW; ++i) w[i] = off0 ? (raw[i] >> off0) | (raw[i + 1] << (32u - off0)) : raw[i];
-    metal::simdgroup_float8x8 a[MT];
+    // Virtual word i: bits [32i - 16, 32i + 16) of the realigned window.
+    #pragma clang loop unroll(full)
+    for (uint i = 1; i < (uint)NW; ++i) v[i] = (w[i - 1] >> 16) | (w[i] << 16);
     const uint ra = r + fn;
-    const float sa = ra < r1 ? float(scales[ra]) * TRELLIS_RCP : 0.0f;
-    const float sb = ra + 1u < r1 ? float(scales[ra + 1u]) * TRELLIS_RCP : 0.0f;
+    const float sa = float(scales[ra]) * TRELLIS_RCP, sb = float(scales[ra + 1u]) * TRELLIS_RCP;
+    metal::simdgroup_float8x8 a[MT];
     #pragma clang loop unroll(full)
     for (uint bk = 0; bk < (uint)MT; ++bk) {
-      const uint m = mBase + 8u * bk + fm;
-      const bool ok = m < M;
-      const device T* xm = x + (ulong)(ok ? m : 0u) * (ulong)R;
-      a[bk].thread_elements()[0] = ok && ra < r1 ? float(xm[ra]) * sa : 0.0f;
-      a[bk].thread_elements()[1] = ok && ra + 1u < r1 ? float(xm[ra + 1u]) * sb : 0.0f;
+      a[bk].thread_elements()[0] = float(xm[bk][ra]) * sa;
+      a[bk].thread_elements()[1] = float(xm[bk][ra + 1u]) * sb;
     }
-    const bool rowOk = rw < r1;
     #pragma clang loop unroll(full)
     for (uint s = 0; s < (uint)S; ++s) {
-      metal::simdgroup_float8x8 b;
-      b.thread_elements()[0] = rowOk ? trellis_y_f32((block_state<K, L>(w, s))) : 0.0f;
-      b.thread_elements()[1] = rowOk ? trellis_y_f32((block_state<K, L>(w, s + (uint)S))) : 0.0f;
+      metal::simdgroup_half8x8 b;
+      b.thread_elements()[0] = codebook[block_state<K, L>(w, v, s)];
+      b.thread_elements()[1] = codebook[block_state<K, L>(w, v, s + (uint)S)];
       #pragma clang loop unroll(full)
       for (uint bk = 0; bk < (uint)MT; ++bk)
         metal::simdgroup_multiply_accumulate(acc[s][bk], a[bk], b, acc[s][bk]);
@@ -113,23 +125,23 @@ const SOURCE = String.raw`
   }
 `;
 
-// State at position t of a realigned window (bit t·K of w, LSB first).
+// State at position t of a realigned window (bits [t·K, +L) of w), one extract (virtual words v past a word edge).
 const STATE_HEADER = String.raw`
 template <int K, int L_>
-inline uint block_state(thread const uint* w, uint t) {
+inline uint block_state(thread const uint* w, thread const uint* v, uint t) {
   const uint b = t * (uint)K;
-  const uint wi = b >> 5;
   const uint off = b & 31u;
-  uint win = w[wi] >> off;
-  if (off + (uint)L_ > 32u) win |= w[wi + 1] << (32u - off);
-  return win & ((1u << (uint)L_) - 1u);
+  if (off + (uint)L_ <= 32u) return (w[b >> 5] >> off) & ((1u << (uint)L_) - 1u);
+  const uint vi = (b + 16u) >> 5;
+  return (v[vi] >> (b + 16u - 32u * vi)) & ((1u << (uint)L_) - 1u);
 }
 `;
 
 function launch(kernel: MetalKernel, x2: MlxArray, codes: MlxArray, scales: MlxArray, g: TrellisGeometry, interleave: 0 | 1): MlxArray {
   const M = x2.shape[0]!;
   if (x2.ndim !== 2 || M < 1) throw new Error("downMmaWide: expects [rows, inputs]");
-  if (g.axis !== 0 || g.T !== 256 || g.cols % 256 !== 0 || g.L > 12) throw new Error("downMmaWide: unsupported geometry");
+  if (g.axis !== 0 || g.T !== 256 || g.cols % 256 !== 0 || g.rows % 8 !== 0 || g.L > 12)
+    throw new Error("downMmaWide: unsupported geometry");
   const { S, MT } = plan(interleave ? "interleaved" : "rowMajor", M);
   const nGroups = (g.cols / 256) * (32 / S);
   // Words covering 2S positions plus the L-bit window, after realignment.
@@ -147,8 +159,8 @@ function launch(kernel: MetalKernel, x2: MlxArray, codes: MlxArray, scales: MlxA
 
 let rowMajor: MetalKernel | undefined, interleaved: MetalKernel | undefined;
 
-/** x2 [M, inFeatures] · W → [M, outFeatures] in x2's dtype for row-major axis-0 codes (T 256), any number of rows.
- *  Borrows inputs. */
+/** x2 [M, inFeatures] · W → [M, outFeatures] in x2's dtype for row-major axis-0 codes (T 256, L at most 12, input
+ *  features a multiple of 8), any number of rows. Borrows inputs. */
 export function downMmaWide(x2: MlxArray, codes: MlxArray, scales: MlxArray, g: TrellisGeometry): MlxArray {
   if (g.blockInterleave || codes.ndim !== 2) throw new Error("downMmaWide: needs row-major codes");
   rowMajor ??= new MetalKernel({ name: "mlx_bun_trellis_down_mma_wide", inputNames: ["x", "codes", "scales"],

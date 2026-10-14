@@ -13,7 +13,9 @@ import { compiledSwiglu } from "../../src/layers/swiglu";
 import { fusedGateUpSwigluMixed as mixedGateUpKernel } from "../../src/kernels/trellis/mixed-gate-up";
 import { CodebookGateUpRow } from "../../src/layers/trellis-reduce-gate-up";
 import { CodebookDownK3iRow, CodebookDownRow } from "../../src/layers/trellis-scatter-down";
-import { FactoredGateUpRow, FactoredGateUpRows, FactoredMixedGateUp, MmaGateUp, MmaGateUpWide } from "../../src/layers/trellis-gate-up";
+import {
+  CodebookMmaGateUp, FactoredGateUpRow, FactoredGateUpRows, FactoredMixedGateUp, MmaGateUp, MmaGateUpWide,
+} from "../../src/layers/trellis-gate-up";
 import {
   FactoredDownK3iRow, FactoredDownK3iRows, FactoredDownRow, FactoredDownRows, MmaDown, MmaDownK3i, MmaDownWide, MmaDownWideK3i,
 } from "../../src/layers/trellis-down";
@@ -57,6 +59,14 @@ describe("Trellis verify layers", () => {
         using actual = layer.forward(x);
         expect(relErr(actual, expected), `k${kg}/${ku} m${m}`).toBeLessThan(2e-2);
       }
+      const codebook = new CodebookMmaGateUp(gate, up);
+      for (const m of [1, 2, 3, 4, 8]) {
+        using x = rows(m, D);
+        using g = gate.forward(x, true), u = up.forward(x, true);
+        using expected = compiledSwiglu(g, u);
+        using actual = codebook.forward(x);
+        expect(relErr(actual, expected), `codebook k${kg}/${ku} m${m}`).toBeLessThan(2e-2);
+      }
       const wide = new MmaGateUpWide(gate, up);
       for (const m of [1, 9, 16, 40]) {
         using x = rows(m, D);
@@ -81,7 +91,7 @@ describe("Trellis verify layers", () => {
         expect(relErr(actual, expected), `${interleave ? "k3i" : "row-major"} m${m}`).toBeLessThan(2e-2);
       }
       const wide = interleave ? new MmaDownWideK3i(down) : new MmaDownWide(down);
-      for (const m of [1, 9, 16, 40]) {
+      for (const m of [1, 2, 4, 8, 9, 16, 40]) {
         using x = rows(m, R);
         using expected = down.forward(x, true);
         using actual = wide.forward(x);
@@ -100,6 +110,7 @@ describe("Trellis verify layers", () => {
     expect(() => new MmaDownWide(interleaved)).toThrow();
     expect(() => new MmaDownWideK3i(rowMajor)).toThrow();
     expect(() => new MmaGateUpWide(gate, rowMajor)).toThrow();
+    expect(() => new CodebookMmaGateUp(gate, rowMajor)).toThrow();
   });
 });
 

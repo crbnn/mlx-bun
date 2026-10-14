@@ -911,7 +911,8 @@ threadgroup table and keep variant 13's one-row output bits.
 | `downCodebookRow` / `downK3InterleavedCodebookRow(x2, codes, scales, geometry)` | One-row axis-0 projection through a threadgroup codebook, row-major 2/4-bit / 3-bit interleaved codes; the scatter kernels' bits |
 | `downMma` / `downK3InterleavedMma(x2, codes, scales, geometry)` | Axis-0 projection for 1..8 rows, row-major / 3-bit interleaved codes |
 | `gateUpMmaWide(x, gate, up)` | Gate/up/SwiGLU for any number of rows, each decoded fragment feeding several 8-row blocks (threadgroup codebook, activations staged in threadgroup memory); each row the bits `gateUpMma` gives its block of 8 |
-| `downMmaWide` / `downK3InterleavedMmaWide(x2, codes, scales, geometry)` | Axis-0 projection for any number of rows, each decoded fragment feeding several 8-row blocks; each row the bits `downMma` gives its block of 8 |
+| `downMmaWide` / `downK3InterleavedMmaWide(x2, codes, scales, geometry)` | Axis-0 projection for any number of rows through a threadgroup codebook, each decoded fragment feeding up to three 8-row blocks; each row the bits `downMma` gives its block of 8 |
+| `gateUpCodebookMma(x, gate, up)` | Gate/up/SwiGLU for 1..8 rows, each code value read from a threadgroup codebook (the M1 Max form); `gateUpMma`'s bits |
 
 Outside the Trellis family, `kernels/quantization/affine{3,4}-{rows,mma}` run
 3- and 4-bit group-64 affine projections for 2..8 rows (shared decode) and
@@ -1007,15 +1008,15 @@ a whole chunk or a tail, of 640 to 2048 positions on the one whose programs (102
 composition that mounts adapters builds every operation on the generic blocks. On
 the M1 Max: the threadgroup-codebook kernels at one row, with the 3-bit projections
 and the head on the one-row affine kernel (MLX's quantized matmul bit for bit; the 4-bit
-projections stay on it); at two to three rows the
-factored Trellis kernels with the affine row kernels for the projections and head;
-at four the matrix-unit gate/up with the factored down; the matrix-unit Trellis set
-at five to eight; the split matrix-unit affine kernel for the projections and head
+projections stay on it); at two to eight rows the
+matrix-unit Trellis kernels that read each code value from a threadgroup codebook
+(`gateUpCodebookMma`, `downMmaWide`), with the affine row kernels for the
+projections and head at two to three rows and the split matrix-unit affine kernel
 at four to eight; every operation of nine to 256 rows (`WIDER_ROWS`: decode and
 verify windows, prompt tails, known-token appends and a mixed forward's packed MLP
 rows) on the any-row matrix-unit Trellis kernels (`gateUpMmaWide`, `downMmaWide`)
 with the split affine kernel for the projections and head, which decode each weight
-once per two or three blocks of 8 rows where the generic blocks re-decode or expand
+once per one to three blocks of 8 rows where the generic blocks re-decode or expand
 every weight (16 rows 0.89 s -> 0.19 s per forward); prompt pieces above 256 rows with their
 attention and DeltaNet projections on `layers/dequantized-linear` (from 128 rows, and
 above MLX's split-K GEMM range at k_proj and v_proj's outputs, from 513, the weight

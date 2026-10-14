@@ -66,7 +66,10 @@
 //   - down-k3-interleaved-factored: 3-bit block-interleaved axis-0 codes
 //   - gate-up-mma / down-mma: 1..8 rows on the simdgroup matrix unit
 //   - gate-up-mma-wide / down-mma-wide: the same fragments for any number of
-//     rows, each decoded fragment feeding the MMAs of several 8-row blocks
+//     rows, each decoded fragment feeding the MMAs of several 8-row blocks,
+//     each code value read from a threadgroup codebook
+//   - gate-up-codebook-mma: gate-up-mma's fragments and bits for 1..8 rows,
+//     each code value read from a threadgroup codebook (the M1 Max form)
 //
 // ExpandedTrellisLinear (layers/trellis-linear.ts) decodes a trellis tensor at
 // construction into 8-bit g64 affine (the eval-carrier numerics, about -45 dB)
@@ -94,3 +97,4 @@ export { gateUpMma } from "./gate-up-mma";
 export { downMma, downK3InterleavedMma } from "./down-mma";
 export { gateUpMmaWide } from "./gate-up-mma-wide";
 export { downMmaWide, downK3InterleavedMmaWide } from "./down-mma-wide";
+export { gateUpCodebookMma } from "./gate-up-codebook-mma";

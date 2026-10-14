@@ -69,18 +69,23 @@ export class MmaDownK3i {
   forward(x: MlxArray): MlxArray { return project(this.down, downK3InterleavedMma, x); }
 }
 
-/** Any number of activation rows on the simdgroup matrix unit, each decoded fragment feeding two 8-row blocks;
- *  row-major codes. */
+/** Any number of activation rows on the simdgroup matrix unit through a threadgroup codebook, each decoded fragment
+ *  feeding up to three 8-row blocks (MmaDown's bits per block); row-major codes. */
 export class MmaDownWide {
   constructor(readonly down: TrellisLinear) {
     rowMajor("MmaDownWide", down);
-    if (down.geometry.T !== 256 || down.geometry.L > 12) throw new Error("MmaDownWide: needs T 256, L <= 12");
+    const g = down.geometry;
+    if (g.T !== 256 || g.L > 12 || g.rows % 8 !== 0) throw new Error("MmaDownWide: needs T 256, L <= 12, rows % 8");
   }
   forward(x: MlxArray): MlxArray { return project(this.down, downMmaWide, x); }
 }
 
-/** Any number of activation rows on the simdgroup matrix unit; 3-bit block-interleaved codes. */
+/** Any number of activation rows on the simdgroup matrix unit through a threadgroup codebook (MmaDownK3i's bits per
+ *  block of 8); 3-bit block-interleaved codes. */
 export class MmaDownWideK3i {
-  constructor(readonly down: TrellisLinear) { k3Interleaved("MmaDownWideK3i", down); }
+  constructor(readonly down: TrellisLinear) {
+    k3Interleaved("MmaDownWideK3i", down);
+    if (down.geometry.rows % 8 !== 0) throw new Error("MmaDownWideK3i: needs rows % 8");
+  }
   forward(x: MlxArray): MlxArray { return project(this.down, downK3InterleavedMmaWide, x); }
 }

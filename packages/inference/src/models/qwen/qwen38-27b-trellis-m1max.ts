@@ -22,32 +22,31 @@
 //
 //   operation                      MLP gate/up + down (row-major/interleaved)  affine projections (3/4-bit)
 //   decode.one, verify.one         CodebookGateUpRow + CodebookDownRow/K3i     AffineRowLinear/QuantizedLinear
-//   decode/verify.twoToThree       FactoredGateUpRows + FactoredDownRows/K3i   Affine3RowsLinear/Affine4RowsLinear
-//   decode/verify.four             MmaGateUp + FactoredDownRows/K3i            AffineSplitMmaLinear
-//   decode/verify.fiveToEight      MmaGateUp + MmaDown/K3i                     AffineSplitMmaLinear
+//   decode/verify.twoToThree       CodebookMmaGateUp + MmaDownWide/K3i         Affine3RowsLinear/Affine4RowsLinear
+//   decode/verify.four             CodebookMmaGateUp + MmaDownWide/K3i         AffineSplitMmaLinear
+//   decode/verify.fiveToEight      CodebookMmaGateUp + MmaDownWide/K3i         AffineSplitMmaLinear
 //   every operation 9..256         MmaGateUpWide + MmaDownWide/K3i             AffineSplitMmaLinear
 //   decode/verify.wider 257+       the generic blocks (TrellisMlp)             QuantizedLinear
 //   prefillChunk.gpu/Tail 257+     the generic blocks (TrellisMlp)             DequantizedLinear
 //   prefillChunk.ane, 224..2048    AneTrellisMlpSplit/K3i                      DequantizedLinear
 //
-// Mixed-width gate/up takes CodebookGateUpRow at one row, split tail (MLX's compiled SwiGLU bit for bit), and
-// FactoredMixedGateUp at two to three rows. Every attention block reads through the cache the composition's KV scheme
-// names: affine 4-bit group 64 composes Bf16FirstKv4Head256Cache (bf16 through its first append, then the fused 4-bit
-// decode kernel at 128 tokens per threadgroup and the folded-GQA window kernel), every other scheme its own lego
-// (composedFullAttentionCache: the plain cache with the stock SDPA, its windows of six to eight rows folding GQA into
-// rows (foldedWindowRead), bf16-first affine or per-layer affine with the composition's read kernels, or bf16-first
-// TurboQuant with the dense read). Every operation of nine to 256 rows (decode and verify windows, prompt tails,
-// known-token appends, a mixed forward's packed MLP rows) runs the wider layers in the table; more rows run the generic
-// blocks. The head is part of each phase: logits.one AffineRowLinear, logits.twoToThree Affine4RowsLinear, logits.four
-// AffineSplitMmaLinear, logits.fiveToEight AffineSplitMmaLinear, logits.wider AffineSplitMmaLinear up to 256 rows,
-// QuantizedLinear otherwise. A bound drafter's own 4-bit projections take Affine4RowsLinear at twoToThree,
-// AffineSplitMmaLinear at four, AffineSplitMmaLinear at fiveToEight, AffineSplitMmaLinear at wider, QuantizedLinear
-// otherwise (TargetView.draftProjections). A drafter that selects by its scores selects over the artifact's draft
-// vocabulary (mtp/draft_vocab.json), those rows of the head on the head's layers (DraftProjection.vocabulary). Decode,
-// verify, prompt tails and embeddings up to eight rows, and decode, verify windows and prompt tails on the wider
-// layers, submit the graph every 4 layers; wider decode and verify windows and known-token appends are otherwise one
-// lazy graph; prompt chunks, prompt tails above 256 rows and embeddings above eight rows, evaluate each layer and its
-// recurrent state.
+// Mixed-width gate/up takes CodebookGateUpRow at one row, split tail (MLX's compiled SwiGLU bit for bit). Every
+// attention block reads through the cache the composition's KV scheme names: affine 4-bit group 64 composes
+// Bf16FirstKv4Head256Cache (bf16 through its first append, then the fused 4-bit decode kernel at 128 tokens per
+// threadgroup and the folded-GQA window kernel), every other scheme its own lego (composedFullAttentionCache: the plain
+// cache with the stock SDPA, its windows of six to eight rows folding GQA into rows (foldedWindowRead), bf16-first
+// affine or per-layer affine with the composition's read kernels, or bf16-first TurboQuant with the dense read). Every
+// operation of nine to 256 rows (decode and verify windows, prompt tails, known-token appends, a mixed forward's packed
+// MLP rows) runs the wider layers in the table; more rows run the generic blocks. The head is part of each phase:
+// logits.one AffineRowLinear, logits.twoToThree Affine4RowsLinear, logits.four AffineSplitMmaLinear, logits.fiveToEight
+// AffineSplitMmaLinear, logits.wider AffineSplitMmaLinear up to 256 rows, QuantizedLinear otherwise. A bound drafter's
+// own 4-bit projections take Affine4RowsLinear at twoToThree, AffineSplitMmaLinear at four, AffineSplitMmaLinear at
+// fiveToEight, AffineSplitMmaLinear at wider, QuantizedLinear otherwise (TargetView.draftProjections). A drafter that
+// selects by its scores selects over the artifact's draft vocabulary (mtp/draft_vocab.json), those rows of the head on
+// the head's layers (DraftProjection.vocabulary). Decode, verify, prompt tails and embeddings up to eight rows, and
+// decode, verify windows and prompt tails on the wider layers, submit the graph every 4 layers; wider decode and verify
+// windows and known-token appends are otherwise one lazy graph; prompt chunks, prompt tails above 256 rows and
+// embeddings above eight rows, evaluate each layer and its recurrent state.
 //
 // Request shapes this graph serves:
 //   - prompt chunks of exactly the composition's chunk size (prefillChunk.gpu) and prompt tails (prefillTail),
@@ -103,8 +102,8 @@ import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import { QuantizedLinear } from "../../layers/quantized-linear";
 import { mropeInvFreq } from "../../layers/qwen-mrope";
 import { compiledSwiglu } from "../../layers/swiglu";
-import { FactoredDownK3iRows, FactoredDownRows, MmaDown, MmaDownK3i, MmaDownWide, MmaDownWideK3i } from "../../layers/trellis-down";
-import { FactoredGateUpRows, FactoredMixedGateUp, MmaGateUp, MmaGateUpWide } from "../../layers/trellis-gate-up";
+import { MmaDownWide, MmaDownWideK3i } from "../../layers/trellis-down";
+import { CodebookMmaGateUp, MmaGateUpWide } from "../../layers/trellis-gate-up";
 import { CodebookGateUpRow } from "../../layers/trellis-reduce-gate-up";
 import { CodebookDownK3iRow, CodebookDownRow } from "../../layers/trellis-scatter-down";
 import { composedAffineKernels } from "../../state/affine-attention";
@@ -424,8 +423,8 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
       });
       this.#twoToThree = generic.map((layer, i) => {
         const spec = LAYERS[i]!, { gate, up, down } = mlpOf(i);
-        const gateUp = spec.gate === spec.up ? new FactoredGateUpRows(gate, up) : new FactoredMixedGateUp(gate, up);
-        const project = spec.downLayout === "k3Interleaved" ? new FactoredDownK3iRows(down) : new FactoredDownRows(down);
+        const gateUp = new CodebookMmaGateUp(gate, up);
+        const project = spec.downLayout === "k3Interleaved" ? new MmaDownWideK3i(down) : new MmaDownWide(down);
         return layerStep(layer, mixerOf(affine4RowsBlocks[i]!, spec.kind), post => {
           using mid = gateUp.forward(post);
           return project.forward(mid);
@@ -433,8 +432,8 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
       });
       this.#four = generic.map((layer, i) => {
         const spec = LAYERS[i]!, { gate, up, down } = mlpOf(i);
-        const gateUp = new MmaGateUp(gate, up);
-        const project = spec.downLayout === "k3Interleaved" ? new FactoredDownK3iRows(down) : new FactoredDownRows(down);
+        const gateUp = new CodebookMmaGateUp(gate, up);
+        const project = spec.downLayout === "k3Interleaved" ? new MmaDownWideK3i(down) : new MmaDownWide(down);
         return layerStep(layer, mixerOf(affineSplitMmaBlocks[i]!, spec.kind), post => {
           using mid = gateUp.forward(post);
           return project.forward(mid);
@@ -442,8 +441,8 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
       });
       this.#fiveToEight = generic.map((layer, i) => {
         const spec = LAYERS[i]!, { gate, up, down } = mlpOf(i);
-        const gateUp = new MmaGateUp(gate, up);
-        const project = spec.downLayout === "k3Interleaved" ? new MmaDownK3i(down) : new MmaDown(down);
+        const gateUp = new CodebookMmaGateUp(gate, up);
+        const project = spec.downLayout === "k3Interleaved" ? new MmaDownWideK3i(down) : new MmaDownWide(down);
         return layerStep(layer, mixerOf(affineSplitMmaBlocks[i]!, spec.kind), post => {
           using mid = gateUp.forward(post);
           return project.forward(mid);
