@@ -23,8 +23,9 @@ export interface CommandBufferLimits {
 export const COMMAND_BUFFER_LIMITS: Readonly<Record<string, CommandBufferLimits>> = Object.freeze({
   // M1 Max: with MLX's 50/50 a 27B model's decode forward commits a buffer every layer or two of weights; raising
   // either limit alone gains nothing. The element limit stays low because a synchronous evaluation commits nothing
-  // until it binds that many elements, so the GPU idles while MLX encodes it: the Neural Engine prompt split evaluates
-  // each layer synchronously, and at 1024 positions 4000 cost ~4% and 200 ~2%, at 300 positions 150 ~2.6%.
+  // until it binds that many elements, so the GPU idles while MLX encodes it: the Neural Engine prompt split waits for
+  // each layer's buffer fills, and at 1024 positions 4000 cost ~4% and 200 ~2%, at 300 positions 150 ~2.6% (2.5% once
+  // the split queued its layers, 2026-10-14, 1024 and 2048 positions then level).
   // Measured 2026-10-14, Qwen3.8 27B Trellis, in-process serve, greedy, two sessions each, identical tokens: plain
   // decode 19.15/19.17 -> 19.50/19.51 tok/s, DFlash 2 adaptive 25.19/25.22 -> 25.80/25.82 (150: 19.69/19.69,
   // 25.87/25.86); prompts of 300-2048 positions unchanged and bit-identical.

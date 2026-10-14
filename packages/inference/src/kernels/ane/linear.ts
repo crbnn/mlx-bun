@@ -265,14 +265,16 @@ export function weightBlob(bytes: Uint8Array): Uint8Array {
 
 const BOOLS = [`    bool ff = const()[name=string("ff"), val=bool(false)];`, `    bool tt = const()[name=string("tt"), val=bool(true)];`];
 
-/** Reduction slices summed inside a streamed-weight program: 8 runs ~2.5x
- *  faster than one on M4 Pro. A reduction not divisible by 8 stays whole. */
+/** Reduction slices summed inside a streamed-weight program unless its caller
+ *  names others: 8 runs ~2.5x faster than one on M4 Pro. A reduction not
+ *  divisible by the slices stays whole. */
 const CHUNKS = 8;
 
-/** a[1,1,rows,red] · b[1,1,cols,red]ᵀ → out, the reduction split into CHUNKS
+/** a[1,1,rows,red] · b[1,1,cols,red]ᵀ → out, the reduction split into `slices`
  *  slices summed inside the program. `tag` keeps value names unique. */
-function chunkedMatmulT(lines: string[], out: string, a: string, b: string, rows: number, cols: number, red: number, tag: string): void {
-  const chunks = red % CHUNKS ? 1 : CHUNKS;
+function chunkedMatmulT(lines: string[], out: string, a: string, b: string, rows: number, cols: number, red: number, tag: string,
+  slices = CHUNKS): void {
+  const chunks = red % slices ? 1 : slices;
   const cc = red / chunks;
   let last = "";
   for (let c = 0; c < chunks; c++) {
@@ -291,31 +293,34 @@ function chunkedMatmulT(lines: string[], out: string, a: string, b: string, rows
   lines.push(`    tensor<fp16, [1, 1, ${rows}, ${cols}]> ${out} = identity(x=${last})[name=string("${out}")];`);
 }
 
-/** y[S, Cout] = x[S, Cin] · w[Cout, Cin]ᵀ, w streamed (inputs: w=0, x=1). */
-export function streamedMatmulProgram(cin: number, cout: number, seq: number): AneProgramSpec {
+/** y[S, Cout] = x[S, Cin] · w[Cout, Cin]ᵀ, w streamed (inputs: w=0, x=1), the
+ *  reduction in `slices` slices (default CHUNKS). */
+export function streamedMatmulProgram(cin: number, cout: number, seq: number, slices = CHUNKS): AneProgramSpec {
   const lines = [`  func main<ios18>(tensor<fp16, [1, 1, ${seq}, ${cin}]> x, tensor<fp16, [1, 1, ${cout}, ${cin}]> w) {`, ...BOOLS];
-  chunkedMatmulT(lines, "y", "x", "w", seq, cout, cin, "m");
-  return { label: `projection ${cin}→${cout}, ${seq} rows`, mil: MIL_HEADER + lines.join("\n") + `\n  } -> (y);\n}\n`,
+  chunkedMatmulT(lines, "y", "x", "w", seq, cout, cin, "m", slices);
+  return { label: `projection ${cin}→${cout}, ${seq} rows${slices === CHUNKS ? "" : `, ${slices} slices`}`,
+    mil: MIL_HEADER + lines.join("\n") + `\n  } -> (y);\n}\n`,
     inputBytes: [cout * cin * 2, seq * cin * 2], outputBytes: seq * cout * 2 };
 }
 
 /** One MLP channel slice with streamed weights:
  *  y[S, D] = (silu(x·wgᵀ) ⊙ (x·wuᵀ)) · wd, wg/wu/wd [N, D] (wd: the down
- *  projection's rows for the same N channels). Inputs in symbol order: wd=0,
- *  wg=1, wu=2, x=3. Measured 10.2 TFLOPS (D 5120, N 9600, S 2048). */
-export function mlpSliceProgram(D: number, N: number, S: number): AneProgramSpec {
-  return { label: `MLP slice ${D}×${N}, ${S} rows`, mil: mlpSliceMil(D, N, S),
+ *  projection's rows for the same N channels), each matmul's reduction in
+ *  `slices` slices (default CHUNKS). Inputs in symbol order: wd=0, wg=1, wu=2,
+ *  x=3. Measured 10.2 TFLOPS (D 5120, N 9600, S 2048, 8 slices, M4 Pro). */
+export function mlpSliceProgram(D: number, N: number, S: number, slices = CHUNKS): AneProgramSpec {
+  return { label: `MLP slice ${D}×${N}, ${S} rows${slices === CHUNKS ? "" : `, ${slices} slices`}`, mil: mlpSliceMil(D, N, S, slices),
     inputBytes: [N * D * 2, N * D * 2, N * D * 2, S * D * 2], outputBytes: S * D * 2 };
 }
 
-function mlpSliceMil(D: number, N: number, S: number): string {
+function mlpSliceMil(D: number, N: number, S: number, slices: number): string {
   const lines = [`  func main<ios18>(tensor<fp16, [1, 1, ${N}, ${D}]> wd, tensor<fp16, [1, 1, ${N}, ${D}]> wg, ` +
     `tensor<fp16, [1, 1, ${N}, ${D}]> wu, tensor<fp16, [1, 1, ${S}, ${D}]> x) {`, ...BOOLS];
-  chunkedMatmulT(lines, "g", "x", "wg", S, N, D, "G");
-  chunkedMatmulT(lines, "u", "x", "wu", S, N, D, "U");
+  chunkedMatmulT(lines, "g", "x", "wg", S, N, D, "G", slices);
+  chunkedMatmulT(lines, "u", "x", "wu", S, N, D, "U", slices);
   lines.push(`    tensor<fp16, [1, 1, ${S}, ${N}]> sg = silu(x=g)[name=string("sg")];`,
     `    tensor<fp16, [1, 1, ${S}, ${N}]> h = mul(x=sg, y=u)[name=string("h")];`);
-  const chunksDown = N % CHUNKS ? 1 : CHUNKS;
+  const chunksDown = N % slices ? 1 : slices;
   const cc = N / chunksDown;
   let last = "";
   for (let c = 0; c < chunksDown; c++) {
@@ -377,9 +382,9 @@ export class AneLinear implements Disposable {
 /** Streamed-weight matmul y[S, Cout] = x[S, Cin] · w[Cout, Cin]ᵀ (row-major fp16). */
 export class AneStreamedMatmul implements Disposable {
   private constructor(readonly program: AneProgram, readonly cin: number, readonly cout: number, readonly seq: number) {}
-  /** Loads `streamedMatmulProgram(cin, cout, seq)`, compiled by the install step. */
-  static create(cin: number, cout: number, seq: number, share?: AneStreamedMatmul): AneStreamedMatmul {
-    return new AneStreamedMatmul(AneProgram.create(streamedMatmulProgram(cin, cout, seq), share?.program), cin, cout, seq);
+  /** Loads `streamedMatmulProgram(cin, cout, seq, slices)`, compiled by the install step. */
+  static create(cin: number, cout: number, seq: number, share?: AneStreamedMatmul, slices?: number): AneStreamedMatmul {
+    return new AneStreamedMatmul(AneProgram.create(streamedMatmulProgram(cin, cout, seq, slices), share?.program), cin, cout, seq);
   }
   /** The weight buffer [Cout·Cin] and the input buffer [S·Cin], borrowed fp16 wraps (AneProgram.inputArray). */
   weights(): MlxArray { return this.program.inputArray(0); }

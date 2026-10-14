@@ -23,10 +23,11 @@ import { TrellisLinear, trellisRows, trellisStoredRows } from "./trellis-linear"
 // graph's layers of one shape share one. Not bit-identical to the GPU path (fp16
 // weights and activations on the ANE); gate by KL.
 //
-// A layer's program depends only on its widths, the fraction and its row count,
-// never on the weights it streams, so the program each split loads is named
-// here as a function of those (`aneMlpSplitProgram`, `aneAffineSplitProgram`):
-// the install step compiles exactly what `build` loads.
+// A layer's program depends only on its widths, the fraction, its row count and
+// its matmuls' reduction slices, never on the weights it streams, so the program
+// each split loads is named here as a function of those (`aneMlpSplitProgram`,
+// `aneAffineSplitProgram`): the install step compiles exactly what `build`
+// loads.
 
 /** Channels the ANE takes of R rows at `fraction` (64-aligned, at least 64 left on each side). */
 export function aneChannels(R: number, fraction: number): number {
@@ -34,15 +35,17 @@ export function aneChannels(R: number, fraction: number): number {
 }
 
 /** The program either whole-MLP split of hidden width D and intermediate width R
- *  loads at `fraction` for pieces of up to `rows` rows. */
-export function aneMlpSplitProgram(D: number, R: number, fraction: number, rows: number): AneProgramSpec {
-  return mlpSliceProgram(D, aneChannels(R, fraction), rows);
+ *  loads at `fraction` for pieces of up to `rows` rows, its matmuls' reductions
+ *  in `slices` slices (mlpSliceProgram's default when absent). */
+export function aneMlpSplitProgram(D: number, R: number, fraction: number, rows: number, slices?: number): AneProgramSpec {
+  return mlpSliceProgram(D, aneChannels(R, fraction), rows, slices);
 }
 
 /** The program an affine projection split of K inputs and N outputs loads at
- *  `fraction` for pieces of up to `rows` rows. */
-export function aneAffineSplitProgram(K: number, N: number, fraction: number, rows: number): AneProgramSpec {
-  return streamedMatmulProgram(K, aneChannels(N, fraction), rows);
+ *  `fraction` for pieces of up to `rows` rows, its reduction in `slices` slices
+ *  (streamedMatmulProgram's default when absent). */
+export function aneAffineSplitProgram(K: number, N: number, fraction: number, rows: number, slices?: number): AneProgramSpec {
+  return streamedMatmulProgram(K, aneChannels(N, fraction), rows, slices);
 }
 
 type Fill = (codes: MlxArray, scales: MlxArray, g: TrellisGeometry, rows: number, dst: MlxArray, offset: number) => MlxArray;
@@ -111,17 +114,17 @@ export class AneTrellisMlpSplit implements Disposable {
   private constructor(readonly program: AneProgram, readonly rows: number, readonly channels: number, readonly gate: TrellisLinear,
     readonly up: TrellisLinear, readonly down: TrellisLinear, readonly rest: Rest) {}
 
-  /** Loads `aneMlpSplitProgram(D, R, fraction, rows)` for pieces of up to
-   *  `rows` rows now, from the compile cache the install step filled (a program
-   *  not compiled on this Mac throws `AneBridgeError`). `share`: a split that
-   *  never runs at the same time as this one; this split holds its program when
-   *  the two are identical, otherwise loads one on its buffers (each at least as
-   *  large). */
+  /** Loads `aneMlpSplitProgram(D, R, fraction, rows, slices)` for pieces of up
+   *  to `rows` rows now, from the compile cache the install step filled (a
+   *  program not compiled on this Mac throws `AneBridgeError`). `share`: a split
+   *  that never runs at the same time as this one; this split holds its program
+   *  when the two are identical, otherwise loads one on its buffers (each at
+   *  least as large). */
   static build(gate: TrellisLinear, up: TrellisLinear, down: TrellisLinear, fraction: number, rows: number,
-    share?: AneMlpSplit): AneTrellisMlpSplit {
+    share?: AneMlpSplit, slices?: number): AneTrellisMlpSplit {
     checkMlp("AneTrellisMlpSplit", gate, up, down, false);
     const R = gate.geometry.rows, n = aneChannels(R, fraction);
-    const program = AneProgram.create(aneMlpSplitProgram(gate.geometry.inFeatures, R, fraction, rows), share?.program);
+    const program = AneProgram.create(aneMlpSplitProgram(gate.geometry.inFeatures, R, fraction, rows, slices), share?.program);
     return new AneTrellisMlpSplit(program, rows, n, gate, up, down,
       { gate: trellisRows(gate, n, R), up: trellisRows(up, n, R), down: trellisStoredRows(down, n, R) });
   }
@@ -141,10 +144,10 @@ export class AneTrellisMlpSplitK3i implements Disposable {
 
   /** As AneTrellisMlpSplit.build. */
   static build(gate: TrellisLinear, up: TrellisLinear, down: TrellisLinear, fraction: number, rows: number,
-    share?: AneMlpSplit): AneTrellisMlpSplitK3i {
+    share?: AneMlpSplit, slices?: number): AneTrellisMlpSplitK3i {
     checkMlp("AneTrellisMlpSplitK3i", gate, up, down, true);
     const R = gate.geometry.rows, n = aneChannels(R, fraction);
-    const program = AneProgram.create(aneMlpSplitProgram(gate.geometry.inFeatures, R, fraction, rows), share?.program);
+    const program = AneProgram.create(aneMlpSplitProgram(gate.geometry.inFeatures, R, fraction, rows, slices), share?.program);
     return new AneTrellisMlpSplitK3i(program, rows, n, gate, up, down,
       { gate: trellisRows(gate, n, R), up: trellisRows(up, n, R), down: trellisStoredRows(down, n, R) });
   }
@@ -158,26 +161,32 @@ export class AneTrellisMlpSplitK3i implements Disposable {
   dispose(): void { this.program.dispose(); for (const lin of Object.values(this.rest)) disposeLinear(lin); }
 }
 
+/** The layer that computes an affine split's GPU rows from the projection's
+ *  remaining rows (default: the QuantizedLinear itself). */
+export type AneGpuRows = (rest: QuantizedLinear) => { forward(x: MlxArray): MlxArray };
+
 /** Affine projection split: the first n output rows of an MLX affine
  *  projection run on the ANE from fp16 rows the GPU dequantizes straight into
  *  the streamed program's weight buffer; the GPU computes the remaining rows;
  *  outputs concatenate in row order. */
 export class AneAffineSplit implements Disposable {
   private constructor(readonly program: AneStreamedMatmul, readonly head: { w: MlxArray; scales: MlxArray; biases: MlxArray },
-    readonly rest: QuantizedLinear, readonly spec: ops.QuantSpec) {}
+    readonly rest: QuantizedLinear, readonly gpu: { forward(x: MlxArray): MlxArray }, readonly spec: ops.QuantSpec) {}
 
-  /** Loads `aneAffineSplitProgram(K, N, fraction, rows)` for pieces of up to
-   *  `rows` rows now, as AneTrellisMlpSplit.build loads its program. `share`: as
-   *  AneTrellisMlpSplit.build. */
-  static build(lin: QuantizedLinear, fraction: number, rows: number, share?: AneAffineSplit): AneAffineSplit {
+  /** Loads `aneAffineSplitProgram(K, N, fraction, rows, slices)` for pieces of
+   *  up to `rows` rows now, as AneTrellisMlpSplit.build loads its program.
+   *  `share`: as AneTrellisMlpSplit.build. `gpuRows`: the layer over the GPU's
+   *  rows. */
+  static build(lin: QuantizedLinear, fraction: number, rows: number, share?: AneAffineSplit, slices?: number,
+    gpuRows?: AneGpuRows): AneAffineSplit {
     const N = lin.outFeatures, K = lin.inFeatures;
     if (!lin.biases || lin.bias || lin.w.ndim !== 2 || lin.spec.mode !== "affine") throw new Error("AneAffineSplit: unsupported projection");
     const n = aneChannels(N, fraction);
-    const program = AneStreamedMatmul.create(K, n, rows, share?.program);
+    const program = AneStreamedMatmul.create(K, n, rows, share?.program, slices);
     const rowsOf = (a: MlxArray, start: number, stop: number) => a.slice([start, 0], [stop, a.shape[1]!]);
     const head = { w: rowsOf(lin.w, 0, n), scales: rowsOf(lin.scales, 0, n), biases: rowsOf(lin.biases, 0, n) };
     const rest = new QuantizedLinear(rowsOf(lin.w, n, N), rowsOf(lin.scales, n, N), rowsOf(lin.biases, n, N), lin.spec);
-    return new AneAffineSplit(program, head, rest, lin.spec);
+    return new AneAffineSplit(program, head, rest, gpuRows ? gpuRows(rest) : rest, lin.spec);
   }
 
   /** x [.., M, K], M <= rows → [.., M, N], unevaluated as the MLP split's
@@ -197,7 +206,7 @@ export class AneAffineSplit implements Disposable {
     }
     ane.evalAsync();
     let gpu: MlxArray;
-    try { gpu = this.rest.forward(x); ops.asyncEvalAll([gpu]); }
+    try { gpu = this.gpu.forward(x); ops.asyncEvalAll([gpu]); }
     finally { ane.wait(); }
     try {
       using used = ane.output(M);                             // the piece's rows of [rows, n] fp16
