@@ -28,7 +28,7 @@
 //   every operation 9..256         MmaGateUpWide + MmaDownWide/K3i             AffineSplitMmaLinear
 //   decode/verify.wider 257+       the generic blocks (TrellisMlp)             QuantizedLinear
 //   prefillChunk.gpu/Tail 257+     the generic blocks (TrellisMlp)             DequantizedLinear
-//   prefillChunk.ane, 224..2048    AneTrellisMlpSplit/K3i                      DequantizedLinear
+//   prefillChunk.ane, 224..2048    AneTrellisMlpSplit/K3i                      in_proj_qkv, in_proj_z, out_proj, q_proj, o_proj split from 768 rows
 //
 // Mixed-width gate/up takes CodebookGateUpRow at one row, split tail (MLX's compiled SwiGLU bit for bit). Every
 // attention block reads through the cache the composition's KV scheme names: affine 4-bit group 64 composes
@@ -46,7 +46,8 @@
 // the head's layers (DraftProjection.vocabulary). Decode, verify, prompt tails and embeddings up to eight rows, and
 // decode, verify windows and prompt tails on the wider layers, submit the graph every 4 layers; wider decode and verify
 // windows and known-token appends are otherwise one lazy graph; prompt chunks, prompt tails above 256 rows and
-// embeddings above eight rows, evaluate each layer and its recurrent state.
+// embeddings above eight rows, evaluate each layer and its recurrent state, which the Neural Engine operations queue
+// without waiting (each split waits for the GPU before its ANE run).
 //
 // Request shapes this graph serves:
 //   - prompt chunks of exactly the composition's chunk size (prefillChunk.gpu) and prompt tails (prefillTail),
@@ -92,7 +93,7 @@ import { mapTokenGroups } from "../../input/token-groups";
 import type { AneProgramSpec } from "../../kernels/ane/linear";
 import { Affine3RowsLinear, Affine4RowsLinear, AffineRowLinear, AffineSplitMmaLinear } from "../../layers/affine-verify-linear";
 import {
-  AneTrellisMlpSplit, AneTrellisMlpSplitK3i, aneMlpSplitProgram, type AneMlpSplit,
+  AneAffineSplit, AneTrellisMlpSplit, AneTrellisMlpSplitK3i, aneAffineSplitProgram, aneMlpSplitProgram, type AneMlpSplit,
 } from "../../layers/ane-prefill-split";
 import { DequantizedLinear } from "../../layers/dequantized-linear";
 import { disposing } from "../../layers/helpers";
@@ -211,40 +212,58 @@ export const LAYERS: readonly Qwen38Layer[] = Object.freeze([
 const PREFIX = "language_model.model";
 const DELTANET_PROJECTIONS = ["in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj"] as const;
 const ATTENTION_PROJECTIONS = ["q_proj", "k_proj", "v_proj", "o_proj"] as const;
+const ANE_PROJECTIONS: ReadonlySet<string> = new Set(["in_proj_qkv", "in_proj_z", "out_proj", "q_proj", "o_proj"]);
 /** Submit the graph every 4 layers at decode and verify widths up to 8 (measured best on this GPU). */
 const ASYNC_EVERY = 4;
 /** Every operation above eight rows of at most WIDER_ROWS rows runs this GPU's wider layers, more rows the generic
  *  blocks: the boundary measured on the whole forward, from this machine's kernel table. */
 export const WIDER_ROWS = 256;
-/** The Neural Engine's channel fraction in each split. */
-const ANE_FRACTION = 0.34;
 /** The Neural Engine operations' row ranges, ascending: a one-sequence prompt piece, a chunk or a tail, whose positions
- *  one holds runs on it, over programs built for its `rows`. From this machine's kernel table. */
-const ANE_RANGES: readonly { readonly minRows: number; readonly rows: number }[] = Object.freeze([
-  { minRows: 224, rows: 256 }, { minRows: 257, rows: 320 }, { minRows: 321, rows: 384 }, { minRows: 385, rows: 448 },
-  { minRows: 449, rows: 512 }, { minRows: 513, rows: 576 }, { minRows: 577, rows: 640 }, { minRows: 641, rows: 704 },
-  { minRows: 705, rows: 768 }, { minRows: 769, rows: 896 }, { minRows: 897, rows: 1024 }, { minRows: 1025, rows: 1280 },
-  { minRows: 1281, rows: 1536 }, { minRows: 1537, rows: 1792 }, { minRows: 1793, rows: 2048 },
+ *  one holds runs on it, over programs built for its `rows` with `fraction` of the MLP's channels on the Neural
+ *  Engine. From this machine's kernel table. */
+const ANE_RANGES: readonly { readonly minRows: number; readonly rows: number; readonly fraction: number }[] = Object.freeze([
+  { minRows: 224, rows: 256, fraction: 0.353 }, { minRows: 257, rows: 320, fraction: 0.353 },
+  { minRows: 321, rows: 384, fraction: 0.353 }, { minRows: 385, rows: 448, fraction: 0.353 },
+  { minRows: 449, rows: 512, fraction: 0.353 }, { minRows: 513, rows: 576, fraction: 0.353 },
+  { minRows: 577, rows: 640, fraction: 0.353 }, { minRows: 641, rows: 704, fraction: 0.353 },
+  { minRows: 705, rows: 768, fraction: 0.353 }, { minRows: 769, rows: 896, fraction: 0.382 },
+  { minRows: 897, rows: 1024, fraction: 0.382 }, { minRows: 1025, rows: 1280, fraction: 0.382 },
+  { minRows: 1281, rows: 1536, fraction: 0.382 }, { minRows: 1537, rows: 1792, fraction: 0.382 },
+  { minRows: 1793, rows: 2048, fraction: 0.382 },
 ]);
+/** The reduction slices of each MLP program's matmuls. From this machine's kernel table. */
+const ANE_SLICES = 4;
+/** The Neural Engine's channel fraction in each projection split. */
+const ANE_AFFINE_FRACTION = 0.375;
+/** The reduction slices of each projection program's matmul. */
+const ANE_AFFINE_SLICES = 4;
+/** The fewest rows of a program whose range splits the projections; the ranges below keep them whole. */
+const ANE_AFFINE_MIN_ROWS = 768;
 
-/** The widths a graph's Neural Engine programs are built at: the MLP's hidden and intermediate widths (no projection
- *  is split). */
+/** The widths a graph's Neural Engine programs are built at: the MLP's hidden and intermediate widths, and the input
+ *  and output widths of each distinct split projection shape. */
 export interface AneWidths {
   readonly hidden: number;
   readonly intermediate: number;
+  readonly projections: readonly (readonly [number, number])[];
 }
 
-/** The artifact's widths, from its description. */
-export const ANE_WIDTHS: AneWidths = Object.freeze({ hidden: 5120, intermediate: 17408 });
+/** The artifact's widths, from its description: in_proj_qkv 5120→10240; in_proj_z 5120→6144; out_proj, o_proj 6144→5120; q_proj 5120→12288. */
+export const ANE_WIDTHS: AneWidths = Object.freeze({
+  hidden: 5120, intermediate: 17408,
+  projections: Object.freeze([[5120, 10240], [5120, 6144], [6144, 5120], [5120, 12288]] as const),
+});
 
 /** The distinct Neural Engine programs this graph loads for `composition`, at the artifact's widths unless
  *  `widths` names others (a synthetic artifact laid out like it): none without the bridge or with adapters mounted,
- *  otherwise the whole-MLP slice every layer shares, for each range in `ANE_RANGES` at that range's rows. The
- *  install step compiles them into the system cache (`compileAnePrograms`, models/ane-install); the constructor
- *  only loads them, so one missing there fails construction with `AneBridgeError`. */
+ *  otherwise, for each range in `ANE_RANGES`, the whole-MLP slice every layer shares and, from ANE_AFFINE_MIN_ROWS
+ *  rows, one program per split projection shape, each for that range's rows. The install step compiles them into the
+ *  system cache (`compileAnePrograms`, models/ane-install); the constructor only loads them, so one missing there
+ *  fails construction with `AneBridgeError`. */
 export function anePrograms(composition: Composition, widths: AneWidths = ANE_WIDTHS): AneProgramSpec[] {
   if (!composition.aneBridge || composition.adapters) return [];
-  return ANE_RANGES.map(({ rows }) => aneMlpSplitProgram(widths.hidden, widths.intermediate, ANE_FRACTION, rows));
+  return ANE_RANGES.flatMap(({ rows, fraction }) => [aneMlpSplitProgram(widths.hidden, widths.intermediate, fraction, rows, ANE_SLICES),
+    ...(rows < ANE_AFFINE_MIN_ROWS ? [] : widths.projections.map(([inputs, outputs]) => aneAffineSplitProgram(inputs, outputs, ANE_AFFINE_FRACTION, rows, ANE_AFFINE_SLICES)))]);
 }
 
 /** One layer: input norm, mixer, residual, post-attention norm, MLP, residual. Consumes nothing; returns an owned output.
@@ -468,19 +487,28 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
     // The Neural Engine operations, one per range in ANE_RANGES, built largest
     // first. Layers run one at a time and the scheduler runs one operation at a
     // time, so each MLP split shares the previous split's program (identical
-    // within a range) or its buffers (the largest range's): one loaded program
-    // per range, the programs `anePrograms` lists, loaded from the compile
-    // cache the install step filled (nothing compiles here).
+    // within a range) or its buffers (the largest range's), and projections of
+    // one shape share theirs: one loaded program per shape and range, the
+    // programs `anePrograms` lists, loaded from the compile cache the install
+    // step filled (nothing compiles here).
     let ane: { readonly minRows: number; readonly rows: number; readonly steps: Step[] }[] | null = null;
     if (composition.aneBridge && !composition.adapters) {
       const started = performance.now();
+      const affineShares = new Map<string, AneAffineSplit>();
       let mlpShare: AneMlpSplit | undefined;
-      ane = [...ANE_RANGES].reverse().map(({ minRows, rows }) => ({ minRows, rows, steps: generic.map((layer, i) => {
+      ane = [...ANE_RANGES].reverse().map(({ minRows, rows, fraction }) => ({ minRows, rows, steps: generic.map((layer, i) => {
         const spec = LAYERS[i]!, { gate, up, down } = mlpOf(i);
         const split = mlpShare = (spec.downLayout === "k3Interleaved" ? AneTrellisMlpSplitK3i : AneTrellisMlpSplit)
-          .build(gate, up, down, ANE_FRACTION, rows, mlpShare);
+          .build(gate, up, down, fraction, rows, mlpShare, ANE_SLICES);
         this.#owned.push(split);
-        const block = promptBlocks![i]!;
+        const block = rows < ANE_AFFINE_MIN_ROWS ? promptBlocks![i]! : blockOf(i, (linear, path) => {
+          if (!ANE_PROJECTIONS.has(path.slice(path.lastIndexOf(".") + 1))) return new DequantizedLinear(linear);
+          const shape = `${linear.inFeatures}:${linear.outFeatures}`;
+          const projection = AneAffineSplit.build(linear, ANE_AFFINE_FRACTION, rows, affineShares.get(shape), ANE_AFFINE_SLICES, rest => new DequantizedLinear(rest));
+          affineShares.set(shape, projection);
+          this.#owned.push(projection);
+          return projection;
+        });
         return layerStep(layer, mixerOf(block, spec.kind), post => split.forward(post, compiledSwiglu));
       }) })).reverse();
       console.error(`[ane] prefill programs ready in ${Math.round(performance.now() - started)} ms`);
@@ -520,7 +548,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
     this.prefillChunk = Object.freeze(split
       ? { gpu, ane: Object.freeze(split.map(({ minRows, rows, steps }) => Object.freeze({ minRows, rows,
         forward: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
-          this.#bounded(steps, embed.encode(ids), state, "window", capture, null, "wider") }))) }
+          this.#queued(steps, embed.encode(ids), state, "window", capture, "wider") }))) }
       : { gpu });
     this.prefillTail = Object.freeze({
       one: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
@@ -659,6 +687,28 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
         h = next;
         const state = cache[i]!.state();
         try { ops.evalAll([h, ...state]); }
+        finally { if (cache[i]!.stateNeedsDispose) for (const a of state) a.dispose(); }
+        capture?.(i, h);
+      }
+      const out = disposing(h, this.finalNorm.forward(h));
+      h = null;
+      capture?.(steps.length, out);
+      return out;
+    } finally { h?.dispose(); }
+  }
+
+  /** Every layer, each layer's output and recurrent state queued for the GPU, not waited for, before the next is
+   *  built: the Neural Engine operations, whose splits wait for the GPU before each ANE run. */
+  #queued(steps: Step[], h0: MlxArray, cache: Cache[], phase: ReadPhase, capture: MlxLayerCapture | null,
+    width: MlxWidthClass): MlxArray {
+    let h: MlxArray | null = h0;
+    try {
+      for (let i = 0; i < steps.length; i++) {
+        const next = steps[i]!(h, cache[i]!, phase, null, width);
+        h.dispose();
+        h = next;
+        const state = cache[i]!.state();
+        try { ops.asyncEvalAll([h, ...state]); }
         finally { if (cache[i]!.stateNeedsDispose) for (const a of state) a.dispose(); }
         capture?.(i, h);
       }

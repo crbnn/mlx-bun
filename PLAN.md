@@ -55,7 +55,10 @@ and 200-token prompts 0.97 -> 0.24, 0.87 -> 0.64 and 2.28 -> 1.90 s), and window
 above 256 rows still the generic blocks, a one-sequence prompt piece of 224 to 2048 positions on the
 Neural Engine split over programs every 64 positions to 768, every 128 to 1024 and every 256 to 2048
 (time to first token of 300-, 400-, 500-, 639-, 700- and 1100-token prompts 2.74/3.55/4.09/5.00/5.09/7.23
--> 2.43/2.98/3.28/3.94/4.26/6.65 s); DFlash 2 adaptive on that chip (in-process serve, four
+-> 2.43/2.98/3.28/3.94/4.26/6.65 s; since 2026-10-14, with its layers queued, its programs in four reduction
+slices and, from 768 positions, the projections split as well, prompts of 300, 500, 639, 1024, 2048 and 8192
+tokens 2.43/3.26/3.89/5.83/11.18/45.85 -> 2.16/2.92/3.58/4.95/9.36/38.54 s with the weights wired);
+DFlash 2 adaptive on that chip (in-process serve, four
 prompts, 192 tokens, 2026-10-14) decodes greedy text at 24.7 against 19.1 tok/s plain, 21.7 against 18.7 under
 Qwen's instruct sampling and 20.3 against 18.7 under its thinking sampling, the MTP head (adaptive up to four
 drafts, the graph's `adaptiveDraftWidths`) at 20.5, 19.7 and 18.6; with two and four concurrent requests DFlash 2
@@ -66,12 +69,12 @@ decode's step time), yet on text the drafter predicts poorly (the short-story pr
 instruct sampling) DFlash 2 still trails plain decode by 2 to 5% and the MTP head by 1 to 4%: the first rounds
 after a request joins draft on an optimistic prior (about 2.5%), each DFlash 2 probe drafts a block (15 to 35 ms
 every 8 to 32 steps) and each return from drafted rounds to pipelined steps costs about one step; the M1
-Max composition prefills 1k and 8k-token prompts at about 175 tok/s (2026-10-13, alternated sessions of the graph's own prefill
-operations, against 129 to 130 before its dense-GEMM prompt projections and Neural Engine MLP split;
-mean KL of the split 1.3e-3 to 2.0e-3) against 200 on the M4 Pro; the paired check's band is
-narrower than session drift for sub-percent decode differences (the clean M1 Max run is the null);
-the TurboQuant fused decode kernel covers head dimensions 64, 128, 256 and 512 and 96 decodes on
-the plain path.
+Max composition prefills 1k and 8k-token prompts at 207 and 213 tok/s (2026-10-14, alternated sessions of the graph's
+own prefill operations; 175 on 2026-10-13, 129 to 130 before its dense-GEMM prompt projections and Neural Engine
+MLP split; mean KL of the split against the GPU alone 1.2e-4 to 1.9e-3, 3e-5 to 2.0e-3 before) against 200 on
+the M4 Pro; the paired check's band is narrower than session drift for sub-percent decode differences (the clean
+M1 Max run is the null); the TurboQuant fused decode kernel covers head dimensions 64, 128, 256 and 512 and 96
+decodes on the plain path.
 
 The measurements of record before the merge. M1 Max (2026-10-12, clean machine, `perf.yml`):
 Trellis default decode 14.1 → 14.0 tok/s (1.000 [0.995, 1.006]), e4b default 64.4 → 64.3 (0.998

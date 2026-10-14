@@ -28,11 +28,15 @@ describe("the install table", () => {
     expect(ANE_WIDTHS).toEqual({ hidden: 5120, intermediate: 17408, projections: [[5120, 6144], [6144, 5120]] });
   });
 
-  test("on an M1 Max the shipped table lists the Qwen3.8 graph's MLP slice for each of its Neural Engine row ranges", () => {
+  test("on an M1 Max the shipped table lists the Qwen3.8 graph's MLP slice for each of its Neural Engine row ranges, and from 768 rows its projection splits", () => {
     const programs = [256, 320, 384, 448, 512, 576, 640, 704, 768, 896, 1024, 1280, 1536, 1792, 2048];
-    expect(labels(record({ device: M1_MAX }))).toEqual(programs.map(rows =>
-      [`MLP slice 5120×5888, ${rows} rows`, [QWEN38_TRELLIS_M1MAX_GRAPH]]));
-    expect(M1_MAX_ANE_WIDTHS).toEqual({ hidden: 5120, intermediate: 17408 });
+    expect(labels(record({ device: M1_MAX }))).toEqual(programs.flatMap(rows => [
+      [`MLP slice 5120×${rows <= 768 ? 6144 : 6656}, ${rows} rows, 4 slices`, [QWEN38_TRELLIS_M1MAX_GRAPH]],
+      ...(rows < 768 ? [] : [[5120, 3840], [5120, 2304], [6144, 1920], [5120, 4608]].map(([inputs, outputs]) =>
+        [`projection ${inputs}→${outputs}, ${rows} rows, 4 slices`, [QWEN38_TRELLIS_M1MAX_GRAPH]])),
+    ]));
+    expect(M1_MAX_ANE_WIDTHS).toEqual({ hidden: 5120, intermediate: 17408,
+      projections: [[5120, 10240], [5120, 6144], [6144, 5120], [5120, 12288]] });
   });
 
   test("the programs follow the composition: the bridge, mounted adapters and the device, not the chunk size", () => {

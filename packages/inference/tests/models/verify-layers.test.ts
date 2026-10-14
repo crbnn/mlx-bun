@@ -5,6 +5,8 @@
 // so they agree to bf16 precision. The codebook layers (layers/trellis-reduce-gate-up,
 // layers/trellis-scatter-down) and the one-row affine layer reproduce the one-row
 // paths they replace bit for bit. Each layer also refuses weights it was not built for.
+// TrellisLinear itself, at prompt rows, leaves its weight expansion unbounded on request
+// with the same bits.
 import { describe, expect, test } from "bun:test";
 import { Dtype, MlxArray, ops } from "@mlx-bun/mlx";
 import { QuantizedLinear } from "../../src/layers/quantized-linear";
@@ -208,5 +210,19 @@ describe("affine verify layers", () => {
       expect(() => new AffineSplitMmaLinear(lin8)).toThrow();
       expect(() => new AffineRowLinear(lin8)).toThrow();
     } finally { q8.packed.dispose(); q8.scales.dispose(); q8.biases?.dispose(); }
+  }, 60_000);
+});
+
+describe("TrellisLinear at prompt rows", () => {
+  test("an unbounded weight expansion gives the bounded product's bits", () => {
+    using x = rows(96, D);
+    // Gate/up form, row-major down, 3-bit interleaved down: each takes D inputs.
+    for (const lin of [trellis(R, D, 1, 3, 7), trellis(D, R, 0, 2, 19), trellis(D, 1024, 0, 3, 23, true)]) {
+      using bounded = lin.forward(x, true);
+      using unbounded = lin.forward(x, true, false);
+      expect(unbounded.shape).toEqual(bounded.shape);
+      expect(Buffer.from(unbounded.rawBytes()).equals(Buffer.from(bounded.rawBytes()))).toBe(true);
+      lin.codes.dispose(); lin.scales.dispose();
+    }
   }, 60_000);
 });

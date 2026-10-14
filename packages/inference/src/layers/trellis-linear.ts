@@ -135,8 +135,13 @@ export class TrellisLinear {
   }
 
   /** A caller may prove row-contiguous, aligned input from an allocating op
-   * such as RMSNorm. Lazy array strides cannot establish that before eval. */
-  forward(x: MlxArray, inputRowContiguous = false): MlxArray {
+   * such as RMSNorm. Lazy array strides cannot establish that before eval.
+   * Rows past the tiled kernels expand the dense weight and multiply; that
+   * product is evaluated before returning, so building the next projection
+   * never holds a second expansion, unless `boundExpansion` is false: a caller
+   * that queues several projections at once (the Neural Engine split's GPU
+   * share) holds their expansions until it evaluates them. */
+  forward(x: MlxArray, inputRowContiguous = false, boundExpansion = true): MlxArray {
     const g = this.geometry;
     const lead = x.shape.slice(0, -1);
     const M = lead.reduce((a, b) => a * b, 1);
@@ -169,7 +174,7 @@ export class TrellisLinear {
     // Disposing `stored` above releases only its JS handle, not the lazy
     // matmul's reference. Direct tiles and packed matvecs stay lazy: they
     // hold activations and bounded partials, without a dense weight matrix.
-    if (expandedWeights) out.eval();
+    if (expandedWeights && boundExpansion) out.eval();
     return out;
   }
 }
