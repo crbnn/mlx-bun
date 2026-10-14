@@ -41,14 +41,14 @@ test("a loaded model records the composition resolved before its graph was built
   try {
     expect(context.composition).toEqual({ device: deviceArchitecture(),
       kv: { kind: "affine", bits: 8, groupSize: 64, kernels: "unfused" }, pagedKv: null,
-      draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 3, vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
+      draftDepth: 0, prefillChunkTokens: 2048, maxRows: 3, vectorGreedySampling: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
       grammarJump: false, greedyDraft: false });
     const binding = await modelServingBinding(context);
     expect(binding.diagnostics()).toEqual({ composition: { device: deviceArchitecture(),
       kv: { kind: "affine", bits: 8, group_size: 64, kernels: "unfused" }, paged_kv: null, draft_depth: 0, prefill_chunk_tokens: 2048,
-      adapters: false, max_rows: 3, packed_mixed_mlp: true, vector_greedy_sampling: true,
-      compiled_decode: true, mixed_prefill: false, mixed_token_budget: 256, prefill_tail_split: true, grammar_jump: false,
-      greedy_draft: false, compiled_geglu: true, compiled_swiglu: true } });
+      max_rows: 3, vector_greedy_sampling: true,
+      mixed_prefill: false, mixed_token_budget: 256, prefill_tail_split: true, grammar_jump: false,
+      greedy_draft: false } });
     // The graph's caches are the composition's: the KV8 legos it names.
     const caches = (context.model as { makeCache(): { signature(): string; dispose(): void }[] }).makeCache();
     try { expect(caches.every(cache => cache.signature() === "kv:bf16-first:kv:plain")).toBe(true); }
@@ -79,7 +79,7 @@ test("paging and its read are composition fields, and /stats prints them; direct
       const binding = await modelServingBinding(context);
       const printed = (binding.diagnostics() as { composition: { paged_kv: unknown; compiled_decode: boolean } }).composition;
       expect(printed.paged_kv).toEqual(wire);
-      expect([context.composition!.compiledDecode, printed.compiled_decode]).toEqual([!wire.direct, !wire.direct]);
+      expect(printed).not.toHaveProperty("compiled_decode");
     } finally { context.dispose(); }
   }
 });
