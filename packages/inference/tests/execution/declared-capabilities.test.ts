@@ -74,7 +74,7 @@ describe("placement follows the graph's declarations", () => {
     expect((adapted.graph as unknown as {loraState:{active:string[]}}).loraState.active).toEqual(["first"]);
     restore();
     expect((adapted.graph as unknown as {loraState:{active:string[]}}).loraState.active).toEqual([]);
-    const compiled = bind(replacement({}));
+    const compiled = bind(replacement({ compiledDecode: true }));
     expect(compiled.plan(shape, {}, schedule).compiledDecode).toBe(true);
 
   });
