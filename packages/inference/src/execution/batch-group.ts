@@ -191,7 +191,7 @@ export class MlxBatchExecutionGroup {
       : null;
     this.#dispatch = new MlxPhaseDispatch(tokenPhasesOf(model));
     this.#vectorGreedy = facts.vectorGreedySampling;
-    this.#mixed = facts.mixedPrefill && model.mixed ? model.mixed : null;
+    this.#mixed = facts.mixedPrefill && (model.mixed || model.mixedSeparate) ? model.mixed ?? [] : null;
     this.#mixedSeparate = model.mixedSeparate;
     this.#mixedTokenBudget = facts.mixedTokenBudget;
   }

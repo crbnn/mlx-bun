@@ -56,7 +56,7 @@ export function trainForwardHidden(
     trainingStandIn(c, window => new TrainingCache(window, masks, attention, rowLengths)));
   for (const c of probe) c.dispose();
   try {
-    return forwardSequence(model, ids, cache, width); // [B, L, hidden]
+    return sequenceHiddenOperation(model, ids, cache, width); // [B, L, hidden]
   } finally {
     for (const c of cache) c.dispose();
   }
@@ -80,7 +80,7 @@ export function trainForward(
 
 
 /** Select the full-sequence operation from its exact token rows. */
-export function forwardSequence(model: { readonly sequence?: readonly MlxSequenceRange[]; readonly sequenceHidden?: MlxSequenceForward },
+export function sequenceHiddenOperation(model: { readonly sequence?: readonly MlxSequenceRange[]; readonly sequenceHidden?: MlxSequenceForward },
   ids: MlxArray, cache: Cache[], rows = ids.shape[0]! * ids.shape[1]!): MlxArray {
   if (model.sequence) return model.sequence.find(range => rows >= range.from && rows <= range.to)!.operation(ids, cache);
   return model.sequenceHidden!(ids, cache, rows);
