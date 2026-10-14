@@ -643,3 +643,60 @@ export class PerLayerInputs {
   }
 }
 
+
+/** Unsorted expert gather. The graph binds this below the reference threshold. */
+export class UnsortedSwitchGLU {
+  constructor(readonly base: SwitchGLU,
+    readonly activation: { forward(gate: MlxArray, up: MlxArray): MlxArray }) {}
+  forward(x: MlxArray, indices: MlxArray): MlxArray {
+    using expanded = ops.expandDims(x, -2);
+    using h = ops.expandDims(expanded, -3);
+    const up = this.base.up.forward(h, indices, false);
+    const gate = this.base.gate.forward(h, indices, false);
+    using mid = this.activation.forward(gate, up);
+    using y = this.base.down.forward(mid, indices, false);
+    const shape = y.shape;
+    shape.splice(shape.length - 2, 1);
+    return ops.reshape(y, shape);
+  }
+}
+
+/** Sorted expert gather and inverse permutation. No token-count selector. */
+export class SortedSwitchGLU {
+  constructor(readonly base: SwitchGLU,
+    readonly activation: { forward(gate: MlxArray, up: MlxArray): MlxArray }) {}
+  forward(x: MlxArray, indices: MlxArray): MlxArray {
+    using expanded = ops.expandDims(x, -2);
+    using h = ops.expandDims(expanded, -3);
+    const k = indices.shape[indices.ndim - 1]!;
+    using idxFlat = ops.reshape(indices, [indices.size]);
+    using order = ops.argsortAxis(idxFlat, 0);
+    using invOrder = ops.argsortAxis(order, 0);
+    using kScalar = ops.scalarLike(k, order);
+    using rowIdx = ops.floorDivide(order, kScalar);
+    using flat = ops.reshape(h, [-1, 1, h.shape[4]!]);
+    using sorted = ops.takeAxis(flat, rowIdx, 0);
+    using idx = ops.takeAxis(idxFlat, order, 0);
+    const up = this.base.up.forward(sorted, idx, true);
+    const gate = this.base.gate.forward(sorted, idx, true);
+    using mid = this.activation.forward(gate, up);
+    using projected = this.base.down.forward(mid, idx, true);
+    using unsorted = ops.takeAxis(projected, invOrder, 0);
+    const [B, L, topK] = indices.shape as number[];
+    using y = ops.reshape(unsorted, [B!, L!, topK!, 1, unsorted.shape.at(-1)!]);
+    const shape = y.shape;
+    shape.splice(shape.length - 2, 1);
+    return ops.reshape(y, shape);
+  }
+}
+
+/** The explicit expert operation, with top-k weighted sum in reference order. */
+export class FixedExperts {
+  constructor(readonly switchGlu: { forward(x: MlxArray, indices: MlxArray): MlxArray }) {}
+  forward(x: MlxArray, indices: MlxArray, weights: MlxArray): MlxArray {
+    using w = ops.expandDims(weights, -1);
+    using y = this.switchGlu.forward(x, indices);
+    using wy = ops.mul(w, y);
+    return ops.sumAxis(wy, -2, false);
+  }
+}

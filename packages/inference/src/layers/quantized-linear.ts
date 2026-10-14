@@ -1,6 +1,6 @@
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
-import { LoraState,loraInputDropout,type LoraWeights } from "./lora";
+import { LoraDelta, type LoraState, type LoraWeights } from "./lora";
 import { quantFor,type ModelConfig } from "../artifacts/config";
 import type { Weights } from "../artifacts/weights";
 import { quantizedMatmulRows } from "../kernels/quantization/affine-rows";
@@ -15,13 +15,13 @@ export interface QuantizedLinearState {
 }
 
 export class QuantizedLinear {
-  /** Mounted adapters keyed by id (null until first mount — fast path). */
-  adapters: Map<string, LoraWeights> | null = null;
-  /** Shared per-model active state (wired by AdapterManager.mount). */
-  loraState: LoraState | null = null;
-  /** Stable per-target index for keying training-only LoRA dropout (set by
-   *  attachForTraining). Gives each adapted linear an independent dropout mask. */
-  dropoutId = 0;
+  readonly delta = new LoraDelta();
+  get adapters(): Map<string, LoraWeights> | null { return this.delta.adapters; }
+  set adapters(value: Map<string, LoraWeights> | null) { this.delta.adapters = value; }
+  get loraState(): LoraState | null { return this.delta.loraState; }
+  set loraState(value: LoraState | null) { this.delta.loraState = value; }
+  get dropoutId(): number { return this.delta.dropoutId; }
+  set dropoutId(value: number) { this.delta.dropoutId = value; }
   private _w: MlxArray;
   private _scales: MlxArray;
   private _biases: MlxArray | null;
@@ -102,37 +102,36 @@ export class QuantizedLinear {
     // Additive bias (mlx QuantizedLinear: `x = x + self["bias"]`), before
     // the LoRA residual (LoRALinear calls the base linear bias-inclusive).
     if (this.bias) { const previous = out; out = ops.add(out, this.bias); previous.dispose(); }
-    // LoRA residual — composition is mlx-lm LoRALinear / optiq apply.py:
-    //   y + (scale · ((x @ A) @ B)).astype(x.dtype)
-    // (optiq mount.py omits the astype, leaking the f32 residual into the
-    // bf16 stream; the
-    // cast form is what the adapters were trained behind.)
-    const st = this.loraState;
-    if (st && st.active.length > 0 && this.adapters && this.adapters.size > 0) {
-      // Training-only LoRA-input dropout (PEFT applies dropout to x before A;
-      // the base quantized path is untouched). Keyed by (seed, dropoutId) so the
-      // backward recompute reproduces the exact mask.
-      let xLora = x;
-      let xDrop: MlxArray | null = null;
-      if (st.dropoutSeed !== null && st.dropoutRate > 0) {
-        xDrop = loraInputDropout(x, st.dropoutRate, st.dropoutSeed, this.dropoutId);
-        xLora = xDrop;
-      }
-      for (const id of st.active) {
-        const lw = this.adapters.get(id);
-        if (!lw) continue;
-        const xa = ops.matmul(xLora, lw.a);
-        const z = ops.matmul(xa, lw.b);
-        xa.dispose();
-        const zs = ops.mulScalar(z, lw.scale);
-        z.dispose();
-        const zc = zs.astype(x.dtype);
-        zs.dispose();
-        const previous = out; out = ops.add(out, zc); previous.dispose();
-        zc.dispose();
-      }
-      xDrop?.dispose();
-    }
-    return out;
+    return this.delta.forward(x, out);
+  }
+}
+
+/** Stock affine projection. The weights and adapter target belong to base. */
+export class QuantizedLinearPlain {
+  readonly #bias: (out: MlxArray) => MlxArray;
+  constructor(readonly base: QuantizedLinear) {
+    this.#bias = base.bias ? out => { const next = ops.add(out, base.bias!); out.dispose(); return next; } : out => out;
+  }
+  static load(weights: Weights, path: string, config: ModelConfig): QuantizedLinearPlain {
+    return new QuantizedLinearPlain(QuantizedLinear.load(weights, path, config));
+  }
+  forward(x: MlxArray): MlxArray {
+    const out = ops.quantizedMatmul(x, this.base.w, this.base.scales, this.base.biases, this.base.spec, true);
+    return this.base.delta.forward(x, this.#bias(out));
+  }
+}
+
+/** Each position uses independent one-row affine arithmetic. */
+export class QuantizedLinearRows {
+  readonly #bias: (out: MlxArray) => MlxArray;
+  constructor(readonly base: QuantizedLinear) {
+    this.#bias = base.bias ? out => { const next = ops.add(out, base.bias!); out.dispose(); return next; } : out => out;
+  }
+  static load(weights: Weights, path: string, config: ModelConfig): QuantizedLinearRows {
+    return new QuantizedLinearRows(QuantizedLinear.load(weights, path, config));
+  }
+  forward(x: MlxArray): MlxArray {
+    const out = quantizedMatmulRows(x, this.base.w, this.base.scales, this.base.biases, this.base.spec);
+    return this.base.delta.forward(x, this.#bias(out));
   }
 }

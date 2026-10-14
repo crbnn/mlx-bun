@@ -1,0 +1,93 @@
+import type { MlxArray } from "@mlx-bun/mlx/array";
+import * as ops from "@mlx-bun/mlx/ops";
+import { expandTrellis, trellisReduce, trellisScatter, wideTrellisPrefill, tiledTrellisPrefill, splitKTrellisPrefill } from "../kernels/trellis/index";
+import { compiledSwiglu } from "./swiglu";
+import { fusedGateUpSwiglu, type TrellisLinear } from "./trellis-linear";
+
+export interface RowProjection { forward(x: MlxArray): MlxArray }
+
+/** The graph supplies a projection kernel. Shapes preserve the input's leading
+ * dimensions; reshaped handles are released while the result remains lazy. */
+function project(lin: TrellisLinear, x: MlxArray, kernel: (x: MlxArray) => MlxArray): MlxArray {
+  const lead = x.shape.slice(0, -1);
+  using rows = ops.reshape(x, [lead.reduce((a, b) => a * b, 1), lin.inFeatures]);
+  using out = kernel(rows);
+  return ops.reshape(out, [...lead, lin.outFeatures]);
+}
+
+export class TrellisReducePrompt {
+  constructor(readonly linear: TrellisLinear) {}
+  forward(x: MlxArray): MlxArray {
+    return project(this.linear, x, rows => trellisReduce(rows, this.linear.codes, this.linear.scales, this.linear.geometry, this.linear.variant));
+  }
+}
+export class TrellisScatterPrompt {
+  constructor(readonly linear: TrellisLinear) {}
+  forward(x: MlxArray): MlxArray {
+    return project(this.linear, x, rows => trellisScatter(rows, this.linear.codes, this.linear.scales, this.linear.geometry, this.linear.variant, this.linear.useSharedScatterCodebook, this.linear.representations.scatter));
+  }
+}
+export class TrellisWidePrompt {
+  constructor(readonly linear: TrellisLinear) {}
+  forward(x: MlxArray): MlxArray {
+    return project(this.linear, x, rows => wideTrellisPrefill(rows, this.linear.codes, this.linear.scales, this.linear.geometry));
+  }
+}
+export class TrellisTiledPrompt {
+  constructor(readonly linear: TrellisLinear) {}
+  forward(x: MlxArray): MlxArray {
+    return project(this.linear, x, rows => tiledTrellisPrefill(rows, this.linear.codes, this.linear.scales, this.linear.geometry));
+  }
+}
+export class TrellisSplitKPrompt {
+  constructor(readonly linear: TrellisLinear) {}
+  forward(x: MlxArray): MlxArray {
+    return project(this.linear, x, rows => splitKTrellisPrefill(rows, this.linear.codes, this.linear.scales, this.linear.geometry));
+  }
+}
+
+/** Axis-1 dense expansion; evaluate the matmul before the next projection so
+ * the deferred graph does not retain every expanded weight. */
+export class TrellisExpandReducePrompt {
+  constructor(readonly linear: TrellisLinear) {}
+  forward(x: MlxArray): MlxArray {
+    const out = project(this.linear, x, rows => {
+      using stored = expandTrellis(this.linear.codes, this.linear.scales, this.linear.geometry, x.dtype, this.linear.variant);
+      using wt = ops.transposeAxes(stored, [1, 0]);
+      return ops.matmul(rows, wt);
+    });
+    out.eval();
+    return out;
+  }
+}
+export class TrellisExpandScatterPrompt {
+  constructor(readonly linear: TrellisLinear) {}
+  forward(x: MlxArray): MlxArray {
+    const out = project(this.linear, x, rows => {
+      using stored = expandTrellis(this.linear.codes, this.linear.scales, this.linear.geometry, x.dtype, this.linear.variant);
+      return ops.matmul(rows, stored);
+    });
+    out.eval();
+    return out;
+  }
+}
+
+/** Fused gate/up/SwiGLU followed by the literal down projection. */
+export class TrellisFusedMLP {
+  constructor(readonly gate: TrellisLinear, readonly up: TrellisLinear, readonly down: RowProjection) {}
+  forward(x: MlxArray): MlxArray {
+    using hidden = fusedGateUpSwiglu(x, this.gate, this.up);
+    return this.down.forward(hidden);
+  }
+}
+
+/** Independent projections followed by the oracle's compiled SwiGLU. */
+export class TrellisUnfusedMLP {
+  constructor(readonly gate: RowProjection, readonly up: RowProjection, readonly down: RowProjection) {}
+  forward(x: MlxArray): MlxArray {
+    using gate = this.gate.forward(x);
+    using up = this.up.forward(x);
+    using hidden = compiledSwiglu(gate, up);
+    return this.down.forward(hidden);
+  }
+}
