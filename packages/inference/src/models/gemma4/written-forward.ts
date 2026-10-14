@@ -73,13 +73,6 @@ export function inputLoraTargets(parts: readonly GemmaInputLayerWeights[]): Map<
   }
   return targets;
 }
-export function graphConstants(parts: readonly GemmaLayerWeights[]): MlxArray[] {
-  return parts.flatMap(layer => layer.attn.ropeFreqs ? [layer.attn.ropeFreqs] : []);
-}
-export function moeGraphConstants(parts: readonly GemmaMoeLayerWeights[]): MlxArray[] {
-  return [...graphConstants(parts), ...parts.map(layer => layer.router.normWeight)];
-}
-
 export interface GemmaMixedGroup {
   readonly ids: MlxArray;
   readonly cache: Cache[];

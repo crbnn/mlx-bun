@@ -18,9 +18,9 @@ import type { ServedComposition } from "../implementation";
 import { GENERATED_GEMMA_FINGERPRINTS as GEMMA_GRAPH_FINGERPRINTS } from "./family";
 import { CompiledDecode } from "./compiled-decode";
 import { bindGemma4MediaInput, gemma4DraftTarget, gemma4MediaEncoders } from "./media";
-import { PerLayerInputs, type Gemma4Phase } from "./blocks";
+import { type Gemma4Phase } from "./blocks";
 import { SlidingAttention, FullAttention, FullKEqVAttention, SharedSlidingAttention, SharedFullAttention, GemmaLayerWeights, GemmaInputLayerWeights, GemmaMoeLayerWeights, GemmaDenseLayer, GemmaInputLayer, GemmaMoeLayer, CompiledGegluMLP, PlainGegluMLP, CompiledGeglu, SortedSwitchGLU, UnsortedSwitchGLU, FixedExperts } from "./written-blocks";
-import { GemmaForwardScope, GemmaInputForwardScope, GemmaMixedScope, ownMixed, donorMixed, sharedMixed, denseLoraTargets, inputLoraTargets, graphConstants, moeGraphConstants, weightBytes, GemmaBuildScope } from "./written-forward";
+import { GemmaForwardScope, GemmaInputForwardScope, GemmaMixedScope, ownMixed, donorMixed, sharedMixed, denseLoraTargets, inputLoraTargets, weightBytes, GemmaBuildScope } from "./written-forward";
 export const FINGERPRINT = GEMMA_GRAPH_FINGERPRINTS["26b"];
 
 /** One decoder layer as the composition fixes it: its attention type; the layer

@@ -71,7 +71,8 @@ describe("family implementations", () => {
       expect(profile.profile.requiredCapabilities).toEqual(["safetensors", "autoregressive", "gemma4-graph"]);
       expect(MLX_MODEL_IMPLEMENTATIONS.select(config, profile).id).toBe("gemma4");
       const table = MLX_GRAPH_TABLES.gemma4!;
-      expect(table.explicit(entry.id)).toBe(entry);
+      expect(table.explicit(entry.id).id).toBe(entry.id);
+      expect(table.explicit(entry.id).serves).toBe(entry.serves);
       expect(table.select(config, resolveComposition(config))).toBe(table.generic);
       expect(Object.getOwnPropertyDescriptor(Gemma4Model.prototype, "trainable")?.get).toBeDefined();
       expect("trainable" in module.GeneratedGemma4.prototype).toBe(false);
