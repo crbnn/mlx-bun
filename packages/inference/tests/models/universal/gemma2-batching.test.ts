@@ -1,7 +1,4 @@
-import { sequenceLogitsOperation } from "../../../src/scoring/full-sequence";
 import type { TestGraph } from "../test-composition";
-import { testGraph } from "../test-composition";
-import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
 import { beforeAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -121,7 +118,9 @@ const { resolveKvScheme } = await import("../../../src/state/kv-scheme");
 const { captureKvAttention } = await import("../../../src/state/kv-attention-view");
 const { unfusedAffineKernels } = await import("../../../src/state/affine-attention");
 const { softcapAttention } = await import("../../../src/state/softcap-attention");
-const { testComposition } = await import("../test-composition");
+const { testComposition, testGraph } = await import("../test-composition");
+const { phaseRowLimit } = await import("../../../src/models/graph");
+const { sequenceLogitsOperation } = await import("../../../src/scoring/full-sequence");
 const { observedPhases, phaseHidden, phaseLogits } = await import("../phase-forward");
 const { syntheticDigests } = await import("../synthetic-digest");
 const digests = syntheticDigests("gemma2");
