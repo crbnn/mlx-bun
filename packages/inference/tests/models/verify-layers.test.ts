@@ -3,8 +3,8 @@
 // projections they replace: TrellisLinear (+ compiled SwiGLU) and
 // QuantizedLinear. Each layer runs one kernel that reassociates the reduction,
 // so they agree to bf16 precision. The codebook layers (layers/trellis-reduce-gate-up,
-// layers/trellis-scatter-down) reproduce the one-row paths they replace bit for
-// bit. Each layer also refuses weights it was not built for.
+// layers/trellis-scatter-down) and the one-row affine layer reproduce the one-row
+// paths they replace bit for bit. Each layer also refuses weights it was not built for.
 import { describe, expect, test } from "bun:test";
 import { Dtype, MlxArray, ops } from "@mlx-bun/mlx";
 import { QuantizedLinear } from "../../src/layers/quantized-linear";
@@ -18,7 +18,7 @@ import {
   FactoredDownK3iRow, FactoredDownK3iRows, FactoredDownRow, FactoredDownRows, MmaDown, MmaDownK3i, MmaDownWide, MmaDownWideK3i,
 } from "../../src/layers/trellis-down";
 import {
-  Affine3MmaLinear, Affine3RowsLinear, Affine4MmaLinear, Affine4RowsLinear, AffineSplitMmaLinear,
+  Affine3MmaLinear, Affine3RowsLinear, Affine4MmaLinear, Affine4RowsLinear, AffineRowLinear, AffineSplitMmaLinear,
 } from "../../src/layers/affine-verify-linear";
 
 const D = 512, R = 256;
@@ -166,6 +166,15 @@ describe("affine verify layers", () => {
         expect(relErr(b, expected), `mma ${bits}-bit m${m}`).toBeLessThan(1e-2);
       }
       expect(() => bits === 3 ? new Affine4RowsLinear(lin) : new Affine3RowsLinear(lin)).toThrow();
+      // The one-row layer takes either width, as stored, and gives QuantizedLinear's bits.
+      {
+        using x = rows(1, D);
+        using expected = lin.forward(x);
+        using actual = new AffineRowLinear(lin).forward(x);
+        using same = ops.equal(actual, expected);
+        using all = ops.allReduce(same);
+        expect(all.toFloat32()[0], `one row ${bits}-bit`).toBe(1);
+      }
       // The M1 Max layer takes either width, as stored.
       const splitLayer = new AffineSplitMmaLinear(lin);
       // Against the float32 product of the dequantized weights: from 14 rows MLX's quantized matmul here is its
@@ -186,6 +195,7 @@ describe("affine verify layers", () => {
     try {
       const lin8 = new QuantizedLinear(q8.packed, q8.scales, q8.biases, { bits: 8, groupSize: 64, mode: "affine" });
       expect(() => new AffineSplitMmaLinear(lin8)).toThrow();
+      expect(() => new AffineRowLinear(lin8)).toThrow();
     } finally { q8.packed.dispose(); q8.scales.dispose(); q8.biases?.dispose(); }
   }, 60_000);
 });

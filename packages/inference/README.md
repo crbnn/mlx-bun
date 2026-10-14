@@ -917,7 +917,10 @@ Outside the Trellis family, `kernels/quantization/affine{3,4}-{rows,mma}` run
 3- and 4-bit group-64 affine projections for 2..8 rows (shared decode) and
 1..8 rows (matrix unit), and `affine-split-mma` any number of rows of either width,
 in blocks of 8, on the matrix unit with output tiles sharing each activation
-fragment and K split across the threadgroup (the M1 Max form); `kernels/attention/kvq4-decode` is one-row attention
+fragment and K split across the threadgroup (the M1 Max form); `affine-row` is one
+row of either width bit for bit MLX's one-row quantized matmul (its qmv's
+arithmetic, each threadgroup computing the activation chunks once for 64 rows);
+`kernels/attention/kvq4-decode` is one-row attention
 over a 4-bit group-64 KV cache with head dim 256, reading each packed row once
 for all query heads of its KV head, the tokens per threadgroup the caller's (512 on
 the M4 Pro, 128 on the M1 Max); `kernels/attention/multi-query` is causal
@@ -1002,7 +1005,9 @@ declaring the row range it takes: the scheduler runs any one-sequence prompt pie
 a whole chunk or a tail, of 640 to 2048 positions on the one whose programs (1024,
 1536 or 2048 positions) hold it, as main's M4 Pro graph did; a
 composition that mounts adapters builds every operation on the generic blocks. On
-the M1 Max: the threadgroup-codebook kernels at one row; at two to three rows the
+the M1 Max: the threadgroup-codebook kernels at one row, with the 3-bit projections
+and the head on the one-row affine kernel (MLX's quantized matmul bit for bit; the 4-bit
+projections stay on it); at two to three rows the
 factored Trellis kernels with the affine row kernels for the projections and head;
 at four the matrix-unit gate/up with the factored down; the matrix-unit Trellis set
 at five to eight; the split matrix-unit affine kernel for the projections and head

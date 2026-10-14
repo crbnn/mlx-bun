@@ -179,21 +179,24 @@ const ROW_WORDS = ["", "one", "two", "three", "four", "five", "six", "seven", "e
 const rowsText = ([fewest, most]: readonly [number, number]) => fewest === most
   ? `${ROW_WORDS[fewest]} row${fewest === 1 ? "" : "s"}` : `${ROW_WORDS[fewest]} to ${ROW_WORDS[most]} rows`;
 
+/** One width class's affine projection layer for each stored width; `null` keeps QuantizedLinear at that width. */
+interface Projections { readonly 3: string | null; readonly 4: string | null }
+
 /** One width class's one-kernel MLP layers. */
 interface MlpLayers {
   readonly sameGateUp: string; readonly mixedGateUp: string; readonly rowMajorDown: string; readonly k3InterleavedDown: string;
 }
 
 /** Each device's kernels and how its operations evaluate: the one-kernel layer of every width class. `null`
- * projections keep the generic blocks' QuantizedLinear (MLX's own qmv/qmm); a `null` MLP class runs the generic
- * blocks' TrellisMlp at that class. */
+ * projections (a class, or one stored width of a class) keep the generic blocks' QuantizedLinear (MLX's own
+ * qmv/qmm); a `null` MLP class runs the generic blocks' TrellisMlp at that class. */
 interface DeviceKernels {
   readonly label: string;
   readonly mlp: Readonly<Record<Narrow, MlpLayers | null>>;
-  readonly projections: Readonly<Record<Narrow, { readonly 3: string; readonly 4: string } | null>>;
-  /** The head of each class (`null`: QuantizedLinear); `one` and `wider` keep QuantizedLinear. `null`: QuantizedLinear
-   *  at every width. */
-  readonly head: Readonly<Record<Exclude<Narrow, "one">, string | null>> | null;
+  readonly projections: Readonly<Record<Narrow, Projections | null>>;
+  /** The head of each class up to eight rows (`null`: QuantizedLinear); above eight rows the wider layers' head, else
+   *  QuantizedLinear. `null`: QuantizedLinear at every width. */
+  readonly head: Readonly<Record<Narrow, string | null>> | null;
   /** Submit the graph every N layers at decode and verify widths up to 8; `null`: those operations are one lazy graph. */
   readonly asyncEvery: number | null;
   /** Verify windows above eight rows: each layer and its recurrent state evaluated before the next (`bounded`), or
@@ -270,7 +273,7 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
       four: { 3: "Affine3RowsLinear", 4: "Affine4RowsLinear" },
       fiveToEight: { 3: "Affine3MmaLinear", 4: "Affine4MmaLinear" },
     },
-    head: { twoToThree: "Affine4RowsLinear", four: "Affine4RowsLinear", fiveToEight: "Affine4MmaLinear" },
+    head: { one: null, twoToThree: "Affine4RowsLinear", four: "Affine4RowsLinear", fiveToEight: "Affine4MmaLinear" },
     asyncEvery: 4,
     widerVerify: "bounded",
     knownSpans: true,
@@ -288,14 +291,15 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
   },
   // The M1 Max GPU's kernels and evaluation, measured there per class (forward + head, one sequence, bf16 KV, each
   // layer's per-call shader time and the whole forward): the threadgroup-codebook gate/up and down kernels at one row,
-  // with MLX's QuantizedLinear; at two to three rows the factored kernels and the affine row kernels, which beat the
-  // matrix-unit ones there; at four the matrix-unit gate/up and affine set (the shared-row gate/up and affine row
-  // kernels fall behind at four rows here) with the factored down; at five to eight the matrix-unit set, about 5.6x
-  // faster than the generic blocks' prefill tiles and 1.2x than QuantizedLinear for the projections and head. Graph
-  // submission every 4 layers takes about 4 ms off every width (2 and 8 within noise of it); wider verify windows one
-  // lazy graph (1.8% faster than bounded at 12 and 16 rows); mixed rows packed on the generic blocks; known tokens as
-  // windows (the committed read's attention boundaries are qualified on the M4 Pro only); prompt pieces with their
-  // projections on the dense GEMM and, from 224 positions, their MLP split with the Neural Engine.
+  // with the one-row affine kernel (MLX's qmv bit for bit) for the 3-bit projections and head; at two to three rows
+  // the factored kernels and the affine row kernels, which beat the matrix-unit ones there; at four the matrix-unit
+  // gate/up and affine set (the shared-row gate/up and affine row kernels fall behind at four rows here) with the
+  // factored down; at five to eight the matrix-unit set, about 5.6x faster than the generic blocks' prefill tiles and
+  // 1.2x than QuantizedLinear for the projections and head. Graph submission every 4 layers takes about 4 ms off every
+  // width (2 and 8 within noise of it); wider verify windows one lazy graph (1.8% faster than bounded at 12 and 16
+  // rows); mixed rows packed on the generic blocks; known tokens as windows (the committed read's attention boundaries
+  // are qualified on the M4 Pro only); prompt pieces with their projections on the dense GEMM and, from 224 positions,
+  // their MLP split with the Neural Engine.
   applegpu_g13s: {
     label: "M1 Max GPU",
     mlp: {
@@ -304,13 +308,18 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
       four: { sameGateUp: "MmaGateUp", mixedGateUp: "MmaGateUp", rowMajorDown: "FactoredDownRows", k3InterleavedDown: "FactoredDownK3iRows" },
       fiveToEight: { sameGateUp: "MmaGateUp", mixedGateUp: "MmaGateUp", rowMajorDown: "MmaDown", k3InterleavedDown: "MmaDownK3i" },
     },
+    // One row: MLX's qmv bit for bit with x's chunks computed once per threadgroup (AffineRowLinear) for the 3-bit
+    // projections and the head, measured on each layer's weights back to back: 5120 -> 10240 0.100 -> 0.082 ms,
+    // 5120 -> 6144 0.062 -> 0.053, 6144 -> 5120 0.062 -> 0.054, the head 2.26 -> 1.96; decode.one (forward + head,
+    // bf16 KV, 512 positions, two sessions each) 54.46/54.35 -> 53.60/53.26 ms, logits bit-identical. The 4-bit
+    // projections stay on MLX's qmv (level or up to 3% slower on AffineRowLinear).
     projections: {
-      one: null,
+      one: { 3: "AffineRowLinear", 4: null },
       twoToThree: { 3: "Affine3RowsLinear", 4: "Affine4RowsLinear" },
       four: { 3: "AffineSplitMmaLinear", 4: "AffineSplitMmaLinear" },
       fiveToEight: { 3: "AffineSplitMmaLinear", 4: "AffineSplitMmaLinear" },
     },
-    head: { twoToThree: "Affine4RowsLinear", four: "AffineSplitMmaLinear", fiveToEight: "AffineSplitMmaLinear" },
+    head: { one: "AffineRowLinear", twoToThree: "Affine4RowsLinear", four: "AffineSplitMmaLinear", fiveToEight: "AffineSplitMmaLinear" },
     asyncEvery: 4,
     widerVerify: "lazy",
     knownSpans: false,
@@ -530,10 +539,12 @@ export function emitQwen38Graph(description: Qwen38Description, stem: string,
   const mlpImports = [...new Set(mlpLayerNames.map(name => LAYER_MODULES[name]!))].sort().map(module =>
     `import { ${mlpLayerNames.filter(name => LAYER_MODULES[name] === module).sort().join(", ")} } from "../../layers/${module}";`);
   const drafter = k.drafter;
+  for (const cls of NARROW) if (k.projections[cls] && k.projections[cls]![3] === null && k.projections[cls]![4] === null)
+    throw new Error(`${stem}: ${c.device}'s ${cls} projections name no layer at either width (write null for the class)`);
   const affineLayers = [...new Set([...Object.values(k.projections).flatMap(p => p ? [p[3], p[4]] : []),
-    ...(head ? Object.values(head).filter((layer): layer is string => layer !== null) : []),
-    ...(drafter ? Object.values(drafter).filter((layer): layer is string => layer !== null) : []),
-    ...(wider ? [wider.projections[3], wider.projections[4], wider.head] : [])])];
+    ...(head ? Object.values(head) : []),
+    ...(drafter ? Object.values(drafter) : []),
+    ...(wider ? [wider.projections[3], wider.projections[4], wider.head] : [])].filter((layer): layer is string => layer !== null))];
   /** The attention and DeltaNet projections are QuantizedLinear in every class and nothing else is built (no prompt
    *  blocks, no Neural Engine operation): mounted adapters apply everywhere, so no class changes with them. */
   const adapterSafe = NARROW.every(cls => k.projections[cls] === null) && head === null && ane === null && promptProjection === null;
@@ -547,15 +558,17 @@ export function emitQwen38Graph(description: Qwen38Description, stem: string,
     return shapes;
   }, new Map<string, [readonly [number, number], string[]]>()).values()];
   /** Blocks are built once per projection layer pair and shared by the classes that name it. */
-  const blocksName = (p: { 3: string; 4: string }) => `${p[4][0]!.toLowerCase()}${p[4].slice(1).replace(/Linear$/, "")}Blocks`;
+  const blocksName = (p: Projections) => { const layer = (p[4] ?? p[3])!;
+    return `${layer[0]!.toLowerCase()}${layer.slice(1).replace(/Linear$/, "")}Blocks`; };
   const projectionSets = [...new Map([...NARROW.flatMap(cls => k.projections[cls] ? [[blocksName(k.projections[cls]!), k.projections[cls]!] as const] : []),
     ...(wider ? [[blocksName(wider.projections), wider.projections] as const] : [])]).entries()];
   const headName = (layer: string) => `${layer[0]!.toLowerCase()}${layer.slice(1).replace(/Linear$/, "")}Head`;
   const heads = head ? [...new Set([...Object.values(head).filter((layer): layer is string => layer !== null), ...(wider ? [wider.head] : [])])] : [];
+  /** A class's projection layer for one stored width, or the QuantizedLinear `linear` itself. */
+  const build = (layer: string | null) => layer ? `new ${layer}(linear)` : "linear";
   /** The head's width table over \`linear\` (the head, or its draft-vocabulary rows), its layers named \`layer…Head\`. */
-  const headTable = (indent: string) => `${indent}one: plain,
-${NARROW.filter(cls => cls !== "one").map(cls => {
-  const layer = head![cls as Exclude<Narrow, "one">];
+  const headTable = (indent: string) => `${NARROW.map(cls => {
+  const layer = head![cls];
   return `${indent}${cls}: ${layer ? `hidden => ${headName(layer)}.forward(hidden)` : "plain"},`;
 }).join("\n")}
 ${indent}wider: ${wider ? `hidden => hidden.size / hidden.shape.at(-1)! <= WIDER_ROWS ? ${headName(wider.head)}.forward(hidden) : plain(hidden)` : "plain"},`;
@@ -584,8 +597,8 @@ ${indent}wider: ${wider ? `hidden => hidden.size / hidden.shape.at(-1)! <= WIDER
     ].map(line => indent + line).join("\n");
   };
   const blockSets = projectionSets.map(([name, p]) =>
-    `      const ${name} = LAYERS.map((_, i) => blockOf(i, ${p[3] === p[4] ? `linear => new ${p[3]}(linear)`
-      : `(linear, _path, width) => width === 3 ? new ${p[3]}(linear) : new ${p[4]}(linear)`}));`).join("\n");
+    `      const ${name} = LAYERS.map((_, i) => blockOf(i, ${p[3] === p[4] ? `linear => ${build(p[3])}`
+      : `(linear, _path, width) => width === 3 ? ${build(p[3])} : ${build(p[4])}`}));`).join("\n");
   /** The wider layers' block set (and, where a mixed forward packs its MLP rows, each layer's MLP alone). */
   const packedWider = !!wider && k.mixed === "packed";
   const widerSet = wider ? [
@@ -631,7 +644,7 @@ ${NARROW.map(cls => narrowSet(cls, "      ")).join("\n")}${wider ? `\n${widerSet
   const classRows = NARROW.map(cls => {
     const m = k.mlp[cls], p = k.projections[cls];
     return row(cls === "one" ? "decode.one, verify.one" : `decode/verify.${cls}`, m ? `${m.sameGateUp} + ${m.rowMajorDown}/K3i`
-      : "the generic blocks (TrellisMlp)", p ? (p[3] === p[4] ? p[3] : `${p[3]}/${p[4]}`) : "QuantizedLinear");
+      : "the generic blocks (TrellisMlp)", p ? (p[3] === p[4] ? p[3]! : `${p[3] ?? "QuantizedLinear"}/${p[4] ?? "QuantizedLinear"}`) : "QuantizedLinear");
   }).join("\n");
   /** Each run of consecutive classes whose mixed-width layer takes the composition's tail or is not their same-width
    *  one (the table row names that), with its layer and rows. */
@@ -669,8 +682,8 @@ ${NARROW.map(cls => narrowSet(cls, "      ")).join("\n")}${wider ? `\n${widerSet
       "bf16-first TurboQuant with the dense read)."]),
     ...(wider ? [`Every operation of nine to ${wider.maxRows} rows (decode and verify windows, prompt tails, known-token appends, a mixed`,
       "forward's packed MLP rows) runs the wider layers in the table; more rows run the generic blocks."] : []),
-    head ? `The head is part of each phase: ${NARROW.filter(cls => cls !== "one").map(cls =>
-      `logits.${cls} ${head[cls as Exclude<Narrow, "one">] ?? "QuantizedLinear"}`).join(", ")}${wider
+    head ? `The head is part of each phase: ${NARROW.filter(cls => cls !== "one" || head.one !== null).map(cls =>
+      `logits.${cls} ${head[cls] ?? "QuantizedLinear"}`).join(", ")}${wider
       ? `, logits.wider ${wider.head} up to ${wider.maxRows} rows` : ""}, QuantizedLinear otherwise.`
       : "The head is QuantizedLinear at every width.",
     ...(drafter ? [`A bound drafter's own 4-bit projections take ${[...NARROW, "wider" as const].filter(cls => drafter[cls] !== null).map(cls =>

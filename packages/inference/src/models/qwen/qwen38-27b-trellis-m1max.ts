@@ -21,7 +21,7 @@
 // 15, 21, 35, 36, 43, 50, 51, 53, 56, 62) and the device's one-kernel layers:
 //
 //   operation                      MLP gate/up + down (row-major/interleaved)  affine projections (3/4-bit)
-//   decode.one, verify.one         CodebookGateUpRow + CodebookDownRow/K3i     QuantizedLinear
+//   decode.one, verify.one         CodebookGateUpRow + CodebookDownRow/K3i     AffineRowLinear/QuantizedLinear
 //   decode/verify.twoToThree       FactoredGateUpRows + FactoredDownRows/K3i   Affine3RowsLinear/Affine4RowsLinear
 //   decode/verify.four             MmaGateUp + FactoredDownRows/K3i            AffineSplitMmaLinear
 //   decode/verify.fiveToEight      MmaGateUp + MmaDown/K3i                     AffineSplitMmaLinear
@@ -38,16 +38,16 @@
 // rows (foldedWindowRead), bf16-first affine or per-layer affine with the composition's read kernels, or bf16-first
 // TurboQuant with the dense read). Every operation of nine to 256 rows (decode and verify windows, prompt tails,
 // known-token appends, a mixed forward's packed MLP rows) runs the wider layers in the table; more rows run the generic
-// blocks. The head is part of each phase: logits.twoToThree Affine4RowsLinear, logits.four AffineSplitMmaLinear,
-// logits.fiveToEight AffineSplitMmaLinear, logits.wider AffineSplitMmaLinear up to 256 rows, QuantizedLinear otherwise.
-// A bound drafter's own 4-bit projections take Affine4RowsLinear at twoToThree, AffineSplitMmaLinear at four,
-// AffineSplitMmaLinear at fiveToEight, AffineSplitMmaLinear at wider, QuantizedLinear otherwise
-// (TargetView.draftProjections). A drafter that selects by its scores selects over the artifact's draft vocabulary
-// (mtp/draft_vocab.json), those rows of the head on the head's layers (DraftProjection.vocabulary). Decode, verify,
-// prompt tails and embeddings up to eight rows, and decode, verify windows and prompt tails on the wider layers, submit
-// the graph every 4 layers; wider decode and verify windows and known-token appends are otherwise one lazy graph;
-// prompt chunks, prompt tails above 256 rows and embeddings above eight rows, evaluate each layer and its recurrent
-// state.
+// blocks. The head is part of each phase: logits.one AffineRowLinear, logits.twoToThree Affine4RowsLinear, logits.four
+// AffineSplitMmaLinear, logits.fiveToEight AffineSplitMmaLinear, logits.wider AffineSplitMmaLinear up to 256 rows,
+// QuantizedLinear otherwise. A bound drafter's own 4-bit projections take Affine4RowsLinear at twoToThree,
+// AffineSplitMmaLinear at four, AffineSplitMmaLinear at fiveToEight, AffineSplitMmaLinear at wider, QuantizedLinear
+// otherwise (TargetView.draftProjections). A drafter that selects by its scores selects over the artifact's draft
+// vocabulary (mtp/draft_vocab.json), those rows of the head on the head's layers (DraftProjection.vocabulary). Decode,
+// verify, prompt tails and embeddings up to eight rows, and decode, verify windows and prompt tails on the wider
+// layers, submit the graph every 4 layers; wider decode and verify windows and known-token appends are otherwise one
+// lazy graph; prompt chunks, prompt tails above 256 rows and embeddings above eight rows, evaluate each layer and its
+// recurrent state.
 //
 // Request shapes this graph serves:
 //   - prompt chunks of exactly the composition's chunk size (prefillChunk.gpu) and prompt tails (prefillTail),
@@ -91,7 +91,7 @@ import type { Composition } from "../../contracts/portable/composition";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import { mapTokenGroups } from "../../input/token-groups";
 import type { AneProgramSpec } from "../../kernels/ane/linear";
-import { Affine3RowsLinear, Affine4RowsLinear, AffineSplitMmaLinear } from "../../layers/affine-verify-linear";
+import { Affine3RowsLinear, Affine4RowsLinear, AffineRowLinear, AffineSplitMmaLinear } from "../../layers/affine-verify-linear";
 import {
   AneTrellisMlpSplit, AneTrellisMlpSplitK3i, aneMlpSplitProgram, type AneMlpSplit,
 } from "../../layers/ane-prefill-split";
@@ -410,13 +410,14 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
       this.#one = this.#twoToThree = this.#four = this.#fiveToEight = this.#wider = this.#generic;
       this.#widerMlp = generic.map((_, i) => (post: MlxArray) => mlpOf(i).forward(post, "window", "wider"));
     } else {
+      const affineRowBlocks = LAYERS.map((_, i) => blockOf(i, (linear, _path, width) => width === 3 ? new AffineRowLinear(linear) : linear));
       const affine4RowsBlocks = LAYERS.map((_, i) => blockOf(i, (linear, _path, width) => width === 3 ? new Affine3RowsLinear(linear) : new Affine4RowsLinear(linear)));
       const affineSplitMmaBlocks = LAYERS.map((_, i) => blockOf(i, linear => new AffineSplitMmaLinear(linear)));
       this.#one = generic.map((layer, i) => {
         const spec = LAYERS[i]!, { gate, up, down } = mlpOf(i);
         const gateUp = new CodebookGateUpRow(gate, up, "split");
         const project = spec.downLayout === "k3Interleaved" ? new CodebookDownK3iRow(down) : new CodebookDownRow(down);
-        return layerStep(layer, mixerOf((layer.linearAttn ?? layer.selfAttn)!, spec.kind), post => {
+        return layerStep(layer, mixerOf(affineRowBlocks[i]!, spec.kind), post => {
           using mid = gateUp.forward(post);
           return project.forward(mid);
         });
@@ -570,9 +571,9 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
     const head = this.lmHead, plain: MlxHeadForward = hidden => head.forward(hidden);
     if (composition.adapters) this.logits = atEveryWidth(plain);
     else {
-      const affine4RowsHead = new Affine4RowsLinear(head), affineSplitMmaHead = new AffineSplitMmaLinear(head);
+      const affineRowHead = new AffineRowLinear(head), affine4RowsHead = new Affine4RowsLinear(head), affineSplitMmaHead = new AffineSplitMmaLinear(head);
       this.logits = Object.freeze<MlxWidthTable<MlxHeadForward>>({
-        one: plain,
+        one: hidden => affineRowHead.forward(hidden),
         twoToThree: hidden => affine4RowsHead.forward(hidden),
         four: hidden => affineSplitMmaHead.forward(hidden),
         fiveToEight: hidden => affineSplitMmaHead.forward(hidden),
@@ -614,9 +615,9 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
     return this.#draftVocabulary ??= qwenDraftVocabulary(this.lmHead, this.config.modelDir, "mtp/draft_vocab.json",
       this.config.text.vocabSize, rows => {
         const plain: MlxHeadForward = hidden => rows.forward(hidden);
-        const affine4RowsHead = new Affine4RowsLinear(rows), affineSplitMmaHead = new AffineSplitMmaLinear(rows);
+        const affineRowHead = new AffineRowLinear(rows), affine4RowsHead = new Affine4RowsLinear(rows), affineSplitMmaHead = new AffineSplitMmaLinear(rows);
         return Object.freeze<MlxWidthTable<MlxHeadForward>>({
-          one: plain,
+          one: hidden => affineRowHead.forward(hidden),
           twoToThree: hidden => affine4RowsHead.forward(hidden),
           four: hidden => affineSplitMmaHead.forward(hidden),
           fiveToEight: hidden => affineSplitMmaHead.forward(hidden),
