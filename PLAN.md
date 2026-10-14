@@ -52,9 +52,10 @@ kernels the graph declares since 2026-10-13; since then operations of nine to 25
 graph's wider layers (any-row matrix-unit Trellis kernels and the split-K affine kernel: verify
 windows of 16 rows 0.89 -> 0.19 s, 32 0.89 -> 0.34, 64 0.77 -> 0.63; time to first token of 16-, 64-
 and 200-token prompts 0.97 -> 0.24, 0.87 -> 0.64 and 2.28 -> 1.90 s), and windows and prompt pieces
-above 256 rows still the generic blocks (500-token prompts 4.2 s; the Neural Engine split measured at
-18.1 and 29.0 ms a layer's MLP at 256 and 512 rows against 20.6 and 37.7 on the GPU, programs not
-built below 640); DFlash 2 adaptive on that chip (in-process serve, four
+above 256 rows still the generic blocks, a one-sequence prompt piece of 224 to 2048 positions on the
+Neural Engine split over programs every 64 positions to 768, every 128 to 1024 and every 256 to 2048
+(time to first token of 300-, 400-, 500-, 639-, 700- and 1100-token prompts 2.74/3.55/4.09/5.00/5.09/7.23
+-> 2.43/2.98/3.28/3.94/4.26/6.65 s); DFlash 2 adaptive on that chip (in-process serve, four
 prompts, 192 tokens) decodes greedy text at 24.1 against 18.3 tok/s plain, 21.7 against 17.9 under
 Qwen's instruct sampling and 19.4 against 17.9 under its thinking sampling, the MTP head (adaptive up
 to four drafts) at 20.3, 18.8 and 17.8; the adaptive gate drafts nothing where drafting does not pay

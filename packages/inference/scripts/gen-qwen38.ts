@@ -295,7 +295,7 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
   // submission every 4 layers takes about 4 ms off every width (2 and 8 within noise of it); wider verify windows one
   // lazy graph (1.8% faster than bounded at 12 and 16 rows); mixed rows packed on the generic blocks; known tokens as
   // windows (the committed read's attention boundaries are qualified on the M4 Pro only); prompt pieces with their
-  // projections on the dense GEMM and, from 640 positions, their MLP split with the Neural Engine.
+  // projections on the dense GEMM and, from 224 positions, their MLP split with the Neural Engine.
   applegpu_g13s: {
     label: "M1 Max GPU",
     mlp: {
@@ -331,10 +331,22 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     // 23 tiles of 256, which it runs faster than 5760) beside the GPU's 66% in 0.70 of the GPU-only time (fractions
     // 0.25 to 0.45 swept; the Neural Engine at about 4 TFLOPS against the GPU's 8; 2% faster prompts than 0.31).
     // Projections stay whole on the dense GEMM (promptProjection): a split there, its GPU share on MLX's quantized
-    // matmul, gains nothing over it.
-    ane: { fraction: 0.34, minRows: 640, rows: [1024, 1536, 2048],
+    // matmul, gains nothing over it. A program runs all its rows whatever the piece holds (one layer's MLP share
+    // 14.7 ms at 256 rows, 25.3 at 512, 46.7 at 1024, 88.8 at 2048) after the GPU fills its weights (4 to 5 ms a
+    // layer), so programs every 64 positions to 768, every 128 to 1024 and every 256 to 2048, from 224 positions,
+    // where the 256-row program overtakes the wider layers (a layer's MLP at 512 rows 38.0 -> 29.6 ms against the
+    // generic blocks; time to first token, one sequence, with promptProjection from 128 rows, against three programs
+    // from 640 positions and promptProjection from 640 rows before: prompts of 230/300/400/500/639/700 tokens
+    // 2.11/2.74/3.55/4.09/5.00/5.09 -> 1.99/2.43/2.98/3.28/3.94/4.26 s, 1100 and 1600 7.23/9.73 -> 6.65/9.03, 16 to
+    // 200, 1024 and 8192 unchanged; bit-identical but for the pieces it moves from the GPU, mean KL 3e-5 to 2.6e-3 at
+    // 14 lengths from 230 to 639 tokens, since a program's rows do not depend on its size (700, 1100 and 1600 on the
+    // smaller programs: bit-identical); 0.31 on the same programs gains 2-3% below 300 tokens and loses 2% at 1024).
+    ane: { fraction: 0.34, minRows: 224,
+      rows: [256, 320, 384, 448, 512, 576, 640, 704, 768, 896, 1024, 1280, 1536, 1792, 2048],
       rowMajorMlp: "AneTrellisMlpSplit", k3InterleavedMlp: "AneTrellisMlpSplitK3i", affine: null, projections: [] },
-    // MLX's quantized matmul bit for bit from 640 rows, 1.27x to 1.38x faster (DequantizedLinear).
+    // MLX's quantized matmul bit for bit from 128 rows (k_proj and v_proj from 513, above MLX's split-K GEMM),
+    // 1.1x to 1.3x faster from 192 rows (DequantizedLinear): time to first token of 300-, 400-, 500- and 639-token
+    // prompts 2.76/3.55/4.07/5.00 -> 2.60/3.39/3.80/4.63 s against it from 640 rows, logits bit-identical.
     promptProjection: "DequantizedLinear",
     // The DFlash 2 drafter's 4-bit projections (its five layers' attention and MLP, fc and the context k and v), each
     // kernel per row count: MLX's quantized matmul at one row, the affine row kernel at two to three (MLP 4.48 ->
@@ -356,13 +368,22 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
   },
 });
 
-/** Break a `// ` comment sentence onto further `// ` lines at 120 columns. */
-function wrapComment(text: string): string {
+/** Break a comment sentence after `prefix` (`// ` by default) onto further lines with that prefix at 120 columns. */
+function wrapComment(text: string, prefix = "// "): string {
   const lines = [""];
   for (const word of text.split(" "))
-    if (lines.at(-1)!.length && 3 + lines.at(-1)!.length + 1 + word.length > 120) lines.push(word);
+    if (lines.at(-1)!.length && prefix.length + lines.at(-1)!.length + 1 + word.length > 120) lines.push(word);
     else lines[lines.length - 1] = lines.at(-1)!.length ? `${lines.at(-1)} ${word}` : word;
-  return lines.join("\n// ");
+  return lines.join(`\n${prefix}`);
+}
+
+/** Code `items` after `prefix`, comma-separated, onto further lines with that prefix at 120 columns. */
+function wrapItems(items: readonly string[], prefix: string): string {
+  const lines = [""];
+  for (const item of items)
+    if (lines.at(-1)!.length && prefix.length + lines.at(-1)!.length + 2 + item.length > 120) lines.push(item);
+    else lines[lines.length - 1] = lines.at(-1)!.length ? `${lines.at(-1)}, ${item}` : item;
+  return lines.join(`,\n${prefix}`);
 }
 
 // ── Description: the artifact facts the template needs ────────────────────────
@@ -721,7 +742,7 @@ ${summary}
 ${ane ? `//   - prompt chunks of exactly the composition's chunk size (prefillChunk.gpu) and prompt tails (prefillTail),
 //     and, when the composition has the Neural Engine bridge and mounts no adapters, one sequence's chunk or tail
 //     of ${ane.minRows} to ${ane.rows.at(-1)} positions on the Neural Engine operation whose programs hold it (prefillChunk.ane:
-//     ${aneRanges.map(([minRows, rows]) => `${minRows}..${rows}`).join(", ")}, programs of ${ane.rows.join(", ")} positions);`
+//     ${wrapComment(`${aneRanges.map(([minRows, rows]) => `${minRows}..${rows}`).join(", ")}, programs of ${ane.rows.join(", ")} positions);`, "//     ")}`
   : "//   - prompt chunks of exactly the composition's chunk size (prefillChunk.gpu) and prompt tails (prefillTail);"}
 //   - decode, one position per sequence, and speculative verify windows of sequences x (depth + 1) positions
 //     with the drafter's layer capture, for any number of sequences${c.maxRows === null ? "" : " up to the composition's rows per forward"}
@@ -829,7 +850,7 @@ const ANE_FRACTION = ${ane.fraction};
 /** The Neural Engine operations' row ranges, ascending: a one-sequence prompt piece, a chunk or a tail, whose positions
  *  one holds runs on it, over programs built for its \`rows\`. From this machine's kernel table. */
 const ANE_RANGES: readonly { readonly minRows: number; readonly rows: number }[] = Object.freeze([
-  ${aneRanges.map(([minRows, rows]) => `{ minRows: ${minRows}, rows: ${rows} }`).join(", ")},
+  ${wrapItems(aneRanges.map(([minRows, rows]) => `{ minRows: ${minRows}, rows: ${rows} }`), "  ")},
 ]);
 
 ${splitsProjections ? `/** The widths a graph's Neural Engine programs are built at: the MLP's hidden and intermediate widths, and the input

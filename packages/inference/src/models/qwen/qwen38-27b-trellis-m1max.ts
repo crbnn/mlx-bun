@@ -28,7 +28,7 @@
 //   every operation 9..256         MmaGateUpWide + MmaDownWide/K3i             AffineSplitMmaLinear
 //   decode/verify.wider 257+       the generic blocks (TrellisMlp)             QuantizedLinear
 //   prefillChunk.gpu/Tail 257+     the generic blocks (TrellisMlp)             DequantizedLinear
-//   prefillChunk.ane, 640..2048    AneTrellisMlpSplit/K3i                      DequantizedLinear
+//   prefillChunk.ane, 224..2048    AneTrellisMlpSplit/K3i                      DequantizedLinear
 //
 // Mixed-width gate/up takes CodebookGateUpRow at one row, split tail (MLX's compiled SwiGLU bit for bit), and
 // FactoredMixedGateUp at two to three rows. Every attention block reads through the cache the composition's KV scheme
@@ -52,8 +52,10 @@
 // Request shapes this graph serves:
 //   - prompt chunks of exactly the composition's chunk size (prefillChunk.gpu) and prompt tails (prefillTail),
 //     and, when the composition has the Neural Engine bridge and mounts no adapters, one sequence's chunk or tail
-//     of 640 to 2048 positions on the Neural Engine operation whose programs hold it (prefillChunk.ane:
-//     640..1024, 1025..1536, 1537..2048, programs of 1024, 1536, 2048 positions);
+//     of 224 to 2048 positions on the Neural Engine operation whose programs hold it (prefillChunk.ane:
+//     224..256, 257..320, 321..384, 385..448, 449..512, 513..576, 577..640, 641..704, 705..768, 769..896, 897..1024,
+//     1025..1280, 1281..1536, 1537..1792, 1793..2048, programs of 256, 320, 384, 448, 512, 576, 640, 704, 768, 896,
+//     1024, 1280, 1536, 1792, 2048 positions);
 //   - decode, one position per sequence, and speculative verify windows of sequences x (depth + 1) positions
 //     with the drafter's layer capture, for any number of sequences
 //     (decode[width], verify[width], logits[width]);
@@ -220,7 +222,10 @@ const ANE_FRACTION = 0.34;
 /** The Neural Engine operations' row ranges, ascending: a one-sequence prompt piece, a chunk or a tail, whose positions
  *  one holds runs on it, over programs built for its `rows`. From this machine's kernel table. */
 const ANE_RANGES: readonly { readonly minRows: number; readonly rows: number }[] = Object.freeze([
-  { minRows: 640, rows: 1024 }, { minRows: 1025, rows: 1536 }, { minRows: 1537, rows: 2048 },
+  { minRows: 224, rows: 256 }, { minRows: 257, rows: 320 }, { minRows: 321, rows: 384 }, { minRows: 385, rows: 448 },
+  { minRows: 449, rows: 512 }, { minRows: 513, rows: 576 }, { minRows: 577, rows: 640 }, { minRows: 641, rows: 704 },
+  { minRows: 705, rows: 768 }, { minRows: 769, rows: 896 }, { minRows: 897, rows: 1024 }, { minRows: 1025, rows: 1280 },
+  { minRows: 1281, rows: 1536 }, { minRows: 1537, rows: 1792 }, { minRows: 1793, rows: 2048 },
 ]);
 
 /** The widths a graph's Neural Engine programs are built at: the MLP's hidden and intermediate widths (no projection

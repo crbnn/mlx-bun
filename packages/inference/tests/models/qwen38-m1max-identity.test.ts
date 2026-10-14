@@ -13,9 +13,10 @@
 // the wider layers from nine to WIDER_ROWS rows) have no generic counterpart: the wider layers are held to the
 // generic graph within bf16 rounding here, and the generator's drift test (qwen38-generated-sync), the kernel tests,
 // the real-artifact parity suite on the M1 Max (tests/parity/qwen-trellis-parity.test.ts) and the app digests are
-// their gates. Its prompt pieces take their projections on DequantizedLinear: MLX's quantized matmul below 640 rows (the
-// pieces here), and above it the dense GEMM, that matmul bit for bit at the artifact's projection shapes but not at
-// these scaled-down ones, which the layer's own test (dequantized-linear) holds. The Neural Engine operation loads
+// their gates. Its prompt pieces take their projections on DequantizedLinear: MLX's quantized matmul below a
+// projection's fewest rows, and from them the dense GEMM, that matmul bit for bit at the artifact's projection shapes
+// (the layer's own test, dequantized-linear, holds them); of these scaled-down projections the pieces here take it only
+// at q_proj's 2048 outputs, bit for bit as well. The Neural Engine operation loads
 // programs compiled for the artifact's widths: the opt-in split tests (ane-split, ane-install) and real-weight runs
 // are its gates. No model, no download.
 import { afterAll, describe, expect, test } from "bun:test";

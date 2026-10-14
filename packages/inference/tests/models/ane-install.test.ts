@@ -29,7 +29,8 @@ describe("the install table", () => {
   });
 
   test("on an M1 Max the shipped table lists the Qwen3.8 graph's MLP slice for each of its Neural Engine row ranges", () => {
-    expect(labels(record({ device: M1_MAX }))).toEqual([1024, 1536, 2048].map(rows =>
+    const programs = [256, 320, 384, 448, 512, 576, 640, 704, 768, 896, 1024, 1280, 1536, 1792, 2048];
+    expect(labels(record({ device: M1_MAX }))).toEqual(programs.map(rows =>
       [`MLP slice 5120×5888, ${rows} rows`, [QWEN38_TRELLIS_M1MAX_GRAPH]]));
     expect(M1_MAX_ANE_WIDTHS).toEqual({ hidden: 5120, intermediate: 17408 });
   });
