@@ -146,13 +146,13 @@ describe("the Qwen 3.5 table", () => {
   });
 
   test("the same artifact on applegpu_g16s with another KV scheme or more rows gets the generic graph", () => {
-    expect(select(on(M4_PRO, qwen, { kv: { override: 8 } }))).toBe("qwen3.5");
+    expect(select(on(M4_PRO, qwen, { kv: { override: 8 } }))).toBe("qwen3.5-wide-m4");
     const layered = { ...qwen, kvQuant: [{ layerIdx: 1, bits: 4, groupSize: 64 }] };
     expect(on(M4_PRO, layered, { kv: { override: "config" } }).kv.kind).toBe("affine-layers");
-    expect(select(on(M4_PRO, layered, { kv: { override: "config" } }))).toBe("qwen3.5");
-    expect(select(on(M4_PRO, qwen, { kv: { turboQuant: { kBits: 8, vBits: 3 } } }))).toBe("qwen3.5");
-    expect(select(on(M4_PRO, qwen, { maxRows: 9 }))).toBe("qwen3.5");
-    expect(select(on(M4_PRO, qwen, { maxRows: 16 }))).toBe("qwen3.5");
+    expect(select(on(M4_PRO, layered, { kv: { override: "config" } }))).toBe("qwen3.5-wide-m4");
+    expect(select(on(M4_PRO, qwen, { kv: { turboQuant: { kBits: 8, vBits: 3 } } }))).toBe("qwen3.5-wide-m4");
+    expect(select(on(M4_PRO, qwen, { maxRows: 9 }))).toBe("qwen3.5-wide-m4");
+    expect(select(on(M4_PRO, qwen, { maxRows: 16 }))).toBe("qwen3.5-wide-m4");
   });
 
   test("on applegpu_g13s the generated M1 Max graph serves the artifact whatever its KV scheme or rows; other GPUs get the generic graph", () => {
@@ -160,16 +160,23 @@ describe("the Qwen 3.5 table", () => {
     expect(select(on(M1_MAX, qwen, { kv: { override: 8 } }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
     expect(select(on(M1_MAX, qwen, { kv: { override: 4 }, maxRows: 16 }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
     expect(select(on(M1_MAX, qwen, { kv: { turboQuant: { kBits: 8, vBits: 3 } } }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
-    expect(select(on("applegpu_g15s", qwen))).toBe("qwen3.5");
+    expect(select(on("applegpu_g15s", qwen))).toBe("qwen3.5-wide-m3");
   });
 
   test("another Qwen 3.5 artifact gets the generic graph on every device; the table fingerprints with the Trellis graph fingerprint", () => {
     const fingerprint = qwen35GraphFingerprint(qwen);
     expect(fingerprint).not.toBe(TRELLIS);
     for (const device of [M4_PRO, M1_MAX]) {
-      expect(table.select(qwen, on(device, qwen)).id).toBe("qwen3.5");
-      expect(select(on(device, qwen), fingerprint)).toBe("qwen3.5");
+      expect(table.select(qwen, on(device, qwen)).id).toBe(device === M4_PRO ? "qwen3.5-wide-m4" : "qwen3.5");
+      expect(select(on(device, qwen), fingerprint)).toBe(device === M4_PRO ? "qwen3.5-wide-m4" : "qwen3.5");
     }
+  });
+
+  test("portable tiled is the unknown-device default and explicit generic choices bypass recommendation keys", () => {
+    const config = qwen;
+    expect(table.select(config, on("unlisted-gpu", config)).id).toBe("qwen3.5");
+    expect(table.select(config, on(M4_PRO, config), "qwen3.5").id).toBe("qwen3.5");
+    expect(table.select(config, on(M1_MAX, config), "qwen3.5-wide-m4").id).toBe("qwen3.5-wide-m4");
   });
 
   test("the published Trellis config selects by its own fingerprint (config only; skips when the snapshot is not downloaded)", async () => {
@@ -179,7 +186,7 @@ describe("the Qwen 3.5 table", () => {
     expect(qwen35GraphFingerprint(config)).toBe(TRELLIS);
     expect(table.select(config, on(M4_PRO, config)).id).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     expect(table.select(config, on(M1_MAX, config)).id).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
-    expect(table.select(config, on(M4_PRO, config, { kv: { override: 8 } })).id).toBe("qwen3.5");
+    expect(table.select(config, on(M4_PRO, config, { kv: { override: 8 } })).id).toBe("qwen3.5-wide-m4");
   });
 });
 

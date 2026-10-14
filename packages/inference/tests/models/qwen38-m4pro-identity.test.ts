@@ -21,7 +21,7 @@ import type { Weights } from "../../src/artifacts/weights";
 import type { BatchableCache, Cache } from "../../src/contracts/mlx/cache";
 import type { Composition, KvStorageScheme } from "../../src/contracts/portable/composition";
 import { LAYERS, Qwen38TrellisM4Pro } from "../../src/models/qwen/qwen38-27b-trellis-m4pro";
-import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
+import { Qwen35WideModel as Qwen35Model } from "../../src/models/qwen/qwen3_5-wide";
 import { unfusedAffineKernels } from "../../src/state/affine-attention";
 import { Bf16FirstKv4Head256Cache, Bf16FirstQuantizedKVCache, Bf16FirstTurboQuantKVCache } from "../../src/state/bf16-first-kv";
 import { KVCache } from "../../src/state/kv";

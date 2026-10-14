@@ -1,3 +1,5 @@
+import { Qwen35WideModel } from "./qwen/qwen3_5-wide";
+import type { ServedComposition } from "./implementation";
 // Model construction consumes one declared profile and one composition. Exact
 // artifact profiles outrank family profiles; the profile names the family's
 // implementation, and the family's graph table picks the graph for the
@@ -58,14 +60,14 @@ import {
 } from "./profile";
 
 type WrittenGraph = (
-  | Gemma4Model | GeneratedGemma4Graph | MiniCPM5Model | Qwen35Model | Qwen38TrellisM4Pro | Qwen38TrellisM1Max | Qwen3Model | Qwen3MoeModel
+  | Gemma4Model | GeneratedGemma4Graph | MiniCPM5Model | Qwen35Model | Qwen35WideModel | Qwen38TrellisM4Pro | Qwen38TrellisM1Max | Qwen3Model | Qwen3MoeModel
   | DiffusionGemmaModel | Glm52Model | UniversalDenseModel);
 
 export type RuntimeModel = WrittenGraph & { makeCache(): Cache[]; readonly composition?: Composition };
 
 /** A family's generic graph: the table entry that constrains nothing. */
-function generic(id: string, create: GraphEntry<Weights, WrittenGraph>["create"]): GraphEntry<Weights, RuntimeModel> {
-  return loadedEntry({ id, serves: {}, create });
+function generic(id: string, create: GraphEntry<Weights, WrittenGraph>["create"], serves: ServedComposition = {}): GraphEntry<Weights, RuntimeModel> {
+  return loadedEntry({ id, serves, create });
 }
 
 function loadedEntry(entry: GraphEntry<Weights, WrittenGraph>): GraphEntry<Weights, RuntimeModel> {
@@ -95,6 +97,8 @@ export const MLX_GRAPH_TABLES: Readonly<Record<ModelGraph, GraphTable<Weights, R
     // The M1 Max composition builds no Neural Engine operation (its device's table has none): no programs to install.
     loadedEntry({ id: QWEN38_TRELLIS_M1MAX_GRAPH, serves: QWEN38_TRELLIS_M1MAX_COMPOSITION,
       create: (weights, config, composition) => new Qwen38TrellisM1Max(weights, config, composition) }),
+    generic("qwen3.5-wide-m3", (weights, config, composition) => new Qwen35WideModel(weights, config, phaseRowLimit(composition)), { device: "applegpu_g15s" }),
+    generic("qwen3.5-wide-m4", (weights, config, composition) => new Qwen35WideModel(weights, config, phaseRowLimit(composition)), { device: "applegpu_g16s" }),
     generic("qwen3.5", (weights, config, composition) => new Qwen35Model(weights, config, phaseRowLimit(composition))),
   ], qwen35GraphFingerprint),
   "qwen3-moe": new GraphTable([generic("qwen3-moe", (weights, config, composition) => new Qwen3MoeModel(weights, config, phaseRowLimit(composition)))]),

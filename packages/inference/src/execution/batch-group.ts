@@ -1,4 +1,4 @@
-import { pagedDecodeCompiles } from "../state/paged/cache";
+import { pagedDecodeCompiles } from "../state/layout";
 import { type MlxForwardWork,type MlxPreparationWork } from "../contracts/mlx/forward-work";
 import type { DisposableResource } from "../contracts/portable/resources";
 import type { ExecutionGroup } from "../contracts/portable/scheduling";

@@ -1,4 +1,4 @@
-import { pagedDecodeCompiles } from "../state/paged/cache";
+import { pagedDecodeCompiles } from "../state/layout";
 import { speculativePrefixNamespace, captureSpeculativeOptions } from "../generation/speculative/cache-identity";
 import { createOrdinaryContinuationRequest } from "./continuation-request";
 import type { ExecutionContext } from "../contracts/portable/scheduling";
