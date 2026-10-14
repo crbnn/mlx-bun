@@ -4,7 +4,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { activeMemory, clearCache, Dtype, synchronize } from "@mlx-bun/mlx/ffi";
 import type { Cache } from "../../src/contracts/mlx/cache";
 import { QwenMtpRows } from "../../src/generation/speculative/bindings/qwen-mtp-rows";
-import { atEveryWidth } from "../../src/models/graph";
+import { rowTable } from "../../src/models/graph";
 import { mtpModule } from "../models/phase-forward";
 import { kvStorage } from "../../src/state/kv-storage";
 
@@ -16,7 +16,7 @@ test("MTP prefill releases the prompt backing buffer and preserves its final hid
   const target = {
     hiddenSize: width, layerCount: 1,
     embed(ids: MlxArray) { return ops.zeros([1, ids.shape[1]!, width], Dtype.float32); },
-    logits: atEveryWidth(() => ops.zeros([1, 1, 8], Dtype.float32)),
+    logits: rowTable(() => ops.zeros([1, 1, 8], Dtype.float32)),
   };
   // A small lazy KV projection lets this ownership test exercise the real
   // rows and cache without model weights or a full attention operation.
@@ -57,7 +57,7 @@ test("a failed MTP sample releases its logits and in-flight module output", asyn
   const target = {
     hiddenSize: width, layerCount: 1,
     embed() { return array(width); },
-    logits: atEveryWidth(() => array(width)),
+    logits: rowTable(() => array(width)),
   };
   const module = mtpModule((_embeds: MlxArray, _hidden: MlxArray, cache: Cache) => {
     using kv = MlxArray.fromFloat32(new Float32Array([1]), [1, 1, 1, 1]);

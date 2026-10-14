@@ -1,3 +1,4 @@
+import { MlxPhaseDispatch } from "../../src/generation/phase-dispatch";
 // The generated M4 Pro graph (src/models/qwen/qwen38-27b-trellis-m4pro.ts, an entire graph built from the
 // composition) on small synthetic weights laid out by the generated quant table: 48 DeltaNet and 16 attention layers
 // with the artifact's 3- and 4-bit affine projections, Trellis gate/up at the artifact's widths (mixed in its ten
@@ -126,7 +127,7 @@ function artifact(): { weights: Weights; config: ModelConfig } {
 }
 
 const composition = (overrides: Partial<Composition> = {}): Composition => Object.freeze<Composition>({
-  device: "applegpu_g16s", aneBridge: false, kv: { kind: "bf16" }, pagedKv: null, draftDepth: { adaptive: true, max: 7 },
+  device: "applegpu_g16s", kv: { kind: "bf16" }, pagedKv: null, draftDepth: { adaptive: true, max: 7 },
   prefillChunkTokens: CHUNK, adapters: false, maxRows: 8, packedMixedMlp: true,
   vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
   grammarJump: false, greedyDraft: false, compiledGeglu: true, compiledSwiglu: true, ...overrides,
@@ -206,13 +207,13 @@ const disposeAll = (...sets: Cache[][]) => { for (const set of sets) for (const 
 let synthetic: { weights: Weights; config: ModelConfig } | null = null;
 const source = () => synthetic ??= artifact();
 let built: Qwen38TrellisM4Pro | null = null;
-const graph = () => built ??= new Qwen38TrellisM4Pro(source().weights, source().config, composition());
+const graph = () => built ??= new Qwen38TrellisM4Pro(source().weights, source().config, composition(), false);
 
 describe("composition", () => {
   test("makeCache composes the lego the composition's KV scheme names; the graph declares what the composition built", () => {
     const current = graph();
     const { weights, config } = source();
-    const composed = (kv: KvStorageScheme) => new Qwen38TrellisM4Pro(weights, config, composition({ kv })).makeCache();
+    const composed = (kv: KvStorageScheme) => new Qwen38TrellisM4Pro(weights, config, composition({ kv }), false).makeCache();
     const plain = current.makeCache(), kv4 = composed(KV4), fused = composed({ ...KV4, kernels: "tiled-causal" });
     const other = composed({ kind: "affine", bits: 8, groupSize: 64, kernels: "unfused" });
     const turbo = composed({ kind: "turbo", kBits: 8, vBits: 3 });
@@ -238,9 +239,9 @@ describe("composition", () => {
       for (const set of [plain, kv4, turbo])
         expect(new Set(set.filter(cache => !(cache instanceof SSMCache)).map(cache => (cache as { masks?: unknown }).masks)).size).toBe(1);
     } finally { disposeAll(plain, kv4, fused, other, turbo); }
-    expect(current.graphCapabilities.adapters).toEqual({ batched: false, mountable: false });
+
     expect(current.loraTargets().size).toBe(0);
-    expect(current.prefillChunk.ane).toBeUndefined();
+    expect(current.prompt.filter(range => range.unit === "ane")).toEqual([]);
     expect(LAYERS.filter(layer => layer.downLayout === "k3Interleaved").length).toBe(40);
     expect(LAYERS.filter(layer => layer.kind === "deltanet").length).toBe(48);
   });
@@ -254,20 +255,20 @@ describe("the M4 Pro graph against the generic Qwen 3.5 graph where both run the
     try {
       {
         using input = ids([prompt(CHUNK, 1)]);
-        outputDiff(`prefillChunk.gpu ${CHUNK}`, current.prefillChunk.gpu(input, mine, null) as MlxArray,
-          generic.prefillChunk.gpu(input, theirs, null) as MlxArray, current.logits.wider, generic.logits.wider);
+        outputDiff(`prefillChunk.gpu ${CHUNK}`, current.multiSequencePrompt.at(-1)!.operation(input, mine, null) as MlxArray,
+          generic.multiSequencePrompt.at(-1)!.operation(input, theirs, null) as MlxArray, current.logits[9]!, generic.logits[9]!);
         stateDiff(`prefillChunk.gpu ${CHUNK}`, mine, theirs);
       }
       {
         using input = ids([prompt(13, 2)]);
-        outputDiff("prefillTail.wider 13", current.prefillTail.wider(input, mine, null) as MlxArray,
-          generic.prefillTail.wider(input, theirs, null) as MlxArray, current.logits.wider, generic.logits.wider);
+        outputDiff("prefillTail.wider 13", new MlxPhaseDispatch(current).prompt("tail", 1, 9)(input, mine, null) as MlxArray,
+          new MlxPhaseDispatch(generic).prompt("tail", 1, 9)(input, theirs, null) as MlxArray, current.logits[9]!, generic.logits[9]!);
         stateDiff("prefillTail.wider 13", mine, theirs);
       }
       {
         using input = ids([prompt(12, 3)]);
-        outputDiff("verify.wider 12", current.verify.wider(input, mine, null) as MlxArray,
-          generic.verify.wider(input, theirs, null) as MlxArray, current.logits.wider, generic.logits.wider);
+        outputDiff("verify.wider 12", current.verify[9]!(input, mine, null) as MlxArray,
+          generic.verify[9]!(input, theirs, null) as MlxArray, current.logits[9]!, generic.logits[9]!);
         stateDiff("verify.wider 12", mine, theirs);
       }
     } finally { disposeAll(mine, theirs); }
@@ -275,24 +276,23 @@ describe("the M4 Pro graph against the generic Qwen 3.5 graph where both run the
 
   test("the adapters composition: every operation runs the generic blocks", () => {
     const { weights, config } = source();
-    const adapters = composition({ adapters: true, aneBridge: true });
-    const adapted = new Qwen38TrellisM4Pro(weights, config, adapters), generic = new Qwen35Model(weights, config, adapters);
-    expect(adapted.graphCapabilities.adapters).toEqual({ batched: true, mountable: true });
+    const adapters = composition({ adapters: true });
+    const adapted = new Qwen38TrellisM4Pro(weights, config, adapters, false), generic = new Qwen35Model(weights, config, adapters);
     expect(adapted.loraTargets().size).toBe(48 * 5 + 16 * 4);
     expect([...adapted.loraTargets().keys()].sort()).toEqual([...generic.loraTargets().keys()].sort());
-    expect(adapted.prefillChunk.ane).toBeUndefined();
+    expect(adapted.prompt.filter(range => range.unit === "ane")).toEqual([]);
     const mine = adapted.makeCache(), theirs = generic.makeCache();
     try {
       const steps: [string, number[][], (graph: Qwen38TrellisM4Pro | Qwen35Model, input: MlxArray, caches: Cache[]) => MlxArray][] = [
-        ["prefillChunk.gpu", [prompt(CHUNK, 90)], (g, input, caches) => g.prefillChunk.gpu(input, caches, null) as MlxArray],
-        ["decode.one", [[7]], (g, input, caches) => g.decode.one(input, caches, null) as MlxArray],
-        ["verify.twoToThree 3", [prompt(3, 91)], (g, input, caches) => g.verify.twoToThree(input, caches, null) as MlxArray],
-        ["verify.four 4", [prompt(4, 93)], (g, input, caches) => g.verify.four(input, caches, null) as MlxArray],
-        ["verify.fiveToEight 6", [prompt(6, 92)], (g, input, caches) => g.verify.fiveToEight(input, caches, null) as MlxArray],
+        ["prefillChunk.gpu", [prompt(CHUNK, 90)], (g, input, caches) => g.multiSequencePrompt.at(-1)!.operation(input, caches, null) as MlxArray],
+        ["decode.one", [[7]], (g, input, caches) => g.decode[1]!(input, caches, null) as MlxArray],
+        ["verify.twoToThree 3", [prompt(3, 91)], (g, input, caches) => g.verify[2]!(input, caches, null) as MlxArray],
+        ["verify.four 4", [prompt(4, 93)], (g, input, caches) => g.verify[4]!(input, caches, null) as MlxArray],
+        ["verify.fiveToEight 6", [prompt(6, 92)], (g, input, caches) => g.verify[5]!(input, caches, null) as MlxArray],
       ];
       for (const [label, rows, run] of steps) {
         using input = ids(rows);
-        outputDiff(`adapters ${label}`, run(adapted, input, mine), run(generic, input, theirs), adapted.logits.one, generic.logits.one);
+        outputDiff(`adapters ${label}`, run(adapted, input, mine), run(generic, input, theirs), adapted.logits[1]!, generic.logits[1]!);
         stateDiff(`adapters ${label}`, mine, theirs);
       }
     } finally { disposeAll(mine, theirs); }

@@ -69,9 +69,6 @@ export interface CompositionRequest {
   readonly compiledGeglu?: boolean;
   /** The SwiGLU activations run the compiled closure. Default true. */
   readonly compiledSwiglu?: boolean;
-  /** Compose the Neural Engine bridge where a graph builds a Neural Engine
-   * operation. Default true: every Apple-silicon Mac has the unit. */
-  readonly aneBridge?: boolean;
 }
 
 /** Resolve the record for `config` on this machine. Reads the GPU architecture
@@ -105,7 +102,6 @@ function compose(request: Omit<CompositionRequest, "kv">, kv: Composition["kv"])
   const runtime = runtimeConfig();
   return Object.freeze({
     device: deviceArchitecture(),
-    aneBridge: request.aneBridge ?? true,
     kv,
     pagedKv,
     draftDepth: !draft ? 0 : draft.adaptive ? Object.freeze({ adaptive: true as const, max: draft.numDraftTokens }) : draft.numDraftTokens,

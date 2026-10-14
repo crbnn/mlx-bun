@@ -16,7 +16,7 @@ import { AdapterManager, type AdapterTarget } from "../../src/adapters/manager";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 
-import { LoraState, type LoraWeights } from "../../src/layers/lora";
+import { LoraDelta, LoraState, type LoraWeights } from "../../src/layers/lora";
 
 
 const root = mkdtempSync(join(tmpdir(), "mlx-bun-lora-format-"));
@@ -211,4 +211,27 @@ describe("AdapterManager PEFT layout", () => {
     );
     expect(manager.list()).toEqual([]);
   });
+});
+
+
+test("mounted adapters apply after an arbitrary projection and follow request selection", async () => {
+  const dir = join(root, "projection-delta");
+  writePeftAdapter(dir,
+    { shape: [2, 3], values: [1, 2, 3, 4, 5, 6] },
+    { shape: [4, 2], values: [7, 8, 9, 10, 11, 12, 13, 14] });
+  const delta = new LoraDelta(3, 4), state = new LoraState();
+  const manager = new AdapterManager({ prefixBase: "model", loraState: state,
+    loraTargets: () => new Map([[MODULE, delta]]) });
+  using x = MlxArray.fromFloat32(new Float32Array([1, 0, -1]), [1, 3]);
+  using weight = MlxArray.fromFloat32(new Float32Array([1, 2, 3, 4, 0, 0, 0, 0, 4, 3, 2, 1]), [3, 4]);
+  const project = () => delta.forward(x, ops.matmul(x, weight));
+  try {
+    expect((await manager.mount("request-a", dir)).mountedLayers).toBe(1);
+    state.active = ["request-a"];
+    using adapted = project();
+    expect([...adapted.toFloat32()]).toEqual([-63, -77, -91, -105]);
+    state.active = [];
+    using base = project();
+    expect([...base.toFloat32()]).toEqual([-3, -1, 1, 3]);
+  } finally { manager.unmount("request-a"); }
 });

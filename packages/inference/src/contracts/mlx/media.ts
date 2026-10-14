@@ -1,6 +1,5 @@
 import type { MlxArray } from '@mlx-bun/mlx/array';
 import type { Cache } from './cache';
-import type { MlxWidthClass } from './width';
 
 /** Prepared embeddings for vision/audio prompts. Qualified models consume
  * this through the media prompt input the graph binds (`bindMediaInput`).
@@ -42,7 +41,7 @@ export interface MlxPromptInput {
    * planner's name for the piece (one position after a reused prefix appends
    * as a decode, more as a tail) and the class of its rows. Returns the hidden
    * of the prompt's last position. */
-  prefill(ids: MlxArray, caches: Cache[], start: number, phase: "tail" | "decode", width: MlxWidthClass): MlxArray;
+  prefill(ids: MlxArray, caches: Cache[], start: number, phase: "tail" | "decode", width: number): MlxArray;
   readonly decodeState?: MlxDecodeState;
 }
 
@@ -52,7 +51,7 @@ export interface MlxDecodeState {
   readonly key: string;
   /** One new token per row at the positions each row's state names; `width`
    * is the class of the rows, named by the scheduler. */
-  decode(ids: MlxArray, caches: Cache[], rows: readonly MlxDecodeState[], width: MlxWidthClass): MlxArray;
+  decode(ids: MlxArray, caches: Cache[], rows: readonly MlxDecodeState[], width: number): MlxArray;
 }
 
 /** Common contract for image encoders: preprocess image bytes into an

@@ -49,7 +49,7 @@ describe("every graph declares its capabilities", () => {
     expect(graph(DiffusionGemmaModel.prototype).graphCapabilities)
       .toEqual(declareGraph({ method: "denoising", media: { input: "pixels", video: false } }));
     expect(graph(Glm52Model.prototype, { capabilities: { dsa: true } }).graphCapabilities)
-      .toEqual(declareGraph({ adapters: { mountable: false }, sparseAttention: true }));
+      .toEqual(declareGraph({ sparseAttention: true }));
     expect(graph(Glm52Model.prototype, { capabilities: { dsa: false } }).graphCapabilities.sparseAttention).toBe(false);
   });
 });

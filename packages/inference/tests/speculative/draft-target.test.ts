@@ -6,7 +6,7 @@ import { deepspecGroups } from "../../src/generation/speculative/bindings/deepsp
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { bindSpeculativeTargetModel } from "../../src/generation/speculative/bindings/binding";
 import { declareGraph } from "../../src/models/capabilities";
-import { atEveryWidth } from "../../src/models/graph";
+import { rowTable } from "../../src/models/graph";
 import { stubPhases } from "../models/phase-forward";
 import { assistantGroups } from "../../src/generation/speculative/bindings/assistant-rows";
 import { DRAFT_CHECKPOINT_SCHEMA } from "../../src/contracts/mlx/draft-checkpoint";
@@ -15,7 +15,7 @@ import type { AssistantDraftStep } from "../../src/contracts/mlx/drafter";
 /** Assistant draft rows holding one row whose true hidden is `hidden`, over `target`. */
 function assistantRows(forward: AssistantDraftStep, target: TargetView, hidden: MlxArray) {
   const checkpoint = { processedTokens: 4, attachment: { schema: DRAFT_CHECKPOINT_SCHEMA.assistant, metadata: { processedTokens: 4 }, tensors: [hidden] } };
-  return assistantGroups({ forwardRows: atEveryWidth(forward), dispose() {} }, "assistant").open({ target, checkpoints: [checkpoint],
+  return assistantGroups({ forwardRows: rowTable(forward), dispose() {} }, "assistant").open({ target, checkpoints: [checkpoint],
     sampling: { selection: { kind: "sampled" }, sample() { throw new Error("the assistant drafts with its own head"); } } });
 }
 

@@ -235,8 +235,8 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the generic graph under kv_c
         } finally { ids.dispose(); }
       } finally { releaseAll(caches.map(cache => () => cache.dispose())); ffi.clearCache(); }
     };
-    const batched = rows(gen);
-    expect(batched.equals(rows(mono))).toBe(true);
+    const batched = (gen);
+    expect(batched.equals((mono))).toBe(true);
     digest("two rows hidden", [batched]);
   } finally {
     // Compiled closures borrow weight arrays: release their tapes before the weights.

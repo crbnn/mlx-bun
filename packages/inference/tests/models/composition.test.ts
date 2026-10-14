@@ -28,12 +28,11 @@ afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 test("the default record: this machine, bf16, no drafter, the 2048-token chunk, no adapters, eight rows", () => {
   const composition = resolveComposition(config);
-  expect(composition).toEqual({ device: deviceArchitecture(), aneBridge: true, kv: { kind: "bf16" }, pagedKv: null,
+  expect(composition).toEqual({ device: deviceArchitecture(), kv: { kind: "bf16" }, pagedKv: null,
     draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 8, packedMixedMlp: true,
     vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
     grammarJump: false, greedyDraft: false, compiledGeglu: true, compiledSwiglu: true });
   // The Neural Engine bridge is composed unless the caller turns it off; nothing probes the machine.
-  expect(resolveComposition(config, { aneBridge: false }).aneBridge).toBe(false);
   expect(Object.isFrozen(composition)).toBe(true);
   expect(Object.isFrozen(composition.kv)).toBe(true);
 });

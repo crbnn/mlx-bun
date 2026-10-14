@@ -50,6 +50,7 @@ export function loraInputDropout(x: MlxArray, p: number, seed: number, id: numbe
  * output, returning its owned replacement (or the same handle with no delta).
  * Request routing sets the shared active state before the operation runs. */
 export class LoraDelta {
+  constructor(readonly inFeatures = 0, readonly outFeatures = 0) {}
   adapters: Map<string, LoraWeights> | null = null;
   loraState: LoraState | null = null;
   dropoutId = 0;

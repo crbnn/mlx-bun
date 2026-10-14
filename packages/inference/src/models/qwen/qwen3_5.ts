@@ -1,3 +1,5 @@
+import { bindGraphCaches } from "../cache-composition";
+import type { MlxCacheLayer, MlxMixedRange } from "../../contracts/mlx/graph";
 // Concrete model graph for Qwen3.5 hybrid models (e.g. Qwen3.6-27B-OptiQ-4bit).
 // Port target: mlx_lm.models.qwen3_5 (+ qwen3_next Attention/MLP/RMSNormGated,
 // gated_delta recurrence). The architecture is a 64-layer stack where every
@@ -30,15 +32,11 @@ import { RMSNorm } from "../../layers/normalization";
 import { type Cache } from "../../contracts/mlx/cache";
 import { qwen35WeightsView } from "./checkpoint";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
-import type {
-  MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxKnownSpans, MlxLayerCapture, MlxMixedForward, MlxPhaseForward, MlxPrefillChunk,
-  MlxTokenPhases, MlxVerifyForward, MlxWidthClass,
-  MlxWidthTable,
-} from "../../contracts/mlx/graph";
+import type { MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxKnownSpans, MlxLayerCapture, MlxMixedForward, MlxPhaseForward, MlxPromptRange, MlxTokenPhases, MlxVerifyForward, MlxRowTable } from "../../contracts/mlx/graph";
 import type { TargetView } from "../../contracts/mlx/draft-target";
 import type { MediaEncoders, MlxPromptInput, Vision } from "../../contracts/mlx/media";
 import { declareGraph } from "../capabilities";
-import { atEveryWidth, byWidth, type ReadPhase } from "../graph";
+import { phaseRowLimit,  rowTable, rowTableFrom, type ReadPhase  } from "../graph";
 import { bindQwenMediaInput, qwenDraftTarget, qwenMediaEncoders } from "./media-input";
 import { SSMCache } from "../../state/ssm";
 import { mropeInvFreq } from "../../layers/qwen-mrope";
@@ -49,7 +47,7 @@ const PREFIX = "language_model";
 
 /** A prompt window above four rows evaluates each layer and its recurrent state before the next (the bounded
  *  workspace a retained prefix leaves room for); four rows or fewer stay one lazy graph. */
-const boundedWindow = (width: MlxWidthClass) => width === "fiveToEight" || width === "wider";
+const boundedWindow = (width: number) => width > 4;
 
 export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
@@ -112,8 +110,19 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
       maxChunkSize: (state: readonly Cache[]) => qwenAppendChunkSize(state[0]!.offset),
     }) : undefined;
     const known: ReadPhase = this.knownSpans ? "committed" : "window";
-    this.appendKnown = byWidth(width => (ids, state) =>
-      this.forwardLayers(this.embed.encode(ids), state, known, undefined, null, width, false));
+    this.appendKnown = rowTableFrom(width => (ids, state) =>
+      this.forwardLayers(this.embed.encode(ids), state, known, undefined, null, width, false), phaseRowLimit(composition));
+
+    this.prompt = [{from: 1, to: 4, operation: (ids, state, capture) => this.#captured(this.forwardLayers(this.embed.encode(ids), state, "window", undefined, capture, 4, false), capture)},
+      {from:5, to:Infinity, operation: (ids,state,capture) => this.#captured(this.forwardLayers(this.embed.encode(ids),state,"window",undefined,capture,9,true),capture)}];
+    this.multiSequencePrompt = this.prompt;
+    this.decode = rowTableFrom(width => (ids, state, capture) =>
+    this.#captured(this.forwardLayers(this.embed.encode(ids), state, "decode", undefined, capture, width, false), capture), phaseRowLimit(composition));
+    this.verify = rowTableFrom(width => (ids, state, capture) =>
+    this.#captured(this.forwardLayers(this.embed.encode(ids), state, "window", undefined, capture, width, false), capture), phaseRowLimit(composition));
+    this.logits = rowTable<MlxHeadForward>(hidden => this.logitsFromHidden(hidden), phaseRowLimit(composition));
+
+    bindGraphCaches(this, composition);
   }
 
   loraTargets(): Map<string, QuantizedLinear> {
@@ -154,10 +163,9 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
    * (`composedFullAttentionCache`). Their TurboQuant read is dense
    * (`denseTurboQuantKernels`): the read decodes keys and values, then runs the
    * fused SDPA. */
-  makeCache(): Cache[] {
-    const masks = new AttentionMasks(), kv = this.composition.kv;
-    return this.layers.map((l, layer) => (l.isLinear ? new SSMCache() : composedFullAttentionCache(kv, layer, masks, denseTurboQuantKernels)));
-  }
+  get cacheLayers(): readonly MlxCacheLayer[] { return this.layers.map(layer => layer.isLinear ? {kind:"recurrent" as const} : {kind:"full" as const,turboQuant:"dense" as const}); }
+
+  makeCache!: () => Cache[];
 
   /** The 27B composition on the M4 Pro qualifies committed known-token spans:
    * its append keeps the native affine arithmetic while Trellis shares up to
@@ -185,43 +193,36 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
 
   /** The scoring and training forward (`MlxSequenceForward`): a window on the
    * MLP kernels of `width`, above four rows each layer evaluated before the next. */
-  sequenceHidden(ids: MlxArray, cache: Cache[], width: MlxWidthClass): MlxArray {
+  sequenceHidden(ids: MlxArray, cache: Cache[], width: number): MlxArray {
     return this.forwardLayers(this.embed.encode(ids), cache, "window", undefined, null, width, boundedWindow(width));
   }
 
   /** One whole chunk of a prompt; rows are sequences times the chunk size, and
    * each layer's output and recurrent state is evaluated before the next. The
    * GPU is this graph's one unit. */
-  readonly prefillChunk: MlxPrefillChunk = {
-    gpu: (ids, state, capture) => this.#captured(this.forwardLayers(this.embed.encode(ids), state, "window", undefined,
-      capture, "wider", true), capture),
-  };
+  readonly prompt: readonly MlxPromptRange[];
+  readonly multiSequencePrompt: readonly MlxPromptRange[];
 
   /** A prompt's positions that are not a whole chunk, on the MLP kernels of
    * their width; above four rows each layer is evaluated before the next. */
-  readonly prefillTail: MlxWidthTable<MlxCapturingForward> = byWidth(width => (ids, state, capture) =>
-    this.#captured(this.forwardLayers(this.embed.encode(ids), state, "window", undefined, capture, width,
-      boundedWindow(width)), capture));
 
   /** One new token per sequence: `ids` [sequences, 1], so rows are sequences. */
-  readonly decode: MlxWidthTable<MlxCapturingForward> = byWidth(width => (ids, state, capture) =>
-    this.#captured(this.forwardLayers(this.embed.encode(ids), state, "decode", undefined, capture, width, false), capture));
+  readonly decode: MlxRowTable<MlxCapturingForward>;
 
   /** A speculative window: each sequence's last accepted token and its drafted
    * tokens, right-padded by the caller to the round's depth, `ids`
    * [sequences, depth + 1], so rows are sequences times (depth + 1). The graph
    * appends all depth + 1 positions; dropping the rejected suffix is the
    * caller's speculative transaction, begun before this call. */
-  readonly verify: MlxWidthTable<MlxVerifyForward> = byWidth(width => (ids, state, capture) =>
-    this.#captured(this.forwardLayers(this.embed.encode(ids), state, "window", undefined, capture, width, false), capture));
+  readonly verify: MlxRowTable<MlxVerifyForward>;
 
   /** Committed known-token spans, when the composition qualifies them (`#qualifiesKnownSpans`). */
   readonly knownSpans: MlxKnownSpans | undefined;
   /** Known tokens: the committed read under `knownSpans`, the window read otherwise. */
-  readonly appendKnown: MlxWidthTable<MlxPhaseForward>;
+  readonly appendKnown: MlxRowTable<MlxPhaseForward>;
 
   /** The one output head at every width. */
-  readonly logits = atEveryWidth<MlxHeadForward>(hidden => this.logitsFromHidden(hidden));
+  readonly logits: MlxRowTable<MlxHeadForward>;
 
   /** Hands `capture` the post-final-norm output after its layers, and returns it. */
   #captured(hidden: MlxArray, capture: MlxLayerCapture | null): MlxArray {
@@ -230,17 +231,17 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
   }
 
   /** The vision prefill phase: a prompt's spliced embeddings (borrowed) at request positions. */
-  prefillEmbeddingsAtPositions(embeds: MlxArray, cache: Cache[], positions: MlxArray, width: MlxWidthClass): MlxArray {
+  prefillEmbeddingsAtPositions(embeds: MlxArray, cache: Cache[], positions: MlxArray, width: number): MlxArray {
     return this.forwardLayers(ops.contiguous(embeds), cache, "window", positions, null, width, boundedWindow(width));
   }
 
   /** A prompt's token ids after a reused prefix, at request positions. */
-  prefillAtPositions(ids: MlxArray, cache: Cache[], positions: MlxArray, width: MlxWidthClass): MlxArray {
+  prefillAtPositions(ids: MlxArray, cache: Cache[], positions: MlxArray, width: number): MlxArray {
     return this.forwardLayers(this.embed.encode(ids), cache, "window", positions, null, width, boundedWindow(width));
   }
 
   /** One new token per row at request positions, including different positions for each row. */
-  decodeAtPositions(ids: MlxArray, cache: Cache[], positions: MlxArray, width: MlxWidthClass): MlxArray {
+  decodeAtPositions(ids: MlxArray, cache: Cache[], positions: MlxArray, width: number): MlxArray {
     return this.forwardLayers(this.embed.encode(ids), cache, "decode", positions, null, width, false);
   }
 
@@ -251,10 +252,10 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
    * keeps its own geometry (`mapTokenGroups`). A prompt group above four rows
    * evaluates each layer and the groups' recurrent state before the next, as
    * the prompt tail does. */
-  readonly mixed: MlxMixedForward = (groups, width) => {
+  readonly mixed: readonly MlxMixedRange[] = [{from:1,to:Infinity,operation:(groups, width) => {
     const hidden: MlxArray[] = [];
     const results: MlxArray[] = [];
-    const bounded = groups.some(group => group.phase === "window" && boundedWindow(group.width));
+    const bounded = groups.some(group => group.phase === "window" && boundedWindow(group.rows));
     try {
       for (const group of groups) hidden.push(this.embed.encode(group.ids));
       for (const [i, layer] of this.layers.entries()) {
@@ -284,7 +285,7 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
       return results;
     } catch (error) { for (const result of results) result.dispose(); throw error; }
     finally { for (const h of hidden) h.dispose(); }
-  };
+  }}];
 
   /** The interleaved-mRoPE inverse frequencies, built by the first forward a
    *  media request hands its positions; a text forward keeps the fast rope. */
@@ -296,7 +297,7 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
    *  and are unused: Qwen3.5 vision attends fully causally. */
   prefillEmbeddings(
     embeds: MlxArray, cache: Cache[], _bidir: MlxArray | null,
-    _ids: MlxArray | null, _multimodal: MlxArray | null, width: MlxWidthClass,
+    _ids: MlxArray | null, _multimodal: MlxArray | null, width: number,
   ): MlxArray {
     const h = ops.contiguous(embeds); // fresh handle — the layer loop consumes it
     return this.forwardLayers(h, cache, "window", undefined, null, width, boundedWindow(width));
@@ -308,7 +309,7 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
    *  recurrent state before the next. `capture` receives each layer's residual
    *  output after the layer runs; the caller hands it the final hidden. */
   protected forwardLayers(h0: MlxArray, cache: Cache[], phase: ReadPhase,
-    positions: MlxArray | undefined, capture: MlxLayerCapture | null, width: MlxWidthClass, bounded: boolean): MlxArray {
+    positions: MlxArray | undefined, capture: MlxLayerCapture | null, width: number, bounded: boolean): MlxArray {
     const L = h0.shape[1]!;
     // Vision requests: one interleaved-mRoPE cos/sin table per forward,
     // shared by all 12 full-attention layers (positions are layer-invariant).

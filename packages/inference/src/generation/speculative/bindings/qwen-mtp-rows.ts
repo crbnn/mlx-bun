@@ -4,8 +4,8 @@ import * as ops from "@mlx-bun/mlx/ops";
 import type { PreparedStateChange } from "../../../contracts/portable/resources";
 import { normalizedArgmax } from "../../../kernels/sampling/normalized-argmax";
 import type { RecurrentMtpModule } from "../../../contracts/mlx/drafter";
-import { widthClass, type MlxWidthTable } from "../../../contracts/mlx/graph";
-import { byWidth } from "../../../models/graph";
+import { type MlxRowTable } from "../../../contracts/mlx/graph";
+import { rowTableFrom } from "../../../models/graph";
 import { applyStateChanges,cleanupFailure,disposeResources } from "../../../runtime/resources";
 import { toLogprobs } from "../../../sampling/index";
 import { BatchedKVCache } from "../../../state/batched-kv";
@@ -27,14 +27,14 @@ type MtpSelect = (output: MlxArray, steps: readonly number[]) => MlxArray;
  *  row's sampler over its log-probabilities. Resolved once when the rows open;
  *  `owned` receives the listed projection, which the rows dispose. */
 function bindMtpSelection(target: RecurrentMtpTarget, sampling: MtpRowSampling,
-  owned: { vocabulary: DraftVocabularyHead | null }): MlxWidthTable<MtpSelect> {
+  owned: { vocabulary: DraftVocabularyHead | null }): MlxRowTable<MtpSelect> {
   const selection = sampling.selection;
   if (selection.kind === "listed") {
     // Frequency-ranked draft vocabulary: project onto the listed rows only.
     // The target still verifies over the full vocabulary.
     if (!target.vocabularyHead) throw new Error("a listed draft vocabulary needs the target's quantized vocabulary head");
     const head = owned.vocabulary = new DraftVocabularyHead(target.vocabularyHead, selection.ids);
-    return byWidth(() => (output, steps) => {
+    return rowTableFrom(() => (output, steps) => {
       using subsetLogits = head.project(output);
       using subsetFlat = ops.reshape(subsetLogits, [steps.length, head.size]);
       return selection.sample(subsetFlat, head, steps);
@@ -42,13 +42,13 @@ function bindMtpSelection(target: RecurrentMtpTarget, sampling: MtpRowSampling,
   }
   // Greedy drafting: one fused normalized-argmax over [B,V]; no logsumexp
   // pass, no per-row top-p/top-k sort, no categorical draw.
-  if (selection.kind === "greedy") return byWidth(width => (output, steps) => {
-    using logits = target.logits[width](output);
+  if (selection.kind === "greedy") return rowTableFrom(width => (output, steps) => {
+    using logits = target.logits[width]!(output);
     using flat = ops.reshape(logits, [steps.length, logits.shape.at(-1)!]);
     return normalizedArgmax(flat);
   });
-  return byWidth(width => (output, steps) => {
-    using logits = target.logits[width](output);
+  return rowTableFrom(width => (output, steps) => {
+    using logits = target.logits[width]!(output);
     using flat = ops.reshape(logits, [steps.length, logits.shape.at(-1)!]);
     using logprobs = toLogprobs(flat);
     return sampling.sample(logprobs, steps);
@@ -56,7 +56,7 @@ function bindMtpSelection(target: RecurrentMtpTarget, sampling: MtpRowSampling,
 }
 
 /** Prefill membership drafts nothing, so its rows bind no selection. */
-const prefillOnly: MlxWidthTable<MtpSelect> = byWidth(() => () => {
+const prefillOnly: MlxRowTable<MtpSelect> = rowTableFrom(() => () => {
   throw new Error("Qwen MTP prefill rows do not draft");
 });
 
@@ -73,7 +73,7 @@ export class QwenMtpRows {
    *  bound selection drafts over it. */
   readonly #owned: { vocabulary: DraftVocabularyHead | null } = { vocabulary: null };
   /** The draft token selection, bound once from the group's sampling. */
-  readonly #select: MlxWidthTable<MtpSelect>;
+  readonly #select: MlxRowTable<MtpSelect>;
 
   constructor(
     readonly target: RecurrentMtpTarget,
@@ -158,7 +158,7 @@ export class QwenMtpRows {
       using embeds = this.target.embed(first);
       const mixed = this.#prefilled.some(value => !value);
       if (mixed) this.#cache.specRoundBegin();
-      this.module.decode[widthClass(B)](embeds, this.#hidden!, this.#cache).dispose();
+      this.module.decode[(B)]!(embeds, this.#hidden!, this.#cache).dispose();
       if (mixed) this.#cache.specRoundRollback(this.#prefilled.map(Number));
     }
     for (let pos = 0; pos + 1 < length; pos += 2048) {
@@ -167,7 +167,7 @@ export class QwenMtpRows {
       using embeds = this.target.embed(ids);
       using hidden = context.slice([0, pos, 0], [B, end, H]);
       // A single position per row appends through the one-position read.
-      (end - pos === 1 ? this.module.decode[widthClass(B)] : this.module.window)(embeds, hidden, this.#cache).dispose();
+      (end - pos === 1 ? this.module.decode[(B)]! : this.module.window)(embeds, hidden, this.#cache).dispose();
       ops.evalAll(this.#cache.state());
     }
     using tail = context.slice([0, length - 1, 0], [B, length, H]);
@@ -233,16 +233,16 @@ export class QwenMtpRows {
       // its companion KV aligned so a later round can resume speculation.
       if (depth === 0) {
         using embeds = this.target.embed(ids!);
-        this.module.decode[widthClass(B)](embeds, this.#hidden!, this.#cache).dispose();
+        this.module.decode[(B)]!(embeds, this.#hidden!, this.#cache).dispose();
         this.#drafts = Array.from({ length: B }, () => []);
         this.#depth = 0;
         this.#hidden!.dispose(); this.#hidden = null;
         return this.#drafts;
       }
-      const width = widthClass(B), select = this.#select[width];
+      const width = (B), select = this.#select[width]!;
       for (let position = 0; position < depth; position++) {
         using embeds = this.target.embed(ids!);
-        const output = this.module.decode[width](embeds, chained ?? this.#hidden!, this.#cache);
+        const output = this.module.decode[width]!(embeds, chained ?? this.#hidden!, this.#cache);
         chained?.dispose(); chained = output;
         const token = select(output, steps.map(step => step + position));
         tokens.push(token);
@@ -276,7 +276,7 @@ export class QwenMtpRows {
       using embeds = this.target.embed(ids);
       using hidden = context.slice([0, depth - 1, 0], [B, depth, context.shape[2]!]);
       this.#cache.specRoundBegin();
-      this.module.decode[widthClass(B)](embeds, hidden, this.#cache).dispose();
+      this.module.decode[(B)]!(embeds, hidden, this.#cache).dispose();
       this.#cache.specRoundRollback(extra);
     }
     using positions = ops.fromInt32([...accepted], [B, 1, 1]);

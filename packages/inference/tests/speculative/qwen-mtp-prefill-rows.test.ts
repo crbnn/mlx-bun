@@ -6,7 +6,7 @@ import { QwenMtpRows } from "../../src/generation/speculative/bindings/qwen-mtp-
 import { type MtpRowState } from "../../src/state/speculative/qwen-mtp-state";
 import type { MtpModule } from "../../src/models/qwen/mtp";
 import type { Cache } from "../../src/contracts/mlx/cache";
-import { atEveryWidth } from "../../src/models/graph";
+import { rowTable } from "../../src/models/graph";
 import { mtpModule } from "../models/phase-forward";
 import { kvStorage } from "../../src/state/kv-storage";
 
@@ -17,7 +17,7 @@ function fixture() {
       using floats = ids.astype(Dtype.float32);
       return ops.reshape(floats, [...ids.shape, 1]);
     },
-    logits: atEveryWidth((): MlxArray => { throw new Error("prefill must not sample or project logits"); }),
+    logits: rowTable((): MlxArray => { throw new Error("prefill must not sample or project logits"); }),
   };
   const module = mtpModule((embeds: MlxArray, hidden: MlxArray, cache: Cache) => {
     forwards.push([...embeds.shape]);
