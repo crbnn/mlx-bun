@@ -13,7 +13,7 @@ export interface GenerationPlacement {
 }
 
 const sharedExecutionExclusions = new Set<ExecutionReason>([
-  "media-batch-unsupported", "adapter-batch-unsupported", "grammar-batch-unsupported", "method-batch-unsupported",
+  "media-batch-unsupported", "grammar-batch-unsupported", "method-batch-unsupported",
 ]);
 
 /** A migrated request shape whose shared executor is not available yet. The

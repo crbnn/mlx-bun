@@ -15,9 +15,9 @@ function compositionWire(composition: Composition): unknown {
  * supply a binding explicitly and need no forward/makeCache methods. */
 export async function modelServingBinding(context: LoadedModelContext, supplied?: ModelBinding): Promise<ModelBinding> {
   if (supplied) return supplied;
-  const [{ declaredGraph, embeddingDeclarationFor }, { embedMany, embeddingTerminatorId, isEmbeddingModel }, { bindMlxGateway }, { MLX_VERSION, deviceArchitecture }, ops, { widthClass }] = await Promise.all([
+  const [{ declaredGraph, embeddingDeclarationFor }, { embedMany, embeddingTerminatorId, isEmbeddingModel }, { bindMlxGateway }, { MLX_VERSION, deviceArchitecture }, ops] = await Promise.all([
     import("@mlx-bun/inference/models"), import("@mlx-bun/inference/embeddings"),
-    import("@mlx-bun/inference/execution"), import("@mlx-bun/mlx/ffi"), import("@mlx-bun/mlx/ops"), import("@mlx-bun/inference/contracts/mlx"),
+    import("@mlx-bun/inference/execution"), import("@mlx-bun/mlx/ffi"), import("@mlx-bun/mlx/ops"),
   ]);
   const ctx = context as ModelContext;
   const model = ctx.model;
@@ -39,7 +39,7 @@ export async function modelServingBinding(context: LoadedModelContext, supplied?
         // The whole prompt as one window (the scoring forward), the head over every position.
         const input = ops.fromInt32(ids, [1, ids.length]);
         let hidden;
-        try { hidden = model.sequenceHidden(input, caches, widthClass(ids.length)); } finally { input.dispose(); }
+        try { hidden = model.sequenceHidden(input, caches, (ids.length)); } finally { input.dispose(); }
         let logits;
         try { logits = model.logitsFromHidden(hidden); } finally { hidden.dispose(); }
         let f: Float32Array;
@@ -64,7 +64,7 @@ export async function modelServingBinding(context: LoadedModelContext, supplied?
         return { bins, vocab };
       } finally { for (const cache of caches) cache.dispose(); }
     },
-    discovery: { adapters: capabilities.adapters.mountable, training: capabilities.adapters.mountable,
+    discovery: { adapters: true, training: !!(model as import("@mlx-bun/inference/contracts/mlx").MlxDeclaredGraph).trainable,
       dsa: capabilities.sparseAttention, embeddings: embedding },
     ...(embedding ? { embed: (inputs: string[], instruction?: string) => embedMany(model, ctx.tokenizer, terminator, inputs, instruction) } : {}),
     diagnostics() {

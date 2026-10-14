@@ -20,7 +20,6 @@ export interface ExecutionCapabilities {
    * emitted token, stop the row when it terminates). The shared sampler masks
    * any model's logits; grammar jump and speculation are qualified separately. */
   readonly grammarBatch: boolean;
-  readonly adapterBatch?: boolean;
   /** Prepared media can enter the ordinary shared execution group. */
   readonly mediaBatch?: boolean;
   readonly mediaPrefixCache?: boolean;
@@ -54,7 +53,7 @@ export interface ExecutionFeatures {
  * (`mechanism: "unsupported"`) name the capability the executor or graph lacks;
  * the rest name a requested feature the request's other choices make incompatible. */
 export type ExecutionReason =
-  | "media-batch-unsupported" | "adapter-batch-unsupported" | "grammar-batch-unsupported"
+  | "media-batch-unsupported" | "grammar-batch-unsupported"
   | "method-batch-unsupported"
   | "draft-method-unsupported" | "logprobs-method-unsupported" | "repetition-penalty-method-unsupported"
   | "logits-extras-method-unsupported" | "fill-method-unsupported"

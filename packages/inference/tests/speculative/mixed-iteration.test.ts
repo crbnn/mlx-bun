@@ -2,14 +2,14 @@ import { expect, test } from "bun:test";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import { runMixedTokenIteration } from "../../src/execution/mixed-iteration";
 import type { MlxForwardStep } from "../../src/contracts/mlx/forward-work";
-import { widthClass, type MlxLayerCapture } from "../../src/contracts/mlx/graph";
+import { type MlxLayerCapture } from "../../src/contracts/mlx/graph";
 import * as ops from "@mlx-bun/mlx/ops";
 
 /** One method forward as the mixed iteration's hook takes it: its phase, rows and own operation. */
 const step = (phase: MlxForwardStep["phase"], ids: MlxArray, own: () => Promise<MlxArray>,
   capture: MlxLayerCapture | null = null): MlxForwardStep => {
   const rows = ids.shape[0]! * ids.shape[1]!;
-  return { phase, rows, width: widthClass(rows), capture, own };
+  return { phase, rows, capture, own };
 };
 const unexpected = (what: string) => async (): Promise<MlxArray> => { throw new Error(what); };
 
@@ -30,7 +30,7 @@ test("mixed execution publishes and retires decode before preparation joins", as
     },
     mixed(groups, rows) {
       expect(groups.map(group => group.ids.shape)).toEqual([[1, 1], [1, 3]]);
-      expect(groups.map(group => [group.phase, group.width])).toEqual([["decode", "one"], ["window", "twoToThree"]]);
+      expect(groups.map(group => [group.phase, group.rows])).toEqual([["decode", 1], ["window", 3]]);
       expect(rows).toBe(4);
       order.push("mixed");
       return groups.map(group => ops.copyOf(group.ids));

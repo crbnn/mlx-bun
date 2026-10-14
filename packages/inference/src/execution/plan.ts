@@ -10,7 +10,6 @@ export function resolveExecution(
   const reasons: ExecutionReason[] = [];
   const sharedRequestExclusions = [
     [request.hasVision && !capabilities.mediaBatch, "media-batch-unsupported"],
-    [request.hasAdapters && !capabilities.adapterBatch, "adapter-batch-unsupported"],
     [request.hasGrammar && !capabilities.grammarBatch, "grammar-batch-unsupported"],
   ] as const;
   const excluded = sharedRequestExclusions.some(([exclusion]) => exclusion);

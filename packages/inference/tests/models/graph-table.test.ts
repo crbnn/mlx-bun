@@ -39,7 +39,7 @@ const on = (device: string, config: ModelConfig, request: CompositionRequest = {
 
 describe("a graph table", () => {
   const entry = (id: string, serves: ServedComposition): GraphEntry<null, string> => ({ id, serves, create: () => id });
-  const composition = (fields: Partial<Composition> = {}): Composition => ({ device: M4_PRO, aneBridge: true, kv: { kind: "bf16" }, pagedKv: null,
+  const composition = (fields: Partial<Composition> = {}): Composition => ({ device: M4_PRO, kv: { kind: "bf16" }, pagedKv: null,
     draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 8, packedMixedMlp: true,
     vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
     grammarJump: false, greedyDraft: false, compiledGeglu: true, compiledSwiglu: true, ...fields });
@@ -71,7 +71,7 @@ describe("a graph table", () => {
   test("default keys cover draft depth, prompt chunk, verification rows, per-layer and TurboQuant KV", () => {
     const layered = { kind: "affine-layers", layers: [{ layer: 1, bits: 8, groupSize: 64 }, { layer: 0, bits: 4, groupSize: 64 }] } as const;
     const table = new GraphTable([
-      entry("depth", { draftDepth: { adaptive: true, max: 7 }, device: M1_MAX }),
+      entry("depth", { draftDepth: { adaptive: true, max: 7 }, device: M1_MAX, maxRows: 8 }),
       entry("chunk", { prefillChunkTokens: 512, device: M1_MAX }),
       entry("verify", { device: M4_PRO, maxRows: 8, maxVerifyRows: 64 }),
       entry("layers", { kv: [layered], device: "applegpu_g15s" }),
@@ -143,7 +143,7 @@ describe("the Qwen 3.5 table", () => {
       expect(select(on(M4_PRO, qwen, { kv: { override: 4, fusedSdpa } }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     expect(select(on(M4_PRO, qwen, { adapters: true }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     expect(select(on(M4_PRO, qwen, { maxRows: 1, draft: { numDraftTokens: 3 } }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
-    expect(select({ ...on(M4_PRO, qwen, { draft: { numDraftTokens: 7, adaptive: true } }), aneBridge: false, prefillChunkTokens: 512 }))
+    expect(select({ ...on(M4_PRO, qwen, { draft: { numDraftTokens: 7, adaptive: true } }), prefillChunkTokens: 512 }))
       .toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
   });
 

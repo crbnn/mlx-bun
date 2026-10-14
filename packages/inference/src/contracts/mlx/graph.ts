@@ -5,9 +5,8 @@ import type { TargetView } from "./draft-target";
 import type { NativeMtpHead } from "./drafter";
 import type { TrainableGraph } from "./trainable";
 import type { MediaEncoders, MediaSidecarProbes, MlxPromptInput, PixelInput, TextEmbeddingModel, Vision } from "./media";
-import type { MlxWidthClass, MlxWidthTable } from "./width";
-
-export { widthClass, type MlxWidthClass, type MlxWidthTable } from "./width";
+import type { MlxRowTable } from "./row-table";
+export type { MlxRowTable } from "./row-table";
 
 /** Weight and expert-residency facts the wired-limit scope reads. */
 export interface MlxModelMemory {
@@ -61,72 +60,25 @@ export type MlxHeadForward = (hidden: MlxArray) => MlxArray;
  * stateless training caches, which own the mask of an unpadded or right-padded
  * batch and the training attention kernel), on the kernels of `width`, the
  * class of its rows. Returns the post-final-norm hidden the caller owns. */
-export type MlxSequenceForward = (ids: MlxArray, state: Cache[], width: MlxWidthClass) => MlxArray;
+export type MlxSequenceForward = (ids: MlxArray, state: Cache[], width: number) => MlxArray;
 
-/** A Neural Engine operation (`MlxCapturingForward`), which splits each layer's
- * channels between the Neural Engine and the GPU, for one sequence's prompt
- * piece of `minRows` to `rows` positions: a whole planned chunk or a tail. Its
- * programs are built for `rows` positions; a shorter piece fills their front,
- * and nothing behind it reaches its output. */
-export interface MlxNeuralEngineChunk {
-  readonly minRows: number;
-  readonly rows: number;
-  readonly forward: MlxCapturingForward;
+/** One contiguous range of positions in a single sequence's prompt piece.
+ * The scheduler selects the operation; the graph never inspects its shape. */
+export interface MlxPromptRange {
+  readonly from: number;
+  readonly to: number;
+  readonly operation: MlxCapturingForward;
+  readonly unit?: "gpu" | "ane";
 }
 
-/** The prompt-chunk operation for each execution unit the composition built.
- * Every operation follows `MlxCapturingForward` and appends the same positions.
- * The scheduler owns the units: it reads which operations exist once when it
- * binds the graph (`ane` is a declared fact, like `verifyRoundCosts`) and
- * chooses per prompt piece; the graph never picks between them. */
-export interface MlxPrefillChunk {
-  /** The GPU operation. Every graph supplies it. */
-  readonly gpu: MlxCapturingForward;
-  /** The Neural Engine operations, by ascending `rows`, their row ranges
-   * disjoint: the one whose range holds a one-sequence piece's positions runs
-   * it, a chunk or a tail alike; a piece no range holds runs on the GPU
-   * (`gpu`, or `MlxTokenPhases.prefillTail`). Present only when the composition
-   * built them. The ranges are the composition's, from its machine's kernel table. */
-  readonly ane?: readonly MlxNeuralEngineChunk[];
-}
-
-
-/** The autoregressive phases, each named by the caller. The graph runs the
- * operation it was asked for and never derives the phase or the width class
- * from its input. Each operation follows `MlxPhaseForward`'s ownership. */
+/** Operations selected by exact row count or prompt position range. */
 export interface MlxTokenPhases {
-  /** One whole planned chunk of a prompt: tokens per sequence equal the
-   * prompt's chunk size; rows are sequences times that size. Token ids only: a
-   * prompt with prepared media enters through the `MlxPromptInput` that
-   * `bindMediaInput` returns. One operation per execution unit. */
-  readonly prefillChunk: MlxPrefillChunk;
-  /** The positions of a prompt that are not a whole planned chunk: what is left
-   * after its whole chunks, or a piece the scheduler planned shorter than a
-   * chunk. Rows are sequences times those tokens, indexed like `verify`. One
-   * position per sequence is not a tail: the scheduler appends it with `decode`,
-   * the one-position read. */
-  readonly prefillTail: MlxWidthTable<MlxCapturingForward>;
-  /** One new token per sequence: `ids` [sequences, 1], so rows are sequences.
-   * A prompt step of one position per sequence appends here too, with the
-   * drafter's capture when it taps the prompt. */
-  readonly decode: MlxWidthTable<MlxCapturingForward>;
-  /** A speculative window: each sequence's last accepted token and its drafted
-   * tokens, right-padded by the caller to the round's depth, `ids`
-   * [sequences, depth + 1], so rows are sequences times (depth + 1). The graph
-   * appends all depth + 1 positions; dropping the rejected suffix is the
-   * caller's speculative transaction, begun before this call. */
-  readonly verify: MlxWidthTable<MlxVerifyForward>;
-  /** Known tokens: positions already decided (a token-fill span, a grammar's
-   * forced span) appended to one sequence's committed state, `ids` [1, tokens],
-   * so rows are its tokens. The graph reads them with the read its composition
-   * declares for known tokens: the committed read where it declares
-   * `knownSpans`, the window read otherwise. Several sequences each append one
-   * known token through `decode`. */
-  readonly appendKnown: MlxWidthTable<MlxPhaseForward>;
-  /** The output head, part of each phase: the entry for the rows of the hidden
-   * the caller projects (a decode or verify forward's rows, or the positions it
-   * selects). A graph with one head supplies it in every entry. */
-  readonly logits: MlxWidthTable<MlxHeadForward>;
+  readonly prompt: readonly MlxPromptRange[];
+  readonly multiSequencePrompt: readonly MlxPromptRange[];
+  readonly decode: MlxRowTable<MlxCapturingForward>;
+  readonly verify: MlxRowTable<MlxVerifyForward>;
+  readonly appendKnown: MlxRowTable<MlxPhaseForward>;
+  readonly logits: MlxRowTable<MlxHeadForward>;
 }
 
 /** How a graph whose composition qualifies committed known-token spans takes
@@ -149,7 +101,7 @@ export interface MlxPhaseGroup {
    * `verify` (a speculative window, which keeps its own projection geometry). */
   readonly phase: "decode" | "window" | "verify";
   /** The class of this group's rows, the caller's to name. */
-  readonly width: MlxWidthClass;
+  readonly rows: number;
   readonly ids: MlxArray;
   readonly state: Cache[];
   readonly capture: MlxLayerCapture | null;
@@ -161,7 +113,7 @@ export interface MlxPhaseGroup {
  * together unless a verify group keeps its geometry. `width` is the class of
  * the packed rows, the caller's to name. Borrows inputs and state; returns one
  * owned post-final-norm hidden per group. */
-export type MlxMixedForward = (groups: readonly MlxPhaseGroup[], width: MlxWidthClass) => MlxArray[];
+export type MlxMixedForward = (groups: readonly MlxPhaseGroup[], width: number) => MlxArray[];
 
 /** A graph's compiled single-token decode step: the whole forward replayed from
  * one recorded graph instead of rebuilt per token. The scheduler chooses it
@@ -239,5 +191,21 @@ export interface MlxDeclaredGraph {
    *  (`appendKnown` then reads committed). */
   readonly knownSpans?: MlxKnownSpans;
   /** Mixed rows in one forward, declared by a composition that serves them. */
-  readonly mixed?: MlxMixedForward;
+  readonly mixed?: readonly MlxMixedRange[];
+}
+
+/** Cache layout written by the graph, independent of request storage policy. */
+export type MlxCacheLayer =
+  | { readonly kind: "full"; readonly turboQuant: "dense" | "deferred"; readonly kv4Head256?: boolean }
+  | { readonly kind: "sliding"; readonly window: number }
+  | { readonly kind: "recurrent" }
+  | { readonly kind: "latent"; readonly geometry: {
+      readonly kvLoraRank: number; readonly ropeHeadDim: number; readonly maxTokens?: number; readonly indexHeadDim?: number;
+    } };
+
+/** Fixed mixed operation for a contiguous range of packed token rows. */
+export interface MlxMixedRange {
+  readonly from: number;
+  readonly to: number;
+  readonly operation: MlxMixedForward;
 }

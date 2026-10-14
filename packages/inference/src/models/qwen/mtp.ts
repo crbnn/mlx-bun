@@ -9,11 +9,11 @@ import { QuantizedLinear } from "../../layers/quantized-linear";
 import { RMSNorm } from "../../layers/normalization";
 import { type Cache } from "../../contracts/mlx/cache";
 import type { RecurrentMtpForward, RecurrentMtpModule } from "../../contracts/mlx/drafter";
-import type { MlxWidthTable } from "../../contracts/mlx/graph";
+import type { MlxRowTable } from "../../contracts/mlx/graph";
 import { DenseLinear } from "../../layers/dense-linear";
 import { compiledSwiglu } from "../../layers/swiglu";
 import { Qwen3Attention } from "./blocks";
-import { atEveryWidth } from "../graph";
+import { rowTable } from "../graph";
 
 type MtpLinear = DenseLinear | QuantizedLinear;
 
@@ -58,7 +58,7 @@ export class MtpModule implements RecurrentMtpModule {
   }
 
   /** One position per row; the module has one draft kernel set, at every width. */
-  readonly decode: MlxWidthTable<RecurrentMtpForward> = atEveryWidth<RecurrentMtpForward>(
+  readonly decode: MlxRowTable<RecurrentMtpForward> = rowTable<RecurrentMtpForward>(
     (tokenEmbeds, hiddens, cache) => this.#block(tokenEmbeds, hiddens, cache, "decode"));
   /** Several positions per row. */
   readonly window: RecurrentMtpForward = (tokenEmbeds, hiddens, cache) => this.#block(tokenEmbeds, hiddens, cache, "window");

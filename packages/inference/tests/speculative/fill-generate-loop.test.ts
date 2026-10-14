@@ -100,8 +100,8 @@ class StubModel {
 
   /** Every phase runs the stub's one forward (late-bound, so a subclass's override serves them all) and its head. */
   readonly #phases = stubPhases((ids, cache) => this.forwardStub(ids, cache), hidden => this.logitsFromHidden(hidden));
-  readonly prefillChunk = this.#phases.prefillChunk;
-  readonly prefillTail = this.#phases.prefillTail;
+  readonly prompt = this.#phases.prompt;
+  readonly multiSequencePrompt = this.#phases.multiSequencePrompt;
   readonly decode = this.#phases.decode;
   readonly verify = this.#phases.verify;
   /** Known tokens append through the cache's committed read. */

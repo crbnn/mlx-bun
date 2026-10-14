@@ -167,7 +167,7 @@ test.skipIf(!inputs)("rotating rows keep their newest window through late joins 
       kinds = probe.map(c => c instanceof RotatingKVCache ? "rotating" as const : "full" as const);
       using ids = ops.fromInt32([prompts.A![0]!], [1, 1]);
       using h = phaseHidden(model as unknown as MlxTokenPhases, ids, probe);
-      using logits = (model as unknown as MlxTokenPhases).logits.one(h);
+      using logits = (model as unknown as MlxTokenPhases).logits[1]!(h);
       projectionDtype = logits.dtypeName;
     } finally { releaseAll(probe.map(c => () => c.dispose())); }
     const pins: Pins = { layers: kinds, window, vocab, projectionDtype, kv: inputs!.kv };

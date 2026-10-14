@@ -39,15 +39,13 @@ test("a loaded model records the composition resolved before its graph was built
   const { modelServingBinding } = await import("../../src/engine/model-serving");
   const context = await loadContext(dir, "tiny", { kv: { override: 8 }, maxRows: 3 });
   try {
-    const aneBridge = context.composition!.aneBridge;
-    expect(context.composition).toEqual({ device: deviceArchitecture(), aneBridge,
+    expect(context.composition).toEqual({ device: deviceArchitecture(),
       kv: { kind: "affine", bits: 8, groupSize: 64, kernels: "unfused" }, pagedKv: null,
       draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 3, packedMixedMlp: true,
       vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
       grammarJump: false, greedyDraft: false, compiledGeglu: true, compiledSwiglu: true });
-    expect(typeof aneBridge).toBe("boolean");
     const binding = await modelServingBinding(context);
-    expect(binding.diagnostics()).toEqual({ composition: { device: deviceArchitecture(), ane_bridge: aneBridge,
+    expect(binding.diagnostics()).toEqual({ composition: { device: deviceArchitecture(),
       kv: { kind: "affine", bits: 8, group_size: 64, kernels: "unfused" }, paged_kv: null, draft_depth: 0, prefill_chunk_tokens: 2048,
       adapters: false, max_rows: 3, packed_mixed_mlp: true, vector_greedy_sampling: true,
       compiled_decode: true, mixed_prefill: false, mixed_token_budget: 256, prefill_tail_split: true, grammar_jump: false,
