@@ -6,16 +6,37 @@ import { HEADER } from "./codebook";
 import type { TrellisGeometry } from "./geometry";
 
 // Down projection on the simdgroup matrix unit for any number of activation
-// rows: down-mma's sub-tiles, splits and accumulation (each output row bit for
-// bit the same), with every decoded B fragment feeding an MMA for MT = 2
-// blocks of 8 rows; grid z walks chunks of 16 rows. The row count is read at
-// run time (one pipeline per geometry). SPLITS f32 partials [M, SPLITS, C]
-// fold in one MLX sum. Two kernels, one per code layout: row-major
-// [rows, cols·K/32] and the 3-bit block interleave [cols/512, rows, 48].
-// Measured on the M1 Max at the Qwen down shape (17408 -> 5120, 3-bit
-// interleaved): 9 rows 0.84 ms, 16 0.85, 32 1.35, 64 2.56, 128 4.99, against
-// 1.74, 1.67, 2.16, 2.89 and 4.10 for weight expansion and GEMM.
-const SG_TG = 4, MT = 2, S = 16, SPLITS = 8;
+// rows: down-mma's splits and accumulation (each output row bit for bit the
+// same), with every decoded B fragment feeding an MMA for MT blocks of 8 rows;
+// grid z walks chunks of 8·MT rows. A simdgroup's S sub-tiles and MT follow
+// the layout and the rows (`plan`): neither changes a sum. The row count is
+// read at run time (one pipeline per geometry and launch). SPLITS f32 partials
+// [M, SPLITS, C] fold in one MLX sum. Two kernels, one per code layout:
+// row-major [rows, cols·K/32] and the 3-bit block interleave [cols/512, rows,
+// 48]. Measured on the M1 Max at the Qwen down shape (17408 -> 5120), 3-bit
+// interleaved: 16 rows 0.89 ms, 24 1.09, 32 1.34, 48 1.73, 64 2.50, 128 4.89,
+// 256 8.85; 4-bit row-major: 0.77, 0.98, 1.23, 1.85, 2.31, 4.47, 8.79; against
+// 1.67, 2.1, 2.16, 2.6, 2.89, 4.10 and about 6.5 for weight expansion and GEMM.
+const SG_TG = 4, SPLITS = 8;
+
+/** Each layout's sub-tiles per simdgroup and the relative cost of one pass of each row-block count it takes, measured
+ *  per pass at 256 rows. The 3-bit interleave's sixteen sub-tiles hold three blocks at most in registers (the
+ *  row-major 4-bit window spills there), so row-major codes take eight sub-tiles and up to four blocks. */
+const PLANS: Readonly<Record<"rowMajor" | "interleaved", { readonly S: number; readonly passCost: Readonly<Record<number, number>> }>> = {
+  interleaved: { S: 16, passCost: { 2: 1, 3: 1.31 } },
+  rowMajor: { S: 8, passCost: { 2: 1, 3: 1.4, 4: 1.79 } },
+};
+
+/** The sub-tiles and row blocks for M rows: the row-block count whose passes cost least in all (the larger on a tie). */
+function plan(layout: keyof typeof PLANS, M: number): { S: number; MT: number } {
+  const { S, passCost } = PLANS[layout];
+  let best = { MT: 0, cost: Infinity };
+  for (const [blocks, cost] of Object.entries(passCost)) {
+    const total = Math.ceil(M / (8 * Number(blocks))) * cost;
+    if (total <= best.cost) best = { MT: Number(blocks), cost: total };
+  }
+  return { S, MT: best.MT };
+}
 
 const SOURCE = String.raw`
   const uint M = (uint)x_shape[0];
@@ -109,6 +130,7 @@ function launch(kernel: MetalKernel, x2: MlxArray, codes: MlxArray, scales: MlxA
   const M = x2.shape[0]!;
   if (x2.ndim !== 2 || M < 1) throw new Error("downMmaWide: expects [rows, inputs]");
   if (g.axis !== 0 || g.T !== 256 || g.cols % 256 !== 0 || g.L > 12) throw new Error("downMmaWide: unsupported geometry");
+  const { S, MT } = plan(interleave ? "interleaved" : "rowMajor", M);
   const nGroups = (g.cols / 256) * (32 / S);
   // Words covering 2S positions plus the L-bit window, after realignment.
   const NW = Math.ceil((2 * S * g.k + g.L - 1) / 32) + 1;

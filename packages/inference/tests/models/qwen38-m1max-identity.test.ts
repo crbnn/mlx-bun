@@ -4,13 +4,14 @@
 // layers) and its 3-bit block-interleaved and row-major downs, scaled down in width. The composition facts it
 // declares (no LoRA targets unless the composition mounts adapters, no committed spans, no Neural Engine operation
 // without the bridge or with adapters, its measured verify costs, the residual basis its fold record names, the caches of each KV scheme). Where the graph
-// runs the generic blocks (a whole prompt chunk, prompt tails and verify windows wider than eight rows, every
+// runs the generic blocks (a whole prompt chunk, prompt tails and verify windows above WIDER_ROWS rows, every
 // operation under the adapters composition) it is held to the generic Qwen 3.5 graph of its family over the same
 // weights under bf16, affine 4- and 8-bit and TurboQuant KV, hidden, logits and every cache tensor, at maxDiff 0. Its
-// row kernels (threadgroup-codebook at one row; factored, simdgroup-matrix and affine verify kernels at two to eight)
-// have no generic counterpart: the generator's drift test (qwen38-generated-sync), the kernel tests, the
-// real-artifact parity suite on the M1 Max (tests/parity/qwen-trellis-parity.test.ts) and the app digests are their
-// gates. Its prompt pieces take their projections on DequantizedLinear: MLX's quantized matmul below 640 rows (the
+// row kernels (threadgroup-codebook at one row; factored, simdgroup-matrix and affine verify kernels at two to eight;
+// the wider layers from nine to WIDER_ROWS rows) have no generic counterpart: the wider layers are held to the
+// generic graph within bf16 rounding here, and the generator's drift test (qwen38-generated-sync), the kernel tests,
+// the real-artifact parity suite on the M1 Max (tests/parity/qwen-trellis-parity.test.ts) and the app digests are
+// their gates. Its prompt pieces take their projections on DequantizedLinear: MLX's quantized matmul below 640 rows (the
 // pieces here), and above it the dense GEMM, that matmul bit for bit at the artifact's projection shapes but not at
 // these scaled-down ones, which the layer's own test (dequantized-linear) holds. The Neural Engine operation loads
 // programs compiled for the artifact's widths: the opt-in split tests (ane-split, ane-install) and real-weight runs
@@ -26,9 +27,9 @@ import { parseQuantization, type ModelConfig } from "../../src/artifacts/config"
 import { TURBOQUANT_FOLD_FILE } from "../../src/artifacts/turboquant-fold";
 import type { Weights } from "../../src/artifacts/weights";
 import type { BatchableCache, Cache } from "../../src/contracts/mlx/cache";
-import type { MlxWidthClass } from "../../src/contracts/mlx/graph";
+import type { MlxLayerCapture, MlxWidthClass } from "../../src/contracts/mlx/graph";
 import type { Composition, KvStorageScheme } from "../../src/contracts/portable/composition";
-import { LAYERS, Qwen38TrellisM1Max } from "../../src/models/qwen/qwen38-27b-trellis-m1max";
+import { LAYERS, Qwen38TrellisM1Max, WIDER_ROWS } from "../../src/models/qwen/qwen38-27b-trellis-m1max";
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
 import { Affine4RowsLinear, AffineSplitMmaLinear } from "../../src/layers/affine-verify-linear";
 import { QuantizedLinear } from "../../src/layers/quantized-linear";
@@ -38,7 +39,8 @@ const HIDDEN = 512, INTER = 256, VOCAB = 256, HEADS = 4, KV_HEADS = 2, HEAD_DIM 
 const HK = 4, HV = 8, DK = 64, DV = 64, KERNEL = 4;
 const KEY_DIM = HK * DK, VALUE_DIM = HV * DV, CONV_DIM = 2 * KEY_DIM + VALUE_DIM;
 const PREFIX = "language_model.model";
-const CHUNK = 40;
+/** A prompt chunk above the wider layers' rows, which the generic blocks run. */
+const CHUNK = WIDER_ROWS + 8;
 
 
 const owned: MlxArray[] = [];
@@ -300,7 +302,7 @@ describe("the composition the generated graph declares", () => {
 });
 
 for (const scheme of Object.keys(SCHEMES)) {
-  test(`${scheme} KV: where both run the generic blocks, the M1 Max graph equals the generic Qwen 3.5 graph (a prompt chunk, a tail and a verify window wider than eight rows)`, () => {
+  test(`${scheme} KV: where both run the generic blocks, the M1 Max graph equals the generic Qwen 3.5 graph (a prompt chunk, a tail and a verify window above WIDER_ROWS rows)`, () => {
     const { current, generic } = graphs(scheme);
     const mine = current.makeCache(), theirs = generic.makeCache();
     const step = (label: string, width: MlxWidthClass, rows: number[][],
@@ -312,11 +314,55 @@ for (const scheme of Object.keys(SCHEMES)) {
     };
     try {
       step(`prefillChunk.gpu ${CHUNK}`, "wider", [prompt(CHUNK, 1)], (g, input, caches) => g.prefillChunk.gpu(input, caches, null));
-      step("prefillTail.wider 13", "wider", [prompt(13, 3)], (g, input, caches) => g.prefillTail.wider(input, caches, null));
-      step("verify.wider 12", "wider", [prompt(12, 5)], (g, input, caches) => g.verify.wider(input, caches, null));
+      step(`prefillTail.wider ${WIDER_ROWS + 1}`, "wider", [prompt(WIDER_ROWS + 1, 3)], (g, input, caches) => g.prefillTail.wider(input, caches, null));
+      step(`verify.wider ${WIDER_ROWS + 2}`, "wider", [prompt(WIDER_ROWS + 2, 5)], (g, input, caches) => g.verify.wider(input, caches, null));
     } finally { disposeAll(mine, theirs); }
   }, 180_000);
 }
+
+// The wider layers against the generic blocks, the first layers' hidden: the largest difference relative to the
+// largest magnitude. Measured over these synthetic weights: 1.4e-2 to 2.9e-2, as the two-to-three- and
+// five-to-eight-row kernels' 1.7e-2 to 2.6e-2 (their 64 random layers compound any rounding, to 7e-2 and above 0.3 by
+// the last layer, so the deeper layers bound nothing); a wrong weight, layer or row is of order one.
+const FIRST_LAYERS_TOLERANCE = 5e-2;
+
+/** The largest absolute difference relative to the largest magnitude of `expected` (both read as float32). */
+function relativeDiff(actual: MlxArray, expected: MlxArray): number {
+  expect(actual.shape).toEqual(expected.shape);
+  using left = actual.astype(Dtype.float32);
+  using right = expected.astype(Dtype.float32);
+  const x = left.toFloat32(), y = right.toFloat32();
+  let worst = 0, scale = 0;
+  for (let i = 0; i < x.length; i++) { worst = Math.max(worst, Math.abs(x[i]! - y[i]!)); scale = Math.max(scale, Math.abs(y[i]!)); }
+  return worst / scale;
+}
+
+test("bf16 KV: from nine to WIDER_ROWS rows the wider layers agree with the generic Qwen 3.5 graph within reassociation (prompt tails, a verify window, a known-token append)", () => {
+  const { current, generic } = graphs("bf16");
+  type Run = (graph: Qwen38TrellisM1Max | Qwen35Model, input: MlxArray, caches: Cache[], capture: MlxLayerCapture | null) => MlxArray;
+  const steps: [string, number, Run][] = [
+    ["prefillTail.wider", 13, (g, input, caches, capture) => g.prefillTail.wider(input, caches, capture) as MlxArray],
+    ["prefillTail.wider", 40, (g, input, caches, capture) => g.prefillTail.wider(input, caches, capture) as MlxArray],
+    ["prefillTail.wider", WIDER_ROWS, (g, input, caches, capture) => g.prefillTail.wider(input, caches, capture) as MlxArray],
+    ["verify.wider", 12, (g, input, caches, capture) => g.verify.wider(input, caches, capture) as MlxArray],
+  ];
+  for (const [label, rows, run] of steps) {
+    // Fresh caches each: a step's differences do not carry into the next one's state.
+    const mine = current.makeCache(), theirs = generic.makeCache();
+    const layers: [MlxArray[], MlxArray[]] = [[], []];
+    const capture = (into: MlxArray[]): MlxLayerCapture => (_, h) => { into.push(ops.contiguous(h)); };
+    try {
+      using input = ids([prompt(rows, rows)]);
+      using a = run(current, input, mine, capture(layers[0])), b = run(generic, input, theirs, capture(layers[1]));
+      const first = Math.max(...layers[0].slice(0, 4).map((h, i) => relativeDiff(h, layers[1][i]!)));
+      console.log(`qwen38-m1max-identity wider layers ${label} ${rows}: first layers' largest relative difference ${first.toExponential(1)}`);
+      expect(first, `${label} ${rows}: the first layers`).toBeLessThan(FIRST_LAYERS_TOLERANCE);
+      using logits = current.logits.wider(a);
+      using wide = logits.astype(Dtype.float32);
+      expect(wide.toFloat32().every(Number.isFinite), `${label} ${rows}: logits finite`).toBe(true);
+    } finally { disposeAll(mine, theirs); for (const h of layers.flat()) h.dispose(); }
+  }
+}, 180_000);
 
 test("the adapters composition: every operation runs the generic blocks", () => {
   const { current: adapted, generic } = graphs("bf16", { adapters: true, aneBridge: true });
@@ -332,6 +378,7 @@ test("the adapters composition: every operation runs the generic blocks", () => 
       ["verify.twoToThree 3", "twoToThree", [prompt(3, 91)], (g, input, caches) => g.verify.twoToThree(input, caches, null) as MlxArray],
       ["verify.four 4", "four", [prompt(4, 93)], (g, input, caches) => g.verify.four(input, caches, null) as MlxArray],
       ["verify.fiveToEight 6", "fiveToEight", [prompt(6, 92)], (g, input, caches) => g.verify.fiveToEight(input, caches, null) as MlxArray],
+      ["verify.wider 12", "wider", [prompt(12, 94)], (g, input, caches) => g.verify.wider(input, caches, null) as MlxArray],
     ];
     for (const [label, width, rows, run] of steps) {
       using input = ids(rows);

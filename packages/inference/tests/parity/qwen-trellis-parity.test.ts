@@ -16,7 +16,13 @@
 //  - greedy trajectory: the prompt once and each selected token on the same live
 //    cache through `model.forward`; every step's full last-position float32
 //    logits hash to main's (bit for bit) and are finite, and every selected
-//    token is main's;
+//    token is main's. Where the graph's prompt operation reassociates (since
+//    2026-10-13 the M1 Max graph runs prompt pieces of nine to WIDER_ROWS
+//    positions on its wider layers), the prompt's logits are held by KL and
+//    argmax (KL_ROW, NEAR_TIE) to its generic blocks' over the same prompt
+//    (`prefillEmbeddings` at the caches' positions, then the plain head), which
+//    hash to main's, and the trajectory then decodes on that prompt state, main's
+//    to the bit;
 //  - verify windows against one-row decode on this tree, main's MTP run
 //    teacher-forced: after the prompt, each recorded round's window [pending,
 //    ...proposals] runs through `verify` at its width class, the caches'
@@ -29,7 +35,8 @@
 //    within KL_ROW per row and KL_MEAN on average, and the same argmax unless the
 //    one-row top is a near-tie (NEAR_TIE), where the window may pick a tied
 //    token. Rows after a rejected proposal read a context no output depends on
-//    and are not compared; the fully accepted rounds compare every window row;
+//    and are not compared; the fully accepted rounds compare every window row
+//    (on main's prompt state, as the trajectory builds it);
 //  - MTP speculation, depth 2, greedy, stop tokens off, through the public gateway
 //    binding. Where every compared window row is bit-identical to its one-row
 //    decode, as main's M1 graph's were, the run equals main's shared batch-one
@@ -196,14 +203,50 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis against main: logits, greedy tokens
     expect(model).toBeInstanceOf(Qwen38TrellisM1Max);
     report.graph = model.constructor.name;
 
+    const promptRows = { prompts: 0, identical: 0, klMax: 0 };
+    const promptExact: boolean[] = [];
+    const lastRow = (out: A) => { const [, L, V] = out.shape as number[]; return out.slice([0, L! - 1, 0], [1, L!, V!]); };
+    /** Prompt `i`'s state as main built it and its logits (owned): this graph's prompt, or where its last-position
+     *  logits are not main's bytes, its generic blocks' (the graph's `prefillEmbeddings` above eight rows: the
+     *  prompt's embeddings at the caches' own positions) and its plain head, main's arithmetic, this graph's prompt
+     *  held to them by KL and argmax. */
+    const mainPrompt = (i: number, ids: readonly number[], hash: string): { cache: A[]; out: A } => {
+      const cache = model.makeCache(), out = phaseLogits(model, ids, cache), last: Float32Array = lastPositionLogits(out);
+      promptRows.prompts++;
+      promptExact[i] = sha256(new Uint8Array(last.buffer, last.byteOffset, last.byteLength)) === hash;
+      if (promptExact[i]) { promptRows.identical++; return { cache, out }; }
+      expect(widthClass(ids.length), `prompt ${i}: the generic blocks take prompts above eight rows`).toBe("wider");
+      const mains = model.makeCache();
+      let main: A;
+      {
+        using tokens = ops.fromInt32([...ids], [1, ids.length]);
+        using embeds = model.embed.encode(tokens);
+        using hidden = model.prefillEmbeddings(embeds, mains, null, null, null, "wider");
+        main = model.logitsFromHidden(hidden);
+      }
+      try {
+        const expected: Float32Array = lastPositionLogits(main);
+        expect(sha256(new Uint8Array(expected.buffer, expected.byteOffset, expected.byteLength)),
+          `prompt ${i}: the generic blocks' logits differ from main's bytes`).toBe(hash);
+        using a = lastRow(main), b = lastRow(out);
+        const kl = klPerToken(a, b)[0]!;
+        expect(kl, `prompt ${i}: KL(main || this graph's prompt)`).toBeLessThanOrEqual(KL_ROW);
+        promptRows.klMax = Math.max(promptRows.klMax, kl);
+        expect(nearTop(expected), `prompt ${i}: this graph's argmax is not main's top or tied with it`).toContain(nearTop(last)[0]!);
+      } catch (error) { main.dispose(); releaseAll(mains.map((c: A) => () => c.dispose())); throw error; }
+      finally { out.dispose(); releaseAll(cache.map((c: A) => () => c.dispose())); }
+      return { cache: mains, out: main };
+    };
+
     // Greedy trajectories, full logits by hash.
     let steps = 0;
     for (const [i, trajectory] of reference.trajectories.entries()) {
-      const cache = model.makeCache();
+      const prompt = mainPrompt(i, trajectory.promptIds, trajectory.logitsSha256[0]!);
+      const cache = prompt.cache;
       try {
         let tokens = trajectory.promptIds;
         for (let step = 0; step < trajectory.greedy.length; step++) {
-          const out = phaseLogits(model, tokens, cache);
+          const out = step === 0 ? prompt.out : phaseLogits(model, tokens, cache);
           let next: number;
           try {
             const last: Float32Array = lastPositionLogits(out);
@@ -220,13 +263,15 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis against main: logits, greedy tokens
       } finally { releaseAll(cache.map((c: A) => () => c.dispose())); clearCache(); }
     }
     report.trajectorySteps = steps;
+    report.prompts = promptRows;
 
     // Main's MTP windows teacher-forced: each verified on the state its accepted predecessors built one row at a time,
     // dropped, then its accepted tokens decoded one row at a time and their logits compared.
     const windows = { rows: 0, identical: 0, klSum: 0, klMax: 0, tieFlips: 0 };
     const plainTies: number[][][] = []; // per run, per emitted token: the one-row near-top tokens at its position
     for (const [i, run] of reference.mtp.runs.entries()) {
-      const cache = model.makeCache();
+      const prompt = mainPrompt(i, reference.prompts[i]!.ids, reference.trajectories[i]!.logitsSha256[0]!);
+      const cache = prompt.cache;
       const ties: number[][] = [];
       plainTies.push(ties);
       try {
@@ -238,7 +283,11 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis against main: logits, greedy tokens
           ties.push(nearTop(last.toFloat32()));
           return last;
         };
-        plain(reference.prompts[i]!.ids).dispose();
+        {
+          using out = prompt.out;
+          using last = lastRow(out);
+          ties.push(nearTop(last.toFloat32()));
+        }
         const { rounds } = speculationOf(run.forwards, run.tokens, reference.mtp.depth, `mtp run ${i}`);
         for (const [r, round] of rounds.entries()) {
           const window = run.forwards[r + 1]!, width = widthClass(window.length), kept = round.accepted + 1;
@@ -274,7 +323,7 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis against main: logits, greedy tokens
           .toEqual(run.tokens);
       } finally { releaseAll(cache.map((c: A) => () => c.dispose())); clearCache(); }
     }
-    const exact = windows.identical === windows.rows;
+    const exact = windows.identical === windows.rows && promptExact.every(Boolean);
     expect(windows.klSum / windows.rows, "mean KL(one row || window) over the compared rows").toBeLessThanOrEqual(KL_MEAN);
     report.windows = { rows: windows.rows, identical: windows.identical, meanKl: windows.klSum / windows.rows,
       maxKl: windows.klMax, tieFlips: windows.tieFlips };

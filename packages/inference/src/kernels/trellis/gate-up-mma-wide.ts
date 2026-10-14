@@ -14,8 +14,9 @@ import { HEADER } from "./codebook";
 // simdgroup reads its B fragments; grid z walks chunks of 8·MT rows. The row
 // count is read at run time (one pipeline per geometry and MT). Measured on
 // the M1 Max at the Qwen MLP shape (17408 x 5120, 3-bit): 9 rows 1.01 ms, 16
-// 0.98, 32 1.87, 64 3.68, 128 7.22 for gate and up together, against 11.3,
-// 10.9, 9.5 (the prefill tiles), 5.3 and 8.1 (weight expansion and GEMM).
+// 0.98, 24 1.52, 32 1.87, 64 3.68, 128 7.22 for gate and up together,
+// against 11.3, 10.9, 10.9, 9.5 (the prefill tiles), 5.3 and 8.1 (weight
+// expansion and GEMM).
 const SG_TG = 8;
 
 const RUN_HEADER = String.raw`
@@ -117,9 +118,9 @@ const SOURCE = String.raw`
 
 let kernel: MetalKernel | undefined;
 
-/** Row blocks per pass for M rows: two (16 rows) unless three blocks of 8 cover them (17..24 rows), measured per
- *  pass at 0.55 ms for one block and 0.93 for two. */
-function rowBlocks(M: number): number { return Math.ceil(M / 8) === 3 ? 1 : 2; }
+/** Row blocks per pass for M rows: two (16 rows), or three where three blocks of 8 cover them (17..24 rows: 1.52
+ *  against 1.64 ms for three passes of one block and 1.86 for two of two). */
+function rowBlocks(M: number): number { return Math.ceil(M / 8) === 3 ? 3 : 2; }
 
 /** silu(gate(x))·up(x) for any number of activation rows. Gate and up share their axis-1 geometry (rows a multiple
  *  of 8, columns of 256, L at most 12); their bit widths may differ. Borrows x and the weights; returns owned lazy
