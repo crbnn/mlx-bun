@@ -94,6 +94,23 @@ export function makeStepSampler(
     appendHistory(ops.fromInt32(recent, [recent.length]));
   };
 
+  // Borrows `scores` [1, V]; returns them processed over `tokens` (the history the processors read), owned unless
+  // no processor replaced them.
+  const applyProcessors = (tokens: MlxArray | null, scores: MlxArray): MlxArray => {
+    let current = scores;
+    try {
+      for (const processor of processors) {
+        const next = processor(tokens, current);
+        if (current !== scores && next !== current) current.dispose();
+        current = next;
+      }
+      return current;
+    } catch (error) {
+      if (current !== scores) current.dispose();
+      throw error;
+    }
+  };
+
   const sampleDevice = (input: MlxArray, step: number): StepSample<MlxArray> => {
     const vocab = input.shape[input.shape.length - 1]!;
     let current = input.shape.length === 2 ? input : ops.reshape(input, [1, vocab]);
@@ -102,8 +119,8 @@ export function makeStepSampler(
     let token: MlxArray | null = null;
     let extras: StepExtras | null = null;
     try {
-      for (const processor of processors) {
-        const next = processor(history, current);
+      if (processors.length) {
+        const next = applyProcessors(history, current);
         if (ownsCurrent && next !== current) current.dispose();
         current = next;
         ownsCurrent = current !== input;
@@ -167,10 +184,11 @@ export function makeStepSampler(
 
   if (config.initialHistory) seedHistory(config.initialHistory);
 
-  // Per-position sampling for a verify window: with no processors, grammar or
-  // capture, position p's draw depends only on its scores and its step key, so
-  // every position of the window can sit in ONE device graph and read back
-  // together. Row p reproduces sample(scores[p], steps[p]) exactly.
+  // Per-position sampling for a verify window: with no grammar or capture, position p's draw depends only on its
+  // scores, its step key and its processor history, which is this request's history extended by the window's inputs
+  // up to p (the drafts the walk accepted before reaching p). Every position of the window can then sit in ONE device
+  // graph and read back together. Row p reproduces sample(scores[p], steps[p]) exactly, processors included: they run
+  // per position on its own [1, V] row over that history, as sample() runs them.
   // The plain filter chain (top-p -> top-k -> temperature -> categorical) can run
   // its filters once over the whole window. Other samplers keep per-row calls.
   const windowFilters = !config.sampler && !options.curve && options.hlg?.enabled !== true &&
@@ -178,21 +196,44 @@ export function makeStepSampler(
     runtimeFlag("MLX_BUN_SAMPLER_WINDOW_FILTERS", true)
     ? { temperature: options.temperature!, topP: options.topP ?? 0, topK: options.topK ?? 0, seed: options.seed ?? 0 }
     : null;
-  const positional = processors.length === 0 && !grammar && !capture
+  const positional = !grammar && !capture
     ? {
-      sample(scores: MlxArray, steps: readonly number[]): MlxArray {
+      sample(scores: MlxArray, steps: readonly number[], inputs?: MlxArray): MlxArray {
         if (scores.shape.length !== 2 || scores.shape[0] !== steps.length)
           throw new Error(`positional sampling expects [${steps.length}, V] scores, got [${scores.shape.join(", ")}]`);
+        if (historyLimit > 0 && inputs?.size !== steps.length)
+          throw new Error(`positional sampling with processor history needs the window's ${steps.length} inputs`);
         const vocab = scores.shape[1]!;
         const tokens: MlxArray[] = [];
-        let packed: MlxArray | null = null;
+        const processed: MlxArray[] = [];
+        let packed: MlxArray | null = null, stacked: MlxArray | null = null;
         try {
+          // Each position's scores after its processors, over the history sample() would hold there.
+          const rowScores = (position: number): MlxArray => {
+            const row = scores.slice([position, 0], [position + 1, vocab]);
+            if (!processors.length) return row;
+            let extended: MlxArray | null = null;
+            try {
+              if (historyLimit > 0 && position > 0) {
+                using drafts = inputs!.slice([1], [position + 1]);
+                extended = history ? ops.concatAxis([history, drafts], 0) : ops.contiguous(drafts);
+              }
+              const next = applyProcessors(extended ?? history, row);
+              if (next !== row) row.dispose();
+              return next;
+            } catch (error) { row.dispose(); throw error; }
+            finally { extended?.dispose(); }
+          };
           if (windowFilters && steps.length > 1) {
             // One filter chain over [W, V] (bit-identical per row to the [1, V]
             // chain, packages/inference/tests/sampling/window.test.ts), then each row's own
             // keyed draw on its [1, V] slice: that shape keeps MLX's inverse-CDF
             // categorical, which the draft's coupled draw relies on.
-            using logprobs = toLogprobs(scores);
+            if (processors.length) {
+              for (let position = 0; position < steps.length; position++) processed.push(rowScores(position));
+              stacked = ops.concatAxis(processed, 0);
+            }
+            using logprobs = toLogprobs(stacked ?? scores);
             let current = logprobs, owned: MlxArray | null = null;
             try {
               if (windowFilters.topP > 0 && windowFilters.topP < 1) { owned = applyTopPRows(current, windowFilters.topP); current = owned; }
@@ -209,7 +250,7 @@ export function makeStepSampler(
             } finally { owned?.dispose(); }
           } else
           for (const [position, step] of steps.entries()) {
-            using row = scores.slice([position, 0], [position + 1, vocab]);
+            using row = rowScores(position);
             if (greedyWithoutMetadata) { tokens.push(normalizedArgmax(row)); continue; }
             using logprobs = toLogprobs(row);
             tokens.push(sampler(logprobs, step));
@@ -221,8 +262,12 @@ export function makeStepSampler(
           return result;
         } finally {
           packed?.dispose();
-          for (const token of tokens) token.dispose();
+          stacked?.dispose();
+          for (const array of [...tokens, ...processed]) array.dispose();
         }
+      },
+      commit(tokens: readonly number[]): void {
+        if (config.historyUpdate === "after-sample") commitNumbers(tokens);
       },
     }
     : undefined;

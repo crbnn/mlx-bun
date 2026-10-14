@@ -172,7 +172,7 @@ export async function prepareSpeculativeRows<Context extends DisposableResource 
       target.materialize?.();
       phaseMs.verify = lap();
     }
-    const results = await sampleSpeculativeRows(rows, proposals, verification.logits);
+    const results = await sampleSpeculativeRows(rows, proposals, verification.logits, ids);
     if (phaseMs) phaseMs.sample = lap();
     return {
       results,
@@ -207,7 +207,7 @@ async function prepareDeviceRound<Context extends DisposableResource>(
     using ids = ops.concatAxis([pending, lazy.tokens], 1);
     target.transaction.begin(depth);
     verification = await target.forward(ids, { sequences: B, positions: depth + 1 });
-    const sampled = sampleWindowOnDevice(rows, verification.logits);
+    const sampled = sampleWindowOnDevice(rows, verification.logits, ids);
     if (!sampled) throw new Error("device round requires stateless window sampling");
     let read: number[];
     try {
@@ -231,26 +231,27 @@ async function prepareDeviceRound<Context extends DisposableResource>(
   finally { lazy.tokens.dispose(); }
 }
 
-/** Sample a borrowed verify window. Each request owns its processor history,
- * grammar and RNG stream; completing one walk never samples its unused suffix.
+/** Sample a borrowed verify window over its borrowed inputs `ids` [B, width]. Each request owns its processor
+ * history, grammar and RNG stream; completing one walk never samples its unused suffix.
  * The existing request adapter and grouped method use this same operation. */
 export async function sampleSpeculativeRows(
-  rows: readonly MlxSpeculativeRow[], proposals: readonly (readonly number[])[], logits: MlxArray,
+  rows: readonly MlxSpeculativeRow[], proposals: readonly (readonly number[])[], logits: MlxArray, ids: MlxArray,
 ): Promise<MlxSpeculativeRowResult[]> {
   let tokens: number[] | undefined;
-  const sampled = sampleWindowOnDevice(rows, logits);
+  const sampled = sampleWindowOnDevice(rows, logits, ids);
   if (sampled) { try { tokens = sampled.toIntTokens(); } finally { sampled.dispose(); } }
   return walkSpeculativeRows(rows, proposals, logits, tokens);
 }
 
 /** Every window position of every row as ONE owned device array [B * width]
- *  (row-major), or null when some row's sampling depends on accepted history, a
- *  grammar or probability capture (those walk position by position).
- *  Plain greedy rows share one stateless argmax; stateless sampled rows
- *  (temperature/top-p/top-k) draw every position with its own (seed, step) key,
- *  so the walk still stops at each row's first rejection with the draws
- *  sequential sampling would make, and unused suffix draws consume nothing. */
-export function sampleWindowOnDevice(rows: readonly MlxSpeculativeRow[], logits: MlxArray): MlxArray | null {
+ *  (row-major), or null when some row's sampling depends on a grammar or
+ *  probability capture (those walk position by position).
+ *  Plain greedy rows share one stateless argmax; other rows (temperature/top-p/top-k,
+ *  processor penalties) draw every position with its own (seed, step) key over
+ *  the history the window's inputs `ids` [B, width] (borrowed) give it, so the
+ *  walk still stops at each row's first rejection with the draws sequential
+ *  sampling would make, and unused suffix draws consume nothing. */
+export function sampleWindowOnDevice(rows: readonly MlxSpeculativeRow[], logits: MlxArray, ids: MlxArray): MlxArray | null {
   const V = logits.shape[2]!, width = logits.shape[1]!;
   const independent = rows[0]?.sampling.independent;
   if (independent && rows.every(row => row.sampling.independent === independent)) {
@@ -263,15 +264,18 @@ export function sampleWindowOnDevice(rows: readonly MlxSpeculativeRow[], logits:
     for (const [row, request] of rows.entries()) {
       using slice = logits.slice([row, 0, 0], [row + 1, width, V]);
       using scores = ops.reshape(slice, [width, V]);
+      using inputs = request.sampling.needsHistory ? ids.slice([row, 0], [row + 1, width]) : null;
+      using window = inputs ? ops.reshape(inputs, [width]) : null;
       perRow.push(request.sampling.positional!.sample(
-        scores, Array.from({ length: width }, (_, position) => request.step + position)));
+        scores, Array.from({ length: width }, (_, position) => request.step + position), window ?? undefined));
     }
     return perRow.length === 1 ? perRow.pop()! : ops.concatAxis(perRow, 0);
   } finally { for (const sampled of perRow) sampled.dispose(); }
 }
 
 /** The host accept walk over already-read window samples (`tokens`, row-major
- *  [B * width]) or, without them, position-by-position sampling. */
+ *  [B * width]), whose used draws it commits to each row's history, or, without
+ *  them, position-by-position sampling. */
 export async function walkSpeculativeRows(
   rows: readonly MlxSpeculativeRow[], proposals: readonly (readonly number[])[], logits: MlxArray,
   tokens: readonly number[] | undefined,
@@ -296,6 +300,7 @@ export async function walkSpeculativeRows(
       acceptance.accept(token, request.grammarDone?.() ?? false);
       if (!acceptance.sawEos) logprobs.push(metadata);
     }
+    if (tokens) request.sampling.positional?.commit(tokens.slice(row * width, row * width + acceptance.position));
     results.push({ drafts: proposals[row]!, acceptance, logprobs });
   }
   return results;

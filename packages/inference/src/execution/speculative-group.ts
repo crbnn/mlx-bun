@@ -546,7 +546,7 @@ class SpeculativeGroup implements MlxGroupedMethod {
   #pipelinesZero(rows: readonly Row[]): boolean {
     return rows.every(row => {
       const request = this.#requests.get(row)!;
-      return !request.fill && (request.sampling.positional || request.sampling.unread);
+      return !request.fill && request.sampling.unread !== undefined;
     });
   }
 
@@ -565,7 +565,7 @@ class SpeculativeGroup implements MlxGroupedMethod {
         using slice = logits.slice([index, 0, 0], [index + 1, 1, V]);
         using scores = ops.reshape(slice, [1, V]);
         const step = rows[index]!.sampled;
-        tokens.push(sampling.positional ? sampling.positional.sample(scores, [step]) : sampling.unread!.sample(scores, step));
+        tokens.push(sampling.unread!.sample(scores, step));
       }
       return tokens.length === 1 ? tokens.pop()! : ops.concatAxis(tokens, 0);
     } finally { disposeResources(tokens); }

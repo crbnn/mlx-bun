@@ -61,8 +61,9 @@ Qwen's instruct sampling and 19.4 against 17.9 under its thinking sampling, the 
 to four drafts) at 20.3, 18.8 and 17.8; the adaptive gate drafts nothing where drafting does not pay
 (such rounds are the pipelined decode step), yet on text the drafter predicts poorly (the
 short-story prompt) greedy and instruct decoding still trail plain decode by 2 to 3% (the first
-rounds draft on an optimistic prior, instruct rounds sample on the host, and MTP's rounds without
-drafts still advance its head); its
+rounds draft on an optimistic prior, and MTP's rounds without drafts still advance its head); instruct
+rounds sample their verify windows on the device since 2026-10-13 (penalties included, the same tokens:
+21.3 -> 21.5 tok/s); its
 per-row verify costs ignore how many requests are batched; the M1 Max composition prefills 1k and
 8k-token prompts at about 175 tok/s (2026-10-13, alternated sessions of the graph's own prefill
 operations, against 129 to 130 before its dense-GEMM prompt projections and Neural Engine MLP split;
