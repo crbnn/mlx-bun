@@ -1,4 +1,4 @@
-import type { MlxSequenceRange, MlxSequenceForward } from "@mlx-bun/inference/contracts/mlx";
+import type { MlxHeadForward, MlxHeadRange, MlxSequenceRange, MlxSequenceForward } from "@mlx-bun/inference/contracts/mlx";
 import type { Composition } from "@mlx-bun/inference/contracts/portable";
 import type { ModelContext, LoadedModelContext } from "./model-host";
 import type { ModelBinding } from "./model-binding";
@@ -22,10 +22,14 @@ export async function modelServingBinding(context: LoadedModelContext, supplied?
   ]);
   const ctx = context as ModelContext;
   const model = ctx.model;
-  const scoring = model as { readonly sequence?: readonly MlxSequenceRange[]; readonly sequenceHidden?: MlxSequenceForward };
-  if (typeof model.makeCache !== "function" || (!scoring.sequence && typeof scoring.sequenceHidden !== "function"))
+  const scoring = model as { readonly sequence?: readonly MlxSequenceRange[]; readonly sequenceHidden?: MlxSequenceForward;
+    readonly sequenceLogits?: readonly MlxHeadRange[]; readonly logitsFromHidden?: MlxHeadForward };
+  if (typeof model.makeCache !== "function")
     throw new Error("model implementation must supply its serving binding");
-  declaredGraph(model);
+  const graph = declaredGraph(model);
+  const hasSequence = !!scoring.sequence?.some(range => typeof range.operation === "function") || typeof scoring.sequenceHidden === "function";
+  const hasHead = !!scoring.sequenceLogits?.some(range => typeof range.operation === "function") || typeof scoring.logitsFromHidden === "function";
+  const adapters = typeof model.loraTargets === "function" && model.loraTargets().size > 0;
   const gateway = bindMlxGateway(model, ctx.draft ?? undefined);
   const capabilities = gateway.capabilities;
   const embedding = isEmbeddingModel(model);
@@ -36,6 +40,7 @@ export async function modelServingBinding(context: LoadedModelContext, supplied?
     stateCompatibility: `mlx-${MLX_VERSION}-${deviceArchitecture()}`,
     gateway,
     async signal(ids, count, minimum) {
+      if (!hasSequence || !hasHead) throw new TypeError("model declares no full-sequence scoring operation for signal");
       const caches = model.makeCache();
       try {
         // The whole prompt as one window (the scoring forward), the head over every position.
@@ -66,7 +71,7 @@ export async function modelServingBinding(context: LoadedModelContext, supplied?
         return { bins, vocab };
       } finally { for (const cache of caches) cache.dispose(); }
     },
-    discovery: { adapters: true, training: !!(model as import("@mlx-bun/inference/contracts/mlx").MlxDeclaredGraph).trainable,
+    discovery: { adapters, training: adapters && ((hasSequence && hasHead) || typeof graph.trainable?.denoising?.canvasLogits === "function"),
       dsa: capabilities.sparseAttention, embeddings: embedding },
     ...(embedding ? { embed: (inputs: string[], instruction?: string) => embedMany(model, ctx.tokenizer, terminator, inputs, instruction) } : {}),
     diagnostics() {
