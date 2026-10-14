@@ -63,7 +63,7 @@ tokens 2.43/3.26/3.89/5.83/11.18/45.85 -> 2.16/2.92/3.58/4.95/9.36/38.54 s with 
 DFlash 2 adaptive on that chip (in-process serve, four
 prompts, 192 tokens, 2026-10-14, with the gate settings the graph declares for it) decodes greedy text at 26.0 against
 19.5 tok/s plain, 22.9 against 19.1 under Qwen's instruct sampling and 21.0 against 19.1 under its thinking sampling
-(33.1, 30.1 and 23.7 on the codebook matrix-unit kernels), the MTP head (adaptive up to four drafts, the graph's
+(33.3, 30.2 and 23.6 on the codebook matrix-unit kernels), the MTP head (adaptive up to four drafts, the graph's
 `adaptiveDraftWidths`) at 21.1, 20.2 and 19.2 (26.9, 25.3 and 21.4); with two and four concurrent requests (before
 the codebook kernels) DFlash 2
 decodes 30.4, 28.5 and 27.1 and 43-46, 39-42 and 38.2 tok/s in aggregate against plain's 19.9, 19.3 and 19.1 and
