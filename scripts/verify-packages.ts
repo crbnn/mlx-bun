@@ -209,21 +209,21 @@ try {
       mlx: ["mlx-abi.test.ts", "compile.test.ts", "metal-kernel.test.ts"],
       inference: ["models/qwen3.test.ts", "models/phase-forward.ts", "models/test-composition.ts", "kernels/trellis-vector-expand.test.ts", "execution/expert-io-native.test.ts"],
     };
+    const installedTestFiles: string[] = [];
     for (const [name, files] of Object.entries(tests)) {
       const installed = join(consumer, "node_modules", "@mlx-bun", name);
       assert((await realpath(installed)).startsWith((await realpath(consumer)) + "/"), "Installed package is a workspace link");
-      const destination = join(consumer, "packages", name);
-      // Examples come from the tarball, so forgetting to publish them fails here.
-      await cp(join(installed, "examples"), join(destination, "examples"), { recursive: true });
-      // Test helpers reach the package through `../../src`, so the installed source sits where they look.
-      await cp(join(installed, "src"), join(destination, "src"), { recursive: true });
+      // Relative helpers and public imports must use the same installed module
+      // instances, including the cache layout registry. Examples remain the
+      // ones shipped in the tarball.
       for (const file of files) {
-        const target = join(destination, "tests", file);
+        const target = join(installed, "tests", file);
         await mkdir(dirname(target), { recursive: true });
         await cp(join(workspace, "packages", name, "tests", file), target);
+        if (file.endsWith(".test.ts")) installedTestFiles.push(target);
       }
     }
-    const output = await run([process.execPath, "test", "packages"], consumer);
+    const output = await run([process.execPath, "test", ...installedTestFiles], consumer);
     if (output.trim()) console.log(output.trim());
     await run([process.execPath, "node_modules/@mlx-bun/mlx/examples/arrays.ts"], consumer);
     await run([process.execPath, "node_modules/@mlx-bun/inference/examples/trellis-expand.ts"], consumer);
