@@ -372,7 +372,7 @@ function relativeDiff(actual: MlxArray, expected: MlxArray): number {
   return worst / scale;
 }
 
-test("bf16 KV: from nine to WIDER_ROWS rows the wider layers agree with the generic Qwen 3.5 graph within reassociation (prompt tails, a verify window, a known-token append)", () => {
+test("bf16 KV: from nine to WIDER_ROWS rows the wider layers agree with the generic Qwen 3.5 graph within reassociation (prompt tails and a verify window)", () => {
   const { current, generic } = graphs("bf16");
   type Run = (graph: Qwen38TrellisM1Max | Qwen35Model, input: MlxArray, caches: Cache[], capture: MlxLayerCapture | null) => MlxArray;
   const steps: [string, number, Run][] = [
