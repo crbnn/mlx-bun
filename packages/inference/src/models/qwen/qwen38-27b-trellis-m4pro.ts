@@ -4,8 +4,8 @@ import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
 import type { Cache } from "../../contracts/mlx/cache";
 import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
-import type { MlxDeclaredGraph, MlxTokenPhases, MlxLayerCapture, MlxHeadForward, MlxRowTable, MlxPromptRange, MlxCacheLayer, MlxPhaseForward } from "../../contracts/mlx/graph";
-import type { MediaEncoders, MlxPromptInput, Vision } from "../../contracts/mlx/media";
+import type { MlxDeclaredGraph, MlxTokenPhases, MlxLayerCapture, MlxHeadForward, MlxRowTable, MlxPromptRange, MlxCacheLayer, MlxPhaseForward, MlxSequenceRange, MlxSeparateMixed } from "../../contracts/mlx/graph";
+import type { MediaEncoders, MlxPromptInput, Vision, MlxPositionedForward, MlxPositionedRange, MlxPositionedEmbeddingsRange } from "../../contracts/mlx/media";
 import type { MropeForwardState } from "../../contracts/mlx/positions";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import type { AneProgramSpec } from "../../kernels/ane/linear";
@@ -93,6 +93,12 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
   readonly verify:MlxRowTable<RowsForward>;
   readonly appendKnown:MlxRowTable<MlxPhaseForward>;
   readonly logits:MlxRowTable<MlxHeadForward>;
+  readonly sequence:readonly MlxSequenceRange[];
+  readonly mediaPrefill:readonly MlxPositionedEmbeddingsRange[];
+  readonly mediaPrompt:readonly MlxPositionedRange[];
+  readonly mediaDecode:MlxRowTable<MlxPositionedForward>;
+  readonly mixedSeparate:MlxSeparateMixed;
+  readonly #head:Plain;
   readonly #targets:Map<string,QuantizedLinear>;
   readonly #owned:{dispose():void}[];
   readonly #residualBasis:ResidualBasis|undefined;
@@ -122,6 +128,7 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
     this.embed=QuantizedEmbedding.load(w,`${PREFIX}.embed_tokens`,c);
     this.finalNorm=new RMSNorm(w.tensor(`${PREFIX}.norm.weight`),t.rmsNormEps);
     this.lmHead=QuantizedLinear.load(w,"language_model.lm_head",c);
+    this.#head=new Plain(this.lmHead);
     const invScale=Math.pow(t.linearKeyHeadDim,-0.5),qk={q:ops.filledBf16(invScale*invScale,t.linearKeyHeadDim),k:ops.filledBf16(invScale,t.linearKeyHeadDim)};
     const rotaryDims=Math.trunc(t.headDim*t.partialRotaryFactor);
     this.#mrope={invFreq:mropeInvFreq(rotaryDims,t.ropeParameters.full_attention!.ropeTheta),rotaryDims};
@@ -797,5 +804,207 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
       ...d48.targets(),...d49.targets(),...d50.targets(),...a51.targets(),...d52.targets(),...d53.targets(),...d54.targets(),...a55.targets(),
       ...d56.targets(),...d57.targets(),...d58.targets(),...a59.targets(),...d60.targets(),...d61.targets(),...d62.targets(),...a63.targets(),
     ]);
+    const oneDecode:RowsForward=(ids,state,capture)=>this.#submitted(this.#one,ids,state,"decode",capture);
+    const rowsDecode:RowsForward=(ids,state,capture)=>this.#submitted(this.#rows,ids,state,"decode",capture);
+    const fourDecode:RowsForward=(ids,state,capture)=>this.#submitted(this.#four,ids,state,"decode",capture);
+    const mmaDecode:RowsForward=(ids,state,capture)=>this.#submitted(this.#mma,ids,state,"decode",capture);
+    const oneWindow:RowsForward=(ids,state,capture)=>this.#submitted(this.#one,ids,state,"window",capture);
+    const rowsWindow:RowsForward=(ids,state,capture)=>this.#submitted(this.#rows,ids,state,"window",capture);
+    const fourWindow:RowsForward=(ids,state,capture)=>this.#submitted(this.#four,ids,state,"window",capture);
+    const mmaWindow:RowsForward=(ids,state,capture)=>this.#submitted(this.#mma,ids,state,"window",capture);
+    const wideWindow:RowsForward=(ids,state,capture)=>this.#bounded(this.#wide,ids,state,"window",capture);
+    const tiledWindow:RowsForward=(ids,state,capture)=>this.#bounded(this.#tiled,ids,state,"window",capture);
+    const expandedWindow:RowsForward=(ids,state,capture)=>this.#bounded(this.#expanded,ids,state,"window",capture);
+    this.decode={1:oneDecode,2:rowsDecode,3:rowsDecode,4:fourDecode,5:mmaDecode,6:mmaDecode,7:mmaDecode,8:mmaDecode};
+    this.verify={
+      1:oneWindow,2:rowsWindow,3:rowsWindow,4:fourWindow,5:mmaWindow,6:mmaWindow,7:mmaWindow,8:mmaWindow,
+      9:wideWindow,10:wideWindow,11:wideWindow,12:wideWindow,13:wideWindow,14:wideWindow,15:wideWindow,
+      16:tiledWindow,17:tiledWindow,18:tiledWindow,19:tiledWindow,20:tiledWindow,21:tiledWindow,22:tiledWindow,23:tiledWindow,
+      24:tiledWindow,25:tiledWindow,26:tiledWindow,27:tiledWindow,28:tiledWindow,29:tiledWindow,30:tiledWindow,31:tiledWindow,32:tiledWindow,
+      33:expandedWindow,34:expandedWindow,35:expandedWindow,36:expandedWindow,37:expandedWindow,38:expandedWindow,39:expandedWindow,40:expandedWindow,
+      41:expandedWindow,42:expandedWindow,43:expandedWindow,44:expandedWindow,45:expandedWindow,46:expandedWindow,47:expandedWindow,48:expandedWindow,
+      49:expandedWindow,50:expandedWindow,51:expandedWindow,52:expandedWindow,53:expandedWindow,54:expandedWindow,55:expandedWindow,56:expandedWindow,
+      57:expandedWindow,58:expandedWindow,59:expandedWindow,60:expandedWindow,61:expandedWindow,62:expandedWindow,63:expandedWindow,64:expandedWindow,
+    };
+    this.prompt=[
+      {from:1,to:1,operation:oneWindow},{from:2,to:3,operation:rowsWindow},{from:4,to:4,operation:fourWindow},
+      {from:5,to:8,operation:mmaWindow},{from:9,to:15,operation:wideWindow},{from:16,to:32,operation:tiledWindow},
+      {from:33,to:639,operation:expandedWindow},
+      {from:640,to:1024,unit:"ane",operation:(ids,state,capture)=>this.#bounded(this.#ane1024,ids,state,"window",capture)},
+      {from:1025,to:1536,unit:"ane",operation:(ids,state,capture)=>this.#bounded(this.#ane1536,ids,state,"window",capture)},
+      {from:1537,to:2048,unit:"ane",operation:(ids,state,capture)=>this.#bounded(this.#ane2048,ids,state,"window",capture)},
+      {from:2049,to:Infinity,operation:expandedWindow},
+    ];
+    this.multiSequencePrompt=[
+      {from:1,to:4,operation:(ids,state,capture)=>this.#bounded(this.#stockNarrow,ids,state,"window",capture)},
+      {from:5,to:8,operation:(ids,state,capture)=>this.#bounded(this.#stockFiveToEight,ids,state,"window",capture)},
+      {from:9,to:15,operation:wideWindow},{from:16,to:32,operation:tiledWindow},{from:33,to:Infinity,operation:expandedWindow},
+    ];
+    const knownNarrow:MlxPhaseForward=(ids,state)=>this.#lazy(this.#knownNarrow,ids,state,"committed",null);
+    const knownFiveToEight:MlxPhaseForward=(ids,state)=>this.#bounded(this.#knownFiveToEight,ids,state,"committed",null);
+    const knownWide:MlxPhaseForward=(ids,state)=>this.#bounded(this.#knownWide,ids,state,"committed",null);
+    const knownTiled:MlxPhaseForward=(ids,state)=>this.#bounded(this.#knownTiled,ids,state,"committed",null);
+    const knownExpanded:MlxPhaseForward=(ids,state)=>this.#bounded(this.#knownExpanded,ids,state,"committed",null);
+    this.appendKnown={
+      1:knownNarrow,2:knownNarrow,3:knownNarrow,4:knownNarrow,5:knownFiveToEight,6:knownFiveToEight,7:knownFiveToEight,8:knownFiveToEight,
+      9:knownWide,10:knownWide,11:knownWide,12:knownWide,13:knownWide,14:knownWide,15:knownWide,
+      16:knownTiled,17:knownTiled,18:knownTiled,19:knownTiled,20:knownTiled,21:knownTiled,22:knownTiled,23:knownTiled,
+      24:knownTiled,25:knownTiled,26:knownTiled,27:knownTiled,28:knownTiled,29:knownTiled,30:knownTiled,31:knownTiled,32:knownTiled,
+      33:knownExpanded,34:knownExpanded,35:knownExpanded,36:knownExpanded,37:knownExpanded,38:knownExpanded,39:knownExpanded,40:knownExpanded,
+      41:knownExpanded,42:knownExpanded,43:knownExpanded,44:knownExpanded,45:knownExpanded,46:knownExpanded,47:knownExpanded,48:knownExpanded,
+      49:knownExpanded,50:knownExpanded,51:knownExpanded,52:knownExpanded,53:knownExpanded,54:knownExpanded,55:knownExpanded,56:knownExpanded,
+      57:knownExpanded,58:knownExpanded,59:knownExpanded,60:knownExpanded,61:knownExpanded,62:knownExpanded,63:knownExpanded,64:knownExpanded,
+    };
+    const headRows=new Affine4Rows(this.lmHead),headMma=new Affine4Mma(this.lmHead);
+    const plainHead:MlxHeadForward=hidden=>this.#head.forward(hidden),rowsHead:MlxHeadForward=hidden=>headRows.forward(hidden),mmaHead:MlxHeadForward=hidden=>headMma.forward(hidden);
+    this.logits={
+      1:plainHead,2:rowsHead,3:rowsHead,4:rowsHead,5:mmaHead,6:mmaHead,7:mmaHead,8:mmaHead,
+      9:plainHead,10:plainHead,11:plainHead,12:plainHead,13:plainHead,14:plainHead,15:plainHead,16:plainHead,
+      17:plainHead,18:plainHead,19:plainHead,20:plainHead,21:plainHead,22:plainHead,23:plainHead,24:plainHead,
+      25:plainHead,26:plainHead,27:plainHead,28:plainHead,29:plainHead,30:plainHead,31:plainHead,32:plainHead,
+      33:plainHead,34:plainHead,35:plainHead,36:plainHead,37:plainHead,38:plainHead,39:plainHead,40:plainHead,
+      41:plainHead,42:plainHead,43:plainHead,44:plainHead,45:plainHead,46:plainHead,47:plainHead,48:plainHead,
+      49:plainHead,50:plainHead,51:plainHead,52:plainHead,53:plainHead,54:plainHead,55:plainHead,56:plainHead,
+      57:plainHead,58:plainHead,59:plainHead,60:plainHead,61:plainHead,62:plainHead,63:plainHead,64:plainHead,
+    };
+    this.sequence=[
+      {from:1,to:1,operation:(ids,state)=>oneWindow(ids,state,null)},
+      {from:2,to:3,operation:(ids,state)=>rowsWindow(ids,state,null)},
+      {from:4,to:4,operation:(ids,state)=>fourWindow(ids,state,null)},
+      {from:5,to:8,operation:(ids,state)=>mmaWindow(ids,state,null)},
+      {from:9,to:15,operation:(ids,state)=>wideWindow(ids,state,null)},
+      {from:16,to:32,operation:(ids,state)=>tiledWindow(ids,state,null)},
+      {from:33,to:Infinity,operation:(ids,state)=>expandedWindow(ids,state,null)},
+    ];
+    this.mediaPrefill=[
+      {from:1,to:4,operation:(embeds,state,positions)=>this.#positioned(mediaNarrow,ops.contiguous(embeds),state,"window",positions)},
+      {from:5,to:8,operation:(embeds,state,positions)=>this.#positionedBounded(mediaFiveToEight,ops.contiguous(embeds),state,positions)},
+      {from:9,to:15,operation:(embeds,state,positions)=>this.#positionedBounded(mediaWide,ops.contiguous(embeds),state,positions)},
+      {from:16,to:32,operation:(embeds,state,positions)=>this.#positionedBounded(mediaTiled,ops.contiguous(embeds),state,positions)},
+      {from:33,to:Infinity,operation:(embeds,state,positions)=>this.#positionedBounded(mediaExpanded,ops.contiguous(embeds),state,positions)},
+    ];
+    this.mediaPrompt=[
+      {from:1,to:4,operation:(ids,state,positions)=>this.#positioned(mediaNarrow,this.embed.encode(ids),state,"window",positions)},
+      {from:5,to:8,operation:(ids,state,positions)=>this.#positionedBounded(mediaFiveToEight,this.embed.encode(ids),state,positions)},
+      {from:9,to:15,operation:(ids,state,positions)=>this.#positionedBounded(mediaWide,this.embed.encode(ids),state,positions)},
+      {from:16,to:32,operation:(ids,state,positions)=>this.#positionedBounded(mediaTiled,this.embed.encode(ids),state,positions)},
+      {from:33,to:Infinity,operation:(ids,state,positions)=>this.#positionedBounded(mediaExpanded,this.embed.encode(ids),state,positions)},
+    ];
+    const mediaSmallDecode:MlxPositionedForward=(ids,state,positions)=>this.#positioned(mediaNarrow,this.embed.encode(ids),state,"decode",positions);
+    const mediaLargeDecode:MlxPositionedForward=(ids,state,positions)=>this.#positioned(mediaFiveToEight,this.embed.encode(ids),state,"decode",positions);
+    this.mediaDecode={1:mediaSmallDecode,2:mediaSmallDecode,3:mediaSmallDecode,4:mediaSmallDecode,5:mediaLargeDecode,6:mediaLargeDecode,7:mediaLargeDecode,8:mediaLargeDecode};
+    const separatedWindow=[
+      {from:1,to:1,operation:(group:Parameters<MlxSeparateMixed["window"][number]["operation"]>[0])=>oneWindow(group.ids,group.state,group.capture)},
+      {from:2,to:3,operation:(group:Parameters<MlxSeparateMixed["window"][number]["operation"]>[0])=>rowsWindow(group.ids,group.state,group.capture)},
+      {from:4,to:4,operation:(group:Parameters<MlxSeparateMixed["window"][number]["operation"]>[0])=>fourWindow(group.ids,group.state,group.capture)},
+      {from:5,to:8,operation:(group:Parameters<MlxSeparateMixed["window"][number]["operation"]>[0])=>mmaWindow(group.ids,group.state,group.capture)},
+      {from:9,to:15,operation:(group:Parameters<MlxSeparateMixed["window"][number]["operation"]>[0])=>wideWindow(group.ids,group.state,group.capture)},
+      {from:16,to:32,operation:(group:Parameters<MlxSeparateMixed["window"][number]["operation"]>[0])=>tiledWindow(group.ids,group.state,group.capture)},
+      {from:33,to:Infinity,operation:(group:Parameters<MlxSeparateMixed["window"][number]["operation"]>[0])=>expandedWindow(group.ids,group.state,group.capture)},
+    ];
+    this.mixedSeparate={decode:[
+      {from:1,to:1,operation:group=>oneDecode(group.ids,group.state,group.capture)},
+      {from:2,to:3,operation:group=>rowsDecode(group.ids,group.state,group.capture)},
+      {from:4,to:4,operation:group=>fourDecode(group.ids,group.state,group.capture)},
+      {from:5,to:8,operation:group=>mmaDecode(group.ids,group.state,group.capture)},
+    ],window:separatedWindow,verify:separatedWindow};
+    console.error(`[graph] ${this.graph}`);
+  }
+
+  dispose():void { disposeResources(this.#owned.splice(0)); }
+  loraTargets():Map<string,QuantizedLinear> { return new Map(this.#targets); }
+  bindMediaInput(input:Vision):MlxPromptInput { return bindQwenMediaInput(this,input.embeddings,input.mrope!); }
+  mediaEncoders(modelDir:string):Promise<MediaEncoders> { return qwenMediaEncoders(this,modelDir); }
+  draftTarget(_state:Cache[]):TargetView { return qwenDraftTarget(this,this.#residualBasis); }
+  logitsFromHidden(hidden:MlxArray):MlxArray { return this.#head.forward(hidden); }
+
+  #submitted(layers:Layers,ids:MlxArray,state:Cache[],phase:ReadPhase,capture:MlxLayerCapture|null):MlxArray {
+    using scope=new SubmittedGraphForwardScope(this.embed.encode(ids),capture,64,4);
+    return this.#run(layers,state,phase,scope);
+  }
+  #bounded(layers:Layers,ids:MlxArray,state:Cache[],phase:ReadPhase,capture:MlxLayerCapture|null):MlxArray {
+    using scope=new BoundedGraphForwardScope(this.embed.encode(ids),capture,state);
+    return this.#run(layers,state,phase,scope);
+  }
+  #lazy(layers:Layers,ids:MlxArray,state:Cache[],phase:ReadPhase,capture:MlxLayerCapture|null):MlxArray {
+    using scope=new GraphForwardScope(this.embed.encode(ids),capture);
+    return this.#run(layers,state,phase,scope);
+  }
+  #positioned(layers:Layers,hidden:MlxArray,state:Cache[],phase:ReadPhase,positions:MlxArray):MlxArray {
+    using scope=new GraphForwardScope(hidden,null);
+    return this.#run(layers,state,phase,scope,{posIds:positions,...this.#mrope});
+  }
+  #positionedBounded(layers:Layers,hidden:MlxArray,state:Cache[],positions:MlxArray):MlxArray {
+    using scope=new BoundedGraphForwardScope(hidden,null,state);
+    return this.#run(layers,state,"window",scope,{posIds:positions,...this.#mrope});
+  }
+
+  /** Every callsite has its written DeltaNet or full-attention layer type. */
+  #run(layers:Layers,state:Cache[],phase:ReadPhase,scope:GraphForwardScope,positions:MropeForwardState|null=null):MlxArray {
+    scope.accept(0,layers[0].forward(scope.hidden,state[0]!,phase));
+    scope.accept(1,layers[1].forward(scope.hidden,state[1]!,phase));
+    scope.accept(2,layers[2].forward(scope.hidden,state[2]!,phase));
+    scope.accept(3,layers[3].forward(scope.hidden,state[3]!,phase,positions));
+    scope.accept(4,layers[4].forward(scope.hidden,state[4]!,phase));
+    scope.accept(5,layers[5].forward(scope.hidden,state[5]!,phase));
+    scope.accept(6,layers[6].forward(scope.hidden,state[6]!,phase));
+    scope.accept(7,layers[7].forward(scope.hidden,state[7]!,phase,positions));
+    scope.accept(8,layers[8].forward(scope.hidden,state[8]!,phase));
+    scope.accept(9,layers[9].forward(scope.hidden,state[9]!,phase));
+    scope.accept(10,layers[10].forward(scope.hidden,state[10]!,phase));
+    scope.accept(11,layers[11].forward(scope.hidden,state[11]!,phase,positions));
+    scope.accept(12,layers[12].forward(scope.hidden,state[12]!,phase));
+    scope.accept(13,layers[13].forward(scope.hidden,state[13]!,phase));
+    scope.accept(14,layers[14].forward(scope.hidden,state[14]!,phase));
+    scope.accept(15,layers[15].forward(scope.hidden,state[15]!,phase,positions));
+    scope.accept(16,layers[16].forward(scope.hidden,state[16]!,phase));
+    scope.accept(17,layers[17].forward(scope.hidden,state[17]!,phase));
+    scope.accept(18,layers[18].forward(scope.hidden,state[18]!,phase));
+    scope.accept(19,layers[19].forward(scope.hidden,state[19]!,phase,positions));
+    scope.accept(20,layers[20].forward(scope.hidden,state[20]!,phase));
+    scope.accept(21,layers[21].forward(scope.hidden,state[21]!,phase));
+    scope.accept(22,layers[22].forward(scope.hidden,state[22]!,phase));
+    scope.accept(23,layers[23].forward(scope.hidden,state[23]!,phase,positions));
+    scope.accept(24,layers[24].forward(scope.hidden,state[24]!,phase));
+    scope.accept(25,layers[25].forward(scope.hidden,state[25]!,phase));
+    scope.accept(26,layers[26].forward(scope.hidden,state[26]!,phase));
+    scope.accept(27,layers[27].forward(scope.hidden,state[27]!,phase,positions));
+    scope.accept(28,layers[28].forward(scope.hidden,state[28]!,phase));
+    scope.accept(29,layers[29].forward(scope.hidden,state[29]!,phase));
+    scope.accept(30,layers[30].forward(scope.hidden,state[30]!,phase));
+    scope.accept(31,layers[31].forward(scope.hidden,state[31]!,phase,positions));
+    scope.accept(32,layers[32].forward(scope.hidden,state[32]!,phase));
+    scope.accept(33,layers[33].forward(scope.hidden,state[33]!,phase));
+    scope.accept(34,layers[34].forward(scope.hidden,state[34]!,phase));
+    scope.accept(35,layers[35].forward(scope.hidden,state[35]!,phase,positions));
+    scope.accept(36,layers[36].forward(scope.hidden,state[36]!,phase));
+    scope.accept(37,layers[37].forward(scope.hidden,state[37]!,phase));
+    scope.accept(38,layers[38].forward(scope.hidden,state[38]!,phase));
+    scope.accept(39,layers[39].forward(scope.hidden,state[39]!,phase,positions));
+    scope.accept(40,layers[40].forward(scope.hidden,state[40]!,phase));
+    scope.accept(41,layers[41].forward(scope.hidden,state[41]!,phase));
+    scope.accept(42,layers[42].forward(scope.hidden,state[42]!,phase));
+    scope.accept(43,layers[43].forward(scope.hidden,state[43]!,phase,positions));
+    scope.accept(44,layers[44].forward(scope.hidden,state[44]!,phase));
+    scope.accept(45,layers[45].forward(scope.hidden,state[45]!,phase));
+    scope.accept(46,layers[46].forward(scope.hidden,state[46]!,phase));
+    scope.accept(47,layers[47].forward(scope.hidden,state[47]!,phase,positions));
+    scope.accept(48,layers[48].forward(scope.hidden,state[48]!,phase));
+    scope.accept(49,layers[49].forward(scope.hidden,state[49]!,phase));
+    scope.accept(50,layers[50].forward(scope.hidden,state[50]!,phase));
+    scope.accept(51,layers[51].forward(scope.hidden,state[51]!,phase,positions));
+    scope.accept(52,layers[52].forward(scope.hidden,state[52]!,phase));
+    scope.accept(53,layers[53].forward(scope.hidden,state[53]!,phase));
+    scope.accept(54,layers[54].forward(scope.hidden,state[54]!,phase));
+    scope.accept(55,layers[55].forward(scope.hidden,state[55]!,phase,positions));
+    scope.accept(56,layers[56].forward(scope.hidden,state[56]!,phase));
+    scope.accept(57,layers[57].forward(scope.hidden,state[57]!,phase));
+    scope.accept(58,layers[58].forward(scope.hidden,state[58]!,phase));
+    scope.accept(59,layers[59].forward(scope.hidden,state[59]!,phase,positions));
+    scope.accept(60,layers[60].forward(scope.hidden,state[60]!,phase));
+    scope.accept(61,layers[61].forward(scope.hidden,state[61]!,phase));
+    scope.accept(62,layers[62].forward(scope.hidden,state[62]!,phase));
+    scope.accept(63,layers[63].forward(scope.hidden,state[63]!,phase,positions));
+    return scope.finish(64,this.finalNorm.forward(scope.hidden));
   }
 }

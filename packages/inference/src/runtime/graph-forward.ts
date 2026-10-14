@@ -1,13 +1,13 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
-import type { Cache } from "../contracts/mlx/cache";
-import type { MlxLayerCapture } from "../contracts/mlx/graph";
+type LayerCapture=(layer:number,hidden:MlxArray)=>void;
+interface ForwardCache { state():MlxArray[]; readonly stateNeedsDispose?:boolean }
 
 /** Owns intermediates of a written forward. The graph calls its layers itself;
  * this scope only releases the previous output and records the new one. */
 export class GraphForwardScope {
   #hidden: MlxArray | null;
-  constructor(hidden: MlxArray, readonly capture: MlxLayerCapture | null) { this.#hidden = hidden; }
+  constructor(hidden: MlxArray, readonly capture: LayerCapture | null) { this.#hidden = hidden; }
   get hidden(): MlxArray { return this.#hidden!; }
   protected replace(next: MlxArray): void {
     this.#hidden!.dispose();
@@ -17,7 +17,7 @@ export class GraphForwardScope {
     this.replace(next);
     this.capture?.(layer, next);
   }
-  bound(layer: number, next: MlxArray, cache: Cache): void {
+  bound(layer: number, next: MlxArray, cache: ForwardCache): void {
     this.replace(next);
     const state = cache.state();
     try { ops.evalAll([next, ...state]); }
@@ -36,13 +36,13 @@ export class GraphForwardScope {
 
 /** The written prompt operation requests one materialization per layer. */
 export class BoundedGraphForwardScope extends GraphForwardScope {
-  constructor(hidden: MlxArray, capture: MlxLayerCapture | null, readonly caches: readonly Cache[]) { super(hidden, capture); }
+  constructor(hidden: MlxArray, capture: LayerCapture | null, readonly caches: readonly ForwardCache[]) { super(hidden, capture); }
   override accept(layer: number, next: MlxArray): void { this.bound(layer, next, this.caches[layer]!); }
 }
 
 /** Submission cadence only; projection and layer calls remain in the file. */
 export class SubmittedGraphForwardScope extends GraphForwardScope {
-  constructor(hidden: MlxArray, capture: MlxLayerCapture | null, readonly layers: number, readonly every: number) { super(hidden, capture); }
+  constructor(hidden: MlxArray, capture: LayerCapture | null, readonly layers: number, readonly every: number) { super(hidden, capture); }
   override accept(layer: number, next: MlxArray): void {
     this.replace(next);
     if ((layer + 1) % this.every === 0 && layer + 1 < this.layers) this.submit();
