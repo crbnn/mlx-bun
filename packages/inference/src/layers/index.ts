@@ -18,4 +18,10 @@ export * from "./rope";
 export * from "./rope-2d";
 
 export * from "./trellis-prompt";
-export { LoraDelta } from "./lora";
+export * from "./affine-verify-linear";
+export * from "./ane-prefill-split";
+export * from "./trellis-gate-up";
+export * from "./trellis-down";
+export * from "./trellis-reduce-gate-up";
+export * from "./trellis-scatter-down";
+export { LoraDelta, LoraOperation, LoraState } from "./lora";

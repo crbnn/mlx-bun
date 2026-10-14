@@ -66,3 +66,8 @@ export class ReduceMixedGateUp {
     return fusedGateUpSwigluMixed(x, this.gate, this.up, this.#variant, this.tail, this.#exactBits);
   }
 }
+
+/** Fixed split activation for the written M1 graph's mixed-width projections. */
+export class ReduceSplitMixedGateUp extends ReduceMixedGateUp {
+  constructor(gate: TrellisLinear, up: TrellisLinear) { super(gate, up, "split"); }
+}

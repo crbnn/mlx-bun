@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { MlxArray } from "@mlx-bun/mlx/array";
+import type { Cache } from "../../src/contracts/mlx/cache";
 import type { MlxCapturingForward, MlxTokenPhases } from "../../src/contracts/mlx/graph";
 import { MlxPhaseDispatch, promptWorkStep, verifyWorkStep } from "../../src/generation/phase-dispatch";
 
@@ -56,4 +57,18 @@ test("mixed-work metadata carries real rows",()=>{
   const own=async()=>{throw new Error("stand-in");};
   expect(promptWorkStep({phase:"tail",sequences:3,tokens:5},null,own)).toEqual({phase:"window",rows:15,capture:null,own});
   expect(verifyWorkStep({sequences:2,positions:4},null,own)).toEqual({phase:"verify",rows:8,capture:null,own});
+});
+
+test("known-span ranges preserve a whole grammar span beyond decode and verify caps",()=>{
+  const narrow=()=>{throw new Error("narrow operation must not run");};
+  const calls:{ids:MlxArray;state:unknown}[]=[];
+  const expanded=(ids:MlxArray,state:unknown)=>{calls.push({ids,state});return ids;};
+  const dispatch=new MlxPhaseDispatch({...graph(),appendKnown:[
+    {from:1,to:4,operation:narrow},{from:5,to:Infinity,operation:expanded},
+  ]});
+  const input={} as MlxArray,state:Cache[]=[];
+  expect(dispatch.known(80)).toBe(expanded);
+  expect(dispatch.known(262144)).toBe(expanded);
+  expect(dispatch.known(80)(input,state)).toBe(input);
+  expect(calls).toEqual([{ids:input,state}]);
 });

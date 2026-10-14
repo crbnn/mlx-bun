@@ -166,7 +166,7 @@ export class AneTrellisMlpSplitK3i implements Disposable {
  *  outputs concatenate in row order. */
 export class AneAffineSplit implements Disposable {
   private constructor(readonly program: AneStreamedMatmul, readonly head: { w: MlxArray; scales: MlxArray; biases: MlxArray },
-    readonly rest: QuantizedLinear, readonly spec: ops.QuantSpec) {}
+    readonly rest: QuantizedLinear, readonly spec: ops.QuantSpec, readonly linear: QuantizedLinear) {}
 
   /** Loads `aneAffineSplitProgram(K, N, fraction, rows)` for pieces of up to
    *  `rows` rows now, as AneTrellisMlpSplit.build loads its program. `share`: as
@@ -179,7 +179,7 @@ export class AneAffineSplit implements Disposable {
     const rowsOf = (a: MlxArray, start: number, stop: number) => a.slice([start, 0], [stop, a.shape[1]!]);
     const head = { w: rowsOf(lin.w, 0, n), scales: rowsOf(lin.scales, 0, n), biases: rowsOf(lin.biases, 0, n) };
     const rest = new QuantizedLinear(rowsOf(lin.w, n, N), rowsOf(lin.scales, n, N), rowsOf(lin.biases, n, N), lin.spec);
-    return new AneAffineSplit(program, head, rest, lin.spec);
+    return new AneAffineSplit(program, head, rest, lin.spec, lin);
   }
 
   /** x [.., M, K], M <= rows → [.., M, N]. */
@@ -210,7 +210,7 @@ export class AneAffineSplit implements Disposable {
       using both = ops.concatAxis([b, g2], -1);
       const result = ops.reshape(both, [...lead, n + this.rest.outFeatures]);
       result.eval();
-      return result;
+      return this.linear.delta.forward(x, result);
     } finally { gpu.dispose(); }
   }
 

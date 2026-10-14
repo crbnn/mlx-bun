@@ -17,7 +17,7 @@ function project(lin: TrellisLinear, kernel: Kernel, x: MlxArray): MlxArray {
   const g = lin.geometry, lead = x.shape.slice(0, -1);
   using x2 = ops.reshape(x, [lead.reduce((a, b) => a * b, 1), g.inFeatures]);
   using y = kernel(x2, lin.codes, lin.scales, g);
-  return ops.reshape(y, [...lead, g.outFeatures]);
+  return lin.delta.forward(x, ops.reshape(y, [...lead, g.outFeatures]));
 }
 function rowMajor(name: string, lin: TrellisLinear): void {
   const g = lin.geometry;
