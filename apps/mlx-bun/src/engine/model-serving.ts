@@ -1,3 +1,4 @@
+import type { MlxSequenceRange, MlxSequenceForward } from "@mlx-bun/inference/contracts/mlx";
 import type { Composition } from "@mlx-bun/inference/contracts/portable";
 import type { ModelContext, LoadedModelContext } from "./model-host";
 import type { ModelBinding } from "./model-binding";
@@ -15,13 +16,14 @@ function compositionWire(composition: Composition): unknown {
  * supply a binding explicitly and need no forward/makeCache methods. */
 export async function modelServingBinding(context: LoadedModelContext, supplied?: ModelBinding): Promise<ModelBinding> {
   if (supplied) return supplied;
-  const [{ declaredGraph, embeddingDeclarationFor }, { embedMany, embeddingTerminatorId, isEmbeddingModel }, { bindMlxGateway }, { MLX_VERSION, deviceArchitecture }, ops] = await Promise.all([
+  const [{ declaredGraph, embeddingDeclarationFor }, { embedMany, embeddingTerminatorId, isEmbeddingModel }, { bindMlxGateway }, { MLX_VERSION, deviceArchitecture }, ops, { sequenceHiddenOperation }] = await Promise.all([
     import("@mlx-bun/inference/models"), import("@mlx-bun/inference/embeddings"),
-    import("@mlx-bun/inference/execution"), import("@mlx-bun/mlx/ffi"), import("@mlx-bun/mlx/ops"),
+    import("@mlx-bun/inference/execution"), import("@mlx-bun/mlx/ffi"), import("@mlx-bun/mlx/ops"), import("@mlx-bun/inference/scoring"),
   ]);
   const ctx = context as ModelContext;
   const model = ctx.model;
-  if (typeof model.makeCache !== "function" || typeof model.sequenceHidden !== "function")
+  const scoring = model as { readonly sequence?: readonly MlxSequenceRange[]; readonly sequenceHidden?: MlxSequenceForward };
+  if (typeof model.makeCache !== "function" || (!scoring.sequence && typeof scoring.sequenceHidden !== "function"))
     throw new Error("model implementation must supply its serving binding");
   declaredGraph(model);
   const gateway = bindMlxGateway(model, ctx.draft ?? undefined);
@@ -39,7 +41,7 @@ export async function modelServingBinding(context: LoadedModelContext, supplied?
         // The whole prompt as one window (the scoring forward), the head over every position.
         const input = ops.fromInt32(ids, [1, ids.length]);
         let hidden;
-        try { hidden = model.sequenceHidden(input, caches, (ids.length)); } finally { input.dispose(); }
+        try { hidden = sequenceHiddenOperation(scoring, input, caches, ids.length); } finally { input.dispose(); }
         let logits;
         try { logits = model.logitsFromHidden(hidden); } finally { hidden.dispose(); }
         let f: Float32Array;

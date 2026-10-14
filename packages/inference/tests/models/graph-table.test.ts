@@ -1,15 +1,14 @@
 // The loader's selection tables (E1): every resident family's graphs are data,
 // selected once at load from the artifact fingerprint and the composition. No
-// model loads here: configs are synthetic or the committed generator fixtures,
+// model loads here: configs and composition records are synthetic,
 // compositions come from resolveComposition with the device overridden, and the
 // selected entry is read, never built. Real-weight selection is
 // graph-table-real-weights.test.ts.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadModelConfig, type ModelConfig } from "../../src/artifacts/config";
-import { configFingerprint } from "../../src/artifacts/fingerprint";
 import type { Composition } from "../../src/contracts/portable/composition";
 import { resolveComposition, type CompositionRequest } from "../../src/models/composition";
 import { MLX_GRAPH_TABLES } from "../../src/models/factory";
@@ -187,36 +186,40 @@ describe("the Qwen 3.5 table", () => {
 
 describe("the Gemma 4 table", () => {
   const table = MLX_GRAPH_TABLES["gemma4"]!;
-  const fixtures = join(import.meta.dir, "../fixtures/gemma4-graphs");
-  const stems = { "gemma4-12b": "gemma-4-12B-it-OptiQ-4bit", "gemma4-e4b": "gemma-4-e4b-it-OptiQ-4bit", "gemma4-26b": "gemma-4-26B-A4B-it-OptiQ-4bit" };
-  const fixture = async (repo: string) => {
-    const snapshots = join(fixtures, `models--mlx-community--${repo}`, "snapshots");
-    return loadModelConfig(join(snapshots, readdirSync(snapshots)[0]!));
+  const graphs = [gemmaE4b, gemma12b, gemma26b] as const;
+  const configFor = (graph: typeof graphs[number]): ModelConfig => {
+    const scheme = graph.COMPOSITION.kv![0]!;
+    if (scheme.kind !== "affine-layers") throw new Error("expected declared per-cache affine scheme");
+    return { ...qwen, modelType: "gemma4", kvQuant: scheme.layers.map(layer => ({ layerIdx: layer.layer, bits: layer.bits, groupSize: layer.groupSize })),
+      text: { ...qwen.text, numHiddenLayers: graph.LAYERS.length, layerTypes: graph.LAYERS.map(layer => layer.attention === "sliding" ? "sliding_attention" : "full_attention") } };
   };
-
-  for (const [stem, repo] of Object.entries(stems)) {
-    test(`${stem}: its fingerprint with its kv_config scheme selects the generated graph; any other scheme the generic graph`, async () => {
-      const config = await fixture(repo);
-      const pick = (request: CompositionRequest) => table.select(config, on(M4_PRO, config, request)).id;
+  for (const [index, stem] of ["gemma4-e4b", "gemma4-12b", "gemma4-26b"].entries()) {
+    test(`${stem}: declared fingerprint and cache scheme select the file within its row tables`, () => {
+      const graph = graphs[index]!, config = configFor(graph);
+      const pick = (request: CompositionRequest) => table.match(graph.FINGERPRINT, on(M4_PRO, config, request)).id;
       expect(on(M4_PRO, config, { kv: { override: "config" } }).kv.kind).toBe("affine-layers");
       expect(pick({ kv: { override: "config" } })).toBe(stem);
       expect(pick({ kv: { override: "config", quantizedKvStart: 100 } })).toBe(stem);
-      // `--fused-sdpa` names the read kernels its caches compose, not another graph.
       for (const fusedSdpa of [true, false]) expect(pick({ kv: { override: "config", fusedSdpa } })).toBe(stem);
-      // Selection does not depend on the device, rows or adapters for these entries.
-      expect(table.select(config, on(M1_MAX, config, { kv: { override: "config" }, maxRows: 32, adapters: true })).id).toBe(stem);
+      const otherMachine = on(M1_MAX, config, { kv: { override: "config" }, maxRows: 32, adapters: true });
+      expect(table.match(graph.FINGERPRINT, otherMachine).id).toBe("gemma4");
+      expect(table.select(config, otherMachine, stem).id).toBe(stem);
+      expect(pick({ kv: { override: "config" }, maxRows: 8, draft: { numDraftTokens: 7 } })).toBe(stem);
+      expect(pick({ kv: { override: "config" }, maxRows: 8, draft: { numDraftTokens: 8 } })).toBe("gemma4");
       for (const other of [{}, { kv: { override: "off" as const } }, { kv: { override: 4 } }, { kv: { override: 8 } },
         { kv: { turboQuant: { kBits: 8, vBits: 3 } } }]) expect(pick(other)).toBe("gemma4");
     });
   }
-
-  test("a generated file's scheme on another fingerprint, or a non-generated Gemma 4 artifact, gets the generic graph", async () => {
-    const e4b = await fixture(stems["gemma4-e4b"]), twelve = await fixture(stems["gemma4-12b"]);
-    const e4bScheme = on(M4_PRO, e4b, { kv: { override: "config" } });
-    expect(table.match(configFingerprint(twelve), e4bScheme).id).toBe("gemma4");
-    expect(table.match("0000000000000000", e4bScheme).id).toBe("gemma4");
+  test("another fingerprint or another file's cache scheme gets the generic default", () => {
+    const config = configFor(gemmaE4b), scheme = on(M4_PRO, config, { kv: { override: "config" } });
+    expect(table.match(gemma12b.FINGERPRINT, scheme).id).toBe("gemma4");
+    expect(table.match("0000000000000000", scheme).id).toBe("gemma4");
   });
 });
+
+import * as gemmaE4b from "../../src/models/gemma4/gemma4-e4b";
+import * as gemma12b from "../../src/models/gemma4/gemma4-12b";
+import * as gemma26b from "../../src/models/gemma4/gemma4-26b";
 
 test("every resident family's table has its generic graph, named for the family", () => {
   for (const [graph, table] of Object.entries(MLX_GRAPH_TABLES)) expect([graph, table.generic.id]).toEqual([graph, graph]);

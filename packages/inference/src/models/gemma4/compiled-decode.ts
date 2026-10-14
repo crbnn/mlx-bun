@@ -62,6 +62,10 @@ export interface CompiledGemmaTarget {
   /** The one-row decode operation the trace records. */
   readonly decode: MlxRowTable<MlxCapturingForward>;
   logitsFromHidden(hidden: MlxArray): MlxArray;
+  /** Written graphs name their plain operations for the enclosing trace. */
+  readonly traceDecode?: MlxCapturingForward;
+  readonly traceLogits?: (hidden: MlxArray) => MlxArray;
+  readonly traceLayers?: CompiledGemmaTarget["layers"];
 }
 
 /** Graph-shape signature: anything that changes the traced op sequence
@@ -85,14 +89,16 @@ function traceCaches(slots: readonly DecodeSlot[], inputs: readonly MlxArray[], 
 }
 
 function makeTraceFn(model: CompiledGemmaTarget, slots: DecodeSlot[]) {
+  const decode = model.traceDecode ?? model.decode[1]!;
+  const head = model.traceLogits ?? model.logitsFromHidden.bind(model);
   return (inputs: MlxArray[]): MlxArray[] => {
     const adapters = traceCaches(slots, inputs, inputs[1]!);
     setCompiledTrace(true);
     try {
       const ids = ops.reshape(inputs[0]!, [1, 1]);
-      const h = model.decode[1]!(ids, adapters, null) as MlxArray;
+      const h = decode(ids, adapters, null) as MlxArray;
       ids.dispose();
-      const logits = model.logitsFromHidden(h);
+      const logits = head(h);
       h.dispose();
       return [logits, ...adapters.flatMap((a) => a.outs)];
     } finally {
@@ -121,6 +127,8 @@ function makeSegmentTraceFn(
   model: CompiledGemmaTarget, slots: DecodeSlot[], from: number, to: number,
   first: boolean, last: boolean,
 ) {
+  const layers = model.traceLayers ?? model.layers;
+  const head = model.traceLogits ?? model.logitsFromHidden.bind(model);
   return (inputs: MlxArray[]): MlxArray[] => {
     setCompiledTrace(true);
     try {
@@ -139,7 +147,7 @@ function makeSegmentTraceFn(
       }
 
       for (let i = from; i < to; i++) {
-        const { h: next, donor } = model.layers[i]!.forward(h, adapters[i - from]!, "decode", null, null);
+        const { h: next, donor } = layers[i]!.forward(h, adapters[i - from]!, "decode", null, null);
         h.dispose();
         h = next;
         donor?.dispose();
@@ -149,7 +157,7 @@ function makeSegmentTraceFn(
       if (last) {
         const normed = model.finalNorm.forward(h);
         h.dispose();
-        out = model.logitsFromHidden(normed);
+        out = head(normed);
         normed.dispose();
       }
       return [out, ...adapters.flatMap((a) => a.outs)];
