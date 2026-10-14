@@ -60,10 +60,10 @@ test("the loaded drafter settles the draft depth before the graph is built: its 
   const { loadContext } = await import("../../src/engine/model-host");
   for (const [numDraftTokens, depth] of [[undefined, 10], [4, 4]] as const) {
     const context = await loadContext(dir, "tiny", { draftKind: "ngram", ...(numDraftTokens ? { numDraftTokens } : {}),
-      kv: { override: 4, quantizedKvStart: 256 }, adapters: true });
+      kv: { override: 4, quantizedKvStart: 256 } });
     try {
       expect(context.draft?.numDraftTokens).toBe(depth);
-      expect(context.composition).toMatchObject({ draftDepth: depth, adapters: true, maxRows: 8,
+      expect(context.composition).toMatchObject({ draftDepth: depth, maxRows: 8,
         kv: { kind: "affine", bits: 4, groupSize: 64, quantizedKvStart: 256 } });
     } finally { context.dispose(); }
   }
