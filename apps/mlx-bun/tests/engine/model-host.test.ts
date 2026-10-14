@@ -187,7 +187,9 @@ test("compiled runner retirement is idempotent and never allocates an absent run
     mock.module("@mlx-bun/mlx/ops", () => ({ fromInt32: () => new ArrayValue() }));
     mock.module("@mlx-bun/mlx/ffi", () => ({ Dtype: {} }));
     const { CompiledDecode } = await import("@mlx-bun/inference/models/gemma4/compiled-decode");
+    const neverTraced = () => { throw new Error("never traced"); };
     const model = { config: { text: { numKvSharedLayers: 1, enableMoeBlock: false } }, perLayerWidth: 0,
+      traceDecode: neverTraced, traceLogits: neverTraced,
       materializeGraphConstants() { materializations++; } };
     CompiledDecode.release(model);
     assert.equal(materializations, 0); assert.equal(allocations, 0);
