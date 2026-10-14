@@ -60,22 +60,18 @@ Neural Engine split over programs every 64 positions to 768, every 128 to 1024 a
 -> 2.43/2.98/3.28/3.94/4.26/6.65 s; since 2026-10-14, with its layers queued, its programs in four reduction
 slices and, from 768 positions, the projections split as well, prompts of 300, 500, 639, 1024, 2048 and 8192
 tokens 2.43/3.26/3.89/5.83/11.18/45.85 -> 2.16/2.92/3.58/4.95/9.36/38.54 s with the weights wired);
-DFlash 2 adaptive on that chip (in-process serve, four
-prompts, 192 tokens, 2026-10-14, with the gate settings the graph declares for it) decodes greedy text at 26.0 against
-19.5 tok/s plain, 22.9 against 19.1 under Qwen's instruct sampling and 21.0 against 19.1 under its thinking sampling
-(33.3, 30.2 and 23.6 on the codebook matrix-unit kernels), the MTP head (adaptive up to four drafts, the graph's
-`adaptiveDraftWidths`) at 21.1, 20.2 and 19.2 (26.9, 25.3 and 21.4); with two and four concurrent requests (before
-the codebook kernels) DFlash 2
-decodes 30.4, 28.5 and 27.1 and 43-46, 39-42 and 38.2 tok/s in aggregate against plain's 19.9, 19.3 and 19.1 and
-30.5, 29.8 and 28.6 (the gate weighs a group's round by the rows it verifies, 16- and 32-row rounds measured);
-the adaptive gate drafts nothing where drafting does not pay (such rounds are the pipelined decode step, at plain
-decode's step time), yet on the short-story prompt DFlash 2 still trails plain decode by up to 5% (instruct sampling)
-and the MTP head by 2 to 4%; a replay of the gate over measured acceptance at every position of 96 texts puts the loss
-on text it loses on into its rounds before it first stops (2.0%) and after probes (1.3%), its probes (0.7%; a DFlash 2
-probe costs 8.7 to 11.5 ms by depth) and its transitions (0.3%: the first step without drafts after a round starts 3 to
-5 ms later than a pipelined one, a round after steps without drafts 6 to 8 ms), and no setting of the gate's prior,
-decay, margin, probe intervals or depth drafts at plain decode's rate or better on every such text without losing on
-text it drafts well; the M1
+DFlash 2 adaptive on that chip (in-process serve, 192 tokens, 2026-10-14, on the codebook matrix-unit kernels with
+the gate settings the graph declares for them; the four standard prompts and the four a replay of the gate finds
+hardest, the sampled modes over three seeds) decodes greedy text at 30.5 against 19.5 tok/s plain, 28.5 against 19.1
+under Qwen's instruct sampling and 24.5 against 19.1 under its thinking sampling (the standard four alone 33.8, 30.9
+and 24.6), the MTP head (adaptive up to four drafts, the graph's `adaptiveDraftWidths`; five and seven lose) at 26.7,
+24.8 and 22.4; with two and four concurrent requests DFlash 2 decodes 42.6, 42.0 and 33.0 and 47.5-48.3, 50.9 and
+45.0-45.3 tok/s in aggregate against plain's 24.2, 23.6 and 22.6 and 36.2, 34.9 and 34.1-35.3 (the gate weighs a
+group's round by the rows it verifies, 16- and 32-row rounds measured); the adaptive gate drafts nothing where
+drafting does not pay (such rounds are the pipelined decode step, at plain decode's step time), yet on short creative
+text (a limerick or a short poem, 35 to 80 tokens) both drafters still trail plain decode, by up to 16% under
+instruct sampling and 3% greedy (7 of 56 prompt, mode and seed runs for DFlash 2, 9 for the MTP head), the loss in
+drafted rounds the text does not repay (a replay over 96 texts: probes and transitions cost under 0.3%); the M1
 Max composition prefills 1k and 8k-token prompts at 207 and 213 tok/s (2026-10-14, alternated sessions of the graph's
 own prefill operations; 175 on 2026-10-13, 129 to 130 before its dense-GEMM prompt projections and Neural Engine
 MLP split; mean KL of the split against the GPU alone 1.2e-4 to 1.9e-3, 3e-5 to 2.0e-3 before) against 200 on
