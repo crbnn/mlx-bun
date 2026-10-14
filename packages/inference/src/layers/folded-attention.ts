@@ -19,7 +19,8 @@ export function foldedSdpaEligible(q: MlxArray, keys: MlxArray): boolean {
  *  query head (MLX's fallback broadcasts each KV head over its query heads).
  *  Otherwise MLX's fallback arithmetic, op for op: the scale cast to the query
  *  dtype, the bottom-right causal mask at -inf, the precise softmax. Bit for bit
- *  `ops.sdpa` on the windows `foldedSdpaEligible` takes (rows (r, i): head
+ *  `ops.sdpa` on the windows `foldedSdpaEligible` takes on `applegpu_g13s`, where
+ *  it was measured, and to bf16 precision elsewhere (rows (r, i): head
  *  KVH·rep + r, query i, which sees keys j <= N - L + i). q [B, H, L, D], keys
  *  and values [B, KVH, N, D] (any strides) → [B, H, L, D], owned by the caller. */
 export function foldedSdpa(q: MlxArray, keys: MlxArray, values: MlxArray, scale: number): MlxArray {

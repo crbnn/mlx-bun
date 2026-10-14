@@ -9,8 +9,8 @@
 // operation under the adapters composition) it is held to the generic Qwen 3.5 graph of its family over the same
 // weights under bf16, affine 4- and 8-bit and TurboQuant KV (affine 4-bit over the KV4 lego in both, whose window
 // reads are not the generic graph's unfused port), hidden, logits and every cache tensor, at maxDiff 0. Its
-// row kernels (threadgroup-codebook at one row; factored, simdgroup-matrix and affine verify kernels at two to eight;
-// the wider layers from nine to WIDER_ROWS rows) have no generic counterpart: the wider layers are held to the
+// row kernels (threadgroup-codebook at one row; the codebook simdgroup-matrix Trellis kernels and the affine verify
+// kernels at two to eight; the wider layers from nine to WIDER_ROWS rows) have no generic counterpart: the wider layers are held to the
 // generic graph within bf16 rounding here, and the generator's drift test (qwen38-generated-sync), the kernel tests,
 // the real-artifact parity suite on the M1 Max (tests/parity/qwen-trellis-parity.test.ts) and the app digests are
 // their gates. Its prompt pieces take their projections on DequantizedLinear: MLX's quantized matmul below a

@@ -151,13 +151,13 @@ export function sdpaRead(keys: MlxArray, values: MlxArray, mask: MaskLease): Att
   };
 }
 
-/** `sdpaRead` bit for bit, reading each KV head's keys and values once for a
- * causal window MLX's fused SDPA hands to its unfused fallback (up to 8 queries
- * per row, more than 32 per KV head: `foldedSdpaEligible`), where that fallback
- * reads them once per query head: such a window folds GQA into rows
- * (`foldedSdpa`); every other read is the stock fused SDPA. The bf16 window read
- * of the M1 Max Qwen3.8 composition, whose 6- to 8-row verify windows take it.
- * Takes ownership of `keys`, `values` and `mask`. */
+/** `sdpaRead`, reading each KV head's keys and values once for a causal window
+ * MLX's fused SDPA hands to its unfused fallback (up to 8 queries per row, more
+ * than 32 per KV head: `foldedSdpaEligible`), where that fallback reads them
+ * once per query head: such a window folds GQA into rows (`foldedSdpa`: the
+ * fallback's bits on `applegpu_g13s`, where it was measured, bf16 precision
+ * elsewhere); every other read is the stock fused SDPA. Takes ownership of
+ * `keys`, `values` and `mask`. */
 export function foldedWindowRead(keys: MlxArray, values: MlxArray, mask: MaskLease): AttentionRead {
   return {
     attend: (q, scale) => mask.mask.mode === "causal" && foldedSdpaEligible(q, keys)

@@ -16,13 +16,12 @@
 //  - greedy trajectory: the prompt once and each selected token on the same live
 //    cache through `model.forward`; every step's full last-position float32
 //    logits hash to main's (bit for bit) and are finite, and every selected
-//    token is main's. Where the graph's prompt operation reassociates (since
-//    2026-10-13 the M1 Max graph runs prompt pieces of nine to WIDER_ROWS
-//    positions on its wider layers), the prompt's logits are held by KL and
-//    argmax (KL_ROW, NEAR_TIE) to its generic blocks' over the same prompt
-//    (`prefillEmbeddings` at the caches' positions, then the plain head), which
-//    hash to main's, and the trajectory then decodes on that prompt state, main's
-//    to the bit;
+//    token is main's. Where the graph's prompt operation reassociates (the M1
+//    Max graph runs prompt pieces of nine to WIDER_ROWS positions on its wider
+//    layers), the prompt's logits are held by KL and argmax (KL_ROW, NEAR_TIE)
+//    to its generic blocks' over the same prompt (`prefillEmbeddings` at the
+//    caches' positions, then the plain head), which hash to main's, and the
+//    trajectory then decodes on that prompt state, main's to the bit;
 //  - verify windows against one-row decode on this tree, main's MTP run
 //    teacher-forced: after the prompt, each recorded round's window [pending,
 //    ...proposals] runs through `verify` at its width class, the caches'
@@ -44,13 +43,14 @@
 //    verify row, accepted or rejected) and the round and draft counters. Where
 //    they are not, a run's last bits depend on its window widths, which Josh's
 //    2026-10-11 width-class decision accepts, KL-gated, as the M4 Pro graph
-//    serves: since 2026-10-13 this tree's M1 Max graph verifies two to three rows
-//    on the factored and affine row kernels, which reassociate relative to its
-//    one-row codebook kernels (main's ran the reduce and scatter row kernels
-//    there). Then the emitted tokens equal plain greedy (main's) up to their
-//    first difference, which must fall on a near-tie of the one-row logits, and
-//    the counters are those the run's own target forwards and tokens give. The
-//    check keys on that measured identity, not on the graph's name.
+//    serves: this tree's M1 Max graph verifies two to eight rows on the codebook
+//    matrix-unit Trellis kernels and the affine row and split matrix-unit
+//    kernels, which reassociate relative to its one-row codebook kernels (main's
+//    ran the reduce and scatter row kernels there). Then the emitted tokens
+//    equal plain greedy (main's) up to their first difference, which must fall
+//    on a near-tie of the one-row logits, and the counters are those the run's
+//    own target forwards and tokens give. The check keys on that measured
+//    identity, not on the graph's name.
 // Continuation state and append geometry are the runtime-oracle plan's job
 // (README, "Repeatable runtime comparison"). This is not a claim about other
 // artifacts, batching above one, quantized KV, sampling, or speed.
@@ -65,12 +65,11 @@ const OPT_IN = ["MLX_BUN_TEST_QWEN_TRELLIS_TARGET", "MLX_BUN_TEST_QWEN_TRELLIS_D
   "MLX_BUN_TEST_QWEN_TRELLIS_REFERENCE_SHA256"] as const;
 const SPEC_KEYS = ["drafted", "accepted", "rejected", "targetCalls", "rounds", "acceptanceLengths", "draftedByPos", "acceptedByPos"] as const;
 const TARGET_METADATA = ["config.json", "model.safetensors.index.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja"];
-// A window row against its one-row decode, where the two are not bit-identical. Measured 2026-10-13 on the M1 Max
-// graph over main's three runs (192 rows): mean KL 2.4e-4, the largest 1.1e-2 (after the end of turn, stop tokens
-// off), the top two logits moved by at most 0.75, one argmax difference, at an exact bf16 tie. Faults put into the
-// two-to-four-row factored down kernel of the 24 row-major layers: one input row of each split's sum skipped, mean
-// 2.6e-3 and largest 1.4e-1; every row reading the first row's activations, mean 3.3 and argmax differences at
-// margins up to 11.
+// A window row against its one-row decode, where the two are not bit-identical. Measured on the M1 Max graph over
+// main's three runs (192 rows): mean KL 3.1e-4, the largest 1.2e-2 (after the end of turn, stop tokens off), every
+// argmax the one-row top or tied with it. Faults put into a two-to-four-row down kernel (the factored one) of the 24
+// row-major layers: one input row of each split's sum skipped, mean 2.6e-3 and largest 1.4e-1; every row reading the
+// first row's activations, mean 3.3 and argmax differences at margins up to 11.
 const KL_ROW = 5e-2, KL_MEAN = 1e-3;
 /** A logit this close to the top one is tied with it: four bf16 steps of a logit between 16 and 32, two above 32
  *  (these runs' top logits lie between 20 and 34). */
