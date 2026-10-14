@@ -4,7 +4,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import type { AttentionRead,BidirectionalAttentionCache,BlockAttentionCache,Cache,CommittedAttentionCache,CompiledDecodeCache,DecodeSlot,DecodeStepInputs,DecodeStepPlan,DecodeTrace,EncoderAttentionCache,KvDonorRows,Mask } from "../contracts/mlx/cache";
 import { bidirMask, createCausalMask } from "../kernels/attention/masks";
 import { QuantizedKVCache } from "./quantized-kv";
-import { AttentionMasks, causalLease, encoderWindowMask, sdpaRead, unmaskedLease, withLease } from "./attention-read";
+import { AttentionMasks, causalLease, encoderWindowMask, sdpaRead, unmaskedLease, withLease, type DenseRead } from "./attention-read";
 import type { AffineKernelSet } from "./affine-attention";
 import { uncomposedTurboQuantKernels, type TurboQuantKernels } from "./turboquant-attention";
 
@@ -16,11 +16,12 @@ export type { AffineKernelSet };
  *
  *  Reads: each named read appends through `updateAndFetch` and attends the
  *  fetched prefix with the stock fused SDPA, the call every graph makes after
- *  `updateAndFetch` today. Decode passes no mask and a window the fused causal
- *  mask; at one query the two compute the same bits, so a one-row window needs
- *  no case of its own. This cache has no sliding window (graphs compose
- *  `RotatingKVCache` for sliding layers), so only the bidirectional and encoder
- *  reads build a mask array. */
+ *  `updateAndFetch` today, a window through `windowRead` (that SDPA unless the
+ *  composition names a read computing its bits otherwise). Decode passes no
+ *  mask and a window the fused causal mask; at one query the two compute the
+ *  same bits, so a one-row window needs no case of its own. This cache has no
+ *  sliding window (graphs compose `RotatingKVCache` for sliding layers), so
+ *  only the bidirectional and encoder reads build a mask array. */
 export class KVCache implements CompiledDecodeCache, CommittedAttentionCache, BidirectionalAttentionCache, EncoderAttentionCache, BlockAttentionCache {
   static readonly STEP = 256;
   /** Set only by compiled-decode trace adapters (see Cache). */
@@ -40,6 +41,11 @@ export class KVCache implements CompiledDecodeCache, CommittedAttentionCache, Bi
      * MiniCPM5's `deferredTurboQuantKernels`; a graph that reads TurboQuant
      * storage only through the deprecated fetches passes none. */
     readonly turboQuantKernels: TurboQuantKernels = uncomposedTurboQuantKernels,
+    /** The read of a causal window (`appendWindow`, `appendCommitted`): the
+     * stock fused SDPA, or the read the composition names
+     * (`foldedWindowRead`, bit for bit the same). Row layouts made from this
+     * storage and its clones read their windows with it. */
+    readonly windowRead: DenseRead = sdpaRead,
   ) {}
 
   signature(): string { return "kv:plain"; }
@@ -51,7 +57,7 @@ export class KVCache implements CompiledDecodeCache, CommittedAttentionCache, Bi
 
   appendWindow(k: MlxArray, v: MlxArray): AttentionRead {
     const [keys, values] = this.updateAndFetch(k, v);
-    return sdpaRead(keys, values, causalLease);
+    return this.windowRead(keys, values, causalLease);
   }
 
   /** A bf16 committed span reads exactly as a window does. */
