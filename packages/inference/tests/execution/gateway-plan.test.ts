@@ -217,7 +217,12 @@ test.each(families)("%s places grammar with a bound grouped draft exactly as the
 });
 
 describe("DiffusionGemma interleaved denoising binding", () => {
-  const diffusion = () => standIn(DiffusionGemmaModel.prototype, "diffusion_gemma") as TestGraph<DiffusionGemmaModel>;
+  const denoisingOperation = () => { throw new Error("placement never denoises"); };
+  const diffusion = () => standIn(DiffusionGemmaModel.prototype, "diffusion_gemma", {
+    denoisingPrefill: [{ from: 1, to: Infinity, operation: denoisingOperation }],
+    denoisingAppend: [{ from: 1, to: Infinity, operation: denoisingOperation }],
+    denoisingDecode: [{ from: 1, to: Infinity, operation: denoisingOperation }],
+  }) as TestGraph<DiffusionGemmaModel>;
   const planWith = (binding: MlxGatewayBinding, request: typeof shape, options: GenerateOptions = {}) =>
     binding.plan(request, options, schedule);
 
