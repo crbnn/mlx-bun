@@ -33,8 +33,8 @@ test.skipIf(!inputs)("openModel builds the graph the table selects for the compo
   const { Qwen38TrellisM4Pro } = await import("../../src/models/qwen/qwen38-27b-trellis-m4pro");
   const { Qwen38TrellisM1Max } = await import("../../src/models/qwen/qwen38-27b-trellis-m1max");
   const { qwen35GraphFingerprint } = await import("../../src/models/qwen/checkpoint");
-  const generated = await Promise.all([import("../../src/models/gemma4/generated/gemma4-12b"),
-    import("../../src/models/gemma4/generated/gemma4-e4b"), import("../../src/models/gemma4/generated/gemma4-26b")]);
+  const generated = await Promise.all([import("../../src/models/gemma4/gemma4-12b"),
+    import("../../src/models/gemma4/gemma4-e4b"), import("../../src/models/gemma4/gemma4-26b")]);
   const dir = inputs!.model;
   const config = await loadModelConfig(dir);
   const device = deviceArchitecture();

@@ -10,7 +10,7 @@ import { CompiledFunction } from "@mlx-bun/mlx/compile";
 import type { ModelConfig } from "../artifacts/config";
 import type { Weights } from "../artifacts/weights";
 import { isCompiledTrace } from "../runtime/compiled-trace";
-import { QuantizedLinear } from "./quantized-linear";
+import { QuantizedLinear, QuantizedLinearPlain } from "./quantized-linear";
 
 /** Verbatim port of mlx_lm/models/gemma4_text.py:
  *    `@partial(mx.compile, shapeless=True) def geglu(gate, x): return nn.gelu_approx(gate) * x`
@@ -100,17 +100,31 @@ export class CompiledGeglu {
 
 export class PlainGegluMLP {
   readonly #activation = new PlainGeglu();
-  constructor(readonly base: GegluMLP) {}
+  readonly #gate: QuantizedLinearPlain;
+  readonly #up: QuantizedLinearPlain;
+  readonly #down: QuantizedLinearPlain;
+  constructor(readonly base: GegluMLP) {
+    this.#gate = new QuantizedLinearPlain(base.gate);
+    this.#up = new QuantizedLinearPlain(base.up);
+    this.#down = new QuantizedLinearPlain(base.down);
+  }
   forward(x: MlxArray): MlxArray {
-    using hidden = this.#activation.forward(this.base.gate.forward(x), this.base.up.forward(x));
-    return this.base.down.forward(hidden);
+    using hidden = this.#activation.forward(this.#gate.forward(x), this.#up.forward(x));
+    return this.#down.forward(hidden);
   }
 }
 export class CompiledGegluMLP {
   readonly #activation = new CompiledGeglu();
-  constructor(readonly base: GegluMLP) {}
+  readonly #gate: QuantizedLinearPlain;
+  readonly #up: QuantizedLinearPlain;
+  readonly #down: QuantizedLinearPlain;
+  constructor(readonly base: GegluMLP) {
+    this.#gate = new QuantizedLinearPlain(base.gate);
+    this.#up = new QuantizedLinearPlain(base.up);
+    this.#down = new QuantizedLinearPlain(base.down);
+  }
   forward(x: MlxArray): MlxArray {
-    using hidden = this.#activation.forward(this.base.gate.forward(x), this.base.up.forward(x));
-    return this.base.down.forward(hidden);
+    using hidden = this.#activation.forward(this.#gate.forward(x), this.#up.forward(x));
+    return this.#down.forward(hidden);
   }
 }

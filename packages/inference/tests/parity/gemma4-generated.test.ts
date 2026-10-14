@@ -88,13 +88,13 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the generic graph under kv_c
   const { composedAffineKernels } = await import("@mlx-bun/inference/state");
   const { composedStorageOf } = await import("../../src/state/capabilities");
   const configKernels = composedAffineKernels("tiled-causal");
-  const { GENERATED_GRAPHS } = await import("../../src/models/gemma4/generated");
+  const { GENERATED_GRAPHS } = await import("../../src/models/gemma4/graphs");
   const path = inputs!.model;
   const config = await loadModelConfig(path);
   const fingerprint = configFingerprint(config);
   const registered = GENERATED_GRAPHS.find(item => item.serves.fingerprint === fingerprint);
   assert(registered, `no generated graph is registered for fingerprint ${fingerprint}`);
-  const generated = await import(`../../src/models/gemma4/generated/${registered.id}`);
+  const generated = await import(`../../src/models/gemma4/${registered.id}`);
   const kvConfig = config.kvQuant;
   assert(kvConfig?.length, "the artifact's kv_config.json did not load");
   const tokenizer = await loadTokenizer(path);

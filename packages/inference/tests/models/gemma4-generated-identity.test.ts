@@ -1,27 +1,13 @@
-import type { Composition } from "../../src/contracts/portable/composition";
-import { testGraph } from "./test-composition";
-import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
-// Each generated Gemma 4 graph (src/models/gemma4/generated/*.ts, an entire graph
-// scripts/gen-gemma4.ts emits for one composition) against the generic Gemma 4
-// graph of its family over the same synthetic weights, where both serve the
-// composition: the artifact's kv_config scheme the generated graph is built for,
-// each graph composing its own bf16-first legos. Synthetic weights in each
-// composition's shape, read from its committed fixture (tests/fixtures/
-// gemma4-graphs): the layer types, the KV-sharing layers, the per-layer inputs
-// (e4b), keys equal to values (12B, 26B), the routed experts (26B), a layer
-// scalar on every layer and the artifact's per-layer kv_config; small widths and a
-// 16-position sliding window, so prompts of 37 and 200 wrap the rings. Prompts,
-// decodes, windows across the sliding boundary and the 256-position step, verify
-// windows and two rows in one forward: hidden, logits and every cache tensor at
-// maxDiff 0. The same graphs on real weights are tests/parity/gemma4-generated.test.ts.
-// No model, no download.
+import { phaseRowLimit } from "../../src/models/graph";
+// The written Gemma graphs against the generic family over deterministic
+// synthetic weights: exact hidden/logits/cache bytes through prompt, decode,
+// verify, ring wrap and the 256-position cache boundary. No artifact download.
+
 import { afterAll, describe, expect, test } from "bun:test";
-import { join } from "node:path";
-import { readdirSync } from "node:fs";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
-import { loadModelConfig, parseQuantization, type ModelConfig } from "../../src/artifacts/config";
+import { parseQuantization, type ModelConfig } from "../../src/artifacts/config";
 import type { Weights } from "../../src/artifacts/weights";
 import type { BatchableCache, Cache } from "../../src/contracts/mlx/cache";
 import type { MlxTokenPhases } from "../../src/contracts/mlx/graph";
@@ -30,14 +16,13 @@ import type { ServedComposition } from "../../src/models/implementation";
 import { Gemma4Model } from "../../src/models/gemma4/model";
 import { phaseHidden } from "./phase-forward";
 import { testComposition } from "./test-composition";
-import * as current12b from "../../src/models/gemma4/generated/gemma4-12b";
-import * as current26b from "../../src/models/gemma4/generated/gemma4-26b";
-import * as currentE4b from "../../src/models/gemma4/generated/gemma4-e4b";
+import * as current12b from "../../src/models/gemma4/gemma4-12b";
+import * as current26b from "../../src/models/gemma4/gemma4-26b";
+import * as currentE4b from "../../src/models/gemma4/gemma4-e4b";
 
 const HIDDEN = 256, INTER = 512, EXPERT_INTER = 128, VOCAB = 256, HEADS = 4, KV_HEADS = 2;
-const HEAD_DIM = 256, GLOBAL_HEAD_DIM = 512, WINDOW = 16, PER_LAYER = 64, EXPERTS = 4, TOP_K = 2;
+const HEAD_DIM = 256, GLOBAL_HEAD_DIM = 512, WINDOW = 16, PER_LAYER = 64, EXPERTS = 16, TOP_K = 8;
 const PREFIX = "language_model.model";
-const FIXTURES = join(import.meta.dir, "../fixtures/gemma4-graphs");
 const owned: MlxArray[] = [];
 afterAll(() => { for (const array of owned) array.dispose(); });
 const keep = (array: MlxArray) => { owned.push(array); return array; };
@@ -48,10 +33,36 @@ const tensor = (values: Float32Array, shape: number[], dtype = Dtype.bfloat16): 
   return keep(wide.astype(dtype));
 };
 
-/** The fixture's config: the composition's structure and its kv_config. */
+/** Independent artifact facts, recorded before the graph-file rewrite.
+ * All three artifacts have full attention at indices 5, 11, 17, ... .
+ * Cache widths are the original artifact kv_config, independent of the file. */
+const ARTIFACT_FACTS = {
+  e4b: { layers: 42, shared: 18, kEqV: false, input: PER_LAYER, moe: false, caches: 24, kv8: [3, 4, 9, 10, 11, 14] },
+  twelve: { layers: 48, shared: 0, kEqV: true, input: 0, moe: false, caches: 48, kv8: [3, 6, 7, 8, 10, 12] },
+  moe: { layers: 30, shared: 0, kEqV: true, input: 0, moe: true, caches: 30, kv8: [0, 3, 4, 5, 8, 9, 11, 12] },
+} as const;
+const artifactFacts = (repo: string) => repo.includes("e4b") ? ARTIFACT_FACTS.e4b : repo.includes("26B") ? ARTIFACT_FACTS.moe : ARTIFACT_FACTS.twelve;
+function artifactScheme(repo: string): KvStorageScheme & { readonly kind: "affine-layers" } {
+  const facts = artifactFacts(repo), kv8 = new Set<number>(facts.kv8);
+  return { kind: "affine-layers", kernels: "tiled-causal", layers: Array.from({ length: facts.caches }, (_, layer) => ({ layer, bits: kv8.has(layer) ? 8 : 4, groupSize: 64 })) };
+}
 async function fixtureConfig(repo: string): Promise<ModelConfig> {
-  const snapshots = join(FIXTURES, `models--mlx-community--${repo}`, "snapshots");
-  return loadModelConfig(join(snapshots, readdirSync(snapshots)[0]!));
+  const facts = artifactFacts(repo);
+  return {
+    modelDir: "", hasVisionSidecar: false, raw: {},
+    quantization: parseQuantization({ bits: 4, group_size: 64, mode: "affine" }),
+    text: {
+      numHiddenLayers: facts.layers, numKvSharedLayers: facts.shared,
+      layerTypes: Array.from({ length: facts.layers }, (_, layer) => layer % 6 === 5 ? "full_attention" : "sliding_attention"),
+      attentionKEqV: facts.kEqV, hiddenSizePerLayerInput: facts.input,
+      enableMoeBlock: facts.moe, tieWordEmbeddings: true,
+      rmsNormEps: 1e-6, finalLogitSoftcapping: 30,
+      ropeParameters: {
+        sliding_attention: { ropeType: "default", ropeTheta: 10000, partialRotaryFactor: 1, factor: 1 },
+        full_attention: { ropeType: "proportional", ropeTheta: 1000000, partialRotaryFactor: 0.25, factor: 1 },
+      },
+    },
+  } as unknown as ModelConfig;
 }
 
 /** Synthetic weights and config in the composition's shape. */
@@ -189,10 +200,11 @@ function stateDiff(label: string, actual: readonly Cache[], expected: readonly C
 
 // ── The graphs ──────────────────────────────────────────────────────────────
 
-type Graph = MlxTokenPhases & { makeCache(): Cache[] };
+type Graph = MlxTokenPhases & { makeCache(): Cache[]; logitsFromHidden(hidden: MlxArray): MlxArray };
 interface Generated {
   readonly COMPOSITION: ServedComposition;
-  readonly GeneratedGemma4: { new (weights: Weights, config: ModelConfig, composition: Composition): Graph; readonly prototype: object };
+  readonly GeneratedGemma4: { new (weights: Weights, config: ModelConfig): Graph & { readonly cacheLayers: readonly MlxCacheLayer[] }; readonly prototype: object };
+
 }
 const COMPOSITIONS: readonly { stem: string; repo: string; module: Generated }[] = [
   { stem: "gemma4-e4b", repo: "gemma-4-e4b-it-OptiQ-4bit", module: currentE4b as unknown as Generated },
@@ -209,8 +221,8 @@ function outputDiff(label: string, model: Graph, generic: Graph, actual: MlxArra
   try {
     const width = rows;
     const hidden = maxDiff(actual, expected, `${label} hidden`);
-    using la = model.logits[width]!(actual);
-    using lb = generic.logits[width]!(expected);
+    using la = model.logitsFromHidden(actual);
+    using lb = generic.logitsFromHidden(expected);
     const logits = maxDiff(la, lb, `${label} logits`);
     using wide = lb.astype(Dtype.float32);
     expect(wide.toFloat32().every(Number.isFinite), `${label} logits finite`).toBe(true);
@@ -235,11 +247,11 @@ for (const c of COMPOSITIONS) {
     const pair = async () => {
       if (graphs) return graphs;
       const { weights, config } = artifact(await fixtureConfig(c.repo), 1);
-      const served = c.module.COMPOSITION.kv![0]!;
-      if (served.kind !== "affine-layers") throw new Error(`${c.stem}: the generated graph serves ${served.kind}`);
-      const kv: KvStorageScheme = { kind: "affine-layers", layers: served.layers, kernels: "tiled-causal" };
+      const kv = artifactScheme(c.repo);
+      expect(c.module.COMPOSITION.kv![0]).toEqual({ kind: "affine-layers", layers: kv.layers });
       const composition = testComposition(kv);
-      return graphs = { model: new c.module.GeneratedGemma4(weights, config, composition), generic: testGraph(new Gemma4Model(weights, config, phaseRowLimit(composition)), composition) };
+      return graphs = { model: bindGraphCaches(new c.module.GeneratedGemma4(weights, config), composition), generic: bindGraphCaches(new Gemma4Model(weights, config, phaseRowLimit(composition)), composition) };
+
     };
 
     test(`${c.stem}: prefill 37, decodes, a window across the sliding boundary, verify 4, decodes`, async () => {
@@ -264,5 +276,30 @@ for (const c of COMPOSITIONS) {
         both("decode after", model, generic, mine, theirs, [[19]]);
       } finally { disposeAll(mine, theirs); }
     }, 120_000);
+
+    if (c.stem !== "gemma4-26b") test(`${c.stem}: the literal plain trace preserves compiled decode logits and cache`, async () => {
+      const { model, generic } = await pair();
+      const compiled = model as Graph & { compiledDecodeStep(): MlxCompiledDecodeStep; releaseCompiledDecode(): void };
+      const control = generic as Graph & { compiledDecodeStep(): MlxCompiledDecodeStep; releaseCompiledDecode(): void };
+      const mine = model.makeCache(), theirs = generic.makeCache();
+      try {
+        both("compiled prefix", model, generic, mine, theirs, [prompt(37, 9)]);
+        const left = compiled.compiledDecodeStep(), right = control.compiledDecodeStep();
+        for (const token of [200, 201, 202]) {
+          using raw = ops.fromInt32([token], [1]);
+          using id = raw.astype(Dtype.uint32);
+          const candidate = left.step(id, mine), expected = right.step(id, theirs);
+          ops.evalAll([candidate.logits, ...candidate.evalWith]); ops.evalAll([expected.logits, ...expected.evalWith]);
+          try { maxDiff(candidate.logits, expected.logits, `${c.stem} compiled logits`); stateDiff(`${c.stem} compiled state`, mine, theirs); }
+          finally { candidate.logits.dispose(); expected.logits.dispose(); }
+        }
+      } finally { compiled.releaseCompiledDecode(); control.releaseCompiledDecode(); disposeAll(mine, theirs); }
+    }, 120_000);
   });
 }
+
+import type { MlxCacheLayer } from "../../src/contracts/mlx/graph";
+
+import { bindGraphCaches } from "../../src/models/cache-composition";
+
+import type { MlxCompiledDecodeStep } from "../../src/contracts/mlx/graph";
