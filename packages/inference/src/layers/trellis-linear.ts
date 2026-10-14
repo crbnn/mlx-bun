@@ -69,7 +69,7 @@ export function trellisRows(lin: TrellisLinear, start: number, stop: number): Tr
   const codes = lin.codes.slice([start, 0], [stop, lin.codes.shape[1]!]);
   const scales = lin.scales.slice([start], [stop]);
   ops.evalAll([codes, scales]);
-  return new TrellisLinear(codes, scales, lin.spec);
+  return new TrellisLinear(codes, scales, lin.spec, false, lin.representations);
 }
 
 /** Stored rows [start, stop) of an axis-0 Trellis projection (input features of
@@ -83,7 +83,7 @@ export function trellisStoredRows(lin: TrellisLinear, start: number, stop: numbe
     : lin.codes.slice([start, 0], [stop, lin.codes.shape[1]!]);
   const scales = lin.scales.slice([start], [stop]);
   ops.evalAll([codes, scales]);
-  return new TrellisLinear(codes, scales, lin.spec);
+  return new TrellisLinear(codes, scales, lin.spec, false, lin.representations);
 }
 
 export class TrellisLinear {
