@@ -1,6 +1,7 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import { expandTrellis, trellisReduce, trellisScatter, wideTrellisPrefill, tiledTrellisPrefill, splitKTrellisPrefill } from "../kernels/trellis/index";
+import { LoraOperation, LoraState } from "./lora";
 import { compiledSwiglu } from "./swiglu";
 import { fusedGateUpSwiglu, type TrellisLinear } from "./trellis-linear";
 
@@ -12,7 +13,7 @@ function project(lin: TrellisLinear, x: MlxArray, kernel: (x: MlxArray) => MlxAr
   const lead = x.shape.slice(0, -1);
   using rows = ops.reshape(x, [lead.reduce((a, b) => a * b, 1), lin.inFeatures]);
   using out = kernel(rows);
-  return ops.reshape(out, [...lead, lin.outFeatures]);
+  return lin.delta.forward(x, ops.reshape(out, [...lead, lin.outFeatures]));
 }
 
 export class TrellisReducePrompt {
@@ -74,11 +75,17 @@ export class TrellisExpandScatterPrompt {
 
 /** Fused gate/up/SwiGLU followed by the literal down projection. */
 export class TrellisFusedMLP {
-  constructor(readonly gate: TrellisLinear, readonly up: TrellisLinear, readonly down: RowProjection) {}
-  forward(x: MlxArray): MlxArray {
-    using hidden = fusedGateUpSwiglu(x, this.gate, this.up);
-    return this.down.forward(hidden);
+  readonly #operation: LoraOperation;
+  constructor(readonly gate: TrellisLinear, readonly up: TrellisLinear, readonly down: RowProjection,
+    state = new LoraState()) {
+    const adapted = new TrellisUnfusedMLP(new TrellisReducePrompt(gate), new TrellisReducePrompt(up), down);
+    this.#operation = new LoraOperation(x => {
+      using hidden = fusedGateUpSwiglu(x, gate, up);
+      return down.forward(hidden);
+    }, x => adapted.forward(x), state, [gate.delta, up.delta]);
   }
+  forward(x: MlxArray): MlxArray { return this.#operation.forward(x); }
+  dispose(): void { this.#operation.dispose(); }
 }
 
 /** Independent projections followed by the oracle's compiled SwiGLU. */

@@ -263,6 +263,7 @@ export class AdapterManager {
     this.#mounted.set(id, info);
     this.#revisions.set(id, revision);
     this.#arrays.set(id, validated.flatMap(({ lw }) => [lw.a, lw.b]));
+    this.#model.loraState.refreshBindings();
     return info;
   }
 
