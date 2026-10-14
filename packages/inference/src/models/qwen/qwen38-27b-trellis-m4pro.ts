@@ -5,7 +5,7 @@ import type { Weights } from "../../artifacts/weights";
 import type { Cache } from "../../contracts/mlx/cache";
 import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
 import type { MlxDeclaredGraph, MlxTokenPhases, MlxLayerCapture, MlxHeadForward, MlxRowTable, MlxPromptRange, MlxCacheLayer, MlxPhaseForward, MlxSequenceRange, MlxSeparateMixed, MlxKnownRange } from "../../contracts/mlx/graph";
-import type { MediaEncoders, MlxPromptInput, Vision, MlxPositionedForward, MlxPositionedRange, MlxPositionedEmbeddingsRange } from "../../contracts/mlx/media";
+import type { MediaEncoders, MlxPromptInput, Vision, MlxPositionedForward, MlxPositionedRange, MlxPositionedEmbeddingsRange, MlxEmbeddingsRange } from "../../contracts/mlx/media";
 import type { MropeForwardState } from "../../contracts/mlx/positions";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import type { AneProgramSpec } from "../../kernels/ane/linear";
@@ -97,6 +97,7 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
   readonly mediaPrefill:readonly MlxPositionedEmbeddingsRange[];
   readonly mediaPrompt:readonly MlxPositionedRange[];
   readonly mediaDecode:MlxRowTable<MlxPositionedForward>;
+  readonly embeddingPrompt:readonly MlxEmbeddingsRange[];
   readonly mixedSeparate:MlxSeparateMixed;
   readonly #head:Plain;
   readonly #targets:Map<string,QwenProjectionTarget>;
@@ -905,6 +906,15 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
       {from:16,to:32,operation:(group:Parameters<MlxSeparateMixed["window"][number]["operation"]>[0])=>tiledWindow(group.ids,group.state,group.capture)},
       {from:33,to:Infinity,operation:(group:Parameters<MlxSeparateMixed["window"][number]["operation"]>[0])=>expandedWindow(group.ids,group.state,group.capture)},
     ];
+    this.embeddingPrompt=[
+      {from:1,to:1,operation:(hidden,cache)=>this.#embeddingSubmitted(this.#one,hidden,cache)},
+      {from:2,to:3,operation:(hidden,cache)=>this.#embeddingSubmitted(this.#rows,hidden,cache)},
+      {from:4,to:4,operation:(hidden,cache)=>this.#embeddingSubmitted(this.#four,hidden,cache)},
+      {from:5,to:8,operation:(hidden,cache)=>this.#embeddingSubmitted(this.#mma,hidden,cache)},
+      {from:9,to:15,operation:(hidden,cache)=>this.#embeddingBounded(this.#wide,hidden,cache)},
+      {from:16,to:32,operation:(hidden,cache)=>this.#embeddingBounded(this.#tiled,hidden,cache)},
+      {from:33,to:Infinity,operation:(hidden,cache)=>this.#embeddingBounded(this.#expanded,hidden,cache)},
+    ];
     this.mixedSeparate={decode:[
       {from:1,to:1,operation:group=>oneDecode(group.ids,group.state,group.capture)},
       {from:2,to:3,operation:group=>rowsDecode(group.ids,group.state,group.capture)},
@@ -924,6 +934,14 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
   #submitted(layers:Layers,ids:MlxArray,state:Cache[],phase:ReadPhase,capture:MlxLayerCapture|null):MlxArray {
     using scope=new SubmittedGraphForwardScope(this.embed.encode(ids),capture,64,4);
     return this.#run(layers,state,phase,scope);
+  }
+  #embeddingSubmitted(layers:Layers,hidden:MlxArray,state:Cache[]):MlxArray {
+    using scope=new SubmittedGraphForwardScope(ops.contiguous(hidden),null,64,4);
+    return this.#run(layers,state,"window",scope);
+  }
+  #embeddingBounded(layers:Layers,hidden:MlxArray,state:Cache[]):MlxArray {
+    using scope=new BoundedGraphForwardScope(ops.contiguous(hidden),null,state);
+    return this.#run(layers,state,"window",scope);
   }
   #bounded(layers:Layers,ids:MlxArray,state:Cache[],phase:ReadPhase,capture:MlxLayerCapture|null):MlxArray {
     using scope=new BoundedGraphForwardScope(this.embed.encode(ids),capture,state);

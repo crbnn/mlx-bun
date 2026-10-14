@@ -1,4 +1,5 @@
 import { MlxPhaseDispatch } from "../../src/generation/phase-dispatch";
+import { bindMlxAutoregressiveGraph } from "../../src/generation/bindings/autoregressive";
 // Written M1 operations on a small synthetic artifact with all 64 quantization
 // layouts. Expanded GPU windows preserve exact hidden, head, and cache tensors
 // under every KV scheme. Artifact-sized tiled/reduce/scatter kernels are held
@@ -295,6 +296,18 @@ test("a long known span keeps one window and reaches beyond verify rows",()=>{
     outputDiff("known span 80",new MlxPhaseDispatch(current).known(80)(input,mine) as MlxArray,
       new MlxPhaseDispatch(generic).known(80)(input,theirs) as MlxArray,current.logitsFromHidden.bind(current),generic.logitsFromHidden.bind(generic));
     stateDiff("known span 80",mine,theirs);
+  } finally {disposeAll(mine,theirs);}
+},180_000);
+
+test("prepared embeddings use the declared window operation and remain borrowed",()=>{
+  const {current,generic}=graphs("bf16"),mine=current.makeCache(),theirs=generic.makeCache();
+  try {
+    using input=ids([prompt(40,72)]),embeddings=current.embed.encode(input);
+    const before=Buffer.from(embeddings.rawBytes());
+    const actual=bindMlxAutoregressiveGraph(current).prefillEmbeddings!(embeddings,mine,null,input,null,40);
+    const expected=bindMlxAutoregressiveGraph(generic).prefillEmbeddings!(embeddings,theirs,null,input,null,40);
+    outputDiff("plain embeddings 40",actual,expected,current.logitsFromHidden.bind(current),generic.logitsFromHidden.bind(generic));
+    stateDiff("plain embeddings 40",mine,theirs);expect(Buffer.from(embeddings.rawBytes())).toEqual(before);
   } finally {disposeAll(mine,theirs);}
 },180_000);
 

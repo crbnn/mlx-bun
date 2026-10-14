@@ -1,4 +1,5 @@
 import { MlxPhaseDispatch } from "../../src/generation/phase-dispatch";
+import { bindMlxAutoregressiveGraph } from "../../src/generation/bindings/autoregressive";
 // The generated M4 Pro graph (src/models/qwen/qwen38-27b-trellis-m4pro.ts, an entire graph built from the
 // composition) on small synthetic weights laid out by the generated quant table: 48 DeltaNet and 16 attention layers
 // with the artifact's 3- and 4-bit affine projections, Trellis gate/up at the artifact's widths (mixed in its ten
@@ -255,6 +256,18 @@ describe("composition", () => {
 });
 
 describe("the M4 Pro graph against the generic Qwen 3.5 graph where both run the generic blocks (bf16 KV)", () => {
+  test("prepared embeddings use their declared text operation and preserve borrowed input",()=>{
+    const current=graph(),{weights,config}=source(),generic=new Qwen35Model(weights,config,composition());
+    const mine=current.makeCache(),theirs=generic.makeCache();
+    try {
+      using input=ids([prompt(40,72)]),embeddings=current.embed.encode(input);
+      const before=Buffer.from(embeddings.rawBytes());
+      const actual=bindMlxAutoregressiveGraph(current).prefillEmbeddings!(embeddings,mine,null,input,null,40);
+      const expected=bindMlxAutoregressiveGraph(generic).prefillEmbeddings!(embeddings,theirs,null,input,null,40);
+      outputDiff("plain embeddings 40",actual,expected,current.logitsFromHidden.bind(current),generic.logitsFromHidden.bind(generic));
+      stateDiff("plain embeddings 40",mine,theirs);expect(Buffer.from(embeddings.rawBytes())).toEqual(before);
+    } finally {disposeAll(mine,theirs);generic.dispose();}
+  },180_000);
   test("a known grammar span beyond the verify cap retains one full committed forward",()=>{
     const current=graph(),{weights,config}=source(),generic=new Qwen35Model(weights,config,composition());
     const committed=(input:MlxArray,cache:Cache[]):MlxArray=>{

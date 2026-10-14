@@ -5,7 +5,7 @@ import type { Weights } from "../../artifacts/weights";
 import type { Cache } from "../../contracts/mlx/cache";
 import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
 import type { MlxDeclaredGraph, MlxTokenPhases, MlxLayerCapture, MlxHeadForward, MlxRowTable, MlxPromptRange, MlxCacheLayer, MlxPhaseForward, MlxSequenceRange, MlxMixedRange, MlxPhaseGroup, MlxMixedGroupRange, MlxSeparateMixed, MlxKnownRange } from "../../contracts/mlx/graph";
-import type { MediaEncoders, MlxPromptInput, Vision, MlxPositionedForward, MlxPositionedRange, MlxPositionedEmbeddingsRange } from "../../contracts/mlx/media";
+import type { MediaEncoders, MlxPromptInput, Vision, MlxPositionedForward, MlxPositionedRange, MlxPositionedEmbeddingsRange, MlxEmbeddingsRange } from "../../contracts/mlx/media";
 import type { MropeForwardState } from "../../contracts/mlx/positions";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import { LoraState } from "../../layers/lora";
@@ -79,6 +79,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
   readonly mediaPrefill:readonly MlxPositionedEmbeddingsRange[];
   readonly mediaPrompt:readonly MlxPositionedRange[];
   readonly mediaDecode:MlxRowTable<MlxPositionedForward>;
+  readonly embeddingPrompt:readonly MlxEmbeddingsRange[];
   readonly mixed:readonly MlxMixedRange[];
   readonly mixedSeparate:MlxSeparateMixed;
   readonly #head:Plain;
@@ -714,6 +715,13 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
     const mediaDecodeNarrow:MlxPositionedForward=(ids,cache,positions)=>this.#positioned(mediaStock,this.embed.encode(ids),cache,"decode",positions);
     const mediaDecodeFive:MlxPositionedForward=(ids,cache,positions)=>this.#positioned(mediaFive,this.embed.encode(ids),cache,"decode",positions);
     this.mediaDecode={1:mediaDecodeNarrow,2:mediaDecodeNarrow,3:mediaDecodeNarrow,4:mediaDecodeNarrow,5:mediaDecodeFive,6:mediaDecodeFive,7:mediaDecodeFive,8:mediaDecodeFive};
+    this.embeddingPrompt=[
+      {from:1,to:1,operation:(hidden,cache)=>this.#embeddingLazy(one,hidden,cache)},
+      {from:2,to:4,operation:(hidden,cache)=>this.#embeddingLazy(rows,hidden,cache)},
+      {from:5,to:8,operation:(hidden,cache)=>this.#embeddingBounded(five,hidden,cache)},
+      {from:9,to:32,operation:(hidden,cache)=>this.#embeddingBounded(tiled,hidden,cache)},
+      {from:33,to:Infinity,operation:(hidden,cache)=>this.#embeddingBounded(expanded,hidden,cache)},
+    ];
     this.mixed=[{from:1,to:4,operation:groups=>this.#packed(stock,groups)},
       {from:5,to:8,operation:groups=>this.#packed(five,groups)},
       {from:9,to:32,operation:groups=>this.#packed(tiled,groups)},
@@ -740,6 +748,14 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
   #lazy(layers:Layers,ids:MlxArray,state:Cache[],phase:ReadPhase,capture:MlxLayerCapture|null):MlxArray {
     using scope=new GraphForwardScope(this.embed.encode(ids),capture);
     return this.#run(layers,state,phase,scope);
+  }
+  #embeddingLazy(layers:Layers,hidden:MlxArray,state:Cache[]):MlxArray {
+    using scope=new GraphForwardScope(ops.contiguous(hidden),null);
+    return this.#run(layers,state,"window",scope);
+  }
+  #embeddingBounded(layers:Layers,hidden:MlxArray,state:Cache[]):MlxArray {
+    using scope=new BoundedGraphForwardScope(ops.contiguous(hidden),null,state);
+    return this.#run(layers,state,"window",scope);
   }
   #bounded(layers:Layers,ids:MlxArray,state:Cache[],phase:ReadPhase,capture:MlxLayerCapture|null):MlxArray {
     using scope=new BoundedGraphForwardScope(this.embed.encode(ids),capture,state);

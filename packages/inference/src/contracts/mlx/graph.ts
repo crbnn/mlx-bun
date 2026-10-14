@@ -202,6 +202,8 @@ export interface MlxDeclaredGraph {
   readonly mixedSeparate?: MlxSeparateMixed;
   /** Full-sequence scoring operations, indexed by total token rows. */
   readonly sequence?: readonly MlxSequenceRange[];
+  /** Prepared embeddings without explicit positions, indexed by total rows. */
+  readonly embeddingPrompt?: readonly import("./media").MlxEmbeddingsRange[];
 }
 
 /** Cache layout written by the graph, independent of request storage policy. */
