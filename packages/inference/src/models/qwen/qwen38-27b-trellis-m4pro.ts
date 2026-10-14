@@ -26,7 +26,7 @@ import { declareGraph } from "../capabilities";
 import type { ReadPhase } from "../graph";
 import { QwenDeltaLayer as Delta, QwenAttentionLayer as Attention } from "./blocks";
 import { bindQwenMediaInput, qwenDraftTarget, qwenMediaEncoders, qwenResidualBasis } from "./media-input";
-import { DeltaWeights, AttentionWeights, GateDownMLP, AneBoundMlp, AneWeightShares, canonicalQwenWeights } from "./written-layers";
+import { DeltaWeights, AttentionWeights, GateDownMLP, AneBoundMlp, AneWeightShares, canonicalQwenWeights, type QwenProjectionTarget } from "./written-layers";
 
 export const QWEN38_TRELLIS_M4PRO_GRAPH = "qwen3.8-27b-trellis-3.2bpw-m4pro";
 export const DECODE_ROWS = 8;
@@ -99,7 +99,7 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
   readonly mediaDecode:MlxRowTable<MlxPositionedForward>;
   readonly mixedSeparate:MlxSeparateMixed;
   readonly #head:Plain;
-  readonly #targets:Map<string,QuantizedLinear>;
+  readonly #targets:Map<string,QwenProjectionTarget>;
   readonly #owned:{dispose():void}[];
   readonly #residualBasis:ResidualBasis|undefined;
   readonly #mrope:{invFreq:MlxArray;rotaryDims:number};
@@ -134,70 +134,81 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
     this.#mrope={invFreq:mropeInvFreq(rotaryDims,t.ropeParameters.full_attention!.ropeTheta),rotaryDims};
     const shares=new AneWeightShares();
     this.#owned=[qk.q,qk.k,this.#mrope.invFreq,{dispose:()=>shares[Symbol.dispose]()}];
-    const d0=new DeltaWeights(w,c,`${PREFIX}.layers.0`,REPRESENTATIONS);
-    const d1=new DeltaWeights(w,c,`${PREFIX}.layers.1`,REPRESENTATIONS);
-    const d2=new DeltaWeights(w,c,`${PREFIX}.layers.2`,REPRESENTATIONS);
-    const a3=new AttentionWeights(w,c,`${PREFIX}.layers.3`,REPRESENTATIONS);
-    const d4=new DeltaWeights(w,c,`${PREFIX}.layers.4`,REPRESENTATIONS);
-    const d5=new DeltaWeights(w,c,`${PREFIX}.layers.5`,REPRESENTATIONS);
-    const d6=new DeltaWeights(w,c,`${PREFIX}.layers.6`,REPRESENTATIONS);
-    const a7=new AttentionWeights(w,c,`${PREFIX}.layers.7`,REPRESENTATIONS);
-    const d8=new DeltaWeights(w,c,`${PREFIX}.layers.8`,REPRESENTATIONS);
-    const d9=new DeltaWeights(w,c,`${PREFIX}.layers.9`,REPRESENTATIONS);
-    const d10=new DeltaWeights(w,c,`${PREFIX}.layers.10`,REPRESENTATIONS);
-    const a11=new AttentionWeights(w,c,`${PREFIX}.layers.11`,REPRESENTATIONS);
-    const d12=new DeltaWeights(w,c,`${PREFIX}.layers.12`,REPRESENTATIONS);
-    const d13=new DeltaWeights(w,c,`${PREFIX}.layers.13`,REPRESENTATIONS);
-    const d14=new DeltaWeights(w,c,`${PREFIX}.layers.14`,REPRESENTATIONS);
-    const a15=new AttentionWeights(w,c,`${PREFIX}.layers.15`,REPRESENTATIONS);
-    const d16=new DeltaWeights(w,c,`${PREFIX}.layers.16`,REPRESENTATIONS);
-    const d17=new DeltaWeights(w,c,`${PREFIX}.layers.17`,REPRESENTATIONS);
-    const d18=new DeltaWeights(w,c,`${PREFIX}.layers.18`,REPRESENTATIONS);
-    const a19=new AttentionWeights(w,c,`${PREFIX}.layers.19`,REPRESENTATIONS);
-    const d20=new DeltaWeights(w,c,`${PREFIX}.layers.20`,REPRESENTATIONS);
-    const d21=new DeltaWeights(w,c,`${PREFIX}.layers.21`,REPRESENTATIONS);
-    const d22=new DeltaWeights(w,c,`${PREFIX}.layers.22`,REPRESENTATIONS);
-    const a23=new AttentionWeights(w,c,`${PREFIX}.layers.23`,REPRESENTATIONS);
-    const d24=new DeltaWeights(w,c,`${PREFIX}.layers.24`,REPRESENTATIONS);
-    const d25=new DeltaWeights(w,c,`${PREFIX}.layers.25`,REPRESENTATIONS);
-    const d26=new DeltaWeights(w,c,`${PREFIX}.layers.26`,REPRESENTATIONS);
-    const a27=new AttentionWeights(w,c,`${PREFIX}.layers.27`,REPRESENTATIONS);
-    const d28=new DeltaWeights(w,c,`${PREFIX}.layers.28`,REPRESENTATIONS);
-    const d29=new DeltaWeights(w,c,`${PREFIX}.layers.29`,REPRESENTATIONS);
-    const d30=new DeltaWeights(w,c,`${PREFIX}.layers.30`,REPRESENTATIONS);
-    const a31=new AttentionWeights(w,c,`${PREFIX}.layers.31`,REPRESENTATIONS);
-    const d32=new DeltaWeights(w,c,`${PREFIX}.layers.32`,REPRESENTATIONS);
-    const d33=new DeltaWeights(w,c,`${PREFIX}.layers.33`,REPRESENTATIONS);
-    const d34=new DeltaWeights(w,c,`${PREFIX}.layers.34`,REPRESENTATIONS);
-    const a35=new AttentionWeights(w,c,`${PREFIX}.layers.35`,REPRESENTATIONS);
-    const d36=new DeltaWeights(w,c,`${PREFIX}.layers.36`,REPRESENTATIONS);
-    const d37=new DeltaWeights(w,c,`${PREFIX}.layers.37`,REPRESENTATIONS);
-    const d38=new DeltaWeights(w,c,`${PREFIX}.layers.38`,REPRESENTATIONS);
-    const a39=new AttentionWeights(w,c,`${PREFIX}.layers.39`,REPRESENTATIONS);
-    const d40=new DeltaWeights(w,c,`${PREFIX}.layers.40`,REPRESENTATIONS);
-    const d41=new DeltaWeights(w,c,`${PREFIX}.layers.41`,REPRESENTATIONS);
-    const d42=new DeltaWeights(w,c,`${PREFIX}.layers.42`,REPRESENTATIONS);
-    const a43=new AttentionWeights(w,c,`${PREFIX}.layers.43`,REPRESENTATIONS);
-    const d44=new DeltaWeights(w,c,`${PREFIX}.layers.44`,REPRESENTATIONS);
-    const d45=new DeltaWeights(w,c,`${PREFIX}.layers.45`,REPRESENTATIONS);
-    const d46=new DeltaWeights(w,c,`${PREFIX}.layers.46`,REPRESENTATIONS);
-    const a47=new AttentionWeights(w,c,`${PREFIX}.layers.47`,REPRESENTATIONS);
-    const d48=new DeltaWeights(w,c,`${PREFIX}.layers.48`,REPRESENTATIONS);
-    const d49=new DeltaWeights(w,c,`${PREFIX}.layers.49`,REPRESENTATIONS);
-    const d50=new DeltaWeights(w,c,`${PREFIX}.layers.50`,REPRESENTATIONS);
-    const a51=new AttentionWeights(w,c,`${PREFIX}.layers.51`,REPRESENTATIONS);
-    const d52=new DeltaWeights(w,c,`${PREFIX}.layers.52`,REPRESENTATIONS);
-    const d53=new DeltaWeights(w,c,`${PREFIX}.layers.53`,REPRESENTATIONS);
-    const d54=new DeltaWeights(w,c,`${PREFIX}.layers.54`,REPRESENTATIONS);
-    const a55=new AttentionWeights(w,c,`${PREFIX}.layers.55`,REPRESENTATIONS);
-    const d56=new DeltaWeights(w,c,`${PREFIX}.layers.56`,REPRESENTATIONS);
-    const d57=new DeltaWeights(w,c,`${PREFIX}.layers.57`,REPRESENTATIONS);
-    const d58=new DeltaWeights(w,c,`${PREFIX}.layers.58`,REPRESENTATIONS);
-    const a59=new AttentionWeights(w,c,`${PREFIX}.layers.59`,REPRESENTATIONS);
-    const d60=new DeltaWeights(w,c,`${PREFIX}.layers.60`,REPRESENTATIONS);
-    const d61=new DeltaWeights(w,c,`${PREFIX}.layers.61`,REPRESENTATIONS);
-    const d62=new DeltaWeights(w,c,`${PREFIX}.layers.62`,REPRESENTATIONS);
-    const a63=new AttentionWeights(w,c,`${PREFIX}.layers.63`,REPRESENTATIONS);
+    const state=this.loraState;
+    const d0=new DeltaWeights(w,c,`${PREFIX}.layers.0`,REPRESENTATIONS,state);
+    const d1=new DeltaWeights(w,c,`${PREFIX}.layers.1`,REPRESENTATIONS,state);
+    const d2=new DeltaWeights(w,c,`${PREFIX}.layers.2`,REPRESENTATIONS,state);
+    const a3=new AttentionWeights(w,c,`${PREFIX}.layers.3`,REPRESENTATIONS,state);
+    const d4=new DeltaWeights(w,c,`${PREFIX}.layers.4`,REPRESENTATIONS,state);
+    const d5=new DeltaWeights(w,c,`${PREFIX}.layers.5`,REPRESENTATIONS,state);
+    const d6=new DeltaWeights(w,c,`${PREFIX}.layers.6`,REPRESENTATIONS,state);
+    const a7=new AttentionWeights(w,c,`${PREFIX}.layers.7`,REPRESENTATIONS,state);
+    const d8=new DeltaWeights(w,c,`${PREFIX}.layers.8`,REPRESENTATIONS,state);
+    const d9=new DeltaWeights(w,c,`${PREFIX}.layers.9`,REPRESENTATIONS,state);
+    const d10=new DeltaWeights(w,c,`${PREFIX}.layers.10`,REPRESENTATIONS,state);
+    const a11=new AttentionWeights(w,c,`${PREFIX}.layers.11`,REPRESENTATIONS,state);
+    const d12=new DeltaWeights(w,c,`${PREFIX}.layers.12`,REPRESENTATIONS,state);
+    const d13=new DeltaWeights(w,c,`${PREFIX}.layers.13`,REPRESENTATIONS,state);
+    const d14=new DeltaWeights(w,c,`${PREFIX}.layers.14`,REPRESENTATIONS,state);
+    const a15=new AttentionWeights(w,c,`${PREFIX}.layers.15`,REPRESENTATIONS,state);
+    const d16=new DeltaWeights(w,c,`${PREFIX}.layers.16`,REPRESENTATIONS,state);
+    const d17=new DeltaWeights(w,c,`${PREFIX}.layers.17`,REPRESENTATIONS,state);
+    const d18=new DeltaWeights(w,c,`${PREFIX}.layers.18`,REPRESENTATIONS,state);
+    const a19=new AttentionWeights(w,c,`${PREFIX}.layers.19`,REPRESENTATIONS,state);
+    const d20=new DeltaWeights(w,c,`${PREFIX}.layers.20`,REPRESENTATIONS,state);
+    const d21=new DeltaWeights(w,c,`${PREFIX}.layers.21`,REPRESENTATIONS,state);
+    const d22=new DeltaWeights(w,c,`${PREFIX}.layers.22`,REPRESENTATIONS,state);
+    const a23=new AttentionWeights(w,c,`${PREFIX}.layers.23`,REPRESENTATIONS,state);
+    const d24=new DeltaWeights(w,c,`${PREFIX}.layers.24`,REPRESENTATIONS,state);
+    const d25=new DeltaWeights(w,c,`${PREFIX}.layers.25`,REPRESENTATIONS,state);
+    const d26=new DeltaWeights(w,c,`${PREFIX}.layers.26`,REPRESENTATIONS,state);
+    const a27=new AttentionWeights(w,c,`${PREFIX}.layers.27`,REPRESENTATIONS,state);
+    const d28=new DeltaWeights(w,c,`${PREFIX}.layers.28`,REPRESENTATIONS,state);
+    const d29=new DeltaWeights(w,c,`${PREFIX}.layers.29`,REPRESENTATIONS,state);
+    const d30=new DeltaWeights(w,c,`${PREFIX}.layers.30`,REPRESENTATIONS,state);
+    const a31=new AttentionWeights(w,c,`${PREFIX}.layers.31`,REPRESENTATIONS,state);
+    const d32=new DeltaWeights(w,c,`${PREFIX}.layers.32`,REPRESENTATIONS,state);
+    const d33=new DeltaWeights(w,c,`${PREFIX}.layers.33`,REPRESENTATIONS,state);
+    const d34=new DeltaWeights(w,c,`${PREFIX}.layers.34`,REPRESENTATIONS,state);
+    const a35=new AttentionWeights(w,c,`${PREFIX}.layers.35`,REPRESENTATIONS,state);
+    const d36=new DeltaWeights(w,c,`${PREFIX}.layers.36`,REPRESENTATIONS,state);
+    const d37=new DeltaWeights(w,c,`${PREFIX}.layers.37`,REPRESENTATIONS,state);
+    const d38=new DeltaWeights(w,c,`${PREFIX}.layers.38`,REPRESENTATIONS,state);
+    const a39=new AttentionWeights(w,c,`${PREFIX}.layers.39`,REPRESENTATIONS,state);
+    const d40=new DeltaWeights(w,c,`${PREFIX}.layers.40`,REPRESENTATIONS,state);
+    const d41=new DeltaWeights(w,c,`${PREFIX}.layers.41`,REPRESENTATIONS,state);
+    const d42=new DeltaWeights(w,c,`${PREFIX}.layers.42`,REPRESENTATIONS,state);
+    const a43=new AttentionWeights(w,c,`${PREFIX}.layers.43`,REPRESENTATIONS,state);
+    const d44=new DeltaWeights(w,c,`${PREFIX}.layers.44`,REPRESENTATIONS,state);
+    const d45=new DeltaWeights(w,c,`${PREFIX}.layers.45`,REPRESENTATIONS,state);
+    const d46=new DeltaWeights(w,c,`${PREFIX}.layers.46`,REPRESENTATIONS,state);
+    const a47=new AttentionWeights(w,c,`${PREFIX}.layers.47`,REPRESENTATIONS,state);
+    const d48=new DeltaWeights(w,c,`${PREFIX}.layers.48`,REPRESENTATIONS,state);
+    const d49=new DeltaWeights(w,c,`${PREFIX}.layers.49`,REPRESENTATIONS,state);
+    const d50=new DeltaWeights(w,c,`${PREFIX}.layers.50`,REPRESENTATIONS,state);
+    const a51=new AttentionWeights(w,c,`${PREFIX}.layers.51`,REPRESENTATIONS,state);
+    const d52=new DeltaWeights(w,c,`${PREFIX}.layers.52`,REPRESENTATIONS,state);
+    const d53=new DeltaWeights(w,c,`${PREFIX}.layers.53`,REPRESENTATIONS,state);
+    const d54=new DeltaWeights(w,c,`${PREFIX}.layers.54`,REPRESENTATIONS,state);
+    const a55=new AttentionWeights(w,c,`${PREFIX}.layers.55`,REPRESENTATIONS,state);
+    const d56=new DeltaWeights(w,c,`${PREFIX}.layers.56`,REPRESENTATIONS,state);
+    const d57=new DeltaWeights(w,c,`${PREFIX}.layers.57`,REPRESENTATIONS,state);
+    const d58=new DeltaWeights(w,c,`${PREFIX}.layers.58`,REPRESENTATIONS,state);
+    const a59=new AttentionWeights(w,c,`${PREFIX}.layers.59`,REPRESENTATIONS,state);
+    const d60=new DeltaWeights(w,c,`${PREFIX}.layers.60`,REPRESENTATIONS,state);
+    const d61=new DeltaWeights(w,c,`${PREFIX}.layers.61`,REPRESENTATIONS,state);
+    const d62=new DeltaWeights(w,c,`${PREFIX}.layers.62`,REPRESENTATIONS,state);
+    const a63=new AttentionWeights(w,c,`${PREFIX}.layers.63`,REPRESENTATIONS,state);
+    this.#owned.push(
+      d0.trellis,d1.trellis,d2.trellis,a3.trellis,d4.trellis,d5.trellis,d6.trellis,a7.trellis,
+      d8.trellis,d9.trellis,d10.trellis,a11.trellis,d12.trellis,d13.trellis,d14.trellis,a15.trellis,
+      d16.trellis,d17.trellis,d18.trellis,a19.trellis,d20.trellis,d21.trellis,d22.trellis,a23.trellis,
+      d24.trellis,d25.trellis,d26.trellis,a27.trellis,d28.trellis,d29.trellis,d30.trellis,a31.trellis,
+      d32.trellis,d33.trellis,d34.trellis,a35.trellis,d36.trellis,d37.trellis,d38.trellis,a39.trellis,
+      d40.trellis,d41.trellis,d42.trellis,a43.trellis,d44.trellis,d45.trellis,d46.trellis,a47.trellis,
+      d48.trellis,d49.trellis,d50.trellis,a51.trellis,d52.trellis,d53.trellis,d54.trellis,a55.trellis,
+      d56.trellis,d57.trellis,d58.trellis,a59.trellis,d60.trellis,d61.trellis,d62.trellis,a63.trellis,
+    );
     // One row: factored gate/up, with the literal mixed-width and down layout.
     this.#one=[
       d0.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain,Plain,qk),
@@ -232,8 +243,8 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
       d29.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain,Plain,qk),
       d30.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
       a31.stage(w,c,Attention,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain),
-      d32.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d33.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
+      d32.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain,Plain,qk),
+      d33.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain,Plain,qk),
       d34.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
       a35.stage(w,c,Attention,GateDownMLP,MixedGate,DownK3iRow,Plain,Plain,Plain,Plain),
       d36.stage(w,c,Delta,GateDownMLP,MixedGate,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
@@ -299,8 +310,8 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
       d29.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Affine3Rows,Affine3Rows,Affine4Rows,Affine4Rows,Affine3Rows,qk),
       d30.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3Rows,Affine3Rows,Affine4Rows,Affine4Rows,Affine3Rows,qk),
       a31.stage(w,c,Attention,GateDownMLP,GateRows,DownRows,Affine4Rows,Affine4Rows,Affine4Rows,Affine4Rows),
-      d32.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3Rows,Affine3Rows,Affine4Rows,Affine4Rows,Affine3Rows,qk),
-      d33.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3Rows,Affine3Rows,Affine4Rows,Affine4Rows,Affine3Rows,qk),
+      d32.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Affine3Rows,Affine3Rows,Affine4Rows,Affine4Rows,Affine3Rows,qk),
+      d33.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Affine3Rows,Affine3Rows,Affine4Rows,Affine4Rows,Affine3Rows,qk),
       d34.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3Rows,Affine3Rows,Affine4Rows,Affine4Rows,Affine3Rows,qk),
       a35.stage(w,c,Attention,GateDownMLP,MixedGate,DownK3iRows,Affine4Rows,Affine4Rows,Affine4Rows,Affine4Rows),
       d36.stage(w,c,Delta,GateDownMLP,MixedGate,DownK3iRows,Affine3Rows,Affine3Rows,Affine4Rows,Affine4Rows,Affine3Rows,qk),
@@ -366,8 +377,8 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
       d29.stage(w,c,Delta,GateDownMLP,GateRows,MmaDown,Affine3Rows,Affine3Rows,Affine4Rows,Affine4Rows,Affine3Rows,qk),
       d30.stage(w,c,Delta,GateDownMLP,GateRows,MmaDownK3i,Affine3Rows,Affine3Rows,Affine4Rows,Affine4Rows,Affine3Rows,qk),
       a31.stage(w,c,Attention,GateDownMLP,GateRows,MmaDown,Affine4Rows,Affine4Rows,Affine4Rows,Affine4Rows),
-      d32.stage(w,c,Delta,GateDownMLP,GateRows,MmaDownK3i,Affine3Rows,Affine3Rows,Affine4Rows,Affine4Rows,Affine3Rows,qk),
-      d33.stage(w,c,Delta,GateDownMLP,GateRows,MmaDownK3i,Affine3Rows,Affine3Rows,Affine4Rows,Affine4Rows,Affine3Rows,qk),
+      d32.stage(w,c,Delta,GateDownMLP,GateRows,MmaDown,Affine3Rows,Affine3Rows,Affine4Rows,Affine4Rows,Affine3Rows,qk),
+      d33.stage(w,c,Delta,GateDownMLP,GateRows,MmaDown,Affine3Rows,Affine3Rows,Affine4Rows,Affine4Rows,Affine3Rows,qk),
       d34.stage(w,c,Delta,GateDownMLP,GateRows,MmaDownK3i,Affine3Rows,Affine3Rows,Affine4Rows,Affine4Rows,Affine3Rows,qk),
       a35.stage(w,c,Attention,GateDownMLP,MixedGate,MmaDownK3i,Affine4Rows,Affine4Rows,Affine4Rows,Affine4Rows),
       d36.stage(w,c,Delta,GateDownMLP,MixedGate,MmaDownK3i,Affine3Rows,Affine3Rows,Affine4Rows,Affine4Rows,Affine3Rows,qk),
@@ -433,8 +444,8 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
       d29.stage(w,c,Delta,GateDownMLP,MmaGate,MmaDown,Affine3Mma,Affine3Mma,Affine4Mma,Affine4Mma,Affine3Mma,qk),
       d30.stage(w,c,Delta,GateDownMLP,MmaGate,MmaDownK3i,Affine3Mma,Affine3Mma,Affine4Mma,Affine4Mma,Affine3Mma,qk),
       a31.stage(w,c,Attention,GateDownMLP,MmaGate,MmaDown,Affine4Mma,Affine4Mma,Affine4Mma,Affine4Mma),
-      d32.stage(w,c,Delta,GateDownMLP,MmaGate,MmaDownK3i,Affine3Mma,Affine3Mma,Affine4Mma,Affine4Mma,Affine3Mma,qk),
-      d33.stage(w,c,Delta,GateDownMLP,MmaGate,MmaDownK3i,Affine3Mma,Affine3Mma,Affine4Mma,Affine4Mma,Affine3Mma,qk),
+      d32.stage(w,c,Delta,GateDownMLP,MmaGate,MmaDown,Affine3Mma,Affine3Mma,Affine4Mma,Affine4Mma,Affine3Mma,qk),
+      d33.stage(w,c,Delta,GateDownMLP,MmaGate,MmaDown,Affine3Mma,Affine3Mma,Affine4Mma,Affine4Mma,Affine3Mma,qk),
       d34.stage(w,c,Delta,GateDownMLP,MmaGate,MmaDownK3i,Affine3Mma,Affine3Mma,Affine4Mma,Affine4Mma,Affine3Mma,qk),
       a35.stage(w,c,Attention,GateDownMLP,MmaGate,MmaDownK3i,Affine4Mma,Affine4Mma,Affine4Mma,Affine4Mma),
       d36.stage(w,c,Delta,GateDownMLP,MmaGate,MmaDownK3i,Affine3Mma,Affine3Mma,Affine4Mma,Affine4Mma,Affine3Mma,qk),
@@ -532,7 +543,7 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
       d20.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares,qk),d21.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares,qk),d22.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares,qk),a23.aneStage(w,c,Attention,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares),
       d24.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares,qk),d25.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares,qk),d26.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares,qk),a27.aneStage(w,c,Attention,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares),
       d28.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares,qk),d29.aneStage(w,c,Delta,AneBoundMlp,AneMlp,AneAffineSplit,Plain,ANE_FRACTION,2048,shares,qk),d30.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares,qk),a31.aneStage(w,c,Attention,AneBoundMlp,AneMlp,AneAffineSplit,Plain,ANE_FRACTION,2048,shares),
-      d32.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares,qk),d33.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares,qk),d34.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares,qk),a35.aneStage(w,c,Attention,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares),
+      d32.aneStage(w,c,Delta,AneBoundMlp,AneMlp,AneAffineSplit,Plain,ANE_FRACTION,2048,shares,qk),d33.aneStage(w,c,Delta,AneBoundMlp,AneMlp,AneAffineSplit,Plain,ANE_FRACTION,2048,shares,qk),d34.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares,qk),a35.aneStage(w,c,Attention,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares),
       d36.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares,qk),d37.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares,qk),d38.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares,qk),a39.aneStage(w,c,Attention,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares),
       d40.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares,qk),d41.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares,qk),d42.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares,qk),a43.aneStage(w,c,Attention,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares),
       d44.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,2048,shares,qk),d45.aneStage(w,c,Delta,AneBoundMlp,AneMlp,AneAffineSplit,Plain,ANE_FRACTION,2048,shares,qk),d46.aneStage(w,c,Delta,AneBoundMlp,AneMlp,AneAffineSplit,Plain,ANE_FRACTION,2048,shares,qk),a47.aneStage(w,c,Attention,AneBoundMlp,AneMlp,AneAffineSplit,Plain,ANE_FRACTION,2048,shares),
@@ -550,7 +561,7 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
       d20.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares,qk),d21.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares,qk),d22.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares,qk),a23.aneStage(w,c,Attention,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares),
       d24.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares,qk),d25.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares,qk),d26.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares,qk),a27.aneStage(w,c,Attention,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares),
       d28.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares,qk),d29.aneStage(w,c,Delta,AneBoundMlp,AneMlp,AneAffineSplit,Plain,ANE_FRACTION,1536,shares,qk),d30.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares,qk),a31.aneStage(w,c,Attention,AneBoundMlp,AneMlp,AneAffineSplit,Plain,ANE_FRACTION,1536,shares),
-      d32.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares,qk),d33.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares,qk),d34.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares,qk),a35.aneStage(w,c,Attention,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares),
+      d32.aneStage(w,c,Delta,AneBoundMlp,AneMlp,AneAffineSplit,Plain,ANE_FRACTION,1536,shares,qk),d33.aneStage(w,c,Delta,AneBoundMlp,AneMlp,AneAffineSplit,Plain,ANE_FRACTION,1536,shares,qk),d34.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares,qk),a35.aneStage(w,c,Attention,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares),
       d36.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares,qk),d37.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares,qk),d38.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares,qk),a39.aneStage(w,c,Attention,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares),
       d40.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares,qk),d41.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares,qk),d42.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares,qk),a43.aneStage(w,c,Attention,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares),
       d44.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1536,shares,qk),d45.aneStage(w,c,Delta,AneBoundMlp,AneMlp,AneAffineSplit,Plain,ANE_FRACTION,1536,shares,qk),d46.aneStage(w,c,Delta,AneBoundMlp,AneMlp,AneAffineSplit,Plain,ANE_FRACTION,1536,shares,qk),a47.aneStage(w,c,Attention,AneBoundMlp,AneMlp,AneAffineSplit,Plain,ANE_FRACTION,1536,shares),
@@ -568,7 +579,7 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
       d20.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares,qk),d21.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares,qk),d22.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares,qk),a23.aneStage(w,c,Attention,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares),
       d24.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares,qk),d25.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares,qk),d26.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares,qk),a27.aneStage(w,c,Attention,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares),
       d28.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares,qk),d29.aneStage(w,c,Delta,AneBoundMlp,AneMlp,AneAffineSplit,Plain,ANE_FRACTION,1024,shares,qk),d30.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares,qk),a31.aneStage(w,c,Attention,AneBoundMlp,AneMlp,AneAffineSplit,Plain,ANE_FRACTION,1024,shares),
-      d32.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares,qk),d33.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares,qk),d34.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares,qk),a35.aneStage(w,c,Attention,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares),
+      d32.aneStage(w,c,Delta,AneBoundMlp,AneMlp,AneAffineSplit,Plain,ANE_FRACTION,1024,shares,qk),d33.aneStage(w,c,Delta,AneBoundMlp,AneMlp,AneAffineSplit,Plain,ANE_FRACTION,1024,shares,qk),d34.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares,qk),a35.aneStage(w,c,Attention,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares),
       d36.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares,qk),d37.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares,qk),d38.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares,qk),a39.aneStage(w,c,Attention,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares),
       d40.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares,qk),d41.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares,qk),d42.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares,qk),a43.aneStage(w,c,Attention,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares),
       d44.aneStage(w,c,Delta,AneBoundMlp,AneMlpK3i,AneAffineSplit,Plain,ANE_FRACTION,1024,shares,qk),d45.aneStage(w,c,Delta,AneBoundMlp,AneMlp,AneAffineSplit,Plain,ANE_FRACTION,1024,shares,qk),d46.aneStage(w,c,Delta,AneBoundMlp,AneMlp,AneAffineSplit,Plain,ANE_FRACTION,1024,shares,qk),a47.aneStage(w,c,Attention,AneBoundMlp,AneMlp,AneAffineSplit,Plain,ANE_FRACTION,1024,shares),
@@ -912,7 +923,7 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
   }
 
   dispose():void { disposeResources(this.#owned.splice(0)); }
-  loraTargets():Map<string,QuantizedLinear> { return new Map(this.#targets); }
+  loraTargets():Map<string,QwenProjectionTarget> { return new Map(this.#targets); }
   bindMediaInput(input:Vision):MlxPromptInput { return bindQwenMediaInput(this,input.embeddings,input.mrope!); }
   mediaEncoders(modelDir:string):Promise<MediaEncoders> { return qwenMediaEncoders(this,modelDir); }
   draftTarget(_state:Cache[]):TargetView { return qwenDraftTarget(this,this.#residualBasis); }

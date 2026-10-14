@@ -136,7 +136,7 @@ numerical("literal fused and unfused Trellis MLP operations retain the old width
   try {
     for (const rows of [1, 2, 3, 4, 8]) {
       using x = input(rows, 512);
-      using expected = old.forward(x, "window", rows === 1 ? "one" : rows <= 3 ? "twoToThree" : rows === 4 ? "four" : "fiveToEight");
+      using expected = old.forward(x,"window",rows);
       const operation = rows <= 4 ? new TrellisFusedMLP(gate, up, new TrellisScatterPrompt(down))
         : new TrellisUnfusedMLP(new TrellisExpandReducePrompt(gate), new TrellisExpandReducePrompt(up), new TrellisExpandScatterPrompt(down));
       using actual = operation.forward(x);

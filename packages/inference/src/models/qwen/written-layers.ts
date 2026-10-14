@@ -5,6 +5,8 @@ import { QuantizedLinear } from "../../layers/quantized-linear";
 import { TrellisLinear } from "../../layers/trellis-linear";
 import type { TrellisRepresentations } from "../../kernels/trellis/index";
 import type { RowProjection } from "../../layers/trellis-prompt";
+import { TrellisUnfusedMLP,TrellisReducePrompt,TrellisExpandReducePrompt,TrellisExpandScatterPrompt } from "../../layers/trellis-prompt";
+import { LoraOperation,LoraState } from "../../layers/lora";
 import { QwenGatedDeltaNet, Qwen3TextAttention, Qwen3MediaAttention, QwenDeltaLayer, QwenAttentionLayer } from "./blocks";
 import { AneAffineSplit, type AneMlpSplit } from "../../layers/ane-prefill-split";
 import { compiledSwiglu } from "../../layers/swiglu";
@@ -24,7 +26,8 @@ export type GateUpClass = new (gate: TrellisLinear, up: TrellisLinear) => RowPro
 export type TrellisProjectionClass = new (linear: TrellisLinear) => RowProjection;
 export type GateDownClass = new (gateUp: RowProjection, down: RowProjection) => RowProjection;
 export type UnfusedClass = new (gate: RowProjection, up: RowProjection, down: RowProjection) => RowProjection;
-export type FusedClass = new (gate: TrellisLinear, up: TrellisLinear, down: RowProjection) => RowProjection;
+export type FusedClass = new (gate: TrellisLinear, up: TrellisLinear, down: RowProjection,state?:LoraState) => RowProjection & {dispose():void};
+export type QwenProjectionTarget=QuantizedLinear|TrellisLinear;
 
 /** Program/buffer ownership shared by written ANE bindings. Shape lookup only
  * shares resources; the graph supplies the operation and row capacity. */
@@ -48,23 +51,38 @@ export interface AneMlpClass {
 }
 export class AneBoundMlp {
   readonly split: AneMlpSplit;
+  readonly #operation:LoraOperation;
   constructor(trellis: TrellisWeights, Split: AneMlpClass, fraction: number, rows: number, shares: AneWeightShares) {
     this.split = Split.build(trellis.gate, trellis.up, trellis.down, fraction, rows, shares.mlp);
     shares.mlp = this.split;
     shares.owned.push(this.split);
+    const overlay=new TrellisUnfusedMLP(new TrellisExpandReducePrompt(trellis.gate),new TrellisExpandReducePrompt(trellis.up),new TrellisExpandScatterPrompt(trellis.down));
+    this.#operation=new LoraOperation(x=>this.split.forward(x,compiledSwiglu),x=>overlay.forward(x),trellis.state,[trellis.gate.delta,trellis.up.delta,trellis.down.delta]);
+    shares.owned.push(this.#operation);
   }
-  forward(x: MlxArray): MlxArray { return this.split.forward(x, compiledSwiglu); }
+  forward(x:MlxArray):MlxArray { return this.#operation.forward(x); }
 }
 
 export class TrellisWeights {
   readonly gate: TrellisLinear;
   readonly up: TrellisLinear;
   readonly down: TrellisLinear;
-  constructor(weights: Weights, config: ModelConfig, prefix: string, representations: TrellisRepresentations) {
+  readonly #owned:{dispose():void}[]=[];
+  constructor(weights: Weights, config: ModelConfig, readonly prefix: string, representations: TrellisRepresentations,readonly state:LoraState) {
     this.gate = TrellisLinear.load(weights, `${prefix}.mlp.gate_proj`, config, false, representations);
     this.up = TrellisLinear.load(weights, `${prefix}.mlp.up_proj`, config, false, representations);
     this.down = TrellisLinear.load(weights, `${prefix}.mlp.down_proj`, config, true, representations);
   }
+  keep(resource:{dispose():void}):void { this.#owned.push(resource); }
+  operation(plain:RowProjection,adapted:RowProjection):LoraOperation {
+    const operation=new LoraOperation(x=>plain.forward(x),x=>adapted.forward(x),this.state,[this.gate.delta,this.up.delta]);
+    this.keep(operation);
+    return operation;
+  }
+  targets():readonly (readonly [string,TrellisLinear])[] {
+    return [[`${this.prefix}.mlp.gate_proj`,this.gate],[`${this.prefix}.mlp.up_proj`,this.up],[`${this.prefix}.mlp.down_proj`,this.down]];
+  }
+  dispose():void { for (const resource of this.#owned.splice(0)) resource.dispose(); }
 }
 
 /** A gate/up operation already includes the activation; its down projection is
@@ -84,8 +102,8 @@ export class DeltaWeights {
   readonly inProjA: QuantizedLinear;
   readonly inProjB: QuantizedLinear;
   readonly outProj: QuantizedLinear;
-  constructor(weights: Weights, config: ModelConfig, readonly prefix: string, representations: TrellisRepresentations) {
-    this.trellis = new TrellisWeights(weights, config, prefix, representations);
+  constructor(weights: Weights, config: ModelConfig, readonly prefix: string, representations: TrellisRepresentations,state:LoraState) {
+    this.trellis = new TrellisWeights(weights, config, prefix, representations,state);
     const block = `${prefix}.linear_attn`;
     this.inProjQkv = QuantizedLinear.load(weights, `${block}.in_proj_qkv`, config);
     this.inProjZ = QuantizedLinear.load(weights, `${block}.in_proj_z`, config);
@@ -97,8 +115,9 @@ export class DeltaWeights {
     Mlp: GateDownClass, GateUp: GateUpClass, Down: TrellisProjectionClass,
     Qkv: AffineProjectionClass, Z: AffineProjectionClass, A: AffineProjectionClass,
     B: AffineProjectionClass, Out: AffineProjectionClass, qkScale: { q: MlxArray; k: MlxArray }): QwenDeltaLayer {
-    return new Layer(weights, config, this.prefix, this.bind(weights, config, Qkv, Z, A, B, Out, qkScale),
-      new Mlp(new GateUp(this.trellis.gate, this.trellis.up), new Down(this.trellis.down)));
+    const down=new Down(this.trellis.down),plain=new Mlp(new GateUp(this.trellis.gate,this.trellis.up),down);
+    const overlay=new TrellisUnfusedMLP(new TrellisReducePrompt(this.trellis.gate),new TrellisReducePrompt(this.trellis.up),down);
+    return new Layer(weights,config,this.prefix,this.bind(weights,config,Qkv,Z,A,B,Out,qkScale),this.trellis.operation(plain,overlay));
   }
   prompt(weights: Weights, config: ModelConfig, Layer: typeof QwenDeltaLayer,
     Mlp: UnfusedClass, Gate: TrellisProjectionClass, Down: TrellisProjectionClass,
@@ -109,8 +128,9 @@ export class DeltaWeights {
   fused(weights: Weights, config: ModelConfig, Layer: typeof QwenDeltaLayer,
     Mlp: FusedClass, Down: TrellisProjectionClass, Plain: AffineProjectionClass,
     qkScale: { q: MlxArray; k: MlxArray }): QwenDeltaLayer {
-    return new Layer(weights, config, this.prefix, this.bind(weights, config, Plain, Plain, Plain, Plain, Plain, qkScale),
-      new Mlp(this.trellis.gate, this.trellis.up, new Down(this.trellis.down)));
+    const mlp=new Mlp(this.trellis.gate,this.trellis.up,new Down(this.trellis.down),this.trellis.state);
+    this.trellis.keep(mlp);
+    return new Layer(weights,config,this.prefix,this.bind(weights,config,Plain,Plain,Plain,Plain,Plain,qkScale),mlp);
   }
   withMlp(weights: Weights, config: ModelConfig, Layer: typeof QwenDeltaLayer,
     mlp: RowProjection, Projection: AffineProjectionClass, qkScale: { q: MlxArray; k: MlxArray }): QwenDeltaLayer {
@@ -145,10 +165,10 @@ export class DeltaWeights {
     block.qkScale = qkScale;
     return block;
   }
-  targets(): readonly (readonly [string, QuantizedLinear])[] {
+  targets(): readonly (readonly [string,QwenProjectionTarget])[] {
     const prefix = `${this.prefix}.linear_attn`;
     return [[`${prefix}.in_proj_qkv`, this.inProjQkv], [`${prefix}.in_proj_z`, this.inProjZ],
-      [`${prefix}.in_proj_a`, this.inProjA], [`${prefix}.in_proj_b`, this.inProjB], [`${prefix}.out_proj`, this.outProj]];
+      [`${prefix}.in_proj_a`, this.inProjA], [`${prefix}.in_proj_b`, this.inProjB], [`${prefix}.out_proj`, this.outProj],...this.trellis.targets()];
   }
 }
 
@@ -158,8 +178,8 @@ export class AttentionWeights {
   readonly kProj: QuantizedLinear;
   readonly vProj: QuantizedLinear;
   readonly oProj: QuantizedLinear;
-  constructor(weights: Weights, config: ModelConfig, readonly prefix: string, representations: TrellisRepresentations) {
-    this.trellis = new TrellisWeights(weights, config, prefix, representations);
+  constructor(weights: Weights, config: ModelConfig, readonly prefix: string, representations: TrellisRepresentations,state:LoraState) {
+    this.trellis = new TrellisWeights(weights, config, prefix, representations,state);
     const block = `${prefix}.self_attn`;
     this.qProj = QuantizedLinear.load(weights, `${block}.q_proj`, config);
     this.kProj = QuantizedLinear.load(weights, `${block}.k_proj`, config);
@@ -169,8 +189,9 @@ export class AttentionWeights {
   stage(weights: Weights, config: ModelConfig, Layer: typeof QwenAttentionLayer,
     Mlp: GateDownClass, GateUp: GateUpClass, Down: TrellisProjectionClass,
     Q: AffineProjectionClass, K: AffineProjectionClass, V: AffineProjectionClass, O: AffineProjectionClass): QwenAttentionLayer {
-    return new Layer(weights, config, this.prefix, this.text(weights, config, Q, K, V, O),
-      new Mlp(new GateUp(this.trellis.gate, this.trellis.up), new Down(this.trellis.down)));
+    const down=new Down(this.trellis.down),plain=new Mlp(new GateUp(this.trellis.gate,this.trellis.up),down);
+    const overlay=new TrellisUnfusedMLP(new TrellisReducePrompt(this.trellis.gate),new TrellisReducePrompt(this.trellis.up),down);
+    return new Layer(weights,config,this.prefix,this.text(weights,config,Q,K,V,O),this.trellis.operation(plain,overlay));
   }
   prompt(weights: Weights, config: ModelConfig, Layer: typeof QwenAttentionLayer,
     Mlp: UnfusedClass, Gate: TrellisProjectionClass, Down: TrellisProjectionClass,
@@ -180,8 +201,9 @@ export class AttentionWeights {
   }
   fused(weights: Weights, config: ModelConfig, Layer: typeof QwenAttentionLayer,
     Mlp: FusedClass, Down: TrellisProjectionClass, Plain: AffineProjectionClass): QwenAttentionLayer {
-    return new Layer(weights, config, this.prefix, this.text(weights, config, Plain, Plain, Plain, Plain),
-      new Mlp(this.trellis.gate, this.trellis.up, new Down(this.trellis.down)));
+    const mlp=new Mlp(this.trellis.gate,this.trellis.up,new Down(this.trellis.down),this.trellis.state);
+    this.trellis.keep(mlp);
+    return new Layer(weights,config,this.prefix,this.text(weights,config,Plain,Plain,Plain,Plain),mlp);
   }
   withMlp(weights: Weights, config: ModelConfig, Layer: typeof QwenAttentionLayer,
     mlp: RowProjection, Projection: AffineProjectionClass): QwenAttentionLayer {
@@ -216,9 +238,9 @@ export class AttentionWeights {
       oProj: shares.projection(this.oProj, Split, fraction, rows),
     });
   }
-  targets(): readonly (readonly [string, QuantizedLinear])[] {
+  targets(): readonly (readonly [string,QwenProjectionTarget])[] {
     const prefix = `${this.prefix}.self_attn`;
     return [[`${prefix}.q_proj`, this.qProj], [`${prefix}.k_proj`, this.kProj],
-      [`${prefix}.v_proj`, this.vProj], [`${prefix}.o_proj`, this.oProj]];
+      [`${prefix}.v_proj`, this.vProj], [`${prefix}.o_proj`, this.oProj],...this.trellis.targets()];
   }
 }

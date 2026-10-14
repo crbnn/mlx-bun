@@ -24,6 +24,8 @@
     "./models/qwen3": "./src/models/qwen/qwen3.ts",
     "./models/qwen3-moe": "./src/models/qwen/qwen3-moe.ts",
     "./models/qwen3_5": "./src/models/qwen/qwen3_5.ts",
+    "./models/qwen/blocks": "./src/models/qwen/blocks.ts",
+    "./models/qwen/written-layers": "./src/models/qwen/written-layers.ts",
     "./models/qwen38-27b-trellis-m4pro": "./src/models/qwen/qwen38-27b-trellis-m4pro.ts",
     "./models/qwen38-27b-trellis-m1max": "./src/models/qwen/qwen38-27b-trellis-m1max.ts",
     "./models/gemma4": "./src/models/gemma4/model.ts",
