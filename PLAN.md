@@ -48,8 +48,12 @@ synthetic digests, the real-weight parity suites, `packages/inference/scripts/di
 Facts recorded for the program after the merge, not planned here: on the M1 Max a two-row verify
 round costs 1.93 plain decode steps (1.30 on the M4 Pro) and eight rows 2.81 (1.94), on the
 factored, matrix-unit and split-K affine kernels and the drafter kernels the graph declares since
-2026-10-13; verify windows above eight rows still take the generic blocks (about 0.9 s at 12 to 16
-rows); DFlash 2 adaptive on that chip (in-process serve, four prompts) decodes greedy text at 22.1
+2026-10-13; since then operations of nine to 256 rows run the graph's wider layers (any-row
+matrix-unit Trellis kernels and the split-K affine kernel: verify windows of 16 rows 0.89 -> 0.19 s,
+32 0.89 -> 0.34, 64 0.77 -> 0.63; time to first token of 16-, 64- and 200-token prompts 0.97 -> 0.24,
+0.87 -> 0.64 and 2.28 -> 1.90 s), and windows and prompt pieces above 256 rows still the generic
+blocks (500-token prompts 4.2 s; the Neural Engine split measured at 18.1 and 29.0 ms a layer's MLP
+at 256 and 512 rows against 20.6 and 37.7 on the GPU, programs not built below 640); DFlash 2 adaptive on that chip (in-process serve, four prompts) decodes greedy text at 22.1
 against 17.1 tok/s plain, 20.5 against 16.8 under Qwen's instruct sampling and 16.6 against 16.2
 under its thinking sampling, the MTP head at 18.1, 16.4 and 15.8; the adaptive gate never drafts
 fewer than one token (a round without drafts costs about 1.1 plain steps there: it is not

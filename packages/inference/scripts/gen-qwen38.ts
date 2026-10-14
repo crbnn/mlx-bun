@@ -327,8 +327,10 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     drafter: { one: null, twoToThree: "Affine4RowsLinear", four: "AffineSplitMmaLinear", fiveToEight: "AffineSplitMmaLinear" },
     // Nine to 256 rows on the matrix unit's any-row kernels, each decoded weight fragment feeding several 8-row blocks
     // (one Qwen MLP, 3-bit, gate/up + down: 16 rows 1.0 + 0.85 ms against 10.9 + 1.7 on the prefill tiles and weight
-    // expansion; 64 rows 3.7 + 2.6 against 5.3 + 2.9; 128 rows 7.2 + 5.0 against 8.1 + 4.1), the split-K affine kernel
-    // for the projections and head (16 rows 2x MLX's quantized matmul, level with it from 32).
+    // expansion; 64 rows 3.7 + 2.5 against 5.3 + 2.9), the split-K affine kernel for the projections and head (16 rows
+    // 2x MLX's quantized matmul, level with it from 32). The whole forward, one sequence's verify window, bf16 KV at
+    // 512 positions: 16 rows 0.89 -> 0.19 s, 32 0.89 -> 0.34, 64 0.77 -> 0.63, 128 1.45 -> 1.22, 256 2.48 -> 2.38;
+    // past 256 rows weight expansion and MLX's GEMM win (384 rows 3.64 against 3.51 s).
     wider: { maxRows: 256,
       mlp: { sameGateUp: "MmaGateUpWide", mixedGateUp: "MmaGateUpWide", rowMajorDown: "MmaDownWide", k3InterleavedDown: "MmaDownWideK3i" },
       projections: { 3: "AffineSplitMmaLinear", 4: "AffineSplitMmaLinear" }, head: "AffineSplitMmaLinear" },
