@@ -262,7 +262,8 @@ describe("the M4 Pro graph against the generic Qwen 3.5 graph where both run the
       using input=ids([prompt(80,71)]);
       expect(new MlxPhaseDispatch(current).known(80)).toBe(new MlxPhaseDispatch(current).known(262144));
       outputDiff("known span 80",new MlxPhaseDispatch(current).known(80)(input,mine) as MlxArray,
-        new MlxPhaseDispatch(generic).known(80)(input,theirs) as MlxArray,current.logitsFromHidden.bind(current),generic.logitsFromHidden.bind(generic));
+        generic.forwardLayers(generic.embed.encode(input),theirs,"committed",undefined,null,80,false),
+        current.logitsFromHidden.bind(current),generic.logitsFromHidden.bind(generic));
       stateDiff("known span 80",mine,theirs);
     } finally {disposeAll(mine,theirs);generic.dispose();}
   },180_000);
