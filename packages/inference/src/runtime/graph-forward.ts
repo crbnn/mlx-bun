@@ -31,3 +31,18 @@ export class GraphForwardScope {
   }
   [Symbol.dispose](): void { this.#hidden?.dispose(); this.#hidden = null; }
 }
+
+/** The written prompt operation requests one materialization per layer. */
+export class BoundedGraphForwardScope extends GraphForwardScope {
+  constructor(hidden: MlxArray, capture: MlxLayerCapture | null, readonly caches: readonly Cache[]) { super(hidden, capture); }
+  override accept(layer: number, next: MlxArray): void { this.bound(layer, next, this.caches[layer]!); }
+}
+
+/** Submission cadence only; projection and layer calls remain in the file. */
+export class SubmittedGraphForwardScope extends GraphForwardScope {
+  constructor(hidden: MlxArray, capture: MlxLayerCapture | null, readonly layers: number, readonly every: number) { super(hidden, capture); }
+  override accept(layer: number, next: MlxArray): void {
+    super.accept(layer, next);
+    if ((layer + 1) % this.every === 0 && layer + 1 < this.layers) this.submit();
+  }
+}

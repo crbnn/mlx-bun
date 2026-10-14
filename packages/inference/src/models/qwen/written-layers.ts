@@ -3,14 +3,19 @@ import type { Weights } from "../../artifacts/weights";
 import type { ModelConfig } from "../../artifacts/config";
 import { QuantizedLinear } from "../../layers/quantized-linear";
 import { TrellisLinear } from "../../layers/trellis-linear";
+import type { TrellisRepresentations } from "../../kernels/trellis/index";
 import type { RowProjection } from "../../layers/trellis-prompt";
-import { QwenGatedDeltaNet, Qwen3TextAttention, Qwen3MediaAttention } from "./blocks";
+import { QwenGatedDeltaNet, Qwen3TextAttention, Qwen3MediaAttention, QwenDeltaLayer, QwenAttentionLayer } from "./blocks";
 import { AneAffineSplit, type AneMlpSplit } from "../../layers/ane-prefill-split";
 import { compiledSwiglu } from "../../layers/swiglu";
 
 /** A weight attachment port. The graph names every constructor at its binding;
  * these helpers only put the named projections on the named block. */
 export type AffineProjectionClass = new (linear: QuantizedLinear) => RowProjection;
+export type GateUpClass = new (gate: TrellisLinear, up: TrellisLinear) => RowProjection;
+export type TrellisProjectionClass = new (linear: TrellisLinear) => RowProjection;
+export type GateDownClass = new (gateUp: RowProjection, down: RowProjection) => RowProjection;
+export type UnfusedClass = new (gate: RowProjection, up: RowProjection, down: RowProjection) => RowProjection;
 
 /** Program/buffer ownership shared by written ANE bindings. Shape lookup only
  * shares resources; the graph supplies the operation and row capacity. */
@@ -46,10 +51,10 @@ export class TrellisWeights {
   readonly gate: TrellisLinear;
   readonly up: TrellisLinear;
   readonly down: TrellisLinear;
-  constructor(weights: Weights, config: ModelConfig, prefix: string) {
-    this.gate = TrellisLinear.load(weights, `${prefix}.mlp.gate_proj`, config);
-    this.up = TrellisLinear.load(weights, `${prefix}.mlp.up_proj`, config);
-    this.down = TrellisLinear.load(weights, `${prefix}.mlp.down_proj`, config, true);
+  constructor(weights: Weights, config: ModelConfig, prefix: string, representations: TrellisRepresentations) {
+    this.gate = TrellisLinear.load(weights, `${prefix}.mlp.gate_proj`, config, false, representations);
+    this.up = TrellisLinear.load(weights, `${prefix}.mlp.up_proj`, config, false, representations);
+    this.down = TrellisLinear.load(weights, `${prefix}.mlp.down_proj`, config, true, representations);
   }
 }
 
@@ -64,18 +69,40 @@ export class GateDownMLP {
 }
 
 export class DeltaWeights {
+  readonly trellis: TrellisWeights;
   readonly inProjQkv: QuantizedLinear;
   readonly inProjZ: QuantizedLinear;
   readonly inProjA: QuantizedLinear;
   readonly inProjB: QuantizedLinear;
   readonly outProj: QuantizedLinear;
-  constructor(weights: Weights, config: ModelConfig, readonly prefix: string) {
+  constructor(weights: Weights, config: ModelConfig, readonly prefix: string, representations: TrellisRepresentations) {
+    this.trellis = new TrellisWeights(weights, config, prefix, representations);
     const block = `${prefix}.linear_attn`;
     this.inProjQkv = QuantizedLinear.load(weights, `${block}.in_proj_qkv`, config);
     this.inProjZ = QuantizedLinear.load(weights, `${block}.in_proj_z`, config);
     this.inProjA = QuantizedLinear.load(weights, `${block}.in_proj_a`, config);
     this.inProjB = QuantizedLinear.load(weights, `${block}.in_proj_b`, config);
     this.outProj = QuantizedLinear.load(weights, `${block}.out_proj`, config);
+  }
+  stage(weights: Weights, config: ModelConfig, Layer: typeof QwenDeltaLayer,
+    Mlp: GateDownClass, GateUp: GateUpClass, Down: TrellisProjectionClass,
+    Qkv: AffineProjectionClass, Z: AffineProjectionClass, A: AffineProjectionClass,
+    B: AffineProjectionClass, Out: AffineProjectionClass, qkScale: { q: MlxArray; k: MlxArray }): QwenDeltaLayer {
+    return new Layer(weights, config, this.prefix, this.bind(weights, config, Qkv, Z, A, B, Out, qkScale),
+      new Mlp(new GateUp(this.trellis.gate, this.trellis.up), new Down(this.trellis.down)));
+  }
+  prompt(weights: Weights, config: ModelConfig, Layer: typeof QwenDeltaLayer,
+    Mlp: UnfusedClass, Gate: TrellisProjectionClass, Down: TrellisProjectionClass,
+    Plain: AffineProjectionClass, qkScale: { q: MlxArray; k: MlxArray }): QwenDeltaLayer {
+    return new Layer(weights, config, this.prefix, this.bind(weights, config, Plain, Plain, Plain, Plain, Plain, qkScale),
+      new Mlp(new Gate(this.trellis.gate), new Gate(this.trellis.up), new Down(this.trellis.down)));
+  }
+  aneStage(weights: Weights, config: ModelConfig, Layer: typeof QwenDeltaLayer,
+    Mlp: typeof AneBoundMlp, Split: AneMlpClass, Affine: typeof AneAffineSplit,
+    Plain: AffineProjectionClass, fraction: number, rows: number, shares: AneWeightShares,
+    qkScale: { q: MlxArray; k: MlxArray }): QwenDeltaLayer {
+    const mlp = new Mlp(this.trellis, Split, fraction, rows, shares);
+    return new Layer(weights, config, this.prefix, this.ane(weights, config, Plain, Affine, fraction, rows, shares, qkScale), mlp);
   }
   bind(weights: Weights, config: ModelConfig,
     Qkv: AffineProjectionClass, Z: AffineProjectionClass, A: AffineProjectionClass,
@@ -107,16 +134,36 @@ export class DeltaWeights {
 }
 
 export class AttentionWeights {
+  readonly trellis: TrellisWeights;
   readonly qProj: QuantizedLinear;
   readonly kProj: QuantizedLinear;
   readonly vProj: QuantizedLinear;
   readonly oProj: QuantizedLinear;
-  constructor(weights: Weights, config: ModelConfig, readonly prefix: string) {
+  constructor(weights: Weights, config: ModelConfig, readonly prefix: string, representations: TrellisRepresentations) {
+    this.trellis = new TrellisWeights(weights, config, prefix, representations);
     const block = `${prefix}.self_attn`;
     this.qProj = QuantizedLinear.load(weights, `${block}.q_proj`, config);
     this.kProj = QuantizedLinear.load(weights, `${block}.k_proj`, config);
     this.vProj = QuantizedLinear.load(weights, `${block}.v_proj`, config);
     this.oProj = QuantizedLinear.load(weights, `${block}.o_proj`, config);
+  }
+  stage(weights: Weights, config: ModelConfig, Layer: typeof QwenAttentionLayer,
+    Mlp: GateDownClass, GateUp: GateUpClass, Down: TrellisProjectionClass,
+    Q: AffineProjectionClass, K: AffineProjectionClass, V: AffineProjectionClass, O: AffineProjectionClass): QwenAttentionLayer {
+    return new Layer(weights, config, this.prefix, this.text(weights, config, Q, K, V, O),
+      new Mlp(new GateUp(this.trellis.gate, this.trellis.up), new Down(this.trellis.down)));
+  }
+  prompt(weights: Weights, config: ModelConfig, Layer: typeof QwenAttentionLayer,
+    Mlp: UnfusedClass, Gate: TrellisProjectionClass, Down: TrellisProjectionClass,
+    Plain: AffineProjectionClass): QwenAttentionLayer {
+    return new Layer(weights, config, this.prefix, this.text(weights, config, Plain, Plain, Plain, Plain),
+      new Mlp(new Gate(this.trellis.gate), new Gate(this.trellis.up), new Down(this.trellis.down)));
+  }
+  aneStage(weights: Weights, config: ModelConfig, Layer: typeof QwenAttentionLayer,
+    Mlp: typeof AneBoundMlp, Split: AneMlpClass, Affine: typeof AneAffineSplit,
+    Plain: AffineProjectionClass, fraction: number, rows: number, shares: AneWeightShares): QwenAttentionLayer {
+    const mlp = new Mlp(this.trellis, Split, fraction, rows, shares);
+    return new Layer(weights, config, this.prefix, this.ane(weights, config, Plain, Affine, fraction, rows, shares), mlp);
   }
   text(weights: Weights, config: ModelConfig, Q: AffineProjectionClass, K: AffineProjectionClass,
     V: AffineProjectionClass, O: AffineProjectionClass): Qwen3TextAttention<RowProjection> {
