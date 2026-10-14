@@ -207,7 +207,7 @@ try {
     // Reuse behavioral tests, rather than keeping a second consumer implementation.
     const tests = {
       mlx: ["mlx-abi.test.ts", "compile.test.ts", "metal-kernel.test.ts"],
-      inference: ["models/qwen3.test.ts", "models/phase-forward.ts", "models/test-composition.ts", "kernels/trellis-vector-expand.test.ts", "execution/expert-io-native.test.ts"],
+      inference: ["models/qwen3.test.ts", "models/phase-forward.ts", "models/phase-observer.ts", "models/test-composition.ts", "kernels/trellis-vector-expand.test.ts", "execution/expert-io-native.test.ts"],
     };
     const installedTestFiles: string[] = [];
     for (const [name, files] of Object.entries(tests)) {
