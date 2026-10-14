@@ -192,6 +192,11 @@ export interface MlxDeclaredGraph {
   readonly knownSpans?: MlxKnownSpans;
   /** Mixed rows in one forward, declared by a composition that serves them. */
   readonly mixed?: readonly MlxMixedRange[];
+  /** Mixed groups that retain their own projection geometry. The scheduler
+   * routes each group independently when a verify group is present. */
+  readonly mixedSeparate?: MlxSeparateMixed;
+  /** Full-sequence scoring operations, indexed by total token rows. */
+  readonly sequence?: readonly MlxSequenceRange[];
 }
 
 /** Cache layout written by the graph, independent of request storage policy. */
@@ -208,4 +213,25 @@ export interface MlxMixedRange {
   readonly from: number;
   readonly to: number;
   readonly operation: MlxMixedForward;
+}
+
+
+/** A full-sequence forward fixed for a contiguous range of token rows. */
+export interface MlxSequenceRange {
+  readonly from: number;
+  readonly to: number;
+  readonly operation: (ids: MlxArray, state: Cache[]) => MlxArray;
+}
+
+/** One mixed group using its own fixed projection geometry. */
+export interface MlxMixedGroupRange {
+  readonly from: number;
+  readonly to: number;
+  readonly operation: (group: MlxPhaseGroup) => MlxArray;
+}
+
+export interface MlxSeparateMixed {
+  readonly decode: readonly MlxMixedGroupRange[];
+  readonly window: readonly MlxMixedGroupRange[];
+  readonly verify: readonly MlxMixedGroupRange[];
 }
