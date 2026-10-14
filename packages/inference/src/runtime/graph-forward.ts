@@ -9,14 +9,16 @@ export class GraphForwardScope {
   #hidden: MlxArray | null;
   constructor(hidden: MlxArray, readonly capture: MlxLayerCapture | null) { this.#hidden = hidden; }
   get hidden(): MlxArray { return this.#hidden!; }
-  accept(layer: number, next: MlxArray): void {
+  protected replace(next: MlxArray): void {
     this.#hidden!.dispose();
     this.#hidden = next;
+  }
+  accept(layer: number, next: MlxArray): void {
+    this.replace(next);
     this.capture?.(layer, next);
   }
   bound(layer: number, next: MlxArray, cache: Cache): void {
-    this.#hidden!.dispose();
-    this.#hidden = next;
+    this.replace(next);
     const state = cache.state();
     try { ops.evalAll([next, ...state]); }
     finally { if (cache.stateNeedsDispose) for (const array of state) array.dispose(); }
@@ -42,7 +44,8 @@ export class BoundedGraphForwardScope extends GraphForwardScope {
 export class SubmittedGraphForwardScope extends GraphForwardScope {
   constructor(hidden: MlxArray, capture: MlxLayerCapture | null, readonly layers: number, readonly every: number) { super(hidden, capture); }
   override accept(layer: number, next: MlxArray): void {
-    super.accept(layer, next);
+    this.replace(next);
     if ((layer + 1) % this.every === 0 && layer + 1 < this.layers) this.submit();
+    this.capture?.(layer, next);
   }
 }

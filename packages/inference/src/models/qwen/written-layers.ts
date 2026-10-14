@@ -8,6 +8,14 @@ import type { RowProjection } from "../../layers/trellis-prompt";
 import { QwenGatedDeltaNet, Qwen3TextAttention, Qwen3MediaAttention, QwenDeltaLayer, QwenAttentionLayer } from "./blocks";
 import { AneAffineSplit, type AneMlpSplit } from "../../layers/ane-prefill-split";
 import { compiledSwiglu } from "../../layers/swiglu";
+import { qwen35WeightsView } from "./checkpoint";
+
+/** Checkpoint naming only; it never selects a layer or numerical operation. */
+export function canonicalQwenWeights(weights: Weights): Weights {
+  const view = qwen35WeightsView(weights);
+  if (view) weights.setView(view);
+  return weights;
+}
 
 /** A weight attachment port. The graph names every constructor at its binding;
  * these helpers only put the named projections on the named block. */
@@ -16,6 +24,7 @@ export type GateUpClass = new (gate: TrellisLinear, up: TrellisLinear) => RowPro
 export type TrellisProjectionClass = new (linear: TrellisLinear) => RowProjection;
 export type GateDownClass = new (gateUp: RowProjection, down: RowProjection) => RowProjection;
 export type UnfusedClass = new (gate: RowProjection, up: RowProjection, down: RowProjection) => RowProjection;
+export type FusedClass = new (gate: TrellisLinear, up: TrellisLinear, down: RowProjection) => RowProjection;
 
 /** Program/buffer ownership shared by written ANE bindings. Shape lookup only
  * shares resources; the graph supplies the operation and row capacity. */
@@ -97,6 +106,16 @@ export class DeltaWeights {
     return new Layer(weights, config, this.prefix, this.bind(weights, config, Plain, Plain, Plain, Plain, Plain, qkScale),
       new Mlp(new Gate(this.trellis.gate), new Gate(this.trellis.up), new Down(this.trellis.down)));
   }
+  fused(weights: Weights, config: ModelConfig, Layer: typeof QwenDeltaLayer,
+    Mlp: FusedClass, Down: TrellisProjectionClass, Plain: AffineProjectionClass,
+    qkScale: { q: MlxArray; k: MlxArray }): QwenDeltaLayer {
+    return new Layer(weights, config, this.prefix, this.bind(weights, config, Plain, Plain, Plain, Plain, Plain, qkScale),
+      new Mlp(this.trellis.gate, this.trellis.up, new Down(this.trellis.down)));
+  }
+  withMlp(weights: Weights, config: ModelConfig, Layer: typeof QwenDeltaLayer,
+    mlp: RowProjection, Projection: AffineProjectionClass, qkScale: { q: MlxArray; k: MlxArray }): QwenDeltaLayer {
+    return new Layer(weights, config, this.prefix, this.bind(weights, config, Projection, Projection, Projection, Projection, Projection, qkScale), mlp);
+  }
   aneStage(weights: Weights, config: ModelConfig, Layer: typeof QwenDeltaLayer,
     Mlp: typeof AneBoundMlp, Split: AneMlpClass, Affine: typeof AneAffineSplit,
     Plain: AffineProjectionClass, fraction: number, rows: number, shares: AneWeightShares,
@@ -158,6 +177,19 @@ export class AttentionWeights {
     Plain: AffineProjectionClass): QwenAttentionLayer {
     return new Layer(weights, config, this.prefix, this.text(weights, config, Plain, Plain, Plain, Plain),
       new Mlp(new Gate(this.trellis.gate), new Gate(this.trellis.up), new Down(this.trellis.down)));
+  }
+  fused(weights: Weights, config: ModelConfig, Layer: typeof QwenAttentionLayer,
+    Mlp: FusedClass, Down: TrellisProjectionClass, Plain: AffineProjectionClass): QwenAttentionLayer {
+    return new Layer(weights, config, this.prefix, this.text(weights, config, Plain, Plain, Plain, Plain),
+      new Mlp(this.trellis.gate, this.trellis.up, new Down(this.trellis.down)));
+  }
+  withMlp(weights: Weights, config: ModelConfig, Layer: typeof QwenAttentionLayer,
+    mlp: RowProjection, Projection: AffineProjectionClass): QwenAttentionLayer {
+    return new Layer(weights, config, this.prefix, this.text(weights, config, Projection, Projection, Projection, Projection), mlp);
+  }
+  mediaLayer(weights: Weights, config: ModelConfig, Layer: typeof QwenAttentionLayer,
+    mlp: RowProjection, Projection: AffineProjectionClass): QwenAttentionLayer {
+    return new Layer(weights, config, this.prefix, this.media(weights, config, Projection, Projection, Projection, Projection), mlp);
   }
   aneStage(weights: Weights, config: ModelConfig, Layer: typeof QwenAttentionLayer,
     Mlp: typeof AneBoundMlp, Split: AneMlpClass, Affine: typeof AneAffineSplit,
