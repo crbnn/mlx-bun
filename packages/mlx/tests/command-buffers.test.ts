@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { COMMAND_BUFFER_LIMITS, commandBufferEnvironment } from "@mlx-bun/mlx/command-buffers";
+import { COMMAND_BUFFER_LIMITS, commandBufferEnvironment } from "../src/command-buffers";
 
 const LIMITS = ["MLX_MAX_OPS_PER_BUFFER", "MLX_MAX_MB_PER_BUFFER"] as const;
 
