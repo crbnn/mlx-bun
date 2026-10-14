@@ -20,6 +20,7 @@ import { Qwen38TrellisM1Max } from "../../src/models/qwen/qwen38-27b-trellis-m1m
 import { LAYERS } from "./qwen38-layout";
 import { bindGraphCaches } from "../../src/models/cache-composition";
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
+import type { TrellisMlp } from "../../src/models/qwen/blocks";
 
 const HIDDEN = 512, INTER = 256, VOCAB = 256, HEADS = 4, KV_HEADS = 2, HEAD_DIM = 256;
 const HK = 4, HV = 8, DK = 64, DV = 64, KERNEL = 4;
@@ -230,7 +231,13 @@ describe("the written graph declarations", () => {
   test("LoRA targets, caches, no committed spans, no Neural Engine operation, the verify costs its composition measured", () => {
     for (const scheme of Object.keys(SCHEMES)) {
       const { current, generic } = graphs(scheme);
-      expect([...current.loraTargets().keys()].sort()).toEqual([...generic.loraTargets().keys()].sort());
+      const expected=LAYERS.flatMap((spec,layer)=>{
+        const prefix=`${PREFIX}.layers.${layer}`;
+        const projections=spec.kind==="deltanet"?["in_proj_qkv","in_proj_z","in_proj_a","in_proj_b","out_proj"]:["q_proj","k_proj","v_proj","o_proj"];
+        const block=spec.kind==="deltanet"?"linear_attn":"self_attn";
+        return [...projections.map(name=>`${prefix}.${block}.${name}`),...(["gate_proj","up_proj","down_proj"] as const).map(name=>`${prefix}.mlp.${name}`)];
+      });
+      expect([...current.loraTargets().keys()].sort()).toEqual(expected.sort());
       expect(current.loraTargets().size).toBe(48 * 5 + 16 * 4 + 64 * 3);
       expect((current as { knownSpans?: unknown }).knownSpans).toBeUndefined();
       expect([...current.verifyRoundCosts]).toEqual([[1,1],[2,1.89],[3,2.35],[4,2.97],[5,12.22],[6,13.16],[7,13.02],[8,12.88]]);
@@ -289,6 +296,33 @@ test("a long known span keeps one window and reaches beyond verify rows",()=>{
       new MlxPhaseDispatch(generic).known(80)(input,theirs) as MlxArray,current.logitsFromHidden.bind(current),generic.logitsFromHidden.bind(generic));
     stateDiff("known span 80",mine,theirs);
   } finally {disposeAll(mine,theirs);}
+},180_000);
+
+test("request adapters on gate, up and down overlay the fixed MLP without changing phase bindings",()=>{
+  const {current,generic}=graphs("bf16"),mine=current.makeCache(),theirs=generic.makeCache();
+  const mlp=generic.layers[0]!.mlp as TrellisMlp;
+  const right=[mlp.gate,mlp.up,mlp.down];
+  const left=[current.loraTargets().get(`${PREFIX}.layers.0.mlp.gate_proj`)!,
+    current.loraTargets().get(`${PREFIX}.layers.0.mlp.up_proj`)!,current.loraTargets().get(`${PREFIX}.layers.0.mlp.down_proj`)!];
+  const operation=current.verify[40];
+  for (let i=0;i<3;i++) {
+    const projection=left[i]!;
+    const adapter={a:tensor(noise(projection.inFeatures*2,91+i,0.02),[projection.inFeatures,2],Dtype.float32),
+      b:tensor(noise(2*projection.outFeatures,94+i,0.02),[2,projection.outFeatures],Dtype.float32),rank:2,scale:0.5};
+    projection.adapters=new Map([["synthetic",adapter]]);projection.loraState=current.loraState;
+    right[i]!.adapters=new Map([["synthetic",adapter]]);right[i]!.loraState=generic.loraState;
+  }
+  current.loraState.active=["synthetic"];generic.loraState.active=["synthetic"];
+  try {
+    using input=ids([prompt(40,91)]);
+    outputDiff("request MLP adapters",current.verify[40]!(input,mine,null),generic.verify[40]!(input,theirs,null) as MlxArray,
+      current.logitsFromHidden.bind(current),generic.logitsFromHidden.bind(generic));
+    stateDiff("request MLP adapters",mine,theirs);expect(current.verify[40]).toBe(operation);
+  } finally {
+    current.loraState.active=[];generic.loraState.active=[];
+    for (const projection of [...left,...right]) {projection.adapters=null;projection.loraState=null;}
+    disposeAll(mine,theirs);
+  }
 },180_000);
 
 test("packed prompt and decode groups preserve hidden, capture order and independent cache states",()=>{
