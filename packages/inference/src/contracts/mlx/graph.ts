@@ -12,6 +12,9 @@ export { widthClass, type MlxWidthClass, type MlxWidthTable } from "./width";
 /** Weight and expert-residency facts the wired-limit scope reads. */
 export interface MlxModelMemory {
   readonly weightsBytes: number;
+  /** The graph's composition measured that its weights are wired for a generation whatever their share of the
+   *  recommended working set; absent: the share decides. */
+  readonly wiredWeights?: boolean;
   readonly expertRuntime?: {
     readonly plan: { readonly plannedBytes: number };
     flushUsage?: () => void;
@@ -190,6 +193,29 @@ export interface MlxDenoisingOperations {
   softEmbeddings(logits: MlxArray, weight: MlxArray): MlxArray;
 }
 
+/** The adaptive draft gate's constants for one drafter on one machine
+ *  (`MlxDeclaredGraph.adaptiveDraftGates`); each absent one keeps the gate's
+ *  default (`AdaptiveDraftGateOptions`). */
+export interface AdaptiveDraftGateSettings {
+  /** Accepted and rejected counts every draft position starts from: their ratio
+   *  is the acceptance the gate assumes before it observes the text, their sum
+   *  how many rounds of evidence that assumption weighs. */
+  readonly priorAccepted?: number;
+  readonly priorRejected?: number;
+  /** The factor a position's counts keep per round that observes it, and every
+   *  count per round without drafts. */
+  readonly decay?: number;
+  readonly idleDecay?: number;
+  /** How much a round's expected rate must exceed a step without drafts. */
+  readonly margin?: number;
+  /** Rounds without drafts before a probe, doubling after each probe that
+   *  leaves the gate drafting nothing, up to `maxProbeInterval`. */
+  readonly probeInterval?: number;
+  readonly maxProbeInterval?: number;
+  /** The depth of a probe a drafter proposes without a verify round. */
+  readonly probeDepth?: number;
+}
+
 /** The operations behind a graph's declared capabilities. A graph implements
  * the ones its `graphCapabilities` promise; composition checks the pairing once
  * when it binds (`declaredGraph`), so execution never probes for them. */
@@ -235,6 +261,15 @@ export interface MlxDeclaredGraph {
    *  single-row decode step (rows 1 = 1). Declared only by a graph measured on
    *  the hardware it serves; speculative depth scheduling reads it. */
   readonly verifyRoundCosts?: ReadonlyMap<number, number>;
+  /** The widest adaptive round per draft provider kind, measured on the hardware
+   *  it serves: an adaptive drafter of a listed kind drafts up to it instead of
+   *  its own width, unless the request names a width. Absent, or a kind it does
+   *  not list: the drafter's own width. */
+  readonly adaptiveDraftWidths?: ReadonlyMap<string, number>;
+  /** The adaptive draft gate's settings per draft provider kind, measured on the
+   *  hardware it serves (an adaptive drafter of a listed kind gates with them).
+   *  Absent, or a kind it does not list: the gate's defaults. */
+  readonly adaptiveDraftGates?: ReadonlyMap<string, AdaptiveDraftGateSettings>;
   /** Committed known-token spans, declared when the composition qualifies them
    *  (`appendKnown` then reads committed). */
   readonly knownSpans?: MlxKnownSpans;

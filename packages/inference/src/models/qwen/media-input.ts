@@ -1,14 +1,16 @@
 import type { ModelConfig } from "../../artifacts/config";
 import { TURBOQUANT_FOLD_FILE, readTurboQuantFold } from "../../artifacts/turboquant-fold";
 import type { QuantizedEmbedding } from "../../layers/quantized-embedding";
-import type { QuantizedLinear } from "../../layers/quantized-linear";
+import { QuantizedLinear } from "../../layers/quantized-linear";
+import { readDraftVocabulary } from "../../artifacts/draft-vocabulary";
+import type { DraftProjection } from "../../contracts/mlx/draft-projection";
 import { mropePositionIds } from "../../layers/qwen-mrope";
 import { type MropeRequestState } from "../../contracts/mlx/positions";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { Cache } from "../../contracts/mlx/cache";
 import type { MediaEncoders, MlxDecodeState, MlxPromptInput, VisionEncoder } from "../../contracts/mlx/media";
 import type { MlxHeadForward, MlxWidthClass, MlxWidthTable } from "../../contracts/mlx/graph";
-import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
+import type { DraftProjectionKernel, ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import * as ops from "@mlx-bun/mlx/ops";
@@ -92,16 +94,46 @@ export function qwenResidualBasis(graph: string, modelDir: string): ResidualBasi
 }
 
 /** Ports draft sources read from this graph: its embedding, head, layer taps,
- * the MTP geometry a checkpoint-native draft head needs and, from a graph whose
- * residual stream carries a rotation fold, that basis (the same object on every view). */
-export function qwenDraftTarget(model: QwenMediaGraph, residualBasis?: ResidualBasis): TargetView {
-  return Object.freeze({ identity: model, ...(residualBasis ? { residualBasis } : {}), hiddenLayerTaps: Object.freeze({
+ * the MTP geometry a checkpoint-native draft head needs, from a graph whose
+ * residual stream carries a rotation fold that basis, and from a graph whose
+ * composition measured them the kernels of a drafter's own projections (each the
+ * same object on every view) and the head over its draft vocabulary (`vocabulary`,
+ * read when a drafter first reads the projection's). */
+export function qwenDraftTarget(model: QwenMediaGraph, residualBasis?: ResidualBasis,
+  draftProjections?: MlxWidthTable<DraftProjectionKernel>, vocabulary?: () => DraftProjection["vocabulary"]): TargetView {
+  const projection: DraftProjection = { embed: model.embed, logits: model.logits };
+  // The vocabulary's rows are gathered when a drafter first reads them, not for drafters that never do.
+  if (vocabulary) Object.defineProperty(projection, "vocabulary", { get: vocabulary, enumerable: true });
+  return Object.freeze({ identity: model, ...(residualBasis ? { residualBasis } : {}), ...(draftProjections ? { draftProjections } : {}),
+    hiddenLayerTaps: Object.freeze({
     layerCount: model.config.text.numHiddenLayers,
-    projection: Object.freeze({ embed: model.embed, logits: model.logits }),
+    projection: Object.freeze(projection),
   }), recurrentMtp: Object.freeze({
     hiddenSize: model.config.text.hiddenSize, layerCount: model.config.text.numHiddenLayers,
     embed: model.embed.encode.bind(model.embed), logits: model.logits,
     vocabularyHead: model.lmHead ? Object.freeze({ w: model.lmHead.w, scales: model.lmHead.scales,
       biases: model.lmHead.biases, spec: model.lmHead.spec, vocabSize: model.config.text.vocabSize }) : undefined,
   }) });
+}
+
+/** The head's rows of the artifact's frequency-ranked draft vocabulary (`file`, a path inside the artifact) and their
+ *  projection per width class on `kernels` (the head's own layers over those rows), for a graph whose composition
+ *  measured a drafter selecting over them. A row gather of an affine head is exact: the rows' logits are the full
+ *  head's arithmetic per row. The gathered arrays go to `owned`, which the graph frees. */
+export function qwenDraftVocabulary(head: QuantizedLinear, modelDir: string, file: string, vocabSize: number,
+  kernels: (rows: QuantizedLinear) => MlxWidthTable<(hidden: MlxArray) => MlxArray>,
+  owned: { dispose(): void }[]): NonNullable<DraftProjection["vocabulary"]> {
+  const listed = readDraftVocabulary(join(modelDir, file), vocabSize);
+  using index = ops.fromInt32([...listed], [listed.length]);
+  const ids = index.astype(Dtype.uint32);
+  owned.push(ids);
+  const gather = (array: MlxArray) => {
+    using rows = ops.takeAxis(array, index, 0);
+    const copy = ops.contiguous(rows);
+    owned.push(copy);
+    return copy;
+  };
+  const rows = new QuantizedLinear(gather(head.w), gather(head.scales), head.biases ? gather(head.biases) : null, head.spec);
+  ops.evalAll([ids, rows.w, rows.scales, ...(rows.biases ? [rows.biases] : [])]);
+  return Object.freeze({ ids, logits: kernels(rows) });
 }

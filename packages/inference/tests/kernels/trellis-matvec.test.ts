@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import { CompiledFunction, Dtype, MlxArray, ops } from "@mlx-bun/mlx";
 import {
-  expandTrellis, fusedGateUpSwiglu, fusedGateUpSwigluMixed, qualifiedRepresentations, trellisReduce, trellisScatter,
-  type TrellisGeometry,
+  balancedScatterRow, expandTrellis, fusedGateUpSwiglu, fusedGateUpSwigluMixed, gateUpReduceRow, qualifiedRepresentations,
+  scatterRow, trellisReduce, trellisScatter, type TrellisGeometry,
 } from "@mlx-bun/inference/kernels/trellis";
 import { deviceArchitecture } from "@mlx-bun/mlx/ffi";
 
@@ -65,6 +65,30 @@ test("interleaved scatter codebook retains outputs across the small row counts",
     same(actual, expected);
   }
 });
+
+test("one-row entry points give their schedules' one-row bits and refuse other rows and layouts", () => {
+  for (const k of [2, 3, 4]) {
+    using gate = weights(k), up = weights(k);
+    using x = input(1, gate.geometry.inFeatures, Dtype.bfloat16, true);
+    using expected = fusedGateUpSwiglu(x, gate, up, 13, shipped.gateUpCodebook);
+    using actual = gateUpReduceRow(x, gate, up, 13, shipped.gateUpCodebook);
+    same(actual, expected);
+  }
+  for (const [k, interleave] of [[2, false], [4, false], [3, false], [3, true]] as const) {
+    using w = weights(k, 0, interleave);
+    using x = input(1, w.geometry.inFeatures, Dtype.bfloat16);
+    using expected = trellisScatter(x, w.codes, w.scales, w.geometry, 13, false, shipped.scatter);
+    // 3-bit codes at T 256 take the balanced kernel, every other width the lane-per-word one.
+    const [row, other] = k === 3 ? [balancedScatterRow, scatterRow] : [scatterRow, balancedScatterRow];
+    using actual = row(x, w.codes, w.scales, w.geometry, 13, shipped.scatter);
+    same(actual, expected);
+    expect(() => other(x, w.codes, w.scales, w.geometry, 13, shipped.scatter)).toThrow();
+  }
+  using gate = weights(3), down = weights(3, 0);
+  using two = input(2, gate.geometry.inFeatures, Dtype.bfloat16), twoDown = input(2, down.geometry.inFeatures, Dtype.bfloat16);
+  expect(() => gateUpReduceRow(two, gate, gate, 13, false)).toThrow("one activation row");
+  expect(() => balancedScatterRow(twoDown, down.codes, down.scales, down.geometry, 13, shipped.scatter)).toThrow("one activation row");
+}, 30_000);
 
 test("fused gate/up schedules and mixed kernel preserve the fused activation tail", () => {
   for (const k of [2, 3, 4]) {

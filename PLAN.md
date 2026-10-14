@@ -45,15 +45,21 @@ synthetic digests, the real-weight parity suites, `packages/inference/scripts/di
 - [ ] Synthetic digests are recorded for `applegpu_g16s` and `applegpu_g13s`; the cases skip on
       any other host until recorded there (`scripts/synthetic-digests.ts record`).
 
-Facts recorded for the program after the merge, not planned here: on the M1 Max a two-row verify
-round costs 1.89 plain decode steps (1.30 on the M4 Pro) and five or more rows cost 12 to 13
-because the generic Trellis MLP takes the prefill kernels there; DFlash 2 at depth 2 beats plain
-decode by about 12% on that chip; the adaptive gate never drafts fewer than one token; its
-per-row verify costs ignore how many requests are batched; the M1 Max composition has no Neural
-Engine bridge and prefills at 121 tok/s against 200 on the M4 Pro; the paired check's band is
-narrower than session drift for sub-percent decode differences (the clean M1 Max run is the null);
-the TurboQuant fused decode kernel covers head dimensions 64, 128, 256 and 512 and 96 decodes on
-the plain path.
+Facts recorded for the program after the merge, not planned here: on the M1 Max a verify round
+of two rows costs 1.77 plain decode steps and of eight rows 2.05 (1.30 and 1.94 on the M4 Pro);
+that graph runs operations of nine to 256 rows on its wider layers and more on the generic
+blocks, and one-sequence prompt pieces of 224 to 2048 positions on the Neural Engine split (mean
+KL against the GPU alone 1.2e-4 to 1.9e-3), prefilling 1k- and 8k-token prompts at 207 and 213
+tok/s (200 on the M4 Pro). With the gate settings the graph declares, DFlash 2 adaptive decodes
+30.5 tok/s greedy, 28.5 under Qwen's instruct sampling and 24.5 under its thinking sampling
+against plain decode's 19.5, 19.1 and 19.1, the MTP head 26.7, 24.8 and 22.4 (in-process serve,
+192 tokens, eight prompts, sampled modes over three seeds); two and four concurrent greedy
+requests decode 42.6 and 47.5 to 48.3 tok/s in aggregate with DFlash 2 against plain's 24.2 and
+36.2. Open: on short creative text (35 to 80 tokens) both drafters still trail plain decode, by
+up to 16% under instruct sampling and 3% greedy, in drafted rounds the text does not repay. The
+paired check's band is narrower than session drift for sub-percent decode differences (the clean
+M1 Max run is the null); the TurboQuant fused decode kernel covers head dimensions 64, 128, 256
+and 512 and 96 decodes on the plain path.
 
 The measurements of record before the merge. M1 Max (2026-10-12, clean machine, `perf.yml`):
 Trellis default decode 14.1 → 14.0 tok/s (1.000 [0.995, 1.006]), e4b default 64.4 → 64.3 (0.998
@@ -91,7 +97,8 @@ while that machine is in use (swap above 512 MB).
   alone do not close this. Done so far: the
   [generated Gemma4 graph test](packages/inference/tests/parity/gemma4-generated.test.ts)
   passed on e4b and 12B (identity within this tree; 26B-A4B not run). Packed Trellis now matches main in 96 full greedy logit vectors, three shared
-  B1/depth-two MTP runs, and the 18-case plain-KV runtime grid with restored
+  B1/depth-two MTP runs (on the M1 Max, whose verify windows reassociate, by KL and greedy
+  agreement), and the 18-case plain-KV runtime grid with restored
   continuation ([evidence](packages/inference/README.md#packed-qwen-trellis-parity)).
   Open: published references and broader Trellis shapes;
   [runtime-oracle](packages/inference/tests/parity/runtime-oracle.test.ts) references

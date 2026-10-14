@@ -2,12 +2,23 @@
 // composition) on small synthetic weights laid out by the generated quant table: 48 DeltaNet and 16 attention layers
 // with the artifact's 3- and 4-bit affine projections, Trellis gate/up at the artifact's widths (mixed in its ten
 // layers) and its 3-bit block-interleaved and row-major downs, scaled down in width. The composition facts it
-// declares (LoRA targets, no committed spans, no Neural Engine operation, its measured verify costs, the residual
-// basis its fold record names, the caches of each KV scheme). From five rows the graph runs the generic blocks: there
-// it is held to the generic Qwen 3.5 graph of its family over the same weights under bf16, affine 4- and 8-bit and
-// TurboQuant KV, hidden, logits and every cache tensor, at maxDiff 0. Its reduce and scatter layers at one to four
-// rows have no generic counterpart: the generator's drift test (qwen38-generated-sync), the real-artifact parity suite
-// on the M1 Max (tests/parity/qwen-trellis-parity.test.ts) and the app digests are their gates. No model, no download.
+// declares (no LoRA targets unless the composition mounts adapters, no committed spans, no Neural Engine operation
+// without the bridge or with adapters, its measured verify costs, the residual basis its fold record names, the caches of each KV scheme:
+// the KV4 lego for affine 4-bit group 64, the generic graph's for every other, bf16 windows on the folded read). Where the graph
+// runs the generic blocks (a whole prompt chunk, prompt tails and verify windows above WIDER_ROWS rows, every
+// operation under the adapters composition) it is held to the generic Qwen 3.5 graph of its family over the same
+// weights under bf16, affine 4- and 8-bit and TurboQuant KV (affine 4-bit over the KV4 lego in both, whose window
+// reads are not the generic graph's unfused port), hidden, logits and every cache tensor, at maxDiff 0. Its
+// row kernels (threadgroup-codebook at one row; the codebook simdgroup-matrix Trellis kernels and the affine verify
+// kernels at two to eight; the wider layers from nine to WIDER_ROWS rows) have no generic counterpart: the wider layers are held to the
+// generic graph within bf16 rounding here, and the generator's drift test (qwen38-generated-sync), the kernel tests,
+// the real-artifact parity suite on the M1 Max (tests/parity/qwen-trellis-parity.test.ts) and the app digests are
+// their gates. Its prompt pieces take their projections on DequantizedLinear: MLX's quantized matmul below a
+// projection's fewest rows, and from them the dense GEMM, that matmul bit for bit at the artifact's projection shapes
+// (the layer's own test, dequantized-linear, holds them); of these scaled-down projections the pieces here take it only
+// at q_proj's 2048 outputs, bit for bit as well. The Neural Engine operation loads
+// programs compiled for the artifact's widths: the opt-in split tests (ane-split, ane-install) and real-weight runs
+// are its gates. No model, no download.
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -19,17 +30,24 @@ import { parseQuantization, type ModelConfig } from "../../src/artifacts/config"
 import { TURBOQUANT_FOLD_FILE } from "../../src/artifacts/turboquant-fold";
 import type { Weights } from "../../src/artifacts/weights";
 import type { BatchableCache, Cache } from "../../src/contracts/mlx/cache";
-import type { MlxWidthClass } from "../../src/contracts/mlx/graph";
+import type { MlxLayerCapture, MlxWidthClass } from "../../src/contracts/mlx/graph";
 import type { Composition, KvStorageScheme } from "../../src/contracts/portable/composition";
-import { LAYERS, Qwen38TrellisM1Max } from "../../src/models/qwen/qwen38-27b-trellis-m1max";
+import { LAYERS, Qwen38TrellisM1Max, WIDER_ROWS } from "../../src/models/qwen/qwen38-27b-trellis-m1max";
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
+import { Affine4RowsLinear, AffineSplitMmaLinear } from "../../src/layers/affine-verify-linear";
+import { QuantizedLinear } from "../../src/layers/quantized-linear";
+import { unfusedAffineKernels } from "../../src/state/affine-attention";
+import { foldedWindowRead, sdpaRead } from "../../src/state/attention-read";
+import { Bf16FirstKv4Head256Cache } from "../../src/state/bf16-first-kv";
+import { KVCache } from "../../src/state/kv";
 import { QWEN38_COMPOSITIONS } from "../../scripts/gen-qwen38";
 
 const HIDDEN = 512, INTER = 256, VOCAB = 256, HEADS = 4, KV_HEADS = 2, HEAD_DIM = 256;
 const HK = 4, HV = 8, DK = 64, DV = 64, KERNEL = 4;
 const KEY_DIM = HK * DK, VALUE_DIM = HV * DV, CONV_DIM = 2 * KEY_DIM + VALUE_DIM;
 const PREFIX = "language_model.model";
-const CHUNK = 40;
+/** A prompt chunk above the wider layers' rows, which the generic blocks run. */
+const CHUNK = WIDER_ROWS + 8;
 
 
 const owned: MlxArray[] = [];
@@ -143,6 +161,17 @@ const SCHEMES: Readonly<Record<string, KvStorageScheme>> = Object.freeze({
   kv8: { kind: "affine", bits: 8, groupSize: 64, kernels: "unfused" },
   turbo: { kind: "turbo", kBits: 8, vBits: 3 },
 });
+/** Affine 4-bit group 64's attention cache: the KV4 lego, bf16 through its first append, its decode kernel at the
+ *  128 tokens per threadgroup the M1 Max's table names, its several-row reads the composition's affine set (`plain`:
+ *  the unfused set, or null for another). */
+function kv4Lego(cache: Cache, plain: typeof unfusedAffineKernels | null): void {
+  expect(cache).toBeInstanceOf(Bf16FirstKv4Head256Cache);
+  const lego = cache as Bf16FirstKv4Head256Cache;
+  expect(lego.start).toBe(0);
+  expect(lego.decodeBlock).toBe(128);
+  if (plain) expect(lego.plain).toBe(plain);
+  else expect(lego.plain).not.toBe(unfusedAffineKernels);
+}
 // ── Comparison ──────────────────────────────────────────────────────────────
 
 const results = new Map<string, { worst: number; tensors: number }>();
@@ -231,18 +260,58 @@ function graphs(scheme: string, overrides: Partial<Composition> = {}): { current
 afterAll(() => { for (const { current } of built.values()) current.dispose(); });
 
 describe("the composition the generated graph declares", () => {
-  test("LoRA targets, caches, no committed spans, no Neural Engine operation, the verify costs its composition measured", () => {
+  test("no LoRA targets without adapters, caches, no committed spans, no Neural Engine operation, the verify costs and wired weights its composition measured", () => {
     for (const scheme of Object.keys(SCHEMES)) {
       const { current, generic } = graphs(scheme);
-      expect([...current.loraTargets().keys()].sort()).toEqual([...generic.loraTargets().keys()].sort());
-      expect(current.loraTargets().size).toBe(48 * 5 + 16 * 4);
+      expect(current.graphCapabilities.adapters).toEqual({ batched: false, mountable: false });
+      expect(current.loraTargets().size).toBe(0);
       expect((current as { knownSpans?: unknown }).knownSpans).toBeUndefined();
       expect([...current.verifyRoundCosts]).toEqual(QWEN38_COMPOSITIONS["qwen38-27b-trellis-m1max"]!.verifyRoundCosts!.costs.map(([rows, cost]) => [rows, cost]));
+      expect(current.wiredWeights).toBe(QWEN38_COMPOSITIONS["qwen38-27b-trellis-m1max"]!.wiredWeights!);
+      expect([...current.adaptiveDraftWidths]).toEqual(QWEN38_COMPOSITIONS["qwen38-27b-trellis-m1max"]!.adaptiveDraftWidths!.map(([kind, width]) => [kind, width]));
+      expect([...current.adaptiveDraftGates]).toEqual(QWEN38_COMPOSITIONS["qwen38-27b-trellis-m1max"]!.adaptiveDraftGates!.map(([kind, settings]) => [kind, settings]));
       expect(current.prefillChunk.ane).toBeUndefined();
       const a = current.makeCache(), b = generic.makeCache();
-      try { expect(a.map(cache => `${cache.constructor.name} ${cache.signature()}`)).toEqual(b.map(cache => `${cache.constructor.name} ${cache.signature()}`)); }
-      finally { disposeAll(a, b); }
+      try {
+        expect(a.map(cache => cache.signature())).toEqual(b.map(cache => cache.signature()));
+        for (const [layer, cache] of a.entries())
+          if (scheme !== "kv4" || LAYERS[layer]!.kind !== "attention") expect(cache.constructor).toBe(b[layer]!.constructor);
+          else kv4Lego(cache, unfusedAffineKernels);
+        // bf16: the plain cache, its windows through the folded read (bit for bit the generic graph's stock read).
+        if (scheme === "bf16") for (const [layer, cache] of a.entries()) if (LAYERS[layer]!.kind === "attention") {
+          expect((cache as KVCache).windowRead).toBe(foldedWindowRead);
+          expect((b[layer] as KVCache).windowRead).toBe(sdpaRead);
+        }
+      } finally { disposeAll(a, b); }
     }
+    // The KV4 lego under the tiled-causal read kernels too, its several-row reads that set.
+    const tiled = graphs("kv4", { kv: { kind: "affine", bits: 4, groupSize: 64, kernels: "tiled-causal" } }).current.makeCache();
+    try { for (const [layer, cache] of tiled.entries()) if (LAYERS[layer]!.kind === "attention") kv4Lego(cache, null); }
+    finally { disposeAll(tiled); }
+  });
+
+  test("the kernels a bound drafter's own 4-bit projections run, one per width class, the same table on every view", () => {
+    const { current } = graphs(Object.keys(SCHEMES)[0]!);
+    const table = current.draftTarget([]).draftProjections!;
+    expect(current.draftTarget([]).draftProjections).toBe(table);
+    // A drafter's 4-bit, group-64 projection (64 outputs over 512 inputs) and its rows at every class.
+    using source = ops.randomNormal([64, 512], Dtype.bfloat16, 0, 0.05, null);
+    const q = ops.quantize(source, 64, 4);
+    const linear = new QuantizedLinear(q.packed, q.scales, q.biases, { bits: 4, groupSize: 64, mode: "affine" });
+    const named: Record<MlxWidthClass, [number, { forward(x: MlxArray): MlxArray }]> = {
+      one: [1, linear], twoToThree: [3, new Affine4RowsLinear(linear)], four: [4, new AffineSplitMmaLinear(linear)],
+      fiveToEight: [8, new AffineSplitMmaLinear(linear)], wider: [12, new AffineSplitMmaLinear(linear)],
+    };
+    try {
+      for (const [width, [rows, layer]] of Object.entries(named) as [MlxWidthClass, [number, { forward(x: MlxArray): MlxArray }]][]) {
+        using x = ops.randomNormal([1, rows, 512], Dtype.bfloat16, 0, 1, null);
+        using declared = table[width](q.packed, q.scales, q.biases)(x);
+        using expected = layer.forward(x);
+        using same = ops.equal(declared, expected);
+        using all = ops.allReduce(same);
+        expect(all.toFloat32()[0]).toBe(1);
+      }
+    } finally { q.packed.dispose(); q.scales.dispose(); q.biases.dispose(); }
   });
 
   test("the residual basis its fold record declares, read once at construction", () => {
@@ -266,9 +335,11 @@ describe("the composition the generated graph declares", () => {
 });
 
 for (const scheme of Object.keys(SCHEMES)) {
-  test(`${scheme} KV: from five rows, the M1 Max graph equals the generic Qwen 3.5 graph (prompt chunk, tails, verify, decode of several sequences)`, () => {
+  test(`${scheme} KV: where both run the generic blocks, the M1 Max graph equals the generic Qwen 3.5 graph (a prompt chunk, a tail and a verify window above WIDER_ROWS rows)`, () => {
     const { current, generic } = graphs(scheme);
-    const mine = current.makeCache(), theirs = generic.makeCache();
+    // Affine 4-bit group 64 composes the KV4 lego, whose quantized window reads are not the generic graph's unfused
+    // port: there the generic graph reads through the caches the M1 Max graph composes.
+    const mine = current.makeCache(), theirs = scheme === "kv4" ? current.makeCache() : generic.makeCache();
     const step = (label: string, width: MlxWidthClass, rows: number[][],
       run: (graph: Qwen38TrellisM1Max | Qwen35Model, input: MlxArray, caches: Cache[]) => MlxArray | Promise<MlxArray>) => {
       using input = ids(rows);
@@ -278,10 +349,76 @@ for (const scheme of Object.keys(SCHEMES)) {
     };
     try {
       step(`prefillChunk.gpu ${CHUNK}`, "wider", [prompt(CHUNK, 1)], (g, input, caches) => g.prefillChunk.gpu(input, caches, null));
-      step("prefillTail.fiveToEight 6", "fiveToEight", [prompt(6, 2)], (g, input, caches) => g.prefillTail.fiveToEight(input, caches, null));
-      step("prefillTail.wider 13", "wider", [prompt(13, 3)], (g, input, caches) => g.prefillTail.wider(input, caches, null));
-      step("verify.fiveToEight 8", "fiveToEight", [prompt(8, 4)], (g, input, caches) => g.verify.fiveToEight(input, caches, null));
-      step("verify.wider 12", "wider", [prompt(12, 5)], (g, input, caches) => g.verify.wider(input, caches, null));
+      step(`prefillTail.wider ${WIDER_ROWS + 1}`, "wider", [prompt(WIDER_ROWS + 1, 3)], (g, input, caches) => g.prefillTail.wider(input, caches, null));
+      step(`verify.wider ${WIDER_ROWS + 2}`, "wider", [prompt(WIDER_ROWS + 2, 5)], (g, input, caches) => g.verify.wider(input, caches, null));
     } finally { disposeAll(mine, theirs); }
   }, 180_000);
 }
+
+// The wider layers against the generic blocks, the first layers' hidden: the largest difference relative to the
+// largest magnitude. Measured over these synthetic weights: 1.4e-2 to 2.9e-2, as the two-to-three- and
+// five-to-eight-row kernels' 1.7e-2 to 2.6e-2 (their 64 random layers compound any rounding, to 7e-2 and above 0.3 by
+// the last layer, so the deeper layers bound nothing); a wrong weight, layer or row is of order one.
+const FIRST_LAYERS_TOLERANCE = 5e-2;
+
+/** The largest absolute difference relative to the largest magnitude of `expected` (both read as float32). */
+function relativeDiff(actual: MlxArray, expected: MlxArray): number {
+  expect(actual.shape).toEqual(expected.shape);
+  using left = actual.astype(Dtype.float32);
+  using right = expected.astype(Dtype.float32);
+  const x = left.toFloat32(), y = right.toFloat32();
+  let worst = 0, scale = 0;
+  for (let i = 0; i < x.length; i++) { worst = Math.max(worst, Math.abs(x[i]! - y[i]!)); scale = Math.max(scale, Math.abs(y[i]!)); }
+  return worst / scale;
+}
+
+test("bf16 KV: from nine to WIDER_ROWS rows the wider layers agree with the generic Qwen 3.5 graph within reassociation (prompt tails and a verify window)", () => {
+  const { current, generic } = graphs("bf16");
+  type Run = (graph: Qwen38TrellisM1Max | Qwen35Model, input: MlxArray, caches: Cache[], capture: MlxLayerCapture | null) => MlxArray;
+  const steps: [string, number, Run][] = [
+    ["prefillTail.wider", 13, (g, input, caches, capture) => g.prefillTail.wider(input, caches, capture) as MlxArray],
+    ["prefillTail.wider", 40, (g, input, caches, capture) => g.prefillTail.wider(input, caches, capture) as MlxArray],
+    ["prefillTail.wider", WIDER_ROWS, (g, input, caches, capture) => g.prefillTail.wider(input, caches, capture) as MlxArray],
+    ["verify.wider", 12, (g, input, caches, capture) => g.verify.wider(input, caches, capture) as MlxArray],
+  ];
+  for (const [label, rows, run] of steps) {
+    // Fresh caches each: a step's differences do not carry into the next one's state.
+    const mine = current.makeCache(), theirs = generic.makeCache();
+    const layers: [MlxArray[], MlxArray[]] = [[], []];
+    const capture = (into: MlxArray[]): MlxLayerCapture => (_, h) => { into.push(ops.contiguous(h)); };
+    try {
+      using input = ids([prompt(rows, rows)]);
+      using a = run(current, input, mine, capture(layers[0])), b = run(generic, input, theirs, capture(layers[1]));
+      const first = Math.max(...layers[0].slice(0, 4).map((h, i) => relativeDiff(h, layers[1][i]!)));
+      console.log(`qwen38-m1max-identity wider layers ${label} ${rows}: first layers' largest relative difference ${first.toExponential(1)}`);
+      expect(first, `${label} ${rows}: the first layers`).toBeLessThan(FIRST_LAYERS_TOLERANCE);
+      using logits = current.logits.wider(a);
+      using wide = logits.astype(Dtype.float32);
+      expect(wide.toFloat32().every(Number.isFinite), `${label} ${rows}: logits finite`).toBe(true);
+    } finally { disposeAll(mine, theirs); for (const h of layers.flat()) h.dispose(); }
+  }
+}, 180_000);
+
+test("the adapters composition: every operation runs the generic blocks", () => {
+  const { current: adapted, generic } = graphs("bf16", { adapters: true, aneBridge: true });
+  expect(adapted.graphCapabilities.adapters).toEqual({ batched: true, mountable: true });
+  expect(adapted.prefillChunk.ane).toBeUndefined();
+  expect(adapted.loraTargets().size).toBe(48 * 5 + 16 * 4);
+  expect([...adapted.loraTargets().keys()].sort()).toEqual([...generic.loraTargets().keys()].sort());
+  const mine = adapted.makeCache(), theirs = generic.makeCache();
+  try {
+    const steps: [string, MlxWidthClass, number[][], (graph: Qwen38TrellisM1Max | Qwen35Model, input: MlxArray, caches: Cache[]) => MlxArray][] = [
+      ["prefillChunk.gpu", "wider", [prompt(CHUNK, 90)], (g, input, caches) => g.prefillChunk.gpu(input, caches, null) as MlxArray],
+      ["decode.one", "one", [[7]], (g, input, caches) => g.decode.one(input, caches, null) as MlxArray],
+      ["verify.twoToThree 3", "twoToThree", [prompt(3, 91)], (g, input, caches) => g.verify.twoToThree(input, caches, null) as MlxArray],
+      ["verify.four 4", "four", [prompt(4, 93)], (g, input, caches) => g.verify.four(input, caches, null) as MlxArray],
+      ["verify.fiveToEight 6", "fiveToEight", [prompt(6, 92)], (g, input, caches) => g.verify.fiveToEight(input, caches, null) as MlxArray],
+      ["verify.wider 12", "wider", [prompt(12, 94)], (g, input, caches) => g.verify.wider(input, caches, null) as MlxArray],
+    ];
+    for (const [label, width, rows, run] of steps) {
+      using input = ids(rows);
+      outputDiff(`adapters ${label}`, run(adapted, input, mine), run(generic, input, theirs), adapted.logits[width], generic.logits[width]);
+      stateDiff(`adapters ${label}`, mine, theirs);
+    }
+  } finally { disposeAll(mine, theirs); }
+}, 180_000);

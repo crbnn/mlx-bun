@@ -6,7 +6,7 @@ import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { AssistantDonors } from "./attention";
 import type { Cache } from "./cache";
 import type { DraftProjection } from "./draft-projection";
-import type { ResidualBasis } from "./draft-target";
+import type { DraftProjectionKernel, ResidualBasis } from "./draft-target";
 import type { MlxWidthTable } from "./width";
 
 /** One drafted step of a KV-borrowing assistant: owned token ids and the post-projected hidden. */
@@ -142,14 +142,16 @@ export interface Dflash2DrafterModel {
   readonly tapLayers: number[];
   /** Draft tokens per block (block size minus the anchor). */
   readonly gamma: number;
-  /** Apply the target's declared residual basis (null: the trained basis) before any projection.
-   *  The first call applies it; every later call must pass the same declaration. */
-  bindResidualBasis(basis: ResidualBasis | null): void;
+  /** Apply the target's declarations before any projection: its residual basis (null: the trained basis) and
+   *  the kernels its composition names for the drafter's 4-bit projections (null: the drafter's own rule). The
+   *  first call applies them; every later call must pass the same declarations. */
+  bindTarget(basis: ResidualBasis | null, projections: MlxWidthTable<DraftProjectionKernel> | null): void;
   /** The context projection (fc over the target's taps, then the hidden norm) per width class of the rows
    *  projected (B × L: a prompt's rows at prefill, a commit's accepted rows), indexed by the caller
-   *  (`widthClass(B × L)`). A 4-bit fc runs the simdgroup matrix unit (`Affine4MmaLinear`, where the weight's
-   *  shape fits it) at `fiveToEight` and MLX's quantized matmul (`QuantizedLinear`) at every other class; a BF16
-   *  fc runs one matmul at every class. No entry runs before `bindResidualBasis`. */
+   *  (`widthClass(B × L)`). A 4-bit fc runs the kernel the target declares for the class or, by the drafter's
+   *  own rule, the simdgroup matrix unit (`Affine4MmaLinear`, where the weight's shape fits it) at `fiveToEight`
+   *  and MLX's quantized matmul (`QuantizedLinear`) at every other class; a BF16 fc runs one matmul at every
+   *  class. No entry runs before `bindTarget`. */
   readonly projectContext: MlxWidthTable<DrafterContextProjection>;
   /** Each layer's k and v over the context rows (k norm, RoPE), per width class of those rows (B × L), indexed
    *  like `projectContext` and on the kernel it names for the class. */
@@ -158,9 +160,8 @@ export interface Dflash2DrafterModel {
    *  trained block size. */
   blockColumns(depth: number): number;
   /** The draft block per width class of its rows (anchors times columns), indexed by the scheduler: every 4-bit
-   *  projection on the simdgroup matrix unit (`Affine4MmaLinear`, where the weight's shape fits it) at
-   *  `fiveToEight` and MLX's quantized matmul (`QuantizedLinear`) at every other class; BF16 projections run one
-   *  matmul at every class. */
+   *  projection on the kernel `projectContext` runs for the class; BF16 projections run one matmul at every
+   *  class. */
   readonly draft: MlxWidthTable<Dflash2DraftBlock>;
   dispose(): void;
 }

@@ -2,13 +2,17 @@
 // against main's packed kernels at variant 6 (f32 code·scale weights, the same
 // decoded values). The new kernels apply the scale after the reduction (or to
 // the activation) and the matrix kernels reorder the sum, so they agree to bf16
-// precision, not bit for bit.
+// precision, not bit for bit. The matrix kernels that read code values from a
+// threadgroup codebook (gate/up for 1..8 rows, down for any number) give the
+// 1..8-row matrix kernels' bits.
 import { describe, expect, test } from "bun:test";
 import { Dtype, MlxArray, ops } from "@mlx-bun/mlx";
 import {
   downFactoredRow, downFactoredRows, downK3InterleavedFactoredRow, downK3InterleavedFactoredRows,
-  downK3InterleavedMma, downMma, fusedGateUpSwiglu, fusedGateUpSwigluMixed, gateUpFactoredRow, gateUpFactoredRows,
-  gateUpMma, mixedGateUpFactoredRows, trellisScatter, type TrellisGeometry,
+  DOWN_ONE_BLOCK, downK3InterleavedMma, downK3InterleavedMmaWide, downK3InterleavedMmaWidePass, downMma, downMmaWide,
+  downMmaWidePass,
+  fusedGateUpSwiglu, fusedGateUpSwigluMixed, gateUpCodebookMma, gateUpFactoredRow, gateUpFactoredRows, gateUpMma,
+  gateUpMmaWide, mixedGateUpFactoredRows, trellisScatter, type TrellisGeometry,
 } from "@mlx-bun/inference/kernels/trellis";
 
 // The #311 representations apply only to variant 13; main's variant 6 reference takes none.
@@ -31,6 +35,16 @@ function weights(k: number, axis: 0 | 1 = 1, interleave = false, seedBase = 31) 
 function input(m: number, k: number, batched = false) {
   using raw = MlxArray.fromFloat32(Float32Array.from({ length: m * k }, (_, i) => ((i * 73 + 19) % 257 - 128) / 31), batched ? [1, m, k] : [m, k]);
   return raw.astype(Dtype.bfloat16);
+}
+
+/** Whether rows [lo, hi) of `actual` (rows on axis `axis`) equal `expected` byte for byte. */
+function sameRows(actual: MlxArray, expected: MlxArray, lo: number, hi: number, axis: 0 | 1): boolean {
+  const start = actual.shape.map(() => 0), stop = [...actual.shape];
+  start[axis] = lo; stop[axis] = hi;
+  using part = actual.slice(start, stop);
+  using same = ops.equal(part, expected);
+  using all = ops.allReduce(same);
+  return all.toFloat32()[0] === 1;
 }
 
 /** max |a - b| relative to max |b| (both cast to f32). */
@@ -135,6 +149,78 @@ describe("simdgroup-matrix kernels", () => {
         using expected = downReference(x, w);
         using actual = (interleave ? downK3InterleavedMma : downMma)(x, w.codes, w.scales, w.geometry);
         expect(relErr(actual, expected), `k${k}${interleave ? "i" : ""} m${m}`).toBeLessThan(2e-2);
+      }
+    }
+  }, 60_000);
+});
+
+describe("simdgroup-matrix kernels at any number of rows", () => {
+  test("gate/up: the reference, and each block of eight rows the 1..8-row kernel's bit for bit", () => {
+    for (const [kg, ku] of [[2, 2], [3, 3], [4, 4], [2, 3]] as const) {
+      using gate = weights(kg), up = weights(ku, 1, false, 97);
+      for (const m of [1, 8, 9, 16, 21, 24, 40]) {
+        using x = input(m, gate.geometry.inFeatures, true);
+        using expected = gateUpReference(x, gate, up);
+        using actual = gateUpMmaWide(x, gate, up);
+        expect(relErr(actual, expected), `k${kg}/${ku} m${m}`).toBeLessThan(2e-2);
+        for (let lo = 0; lo < m; lo += 8) {
+          using block = x.slice([0, lo, 0], [1, Math.min(m, lo + 8), x.shape[2]!]);
+          using alone = gateUpMma(block, gate, up);
+          expect(sameRows(actual, alone, lo, Math.min(m, lo + 8), 1), `k${kg}/${ku} m${m} rows ${lo}+`).toBe(true);
+        }
+      }
+    }
+  }, 60_000);
+
+  test("down projection, both code layouts: the reference, and each block of eight rows the 1..8-row kernel's bit for bit", () => {
+    for (const [k, interleave] of [[2, false], [3, false], [4, false], [3, true]] as const) {
+      using w = weights(k, 0, interleave);
+      for (const m of [1, 2, 3, 4, 5, 8, 9, 16, 21, 24, 40]) {
+        using x = input(m, w.geometry.inFeatures);
+        using expected = downReference(x, w);
+        using actual = (interleave ? downK3InterleavedMmaWide : downMmaWide)(x, w.codes, w.scales, w.geometry);
+        expect(relErr(actual, expected), `k${k}${interleave ? "i" : ""} m${m}`).toBeLessThan(2e-2);
+        for (let lo = 0; lo < m; lo += 8) {
+          using block = x.slice([lo, 0], [Math.min(m, lo + 8), x.shape[1]!]);
+          using alone = (interleave ? downK3InterleavedMma : downMma)(block, w.codes, w.scales, w.geometry);
+          expect(sameRows(actual, alone, lo, Math.min(m, lo + 8), 0), `k${k}${interleave ? "i" : ""} m${m} rows ${lo}+`).toBe(true);
+        }
+      }
+    }
+  }, 60_000);
+});
+
+describe("threadgroup-codebook simdgroup-matrix gate/up", () => {
+  test("gate/up for 1..8 rows: the reference, and the 1..8-row matrix kernel's bits", () => {
+    for (const [kg, ku] of [[2, 2], [3, 3], [4, 4], [2, 3], [4, 3]] as const) {
+      using gate = weights(kg), up = weights(ku, 1, false, 97);
+      for (const m of [1, 2, 3, 4, 5, 8]) {
+        using x = input(m, gate.geometry.inFeatures, true);
+        using expected = gateUpReference(x, gate, up);
+        using actual = gateUpCodebookMma(x, gate, up);
+        expect(relErr(actual, expected), `k${kg}/${ku} m${m}`).toBeLessThan(2e-2);
+        using alone = gateUpMma(x, gate, up);
+        expect(sameRows(actual, alone, 0, m, 1), `k${kg}/${ku} m${m} bits`).toBe(true);
+      }
+    }
+  }, 60_000);
+
+});
+
+describe("threadgroup-codebook any-row down projection in a fixed pass", () => {
+  test("one block per pass, and two and three for row-major codes: each block of eight rows the 1..8-row kernel's bits", () => {
+    for (const [k, interleave] of [[2, false], [3, false], [4, false], [3, true]] as const) {
+      using w = weights(k, 0, interleave);
+      const passes = interleave ? [DOWN_ONE_BLOCK] : [DOWN_ONE_BLOCK, { S: 8, MT: 2 }, { S: 8, MT: 3 }];
+      for (const pass of passes) for (const m of [1, 2, 3, 5, 8, 12]) {
+        using x = input(m, w.geometry.inFeatures);
+        using actual = interleave ? downK3InterleavedMmaWidePass(x, w.codes, w.scales, w.geometry, pass)
+          : downMmaWidePass(x, w.codes, w.scales, w.geometry, pass);
+        for (let lo = 0; lo < m; lo += 8) {
+          using block = x.slice([lo, 0], [Math.min(m, lo + 8), x.shape[1]!]);
+          using alone = (interleave ? downK3InterleavedMma : downMma)(block, w.codes, w.scales, w.geometry);
+          expect(sameRows(actual, alone, lo, Math.min(m, lo + 8), 0), `k${k}${interleave ? "i" : ""} S${pass.S} MT${pass.MT} m${m} rows ${lo}+`).toBe(true);
+        }
       }
     }
   }, 60_000);

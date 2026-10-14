@@ -50,6 +50,13 @@
 //       expand), and the shared scatter codebook for M=3..4 bf16 on the
 //       interleaved k3 layout
 //
+// Threadgroup-codebook one-row kernels (every code value of the 2^L states
+// generated once per threadgroup), the variant-13 output of the kernels above
+// bit for bit:
+//   - gate-up-codebook: gate/up/SwiGLU, the same or different widths
+//   - down-codebook: lanes owning word-aligned runs of positions (every window
+//     shift a constant), row-major 2/4-bit and 3-bit block-interleaved codes
+//
 // Factored-scale kernels: weights contribute their code value y and the scale
 // (with 1/147.8) applies once per output (gate/up) or per input row (down);
 // one kernel per row form and code layout:
@@ -58,6 +65,12 @@
 //   - down-factored: row-major axis-0 codes, one row / 2..4 rows
 //   - down-k3-interleaved-factored: 3-bit block-interleaved axis-0 codes
 //   - gate-up-mma / down-mma: 1..8 rows on the simdgroup matrix unit
+//   - gate-up-mma-wide / down-mma-wide: the same fragments for any number of
+//     rows, each decoded fragment feeding the MMAs of several 8-row blocks,
+//     each code value read from a threadgroup codebook; down-mma-wide in
+//     passes the rows plan or the caller fixes (one block for 1..8 rows)
+//   - gate-up-codebook-mma: gate-up-mma's fragments and bits for 1..8 rows,
+//     each code value read from a threadgroup codebook (the M1 Max form)
 //
 // ExpandedTrellisLinear (layers/trellis-linear.ts) decodes a trellis tensor at
 // construction into 8-bit g64 affine (the eval-carrier numerics, about -45 dB)
@@ -70,6 +83,8 @@ export { trellisReduce, TRELLIS_MATVEC_MAX_M } from "./reduce";
 export { trellisScatter, scatterRow, scatterRows, balancedScatterRow, balancedScatterRows } from "./scatter";
 export { qualifiedRepresentations, type ScatterRepresentation, type TrellisRepresentations } from "./qualified";
 export { fusedGateUpSwiglu, gateUpReduceRow, gateUpReduceRows } from "./gate-up";
+export { gateUpCodebookRow } from "./gate-up-codebook";
+export { downCodebookRow, downK3InterleavedCodebookRow } from "./down-codebook";
 export { fusedGateUpSwigluMixed, type MixedGateUpTail } from "./mixed-gate-up";
 export { tiledTrellisPrefill, tiledTrellisPrefillEligible } from "./tiled-prefill";
 export { splitKTrellisPrefill, splitKTrellisPrefillEligible } from "./splitk-prefill";
@@ -81,3 +96,8 @@ export { downFactoredRow, downFactoredRows } from "./down-factored";
 export { downK3InterleavedFactoredRow, downK3InterleavedFactoredRows } from "./down-k3-interleaved-factored";
 export { gateUpMma } from "./gate-up-mma";
 export { downMma, downK3InterleavedMma } from "./down-mma";
+export { gateUpMmaWide } from "./gate-up-mma-wide";
+export {
+  downMmaWide, downK3InterleavedMmaWide, downMmaWidePass, downK3InterleavedMmaWidePass, DOWN_ONE_BLOCK, type DownPass,
+} from "./down-mma-wide";
+export { gateUpCodebookMma } from "./gate-up-codebook-mma";

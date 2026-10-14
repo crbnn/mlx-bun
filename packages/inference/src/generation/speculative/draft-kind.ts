@@ -93,7 +93,8 @@ const mtp: DraftProviderKind = {
     // Default the round width to the head's trained block (block_size 3 → 2
     // recursive drafts + the pending row per round; the head was trained
     // multi-step, so an explicit larger width is allowed but acceptance
-    // decides whether it pays).
+    // decides whether it pays). A graph may declare the adaptive width it
+    // measured for this kind (`adaptiveDraftWidths`).
     const block = (await Bun.file(`${dir}/config.json`).json() as { block_size?: number }).block_size;
     const numDraftTokens = request.numDraftTokens === undefined && typeof block === "number"
       ? Math.max(1, block - 1) : fixedWidth(request, 3);

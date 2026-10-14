@@ -3,6 +3,7 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { AttentionCache, AttentionRead, Mask } from "../contracts/mlx/cache";
 import { bidirMask } from "../kernels/attention/masks";
+import { foldedSdpa, foldedSdpaEligible } from "../layers/folded-attention";
 import { disposeResources } from "../runtime/resources";
 
 /** A mask held by one attention read until that read is disposed. */
@@ -135,12 +136,32 @@ export function rotatingBlockMask(masks: AttentionMasks, maxSize: number, offset
   });
 }
 
+/** A read over dense stored keys and values under a leased mask; it takes
+ * ownership of `keys`, `values` and `mask`. A bf16 storage reads its windows
+ * with the one its composition names (`KVCache.windowRead`). */
+export type DenseRead = (keys: MlxArray, values: MlxArray, mask: MaskLease) => AttentionRead;
+
 /** The read over dense stored keys and values: the stock fused SDPA kernel
  * (`ops.sdpa`) under the leased mask. Takes ownership of `keys`, `values` and
  * `mask`. */
 export function sdpaRead(keys: MlxArray, values: MlxArray, mask: MaskLease): AttentionRead {
   return {
     attend: (q, scale) => ops.sdpa(q, keys, values, scale, mask.mask.mode, mask.mask.arr),
+    dispose() { keys.dispose(); values.dispose(); mask.release(); },
+  };
+}
+
+/** `sdpaRead`, reading each KV head's keys and values once for a causal window
+ * MLX's fused SDPA hands to its unfused fallback (up to 8 queries per row, more
+ * than 32 per KV head: `foldedSdpaEligible`), where that fallback reads them
+ * once per query head: such a window folds GQA into rows (`foldedSdpa`: the
+ * fallback's bits on `applegpu_g13s`, where it was measured, bf16 precision
+ * elsewhere); every other read is the stock fused SDPA. Takes ownership of
+ * `keys`, `values` and `mask`. */
+export function foldedWindowRead(keys: MlxArray, values: MlxArray, mask: MaskLease): AttentionRead {
+  return {
+    attend: (q, scale) => mask.mask.mode === "causal" && foldedSdpaEligible(q, keys)
+      ? foldedSdpa(q, keys, values, scale) : ops.sdpa(q, keys, values, scale, mask.mask.mode, mask.mask.arr),
     dispose() { keys.dispose(); values.dispose(); mask.release(); },
   };
 }

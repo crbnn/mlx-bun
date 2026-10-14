@@ -18,12 +18,15 @@
 // A list shipped beside the draft companion (`draft_vocab.json`) loads
 // automatically; MLX_BUN_SPEC_DRAFT_VOCAB=<path to json {"ids":[...]}> selects
 // another list and =0/=off disables it (see configuredDraftVocabulary).
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
+import { DRAFT_VOCAB_FILE, readDraftVocabulary } from "../../artifacts/draft-vocabulary";
 import { runtimeValue } from "../../runtime/config";
 import { applyMinP, applyTopK, applyTopP, stepKey, toLogprobs, type SamplerOptions } from "../../sampling/index";
+
+export { DRAFT_VOCAB_FILE };
 
 export interface QuantizedHeadState {
   readonly w: MlxArray;
@@ -31,10 +34,6 @@ export interface QuantizedHeadState {
   readonly biases: MlxArray | null;
   readonly spec: ops.QuantSpec;
 }
-
-const lists = new Map<string, readonly number[]>();
-
-export const DRAFT_VOCAB_FILE = "draft_vocab.json";
 
 /** The draft vocabulary for this target, validated against its vocabulary size,
  *  or null. Precedence: `MLX_BUN_SPEC_DRAFT_VOCAB=<path>` selects a list,
@@ -48,20 +47,7 @@ export function configuredDraftVocabulary(vocabSize: number, companionDir?: stri
     const shipped = join(companionDir, DRAFT_VOCAB_FILE);
     if (existsSync(shipped)) path = shipped;
   }
-  if (!path) return null;
-  let ids = lists.get(path);
-  if (!ids) {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as { ids?: unknown };
-    if (!Array.isArray(parsed.ids) || parsed.ids.length === 0)
-      throw new Error(`draft vocabulary ${path}: expected {"ids":[...]}`);
-    const sorted = [...new Set(parsed.ids as number[])].sort((a, b) => a - b);
-    if (!sorted.every(id => Number.isInteger(id) && id >= 0))
-      throw new Error(`draft vocabulary ${path}: ids must be nonnegative integers`);
-    lists.set(path, ids = sorted);
-  }
-  if (ids.at(-1)! >= vocabSize)
-    throw new Error(`draft vocabulary ${path}: id ${ids.at(-1)} outside the target vocabulary ${vocabSize}`);
-  return ids;
+  return path ? readDraftVocabulary(path, vocabSize) : null;
 }
 
 /** Rows of a quantized head (affine packs along the input axis, so a row

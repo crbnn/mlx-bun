@@ -21,12 +21,14 @@
 
 import { parseArgs } from "node:util";
 import { loadModelConfig, quantFor } from "../src/artifacts/config";
+import type { AdaptiveDraftGateSettings } from "../src/contracts/mlx/graph";
 
 /** The facts that fix one generated graph. The fingerprint and device choose the
  * layer and kernel tables written into the file; `kv` names the scheme whose
  * cache lego `makeCache` composes, or every scheme; `mixedGateUp` chooses the
  * mixed-width gate/up layer where the device's table names the reduce kernels;
- * `verifyRoundCosts` are the numbers measured for this composition on its host.
+ * `verifyRoundCosts` are the numbers measured for this composition on its host,
+ * `wiredWeights` a residency it measured there.
  * `draftDepth`, `prefillChunkTokens`, `maxRows` and `aneBridge` record what the
  * file was generated and gated for (the device's table writes the Neural Engine
  * chunk operation, which the constructor builds when the record it is handed has
@@ -46,21 +48,20 @@ export interface Qwen38Composition {
   readonly artifact: string;
   readonly fingerprint: string;
   readonly device: string;
-  /** bf16 and one affine scheme, whose cache lego the device's table names (`kvLego`); or `"every"`: each scheme
-   *  composes its own lego (`composedFullAttentionCache`) and the table entry constrains none. */
+  /** bf16 and one affine scheme, whose cache lego the device's table names (`kvLego`); or `"every"`: the table entry
+   *  constrains none, the scheme of the device's `kvLego` composes that lego and each other scheme its own
+   *  (`composedFullAttentionCache`). */
   readonly kv: { readonly kind: "affine"; readonly bits: number; readonly groupSize: number } | "every";
   readonly draftDepth: { readonly adaptive: true; readonly max: number } | number;
   readonly prefillChunkTokens: number;
   /** The most rows per forward the table entry admits; null admits any number. */
   readonly maxRows: number | null;
   readonly aneBridge: boolean;
-  /** Layers whose gate and up widths differ, at one to four rows, on the reduce kernels. `"split"`, the default and
-   *  measured best: `ReduceMixedGateUp` with MLX's compiled-SwiGLU tail, bit-identical to the two projections plus a
-   *  separate SwiGLU and one kernel instead of three (about 1 ms less per verify forward on the M1 Max over the
-   *  artifact's ten such layers). `"fused"`:
-   *  the same kernel with the same-width kernel's float32 sigmoid (last bits differ). `"off"`: those layers keep the
-   *  generic blocks' two projections and separate SwiGLU, the A/B control. Only a device whose table names
-   *  `ReduceMixedGateUp` reads it. */
+  /** Layers whose gate and up widths differ, at one row, on the codebook kernel. `"split"`, the default and measured
+   *  best: `CodebookGateUpRow` with MLX's compiled-SwiGLU tail, bit-identical to the two projections plus a separate
+   *  SwiGLU and one kernel instead of three. `"fused"`: the same kernel with the same-width kernel's float32 sigmoid
+   *  (last bits differ). `"off"`: those layers keep the generic blocks' two projections and separate SwiGLU, the A/B
+   *  control. Only a device whose table names a layer that takes the tail (`TAILED`) reads it. */
   readonly mixedGateUp?: "split" | "fused" | "off";
   /** A verify round's cost by its rows (draft depth + 1) relative to one plain decode step, measured for this
    *  composition on `host`: the DFlash 2 drafter's round time at each fixed depth over the plain decode step's time,
@@ -68,6 +69,22 @@ export interface Qwen38Composition {
    *  against the decayed acceptance rate. Absent: the graph declares none, and `--num-draft-tokens adaptive` is
    *  refused on it. */
   readonly verifyRoundCosts?: { readonly host: string; readonly costs: readonly (readonly [number, number])[] };
+  /** The widest adaptive round per draft provider kind, measured for this composition on its host
+   *  (\`MlxDeclaredGraph.adaptiveDraftWidths\`): an adaptive drafter of a listed kind drafts up to it instead of its own
+   *  width. Absent: every drafter its own width. */
+  readonly adaptiveDraftWidths?: readonly (readonly [string, number])[];
+  /** The adaptive draft gate's settings per draft provider kind, measured for this composition on its host
+   *  (\`MlxDeclaredGraph.adaptiveDraftGates\`): an adaptive drafter of a listed kind gates with them. Absent: every
+   *  drafter the gate's defaults. */
+  readonly adaptiveDraftGates?: readonly (readonly [string, AdaptiveDraftGateSettings])[];
+  /** The graph declares its weights wired for each generation (`MlxModelMemory.wiredWeights`), measured for this
+   *  composition on its host, where their share of the recommended working set alone would leave them unwired.
+   *  Absent: the share decides. */
+  readonly wiredWeights?: true;
+  /** The artifact's frequency-ranked draft vocabulary (a path inside the artifact) a bound drafter that selects by
+   *  its scores drafts over (`DraftProjection.vocabulary`: those rows of the head on the head's layers per width
+   *  class), measured for this composition on its host. Absent: drafters select over the full head. */
+  readonly draftVocabulary?: string;
 }
 
 export const QWEN38_COMPOSITIONS: Readonly<Record<string, Qwen38Composition>> = Object.freeze({
@@ -101,13 +118,45 @@ export const QWEN38_COMPOSITIONS: Readonly<Record<string, Qwen38Composition>> = 
     draftDepth: { adaptive: true, max: 7 },
     prefillChunkTokens: 2048,
     maxRows: null,
-    aneBridge: false,
+    aneBridge: true,
     mixedGateUp: "split",
-    // Measured 2026-10-12 on this graph and artifact: scripts/bench-mtp.ts, the DFlash 2 drafter at depths 1..7
-    // against the depth-0 plain arm (69.7 ms per token), bf16 KV, greedy, two prompts, 128 tokens, four
-    // repetitions, whose ratios span under 1% at every width. Five to eight rows run the generic blocks, whose
-    // Trellis MLP takes the prefill kernels above four rows.
-    verifyRoundCosts: { host: "M1 Max 32 GB", costs: [[1, 1], [2, 1.89], [3, 2.35], [4, 2.97], [5, 12.22], [6, 13.16], [7, 13.02], [8, 12.88]] },
+    // Measured 2026-10-14 on this graph and artifact, with the matrix-unit Trellis kernels reading code values from a
+    // threadgroup codebook at two to 256 rows: scripts/bench-mtp.ts, the DFlash 2 drafter at depths 1..7 against the
+    // depth-0 plain arm (51.2 ms per token), bf16 KV, greedy, two prompts, 128 tokens, two sessions of two repetitions,
+    // whose ratios agree within 0.5% (2.01 to 2.96 before those kernels, 2026-10-13). Rounds of several sequences:
+    // in-process serve, DFlash 2 at fixed depths over two and four concurrent greedy requests, the round time while
+    // every request was active over the same serve's one-row plain step (52.6 ms), two sessions: 16 rows 3.47 (four
+    // sequences of four) and 3.44 (two of eight), 32 rows 6.31 and 6.48 (four of eight) (4.01 and 7.30 before).
+    verifyRoundCosts: { host: "M1 Max 32 GB", costs: [[1, 1], [2, 1.77], [3, 1.95], [4, 1.98], [5, 2], [6, 2.03], [7, 2.04], [8, 2.05],
+      [16, 3.46], [32, 6.4]] },
+    // Measured 2026-10-13 on this graph and artifact: scripts/bench-mtp.ts, the MTP head adaptive up to 2 (its
+    // trained block) 18.0 tok/s, up to 4 19.9, up to 7 19.1 (fixed depth 3 18.6), greedy, three prompts, 128 tokens.
+    // Remeasured 2026-10-14 on the verify costs above (in-process serve, bf16 KV, eight prompts of 192 tokens, greedy
+    // and Qwen's thinking and instruct sampling, two sessions each, the gate settings below): up to 4
+    // 26.70/22.69/24.79 tok/s, up to 5 26.26/22.06/25.15, up to 7 25.61/20.56/23.71 (its drafts past the fourth are
+    // accepted 0.52-0.56 of the time).
+    adaptiveDraftWidths: [["mtp", 4]],
+    // Measured 2026-10-14 on this graph and artifact with the verify costs above: a replay of the gate over the DFlash 2
+    // drafter's and the MTP head's acceptance at every position of 96 texts (32 prompts, greedy and Qwen's thinking and
+    // instruct sampling, up to 192 tokens, decoded plainly), with these verify costs (and 15% cheaper or dearer rounds)
+    // and the measured step (51.1-52.2 ms) and probe (8.7-11.5 ms by depth): counts that keep 95% per observing round
+    // instead of 85% and 93% per step without drafts, DFlash 2 probing one draft deep, gain on every prompt set and
+    // every mode for both drafters (DFlash 2 2.4%, the MTP head 2.0% by geometric mean). In-process serve, bf16 KV, the
+    // four standard prompts and the replay's four hardest, 192 tokens, A B A B, sampled modes over three seeds: DFlash 2
+    // adaptive greedy 29.34 -> 30.47 tok/s, thinking 23.77 -> 24.45, instruct 28.26 -> 28.50; the MTP head greedy
+    // 25.59 -> 26.70, thinking 22.02 -> 22.42, instruct 24.51 -> 24.77 (against 2.7/0.3 priors, 1% idle aging and
+    // three-deep probes for DFlash 2 and the defaults for the MTP head, chosen on the costs before these kernels).
+    adaptiveDraftGates: [["dflash2", { decay: 0.95, idleDecay: 0.93, probeDepth: 1 }], ["mtp", { decay: 0.95, idleDecay: 0.93 }]],
+    // Measured 2026-10-13 on the M1 Max 32 GB, where the 11.96e9 B weights are under half the 26.8e9 B recommended
+    // set: wired, bit-identical, paired A/B, GPU prefill 1k/8k 136/142 -> 143/145 tok/s; with the Neural Engine
+    // split 171/173 -> 172/177 and the first GPU step after the split 0.15-1.4 s -> 61-69 ms; one-row decode
+    // unchanged (60.0 ms).
+    wiredWeights: true,
+    // Measured 2026-10-13 on this graph and artifact: the DFlash 2 drafter over the artifact's 65,536-token list against
+    // the full head, adaptive, in-process serve, bf16 KV, four prompts of 192 tokens, A B A B: greedy 24.75/24.68 ->
+    // 24.75/24.67 tok/s, Qwen's instruct sampling 21.50/21.43 -> 21.67/21.77, its thinking sampling 19.96/20.01 ->
+    // 19.94/20.13 (requests whose drafts did not change: 0.5-3% faster); the M4 Pro lost 3-7% with it (pre-refactor).
+    draftVocabulary: "mtp/draft_vocab.json",
   },
 });
 
@@ -148,6 +197,14 @@ export const ATTENTION_PROJECTIONS = ["q_proj", "k_proj", "v_proj", "o_proj"] as
 /** The width classes up to eight rows (`MlxWidthTable` without `wider`, which is the generic blocks). */
 const NARROW = ["one", "twoToThree", "four", "fiveToEight"] as const;
 type Narrow = (typeof NARROW)[number];
+/** The rows of each class, fewest and most. */
+const CLASS_ROWS: Readonly<Record<Narrow, readonly [number, number]>> = { one: [1, 1], twoToThree: [2, 3], four: [4, 4], fiveToEight: [5, 8] };
+const ROW_WORDS = ["", "one", "two", "three", "four", "five", "six", "seven", "eight"];
+const rowsText = ([fewest, most]: readonly [number, number]) => fewest === most
+  ? `${ROW_WORDS[fewest]} row${fewest === 1 ? "" : "s"}` : `${ROW_WORDS[fewest]} to ${ROW_WORDS[most]} rows`;
+
+/** One width class's affine projection layer for each stored width; `null` keeps QuantizedLinear at that width. */
+interface Projections { readonly 3: string | null; readonly 4: string | null }
 
 /** One width class's one-kernel MLP layers. */
 interface MlpLayers {
@@ -155,14 +212,15 @@ interface MlpLayers {
 }
 
 /** Each device's kernels and how its operations evaluate: the one-kernel layer of every width class. `null`
- * projections keep the generic blocks' QuantizedLinear (MLX's own qmv/qmm); a `null` MLP class runs the generic
- * blocks' TrellisMlp at that class. */
+ * projections (a class, or one stored width of a class) keep the generic blocks' QuantizedLinear (MLX's own
+ * qmv/qmm); a `null` MLP class runs the generic blocks' TrellisMlp at that class. */
 interface DeviceKernels {
   readonly label: string;
   readonly mlp: Readonly<Record<Narrow, MlpLayers | null>>;
-  readonly projections: Readonly<Record<Narrow, { readonly 3: string; readonly 4: string } | null>>;
-  /** The head of each class; `one` and `wider` keep QuantizedLinear. `null`: QuantizedLinear at every width. */
-  readonly head: Readonly<Record<Exclude<Narrow, "one">, string>> | null;
+  readonly projections: Readonly<Record<Narrow, Projections | null>>;
+  /** The head of each class up to eight rows (`null`: QuantizedLinear); above eight rows the wider layers' head, else
+   *  QuantizedLinear. `null`: QuantizedLinear at every width. */
+  readonly head: Readonly<Record<Narrow, string | null>> | null;
   /** Submit the graph every N layers at decode and verify widths up to 8; `null`: those operations are one lazy graph. */
   readonly asyncEvery: number | null;
   /** Verify windows above eight rows: each layer and its recurrent state evaluated before the next (`bounded`), or
@@ -174,24 +232,64 @@ interface DeviceKernels {
   /** Mixed rows: each group on its own phase's operation for its width (`perGroup`), or the generic blocks with the
    *  prompt and decode groups' MLP rows packed into one call (`packed`). */
   readonly mixed: "perGroup" | "packed";
-  /** The cache lego a composition's affine scheme composes; `null` for compositions serving every scheme. */
-  readonly kvLego: string | null;
+  /** The cache lego the affine scheme it serves (`KV_LEGOS`) composes, the scheme of a composition naming one or
+   *  that scheme among every scheme, and the tokens per threadgroup of its one-row decode kernel (absent: the lego's
+   *  own); `null`: each scheme composes its own lego (`composedFullAttentionCache`). */
+  readonly kvLego: { readonly name: string; readonly decodeBlock?: number } | null;
+  /** The causal window read of the composition's bf16 caches, a `DenseRead` of state/attention-read; `null`: the
+   *  stock fused SDPA (`sdpaRead`). */
+  readonly bf16WindowRead: string | null;
   /** The Neural Engine operations: the channel fraction, the split layers, and the row counts their programs are built
-   *  for (ascending), the smallest of which a one-sequence prompt piece of `minRows` positions or more runs. */
-  readonly ane: { readonly fraction: number; readonly minRows: number; readonly rows: readonly number[];
-    readonly rowMajorMlp: string; readonly k3InterleavedMlp: string; readonly affine: string; readonly projections: readonly string[] } | null;
+   *  for (ascending), the smallest of which a one-sequence prompt piece of `minRows` positions or more runs. `affine`
+   *  splits the named `projections`; none (`null`, `[]`): the MLP alone is split. `fraction` is every program's, or each
+   *  MLP program's in `rows` order (never falling: the widest program's buffers serve the others; the projection splits
+   *  then name their own, `affineFraction`). `loop`: each layer's output and recurrent state evaluated before the next layer is built
+   *  (`bounded`), or queued without waiting (`queued`: each split waits for the GPU before its ANE run). `slices`: the
+   *  reduction slices of the MLP programs' matmuls (kernels/ane/linear's mlpSliceProgram; absent: its default).
+   *  `affineFraction` and `affineSlices`: the projection splits' own (absent: `fraction`, the program's default); their
+   *  GPU rows run the device's `promptProjection` layer where it names one. `affineMinRows`: the fewest rows of a program
+   *  whose range splits the projections (absent: every range; a range below it keeps the prompt projections whole). */
+  readonly ane: { readonly fraction: number | readonly number[]; readonly loop: "bounded" | "queued"; readonly slices?: number;
+    readonly affineFraction?: number; readonly affineSlices?: number; readonly affineMinRows?: number;
+    readonly minRows: number; readonly rows: readonly number[];
+    readonly rowMajorMlp: string; readonly k3InterleavedMlp: string; readonly affine: string | null; readonly projections: readonly string[] } | null;
+  /** The attention and DeltaNet projections of the prompt operations (prefillChunk.gpu, prefillTail.wider, and the
+   *  Neural Engine operations' projections it does not split), when the composition mounts no adapters: a layer of
+   *  `PROMPT_PROJECTION_MODULES`; `null` keeps the generic blocks' QuantizedLinear. */
+  readonly promptProjection: string | null;
+  /** The layer a bound drafter's own 4-bit projections run at each width class of their rows (`null` at a class:
+   *  QuantizedLinear), declared on the graph's draft target (\`TargetView.draftProjections\`); \`null\`: the graph
+   *  declares none and the drafter keeps its own rule. */
+  readonly drafter: Readonly<Record<Narrow | "wider", string | null>> | null;
+  /** Every operation above eight rows of at most \`maxRows\` rows (decode and verify windows, prompt tails, known-token
+   *  appends, a mixed forward's packed MLP rows, the head) on these layers, which take any number of rows: the MLP's,
+   *  the attention and DeltaNet projections' and the head's. More rows run the generic blocks. \`maxRows\` is the
+   *  boundary measured on the whole forward. \`null\`: every operation above eight rows runs the generic blocks. */
+  readonly wider: { readonly maxRows: number; readonly mlp: MlpLayers; readonly projections: { readonly 3: string; readonly 4: string };
+    readonly head: string } | null;
 }
+
+/** The affine scheme each KV cache lego of state/bf16-first-kv serves. */
+const KV_LEGOS: Readonly<Record<string, { readonly bits: number; readonly groupSize: number }>> = Object.freeze({
+  Bf16FirstKv4Head256Cache: { bits: 4, groupSize: 64 },
+});
+
+/** The module under src/layers each prompt projection layer lives in. */
+const PROMPT_PROJECTION_MODULES: Readonly<Record<string, string>> = Object.freeze({ DequantizedLinear: "dequantized-linear" });
 
 /** The module under src/layers each one-kernel MLP layer lives in. */
 const LAYER_MODULES: Readonly<Record<string, string>> = Object.freeze({
   FactoredGateUpRow: "trellis-gate-up", FactoredGateUpRows: "trellis-gate-up", FactoredMixedGateUp: "trellis-gate-up",
-  MmaGateUp: "trellis-gate-up",
+  MmaGateUp: "trellis-gate-up", MmaGateUpWide: "trellis-gate-up",
   FactoredDownRow: "trellis-down", FactoredDownRows: "trellis-down", FactoredDownK3iRow: "trellis-down",
   FactoredDownK3iRows: "trellis-down", MmaDown: "trellis-down", MmaDownK3i: "trellis-down",
-  ReduceGateUpRow: "trellis-reduce-gate-up", ReduceGateUpRows: "trellis-reduce-gate-up", ReduceMixedGateUp: "trellis-reduce-gate-up",
-  ScatterDownRow: "trellis-scatter-down", ScatterDownRows: "trellis-scatter-down", ScatterDownK3iRow: "trellis-scatter-down",
-  ScatterDownK3iRows: "trellis-scatter-down",
+  MmaDownWide: "trellis-down", MmaDownWideK3i: "trellis-down",
+  CodebookMmaGateUp: "trellis-gate-up", CodebookMmaDown: "trellis-down", CodebookMmaDownK3i: "trellis-down",
+  CodebookGateUpRow: "trellis-codebook-gate-up", CodebookDownRow: "trellis-codebook-down", CodebookDownK3iRow: "trellis-codebook-down",
 });
+
+/** Gate/up layers that take the composition's mixed-width SwiGLU tail (`mixedGateUp`) as their third argument. */
+const TAILED = new Set(["CodebookGateUpRow"]);
 
 const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
   applegpu_g16s: {
@@ -209,40 +307,151 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
       four: { 3: "Affine3RowsLinear", 4: "Affine4RowsLinear" },
       fiveToEight: { 3: "Affine3MmaLinear", 4: "Affine4MmaLinear" },
     },
-    head: { twoToThree: "Affine4RowsLinear", four: "Affine4RowsLinear", fiveToEight: "Affine4MmaLinear" },
+    head: { one: null, twoToThree: "Affine4RowsLinear", four: "Affine4RowsLinear", fiveToEight: "Affine4MmaLinear" },
     asyncEvery: 4,
     widerVerify: "bounded",
     knownSpans: true,
     mixed: "perGroup",
-    kvLego: "Bf16FirstKv4Head256Cache",
+    kvLego: { name: "Bf16FirstKv4Head256Cache" },
+    bf16WindowRead: null,
     // Main's Neural Engine prefill plan (9593d881, from a8a5ba45): every one-sequence prompt piece of 640 to 2048
     // positions, a chunk or a tail, on the smallest of the programs built every 512 positions up to 2048.
-    ane: { fraction: 0.55, minRows: 640, rows: [1024, 1536, 2048],
+    ane: { fraction: 0.55, loop: "bounded", minRows: 640, rows: [1024, 1536, 2048],
       rowMajorMlp: "AneTrellisMlpSplit", k3InterleavedMlp: "AneTrellisMlpSplitK3i", affine: "AneAffineSplit",
       projections: ["in_proj_z", "out_proj", "o_proj"] },
+    promptProjection: null,
+    drafter: null,
+    wider: null,
   },
-  // The M1 Max GPU's kernels and evaluation, measured there: the reduce gate/up and scatter down kernels up to
-  // four rows (the representations qualified on this GPU family, through TrellisLinear), the generic blocks above;
-  // MLX's QuantizedLinear for every projection and the head; no graph submission; mixed rows packed on the generic
-  // blocks; known tokens as windows.
+  // The M1 Max GPU's kernels and evaluation, measured there per class (forward + head, one sequence, bf16 KV, each
+  // layer's per-call shader time and the whole forward): the threadgroup-codebook gate/up and down kernels at one row,
+  // with the one-row affine kernel (MLX's qmv bit for bit) for the 3-bit projections and head; at two to eight rows
+  // the matrix-unit Trellis kernels that read each code value from a threadgroup codebook (one MLP, real weights,
+  // gate/up 0.45 to 0.48 ms and down 0.24 at every row count, against the factored kernels' 0.62 to 0.67 and 0.41 to
+  // 0.43 at two rows and the 1MAD-arithmetic matrix kernels' 1.08 to 1.17 and 0.43 to 0.46 at eight; the whole forward
+  // at 2/3/4/8 rows 99.8/119.5/124.3/141.2 -> 82.1/90.5/90.7/93.3 ms, A B A B, five to eight rows bit-identical, two
+  // to four mean KL 1.0e-4 to 1.4e-4), with the affine row kernels for the projections and head at two to three rows,
+  // which beat the matrix-unit ones there, and the matrix-unit affine set at four to eight (the affine row kernels fall
+  // behind at four rows here; 1.2x QuantizedLinear for the projections and head). Graph submission every 4 layers
+  // takes about 4 ms off every width (2 and 8 within noise of it); wider verify windows one lazy graph (1.8% faster
+  // than bounded at 12 and 16 rows); mixed rows packed on the generic blocks; known tokens as windows (the committed
+  // read's attention boundaries are qualified on the M4 Pro only); prompt pieces with their projections on the dense
+  // GEMM and, from 224 positions, their MLP split with the Neural Engine.
   applegpu_g13s: {
     label: "M1 Max GPU",
     mlp: {
-      one: { sameGateUp: "ReduceGateUpRow", mixedGateUp: "ReduceMixedGateUp", rowMajorDown: "ScatterDownRow", k3InterleavedDown: "ScatterDownK3iRow" },
-      twoToThree: { sameGateUp: "ReduceGateUpRows", mixedGateUp: "ReduceMixedGateUp", rowMajorDown: "ScatterDownRows", k3InterleavedDown: "ScatterDownK3iRows" },
-      four: { sameGateUp: "ReduceGateUpRows", mixedGateUp: "ReduceMixedGateUp", rowMajorDown: "ScatterDownRows", k3InterleavedDown: "ScatterDownK3iRows" },
-      fiveToEight: null,
+      one: { sameGateUp: "CodebookGateUpRow", mixedGateUp: "CodebookGateUpRow", rowMajorDown: "CodebookDownRow", k3InterleavedDown: "CodebookDownK3iRow" },
+      twoToThree: { sameGateUp: "CodebookMmaGateUp", mixedGateUp: "CodebookMmaGateUp", rowMajorDown: "CodebookMmaDown", k3InterleavedDown: "CodebookMmaDownK3i" },
+      four: { sameGateUp: "CodebookMmaGateUp", mixedGateUp: "CodebookMmaGateUp", rowMajorDown: "CodebookMmaDown", k3InterleavedDown: "CodebookMmaDownK3i" },
+      fiveToEight: { sameGateUp: "CodebookMmaGateUp", mixedGateUp: "CodebookMmaGateUp", rowMajorDown: "CodebookMmaDown", k3InterleavedDown: "CodebookMmaDownK3i" },
     },
-    projections: { one: null, twoToThree: null, four: null, fiveToEight: null },
-    head: null,
-    asyncEvery: null,
+    // One row: MLX's qmv bit for bit with x's chunks computed once per threadgroup (AffineRowLinear) for the 3-bit
+    // projections and the head, measured on each layer's weights back to back: 5120 -> 10240 0.100 -> 0.082 ms,
+    // 5120 -> 6144 0.062 -> 0.053, 6144 -> 5120 0.062 -> 0.054, the head 2.26 -> 1.96; decode.one (forward + head,
+    // bf16 KV, 512 positions, two sessions each) 54.46/54.35 -> 53.60/53.26 ms, logits bit-identical. The 4-bit
+    // projections stay on MLX's qmv (level or up to 3% slower on AffineRowLinear).
+    projections: {
+      one: { 3: "AffineRowLinear", 4: null },
+      twoToThree: { 3: "Affine3RowsLinear", 4: "Affine4RowsLinear" },
+      four: { 3: "AffineSplitMmaLinear", 4: "AffineSplitMmaLinear" },
+      fiveToEight: { 3: "AffineSplitMmaLinear", 4: "AffineSplitMmaLinear" },
+    },
+    head: { one: "AffineRowLinear", twoToThree: "Affine4RowsLinear", four: "AffineSplitMmaLinear", fiveToEight: "AffineSplitMmaLinear" },
+    asyncEvery: 4,
     widerVerify: "lazy",
     knownSpans: false,
     mixed: "packed",
-    kvLego: null,
-    ane: null,
+    // Affine 4-bit group 64 KV on the KV4 lego (one-row decode kernel, folded-GQA windows) in place of the unfused
+    // port, measured 2026-10-13 (forward + head, one sequence, 16 steps, two sessions each) at 512, 4K, 8.5K and 16K
+    // positions: decode 60.3/63.4/67.8/74.3 -> 59.9/61.3/63.5/66.9 ms, verify windows of 4 rows
+    // 128.4/143.5/159.9/190.9 -> 125.6/131.9/136.3/145.6, of 8 rows 146.4/154.4/165.0/188.2 -> 144.0/147.4/153.4/164.5.
+    // Its decode kernel at 128 tokens per threadgroup (the M4 Pro's 512 leaves four threadgroups per layer at 512
+    // positions): decode 61.3/62.0/64.0/65.1 ms at 512 -> 59.9/61.4/63.5/66.9 at 128 (256: 60.4/61.8/63.2/66.0).
+    kvLego: { name: "Bf16FirstKv4Head256Cache", decodeBlock: 128 },
+    // bf16 verify windows of six to eight rows (36 to 48 query vectors per KV head, more than MLX's vector kernel takes)
+    // with GQA folded into rows, bit for bit MLX's fallback, which reads every KV head once per query head: eight rows
+    // 146.7/159.3/177.7/207.9 -> 142.9/149.8/159.3/172.1 ms at 512/4K/8.5K/16K positions (forward + head, two
+    // sessions each; logits bit-identical at every width).
+    bf16WindowRead: "foldedWindowRead",
+    // Measured 2026-10-13 on one layer's MLP at 1024 and 2048 rows: the Neural Engine's 34% of the channels (5888,
+    // 23 tiles of 256, which it runs faster than 5760) beside the GPU's 66% in 0.70 of the GPU-only time (fractions
+    // 0.25 to 0.45 swept; the Neural Engine at about 4 TFLOPS against the GPU's 8; 2% faster prompts than 0.31).
+    // A projection split whose GPU share ran MLX's quantized matmul gained nothing over the dense GEMM
+    // (promptProjection); one whose share runs the dense GEMM does (below). A program runs all its rows whatever the
+    // piece holds (one layer's MLP share 14.7 ms at 256 rows, 25.3 at 512, 46.7 at 1024, 88.8 at 2048) after the GPU
+    // fills its weights (4 to 5 ms a layer), so programs every 64 positions to 768, every 128 to 1024 and every 256 to
+    // 2048, from 224 positions, where the 256-row program overtakes the wider layers (a layer's MLP at 512 rows 38.0 ->
+    // 29.6 ms against the generic blocks; time to first token, one sequence, with promptProjection from 128 rows,
+    // against three programs from 640 positions and promptProjection from 640 rows before: prompts of
+    // 230/300/400/500/639/700 tokens 2.11/2.74/3.55/4.09/5.00/5.09 -> 1.99/2.43/2.98/3.28/3.94/4.26 s, 1100 and 1600
+    // 7.23/9.73 -> 6.65/9.03, 16 to 200, 1024 and 8192 unchanged; bit-identical but for the pieces it moves from the
+    // GPU, mean KL 3e-5 to 2.6e-3 at 14 lengths from 230 to 639 tokens, since a program's rows do not depend on its
+    // size (700, 1100 and 1600 on the smaller programs: bit-identical); 0.31 on the same programs gains 2-3% below 300
+    // tokens and loses 2% at 1024).
+    // The layers queue without waiting for the GPU (`queued`): each split starts the Neural Engine once the GPU has
+    // filled its buffers (wrapped once for MLX), queues its GPU share whole and leaves its sum for the next layer to
+    // evaluate. Measured 2026-10-14, alternated sessions, two each, with the fill at 16 weights a thread: pieces of
+    // 320, 1024 and 2048 positions 2.42/5.71/11.01 -> 2.25/5.50/10.78 s (each layer evaluated before the next: 1-1.5%
+    // slower).
+    // Each program's matmuls sum their reductions in four slices (`slices`), which this Neural Engine runs faster than
+    // eight (one layer's MLP slice of 5888 channels at 320 rows 19.3 -> 16.7 ms, at 1024 47.7 -> 40.0; two slices fail
+    // to compile at some shapes); that moves the MLP's balance to 35% of its channels to 768 positions and 38% above
+    // (fractions 0.338 to 0.397 swept, two sessions each: pieces of 512 and 640 positions 2.94/3.57 -> 2.93/3.53 s, of
+    // 1024, 1536 and 2048 positions 5.51/8.09/10.76 -> 5.43/7.86/10.42 against 34%). From 768 positions the attention
+    // and DeltaNet projections split too, 37.5% of their rows on the Neural Engine, the rest on DequantizedLinear
+    // (two sessions each: pieces of 768, 1024 and 2048 positions 4.26/5.51/10.79 -> 4.14/5.17/9.75 s; 30% and 45%
+    // both slower at 2048; at 640 positions about 1% faster, at 512 slower, a split costing more than it saves: 500
+    // positions 3.05 -> 3.68 s).
+    ane: { fraction: [0.353, 0.353, 0.353, 0.353, 0.353, 0.353, 0.353, 0.353, 0.353, 0.382, 0.382, 0.382, 0.382, 0.382,
+      0.382], loop: "queued", slices: 4, minRows: 224,
+      rows: [256, 320, 384, 448, 512, 576, 640, 704, 768, 896, 1024, 1280, 1536, 1792, 2048],
+      rowMajorMlp: "AneTrellisMlpSplit", k3InterleavedMlp: "AneTrellisMlpSplitK3i", affine: "AneAffineSplit",
+      projections: ["in_proj_qkv", "in_proj_z", "out_proj", "q_proj", "o_proj"],
+      affineFraction: 0.375, affineSlices: 4, affineMinRows: 768 },
+    // MLX's quantized matmul bit for bit from 128 rows (k_proj and v_proj from 513, above MLX's split-K GEMM),
+    // 1.1x to 1.3x faster from 192 rows (DequantizedLinear): time to first token of 300-, 400-, 500- and 639-token
+    // prompts 2.76/3.55/4.07/5.00 -> 2.60/3.39/3.80/4.63 s against it from 640 rows, logits bit-identical.
+    promptProjection: "DequantizedLinear",
+    // The DFlash 2 drafter's 4-bit projections (its five layers' attention and MLP, fc and the context k and v), each
+    // kernel per row count: MLX's quantized matmul at one row, the affine row kernel at two to three (MLP 4.48 ->
+    // 3.57 ms at two rows), the split-K matrix-unit kernel at four to eight (MLP 8.49 -> 4.46 ms at four rows,
+    // 16.2 -> 4.45 at eight on the matrix unit before it), and above eight rows (two or more sequences' blocks) the
+    // split-K kernel in blocks of 8 (a draft pass's projections at 16 rows 25.0 -> 12.2 ms, 24 rows 25.4 -> 17.3, level
+    // with MLX's quantized matmul from 32).
+    drafter: { one: null, twoToThree: "Affine4RowsLinear", four: "AffineSplitMmaLinear", fiveToEight: "AffineSplitMmaLinear",
+      wider: "AffineSplitMmaLinear" },
+    // Nine to 256 rows on the matrix unit's any-row kernels, each decoded weight fragment feeding several 8-row blocks
+    // (one Qwen MLP, 3-bit, gate/up + down: 16 rows 1.0 + 0.85 ms against 10.9 + 1.7 on the prefill tiles and weight
+    // expansion; 64 rows 3.7 + 2.5 against 5.3 + 2.9), the split-K affine kernel for the projections and head (16 rows
+    // 2x MLX's quantized matmul, level with it from 32). The whole forward, one sequence's verify window, bf16 KV at
+    // 512 positions: 16 rows 0.89 -> 0.19 s, 32 0.89 -> 0.34, 64 0.77 -> 0.63, 128 1.45 -> 1.22, 256 2.48 -> 2.38;
+    // past 256 rows weight expansion and MLX's GEMM win (384 rows 3.64 against 3.51 s). The down kernel reading each code
+    // value from a threadgroup codebook (2026-10-14; one 3-bit interleaved down at 16/32/64 rows 0.67/1.24/2.39 ->
+    // 0.44/0.84/1.65 ms, 2-bit 0.64/1.08/2.13 -> 0.40/0.76/1.49): 16/24/32 rows 180.2/265.3/331.7 -> 158.2/242.3/291.3
+    // ms, bit-identical.
+    wider: { maxRows: 256,
+      mlp: { sameGateUp: "MmaGateUpWide", mixedGateUp: "MmaGateUpWide", rowMajorDown: "MmaDownWide", k3InterleavedDown: "MmaDownWideK3i" },
+      projections: { 3: "AffineSplitMmaLinear", 4: "AffineSplitMmaLinear" }, head: "AffineSplitMmaLinear" },
   },
 });
+
+/** Break a comment sentence after `prefix` (`// ` by default) onto further lines with that prefix at 120 columns. */
+function wrapComment(text: string, prefix = "// "): string {
+  const lines = [""];
+  for (const word of text.split(" "))
+    if (lines.at(-1)!.length && prefix.length + lines.at(-1)!.length + 1 + word.length > 120) lines.push(word);
+    else lines[lines.length - 1] = lines.at(-1)!.length ? `${lines.at(-1)} ${word}` : word;
+  return lines.join(`\n${prefix}`);
+}
+
+/** Code `items` after `prefix`, comma-separated, onto further lines with that prefix at 120 columns. */
+function wrapItems(items: readonly string[], prefix: string): string {
+  const lines = [""];
+  for (const item of items)
+    if (lines.at(-1)!.length && prefix.length + lines.at(-1)!.length + 2 + item.length > 120) lines.push(item);
+    else lines[lines.length - 1] = lines.at(-1)!.length ? `${lines.at(-1)}, ${item}` : item;
+  return lines.join(`,\n${prefix}`);
+}
 
 // ── Description: the artifact facts the template needs ────────────────────────
 
@@ -334,22 +543,53 @@ export function emitQwen38Graph(description: Qwen38Description, stem: string,
   if (!k) throw new Error(`${stem}: no kernel table for device ${c.device}`);
   if (description.fingerprint !== c.fingerprint)
     throw new Error(`${stem}: the source's graph fingerprint ${description.fingerprint} is not the composition's ${c.fingerprint}`);
-  const kvLego = k.kvLego, ane = k.ane, head = k.head, asyncEvery = k.asyncEvery;
-  if ((c.kv === "every") !== (kvLego === null))
-    throw new Error(`${stem}: ${c.kv === "every" ? "a composition serving every KV scheme composes no lego of its own"
-      : "an affine KV composition composes the lego its device's table names"} (${c.device}: ${kvLego ?? "none"})`);
+  const kvLego = k.kvLego?.name ?? null, ane = k.ane, head = k.head, asyncEvery = k.asyncEvery;
+  /** The lego's decode block argument, where the device's table names one. */
+  const decodeBlock = k.kvLego?.decodeBlock === undefined ? "" : `, ${k.kvLego.decodeBlock}`;
+  /** The bf16 caches' window read argument, where the device's table names one. */
+  const windowRead = k.bf16WindowRead === null ? "" : `, ${k.bf16WindowRead}`;
+  /** The bf16 cache's read, in the header's prose. */
+  const plainRead = k.bf16WindowRead === null ? "the stock SDPA"
+    : `the stock SDPA, its windows of six to eight rows folding GQA into rows (${k.bf16WindowRead})`;
+  /** The affine scheme the device's KV lego serves. */
+  const legoKv = kvLego === null ? null : KV_LEGOS[kvLego];
+  if (legoKv === undefined) throw new Error(`${stem}: no KV scheme for cache lego ${kvLego}`);
+  if (c.kv !== "every" && (legoKv?.bits !== c.kv.bits || legoKv.groupSize !== c.kv.groupSize))
+    throw new Error(`${stem}: an affine KV composition composes the lego its device's table names for that scheme (${c.device}: ${kvLego ?? "none"})`);
   if ((c.kv === "every") !== (c.maxRows === null))
     throw new Error(`${stem}: this template constrains the KV schemes and the rows together, or neither`);
   if (c.aneBridge && !ane) throw new Error(`${stem}: ${c.device}'s table builds no Neural Engine operation`);
+  if (ane && (ane.affine === null) !== (ane.projections.length === 0))
+    throw new Error(`${stem}: ${c.device}'s Neural Engine table names a projection split layer exactly when it splits projections`);
+  /** The Neural Engine operations split projections as well as the MLP. */
+  const splitsProjections = !!ane && ane.projections.length > 0;
+  const promptProjection = k.promptProjection;
+  if (promptProjection !== null && !PROMPT_PROJECTION_MODULES[promptProjection])
+    throw new Error(`${stem}: no module for prompt projection layer ${promptProjection}`);
   /** Each Neural Engine operation's row range: from the device's fewest positions, or one above the previous
    *  program's, up to its own program's. */
   const aneRanges = (ane?.rows ?? []).map((rows, j, all) => [j === 0 ? ane!.minRows : all[j - 1]! + 1, rows] as const);
   if (aneRanges.some(([minRows, rows]) => minRows > rows))
     throw new Error(`${stem}: ${c.device}'s Neural Engine programs ascend from at least the fewest positions a piece runs`);
+  /** The projection splits' fraction and slices, and the GPU rows' layer, as the template passes them. */
+  const affineFraction = ane?.affineFraction === undefined ? "ANE_FRACTION" : "ANE_AFFINE_FRACTION";
+  const affineSlicesArg = ane?.affineSlices === undefined ? "" : ", ANE_AFFINE_SLICES";
+  const affineBuildArgs = promptProjection ? `, ${ane?.affineSlices === undefined ? "undefined" : "ANE_AFFINE_SLICES"}, rest => new ${promptProjection}(rest)`
+    : affineSlicesArg;
+  /** Each program's channel fraction, in `rows` order, where the device's table names one per program; else null. */
+  const aneFractions = ane && typeof ane.fraction !== "number" ? ane.fraction : null;
+  if (aneFractions && (aneFractions.length !== ane!.rows.length || aneFractions.some((f, j) => j > 0 && f < aneFractions[j - 1]!)))
+    throw new Error(`${stem}: ${c.device}'s per-program Neural Engine fractions are one per program, never falling`);
+  if (aneFractions && splitsProjections && ane!.affineFraction === undefined)
+    throw new Error(`${stem}: ${c.device}'s per-program MLP fractions need the projection splits' own (affineFraction)`);
+  if (ane?.affineMinRows !== undefined && (!splitsProjections || promptProjection === null))
+    throw new Error(`${stem}: ${c.device}'s affineMinRows keeps the prompt projections (promptProjection) below it, so it needs both`);
+  /** The MLP split's fraction as the template passes it: the range's own, or the device's one. */
+  const mlpFraction = aneFractions ? "fraction" : "ANE_FRACTION";
   const one = k.mlp.one;
   if (!one) throw new Error(`${stem}: ${c.device}'s table names no one-row MLP layers`);
-  if (c.mixedGateUp !== undefined && !NARROW.some(cls => k.mlp[cls]?.mixedGateUp === "ReduceMixedGateUp"))
-    throw new Error(`${stem}: mixedGateUp chooses the reduce kernels' mixed-width layer, which ${c.device}'s table does not name`);
+  if (c.mixedGateUp !== undefined && !NARROW.some(cls => TAILED.has(k.mlp[cls]?.mixedGateUp ?? "")))
+    throw new Error(`${stem}: mixedGateUp chooses the tail of a mixed-width layer, which ${c.device}'s table does not name`);
   const mixedTail = c.mixedGateUp ?? "split";
   const layers = description.layers;
   const interleaved = layers.filter(layer => layer.downLayout === "k3Interleaved").length;
@@ -361,18 +601,26 @@ export function emitQwen38Graph(description: Qwen38Description, stem: string,
 
   /** A class whose layers are the generic blocks' (TrellisMlp at that class). */
   const generic = (cls: Narrow) => k.mlp[cls] === null;
-  const sets = NARROW.flatMap(cls => k.mlp[cls] ? [k.mlp[cls]!] : []);
+  const wider = k.wider;
+  if (wider && !head) throw new Error(`${stem}: ${c.device}'s wider layers take the head on its table's head layers`);
+  const sets = [...NARROW.flatMap(cls => k.mlp[cls] ? [k.mlp[cls]!] : []), ...(wider ? [wider.mlp] : [])];
   /** The reduce mixed-width layer with `mixedGateUp: "off"`: those layers keep the generic blocks. */
-  const offMixed = (m: MlpLayers) => m.mixedGateUp === "ReduceMixedGateUp" && mixedTail === "off";
+  const offMixed = (m: MlpLayers) => TAILED.has(m.mixedGateUp) && mixedTail === "off";
   const mlpLayerNames = [...new Set(sets.flatMap(m =>
     [m.sameGateUp, ...(offMixed(m) ? [] : [m.mixedGateUp]), m.rowMajorDown, m.k3InterleavedDown]))];
   for (const name of mlpLayerNames) if (!LAYER_MODULES[name]) throw new Error(`${stem}: no module for layer ${name}`);
   const mlpImports = [...new Set(mlpLayerNames.map(name => LAYER_MODULES[name]!))].sort().map(module =>
     `import { ${mlpLayerNames.filter(name => LAYER_MODULES[name] === module).sort().join(", ")} } from "../../layers/${module}";`);
-  const affineLayers = [...new Set([...Object.values(k.projections).flatMap(p => p ? [p[3], p[4]] : []), ...(head ? Object.values(head) : [])])];
-  /** The attention and DeltaNet projections are QuantizedLinear in every class and nothing else is built: mounted
-   *  adapters apply everywhere, so no class changes with them. */
-  const adapterSafe = NARROW.every(cls => k.projections[cls] === null) && head === null && ane === null;
+  const drafter = k.drafter;
+  for (const cls of NARROW) if (k.projections[cls] && k.projections[cls]![3] === null && k.projections[cls]![4] === null)
+    throw new Error(`${stem}: ${c.device}'s ${cls} projections name no layer at either width (write null for the class)`);
+  const affineLayers = [...new Set([...Object.values(k.projections).flatMap(p => p ? [p[3], p[4]] : []),
+    ...(head ? Object.values(head) : []),
+    ...(drafter ? Object.values(drafter) : []),
+    ...(wider ? [wider.projections[3], wider.projections[4], wider.head] : [])].filter((layer): layer is string => layer !== null))];
+  /** The attention and DeltaNet projections are QuantizedLinear in every class and nothing else is built (no prompt
+   *  blocks, no Neural Engine operation): mounted adapters apply everywhere, so no class changes with them. */
+  const adapterSafe = NARROW.every(cls => k.projections[cls] === null) && head === null && ane === null && promptProjection === null;
   /** Each distinct [inputs, outputs] shape of the split projections, with the projections that have it (none where
    *  the device's table builds no Neural Engine operation). */
   const aneShapes = [...(ane?.projections ?? []).reduce((shapes, name) => {
@@ -383,13 +631,27 @@ export function emitQwen38Graph(description: Qwen38Description, stem: string,
     return shapes;
   }, new Map<string, [readonly [number, number], string[]]>()).values()];
   /** Blocks are built once per projection layer pair and shared by the classes that name it. */
-  const blocksName = (p: { 3: string; 4: string }) => `${p[4][0]!.toLowerCase()}${p[4].slice(1).replace(/Linear$/, "")}Blocks`;
-  const projectionSets = [...new Map(NARROW.flatMap(cls => k.projections[cls] ? [[blocksName(k.projections[cls]!), k.projections[cls]!] as const] : [])).entries()];
+  const blocksName = (p: Projections) => { const layer = (p[4] ?? p[3])!;
+    return `${layer[0]!.toLowerCase()}${layer.slice(1).replace(/Linear$/, "")}Blocks`; };
+  const projectionSets = [...new Map([...NARROW.flatMap(cls => k.projections[cls] ? [[blocksName(k.projections[cls]!), k.projections[cls]!] as const] : []),
+    ...(wider ? [[blocksName(wider.projections), wider.projections] as const] : [])]).entries()];
   const headName = (layer: string) => `${layer[0]!.toLowerCase()}${layer.slice(1).replace(/Linear$/, "")}Head`;
-  const heads = head ? [...new Set(Object.values(head))] : [];
-  const mixedExpr = (m: MlpLayers) => m.mixedGateUp === "ReduceMixedGateUp"
-    ? `new ReduceMixedGateUp(gate, up, ${JSON.stringify(mixedTail)})` : `new ${m.mixedGateUp}(gate, up)`;
-  const gateUpExpr = (m: MlpLayers) => m.sameGateUp === m.mixedGateUp || offMixed(m) ? `new ${m.sameGateUp}(gate, up)`
+  const heads = head ? [...new Set([...Object.values(head).filter((layer): layer is string => layer !== null), ...(wider ? [wider.head] : [])])] : [];
+  /** A class's projection layer for one stored width, or the QuantizedLinear `linear` itself. */
+  const build = (layer: string | null) => layer ? `new ${layer}(linear)` : "linear";
+  /** The head's width table over \`linear\` (the head, or its draft-vocabulary rows), its layers named \`layer…Head\`. */
+  const headTable = (indent: string) => `${NARROW.map(cls => {
+  const layer = head![cls];
+  return `${indent}${cls}: ${layer ? `hidden => ${headName(layer)}.forward(hidden)` : "plain"},`;
+}).join("\n")}
+${indent}wider: ${wider ? `hidden => hidden.size / hidden.shape.at(-1)! <= WIDER_ROWS ? ${headName(wider.head)}.forward(hidden) : plain(hidden)` : "plain"},`;
+  const vocabulary = c.draftVocabulary ?? null;
+  if (vocabulary && !head) throw new Error(`${stem}: a draft vocabulary runs on the head layers of ${c.device}'s table`);
+  /** A layer's construction; a tailed layer takes the mixed-width tail (the split one where those layers are off). */
+  const construct = (layer: string) => TAILED.has(layer)
+    ? `new ${layer}(gate, up, ${JSON.stringify(mixedTail === "off" ? "split" : mixedTail)})` : `new ${layer}(gate, up)`;
+  const mixedExpr = (m: MlpLayers) => construct(m.mixedGateUp);
+  const gateUpExpr = (m: MlpLayers) => m.sameGateUp === m.mixedGateUp || offMixed(m) ? construct(m.sameGateUp)
     : `spec.gate === spec.up ? new ${m.sameGateUp}(gate, up) : ${mixedExpr(m)}`;
   const narrowSet = (cls: Narrow, indent: string) => {
     const m = k.mlp[cls], p = k.projections[cls];
@@ -408,16 +670,33 @@ export function emitQwen38Graph(description: Qwen38Description, stem: string,
     ].map(line => indent + line).join("\n");
   };
   const blockSets = projectionSets.map(([name, p]) =>
-    `      const ${name} = LAYERS.map((_, i) => blockOf(i, (linear, _path, width) => width === 3 ? new ${p[3]}(linear) : new ${p[4]}(linear)));`).join("\n");
+    `      const ${name} = LAYERS.map((_, i) => blockOf(i, ${p[3] === p[4] ? `linear => ${build(p[3])}`
+      : `(linear, _path, width) => width === 3 ? ${build(p[3])} : ${build(p[4])}`}));`).join("\n");
+  /** The wider layers' block set (and, where a mixed forward packs its MLP rows, each layer's MLP alone). */
+  const packedWider = !!wider && k.mixed === "packed";
+  const widerSet = wider ? [
+    `const widerMlp = generic.map((_, i) => {`,
+    `  const spec = LAYERS[i]!, { gate, up, down } = mlpOf(i);`,
+    `  const gateUp = ${gateUpExpr(wider.mlp)};`,
+    `  const project = spec.downLayout === "k3Interleaved" ? new ${wider.mlp.k3InterleavedDown}(down) : new ${wider.mlp.rowMajorDown}(down);`,
+    `  return (post: MlxArray) => {`,
+    `    using mid = gateUp.forward(post);`,
+    `    return project.forward(mid);`,
+    `  };`,
+    `});`,
+    `this.#wider = generic.map((layer, i) => layerStep(layer, mixerOf(${blocksName(wider.projections)}[i]!, LAYERS[i]!.kind), widerMlp[i]!));`,
+    ...(packedWider ? [`this.#widerMlp = widerMlp;`] : []),
+  ].map(line => `      ${line}`).join("\n") : "";
   const narrowBlock = adapterSafe ? `    // Every class's attention and DeltaNet projections are the generic blocks' QuantizedLinear, which apply
     // mounted adapters: no class changes with them.
 ${NARROW.map(cls => narrowSet(cls, "    ")).join("\n")}` : `    if (composition.adapters) {
       // Every class runs the generic blocks: their QuantizedLinear projections
       // apply the mounted adapters (the one-kernel layers do not).
-      this.#one = this.#twoToThree = this.#four = this.#fiveToEight = this.#generic;
+      this.#one = this.#twoToThree = this.#four = this.#fiveToEight = ${wider ? "this.#wider = " : ""}this.#generic;${packedWider ? `
+      this.#widerMlp = generic.map((_, i) => (post: MlxArray) => mlpOf(i).forward(post, "window", "wider"));` : ""}
     } else {
 ${blockSets}
-${NARROW.map(cls => narrowSet(cls, "      ")).join("\n")}
+${NARROW.map(cls => narrowSet(cls, "      ")).join("\n")}${wider ? `\n${widerSet}` : ""}
     }`;
   /** One phase's operation of a class: its own block set (submitted every `asyncEvery` layers, or one lazy graph),
    *  or for a generic class the generic blocks with `genericLoop`. */
@@ -426,6 +705,10 @@ ${NARROW.map(cls => narrowSet(cls, "      ")).join("\n")}
         ${generic(cls) ? `this.#${genericLoop}(wide, embed.encode(ids), state, ${JSON.stringify(phase)}, capture, null, ${JSON.stringify(cls)})`
       : asyncEvery !== null ? `this.#submitted(${cls}, embed.encode(ids), state, ${JSON.stringify(phase)}, capture, ${JSON.stringify(cls)})`
       : `this.#lazy(${cls}, embed.encode(ids), state, ${JSON.stringify(phase)}, capture, null, ${JSON.stringify(cls)})`},`;
+  /** An operation of the wider layers for \`phase\`, evaluated as the narrow classes' own block sets are. */
+  const widerRun = (phase: ReadPhaseName) => asyncEvery !== null
+    ? `this.#submitted(wider, embed.encode(ids), state, ${JSON.stringify(phase)}, capture, "wider")`
+    : `this.#lazy(wider, embed.encode(ids), state, ${JSON.stringify(phase)}, capture, null, "wider")`;
   /** Above the widest own block set (and at a generic class), a prompt window evaluates each layer before the next. */
   const boundedWidths = [...NARROW.filter(generic), "wider"].map(cls => `width === ${JSON.stringify(cls)}`).join(" || ");
 
@@ -434,25 +717,65 @@ ${NARROW.map(cls => narrowSet(cls, "      ")).join("\n")}
   const classRows = NARROW.map(cls => {
     const m = k.mlp[cls], p = k.projections[cls];
     return row(cls === "one" ? "decode.one, verify.one" : `decode/verify.${cls}`, m ? `${m.sameGateUp} + ${m.rowMajorDown}/K3i`
-      : "the generic blocks (TrellisMlp)", p ? `${p[3]}/${p[4]}` : "QuantizedLinear");
+      : "the generic blocks (TrellisMlp)", p ? (p[3] === p[4] ? p[3]! : `${p[3] ?? "QuantizedLinear"}/${p[4] ?? "QuantizedLinear"}`) : "QuantizedLinear");
   }).join("\n");
-  const mixedSentence = one.mixedGateUp !== "ReduceMixedGateUp" ? `Mixed-width gate/up takes ${one.mixedGateUp} at one to four rows.`
-    : mixedTail === "off" ? "Mixed-width gate/up keeps the generic blocks (two projections, a separate SwiGLU) at one to four rows."
-    : `Mixed-width gate/up takes ReduceMixedGateUp at one to four rows, ${mixedTail === "split"
-      ? "split tail (MLX's compiled SwiGLU bit for bit)" : "fused tail (the same-width kernel's float32 sigmoid)"}.`;
-  const summary = kvLego && head && asyncEvery !== null ? `// ${mixedSentence} Every attention block reads
+  /** Each run of consecutive classes whose mixed-width layer takes the composition's tail or is not their same-width
+   *  one (the table row names that), with its layer and rows. */
+  const mixedRuns: { layer: string; rows: [number, number] }[] = [];
+  for (const cls of NARROW) {
+    const m = k.mlp[cls], last = mixedRuns.at(-1);
+    if (!m || (m.mixedGateUp === m.sameGateUp && !TAILED.has(m.mixedGateUp))) continue;
+    if (last?.layer === m.mixedGateUp && last.rows[1] + 1 === CLASS_ROWS[cls][0]) last.rows[1] = CLASS_ROWS[cls][1];
+    else mixedRuns.push({ layer: m.mixedGateUp, rows: [...CLASS_ROWS[cls]] });
+  }
+  /** Each run as a verb and its object; a run whose verb is the previous run's omits it. */
+  const mixedPhrases = mixedRuns.map(({ layer, rows }) => !TAILED.has(layer) ? ["takes", `${layer} at ${rowsText(rows)}`]
+    : mixedTail === "off" ? ["keeps", `the generic blocks (two projections, a separate SwiGLU) at ${rowsText(rows)}`]
+    : ["takes", `${layer} at ${rowsText(rows)}, ${mixedTail === "split"
+      ? "split tail (MLX's compiled SwiGLU bit for bit)" : "fused tail (the same-width kernel's float32 sigmoid)"}`]);
+  const mixedSentence = `Mixed-width gate/up ${mixedPhrases.map(([verb, object], j) =>
+    j > 0 && mixedPhrases[j - 1]![0] === verb ? object : `${verb} ${object}`).join(", and ")}.`;
+  /** The most rows the graph's own block sets take (the generic blocks above). */
+  const widest = generic("fiveToEight") ? "four" : "eight";
+  const summary = c.kv !== "every" && head && asyncEvery !== null ? `// ${wrapComment(mixedSentence)} Every attention block reads
 // through the cache (${kvLego}: bf16 through its first append, then the fused 4-bit decode
 // kernel and the folded-GQA window kernel; the bf16 cache: the stock SDPA). The head is part of each phase: logits.twoToThree ${head.twoToThree}, logits.four
 // ${head.four}, logits.fiveToEight ${head.fiveToEight}, QuantizedLinear otherwise. Decode and verify up to 8 rows submit
 // the graph every ${asyncEvery} layers; prompt chunks, tails and wider verify windows evaluate each layer
-// and its recurrent state.` : `// ${mixedSentence}
-// Every attention block reads through the cache the composition's KV scheme names (composedFullAttentionCache: the
-// plain cache with the stock SDPA, bf16-first affine or per-layer affine with the composition's read kernels, or
-// bf16-first TurboQuant with the dense read). The head is QuantizedLinear at every width. Decode, verify and
-// known-token appends are one lazy graph at every width; prompt chunks, and prompt tails and embeddings above four
-// rows, evaluate each layer and its recurrent state.`;
-  const kvText = c.kv === "every" ? "every scheme, each composing its own cache lego (composedFullAttentionCache)"
-    : `bf16, or affine ${c.kv.bits}-bit group ${c.kv.groupSize} (composes ${kvLego})`;
+// and its recurrent state.` : `// ${wrapComment([
+    mixedSentence,
+    ...(legoKv ? [`Every attention block reads through the cache the composition's KV scheme names: affine ${legoKv.bits}-bit`,
+      `group ${legoKv.groupSize} composes ${kvLego} (bf16 through its first append, then the fused 4-bit decode kernel${
+        k.kvLego?.decodeBlock === undefined ? "" : ` at ${k.kvLego.decodeBlock} tokens per threadgroup`} and the`,
+      `folded-GQA window kernel), every other scheme its own lego (composedFullAttentionCache: the plain cache with ${plainRead},`,
+      "bf16-first affine or per-layer affine with the composition's read kernels, or bf16-first TurboQuant with the",
+      "dense read)."] : [
+      "Every attention block reads through the cache the composition's KV scheme names (composedFullAttentionCache: the",
+      `plain cache with ${plainRead}, bf16-first affine or per-layer affine with the composition's read kernels, or`,
+      "bf16-first TurboQuant with the dense read)."]),
+    ...(wider ? [`Every operation of nine to ${wider.maxRows} rows (decode and verify windows, prompt tails, known-token appends, a mixed`,
+      "forward's packed MLP rows) runs the wider layers in the table; more rows run the generic blocks."] : []),
+    head ? `The head is part of each phase: ${NARROW.filter(cls => cls !== "one" || head.one !== null).map(cls =>
+      `logits.${cls} ${head[cls] ?? "QuantizedLinear"}`).join(", ")}${wider
+      ? `, logits.wider ${wider.head} up to ${wider.maxRows} rows` : ""}, QuantizedLinear otherwise.`
+      : "The head is QuantizedLinear at every width.",
+    ...(drafter ? [`A bound drafter's own 4-bit projections take ${[...NARROW, "wider" as const].filter(cls => drafter[cls] !== null).map(cls =>
+      `${drafter[cls]} at ${cls}`).join(", ")}, QuantizedLinear otherwise (TargetView.draftProjections).`] : []),
+    ...(vocabulary ? [`A drafter that selects by its scores selects over the artifact's draft vocabulary (${vocabulary}), those rows of the`,
+      "head on the head's layers (DraftProjection.vocabulary)."] : []),
+    asyncEvery !== null ? `Decode, verify, prompt tails and embeddings up to ${widest} rows${wider
+      ? ", and decode, verify windows and prompt tails on the wider layers," : ""} submit the graph every ${asyncEvery} layers; wider decode${
+      k.widerVerify === "lazy" ? " and verify windows" : ""}${k.knownSpans ? "" : " and known-token appends"} are ${wider ? "otherwise " : ""}one lazy graph;`
+      : `Decode${k.widerVerify === "lazy" ? ", verify" : ` and verify up to ${widest} rows`}${k.knownSpans ? "" : " and known-token appends"
+      } are one lazy graph${k.widerVerify === "lazy" ? " at every width" : ""};`,
+    wider ? `prompt chunks, prompt tails above ${wider.maxRows} rows and embeddings above ${widest} rows${k.widerVerify === "bounded" ? ", and wider verify windows" : ""},`
+      : `prompt chunks, and prompt tails and embeddings above ${widest} rows${k.widerVerify === "bounded" ? ", and wider verify windows" : ""},`,
+    `evaluate each layer and its recurrent state${ane?.loop === "queued" ? ", which the Neural Engine operations queue without waiting (each split waits for the GPU before its ANE run)" : ""}.`,
+  ].join(" "))}`;
+  const kvText = c.kv !== "every" ? `bf16, or affine ${c.kv.bits}-bit group ${c.kv.groupSize} (composes ${kvLego})`
+    : legoKv ? `every scheme: affine ${legoKv.bits}-bit group ${legoKv.groupSize} composing ${kvLego}, each other its own cache lego
+//                (composedFullAttentionCache)`
+    : "every scheme, each composing its own cache lego (composedFullAttentionCache)";
   const composition = c.kv === "every" ? `/** The composition this file was generated and gated for, its entry in the loader's table: the artifact's graph
  *  fingerprint on this GPU. KV scheme, rows per forward, draft depth, prefill chunk, adapters and the Neural Engine
  *  bridge constrain nothing: the constructor builds them from the record it is handed. */
@@ -479,7 +802,7 @@ export const COMPOSITION: ServedComposition = Object.freeze({
 //   draft depth  ${depthText(c.draftDepth)}
 //   prefill      ${c.prefillChunkTokens}-token chunks
 //   rows         ${c.maxRows === null ? "any number" : `up to ${c.maxRows}`} per forward
-//   Neural Engine bridge ${c.aneBridge ? "present" : "absent"}
+//   Neural Engine bridge ${c.aneBridge ? "present" : "absent"}${c.wiredWeights ? "\n//   weights      wired for each generation" : ""}
 //
 // An entire graph: built once at construction from the composition record it is
 // handed, it inherits from no class and never calls another graph. Every phase and
@@ -490,9 +813,15 @@ export const COMPOSITION: ServedComposition = Object.freeze({
 //
 ${row("operation", "MLP gate/up + down (row-major/interleaved)", "affine projections (3/4-bit)")}
 ${classRows}
-${row("decode/verify.wider,", "the generic blocks (TrellisMlp)", "QuantizedLinear")}
-${row("prefillChunk.gpu, prefillTail", "", "")}${ane ? `
-${row(`prefillChunk.ane, ${ane.minRows}..${ane.rows.at(-1)}`, `${ane.rowMajorMlp}/K3i`, `${ane.projections.join(", ")} split`)}` : ""}
+${wider ? `${row(`every operation 9..${wider.maxRows}`, `${wider.mlp.sameGateUp} + ${wider.mlp.rowMajorDown}/K3i`,
+  wider.projections[3] === wider.projections[4] ? wider.projections[3] : `${wider.projections[3]}/${wider.projections[4]}`)}
+` : ""}${promptProjection ? `${row(`decode/verify.wider${wider ? ` ${wider.maxRows + 1}+` : ""}`, "the generic blocks (TrellisMlp)", "QuantizedLinear")}
+${row(wider ? `prefillChunk.gpu/Tail ${wider.maxRows + 1}+` : "prefillChunk.gpu/Tail.wider", "the generic blocks (TrellisMlp)", promptProjection)}`
+  : `${row("decode/verify.wider,", "the generic blocks (TrellisMlp)", "QuantizedLinear")}
+${row("prefillChunk.gpu, prefillTail", "", "")}`}${ane ? `
+${row(`prefillChunk.ane, ${ane.minRows}..${ane.rows.at(-1)}`, `${ane.rowMajorMlp}/K3i`,
+  splitsProjections ? `${ane.projections.join(", ")} split${ane.affineMinRows === undefined ? "" : ` from ${ane.affineMinRows} rows`}`
+    : promptProjection ?? "QuantizedLinear")}` : ""}
 //
 ${summary}
 //
@@ -500,7 +829,7 @@ ${summary}
 ${ane ? `//   - prompt chunks of exactly the composition's chunk size (prefillChunk.gpu) and prompt tails (prefillTail),
 //     and, when the composition has the Neural Engine bridge and mounts no adapters, one sequence's chunk or tail
 //     of ${ane.minRows} to ${ane.rows.at(-1)} positions on the Neural Engine operation whose programs hold it (prefillChunk.ane:
-//     ${aneRanges.map(([minRows, rows]) => `${minRows}..${rows}`).join(", ")}, programs of ${ane.rows.join(", ")} positions);`
+//     ${wrapComment(`${aneRanges.map(([minRows, rows]) => `${minRows}..${rows}`).join(", ")}, programs of ${ane.rows.join(", ")} positions);`, "//     ")}`
   : "//   - prompt chunks of exactly the composition's chunk size (prefillChunk.gpu) and prompt tails (prefillTail);"}
 //   - decode, one position per sequence, and speculative verify windows of sequences x (depth + 1) positions
 //     with the drafter's layer capture, for any number of sequences${c.maxRows === null ? "" : " up to the composition's rows per forward"}
@@ -517,7 +846,7 @@ ${k.mixed === "perGroup" ? "//   - mixed groups of rows in one forward (mixed), 
 ${adapterSafe ? `//   - mounted LoRA adapters: the attention and DeltaNet projections are the generic blocks' QuantizedLinear at
 //     every width, which apply them (the Trellis MLP is no adapter target);
 //   - paged KV (the paged legos' own reads in place of the plain full-attention storage).` : `//   - mounted LoRA adapters when the composition mounts them: every operation then runs the generic blocks,
-//     whose QuantizedLinear projections apply them, and the Neural Engine operation is not built;
+//     whose QuantizedLinear projections apply them${ane ? ", and the Neural Engine operation is not built" : ""};
 //   - paged KV (the paged legos' own reads in place of the plain full-attention storage).
 // The planner refuses, from the declared capabilities and never by routing to another graph, adapter requests
 // when the composition mounts none (adapter-batch-unsupported).`}${kvLego ? `
@@ -529,7 +858,8 @@ import * as ops from "@mlx-bun/mlx/ops";
 import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
 import type { Cache, GatedDeltaCache } from "../../contracts/mlx/cache";
-import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
+${vocabulary ? `import type { DraftProjection } from "../../contracts/mlx/draft-projection";
+` : ""}import type { ${drafter ? "DraftProjectionKernel, " : ""}ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
 import type {
 ${k.knownSpans ? `  MlxDeclaredGraph, MlxHeadForward, MlxKnownSpans, MlxLayerCapture, MlxMixedForward, MlxPhaseForward,
   MlxPrefillChunk, MlxTokenPhases, MlxWidthClass, MlxWidthTable,` : `  MlxDeclaredGraph, MlxHeadForward, MlxLayerCapture, MlxMixedForward, MlxPhaseForward, MlxPrefillChunk,
@@ -543,9 +873,12 @@ ${[
     ...(k.mixed === "packed" ? [`import { mapTokenGroups } from "../../input/token-groups";`] : []),
     ...(ane ? [`import type { AneProgramSpec } from "../../kernels/ane/linear";`] : []),
     ...(affineLayers.length ? [`import { ${affineLayers.sort().join(", ")} } from "../../layers/affine-verify-linear";`] : []),
-    ...(ane ? [`import {
-  ${[ane.affine, ane.rowMajorMlp, ane.k3InterleavedMlp].sort().join(", ")}, aneAffineSplitProgram, aneMlpSplitProgram, type AneMlpSplit,
+    ...(ane ? [splitsProjections ? `import {
+  ${[ane.affine!, ane.rowMajorMlp, ane.k3InterleavedMlp].sort().join(", ")}, aneAffineSplitProgram, aneMlpSplitProgram, type AneMlpSplit,
+} from "../../layers/ane-prefill-split";` : `import {
+  ${[ane.rowMajorMlp, ane.k3InterleavedMlp].sort().join(", ")}, aneMlpSplitProgram, type AneMlpSplit,
 } from "../../layers/ane-prefill-split";`] : []),
+    ...(promptProjection ? [`import { ${promptProjection} } from "../../layers/${PROMPT_PROJECTION_MODULES[promptProjection]}";`] : []),
     `import { disposing } from "../../layers/helpers";`,
     `import { LoraState } from "../../layers/lora";`,
     `import { RMSNorm } from "../../layers/normalization";`,
@@ -556,7 +889,7 @@ ${[
     ...(ane ? [`import { compiledSwiglu } from "../../layers/swiglu";`] : []),
     ...mlpImports,
     ...(kvLego ? [`import { composedAffineKernels } from "../../state/affine-attention";`] : []),
-    `import { AttentionMasks } from "../../state/attention-read";`,
+    `import { AttentionMasks${windowRead} } from "../../state/attention-read";`,
     `import { ${kvLego ? `${kvLego}, ` : ""}composedFullAttentionCache } from "../../state/bf16-first-kv";`,
   ].join("\n")}
 import { SSMCache } from "../../state/ssm";
@@ -564,11 +897,11 @@ import { denseTurboQuantKernels } from "../../state/turboquant-attention";
 import { declareGraph } from "../capabilities";
 import { atEveryWidth, byWidth, type ReadPhase } from "../graph";
 import type { ServedComposition } from "../implementation";
-${projectionSets.length || ane ? `import {
+${projectionSets.length || ane || promptProjection ? `import {
   GatedDeltaNet, Qwen3Attention, Qwen3Layer, type AttentionLinear, type AttentionLinearLoader, type TrellisMlp,
 } from "./blocks";` : `import { Qwen3Layer, type AttentionLinear, type GatedDeltaNet, type Qwen3Attention, type TrellisMlp } from "./blocks";`}
 import { qwen35WeightsView } from "./checkpoint";
-import { bindQwenMediaInput, qwenDraftTarget, qwenMediaEncoders, qwenResidualBasis } from "./media-input";
+import { bindQwenMediaInput, qwenDraftTarget, ${vocabulary ? "qwenDraftVocabulary, " : ""}qwenMediaEncoders, qwenResidualBasis } from "./media-input";
 
 export const ${constName(c)} = ${JSON.stringify(c.graph)};
 
@@ -593,18 +926,35 @@ ${table}
 const PREFIX = "language_model.model";
 const DELTANET_PROJECTIONS = ${list(DELTANET_PROJECTIONS)} as const;
 const ATTENTION_PROJECTIONS = ${list(ATTENTION_PROJECTIONS)} as const;
-${ane ? `const ANE_PROJECTIONS: ReadonlySet<string> = new Set(${list(ane.projections)});
+${splitsProjections ? `const ANE_PROJECTIONS: ReadonlySet<string> = new Set(${list(ane!.projections)});
 ` : ""}${asyncEvery !== null ? `/** Submit the graph every ${asyncEvery} layers at decode and verify widths up to 8 (measured best on this GPU). */
 const ASYNC_EVERY = ${asyncEvery};
-` : ""}${ane ? `/** The Neural Engine's channel fraction in each split. */
+` : ""}${wider ? `/** Every operation above eight rows of at most WIDER_ROWS rows runs this GPU's wider layers, more rows the generic
+ *  blocks: the boundary measured on the whole forward, from this machine's kernel table. */
+export const WIDER_ROWS = ${wider.maxRows};
+` : ""}${ane ? `${aneFractions ? `/** The Neural Engine operations' row ranges, ascending: a one-sequence prompt piece, a chunk or a tail, whose positions
+ *  one holds runs on it, over programs built for its \`rows\` with \`fraction\` of the MLP's channels on the Neural
+ *  Engine. From this machine's kernel table. */
+const ANE_RANGES: readonly { readonly minRows: number; readonly rows: number; readonly fraction: number }[] = Object.freeze([
+  ${wrapItems(aneRanges.map(([minRows, rows], j) => `{ minRows: ${minRows}, rows: ${rows}, fraction: ${aneFractions[j]} }`), "  ")},
+]);
+` : `/** The Neural Engine's channel fraction in each split. */
 const ANE_FRACTION = ${ane.fraction};
 /** The Neural Engine operations' row ranges, ascending: a one-sequence prompt piece, a chunk or a tail, whose positions
  *  one holds runs on it, over programs built for its \`rows\`. From this machine's kernel table. */
 const ANE_RANGES: readonly { readonly minRows: number; readonly rows: number }[] = Object.freeze([
-  ${aneRanges.map(([minRows, rows]) => `{ minRows: ${minRows}, rows: ${rows} }`).join(", ")},
+  ${wrapItems(aneRanges.map(([minRows, rows]) => `{ minRows: ${minRows}, rows: ${rows} }`), "  ")},
 ]);
-
-/** The widths a graph's Neural Engine programs are built at: the MLP's hidden and intermediate widths, and the input
+`}${ane.slices === undefined ? "" : `/** The reduction slices of each MLP program's matmuls. From this machine's kernel table. */
+const ANE_SLICES = ${ane.slices};
+`}${ane.affineFraction === undefined ? "" : `/** The Neural Engine's channel fraction in each projection split. */
+const ANE_AFFINE_FRACTION = ${ane.affineFraction};
+`}${ane.affineSlices === undefined ? "" : `/** The reduction slices of each projection program's matmul. */
+const ANE_AFFINE_SLICES = ${ane.affineSlices};
+`}${ane.affineMinRows === undefined ? "" : `/** The fewest rows of a program whose range splits the projections; the ranges below keep them whole. */
+const ANE_AFFINE_MIN_ROWS = ${ane.affineMinRows};
+`}
+${splitsProjections ? `/** The widths a graph's Neural Engine programs are built at: the MLP's hidden and intermediate widths, and the input
  *  and output widths of each distinct split projection shape. */
 export interface AneWidths {
   readonly hidden: number;
@@ -620,16 +970,38 @@ export const ANE_WIDTHS: AneWidths = Object.freeze({
 
 /** The distinct Neural Engine programs this graph loads for \`composition\`, at the artifact's widths unless
  *  \`widths\` names others (a synthetic artifact laid out like it): none without the bridge or with adapters mounted,
- *  otherwise, for each range in \`ANE_RANGES\`, the whole-MLP slice every layer shares and one program per split
+${ane.affineMinRows === undefined ? ` *  otherwise, for each range in \`ANE_RANGES\`, the whole-MLP slice every layer shares and one program per split
  *  projection shape, each for that range's rows. The install step compiles them into the system cache
  *  (\`compileAnePrograms\`, models/ane-install); the constructor only loads them, so one missing there fails
- *  construction with \`AneBridgeError\`. */
+ *  construction with \`AneBridgeError\`. */` : ` *  otherwise, for each range in \`ANE_RANGES\`, the whole-MLP slice every layer shares and, from ANE_AFFINE_MIN_ROWS
+ *  rows, one program per split projection shape, each for that range's rows. The install step compiles them into the
+ *  system cache (\`compileAnePrograms\`, models/ane-install); the constructor only loads them, so one missing there
+ *  fails construction with \`AneBridgeError\`. */`}
 export function anePrograms(composition: Composition, widths: AneWidths = ANE_WIDTHS): AneProgramSpec[] {
   if (!composition.aneBridge || composition.adapters) return [];
-  return ANE_RANGES.flatMap(({ rows }) => [aneMlpSplitProgram(widths.hidden, widths.intermediate, ANE_FRACTION, rows),
-    ...widths.projections.map(([inputs, outputs]) => aneAffineSplitProgram(inputs, outputs, ANE_FRACTION, rows))]);
+  return ANE_RANGES.flatMap(({ rows${aneFractions ? ", fraction" : ""} }) => [aneMlpSplitProgram(widths.hidden, widths.intermediate, ${mlpFraction}, rows${ane.slices === undefined ? "" : ", ANE_SLICES"}),
+    ...${ane.affineMinRows === undefined ? "" : "(rows < ANE_AFFINE_MIN_ROWS ? [] : "}widths.projections.map(([inputs, outputs]) => aneAffineSplitProgram(inputs, outputs, ${affineFraction}, rows${affineSlicesArg}))${ane.affineMinRows === undefined ? "" : ")"}]);
 }
-` : ""}
+` : `/** The widths a graph's Neural Engine programs are built at: the MLP's hidden and intermediate widths (no projection
+ *  is split). */
+export interface AneWidths {
+  readonly hidden: number;
+  readonly intermediate: number;
+}
+
+/** The artifact's widths, from its description. */
+export const ANE_WIDTHS: AneWidths = Object.freeze({ hidden: ${description.widths.hidden}, intermediate: ${description.widths.intermediate} });
+
+/** The distinct Neural Engine programs this graph loads for \`composition\`, at the artifact's widths unless
+ *  \`widths\` names others (a synthetic artifact laid out like it): none without the bridge or with adapters mounted,
+ *  otherwise the whole-MLP slice every layer shares, for each range in \`ANE_RANGES\` at ${aneFractions ? "its rows and fraction" : "that range's rows"}. The
+ *  install step compiles them into the system cache (\`compileAnePrograms\`, models/ane-install); the constructor
+ *  only loads them, so one missing there fails construction with \`AneBridgeError\`. */
+export function anePrograms(composition: Composition, widths: AneWidths = ANE_WIDTHS): AneProgramSpec[] {
+  if (!composition.aneBridge || composition.adapters) return [];
+  return ANE_RANGES.map(({ rows${aneFractions ? ", fraction" : ""} }) => aneMlpSplitProgram(widths.hidden, widths.intermediate, ${mlpFraction}, rows${ane.slices === undefined ? "" : ", ANE_SLICES"}));
+}
+`}` : ""}
 /** One layer: input norm, mixer, residual, post-attention norm, MLP, residual. Consumes nothing; returns an owned output.
  *  \`width\` is the class of \`x\`'s rows the calling operation names (the generic blocks' MLP reads it). */
 type Step = (x: MlxArray, cache: Cache, phase: ReadPhase, mrope: MropeForwardState | null, width: MlxWidthClass) => MlxArray;
@@ -650,7 +1022,14 @@ function layerStep(layer: Qwen3Layer, mixer: Mixer, mlp: (post: MlxArray) => Mlx
   };
 }
 
-/** The mixer of a layer's DeltaNet or attention block. */
+${packedWider ? `/** A layer's MLP block over \`hidden\` (borrowed): the post-attention norm, \`mlp\`, the residual. Returns an owned output. */
+function mlpBlock(layer: Qwen3Layer, hidden: MlxArray, mlp: (post: MlxArray) => MlxArray): MlxArray {
+  using post = layer.postAttnNorm.forward(hidden);
+  using out = mlp(post);
+  return ops.add(hidden, out);
+}
+
+` : ""}/** The mixer of a layer's DeltaNet or attention block. */
 function mixerOf(block: GatedDeltaNet<AttentionLinear> | Qwen3Attention<AttentionLinear>, kind: Qwen38Layer["kind"]): Mixer {
   if (kind === "deltanet") {
     const delta = block as GatedDeltaNet<AttentionLinear>;
@@ -665,7 +1044,10 @@ export class ${c.className} implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
   readonly composition: Composition;
   readonly weightsBytes: number;
-  /** Base path for LoRA target keys (weights carry the language_model prefix). */
+${c.wiredWeights ? `  /** Its weights are wired for each generation, whatever their share of the working set (measured for this
+   *  composition). */
+  readonly wiredWeights = true;
+` : ""}  /** Base path for LoRA target keys (weights carry the language_model prefix). */
   readonly prefixBase = PREFIX;
   readonly loraState = new LoraState();
   /** The full-attention layer whose cache supplies logical positions. */
@@ -680,6 +1062,14 @@ ${c.verifyRoundCosts ? `  /** Verify forward cost by rows relative to one decode
   readonly verifyRoundCosts: ReadonlyMap<number, number> = new Map([
     ${c.verifyRoundCosts.costs.map(([rows, cost]) => `[${rows}, ${cost}]`).join(", ")},
   ]);
+` : ""}${c.adaptiveDraftWidths ? `  /** The widest adaptive round per draft provider kind${c.verifyRoundCosts ? ` (${c.verifyRoundCosts.host})` : ""}. */
+  readonly adaptiveDraftWidths: ReadonlyMap<string, number> = new Map([
+    ${c.adaptiveDraftWidths.map(([kind, width]) => `[${JSON.stringify(kind)}, ${width}]`).join(", ")},
+  ]);
+` : ""}${c.adaptiveDraftGates ? `  /** The adaptive draft gate's settings per draft provider kind${c.verifyRoundCosts ? ` (${c.verifyRoundCosts.host})` : ""}. */
+  readonly adaptiveDraftGates: NonNullable<MlxDeclaredGraph["adaptiveDraftGates"]> = new Map([
+${c.adaptiveDraftGates.map(([kind, settings]) => `    [${JSON.stringify(kind)}, { ${Object.entries(settings).map(([key, value]) => `${key}: ${value}`).join(", ")} }],`).join("\n")}
+  ]);
 ` : ""}
   readonly prefillChunk: MlxPrefillChunk;
   readonly prefillTail: MlxWidthTable<RowsForward>;
@@ -693,7 +1083,8 @@ ${k.knownSpans ? `  /** Committed known-token spans: the append keeps the native
   });
 ` : ""}
   /** The generic blocks: ${k.knownSpans ? "prompt chunks and tails on the GPU, wide windows, media positions, committed appends"
-    : "prompt chunks, every operation above four rows, media positions, mixed rows"}. */
+    : promptProjection ? `every operation above ${wider ? wider.maxRows : widest} rows (prompt pieces with the prompt blocks' projections), media positions${k.mixed === "packed" ? ", mixed rows" : ""}`
+    : `prompt chunks, every operation above ${widest} rows, media positions${k.mixed === "packed" ? ", mixed rows" : ""}`}. */
   readonly #generic: Step[];
 ${k.mixed === "packed" ? `  /** The generic layers, which a mixed forward drives block by block. */
   readonly #layers: readonly Qwen3Layer[];
@@ -703,13 +1094,23 @@ ${k.mixed === "packed" ? `  /** The generic layers, which a mixed forward drives
   readonly #twoToThree: Step[];
   readonly #four: Step[];
   readonly #fiveToEight: Step[];
-  /** The block sets of the classes up to eight rows, by class. */
+${wider ? `  /** Operations above eight rows of at most WIDER_ROWS rows: every layer on the wider layers (the generic blocks when
+   *  the composition mounts adapters). */
+  readonly #wider: Step[];
+${packedWider ? `  /** Each layer's MLP on the wider layers (the post-attention-normed hidden to its output, owned), for a mixed
+   *  forward's packed MLP rows. */
+  readonly #widerMlp: ((post: MlxArray) => MlxArray)[];
+` : ""}` : ""}  /** The block sets of the classes up to eight rows, by class. */
   readonly #narrow: Readonly<Record<Exclude<MlxWidthClass, "wider">, Step[]>>;
   readonly #loraTargets: ReadonlyMap<string, QuantizedLinear>;
   readonly #mrope: { readonly invFreq: MlxArray; readonly rotaryDims: number };
   /** The artifact's R1 basis, from its fold record (read once, here). */
   readonly #residualBasis: ResidualBasis | undefined;
-  /** What this graph created and frees in \`dispose\`: its constants${ane ? " and the Neural Engine layers' programs" : ""}. */
+${drafter ? `  /** The kernels a bound drafter's own 4-bit projections run, per width class of their rows. */
+  readonly #draftProjections: MlxWidthTable<DraftProjectionKernel>;
+` : ""}${vocabulary ? `  /** The head's rows of the artifact's draft vocabulary on the head's layers, built when a drafter first reads them. */
+  #draftVocabulary: NonNullable<DraftProjection["vocabulary"]> | undefined;
+` : ""}  /** What this graph created and frees in \`dispose\`: its constants${ane ? " and the Neural Engine layers' programs" : ""}. */
   readonly #owned: { dispose(): void }[] = [];
   /** The attention cache of layer \`layer\` the composition's KV scheme names, over one \`makeCache\` call's masks. */
   readonly #attentionCache: (masks: AttentionMasks, layer: number) => Cache;
@@ -723,7 +1124,16 @@ ${k.mixed === "packed" ? `  /** The generic layers, which a mixed forward drives
     this.config = config;
     this.composition = composition;
     this.#residualBasis = qwenResidualBasis(this.graph, config.modelDir);
-    this.weightsBytes = [...weights.shards.files.values()].reduce((a, f) => a + f.mmap.size, 0);
+${drafter ? `    // A bound drafter's own 4-bit, group-64 projections, over the weights it quantized (borrowed).
+    const draftAffine = (w: MlxArray, scales: MlxArray, biases: MlxArray) =>
+      new QuantizedLinear(w, scales, biases, { bits: 4, groupSize: 64, mode: "affine" });
+    this.#draftProjections = Object.freeze<MlxWidthTable<DraftProjectionKernel>>({
+${[...NARROW, "wider" as const].map(cls => {
+  const layer = drafter[cls];
+  return `      ${cls}: (w, scales, biases) => { const kernel = ${layer ? `new ${layer}(draftAffine(w, scales, biases))` : "draftAffine(w, scales, biases)"}; return x => kernel.forward(x); },`;
+}).join("\n")}
+    });
+` : ""}    this.weightsBytes = [...weights.shards.files.values()].reduce((a, f) => a + f.mmap.size, 0);
     this.faIdx = t.fullAttentionInterval - 1;
     this.embed = QuantizedEmbedding.load(weights, \`\${PREFIX}.embed_tokens\`, config);
     const generic = LAYERS.map((_, i) => new Qwen3Layer(weights, config, i));
@@ -738,7 +1148,7 @@ ${k.mixed === "packed" ? `  /** The generic layers, which a mixed forward drives
     const qkScale = { q: ops.filledBf16(invScale * invScale, t.linearKeyHeadDim), k: ops.filledBf16(invScale, t.linearKeyHeadDim) };
     for (const layer of generic) if (layer.linearAttn) layer.linearAttn.qkScale = qkScale;
     this.#owned.push(qkScale.q, qkScale.k, this.#mrope.invFreq);
-${projectionSets.length || ane ? `
+${projectionSets.length || ane || promptProjection ? `
     /** The block of layer \`i\` whose projections \`project\` builds from each one's stored width. */
     const blockOf = (i: number, project: (linear: QuantizedLinear, path: string, width: number) => AttentionLinear) => {
       const spec = LAYERS[i]!, block = \`\${PREFIX}.layers.\${i}.\${spec.kind === "deltanet" ? "linear_attn" : "self_attn"}\`;
@@ -757,32 +1167,41 @@ ${k.mixed === "packed" ? `    this.#layers = generic;
     this.#packMixedMlp = composition.packedMixedMlp;
 ` : ""}
 ${narrowBlock}
-
-${ane ? `    // The Neural Engine operations, one per range in ANE_RANGES, built largest
+${promptProjection ? `
+    // The attention and DeltaNet blocks of the prompt operations: every projection on ${promptProjection}, unless
+    // the composition mounts adapters (then the generic blocks', whose QuantizedLinear applies them).
+    const promptBlocks = composition.adapters ? null : LAYERS.map((_, i) => blockOf(i, linear => new ${promptProjection}(linear)));
+` : ""}
+${ane ? `${splitsProjections ? `    // The Neural Engine operations, one per range in ANE_RANGES, built largest
     // first. Layers run one at a time and the scheduler runs one operation at a
     // time, so each MLP split shares the previous split's program (identical
     // within a range) or its buffers (the largest range's), and projections of
     // one shape share theirs: one loaded program per shape and range, the
     // programs \`anePrograms\` lists, loaded from the compile cache the install
-    // step filled (nothing compiles here).
+    // step filled (nothing compiles here).` : `    // The Neural Engine operations, one per range in ANE_RANGES, built largest
+    // first. Layers run one at a time and the scheduler runs one operation at a
+    // time, so each MLP split shares the previous split's program (identical
+    // within a range) or its buffers (the largest range's): one loaded program
+    // per range, the programs \`anePrograms\` lists, loaded from the compile
+    // cache the install step filled (nothing compiles here).`}
     let ane: { readonly minRows: number; readonly rows: number; readonly steps: Step[] }[] | null = null;
     if (composition.aneBridge && !composition.adapters) {
       const started = performance.now();
-      const affineShares = new Map<string, ${ane.affine}>();
-      let mlpShare: AneMlpSplit | undefined;
-      ane = [...ANE_RANGES].reverse().map(({ minRows, rows }) => ({ minRows, rows, steps: generic.map((layer, i) => {
+${splitsProjections ? `      const affineShares = new Map<string, ${ane.affine}>();
+` : ""}      let mlpShare: AneMlpSplit | undefined;
+      ane = [...ANE_RANGES].reverse().map(({ minRows, rows${aneFractions ? ", fraction" : ""} }) => ({ minRows, rows, steps: generic.map((layer, i) => {
         const spec = LAYERS[i]!, { gate, up, down } = mlpOf(i);
         const split = mlpShare = (spec.downLayout === "k3Interleaved" ? ${ane.k3InterleavedMlp} : ${ane.rowMajorMlp})
-          .build(gate, up, down, ANE_FRACTION, rows, mlpShare);
+          .build(gate, up, down, ${mlpFraction}, rows, mlpShare${ane.slices === undefined ? "" : ", ANE_SLICES"});
         this.#owned.push(split);
-        const block = blockOf(i, (linear, path) => {
-          if (!ANE_PROJECTIONS.has(path.slice(path.lastIndexOf(".") + 1))) return linear;
+${splitsProjections ? `        const block = ${ane.affineMinRows === undefined ? "" : "rows < ANE_AFFINE_MIN_ROWS ? promptBlocks![i]! : "}blockOf(i, (linear, path) => {
+          if (!ANE_PROJECTIONS.has(path.slice(path.lastIndexOf(".") + 1))) return ${promptProjection ? `new ${promptProjection}(linear)` : "linear"};
           const shape = \`\${linear.inFeatures}:\${linear.outFeatures}\`;
-          const projection = ${ane.affine}.build(linear, ANE_FRACTION, rows, affineShares.get(shape));
+          const projection = ${ane.affine}.build(linear, ${affineFraction}, rows, affineShares.get(shape)${affineBuildArgs});
           affineShares.set(shape, projection);
           this.#owned.push(projection);
           return projection;
-        });
+        });` : `        const block = ${promptProjection ? "promptBlocks![i]!" : "(layer.linearAttn ?? layer.selfAttn)!"};`}
         return layerStep(layer, mixerOf(block, spec.kind), post => split.forward(post, compiledSwiglu));
       }) })).reverse();
       console.error(\`[ane] prefill programs ready in \${Math.round(performance.now() - started)} ms\`);
@@ -801,27 +1220,35 @@ ${ane ? `    // The Neural Engine operations, one per range in ANE_RANGES, built
       prefill: { boundedWorkspace: true },
 ${adapterSafe ? "" : "      adapters: composition.adapters ? {} : { batched: false, mountable: false },\n"}    });
 
-${kvLego ? `    // The attention cache the composition's KV scheme names, chosen once: affine ${(c.kv as { bits: number }).bits}-bit group ${(c.kv as { groupSize: number }).groupSize}
-    // composes ${kvLego}; bf16, the table's other scheme for this graph, the plain cache with the dense
-    // TurboQuant read (\`composedFullAttentionCache\`).
+${legoKv ? `    // The attention cache the composition's KV scheme names, chosen once: affine ${legoKv.bits}-bit group ${legoKv.groupSize}
+    // composes ${kvLego}; ${c.kv === "every" ? `every other scheme its own lego, with the dense TurboQuant read
+    // (\`composedFullAttentionCache\`).` : `bf16, the table's other scheme for this graph, the plain cache with the dense
+    // TurboQuant read (\`composedFullAttentionCache\`).`}
     const kv = composition.kv;
-    this.#attentionCache = kv.kind === "affine" && kv.bits === ${(c.kv as { bits: number }).bits} && kv.groupSize === ${(c.kv as { groupSize: number }).groupSize}
-      ? (masks: AttentionMasks) => new ${kvLego}(kv.quantizedKvStart ?? 0, composedAffineKernels(kv.kernels), masks)
-      : (masks: AttentionMasks, layer: number) => composedFullAttentionCache(kv, layer, masks, denseTurboQuantKernels);`
+    this.#attentionCache = kv.kind === "affine" && kv.bits === ${legoKv.bits} && kv.groupSize === ${legoKv.groupSize}
+      ? (masks: AttentionMasks) => new ${kvLego}(kv.quantizedKvStart ?? 0, composedAffineKernels(kv.kernels), masks${decodeBlock})
+      : (masks: AttentionMasks, layer: number) => composedFullAttentionCache(kv, layer, masks, denseTurboQuantKernels${windowRead});`
   : `    // The attention cache the composition's KV scheme names: that scheme's own lego, with the dense TurboQuant read
     // (\`composedFullAttentionCache\`).
     const kv = composition.kv;
-    this.#attentionCache = (masks: AttentionMasks, layer: number) => composedFullAttentionCache(kv, layer, masks, denseTurboQuantKernels);`}
+    this.#attentionCache = (masks: AttentionMasks, layer: number) => composedFullAttentionCache(kv, layer, masks, denseTurboQuantKernels${windowRead});`}
 
     this.#narrow = Object.freeze({ ${NARROW.map(cls => `${cls}: this.#${cls}`).join(", ")} });
-    const ${NARROW.filter(cls => !generic(cls)).map(cls => `${cls} = this.#${cls}`).join(", ")}, wide = this.#generic;
+    const ${NARROW.filter(cls => !generic(cls)).map(cls => `${cls} = this.#${cls}`).join(", ")}, wide = this.#generic${wider ? ", wider = this.#wider" : ""};
     const embed = this.embed${ane ? ", split = ane" : ""};
-    const gpu: RowsForward = (ids, state, capture) =>
-      this.#bounded(wide, embed.encode(ids), state, "window", capture, null, "wider");
+${promptProjection ? `    // Prompt pieces above ${wider ? "WIDER_ROWS" : "eight"} rows: the prompt blocks, then the generic blocks' MLP.
+    const prompt = promptBlocks ? generic.map((layer, i) => layerStep(layer, mixerOf(promptBlocks[i]!, LAYERS[i]!.kind),
+      post => mlpOf(i).forward(post, "window", "wider"))) : wide;
+    const gpu: RowsForward = (ids, state, capture) =>${wider ? ` ids.size <= WIDER_ROWS
+      ? ${widerRun("window")}
+      : ` : "\n      "}this.#bounded(prompt, embed.encode(ids), state, "window", capture, null, "wider");`
+  : `    const gpu: RowsForward = (ids, state, capture) =>${wider ? ` ids.size <= WIDER_ROWS
+      ? ${widerRun("window")}
+      : ` : "\n      "}this.#bounded(wide, embed.encode(ids), state, "window", capture, null, "wider");`}
 ${ane ? `    this.prefillChunk = Object.freeze(split
       ? { gpu, ane: Object.freeze(split.map(({ minRows, rows, steps }) => Object.freeze({ minRows, rows,
         forward: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
-          this.#bounded(steps, embed.encode(ids), state, "window", capture, null, "wider") }))) }
+          this.#${ane.loop}(steps, embed.encode(ids), state, "window", capture${ane.loop === "bounded" ? ", null" : ""}, "wider") }))) }
       : { gpu });` : "    this.prefillChunk = Object.freeze({ gpu });"}
     this.prefillTail = Object.freeze({
 ${NARROW.map(cls => entry(cls, "window", "bounded")).join("\n")}
@@ -829,17 +1256,28 @@ ${NARROW.map(cls => entry(cls, "window", "bounded")).join("\n")}
     });
     this.decode = Object.freeze({
 ${NARROW.map(cls => entry(cls, "decode", "lazy")).join("\n")}
-      wider: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) => this.#lazy(wide, embed.encode(ids), state, "decode", capture, null, "wider"),
+      wider: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>${wider ? ` ids.size <= WIDER_ROWS
+        ? ${widerRun("decode")}
+        :` : ""} this.#lazy(wide, embed.encode(ids), state, "decode", capture, null, "wider"),
     });
     this.verify = Object.freeze({
 ${NARROW.map(cls => entry(cls, "window", k.widerVerify)).join("\n")}
-      wider: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) => this.#${k.widerVerify}(wide, embed.encode(ids), state, "window", capture, null, "wider"),
+      wider: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>${wider ? ` ids.size <= WIDER_ROWS
+        ? ${widerRun("window")}
+        :` : ""} this.#${k.widerVerify}(wide, embed.encode(ids), state, "window", capture, null, "wider"),
     });
 ${k.knownSpans ? `    // Known tokens read committed on the generic blocks, evaluated per layer above four rows.
     this.appendKnown = byWidth<MlxPhaseForward>(width => width === "fiveToEight" || width === "wider"
       ? (ids, state) => this.#bounded(wide, embed.encode(ids), state, "committed", null, null, width)
       : (ids, state) => this.#lazy(wide, embed.encode(ids), state, "committed", null, null, width));`
-  : `    // Known tokens append as windows (no committed spans) on the block set of their width, one lazy graph.
+  : wider ? `    // Known tokens append as windows (no committed spans) on the block set of their width (above eight rows the
+    // wider layers' up to WIDER_ROWS rows, the generic blocks above), one lazy graph.
+    this.appendKnown = byWidth<MlxPhaseForward>(width => {
+      if (width === "wider")
+        return (ids, state) => this.#lazy(ids.size <= WIDER_ROWS ? wider : wide, embed.encode(ids), state, "window", null, null, width);
+      const steps = this.#narrow[width];
+      return (ids, state) => this.#lazy(steps, embed.encode(ids), state, "window", null, null, width);
+    });` : `    // Known tokens append as windows (no committed spans) on the block set of their width, one lazy graph.
     this.appendKnown = byWidth<MlxPhaseForward>(width => {
       const steps = width === "wider" ? wide : this.#narrow[width];
       return (ids, state) => this.#lazy(steps, embed.encode(ids), state, "window", null, null, width);
@@ -849,9 +1287,7 @@ ${head ? `    if (composition.adapters) this.logits = atEveryWidth(plain);
     else {
       const ${heads.map(layer => `${headName(layer)} = new ${layer}(head)`).join(", ")};
       this.logits = Object.freeze<MlxWidthTable<MlxHeadForward>>({
-        one: plain,
-${NARROW.filter(cls => cls !== "one").map(cls => `        ${cls}: hidden => ${headName(head[cls as Exclude<Narrow, "one">])}.forward(hidden),`).join("\n")}
-        wider: plain,
+${headTable("        ")}
       });
     }` : "    this.logits = atEveryWidth(plain);"}
     console.error(\`[graph] \${this.graph} \${COMPOSITION.fingerprint}${ane ? ` ane-prefill=\${ane ? "on" : "off"}` : ""} adapters=\${composition.adapters ? "on" : "off"}\`);
@@ -861,9 +1297,11 @@ ${NARROW.filter(cls => cls !== "one").map(cls => `        ${cls}: hidden => ${he
    *  after the last forward. */
   dispose(): void { for (const resource of this.#owned.splice(0)) resource.dispose(); }
 
-${kvLego ? `  /** One cache per layer, the attention caches sharing one mask memo: the cache the composition's KV scheme names
-   *  (affine ${(c.kv as { bits: number }).bits}-bit group ${(c.kv as { groupSize: number }).groupSize}: ${kvLego}, bf16 through its first append, then the KV4 decode
-   *  and folded window reads; bf16: \`composedFullAttentionCache\`'s plain cache with the dense TurboQuant read). */`
+${legoKv ? `  /** One cache per layer, the attention caches sharing one mask memo: the cache the composition's KV scheme names
+   *  (affine ${legoKv.bits}-bit group ${legoKv.groupSize}: ${kvLego}, bf16 through its first append, then the KV4 decode
+   *  and folded window reads; ${c.kv === "every" ? `every other scheme: \`composedFullAttentionCache\`, the plain cache,
+   *  ${k.bf16WindowRead === null ? "" : `its windows ${k.bf16WindowRead}, `}bf16-first affine or per-layer affine with the composition's read kernels,
+   *  or bf16-first TurboQuant with the dense read). */` : `bf16: \`composedFullAttentionCache\`'s plain cache with the dense TurboQuant read). */`}`
   : `  /** One cache per layer, the attention caches sharing one mask memo: the cache the composition's KV scheme names
    *  (\`composedFullAttentionCache\`: the plain cache, bf16-first affine or per-layer affine with the composition's read
    *  kernels, or bf16-first TurboQuant with the dense read). */`}
@@ -878,10 +1316,29 @@ ${kvLego ? `  /** One cache per layer, the attention caches sharing one mask mem
 
   bindMediaInput(input: Vision): MlxPromptInput { return bindQwenMediaInput(this, input.embeddings, input.mrope!); }
   mediaEncoders(modelDir: string): Promise<MediaEncoders> { return qwenMediaEncoders(this, modelDir); }
-  /** The drafter's ports: its hidden-layer taps (verify's capture), embedding and head, and the residual basis
-   *  (R1 seed, final-norm gain) the artifact's fold record declares. */
-  draftTarget(_caches: Cache[]): TargetView { return qwenDraftTarget(this, this.#residualBasis); }
-
+${vocabulary ? `  /** The drafter's ports: its hidden-layer taps (verify's capture), embedding and head, the residual basis (R1 seed,
+   *  final-norm gain) the artifact's fold record declares, ${drafter ? "the kernels of its own projections, " : ""}and the head's rows of
+   *  the artifact's draft vocabulary. */
+  draftTarget(_caches: Cache[]): TargetView {
+    return qwenDraftTarget(this, this.#residualBasis, ${drafter ? "this.#draftProjections" : "undefined"}, () => this.#vocabularyHead());
+  }
+` : `  /** The drafter's ports: its hidden-layer taps (verify's capture), embedding and head, ${drafter ? "the" : "and the"} residual basis
+   *  (R1 seed, final-norm gain) the artifact's fold record declares${drafter ? ", and the kernels of its own projections" : ""}. */
+  draftTarget(_caches: Cache[]): TargetView { return qwenDraftTarget(this, this.#residualBasis${drafter ? ", this.#draftProjections" : ""}); }
+`}${vocabulary ? `
+  /** The head's rows of the artifact's draft vocabulary (\`${vocabulary}\`) on the head's layers per width class,
+   *  built once, when a drafter first reads them. */
+  #vocabularyHead(): NonNullable<DraftProjection["vocabulary"]> {
+    return this.#draftVocabulary ??= qwenDraftVocabulary(this.lmHead, this.config.modelDir, ${JSON.stringify(vocabulary)},
+      this.config.text.vocabSize, rows => {
+        const plain: MlxHeadForward = hidden => rows.forward(hidden);
+        const ${heads.map(layer => `${headName(layer)} = new ${layer}(rows)`).join(", ")};
+        return Object.freeze<MlxWidthTable<MlxHeadForward>>({
+${headTable("          ")}
+        });
+      }, this.#owned);
+  }
+` : ""}
   // ── The layer loops. Each consumes h0 and returns the post-final-norm hidden,
   // owned by the caller; \`capture\` sees every layer's output, then the final hidden.
 ${asyncEvery !== null ? `
@@ -926,7 +1383,29 @@ ${asyncEvery !== null ? `
     } finally { h?.dispose(); }
   }
 
-  /** Every layer, nothing evaluated. */
+${ane?.loop === "queued" ? `  /** Every layer, each layer's output and recurrent state queued for the GPU, not waited for, before the next is
+   *  built: the Neural Engine operations, whose splits wait for the GPU before each ANE run. */
+  #queued(steps: Step[], h0: MlxArray, cache: Cache[], phase: ReadPhase, capture: MlxLayerCapture | null,
+    width: MlxWidthClass): MlxArray {
+    let h: MlxArray | null = h0;
+    try {
+      for (let i = 0; i < steps.length; i++) {
+        const next = steps[i]!(h, cache[i]!, phase, null, width);
+        h.dispose();
+        h = next;
+        const state = cache[i]!.state();
+        try { ops.asyncEvalAll([h, ...state]); }
+        finally { if (cache[i]!.stateNeedsDispose) for (const a of state) a.dispose(); }
+        capture?.(i, h);
+      }
+      const out = disposing(h, this.finalNorm.forward(h));
+      h = null;
+      capture?.(steps.length, out);
+      return out;
+    } finally { h?.dispose(); }
+  }
+
+` : ""}  /** Every layer, nothing evaluated. */
   #lazy(steps: Step[], h0: MlxArray, cache: Cache[], phase: ReadPhase, capture: MlxLayerCapture | null,
     mrope: MropeForwardState | null, width: MlxWidthClass): MlxArray {
     let h: MlxArray | null = h0;
@@ -958,7 +1437,8 @@ ${k.mixed === "perGroup" ? `  /** Mixed rows in one forward: each group runs its
   };` : `  /** Mixed rows in one forward on the generic blocks: each group's attention and DeltaNet read its own caches in its
    *  own phase (a verify group reads a window); the MLP rows of the groups that may share it run as one call at
    *  \`width\`, the class of the groups' rows, when the composition packs mixed MLP, a verify group keeping its own
-   *  geometry (\`mapTokenGroups\`). A prompt group above four rows evaluates each layer and the groups' recurrent state
+   *  geometry (\`mapTokenGroups\`)${packedWider ? `; a call above eight rows of at most WIDER_ROWS rows runs the wider
+   *  layers' MLP` : ""}. A prompt group above four rows evaluates each layer and the groups' recurrent state
    *  before the next, as the prompt tail does. */
   readonly mixed: MlxMixedForward = (groups, width) => {
     const hidden: MlxArray[] = [];
@@ -971,7 +1451,10 @@ ${k.mixed === "perGroup" ? `  /** Mixed rows in one forward: each group runs its
         try {
           for (const [row, group] of groups.entries())
             mids.push(layer.forwardAttn(hidden[row]!, group.state[i]!, group.phase === "decode" ? "decode" : "window"));
-          const outputs = mapTokenGroups(groups, mids, (h, w) => layer.forwardMlp(h, "window", w), width, this.#packMixedMlp);
+${packedWider ? `          const mlp = this.#widerMlp[i]!;
+          const outputs = mapTokenGroups(groups, mids, (h, w) => w === "wider" && h.size / h.shape.at(-1)! <= WIDER_ROWS
+            ? mlpBlock(layer, h, mlp) : layer.forwardMlp(h, "window", w), width, this.#packMixedMlp);`
+  : `          const outputs = mapTokenGroups(groups, mids, (h, w) => layer.forwardMlp(h, "window", w), width, this.#packMixedMlp);`}
           for (const row of groups.keys()) { hidden[row]!.dispose(); hidden[row] = outputs[row]!; }
           // Materialize every layer's recurrent tail as well as the residual: it is not a dependency of the hidden
           // and otherwise pins prefill buffers.
@@ -1015,8 +1498,8 @@ ${k.mixed === "perGroup" ? `  /** Mixed rows in one forward: each group runs its
   }
 
   /** The vision prefill phase for direct generation: spliced embeddings (borrowed) at the cache's own positions, on
-   *  the block set of their width (${asyncEvery !== null ? "the one-sequence row sets up to eight rows, the generic blocks above"
-    : "the one-sequence row sets up to four rows, one lazy graph; the generic blocks\n   *  above, each layer evaluated before the next"}). */
+   *  the block set of their width (${asyncEvery !== null ? `the one-sequence row sets up to ${widest} rows, the generic blocks above`
+    : `the one-sequence row sets up to ${widest} rows, one lazy graph; the generic blocks\n   *  above, each layer evaluated before the next`}). */
   prefillEmbeddings(embeds: MlxArray, cache: Cache[], _bidir: MlxArray | null, _ids: MlxArray | null,
     _multimodal: MlxArray | null, width: MlxWidthClass): MlxArray {
     const h0 = ops.contiguous(embeds);

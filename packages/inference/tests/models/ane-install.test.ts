@@ -9,6 +9,7 @@ import { AneProgram, aneProgramKey, mlpSliceProgram, streamedMatmulProgram } fro
 import { aneInstallPrograms, compileAnePrograms } from "../../src/models/ane-install";
 import { machineComposition } from "../../src/models/composition";
 import { GraphTable, type GraphEntry } from "../../src/models/implementation";
+import { ANE_WIDTHS as M1_MAX_ANE_WIDTHS, QWEN38_TRELLIS_M1MAX_GRAPH } from "../../src/models/qwen/qwen38-27b-trellis-m1max";
 import { ANE_WIDTHS, QWEN38_TRELLIS_M4PRO_GRAPH } from "../../src/models/qwen/qwen38-27b-trellis-m4pro";
 
 const M4_PRO = "applegpu_g16s", M1_MAX = "applegpu_g13s";
@@ -27,11 +28,23 @@ describe("the install table", () => {
     expect(ANE_WIDTHS).toEqual({ hidden: 5120, intermediate: 17408, projections: [[5120, 6144], [6144, 5120]] });
   });
 
+  test("on an M1 Max the shipped table lists the Qwen3.8 graph's MLP slice for each of its Neural Engine row ranges, and from 768 rows its projection splits", () => {
+    const programs = [256, 320, 384, 448, 512, 576, 640, 704, 768, 896, 1024, 1280, 1536, 1792, 2048];
+    expect(labels(record({ device: M1_MAX }))).toEqual(programs.flatMap(rows => [
+      [`MLP slice 5120×${rows <= 768 ? 6144 : 6656}, ${rows} rows, 4 slices`, [QWEN38_TRELLIS_M1MAX_GRAPH]],
+      ...(rows < 768 ? [] : [[5120, 3840], [5120, 2304], [6144, 1920], [5120, 4608]].map(([inputs, outputs]) =>
+        [`projection ${inputs}→${outputs}, ${rows} rows, 4 slices`, [QWEN38_TRELLIS_M1MAX_GRAPH]])),
+    ]));
+    expect(M1_MAX_ANE_WIDTHS).toEqual({ hidden: 5120, intermediate: 17408,
+      projections: [[5120, 10240], [5120, 6144], [6144, 5120], [5120, 12288]] });
+  });
+
   test("the programs follow the composition: the bridge, mounted adapters and the device, not the chunk size", () => {
     expect(labels(record({ prefillChunkTokens: 128 }))).toEqual(labels(record()));
     expect(labels(record({ aneBridge: false }))).toEqual([]);
     expect(labels(record({ adapters: true }))).toEqual([]);
-    expect(labels(record({ device: M1_MAX }))).toEqual([]);
+    expect(labels(record({ device: M1_MAX, adapters: true }))).toEqual([]);
+    expect(labels(record({ device: "applegpu_g15s" }))).toEqual([]);
   });
 
   test("entries constrained to another device are skipped; a program two entries load is one program naming both", () => {

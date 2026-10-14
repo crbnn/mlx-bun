@@ -10,13 +10,27 @@ export interface SamplingSession<Scores, DeviceToken, Result> {
   /** Optional stateless operation shared across compatible rows and positions.
    * It borrows scores and returns owned device tokens, without advancing history. */
   readonly independent?: { sample(scores: Scores): DeviceToken };
-  /** Optional per-position operation for ONE request whose selection at each
-   * position depends only on that position's scores and step (no processor
-   * history, grammar or probability capture). Borrows [N,V] scores and returns
+  /** Optional per-position operation for ONE request whose selection depends on
+   * no grammar or probability capture: position p's draw depends only on its
+   * scores, its step and its processor history. Borrows [N,V] scores and returns
    * owned device tokens [N] for the given steps, without advancing history.
-   * Draws are those sample() would make at each step: seeded sampling keys by
-   * (seed, step), never by a shared stream, so unused positions cost nothing. */
-  readonly positional?: { sample(scores: Scores, steps: readonly number[]): DeviceToken };
+   * A request with processor history (`needsHistory`) also passes the window's
+   * inputs [N] (borrowed: the pending token, then the drafts): position p reads
+   * its history extended by inputs[1..p], the history sample() would hold there
+   * had every earlier position drawn its draft. Draws are those sample() would
+   * make at each step: seeded sampling keys by (seed, step), never by a shared
+   * stream, so unused positions cost nothing. `commit` takes the tokens a walk
+   * over the window used, in order, and advances history as sample() would have
+   * advanced it drawing each. */
+  readonly positional?: {
+    sample(scores: Scores, steps: readonly number[], inputs?: DeviceToken): DeviceToken;
+    commit(tokens: readonly number[]): void;
+  };
+  /** Optional draw left on the device for a request whose selection depends on
+   * its processor history but on no grammar or probability capture: borrows
+   * [1,V] scores and returns the owned device token sample() would draw at
+   * `step`, committing it to history unread when sample() would commit it. */
+  readonly unread?: { sample(scores: Scores, step: number): DeviceToken };
   readonly isPlainGreedy: boolean;
   readonly capturesLogprobs: boolean;
   readonly needsHistory: boolean;

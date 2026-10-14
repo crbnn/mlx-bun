@@ -79,8 +79,12 @@ export interface ModelContext<Model = RuntimeModel> {
     numDraftTokens: number;
     /** Each round's draft count comes from the graph's verify costs (`--num-draft-tokens adaptive`). */
     adaptiveDepth?: boolean;
+    /** The adaptive gate's settings the graph measured for this drafter's kind (`adaptiveDraftGates`). */
+    gate?: import("@mlx-bun/inference/contracts/mlx").AdaptiveDraftGateSettings;
     /** The provider is the checkpoint's own draft head, not a configured drafter. */
     native?: true;
+    /** The registered kind that loaded it (a graph may declare an adaptive width for it). */
+    kind?: string;
   } | null;
   /** The composition this load resolved before building the graph: device,
    * Neural Engine bridge, KV scheme, draft depth, prefill chunk, adapters and
@@ -384,9 +388,14 @@ export async function loadContext(
     if (draft) owned.add(draft.provider);
     if (opts.adaptiveDraftDepth) {
       if (!draft) throw new Error("--num-draft-tokens adaptive needs a drafter (--draft-model, --draft-kind or the checkpoint's MTP head)");
-      if (!declaredGraph(model).verifyRoundCosts)
+      const graph = declaredGraph(model);
+      if (!graph.verifyRoundCosts)
         throw new Error("--num-draft-tokens adaptive needs a graph measured on this machine (one that declares its verify costs); this model's graph does not");
-      draft = { ...draft, adaptiveDepth: true };
+      // A drafter kind whose adaptive width the graph measured drafts up to it, unless the request named a width, and
+      // gates with the settings the graph measured for it.
+      const width = opts.numDraftTokens === undefined && draft.kind !== undefined ? graph.adaptiveDraftWidths?.get(draft.kind) : undefined;
+      const gate = draft.kind !== undefined ? graph.adaptiveDraftGates?.get(draft.kind) : undefined;
+      draft = { ...draft, adaptiveDepth: true, ...(width === undefined ? {} : { numDraftTokens: width }), ...(gate ? { gate } : {}) };
     }
     const adapters = new AdapterManager(model);
     owned.add({ dispose() { disposeResources(adapters.list().map(({ id }) => ({ dispose() { adapters.unmount(id); } }))); } });

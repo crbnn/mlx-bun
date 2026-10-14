@@ -4,6 +4,9 @@ import type { TrellisGeometry } from "../kernels/trellis/geometry";
 import { downFactoredRow, downFactoredRows } from "../kernels/trellis/down-factored";
 import { downK3InterleavedFactoredRow, downK3InterleavedFactoredRows } from "../kernels/trellis/down-k3-interleaved-factored";
 import { downK3InterleavedMma, downMma } from "../kernels/trellis/down-mma";
+import {
+  DOWN_ONE_BLOCK, downK3InterleavedMmaWide, downK3InterleavedMmaWidePass, downMmaWide, downMmaWidePass,
+} from "../kernels/trellis/down-mma-wide";
 import { TrellisLinear } from "./trellis-linear";
 
 // Down-projection layers over a Qwen MLP's axis-0 Trellis codes. Each layer
@@ -19,6 +22,10 @@ function project(lin: TrellisLinear, kernel: Kernel, x: MlxArray): MlxArray {
   using y = kernel(x2, lin.codes, lin.scales, g);
   return ops.reshape(y, [...lead, g.outFeatures]);
 }
+// The any-row codebook down kernel in one block of 8 rows per pass, fixed for the 1..8-row layers.
+const oneBlockDown: Kernel = (x2, codes, scales, g) => downMmaWidePass(x2, codes, scales, g, DOWN_ONE_BLOCK);
+const oneBlockDownK3i: Kernel = (x2, codes, scales, g) => downK3InterleavedMmaWidePass(x2, codes, scales, g, DOWN_ONE_BLOCK);
+
 function rowMajor(name: string, lin: TrellisLinear): void {
   const g = lin.geometry;
   if (g.axis !== 0 || g.blockInterleave || lin.codes.ndim !== 2) throw new Error(`${name}: needs packed row-major axis-0 codes`);
@@ -66,4 +73,45 @@ export class MmaDown {
 export class MmaDownK3i {
   constructor(readonly down: TrellisLinear) { k3Interleaved("MmaDownK3i", down); }
   forward(x: MlxArray): MlxArray { return project(this.down, downK3InterleavedMma, x); }
+}
+
+/** Any number of activation rows on the simdgroup matrix unit through a threadgroup codebook, each decoded fragment
+ *  feeding up to three 8-row blocks (MmaDown's bits per block); row-major codes. */
+export class MmaDownWide {
+  constructor(readonly down: TrellisLinear) {
+    rowMajor("MmaDownWide", down);
+    const g = down.geometry;
+    if (g.T !== 256 || g.L > 12 || g.rows % 8 !== 0) throw new Error("MmaDownWide: needs T 256, L <= 12, rows % 8");
+  }
+  forward(x: MlxArray): MlxArray { return project(this.down, downMmaWide, x); }
+}
+
+/** Any number of activation rows on the simdgroup matrix unit through a threadgroup codebook (MmaDownK3i's bits per
+ *  block of 8); 3-bit block-interleaved codes. */
+export class MmaDownWideK3i {
+  constructor(readonly down: TrellisLinear) {
+    k3Interleaved("MmaDownWideK3i", down);
+    if (down.geometry.rows % 8 !== 0) throw new Error("MmaDownWideK3i: needs rows % 8");
+  }
+  forward(x: MlxArray): MlxArray { return project(this.down, downK3InterleavedMmaWide, x); }
+}
+
+/** 1..8 activation rows on the simdgroup matrix unit through a threadgroup codebook, one block of 8 rows per pass (the
+ *  any-row kernel's one-block pass; MmaDown's bits); row-major codes. */
+export class CodebookMmaDown {
+  constructor(readonly down: TrellisLinear) {
+    rowMajor("CodebookMmaDown", down);
+    const g = down.geometry;
+    if (g.T !== 256 || g.L > 12 || g.rows % 8 !== 0) throw new Error("CodebookMmaDown: needs T 256, L <= 12, rows % 8");
+  }
+  forward(x: MlxArray): MlxArray { return project(this.down, oneBlockDown, x); }
+}
+
+/** CodebookMmaDown for 3-bit block-interleaved codes (MmaDownK3i's bits). */
+export class CodebookMmaDownK3i {
+  constructor(readonly down: TrellisLinear) {
+    k3Interleaved("CodebookMmaDownK3i", down);
+    if (down.geometry.rows % 8 !== 0) throw new Error("CodebookMmaDownK3i: needs rows % 8");
+  }
+  forward(x: MlxArray): MlxArray { return project(this.down, oneBlockDownK3i, x); }
 }
