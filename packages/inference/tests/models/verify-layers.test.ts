@@ -136,7 +136,7 @@ function sameBits(actual: MlxArray, expected: MlxArray): boolean {
 }
 
 describe("Trellis codebook layers", () => {
-  // The paths they replace: the reduce gate/up (fusedGateUpSwiglu, and the mixed kernel at the projections' variant)
+  // The paths they replace: the reduce gate/up (fusedGateUpSwiglu, and the mixed kernel at the projections' variant and qualified bits)
   // and TrellisLinear's own one-row down projection.
   test("each layer computes its replaced path's bits at one row", () => {
     for (const [kg, ku] of [[3, 3], [2, 3], [4, 3]] as const) {
@@ -147,7 +147,7 @@ describe("Trellis codebook layers", () => {
         using actual = new CodebookGateUpRow(gate, up, "split").forward(x);
         expect(sameBits(actual, expected), `k${kg}`).toBe(true);
       } else for (const tail of ["split", "fused"] as const) {
-        using expected = mixedGateUpKernel(x, gate, up, gate.variant, tail);
+        using expected = mixedGateUpKernel(x, gate, up, gate.variant, tail, gate.representations.mixedExactBits);
         using actual = new CodebookGateUpRow(gate, up, tail).forward(x);
         expect(sameBits(actual, expected), `k${kg}/${ku} ${tail}`).toBe(true);
       }

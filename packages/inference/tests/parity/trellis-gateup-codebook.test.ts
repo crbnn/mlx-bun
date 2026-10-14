@@ -24,10 +24,10 @@ const digest = (a: MlxArray) => createHash("sha256").update(a.rawBytesView()).di
 
 type Mode = "inline" | "codebook" | "combined" | "generic" | "scatter-codebook" | "row-codebook";
 /** `rowKernels`: one row runs the threadgroup-codebook row kernels (the M1 Max graph's decode.one). */
-interface Representation { codebook: boolean; scatter: ScatterRepresentation; rowKernels: boolean }
+interface Representation { codebook: boolean; mixedBits: boolean; scatter: ScatterRepresentation; rowKernels: boolean }
 const representation = (mode: Mode): Representation => {
   const bits = mode === "combined" || mode === "generic" || mode === "scatter-codebook";
-  return { codebook: mode !== "inline", scatter: { bits, genericBits: mode === "generic" || mode === "scatter-codebook",
+  return { codebook: mode !== "inline", mixedBits: bits, scatter: { bits, genericBits: mode === "generic" || mode === "scatter-codebook",
     floatCodebook: mode === "scatter-codebook" }, rowKernels: mode === "row-codebook" };
 };
 
@@ -44,7 +44,7 @@ function representedMlp(mlp: { gate: unknown; up: unknown; down: unknown; forwar
       if (M > TRELLIS_MATVEC_MAX_M) return mlp.forward(x, phase, width);
       const row = r.rowKernels && M === 1;
       using mid = row ? gateUpCodebookRow(x, gate, up, "split") : gate.geometry.k === up.geometry.k
-        ? fusedGateUpSwiglu(x, gate, up, 13, r.codebook) : fusedGateUpSwigluMixed(x, gate, up, 13, "split");
+        ? fusedGateUpSwiglu(x, gate, up, 13, r.codebook) : fusedGateUpSwigluMixed(x, gate, up, 13, "split", r.mixedBits);
       using rows = ops.reshape(mid, [M, down.geometry.inFeatures]);
       using y = row ? (down.geometry.blockInterleave ? downK3InterleavedCodebookRow : downCodebookRow)(rows, down.codes, down.scales, down.geometry)
         : trellisScatter(rows, down.codes, down.scales, down.geometry, 13, down.useSharedScatterCodebook, r.scatter);

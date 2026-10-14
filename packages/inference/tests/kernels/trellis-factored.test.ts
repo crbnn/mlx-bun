@@ -62,7 +62,7 @@ function gateUpReference(x: MlxArray, gate: ReturnType<typeof weights>, up: Retu
   for (let lo = 0; lo < m; lo += 4) {
     using part = x.slice([0, lo, 0], [1, Math.min(m, lo + 4), x.shape[2]!]);
     pieces.push(gate.geometry.k === up.geometry.k ? fusedGateUpSwiglu(part, gate, up, 6, false)
-      : fusedGateUpSwigluMixed(part, gate, up, 6, "split"));
+      : fusedGateUpSwigluMixed(part, gate, up, 6, "split", false));
   }
   try { return ops.concatAxis(pieces, 1); } finally { for (const p of pieces) p.dispose(); }
 }

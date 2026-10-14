@@ -874,6 +874,9 @@ They borrow input arrays and return an owned, lazy output array.
 | `trellisScatter(x, codes, scales, geometry, variant, useSharedScatterCodebook, representation)` | Axis-0 projection; same input shape and row budget |
 | `fusedGateUpSwiglu(x, gate, up, variant, codebook)` | Matching axis-1 gate/up geometry and bit width; preserves leading input dimensions, with 1..4 total rows |
 | `fusedGateUpSwigluMixed(x, gate, up, variant, tail, exactBits)` | Matching axis-1 geometry with independent bit widths; `tail` is `"fused"` or `"split"` |
+| `gateUpReduceRow(x, gate, up, variant, codebook)` / `gateUpReduceRows(x, gate, up, variant)` | `fusedGateUpSwiglu`'s one-row / 2..4 shared-row kernel alone |
+| `scatterRow` / `balancedScatterRow(x2, codes, scales, geometry, variant, representation)` | `trellisScatter`'s one-row kernel alone; balanced takes 3-bit codes at T 256, the other every other width |
+| `scatterRows(x2, codes, scales, geometry, variant)` / `balancedScatterRows(..., sharedCodebook)` | `trellisScatter`'s 2..4 shared-row kernels alone, the same split |
 | `expandTrellis(codes, scales, geometry, dtype, variant)` | General expansion, and variant 13's vector form |
 | `tiledTrellisPrefill(x, codes, scales, geometry)` | Axis-1 packed prefill, M=5..32 |
 | `splitKTrellisPrefill(x, codes, scales, geometry)` | Axis-0 packed prefill, M=5..8 |

@@ -148,8 +148,12 @@ test("explicit single-row representations preserve output bits on any GPU", () =
       continue;
     }
     for (const tail of ["fused", "split"] as const) {
-      using expected = fusedGateUpSwigluMixed(xUp, gate, up, 13, tail);
+      using expected = fusedGateUpSwigluMixed(xUp, gate, up, 13, tail, false);
+      using exact = fusedGateUpSwigluMixed(xUp, gate, up, 13, tail, true);
+      using machine = fusedGateUpSwigluMixed(xUp, gate, up, 13, tail, qualified.mixedExactBits);
       using row = gateUpCodebookRow(xUp, gate, up, tail);
+      same(exact, expected);
+      same(machine, expected);
       same(row, expected);
     }
   }
@@ -179,7 +183,7 @@ test("one-row codebook kernels reproduce the shipped one-row kernels on small sy
     using gc = codes([upRows, cols * kg / 32]), uc = codes([upRows, cols * ku / 32]);
     const gate = { geometry: { ...up, k: kg }, codes: gc, scales: upScales }, upw = { geometry: { ...up, k: ku }, codes: uc, scales: upScales };
     for (const tail of kg === ku ? ["split"] as const : ["split", "fused"] as const) {
-      using expected = kg === ku ? fusedGateUpSwiglu(xUp, gate, upw, 13, false) : fusedGateUpSwigluMixed(xUp, gate, upw, 13, tail);
+      using expected = kg === ku ? fusedGateUpSwiglu(xUp, gate, upw, 13, false) : fusedGateUpSwigluMixed(xUp, gate, upw, 13, tail, false);
       using actual = gateUpCodebookRow(xUp, gate, upw, tail);
       same(actual, expected);
     }
