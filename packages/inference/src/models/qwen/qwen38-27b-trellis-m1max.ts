@@ -4,7 +4,7 @@ import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
 import type { Cache } from "../../contracts/mlx/cache";
 import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
-import type { MlxDeclaredGraph, MlxTokenPhases, MlxLayerCapture, MlxHeadForward, MlxRowTable, MlxPromptRange, MlxCacheLayer, MlxPhaseForward, MlxSequenceRange, MlxMixedRange, MlxPhaseGroup, MlxMixedGroupRange, MlxSeparateMixed } from "../../contracts/mlx/graph";
+import type { MlxDeclaredGraph, MlxTokenPhases, MlxLayerCapture, MlxHeadForward, MlxRowTable, MlxPromptRange, MlxCacheLayer, MlxPhaseForward, MlxSequenceRange, MlxMixedRange, MlxPhaseGroup, MlxMixedGroupRange, MlxSeparateMixed, MlxKnownRange } from "../../contracts/mlx/graph";
 import type { MediaEncoders, MlxPromptInput, Vision, MlxPositionedForward, MlxPositionedRange, MlxPositionedEmbeddingsRange } from "../../contracts/mlx/media";
 import type { MropeForwardState } from "../../contracts/mlx/positions";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
@@ -19,7 +19,7 @@ import { TrellisFusedMLP, TrellisUnfusedMLP, TrellisScatterPrompt as Scatter, Tr
 import { GraphForwardScope, BoundedGraphForwardScope } from "../../runtime/graph-forward";
 import { disposeResources } from "../../runtime/resources";
 import { declareGraph } from "../capabilities";
-import { fixedRowBindings, type ReadPhase } from "../graph";
+import type { ReadPhase } from "../graph";
 import { QwenDeltaLayer as Delta, QwenAttentionLayer as Attention } from "./blocks";
 import { bindQwenMediaInput, qwenDraftTarget, qwenMediaEncoders, qwenResidualBasis } from "./media-input";
 import { DeltaWeights, AttentionWeights, GateDownMLP, canonicalQwenWeights, type QwenProjectionTarget } from "./written-layers";
@@ -73,7 +73,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
   readonly multiSequencePrompt:readonly MlxPromptRange[];
   readonly decode:MlxRowTable<RowsForward>;
   readonly verify:MlxRowTable<RowsForward>;
-  readonly appendKnown:MlxRowTable<MlxPhaseForward>;
+  readonly appendKnown:readonly MlxKnownRange[];
   readonly logits:MlxRowTable<MlxHeadForward>;
   readonly sequence:readonly MlxSequenceRange[];
   readonly mediaPrefill:readonly MlxPositionedEmbeddingsRange[];
@@ -680,17 +680,8 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
     const knownFive:MlxPhaseForward=(ids,cache)=>windowFive(ids,cache,null);
     const knownTiled:MlxPhaseForward=(ids,cache)=>windowTiled(ids,cache,null);
     const knownExpanded:MlxPhaseForward=(ids,cache)=>windowExpanded(ids,cache,null);
-    this.appendKnown={
-      ...fixedRowBindings(65,t.maxPositionEmbeddings,knownExpanded),
-      1:knownOne,2:knownRows,3:knownRows,4:knownRows,5:knownFive,6:knownFive,7:knownFive,8:knownFive,
-      9:knownTiled,10:knownTiled,11:knownTiled,12:knownTiled,13:knownTiled,14:knownTiled,15:knownTiled,16:knownTiled,
-      17:knownTiled,18:knownTiled,19:knownTiled,20:knownTiled,21:knownTiled,22:knownTiled,23:knownTiled,24:knownTiled,
-      25:knownTiled,26:knownTiled,27:knownTiled,28:knownTiled,29:knownTiled,30:knownTiled,31:knownTiled,32:knownTiled,
-      33:knownExpanded,34:knownExpanded,35:knownExpanded,36:knownExpanded,37:knownExpanded,38:knownExpanded,39:knownExpanded,40:knownExpanded,
-      41:knownExpanded,42:knownExpanded,43:knownExpanded,44:knownExpanded,45:knownExpanded,46:knownExpanded,47:knownExpanded,48:knownExpanded,
-      49:knownExpanded,50:knownExpanded,51:knownExpanded,52:knownExpanded,53:knownExpanded,54:knownExpanded,55:knownExpanded,56:knownExpanded,
-      57:knownExpanded,58:knownExpanded,59:knownExpanded,60:knownExpanded,61:knownExpanded,62:knownExpanded,63:knownExpanded,64:knownExpanded,
-    };
+    this.appendKnown=[{from:1,to:1,operation:knownOne},{from:2,to:4,operation:knownRows},
+      {from:5,to:8,operation:knownFive},{from:9,to:32,operation:knownTiled},{from:33,to:Infinity,operation:knownExpanded}];
     const head:MlxHeadForward=hidden=>this.#head.forward(hidden);
     this.logits={
       1:head,2:head,3:head,4:head,5:head,6:head,7:head,8:head,9:head,10:head,11:head,12:head,13:head,14:head,15:head,16:head,
