@@ -8,7 +8,7 @@ import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { quantizedSdpaUnfused } from "../../src/layers/quantized-attention";
-import { kvq4DecodeEligible, kvq4DecodeSdpa } from "../../src/kernels/attention/kvq4-decode";
+import { KV4_DECODE_BLOCK, kvq4DecodeEligible, kvq4DecodeSdpa } from "../../src/kernels/attention/kvq4-decode";
 import { multiQueryCausalSdpa } from "../../src/kernels/attention/multi-query";
 
 const H = 24, KVH = 4, D = 256, scale = 1 / Math.sqrt(D);
@@ -25,8 +25,9 @@ const maxDiff = (a: MlxArray, b: MlxArray) => {
 
 describe("fused one-row decode over a 4-bit cache", () => {
   const bits = 4;
-  for (const N of [300, 1100]) {
-    test(`${N} keys`, () => {
+  // The M4 Pro's 512 tokens per threadgroup and the M1 Max's 128: one block, or several to merge.
+  for (const N of [300, 1100]) for (const block of [KV4_DECODE_BLOCK, 128]) {
+    test(`${N} keys, ${block} per threadgroup`, () => {
       using q = rand([1, H, 1, D], 1);
       using k = rand([1, KVH, N, D], 2);
       using v = rand([1, KVH, N, D], 3);
@@ -34,7 +35,7 @@ describe("fused one-row decode over a 4-bit cache", () => {
       try {
         expect(kvq4DecodeEligible(q, kq, 64, bits)).toBe(true);
         using ref = quantizedSdpaUnfused(q, kq, vq, scale, { mode: "", arr: null }, 64, bits);
-        using fused = kvq4DecodeSdpa(q, kq, vq, scale);
+        using fused = kvq4DecodeSdpa(q, kq, vq, scale, block);
         expect(maxDiff(ref, fused)).toBeLessThan(2e-2);
       } finally { for (const t of [kq, vq]) { t.packed.dispose(); t.scales.dispose(); t.biases.dispose(); } }
     });

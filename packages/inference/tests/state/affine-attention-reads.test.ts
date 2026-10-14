@@ -21,6 +21,7 @@ import {
   foldedQuantizedSdpa, fusedSdpaConfigSupported, quantizedSdpaTiled, quantizedSdpaUnfused,
 } from "../../src/layers/quantized-attention";
 import { quantizedAppendAttention } from "../../src/layers/quantized-append-attention";
+import { KV4_DECODE_BLOCK } from "../../src/kernels/attention/kvq4-decode";
 import { kv4DecodeAttention } from "../../src/layers/kv4-decode-attention";
 import { composedAffineKernels, tiledAffineKernels, tiledCausalAffineKernels, unfusedAffineKernels, type AffineKernels } from "../../src/state/affine-attention";
 import { AttentionMasks } from "../../src/state/attention-read";
@@ -95,7 +96,7 @@ function oldM4ProRead(cache: QuantizedKVCache, k: MlxArray, v: MlxArray, q: MlxA
   const [keys, values] = cache.updateAndFetchQuantized(k, v);
   try {
     return q.shape[2] === 1
-      ? { out: kv4DecodeAttention(q, keys, values, scale, 64, 4), kernel: "kv4" }
+      ? { out: kv4DecodeAttention(q, keys, values, scale, 64, 4, KV4_DECODE_BLOCK), kernel: "kv4" }
       : { out: foldedQuantizedSdpa(q, keys, values, scale, 64, 4), kernel: "folded" };
   } finally { disposeTriple(keys); disposeTriple(values); }
 }

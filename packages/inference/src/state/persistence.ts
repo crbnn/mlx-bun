@@ -180,7 +180,7 @@ const CACHE_CODECS = {
     },
     clone: (cache, context) => {
       const c = cache as KVCache;
-      const clone = new KVCache(undefined, c.turboQuantKernels);
+      const clone = new KVCache(undefined, c.turboQuantKernels, c.windowRead);
       if (!c.keys || !c.values) return clone;
       clone.restoreState(
         context.liveView(c.keys, c.offset),
@@ -191,8 +191,9 @@ const CACHE_CODECS = {
     },
     load: (entry, context) => {
       // A plain entry saved from the graph's KVCache at this layer: the restored
-      // cache carries the TurboQuant read the graph composed into it.
-      const cache = new KVCache(undefined, (context.prototype as KVCache).turboQuantKernels);
+      // cache carries the TurboQuant and window reads the graph composed into it.
+      const prototype = context.prototype as KVCache;
+      const cache = new KVCache(undefined, prototype.turboQuantKernels, prototype.windowRead);
       cache.restoreState(
         context.grownArr(entry.tensors[0]!, entry.offset),
         context.grownArr(entry.tensors[1]!, entry.offset),

@@ -59,7 +59,7 @@ export class FullPrefillRow implements Cache {
   private restored(planes: MlxArray[], offset: number): FullCache {
     const source = this.inner;
     if (source instanceof KVCache) {
-      const result = new KVCache(undefined, source.turboQuantKernels);
+      const result = new KVCache(undefined, source.turboQuantKernels, source.windowRead);
       if (planes.length) result.restoreState(planes[0]!, planes[1]!, offset);
       return result;
     }
