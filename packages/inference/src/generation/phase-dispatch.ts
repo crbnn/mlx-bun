@@ -76,7 +76,9 @@ export class MlxPhaseDispatch {
   prompt(phase: PrefillPhase, sequences: number, tokens: number): MlxCapturingForward {
     if (phase === "decode") return this.#graph.decode[sequences]!;
     const positions = sequences > 1 ? sequences * tokens : tokens;
-    const ranges = sequences > 1 ? this.#graph.multiSequencePrompt : this.#prompt;
+    const ranges = sequences > 1
+      ? phase === "chunk" ? this.#graph.multiSequencePromptChunk ?? this.#graph.multiSequencePrompt : this.#graph.multiSequencePrompt
+      : phase === "chunk" ? this.#graph.promptChunk ?? this.#prompt : this.#prompt;
     const range = ranges.find(range => positions >= range.from && positions <= range.to);
     if (!range) throw new Error(`graph has no prompt operation for ${tokens} positions`);
     return range.operation;

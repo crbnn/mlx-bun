@@ -114,8 +114,8 @@ const ROW_LAYOUTS: readonly RowLayoutEntry<Cache>[] = [
   }),
   entry(KVCache, {
     decode: cache => new PaddedKVRows(cache.masks),
-    prefill: cache => new BatchedKVCache(cache.masks),
-    verify: cache => new BatchedKVCache(cache.masks),
+    prefill: cache => new BatchedKVCache(cache.masks, cache.windowRead),
+    verify: cache => new BatchedKVCache(cache.masks, cache.windowRead),
   }),
 ];
 

@@ -11,10 +11,13 @@
 //   value in one register: value in bits 0..31, has_value at bit 32.
 
 import { dlopen, FFIType, ptr, read, type Pointer } from "bun:ffi";
+import { applyCommandBufferLimits } from "./command-buffers";
 import { MLX_CORE_VERSION, resolveLibmlxc } from "./native";
 
 const { ptr: P, i32, u64, f32, f64, cstring } = FFIType;
 
+// MLX reads its command-buffer limits once, when it builds its Metal device.
+applyCommandBufferLimits();
 export const LIBMLXC_PATH = resolveLibmlxc();
 export const C = dlopen(LIBMLXC_PATH, {
   // linked MLX core version, independent of the C API family

@@ -10,7 +10,7 @@ import type { MropeForwardState } from "../../contracts/mlx/positions";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import type { AneProgramSpec } from "../../kernels/ane/linear";
 import { Affine3MmaLinear as Affine3Mma, Affine3RowsLinear as Affine3Rows, Affine4MmaLinear as Affine4Mma, Affine4RowsLinear as Affine4Rows } from "../../layers/affine-verify-linear";
-import { AneAffineSplit, AneTrellisMlpSplit as AneMlp, AneTrellisMlpSplitK3i as AneMlpK3i, aneAffineSplitProgram, aneMlpSplitProgram } from "../../layers/ane-prefill-split";
+import { AneAffineSplit, AneTrellisExpandedMlpSplit as AneMlp, AneTrellisExpandedMlpSplitK3i as AneMlpK3i, aneAffineSplitProgram, aneMlpSplitProgram } from "../../layers/ane-prefill-split";
 import { LoraState } from "../../layers/lora";
 import { RMSNorm } from "../../layers/normalization";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";

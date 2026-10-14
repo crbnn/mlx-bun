@@ -4,6 +4,8 @@ import { deviceArchitecture } from "@mlx-bun/mlx/ffi";
 import { HEADER } from "../../src/kernels/trellis/codebook";
 import { fusedGateUpSwiglu, gateUpCodebookEligible } from "../../src/kernels/trellis/gate-up";
 import { fusedGateUpSwigluMixed } from "../../src/kernels/trellis/mixed-gate-up";
+import { gateUpCodebookRow } from "../../src/kernels/trellis/gate-up-codebook";
+import { downCodebookRow, downK3InterleavedCodebookRow } from "../../src/kernels/trellis/down-codebook";
 import { scatterFloatCodebookEligible, trellisScatter } from "../../src/kernels/trellis/scatter";
 import { qualifiedRepresentations } from "../../src/kernels/trellis/qualified";
 import type { TrellisGeometry } from "../../src/kernels/trellis/geometry";
@@ -121,6 +123,9 @@ test("explicit single-row representations preserve output bits on any GPU", () =
     const g: TrellisGeometry = { ...down, k, ...(k === 3 ? { blockInterleave: 2 as const } : {}) };
     using c = codes(k === 3 ? [g.cols / 512, g.rows, 48] : [g.rows, g.cols * k / 32]);
     using expected = trellisScatter(xDown, c, scales, g, 13, false, { bits: false, genericBits: false, floatCodebook: false });
+    // Before the alternatives below free buffers already holding these output bits for the next allocation to reuse.
+    using codebook = (k === 3 ? downK3InterleavedCodebookRow : downCodebookRow)(xDown, c, scales, g);
+    same(codebook, expected);
     for (const representation of [{ bits: true, genericBits: true, floatCodebook: false },
       { bits: false, genericBits: false, floatCodebook: true }, { bits: true, genericBits: true, floatCodebook: true }, qualified.scatter]) {
       using actual = trellisScatter(xDown, c, scales, g, 13, false, representation);
@@ -136,16 +141,62 @@ test("explicit single-row representations preserve output bits on any GPU", () =
       using inline = fusedGateUpSwiglu(xUp, gate, up, 13, false);
       using codebook = fusedGateUpSwiglu(xUp, gate, up, 13, true);
       using machine = fusedGateUpSwiglu(xUp, gate, up, 13, qualified.gateUpCodebook);
+      using row = gateUpCodebookRow(xUp, gate, up, "split");
       same(codebook, inline);
       same(machine, inline);
+      same(row, inline);
       continue;
     }
     for (const tail of ["fused", "split"] as const) {
       using expected = fusedGateUpSwigluMixed(xUp, gate, up, 13, tail, false);
       using exact = fusedGateUpSwigluMixed(xUp, gate, up, 13, tail, true);
       using machine = fusedGateUpSwigluMixed(xUp, gate, up, 13, tail, qualified.mixedExactBits);
+      using row = gateUpCodebookRow(xUp, gate, up, tail);
       same(exact, expected);
       same(machine, expected);
+      same(row, expected);
     }
+  }
+}, 60_000);
+
+test("one-row codebook kernels reproduce the shipped one-row kernels on small synthetic shapes", () => {
+  // Gate/up: rows not a multiple of a threadgroup's 32, and more than its threadgroups take at once (SIMD groups
+  // loop over rows). Down: 128 splits of which some are empty and the others hold an odd number of rows (the two-row
+  // steps and their remainder), SIMD groups only partly over blocks, and threadgroups with a SIMD-group pair past
+  // the last columns (512 columns) or half of one (768).
+  let seed = 4099;
+  const codes = (shape: number[]) => {
+    using signed = MlxArray.fromInt32(Int32Array.from({ length: shape.reduce((a, b) => a * b, 1) },
+      () => seed = Math.imul(seed, 1664525) + 1013904223), shape);
+    return signed.astype(Dtype.uint32);
+  };
+  const same = (actual: MlxArray, expected: MlxArray) =>
+    expect(Buffer.from(actual.rawBytes()).equals(Buffer.from(expected.rawBytes()))).toBe(true);
+  const rows = 300, cols = 512, upRows = 5300;
+  using s32 = MlxArray.fromFloat32(Float32Array.from({ length: upRows }, (_, i) => (i % 31 + 1) / 256), [upRows]);
+  using upScales = s32.astype(Dtype.float16);
+  using scales = upScales.slice([0], [rows]);
+  const up: TrellisGeometry = { k: 3, L: 12, T: 256, axis: 1, rows: upRows, cols, inFeatures: cols, outFeatures: upRows };
+  using rawUp = MlxArray.fromFloat32(Float32Array.from({ length: cols }, (_, i) => Math.cos(i * 0.21)), [1, cols]);
+  using xUp = rawUp.astype(Dtype.bfloat16);
+  for (const [kg, ku] of [[2, 2], [3, 3], [4, 4], [2, 3], [4, 3]] as const) {
+    using gc = codes([upRows, cols * kg / 32]), uc = codes([upRows, cols * ku / 32]);
+    const gate = { geometry: { ...up, k: kg }, codes: gc, scales: upScales }, upw = { geometry: { ...up, k: ku }, codes: uc, scales: upScales };
+    for (const tail of kg === ku ? ["split"] as const : ["split", "fused"] as const) {
+      using expected = kg === ku ? fusedGateUpSwiglu(xUp, gate, upw, 13, false) : fusedGateUpSwigluMixed(xUp, gate, upw, 13, tail, false);
+      using actual = gateUpCodebookRow(xUp, gate, upw, tail);
+      same(actual, expected);
+    }
+  }
+  using rawDown = MlxArray.fromFloat32(Float32Array.from({ length: rows }, (_, i) => Math.sin(i * 0.13)), [1, rows]);
+  using xDown = rawDown.astype(Dtype.bfloat16);
+  const none = { bits: false, genericBits: false, floatCodebook: false };
+  for (const [k, outCols] of [[2, cols], [3, cols], [4, cols], [2, 768], [4, 768]] as const) {
+    const g: TrellisGeometry = { k, L: 12, T: 256, axis: 0, rows, cols: outCols, inFeatures: rows, outFeatures: outCols,
+      ...(k === 3 ? { blockInterleave: 2 as const } : {}) };
+    using c = codes(k === 3 ? [outCols / 512, rows, 48] : [rows, outCols * k / 32]);
+    using expected = trellisScatter(xDown, c, scales, g, 13, false, none);
+    using actual = (k === 3 ? downK3InterleavedCodebookRow : downCodebookRow)(xDown, c, scales, g);
+    same(actual, expected);
   }
 }, 60_000);

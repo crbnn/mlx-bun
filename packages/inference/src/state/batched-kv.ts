@@ -6,18 +6,18 @@ import { KVCache } from "./kv";
 import { isPlainKvCache } from "./capabilities";
 import { type AttentionRead, type BatchableCache, type Cache, type CommittedAttentionCache, type Mask, type PaddedPrefillCache, type PrefillPadding } from "../contracts/mlx/cache";
 import { FullPrefillPadding } from "./full-prefill-padding";
-import { AttentionMasks, causalLease, sdpaRead, unmaskedLease, withLease, type MaskLease } from "./attention-read";
+import { AttentionMasks, causalLease, sdpaRead, unmaskedLease, withLease, type DenseRead, type MaskLease } from "./attention-read";
 
 /** Full-attention storage with independently advancing row positions.
  * Speculative rollback changes coverage, without moving the retained KV.
  * Subsequent appends overwrite each row's rejected suffix in place when MLX
  * can donate the buffer. Queue membership is outside this layout.
  *
- * Reads: append through `updateAndFetch`, then the stock fused SDPA. While
- * every row is unpadded and at one position, decode passes no mask and a window
- * the fused causal mask; otherwise both pass the per-row mask (causal, past
- * each row's left padding) for their query count, built once per forward
- * through `masks`. */
+ * Reads: append through `updateAndFetch`, then the stock fused SDPA, a window
+ * through `windowRead` (its source storage's). While every row is unpadded and
+ * at one position, decode passes no mask and a window the fused causal mask;
+ * otherwise both pass the per-row mask (causal, past each row's left padding)
+ * for their query count, built once per forward through `masks`. */
 export class BatchedKVCache implements BatchableCache, PaddedPrefillCache, CommittedAttentionCache {
   keys: MlxArray | null = null;
   values: MlxArray | null = null;
@@ -30,14 +30,16 @@ export class BatchedKVCache implements BatchableCache, PaddedPrefillCache, Commi
   constructor(
     /** The per-forward masks of the model this layout serves. */
     readonly masks = new AttentionMasks(),
+    /** The window read of the storage it was made from (`KVCache.windowRead`). */
+    readonly windowRead: DenseRead = sdpaRead,
   ) {}
 
   appendDecode(k: MlxArray, v: MlxArray): AttentionRead {
-    return this.#read(k, v, this.#mask(1, unmaskedLease));
+    return this.#read(k, v, this.#mask(1, unmaskedLease), sdpaRead);
   }
 
   appendWindow(k: MlxArray, v: MlxArray): AttentionRead {
-    return this.#read(k, v, this.#mask(k.shape[2]!, causalLease));
+    return this.#read(k, v, this.#mask(k.shape[2]!, causalLease), this.windowRead);
   }
 
   /** Fill spans run on this layout (the target layout of a full-attention
@@ -46,10 +48,10 @@ export class BatchedKVCache implements BatchableCache, PaddedPrefillCache, Commi
     return this.appendWindow(k, v);
   }
 
-  #read(k: MlxArray, v: MlxArray, mask: MaskLease): AttentionRead {
+  #read(k: MlxArray, v: MlxArray, mask: MaskLease, read: DenseRead): AttentionRead {
     return withLease(mask, held => {
       const [keys, values] = this.updateAndFetch(k, v);
-      return sdpaRead(keys, values, held);
+      return read(keys, values, held);
     });
   }
 
@@ -92,7 +94,7 @@ export class BatchedKVCache implements BatchableCache, PaddedPrefillCache, Commi
     return this.#rope ??= ops.fromInt32(this.rowOffsets, [this.rowOffsets.length]);
   }
   #positionsChanged(): void { this.#rope?.dispose(); this.#rope = undefined; }
-  makeEmptyBatch(): BatchedKVCache { return new BatchedKVCache(this.masks); }
+  makeEmptyBatch(): BatchedKVCache { return new BatchedKVCache(this.masks, this.windowRead); }
   bytesPerToken(): number {
     if (!this.keys || !this.values) return 0;
     return (this.keys.nbytes + this.values.nbytes) / (this.rowOffsets.length * this.keys.shape[2]!);

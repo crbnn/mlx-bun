@@ -340,8 +340,24 @@ bun --no-env-file test packages/inference/tests/parity/qwen-trellis-parity.test.
 On M1 Max 32 GB, MLX 0.32.2 (`applegpu_g13s`), Bun 1.4.2, the candidate
 matched main `02d723a2875153196f8c6c10bce2daf6f0044655`: 96 complete
 last-position float32 logit vectors and greedy tokens across three prompts;
-three 64-token MTP runs with every target input and speculation counter equal.
-Both MTP runs use the shared gateway with batch capacity one, depth two, plain
+three 64-token MTP runs with every target input and speculation counter equal,
+where the graph's operations are bit-identical to main's. The M1 Max graph's are
+not everywhere: it verifies the MTP runs' two- and three-row windows on kernels that
+reassociate relative to its one-row decode (the width-class decision, KL-gated:
+the matrix-unit Trellis kernels that read code values from a threadgroup
+codebook, with the affine row kernels), so the test teacher-forces main's MTP
+windows and holds each window row to the one-row decode of its position
+instead: 192 rows, mean KL 3.1e-4, largest 1.2e-2, every window's argmax the
+one-row top or tied with it; the one-row decode still selects all 192 of
+main's emitted tokens. Two runs emit main's tokens (one with main's counters),
+the third differs from main's at token 17. The M1 Max graph also runs prompt
+pieces of nine to 256 positions (these prompts' 23 to 32) on its wider layers,
+which reassociate: the test then holds each prompt's last-position logits by KL
+and argmax to the graph's generic blocks' over the same prompt
+(`prefillEmbeddings` at the caches' positions, then the plain head), which are
+main's bytes, and decodes the trajectory and the teacher-forced windows on that
+prompt state, main's to the bit.
+The MTP runs use the shared gateway with batch capacity one, depth two, plain
 KV, greedy sampling and stopping tokens disabled. The reference SHA-256 is
 `15421eb8c691fab7eabeb6e13c9a5c2a2eeed5caf5832f57e3575ef0119780f9`.
 An earlier comparison against main's single-request MTP loop kept all 192
@@ -845,6 +861,9 @@ They borrow input arrays and return an owned, lazy output array.
 | `trellisScatter(x, codes, scales, geometry, variant, useSharedScatterCodebook, representation)` | Axis-0 projection; same input shape and row budget |
 | `fusedGateUpSwiglu(x, gate, up, variant, codebook)` | Matching axis-1 gate/up geometry and bit width; preserves leading input dimensions, with 1..4 total rows |
 | `fusedGateUpSwigluMixed(x, gate, up, variant, tail, exactBits)` | Matching axis-1 geometry with independent bit widths; `tail` is `"fused"` or `"split"` |
+| `gateUpReduceRow(x, gate, up, variant, codebook)` / `gateUpReduceRows(x, gate, up, variant)` | `fusedGateUpSwiglu`'s one-row / 2..4 shared-row kernel alone |
+| `scatterRow` / `balancedScatterRow(x2, codes, scales, geometry, variant, representation)` | `trellisScatter`'s one-row kernel alone; balanced takes 3-bit codes at T 256, the other every other width |
+| `scatterRows(x2, codes, scales, geometry, variant)` / `balancedScatterRows(..., sharedCodebook)` | `trellisScatter`'s 2..4 shared-row kernels alone, the same split |
 | `expandTrellis(codes, scales, geometry, dtype, variant)` | General expansion, and variant 13's vector form |
 | `tiledTrellisPrefill(x, codes, scales, geometry)` | Axis-1 packed prefill, M=5..32 |
 | `splitKTrellisPrefill(x, codes, scales, geometry)` | Axis-0 packed prefill, M=5..8 |
@@ -865,11 +884,13 @@ row-contiguous input. These profiles and numerical
 contracts are unchanged; they are not universal dispatch rules for every shape.
 
 Single-purpose kernels from the same entry point: each runs one algorithm for
-one row form and one code layout, takes no options, and checks its inputs. The
-factored kernels decode each weight's code value y and apply the row scale
-(with 1/147.8) once per output, or fold it into each input row's activation;
-the matrix kernels run on the simdgroup matrix unit. Both reassociate relative
-to variant 6 and agree with it to bf16 precision, not bit for bit.
+one row form and one code layout, takes no options beyond the mixed-width
+SwiGLU tail, and checks its inputs. The factored kernels decode each weight's
+code value y and apply the row scale (with 1/147.8) once per output, or fold it
+into each input row's activation; the matrix kernels run on the simdgroup matrix
+unit. Both reassociate relative to variant 6 and agree with it to bf16
+precision, not bit for bit. The codebook kernels look each code value up in a
+threadgroup table and keep variant 13's one-row output bits.
 
 | Operation | Input and purpose |
 | --- | --- |
@@ -878,17 +899,28 @@ to variant 6 and agree with it to bf16 precision, not bit for bit.
 | `downFactoredRow` / `downFactoredRows(x2, codes, scales, geometry)` | Axis-0 projection over row-major codes; one row / 2..4 rows |
 | `downK3InterleavedFactoredRow` / `downK3InterleavedFactoredRows(...)` | The same over 3-bit block-interleaved codes (T 256, L 12) |
 | `gateUpMma(x, gate, up)` | Gate/up/SwiGLU for 1..8 rows; widths may differ |
+| `gateUpCodebookRow(x, gate, up, tail)` | One-row gate/up/SwiGLU through a threadgroup codebook; widths may differ; the reduce kernels' bits |
+| `downCodebookRow` / `downK3InterleavedCodebookRow(x2, codes, scales, geometry)` | One-row axis-0 projection through a threadgroup codebook, row-major 2/4-bit / 3-bit interleaved codes; the scatter kernels' bits |
 | `downMma` / `downK3InterleavedMma(x2, codes, scales, geometry)` | Axis-0 projection for 1..8 rows, row-major / 3-bit interleaved codes |
+| `gateUpMmaWide(x, gate, up)` | Gate/up/SwiGLU for any number of rows, each decoded fragment feeding several 8-row blocks (threadgroup codebook, activations staged in threadgroup memory); each row the bits `gateUpMma` gives its block of 8 |
+| `downMmaWide` / `downK3InterleavedMmaWide(x2, codes, scales, geometry)` | Axis-0 projection for any number of rows through a threadgroup codebook, each decoded fragment feeding up to three 8-row blocks in the pass the rows plan (`downMmaWidePass` / `downK3InterleavedMmaWidePass` take the pass, `DOWN_ONE_BLOCK` for 1..8 rows); each row the bits `downMma` gives its block of 8 |
+| `gateUpCodebookMma(x, gate, up)` | Gate/up/SwiGLU for 1..8 rows, each code value read from a threadgroup codebook (the M1 Max form); `gateUpMma`'s bits |
 
 Outside the Trellis family, `kernels/quantization/affine{3,4}-{rows,mma}` run
 3- and 4-bit group-64 affine projections for 2..8 rows (shared decode) and
-1..8 rows (matrix unit); `kernels/attention/kvq4-decode` is one-row attention
+1..8 rows (matrix unit), and `affine-split-mma` any number of rows of either width,
+in blocks of 8, on the matrix unit with output tiles sharing each activation
+fragment and K split across the threadgroup (the M1 Max form); `affine-row` is one
+row of either width bit for bit MLX's one-row quantized matmul (its qmv's
+arithmetic, each threadgroup computing the activation chunks once for 64 rows);
+`kernels/attention/kvq4-decode` is one-row attention
 over a 4-bit group-64 KV cache with head dim 256, reading each packed row once
-for all query heads of its KV head; `kernels/attention/multi-query` is causal
+for all query heads of its KV head, the tokens per threadgroup the caller's (512 on
+the M4 Pro, 128 on the M1 Max); `kernels/attention/multi-query` is causal
 flash decoding for 2..8 query rows over a BF16 cache. `kernels/ane` holds the
 Neural Engine programs (`linear`) and the GPU kernels that fill their buffers
 (`fill`). The layers in `layers/trellis-gate-up`, `layers/trellis-down`,
-`layers/affine-verify-linear`, `layers/kv4-decode-attention` and
+`layers/trellis-codebook-gate-up`, `layers/trellis-codebook-down`, `layers/affine-verify-linear`, `layers/kv4-decode-attention` and
 `layers/ane-prefill-split` bind loaded weights to these kernels, one kernel per
 layer.
 
@@ -945,15 +977,18 @@ that carries its own draft head declares it (`GraphCapabilities.nativeDraft`), a
 `DraftProviderRegistry.native(graph)` builds the provider.
 
 `models/qwen38-27b-trellis-m4pro` and `models/qwen38-27b-trellis-m1max` are
-separate written files for `mlx-bun/Qwen3.8-27B-Trellis-3.2bpw`. Each lists all 64
-layers and the literal projection and MLP classes for its row bindings. M4 Pro
-uses factored row kernels, the matrix-unit down at four rows and the matrix-unit
-set at five to eight; M1 Max uses its Reduce and Scatter layers. GPU prompt
-operations are explicit contiguous ranges, retaining each measured kernel's
-existing arithmetic. The M4 Pro file also declares its Neural Engine operations
-for 640..1024, 1025..1536 and 1537..2048 positions. The scheduler indexes that
-range for a one-sequence prompt piece; installation compiles the listed programs
-before loading. The graph has no bridge flag or adapter-dependent fallback.
+separate written files for `mlx-bun/Qwen3.8-27B-Trellis-3.2bpw`. Each names all 64
+layers and the literal projection and MLP forms for its row bindings. M4 Pro
+keeps its factored row and matrix-unit kernels. M1 Max names its threadgroup
+codebook forms at one row, codebook matrix-unit forms at two to eight rows,
+wide matrix-unit forms at nine to 256 rows, and expanded GPU forms above that.
+Its prompt projection forms also retain the measured dequantized matmuls.
+
+The files declare the Neural Engine program ranges directly: M4 Pro uses
+640..1024, 1025..1536 and 1537..2048 positions; M1 Max uses fifteen capacities
+from 256 to 2048, beginning at 224 positions. The scheduler indexes those ranges
+for one-sequence pieces, and installation compiles the listed programs. Each
+file also states its measured verification costs and draft-gate settings.
 
 The loader recommends a file from its artifact, device and module-configuration
 keys. These are defaults: callers can explicitly choose a differently tuned file,
@@ -965,7 +1000,8 @@ The code-authoring rules do not restrict those choices.
 For explicit state and tensor operations, compose the cache legos with
 `composeGraphCaches(graph, configuration)` or use the loader-bound `makeCache`.
 Use `MlxPhaseDispatch` to index prompt ranges and exact-row `decode`, `verify`
-and serving `logits` tables. Known appends use whole-span ranges, preserving
+and serving `logits` tables. Chunk-specific ranges preserve a file's distinct
+chunk and tail operations when it declares them. Known appends use whole-span ranges, preserving
 arbitrarily long accepted grammar spans without imposing the verifier's row cap.
 Scoring heads, media and denoising consumers index their own declared ranges. Each file declares verification costs and known-span operations
 where measured. `examples/qwen3-forward.ts` runs a prompt and a decode through
@@ -1025,6 +1061,12 @@ checks below.
   port, OptiQ's tiled port, the folded and grouped-heads forms). An affine lego
   takes its kernel set at construction (`state/affine-attention`: unfused or
   tiled-causal as the composition names, or the opt-in always-tiled set).
+- `layers/folded-attention.ts`: bf16 causal windows of up to eight queries that MLX's
+  fused SDPA hands to its unfused fallback (more than 32 query vectors per KV head),
+  with GQA folded into rows: that fallback bit for bit, each KV head's keys and values
+  read once instead of once per query head. A bf16 storage reads its windows with the
+  read its composition names (`KVCache.windowRead`: `sdpaRead`, or `foldedWindowRead`),
+  and its row layouts and clones with the same.
 - `kernels/turboquant/`: packing, rotation, codebooks, and packed decode kernels.
 - `kernels/delta/gated.ts`: DeltaNet kernels; recurrent storage and its
   `recurDecode`/`recurWindow` live in `state/ssm.ts`. The training cache
@@ -1191,10 +1233,34 @@ draft source. DFlash 2 (`incoai/Qwen3.8-27B-DFlash2`) drafts a whole block in on
 five tapped target layers, with
 its projections quantized at load to the width the registry passes (4 bits). `bindMlxGateway(model, { provider,
 numDraftTokens, adaptiveDepth })` drafts `numDraftTokens` every round, or with
-`adaptiveDepth` chooses each round's count (up to that) from the decayed
-acceptance rate and the graph's declared `verifyRoundCosts`. A target graph whose residual stream
+`adaptiveDepth` chooses each round's count (up to that, none included) from the decayed
+acceptance at each draft position and the graph's declared `verifyRoundCosts`, weighing a
+round of B sequences by the rows it verifies, B(k + 1), against a step without drafts over
+the same B rows (past the widest measured forward, at that forward's cost per row). The app
+passes `numDraftTokens` as the drafter's own width, or, for an adaptive drafter of a kind
+the graph lists in `adaptiveDraftWidths` (the M1 Max graph: an MTP head, 4), the width
+measured there; the composition's `draftDepth` records the drafter's own. A round
+without drafts is the graph's decode step, pipelined as plain decode is: built from the
+previous step's samples on the device before they are read, its input dropped again
+(`bindRowStepRollback`) if that sample ends its row. A run of such rounds probes at
+intervals that double while drafting keeps not paying: a drafter whose rows draft without
+committing (`preview`: the DFlash 2 block, or the Qwen MTP head's first draft under a round of
+its own cache that it rolls back) proposes from a step's input and the steps that follow compare
+its proposals with their samples; any other drafter verifies one draft. A graph whose composition measured them
+declares the gate's constants per drafter kind (`adaptiveDraftGates`: the prior's acceptance and weight, the decay per
+round and per step without drafts, the margin, the probe intervals and depth; the M1 Max graph, for DFlash 2 and the
+MTP head, counts that keep 95% per observing round and 93% per step without drafts, DFlash 2 probing one draft deep);
+other graphs and kinds keep the gate's defaults. A target graph whose residual stream
 carries a TurboQuant R1 fold declares it on its draft target (`residualBasis`: the R1 seed and the
 final-norm gain the fold moved into the head); the drafter loads unrotated and applies it when a draft group binds.
+A graph whose composition measured them declares the kernels of a drafter's own 4-bit projections per width class
+(`draftProjections`; the M1 Max graph: the affine row kernel at two to three rows, the split matrix-unit kernel from
+four, MLX's quantized matmul at one); the DFlash 2 drafter builds them when its first group binds and
+otherwise keeps its own rule (the simdgroup matrix unit at five to eight rows, MLX's quantized matmul otherwise).
+A graph whose composition measured it declares the target's frequency-ranked draft vocabulary on its draft head
+(`DraftProjection.vocabulary`: the M1 Max graph, the artifact's `mtp/draft_vocab.json`, those rows of its head on the
+head's own layers, gathered when a drafter first reads them); DFlash 2 then projects onto those rows and selects among
+them, the target still verifying over its full head.
 A library caller speculates as the app does: `binding.plan` with `hasDraft`, then
 `binding.methodRequest` and `submit` on `binding.createBatchGroup({ maxBatch: 1 })`
 (`@mlx-bun/training/dspark`'s calibration runs this way).

@@ -49,3 +49,17 @@ export class SubmittedGraphForwardScope extends GraphForwardScope {
     this.capture?.(layer, next);
   }
 }
+
+
+/** Queue a written layer and its cache state together before the next layer
+ * writes shared ANE buffers. Submission remains asynchronous. */
+export class QueuedGraphForwardScope extends GraphForwardScope {
+  constructor(hidden: MlxArray, capture: LayerCapture | null, readonly caches: readonly ForwardCache[]) { super(hidden, capture); }
+  override accept(layer: number, next: MlxArray): void {
+    this.replace(next);
+    const cache = this.caches[layer]!, state = cache.state();
+    try { ops.asyncEvalAll([next, ...state]); }
+    finally { if (cache.stateNeedsDispose) for (const array of state) array.dispose(); }
+    this.capture?.(layer, next);
+  }
+}

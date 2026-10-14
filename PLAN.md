@@ -79,8 +79,9 @@ Binding for every graph file in the tree, held by the architecture gate where me
   alternate operations or name a different one; evidence populates the table, not the API.
   Prompt pieces use contiguous position ranges. Whole known appends and full-sequence heads
   use row ranges without the verifier's cap, preserving accepted grammar spans and scoring
-  sequences as one forward. The scheduler describes the work as N rows and indexes, choosing
-  nothing. The five width names and `widthClass` leave the contract. New kernels change lines in a file, never what the
+  sequences as one forward. A written table may declare one default operation for positive
+  rows beyond its explicit entries. Chunk and tail ranges can differ by phase. The scheduler
+  describes the work as N rows and indexes, choosing nothing. The five width names and `widthClass` leave the contract. New kernels change lines in a file, never what the
   scheduler understands.
 - A layer binds exactly one kernel and decides nothing at call time either. Where a layer today
   picks a kernel by row count, width, compiled form or adapter state, it becomes one class per
@@ -108,9 +109,10 @@ Binding for every graph file in the tree, held by the architecture gate where me
   another machine's file, not another model, not another family. Only a change to a kernel or a
   layer reaches every file that imports it, and that is caught by the type checker and those
   files' own gates, never by regenerating anything.
-- This program changes no numbers: bit identity with main (3ea6ba5e) on every served composition
+- This program changes no numbers: bit identity with main (3743321e) on every served composition
   where main served it (the digests, the parity suites, the captured texts), and performance
-  unchanged (paired, preflight-gated). Performance work is not this program.
+  checked with a short scoped regression run (paired, preflight-gated). Performance work
+  is not this program.
 
 ### Items
 
@@ -123,7 +125,8 @@ matrix runs once at the end. Agents do the work; Josh reviews the plan, I review
       `verify` and serving `logits` as tables from exact row count to operation, up to the
       scheduler's cap; whole `appendKnown` spans use declared row ranges; `prompt` as an ordered
       list of `{ from, to, operation }` position ranges for one-sequence pieces (replacing `prefillChunk.gpu`, `prefillChunk.ane` and `prefillTail`), plus
-      the multi-sequence chunk operation. `phase-dispatch.ts` indexes by rows and by range.
+      the multi-sequence operations. A graph may declare distinct chunk ranges where its
+      chunk and tail arithmetic differs. `phase-dispatch.ts` indexes by rows and by range.
       `widthClass`, `MlxWidthClass`, `byWidth`, `atEveryWidth` go. Adapters: the delta that
       `QuantizedLinear` applies inside its forward today becomes a layer applied after any
       projection the graph names as a target (it adds to the projection's output, so the one-kernel
@@ -147,8 +150,9 @@ matrix runs once at the end. Agents do the work; Josh reviews the plan, I review
       the artifact (bf16, kv4, config; default and 128-token chunks; one and four rows; the long
       prompt), the identity test against the generic graph at maxDiff 0, the five captured texts
       identical, and the real-weight parity suite at its recorded numbers.
-- [ ] **G3. The M1 Max file.** `models/qwen/qwen38-27b-trellis-m1max.ts` in the same form with its
-      Reduce and Scatter layers and no Neural Engine entries. Exit: the identity test; its digests
+- [ ] **G3. The M1 Max file.** `models/qwen/qwen38-27b-trellis-m1max.ts` in the same form,
+      preserving main's codebook and wide matrix-unit layers, dequantized prompt projections,
+      fifteen Neural Engine program ranges, cache reads and measured draft settings. Exit: the identity test; its digests
       on the M1 Max when that machine is clean.
 - [ ] **G4. The Gemma 4 files.** `models/gemma4/generated/gemma4-{e4b,12b,26b}.ts` rewritten as files
       under `models/gemma4/` (the directory name goes with the scripts): every layer with its sliding
@@ -193,10 +197,12 @@ matrix runs once at the end. Agents do the work; Josh reviews the plan, I review
       composition"; the paragraph that describes the scripts goes; the ownership table row for
       `models/` says files. `packages/inference/README.md` likewise. This section closes and the
       composition refactor's paragraph is corrected ("built at load" becomes "selected at load").
-- [ ] **G10. The full gate and the merge.** Once, against main 3ea6ba5e: the app-path digest
+- [ ] **G10. The full gate and the merge.** Once, against main 3743321e: the app-path digest
       matrix on every artifact in the served set, the parity suites, the captured texts on the M4
-      Pro, the identity tests on both machines, the paired serve check on the M4 Pro and on the M1
-      Max when clean. Then `refactor/graph-files` merges to `main` once.
+      Pro and the identity tests on both machines. Performance qualification for this refactor
+      is a short scoped paired regression check of the affected graphs against latest main,
+      on a clean machine. Create one final merge request from `refactor/graph-files` to `main`;
+      Josh decides when it merges.
 
 ## Composition refactor
 
@@ -228,15 +234,21 @@ synthetic digests, the real-weight parity suites, `packages/inference/scripts/di
 - [ ] Synthetic digests are recorded for `applegpu_g16s` and `applegpu_g13s`; the cases skip on
       any other host until recorded there (`scripts/synthetic-digests.ts record`).
 
-Facts recorded for the program after the merge, not planned here: on the M1 Max a two-row verify
-round costs 1.89 plain decode steps (1.30 on the M4 Pro) and five or more rows cost 12 to 13
-because the generic Trellis MLP takes the prefill kernels there; DFlash 2 at depth 2 beats plain
-decode by about 12% on that chip; the adaptive gate never drafts fewer than one token; its
-per-row verify costs ignore how many requests are batched; the M1 Max composition has no Neural
-Engine bridge and prefills at 121 tok/s against 200 on the M4 Pro; the paired check's band is
-narrower than session drift for sub-percent decode differences (the clean M1 Max run is the null);
-the TurboQuant fused decode kernel covers head dimensions 64, 128, 256 and 512 and 96 decodes on
-the plain path.
+Facts recorded for the program after the merge, not planned here: on the M1 Max a verify round
+of two rows costs 1.77 plain decode steps and of eight rows 2.05 (1.30 and 1.94 on the M4 Pro);
+that graph runs operations of nine to 256 rows on its wider layers and more on the generic
+blocks, and one-sequence prompt pieces of 224 to 2048 positions on the Neural Engine split (mean
+KL against the GPU alone 1.2e-4 to 1.9e-3), prefilling 1k- and 8k-token prompts at 207 and 213
+tok/s (200 on the M4 Pro). With the gate settings the graph declares, DFlash 2 adaptive decodes
+30.5 tok/s greedy, 28.5 under Qwen's instruct sampling and 24.5 under its thinking sampling
+against plain decode's 19.5, 19.1 and 19.1, the MTP head 26.7, 24.8 and 22.4 (in-process serve,
+192 tokens, eight prompts, sampled modes over three seeds); two and four concurrent greedy
+requests decode 42.6 and 47.5 to 48.3 tok/s in aggregate with DFlash 2 against plain's 24.2 and
+36.2. Open: on short creative text (35 to 80 tokens) both drafters still trail plain decode, by
+up to 16% under instruct sampling and 3% greedy, in drafted rounds the text does not repay. The
+paired check's band is narrower than session drift for sub-percent decode differences (the clean
+M1 Max run is the null); the TurboQuant fused decode kernel covers head dimensions 64, 128, 256
+and 512 and 96 decodes on the plain path.
 
 The measurements of record before the merge. M1 Max (2026-10-12, clean machine, `perf.yml`):
 Trellis default decode 14.1 → 14.0 tok/s (1.000 [0.995, 1.006]), e4b default 64.4 → 64.3 (0.998
@@ -274,7 +286,8 @@ while that machine is in use (swap above 512 MB).
   alone do not close this. Done so far: the
   [generated Gemma4 graph test](packages/inference/tests/parity/gemma4-generated.test.ts)
   passed on e4b and 12B (identity within this tree; 26B-A4B not run). Packed Trellis now matches main in 96 full greedy logit vectors, three shared
-  B1/depth-two MTP runs, and the 18-case plain-KV runtime grid with restored
+  B1/depth-two MTP runs (on the M1 Max, whose verify windows reassociate, by KL and greedy
+  agreement), and the 18-case plain-KV runtime grid with restored
   continuation ([evidence](packages/inference/README.md#packed-qwen-trellis-parity)).
   Open: published references and broader Trellis shapes;
   [runtime-oracle](packages/inference/tests/parity/runtime-oracle.test.ts) references

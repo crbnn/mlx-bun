@@ -220,26 +220,51 @@ export class QwenMtpRows {
     return this.#drafts;
   }
 
+  /** The first proposal `draftDevice` would make from `pending` ([B, 1], owned, left on the device), drafted under a
+   *  round of the head's own cache that rolls back, so the rows' state is unchanged (`DraftRowGroup.preview`). One
+   *  position whatever `depth` asks: each further one costs another head step, and one is what a verify round's
+   *  probe drafts. Null at depth 0. */
+  preview(pending: readonly number[], depth: number, steps: readonly number[]): MlxArray | null {
+    if (depth === 0) return null;
+    const B = pending.length;
+    this.#cache.specRoundBegin();
+    try {
+      using packed = this.#proposals(pending, 1, steps); // [B]
+      return ops.reshape(packed, [B, 1]);
+    } finally { this.#cache.specRoundRollback(0); }
+  }
+
   /** Build the draft chain. Returns the packed device tokens [depth * B]
    *  (position-major), or the empty proposals at depth 0. */
   #chain(pending: readonly number[], depth: number, steps: readonly number[]): MlxArray | number[][] {
     const B = pending.length;
+    this.#cache.specRoundBegin();
+    // A zero-proposal round still processes the pending target token. Keep
+    // its companion KV aligned so a later round can resume speculation.
+    if (depth === 0) {
+      using ids = ops.fromInt32([...pending], [B, 1]);
+      using embeds = this.target.embed(ids);
+      this.module.decode[B]!(embeds, this.#hidden!, this.#cache).dispose();
+      this.#drafts = Array.from({ length: B }, () => []);
+      this.#depth = 0;
+      this.#hidden!.dispose(); this.#hidden = null;
+      return this.#drafts;
+    }
+    const packed = this.#proposals(pending, depth, steps);
+    this.#depth = depth;
+    this.#hidden!.dispose(); this.#hidden = null;
+    return packed;
+  }
+
+  /** The draft steps from each row's pending token and the true hidden before it, appended to the head's cache:
+   *  the packed device tokens [depth * B] (position-major), owned. Changes no other state. */
+  #proposals(pending: readonly number[], depth: number, steps: readonly number[]): MlxArray {
+    const B = pending.length;
     const tokens: MlxArray[] = [];
     let ids: MlxArray | null = ops.fromInt32([...pending], [B, 1]);
     let chained: MlxArray | null = null;
-    this.#cache.specRoundBegin();
     try {
-      // A zero-proposal round still processes the pending target token. Keep
-      // its companion KV aligned so a later round can resume speculation.
-      if (depth === 0) {
-        using embeds = this.target.embed(ids!);
-        this.module.decode[(B)]!(embeds, this.#hidden!, this.#cache).dispose();
-        this.#drafts = Array.from({ length: B }, () => []);
-        this.#depth = 0;
-        this.#hidden!.dispose(); this.#hidden = null;
-        return this.#drafts;
-      }
-      const width = (B), select = this.#select[width]!;
+      const width = B, select = this.#select[width]!;
       for (let position = 0; position < depth; position++) {
         using embeds = this.target.embed(ids!);
         const output = this.module.decode[width]!(embeds, chained ?? this.#hidden!, this.#cache);
@@ -248,10 +273,7 @@ export class QwenMtpRows {
         tokens.push(token);
         ids!.dispose(); ids = ops.reshape(token, [B, 1]);
       }
-      const packed = ops.concatAxis(tokens, 0);
-      this.#depth = depth;
-      this.#hidden!.dispose(); this.#hidden = null;
-      return packed;
+      return ops.concatAxis(tokens, 0);
     } finally {
       ids?.dispose(); chained?.dispose();
       for (const token of tokens) token.dispose();

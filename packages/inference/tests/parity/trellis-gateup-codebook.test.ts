@@ -6,7 +6,10 @@ import { Weights, loadModelConfig } from "@mlx-bun/inference/artifacts";
 import { Qwen35Model } from "@mlx-bun/inference/models/qwen3_5";
 import { resolveComposition } from "@mlx-bun/inference";
 import { TrellisLinear } from "@mlx-bun/inference/layers";
-import { TRELLIS_MATVEC_MAX_M, fusedGateUpSwiglu, fusedGateUpSwigluMixed, trellisScatter, type ScatterRepresentation } from "@mlx-bun/inference/kernels/trellis";
+import {
+  TRELLIS_MATVEC_MAX_M, downCodebookRow, downK3InterleavedCodebookRow, fusedGateUpSwiglu, fusedGateUpSwigluMixed, gateUpCodebookRow,
+  trellisScatter, type ScatterRepresentation,
+} from "@mlx-bun/inference/kernels/trellis";
 import { gateUpCodebookEligible } from "../../src/kernels/trellis/gate-up";
 import { scatterBitsEligible, scatterFloatCodebookEligible } from "../../src/kernels/trellis/scatter";
 import type { ReadPhase } from "../../src/models/graph";
@@ -21,12 +24,13 @@ import { phaseLogits } from "../models/phase-forward";
 const artifact = process.env.MLX_BUN_TEST_TRELLIS_MODEL;
 const digest = (a: MlxArray) => createHash("sha256").update(a.rawBytesView()).digest("hex");
 
-type Mode = "inline" | "codebook" | "combined" | "generic" | "scatter-codebook";
-interface Representation { codebook: boolean; mixedBits: boolean; scatter: ScatterRepresentation }
+type Mode = "inline" | "codebook" | "combined" | "generic" | "scatter-codebook" | "row-codebook";
+/** `rowKernels`: one row runs the threadgroup-codebook row kernels (the M1 Max graph's decode.one). */
+interface Representation { codebook: boolean; mixedBits: boolean; scatter: ScatterRepresentation; rowKernels: boolean }
 const representation = (mode: Mode): Representation => {
   const bits = mode === "combined" || mode === "generic" || mode === "scatter-codebook";
-  return { codebook: mode !== "inline", mixedBits: bits, scatter: { bits,
-    genericBits: mode === "generic" || mode === "scatter-codebook", floatCodebook: mode === "scatter-codebook" } };
+  return { codebook: mode !== "inline", mixedBits: bits, scatter: { bits, genericBits: mode === "generic" || mode === "scatter-codebook",
+    floatCodebook: mode === "scatter-codebook" }, rowKernels: mode === "row-codebook" };
 };
 
 /** The MLP step of the packed graph that serves this artifact on `applegpu_g13s`
@@ -40,10 +44,12 @@ function representedMlp(mlp: { gate: unknown; up: unknown; down: unknown; forwar
     forward(x: MlxArray, phase: ReadPhase, width: number): MlxArray {
       const lead = x.shape.slice(0, -1), M = lead.reduce((a, b) => a * b, 1);
       if (M > TRELLIS_MATVEC_MAX_M) return mlp.forward(x, phase, width);
-      using mid = gate.geometry.k === up.geometry.k ? fusedGateUpSwiglu(x, gate, up, 13, r.codebook)
-        : fusedGateUpSwigluMixed(x, gate, up, 13, "split", r.mixedBits);
+      const row = r.rowKernels && M === 1;
+      using mid = row ? gateUpCodebookRow(x, gate, up, "split") : gate.geometry.k === up.geometry.k
+        ? fusedGateUpSwiglu(x, gate, up, 13, r.codebook) : fusedGateUpSwigluMixed(x, gate, up, 13, "split", r.mixedBits);
       using rows = ops.reshape(mid, [M, down.geometry.inFeatures]);
-      using y = trellisScatter(rows, down.codes, down.scales, down.geometry, 13, down.useSharedScatterCodebook, r.scatter);
+      using y = row ? (down.geometry.blockInterleave ? downK3InterleavedCodebookRow : downCodebookRow)(rows, down.codes, down.scales, down.geometry)
+        : trellisScatter(rows, down.codes, down.scales, down.geometry, 13, down.useSharedScatterCodebook, r.scatter);
       return ops.reshape(y, [...lead, down.geometry.outFeatures]);
     },
   };
@@ -113,12 +119,13 @@ test.skipIf(!artifact || deviceArchitecture() !== "applegpu_g13s")(
         const prompt = Array.from({ length }, (_, i) => 100 + i * 7);
         const baseline = run("inline", prompt), codebook = run("codebook", prompt), combined = run("combined", prompt);
         const generic = run("generic", prompt);
-        const scatterCodebook = run("scatter-codebook", prompt);
+        const scatterCodebook = run("scatter-codebook", prompt), rowCodebook = run("row-codebook", prompt);
         expect(codebook).toEqual(baseline);
         expect(combined).toEqual(baseline);
         expect(generic).toEqual(baseline);
         expect(scatterCodebook).toEqual(baseline);
-        console.log(`[trellis-codebook+bits] prefix=${length}: 17 full logit tensors, all live state and tokens match across five modes`);
+        expect(rowCodebook).toEqual(baseline);
+        console.log(`[trellis-codebook+bits] prefix=${length}: 17 full logit tensors, all live state and tokens match across six modes`);
       }
     } finally {
       model.layers.forEach((layer, i) => { (layer as unknown as { mlp: unknown }).mlp = loaded[i]; });
