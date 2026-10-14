@@ -118,8 +118,12 @@ export const QWEN38_COMPOSITIONS: Readonly<Record<string, Qwen38Composition>> = 
     // Measured 2026-10-13 on this graph and artifact, with the one-row codebook kernels' bit-field reads, the split-K
     // affine kernels at four to eight rows and the drafter's own kernels this graph declares: scripts/bench-mtp.ts,
     // the DFlash 2 drafter at depths 1..7 against the depth-0 plain arm (54.5-55.9 ms per token), bf16 KV, greedy,
-    // two prompts, 128 tokens, four sessions of two repetitions, whose ratios span under 2.5% at every width.
-    verifyRoundCosts: { host: "M1 Max 32 GB", costs: [[1, 1], [2, 2.01], [3, 2.42], [4, 2.56], [5, 2.69], [6, 2.78], [7, 2.87], [8, 2.96]] },
+    // two prompts, 128 tokens, four sessions of two repetitions, whose ratios span under 2.5% at every width. Rounds
+    // of several sequences (2026-10-13, the integration head): in-process serve, DFlash 2 at fixed depths over two and
+    // four concurrent greedy requests, the round time while every request was active over a one-row plain step
+    // (53.4 ms): 16 rows 3.94 (four sequences of four) and 4.08 (two of eight), 32 rows 7.30 (four of eight).
+    verifyRoundCosts: { host: "M1 Max 32 GB", costs: [[1, 1], [2, 2.01], [3, 2.42], [4, 2.56], [5, 2.69], [6, 2.78], [7, 2.87], [8, 2.96],
+      [16, 4.01], [32, 7.3]] },
     // Measured 2026-10-13 on this graph and artifact: scripts/bench-mtp.ts, the MTP head adaptive up to 2 (its
     // trained block) 18.0 tok/s, up to 4 19.9, up to 7 19.1 (fixed depth 3 18.6), greedy, three prompts, 128 tokens.
     adaptiveDraftWidths: [["mtp", 4]],

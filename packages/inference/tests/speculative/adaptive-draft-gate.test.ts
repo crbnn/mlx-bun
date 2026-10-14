@@ -88,4 +88,24 @@ describe("adaptive speculative draft gate", () => {
     expect(gate.acceptance(1)).toBeCloseTo(0.9, 9);
     expect(gate.choose(7)).toBe(7);
   });
+
+  test("weighs a group's round by the rows its forward carries against a step without drafts over the same rows", () => {
+    // A machine whose one-row step is cheap and whose wider forwards cost little more per row.
+    const wide = new Map([[1, 1], [2, 2], [4, 2.5], [8, 3], [16, 3.4], [32, 6]]);
+    const gate = new AdaptiveDraftGate(wide, { maxDraftTokens: 7 });
+    for (let i = 0; i < 24; i++) gate.observe(3, 1);
+    // One sequence: the same rate as before rows were counted.
+    expect(gate.expectedRate(3, 1)).toBeCloseTo(gate.expectedRate(3), 12);
+    // Four sequences drafting 3 verify 16 rows against a 4-row step: (1 + a1 + ...) * 2.5 / 3.4.
+    let survive = 1, tokens = 1;
+    for (let position = 1; position <= 3; position++) { survive *= gate.acceptance(position); tokens += survive; }
+    expect(gate.expectedRate(3, 4)).toBeCloseTo(tokens * 2.5 / 3.4, 12);
+    // Drafting pays at four sequences where it does not at one.
+    expect(gate.choose(7, 1)).toBe(0);
+    expect(gate.choose(7, 4)).toBeGreaterThan(0);
+    // Past the widest measured forward a row costs what one of that forward does: 64 rows, 6 * 64 / 32.
+    expect(gate.expectedRate(7, 8)).toBeCloseTo((1 + [1, 2, 3, 4, 5, 6, 7].reduce((sum, k) => {
+      let p = 1; for (let position = 1; position <= k; position++) p *= gate.acceptance(position); return sum + p;
+    }, 0)) * 3 / 12, 12);
+  });
 });

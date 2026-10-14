@@ -1268,7 +1268,9 @@ five tapped target layers, with
 its projections quantized at load to the width the registry passes (4 bits). `bindMlxGateway(model, { provider,
 numDraftTokens, adaptiveDepth })` drafts `numDraftTokens` every round, or with
 `adaptiveDepth` chooses each round's count (up to that, none included) from the decayed
-acceptance at each draft position and the graph's declared `verifyRoundCosts`. The app
+acceptance at each draft position and the graph's declared `verifyRoundCosts`, weighing a
+round of B sequences by the rows it verifies, B(k + 1), against a step without drafts over
+the same B rows (past the widest measured forward, at that forward's cost per row). The app
 passes `numDraftTokens` as the drafter's own width, or, for an adaptive drafter of a kind
 the graph lists in `adaptiveDraftWidths` (the M1 Max graph: an MTP head, 4), the width
 measured there; the composition's `draftDepth` records the drafter's own. A round

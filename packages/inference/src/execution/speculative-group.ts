@@ -407,7 +407,7 @@ class SpeculativeGroup implements MlxGroupedMethod {
     const cap = Math.min(this.depth, Math.max(...rows.map(row => row.req.maxTokens - row.generated)));
     // A round without drafts verifies the pending token alone (one plain decode step) and still advances the
     // drafter's context through its commit; rows that sample on the device pipeline such rounds as plain decode does.
-    let depth = this.#gate && cap > 0 ? this.#gate.next(cap) : cap;
+    let depth = this.#gate && cap > 0 ? this.#gate.next(cap, rows.length) : cap;
     // A probe from a drafter that can propose without committing is compared with the samples instead of verified.
     const shadow = depth > 0 && this.#gate?.probing && this.#draft!.preview && !this.#shadow ? cap : 0;
     if ((depth === 0 || shadow) && this.#pipelinesZero(rows)) return this.#zeroStep(rows, work, shadow);
