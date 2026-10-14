@@ -140,6 +140,7 @@ describe("the Qwen 3.5 table", () => {
     for (const fusedSdpa of [true, false])
       expect(select(on(M4_PRO, qwen, { kv: { override: 4, fusedSdpa } }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     expect(select(on(M4_PRO, qwen, {}))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
+
     expect(select(on(M4_PRO, qwen, { maxRows: 1, draft: { numDraftTokens: 3 } }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     expect(select({ ...on(M4_PRO, qwen, { draft: { numDraftTokens: 7, adaptive: true } }), prefillChunkTokens: 512 }))
       .toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
@@ -161,6 +162,7 @@ describe("the Qwen 3.5 table", () => {
     expect(select(on(M1_MAX, qwen, { kv: { override: 4 }, maxRows: 16 }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
     expect(select(on(M1_MAX, qwen, { kv: { turboQuant: { kBits: 8, vBits: 3 } } }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
     expect(select(on("applegpu_g15s", qwen))).toBe("qwen3.5-wide-m3");
+
   });
 
   test("another Qwen 3.5 artifact gets the generic graph on every device; the table fingerprints with the Trellis graph fingerprint", () => {
