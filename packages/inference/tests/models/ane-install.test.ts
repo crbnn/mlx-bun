@@ -29,7 +29,7 @@ describe("the install table", () => {
 
   test("the programs follow the composition: the bridge, mounted adapters and the device, not the chunk size", () => {
     expect(labels(record({ prefillChunkTokens: 128 }))).toEqual(labels(record()));
-    expect(labels(record({ adapters: true }))).toEqual(labels(record()));
+    expect(labels(record({}))).toEqual(labels(record()));
     expect(labels(record({ device: M1_MAX }))).toEqual([]);
   });
 

@@ -1,3 +1,6 @@
+import type { TestGraph } from "../models/test-composition";
+import { testGraph } from "../models/test-composition";
+import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
 // The TurboQuant head dimensions beyond the reference's four (signs.ts,
 // scripts/gen-turboquant-signs.ts), gated where they sit beside the existing
 // ones. The rotation is orthogonal at every generated size (its inverse
@@ -72,7 +75,7 @@ test("the 3-bit value round trip keeps the Lloyd-Max distortion of the existing 
 });
 
 /** A llama-shaped graph with head dimension `d` over synthetic 4-bit weights. */
-function graph(d: number, kv: KvStorageScheme): UniversalDenseModel {
+function graph(d: number, kv: KvStorageScheme): TestGraph<UniversalDenseModel> {
   const tensors = new Map<string, MlxArray>();
   let seed = 1;
   const linear = (path: string, rows: number, cols: number, scale = 0.06) => {
@@ -115,7 +118,7 @@ function graph(d: number, kv: KvStorageScheme): UniversalDenseModel {
       globalHeadDim: d, intermediateSize: INTER, rmsNormEps: 1e-6, vocabSize: VOCAB,
       ropeParameters: { full_attention: { ropeTheta: 10000 } }, tieWordEmbeddings: false },
   } as unknown as ModelConfig;
-  return new UniversalDenseModel(weights, config, testComposition(kv));
+  return testGraph(new UniversalDenseModel(weights, config, undefined, phaseRowLimit(testComposition(kv))), testComposition(kv));
 }
 
 /** Logits [1, FORCED, V] of the teacher-forced decode after the prompt, under `kv`. */

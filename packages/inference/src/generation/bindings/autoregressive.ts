@@ -1,3 +1,4 @@
+import { pagedDecodeCompiles } from "../../state/paged/cache";
 import type { GraphDescriptor } from "../../contracts/portable/graph";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { Cache } from "../../contracts/mlx/cache";
@@ -65,7 +66,7 @@ export interface MlxAutoregressiveBinding {
 export function bindMlxAutoregressiveGraph(model: MlxTokenGraph): MlxAutoregressiveBinding {
   const runtime = runtimeConfig();
   const facts = model.composition ?? COMPOSITION_DEFAULTS;
-  const compiledOn = facts.compiledDecode;
+  const compiledOn = (!model.composition?.pagedKv || pagedDecodeCompiles(model.composition.pagedKv, model.composition.kv));
   return {
     runtime,
     prefillPolicy: resolveMlxPrefillPolicy(model, runtime),
@@ -79,7 +80,9 @@ export function bindMlxAutoregressiveGraph(model: MlxTokenGraph): MlxAutoregress
     pagedKv: facts.pagedKv ?? null, prefillTailSplit: facts.prefillTailSplit, grammarJump: facts.grammarJump,
     ...(model.knownSpans ? { knownSpans: model.knownSpans } : {}),
     makeCache: model.makeCache.bind(model),
-    prefillEmbeddings: model.prefillEmbeddings?.bind(model),
+    prefillEmbeddings: model.embeddingPrompt ? (embeddings, caches, imageMask, ids, multimodalMask, rows) =>
+      model.embeddingPrompt!.find(range => rows >= range.from && rows <= range.to)!.operation(embeddings, caches, imageMask, ids, multimodalMask)
+      : model.prefillEmbeddings?.bind(model),
     createDecode(policy) {
       // Only a graph that declares a compiled step has one, and only a
       // composition whose storage the step drives keeps it on. Adapters would

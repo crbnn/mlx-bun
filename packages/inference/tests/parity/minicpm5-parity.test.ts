@@ -1,3 +1,5 @@
+import { testGraph } from "../models/test-composition";
+import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
 // MiniCPM5 greedy decode parity against an external mlx-lm reference: 100 full
 // f32 logit vectors and greedy IDs through the direct model forward, batch one,
 // plain KV. The model, reference and oracle stay outside this repository; this
@@ -146,7 +148,7 @@ test.skipIf(!inputs)("MiniCPM5: 100 greedy steps match the external reference bi
   const greedy: number[] = [];
   let cache: Array<{ dispose(): void }> = [], valuesCompared = 0;
   try {
-    const model = new MiniCPM5Model(weights, config, resolveComposition(config));
+    const model = testGraph(new MiniCPM5Model(weights, config, phaseRowLimit(resolveComposition(config))), resolveComposition(config));
     const layers = model.makeCache();
     cache = layers;
     // Plain KV per layer from the model itself: no artifact loader applies kv_config.json.

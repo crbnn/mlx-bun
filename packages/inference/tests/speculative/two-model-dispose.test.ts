@@ -1,3 +1,4 @@
+import type { TestGraph } from "../models/test-composition";
 // A two-model draft provider owns its draft graph and the weights it opened:
 // its dispose releases what the graph built at construction (here a llama3
 // scaled rope's frequency table), then the weights. A synthetic checkpoint
@@ -58,7 +59,7 @@ test("a two-model provider's dispose releases its graph's constants, then its we
   const provider = await TwoModelProvider.load(dir);
   const graph = provider.model;
   expect(graph).toBeInstanceOf(UniversalDenseModel);
-  const freqs = (graph as UniversalDenseModel).sharedRope.freqs;
+  const freqs = (graph as TestGraph<UniversalDenseModel>).sharedRope.freqs;
   expect(freqs).not.toBeNull();
   // The provider's weights are private; the order is read off both disposals.
   const weights = (provider as unknown as { weights: { dispose(): void } }).weights;

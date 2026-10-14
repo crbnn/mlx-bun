@@ -1,3 +1,6 @@
+import { testGraph } from "./test-composition";
+import type { TestGraph } from "./test-composition";
+import { phaseRowLimit } from "../../src/models/graph";
 import { MlxPhaseDispatch } from "../../src/generation/phase-dispatch";
 // The generated M4 Pro graph (src/models/qwen/qwen38-27b-trellis-m4pro.ts, an entire graph built from the
 // composition) on small synthetic weights laid out by the generated quant table: 48 DeltaNet and 16 attention layers
@@ -131,9 +134,8 @@ function artifact(): { weights: Weights; config: ModelConfig } {
 
 const composition = (overrides: Partial<Composition> = {}): Composition => Object.freeze<Composition>({
   device: "applegpu_g16s", kv: { kind: "bf16" }, pagedKv: null, draftDepth: { adaptive: true, max: 7 },
-  prefillChunkTokens: CHUNK, adapters: false, maxRows: 8, packedMixedMlp: true,
-  vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
-  grammarJump: false, greedyDraft: false, compiledGeglu: true, compiledSwiglu: true, ...overrides,
+  prefillChunkTokens: CHUNK, maxRows: 8, vectorGreedySampling: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
+  grammarJump: false, greedyDraft: false, ...overrides,
 });
 /** The M4 Pro composition's KV scheme (`--kv-quant 4`, fused SDPA unset). */
 const KV4: KvStorageScheme = Object.freeze({ kind: "affine", bits: 4, groupSize: 64, kernels: "unfused" });
@@ -256,7 +258,7 @@ describe("composition", () => {
 
 describe("the M4 Pro graph against the generic Qwen 3.5 graph where both run the generic blocks (bf16 KV)", () => {
   test("a known grammar span beyond the verify cap retains one full committed forward",()=>{
-    const current=graph(),{weights,config}=source(),generic=new Qwen35Model(weights,config,composition());
+    const current=graph(),{weights,config}=source(),generic=testGraph(new Qwen35Model(weights, config, phaseRowLimit(composition())), composition());
     const committed=(input:MlxArray,cache:Cache[]):MlxArray=>{
       let hidden=generic.embed.encode(input);
       try {
@@ -278,7 +280,7 @@ describe("the M4 Pro graph against the generic Qwen 3.5 graph where both run the
   },180_000);
   test("a whole prompt chunk, a prompt tail and a window wider than eight rows", () => {
     const current = graph(), { weights, config } = source();
-    const generic = new Qwen35Model(weights, config, composition());
+    const generic = testGraph(new Qwen35Model(weights, config, phaseRowLimit(composition())), composition());
     const mine = current.makeCache(), theirs = generic.makeCache();
     try {
       {
@@ -303,7 +305,7 @@ describe("the M4 Pro graph against the generic Qwen 3.5 graph where both run the
   }, 180_000);
 
   test("a request adapter overlays the written projection without rebuilding phase bindings", () => {
-    const current=graph(),{weights,config}=source(),generic=new Qwen35Model(weights,config,composition());
+    const current=graph(),{weights,config}=source(),generic=testGraph(new Qwen35Model(weights, config, phaseRowLimit(composition())), composition());
     const path=`${PREFIX}.layers.0.linear_attn.in_proj_z`;
     const left=current.loraTargets().get(path)!,right=generic.loraTargets().get(path)!;
     const adapter={a:tensor(noise(HIDDEN*2,99,0.02),[HIDDEN,2],Dtype.float32),b:tensor(noise(2*VALUE_DIM,101,0.02),[2,VALUE_DIM],Dtype.float32),rank:2,scale:0.5};

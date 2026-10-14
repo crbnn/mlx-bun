@@ -1,5 +1,4 @@
-import { bindGraphCaches } from "../cache-composition";
-import type { MlxCacheLayer, MlxMixedRange } from "../../contracts/mlx/graph";
+import type { MlxCacheLayer, MlxMixedRange, MlxSequenceRange } from "../../contracts/mlx/graph";
 // UniversalDense — the Tier-0 config-driven dense llama-family module
 // (`02d723a:docs/design/generic-model-support.md` §4.1). One module, shaped exactly
 // like qwen3.ts, with every arch delta selected by the UniversalArgs
@@ -21,7 +20,6 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { logitSoftcap } from "../../kernels/logits";
 import { disposing } from "../../layers/helpers";
 import { composedFullAttentionCache, composedSlidingAttentionCache } from "../../state/bf16-first-kv";
-import type { Composition } from "../../contracts/portable/composition";
 import { AttentionMasks } from "../../state/attention-read";
 import { softcapAttentionReads } from "../../state/softcap-attention";
 import { denseTurboQuantKernels } from "../../state/turboquant-attention";
@@ -29,9 +27,12 @@ import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import type { MlxRowTable, MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPromptRange, MlxTokenPhases, MlxVerifyForward } from "../../contracts/mlx/graph";
 import { ORDINARY_VERIFICATION, declareGraph } from "../capabilities";
-import { phaseRowLimit,  rowTable, type ReadPhase  } from "../graph";
-import type { QuantizedLinear } from "../../layers/quantized-linear";
+import { DEFAULT_PHASE_ROWS, rowTable, rowTableFrom, type ReadPhase   } from "../graph";
+import { QuantizedLinear, QuantizedLinearPlain } from "../../layers/quantized-linear";
 import { TrellisLinear } from "../../layers/trellis-linear";
+import { Dtype } from "@mlx-bun/mlx/ffi";
+import { TrellisReducePrompt, TrellisScatterPrompt, TrellisTiledPrompt, TrellisSplitKPrompt, TrellisExpandReducePrompt, TrellisExpandScatterPrompt, type RowProjection } from "../../layers/trellis-prompt";
+import { tiledTrellisPrefillEligible, splitKTrellisPrefillEligible } from "../../kernels/trellis/index";
 import { RMSNorm } from "../../layers/normalization";
 import { type Cache } from "../../contracts/mlx/cache";
 import { genericArgsFor, universalCacheWindows, universalMaskRecipe, type UniversalArgs } from "./archs";
@@ -57,8 +58,71 @@ function softcapRead(softcap: number, window: number | null, arrayMasks: boolean
  * affine-quantized (a `.scales` tensor and no Trellis entry in the quant
  * table): a `QuantizedLinear`, the only flavor adapters mount on. Read from the
  * artifact at load, as `loadLinear` reads it. */
-function adapterTarget(weights: Weights, config: ModelConfig, path: string, linear: AnyLinear): QuantizedLinear | null {
-  return !TrellisLinear.isTrellis(config, path) && weights.has(`${path}.scales`) ? linear as QuantizedLinear : null;
+function adapterTarget(_weights: Weights, _config: ModelConfig, _path: string, linear: AnyLinear): QuantizedLinear | TrellisLinear | null {
+  return linear instanceof QuantizedLinear || linear instanceof TrellisLinear ? linear : null;
+}
+
+// Portable fixed Trellis arithmetic; the wide-native file spells the other
+// artifact-compatible projection form independently.
+const TRELLIS_FORMS = { gateUpCodebook: false, mixedExactBits: false,
+  scatter: {bits:false,genericBits:false,floatCodebook:false}, widePrefill: false };
+function stockProjection(base: AnyLinear): RowProjection {
+  return base instanceof QuantizedLinear ? new QuantizedLinearPlain(base) : base;
+}
+function packedProjection(base: TrellisLinear): RowProjection {
+  return base.geometry.axis === 1 ? new TrellisReducePrompt(base) : new TrellisScatterPrompt(base);
+}
+function expandedProjection(base: TrellisLinear): RowProjection {
+  return base.geometry.axis === 1 ? new TrellisExpandReducePrompt(base) : new TrellisExpandScatterPrompt(base);
+}
+
+// Read exact MLX dtype metadata at load. These lazy probes never evaluate or
+// allocate an expanded weight; owning norms, ropes and payloads are reused.
+function normType(norm: AnyNorm | null, dtype: Dtype, width: number): Dtype {
+  if (!norm) return dtype;
+  using x = ops.zeros([1, width], dtype), out = norm.forward(x); return out.dtype;
+}
+function linearType(base: AnyLinear, dtype: Dtype): Dtype {
+  if (base instanceof TrellisLinear) return dtype;
+  using x = ops.zeros([1, base.inFeatures], dtype), out = stockProjection(base).forward(x); return out.dtype;
+}
+function promotedType(a: Dtype, b: Dtype): Dtype {
+  using x = ops.zeros([1], a), y = ops.zeros([1], b), out = ops.add(x,y); return out.dtype;
+}
+function projectionFacts(layers: readonly UniversalLayer[], input: Dtype, width: number): {types: Map<AnyLinear,Dtype>; output: Dtype} {
+  const types = new Map<AnyLinear,Dtype>();
+  const linear = (base: AnyLinear, dtype: Dtype) => { types.set(base,dtype); return linearType(base,dtype); };
+  let current = input;
+  for (const layer of layers) {
+    const a = layer.a, attn = layer.attn, mlp = layer.mlp;
+    const xn = a.block === "post" ? current : normType(layer.inputNorm,current,width);
+    let q: Dtype, k: Dtype, v: Dtype;
+    if (attn.qkvProj) q = k = v = linear(attn.qkvProj,xn);
+    else { q = linear(attn.qProj!,xn); k = linear(attn.kProj!,xn); v = linear(attn.vProj!,xn); }
+    q = normType(attn.qNorm,q,a.qkNorm === "full" ? a.numHeads*a.headDim : a.headDim);
+    k = normType(attn.kNorm,k,a.qkNorm === "full" ? a.numKvHeads*a.headDim : a.headDim);
+    let attended: Dtype;
+    if (attn.softcap !== null) attended = promotedType(promotedType(q,k),v);
+    else {
+      using qq=ops.zeros([1,a.numHeads,1,a.headDim],q), kk=ops.zeros([1,a.numKvHeads,1,a.headDim],k), vv=ops.zeros([1,a.numKvHeads,1,a.headDim],v);
+      using out=ops.sdpa(qq,kk,vv,a.attnScale,"causal"); attended=out.dtype;
+    }
+    let r = linear(attn.oProj,attended);
+    if (a.block === "post" || a.block === "gemma2") r = normType(layer.postAttnNorm,r,width);
+    else if (a.block === "glm4") r = normType(layer.extraNorm1,r,width);
+    const h = promotedType(current,r);
+    const hn = a.block === "post" ? h : normType(a.block === "gemma2" ? layer.extraNorm1 : layer.postAttnNorm,h,width);
+    let mid: Dtype;
+    if (mlp.gateUp) mid=linear(mlp.gateUp,hn);
+    else {
+      const gate=linear(mlp.gate!,hn);
+      mid=mlp.up ? promotedType(gate,linear(mlp.up,hn)) : gate;
+    }
+    let out = linear(mlp.down,mid);
+    if (a.block === "post" || a.block === "gemma2" || a.block === "glm4") out=normType(layer.extraNorm2,out,width);
+    current=promotedType(h,out);
+  }
+  return {types,output:current};
 }
 
 /** Rope for one attention module, per the descriptor (llama's
@@ -100,8 +164,8 @@ class UniversalAttention {
    * attends encoded KV. */
   readonly softcap: number | null;
   /** The projections adapters mount on (affine-quantized), read at load. */
-  readonly adapters: { readonly q: QuantizedLinear | null; readonly k: QuantizedLinear | null;
-    readonly v: QuantizedLinear | null; readonly qkv: QuantizedLinear | null; readonly o: QuantizedLinear | null };
+  readonly adapters: { readonly q: QuantizedLinear | TrellisLinear | null; readonly k: QuantizedLinear | TrellisLinear | null;
+    readonly v: QuantizedLinear | TrellisLinear | null; readonly qkv: QuantizedLinear | TrellisLinear | null; readonly o: QuantizedLinear | TrellisLinear | null };
 
   constructor(
     weights: Weights,
@@ -114,7 +178,7 @@ class UniversalAttention {
     readonly reads: AttentionReadStrategy,
   ) {
     this.softcap = a.attnLogitSoftcap;
-    const load = (name: string) => loadLinear(weights, `${prefix}.${name}`, config, audit);
+    const load = (name: string) => loadLinear(weights, `${prefix}.${name}`, config, audit, TRELLIS_FORMS);
     const target = (name: string, linear: AnyLinear | null) =>
       linear && adapterTarget(weights, config, `${prefix}.${name}`, linear);
     if (a.fusedQkv) {
@@ -231,8 +295,8 @@ export class UniversalMLP {
    *  use a plain nn.gelu composition). Set to null for the uncompiled composition. */
   swigluFn: SwigluFn | null = compiledSwiglu;
   /** The projections adapters mount on (affine-quantized), read at load. */
-  readonly adapters: { readonly gate: QuantizedLinear | null; readonly up: QuantizedLinear | null;
-    readonly gateUp: QuantizedLinear | null; readonly down: QuantizedLinear | null };
+  readonly adapters: { readonly gate: QuantizedLinear | TrellisLinear | null; readonly up: QuantizedLinear | TrellisLinear | null;
+    readonly gateUp: QuantizedLinear | TrellisLinear | null; readonly down: QuantizedLinear | TrellisLinear | null };
 
   constructor(
     weights: Weights,
@@ -241,7 +305,7 @@ export class UniversalMLP {
     readonly kind: UniversalArgs["mlp"],
     audit: WeightAudit,
   ) {
-    const load = (name: string) => loadLinear(weights, `${prefix}.${name}`, config, audit);
+    const load = (name: string) => loadLinear(weights, `${prefix}.${name}`, config, audit, TRELLIS_FORMS);
     const target = (name: string, linear: AnyLinear) => adapterTarget(weights, config, `${prefix}.${name}`, linear);
     if (kind === "fused_swiglu") {
       this.gateUp = load("gate_up_proj");
@@ -444,7 +508,6 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
   readonly args: UniversalArgs;
   /** The served configuration this graph was built for: its KV scheme is what `makeCache` composes. */
-  readonly composition: Composition;
   readonly weightsBytes: number;
   readonly prefixBase = "model";
   readonly loraState = new LoraState();
@@ -456,6 +519,9 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
   readonly ropes: UniversalRope[];
   /** Whether every attention layer, as bound, reads encoded (affine) KV views. */
   readonly encodedKvAttention: boolean;
+  readonly #views: readonly {from:number;to:number;layers:readonly UniversalLayer[];head:MlxHeadForward}[];
+  readonly sequenceLogits: readonly import("../../contracts/mlx/graph").MlxHeadRange[];
+  logitsFromHidden?: MlxHeadForward;
 
   /** A graph whose attention softcaps its scores verifies ordinary rounds only
    * (its layers read dense K/V through the softcapped read). */
@@ -466,13 +532,12 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
   // bound at construction; later edits to `args` cannot make them disagree.
   readonly #cacheWindows: readonly (number | null)[];
 
-  constructor(weights: Weights, config: ModelConfig, composition: Composition, args?: UniversalArgs) {
+  constructor(weights: Weights, config: ModelConfig, args?: UniversalArgs, maxPhaseRows = DEFAULT_PHASE_ROWS) {
     const a = args ?? genericArgsFor(config);
     if (!a)
       throw new Error(`UniversalDenseModel: no descriptor for model_type ${config.modelType}`);
     this.config = config;
     this.args = a;
-    this.composition = composition;
     this.#cacheWindows = universalCacheWindows(a);
     // Each layer's read: the cache's own read, or the softcapped read over plain
     // KV with the layer group's window (gemma2: create_attention_mask(...,
@@ -508,32 +573,70 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
       : loadRmsNorm(weights, "model.norm", a.normEps, a.norm === "rmsnorm_plus_one", audit);
     this.lmHead = a.tieWordEmbeddings
       ? null
-      : loadLinear(weights, "lm_head", config, audit);
+      : loadLinear(weights, "lm_head", config, audit, TRELLIS_FORMS);
 
     // Load-time weight audit: unconsumed tensors (outside the arch's
     // sanitize drops) are a LOAD ERROR, never a silently-wrong model.
     audit.finish(weights, a.dropWeightPatterns);
 
-    const multiSequencePrompt: MlxCapturingForward = (ids, cache) =>
-    this.forwardLayers(this.#embed(ids), cache, "window");
-    this.prompt = [{ from: 1, to: Infinity, operation: multiSequencePrompt }];
-    this.multiSequencePrompt = this.prompt;
-    this.appendKnown = rowTable<MlxPhaseForward>((ids, cache) =>
-    this.forwardLayers(this.#embed(ids), cache, "window"), phaseRowLimit(composition));
-    this.logits = rowTable<MlxHeadForward>(hidden => this.logitsFromHidden(hidden), phaseRowLimit(composition));
-    this.decode = rowTable<MlxPhaseForward>((ids, cache) =>
-    this.forwardLayers(this.#embed(ids), cache, "decode"), phaseRowLimit(composition));
-    this.verify = rowTable<MlxVerifyForward>((ids, cache) =>
-    this.forwardLayers(this.#embed(ids), cache, "window"), phaseRowLimit(composition));
+    using probeIds=ops.zeros([1,1],Dtype.int32), probeEmbedding=this.#embed(probeIds);
+    const facts=projectionFacts(this.layers,probeEmbedding.dtype,a.hiddenSize);
+    const finalType=normType(this.finalNorm,facts.output,a.hiddenSize);
+    if (this.lmHead) facts.types.set(this.lmHead,finalType);
+    const narrow=(base:AnyLinear):RowProjection=>base instanceof TrellisLinear ? packedProjection(base) : stockProjection(base);
+    const five=(base:AnyLinear):RowProjection=> {
+      if (!(base instanceof TrellisLinear)) return stockProjection(base);
+      const dtype=facts.types.get(base)!;
+      return tiledTrellisPrefillEligible(base.geometry,5,dtype,false) ? new TrellisTiledPrompt(base)
+        : splitKTrellisPrefillEligible(base.geometry,5,dtype) ? new TrellisSplitKPrompt(base) : expandedProjection(base);
+    };
+    const nine=(base:AnyLinear):RowProjection=>base instanceof TrellisLinear
+      ? tiledTrellisPrefillEligible(base.geometry,9,facts.types.get(base)!,false) ? new TrellisTiledPrompt(base) : expandedProjection(base)
+      : stockProjection(base);
+    const sixteen=(base:AnyLinear):RowProjection=>base instanceof TrellisLinear
+      ? tiledTrellisPrefillEligible(base.geometry,16,facts.types.get(base)!,false) ? new TrellisTiledPrompt(base) : expandedProjection(base)
+      : stockProjection(base);
+    const expanded=(base:AnyLinear):RowProjection=>base instanceof TrellisLinear ? expandedProjection(base) : stockProjection(base);
+    const bind=(from:number,to:number,project:(base:AnyLinear)=>RowProjection)=> {
+      // Views inherit the owning block's norms, rope, audit-derived facts and
+      // adapter carriers. Only projection call ports are replaced.
+      const layers=this.layers.map(base=> {
+        const attn=Object.assign(Object.create(base.attn),{qProj:base.attn.qProj && project(base.attn.qProj),kProj:base.attn.kProj && project(base.attn.kProj),
+          vProj:base.attn.vProj && project(base.attn.vProj),qkvProj:base.attn.qkvProj && project(base.attn.qkvProj),oProj:project(base.attn.oProj)});
+        const mlp=Object.assign(Object.create(base.mlp),{gate:base.mlp.gate && project(base.mlp.gate),up:base.mlp.up && project(base.mlp.up),
+          gateUp:base.mlp.gateUp && project(base.mlp.gateUp),down:project(base.mlp.down)});
+        return Object.assign(Object.create(base),{attn,mlp}) as UniversalLayer;
+      });
+      const head=this.lmHead ? project(this.lmHead) : null;
+      return {from,to,layers,head:(hidden:MlxArray)=>this.#finishLogits(hidden,head)};
+    };
+    this.#views=[bind(1,4,narrow),bind(5,8,five),bind(9,15,nine),bind(16,32,sixteen),bind(33,Infinity,expanded)];
+    if (!(this.lmHead instanceof TrellisLinear)) this.logitsFromHidden=this.#views[0]!.head;
+    const head=(view:{head:MlxHeadForward}):MlxHeadForward=>this.logitsFromHidden
+      ? hidden=>this.logitsFromHidden!(hidden) : view.head;
+    this.prompt=this.#views.map(view=>({from:view.from,to:view.to,operation:(ids,cache)=>this.forwardLayers(this.#embed(ids),cache,"window",view.layers)}));
+    this.multiSequencePrompt=this.prompt;
+    this.appendKnown=this.#views.map(view=>({from:view.from,to:view.to,operation:(ids,cache)=>this.forwardLayers(this.#embed(ids),cache,"window",view.layers)}));
+    this.decode=rowTableFrom(rows=>{
+      const view=this.#views.find(view=>rows>=view.from && rows<=view.to)!;
+      return (ids,cache)=>this.forwardLayers(this.#embed(ids),cache,"decode",view.layers);
+    },maxPhaseRows);
+    this.verify=rowTableFrom(rows=>{
+      const view=this.#views.find(view=>rows>=view.from && rows<=view.to)!;
+      return (ids,cache)=>this.forwardLayers(this.#embed(ids),cache,"window",view.layers);
+    },maxPhaseRows);
+    this.logits=rowTableFrom(rows=>head(this.#views.find(view=>rows>=view.from && rows<=view.to)!),maxPhaseRows);
+    this.sequence=this.#views.map(view=>({from:view.from,to:view.to,operation:(ids,cache)=>this.forwardLayers(this.#embed(ids),cache,"window",view.layers)}));
+    this.sequenceLogits=this.#views.map(view=>({from:view.from,to:view.to,operation:head(view)}));
 
-    bindGraphCaches(this, composition);
+    this.cacheLayers = this.#cacheWindows.map(window=>window ? {kind:"sliding" as const,window}:{kind:"full" as const,turboQuant:"dense" as const});
   }
 
   /** LoRA hot-swap targets — quantized linears only (dense checkpoints
    *  serve without adapter support at Tier-0), read at load. */
-  loraTargets(): Map<string, QuantizedLinear> {
-    const out = new Map<string, QuantizedLinear>();
-    const put = (path: string, lin: QuantizedLinear | null) => {
+  loraTargets(): Map<string, QuantizedLinear | TrellisLinear> {
+    const out = new Map<string, QuantizedLinear | TrellisLinear>();
+    const put = (path: string, lin: QuantizedLinear | TrellisLinear | null) => {
       if (lin) out.set(path, lin);
     };
     for (let i = 0; i < this.layers.length; i++) {
@@ -559,14 +662,9 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
    * one mask memo. The full-attention caches' TurboQuant read is dense
    * (`denseTurboQuantKernels`): the read decodes keys and values first (the
    * softcapped read attends the decoded window). */
-  get cacheLayers(): readonly MlxCacheLayer[] { return this.#cacheWindows.map(window=>window ? {kind:"sliding" as const,window}:{kind:"full" as const,turboQuant:"dense" as const}); }
+  readonly cacheLayers: readonly MlxCacheLayer[];
+  readonly sequence: readonly MlxSequenceRange[];
 
-  makeCache!: () => Cache[];
-
-  /** The scoring forward (`MlxSequenceForward`): the window read at every width. */
-  sequenceHidden(ids: MlxArray, cache: Cache[], _width: number): MlxArray {
-    return this.forwardLayers(this.#embed(ids), cache, "window");
-  }
 
   /** One whole chunk of a prompt; rows are sequences times the chunk size. The GPU is this graph's one unit. */
   readonly prompt: readonly MlxPromptRange[];
@@ -575,7 +673,7 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
   /** A prompt's positions that are not a whole chunk: the window read at every width. */
 
   /** Known tokens: this graph declares no committed spans, so they read as a window. */
-  readonly appendKnown: MlxRowTable<MlxPhaseForward>;
+  readonly appendKnown: import("../../contracts/mlx/graph").MlxKnownOperations;
 
   /** The one output head at every width. */
   readonly logits: MlxRowTable<MlxHeadForward>;
@@ -597,11 +695,11 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
    *  `phase`. This call owns h0 and each intermediate hidden state, and
    *  releases them on failure as on success; an execution failure stays the
    *  primary error. */
-  protected forwardLayers(h0: MlxArray, cache: Cache[], phase: ReadPhase): MlxArray {
+  protected forwardLayers(h0: MlxArray, cache: Cache[], phase: ReadPhase, layers: readonly UniversalLayer[] = this.layers): MlxArray {
     let cur = h0;
     try {
       for (let i = 0; i < this.layers.length; i++) {
-        const next = this.layers[i]!.forward(cur, cache[i]!, phase);
+        const next = layers[i]!.forward(cur, cache[i]!, phase);
         const done = cur;
         cur = next;
         done.dispose();
@@ -617,8 +715,8 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
     return out;
   }
 
-  logitsFromHidden(h: MlxArray): MlxArray {
-    let logits = this.lmHead ? this.lmHead.forward(h) : this.embed.asLinear(h);
+  #finishLogits(h: MlxArray, head: RowProjection | null): MlxArray {
+    let logits = head ? head.forward(h) : this.embed.asLinear(h);
     if (this.args.finalLogitSoftcap !== null)
       logits = disposing(logits, logitSoftcap(logits, this.args.finalLogitSoftcap));
     if (this.args.logitsDivisor !== null) {

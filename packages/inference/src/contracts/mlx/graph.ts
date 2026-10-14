@@ -54,6 +54,7 @@ export type MlxVerifyForward = MlxCapturingForward;
 /** The output head over a post-final-norm hidden [.., hidden-width] (borrowed)
  * to logits [.., vocabulary] the caller owns, possibly unevaluated. */
 export type MlxHeadForward = (hidden: MlxArray) => MlxArray;
+export interface MlxHeadRange { readonly from: number; readonly to: number; readonly operation: MlxHeadForward }
 
 /** The scoring and training forward, not a serving phase: every position of
  * `ids` [sequences, tokens] as one causal window over the caller's caches (the
@@ -134,11 +135,31 @@ export interface MlxCompiledDecodeStep {
 
 /** method `denoising`: what the canvas denoiser drives over a graph's weights, with the prefill state
  * an array of caches. A graph that declares the method implements these; binding refuses one that does not. */
+export interface MlxDenoisingPrefillRange {
+  readonly from: number;
+  readonly to: number;
+  readonly operation: (promptIds: number[], pixels: MlxArray | null) => Cache[];
+}
+
+export interface MlxDenoisingDecodeRange {
+  readonly from: number;
+  readonly to: number;
+  readonly operation: (canvas: MlxArray, state: Cache[], feedback: MlxArray | null) => MlxArray;
+}
+export interface MlxDenoisingAppendRange {
+  readonly from: number;
+  readonly to: number;
+  readonly operation: (tokens: MlxArray, state: Cache[]) => void;
+}
+
 export interface MlxDenoisingOperations {
+  readonly denoisingDecode?: readonly MlxDenoisingDecodeRange[];
+  readonly denoisingAppend?: readonly MlxDenoisingAppendRange[];
+  readonly denoisingPrefill?: readonly MlxDenoisingPrefillRange[];
   readonly config: { readonly text: { readonly vocabSize: number } };
   readonly canvasLength: number;
   readonly embedScale: number;
-  prefill(promptIds: number[]): Cache[];
+  prefill?(promptIds: number[]): Cache[];
   /** Image-conditioned prefill from channel-first pixels. */
   prefillVision?(promptIds: number[], pixels: MlxArray): Cache[];
   extendPrefill(tokens: MlxArray, state: Cache[]): void;
@@ -202,6 +223,9 @@ export interface MlxDeclaredGraph {
   readonly mixedSeparate?: MlxSeparateMixed;
   /** Full-sequence scoring operations, indexed by total token rows. */
   readonly sequence?: readonly MlxSequenceRange[];
+  readonly sequenceLogits?: readonly MlxHeadRange[];
+  /** Prepared embeddings without explicit positions, indexed by total rows. */
+  readonly embeddingPrompt?: readonly import("./media").MlxEmbeddingsRange[];
 }
 
 /** Cache layout written by the graph, independent of request storage policy. */

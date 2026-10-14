@@ -1,5 +1,4 @@
-import { bindGraphCaches } from "../cache-composition";
-import type { MlxCacheLayer, MlxMixedRange } from "../../contracts/mlx/graph";
+import type { MlxCacheLayer, MlxMixedRange, MlxSequenceRange } from "../../contracts/mlx/graph";
 // Concrete model graph for Qwen3.5 hybrid models (e.g. Qwen3.6-27B-OptiQ-4bit).
 // Port target: mlx_lm.models.qwen3_5 (+ qwen3_next Attention/MLP/RMSNormGated,
 // gated_delta recurrence). The architecture is a 64-layer stack where every
@@ -15,19 +14,18 @@ import type { MlxCacheLayer, MlxMixedRange } from "../../contracts/mlx/graph";
 import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
 
-import { mapTokenGroups } from "../../input/token-groups";
+import { mapPackedTokens } from "../../input/token-groups";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 
 import * as ops from "@mlx-bun/mlx/ops";
 import { qwenAppendChunkSize } from "../../layers/qwen-append";
 import { disposing } from "../../layers/helpers";
 import { composedFullAttentionCache } from "../../state/bf16-first-kv";
-import type { Composition } from "../../contracts/portable/composition";
 import { AttentionMasks } from "../../state/attention-read";
 import { denseTurboQuantKernels } from "../../state/turboquant-attention";
 import { LoraState } from "../../layers/lora";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
-import { QuantizedLinear } from "../../layers/quantized-linear";
+import { QuantizedLinear, QuantizedLinearPlain } from "../../layers/quantized-linear";
 import { RMSNorm } from "../../layers/normalization";
 import { type Cache } from "../../contracts/mlx/cache";
 import { qwen35WeightsView } from "./checkpoint";
@@ -36,19 +34,34 @@ import type { MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxKnownSpa
 import type { TargetView } from "../../contracts/mlx/draft-target";
 import type { MediaEncoders, MlxPromptInput, Vision } from "../../contracts/mlx/media";
 import { declareGraph } from "../capabilities";
-import { phaseRowLimit,  rowTable, rowTableFrom, type ReadPhase  } from "../graph";
+import { DEFAULT_PHASE_ROWS,  rowTable, rowTableFrom, type ReadPhase   } from "../graph";
 import { bindQwenMediaInput, qwenDraftTarget, qwenMediaEncoders } from "./media-input";
 import { SSMCache } from "../../state/ssm";
 import { mropeInvFreq } from "../../layers/qwen-mrope";
 import type { MropeForwardState } from "../../contracts/mlx/positions";
-import { Qwen3Layer } from "./blocks";
+import { Qwen3Layer, QwenAttentionLayer, QwenDeltaLayer, QwenGatedDeltaNet, Qwen3TextAttention, Qwen3MediaAttention, type QwenMlp } from "./blocks";
+import { Dtype } from "@mlx-bun/mlx/ffi";
+import { fusedGateUpEligible, type TrellisLinear } from "../../layers/trellis-linear";
+import { TrellisFusedMLP, TrellisUnfusedMLP, TrellisReducePrompt, TrellisScatterPrompt, TrellisWidePrompt, TrellisTiledPrompt, TrellisSplitKPrompt, TrellisExpandReducePrompt, TrellisExpandScatterPrompt, type RowProjection } from "../../layers/trellis-prompt";
+import { wideTrellisPrefillEligible, tiledTrellisPrefillEligible, splitKTrellisPrefillEligible } from "../../kernels/trellis/index";
 
 const PREFIX = "language_model";
 
-/** A prompt window above four rows evaluates each layer and its recurrent state before the next (the bounded
- *  workspace a retained prefix leaves room for); four rows or fewer stay one lazy graph. */
-const boundedWindow = (width: number) => width > 4;
-
+// Fixed generic projection forms. The loader may use artifact geometry to bind
+// a compatible layer; forward calls never choose a projection kernel.
+const GENERIC_TRELLIS = { gateUpCodebook: false, mixedExactBits: false,
+  scatter: { bits: false, genericBits: false, floatCodebook: false }, widePrefill: false };
+type FixedLayer = QwenDeltaLayer | QwenAttentionLayer;
+interface FixedRange { readonly from: number; readonly to: number; readonly layers: readonly FixedLayer[]; readonly media: readonly FixedLayer[] }
+function packedProjection(base: TrellisLinear): RowProjection {
+  return base.geometry.axis === 1 ? new TrellisReducePrompt(base) : new TrellisScatterPrompt(base);
+}
+function expandedProjection(base: TrellisLinear): RowProjection {
+  return base.geometry.axis === 1 ? new TrellisExpandReducePrompt(base) : new TrellisExpandScatterPrompt(base);
+}
+function affineMlp(base: Extract<QwenMlp, {kind: "affine"}>): RowProjection {
+  return new TrellisUnfusedMLP(new QuantizedLinearPlain(base.gate), new QuantizedLinearPlain(base.up), new QuantizedLinearPlain(base.down));
+}
 export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
   readonly weightsBytes: number;
@@ -74,14 +87,11 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly lmHead: QuantizedLinear | null;
   readonly tied: boolean;
   readonly faIdx: number;
-  /** The served configuration this graph was built for: its KV scheme (what
-   *  `makeCache` composes) and its switches. */
-  readonly composition: Composition;
-  /** The composition's `packedMixedMlp`: the groups of a mixed forward share
-   *  one MLP call. */
-  readonly #packMixedMlp: boolean;
+  readonly #ranges: readonly FixedRange[];
+  readonly #adapterOperations: TrellisFusedMLP[] = [];
+  readonly #head: (hidden: MlxArray) => MlxArray;
 
-  constructor(weights: Weights, config: ModelConfig, composition: Composition) {
+  constructor(weights: Weights, config: ModelConfig, maxPhaseRows = DEFAULT_PHASE_ROWS) {
     // Checkpoint-generation normalization BEFORE the first tensor() call: the
     // 5.8-family export names the trunk `model.language_model.*` with a
     // top-level `lm_head`, ships `mtp.*` in-repo, and stores RMSNorm gains as
@@ -91,42 +101,101 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
     const view = qwen35WeightsView(weights);
     if (view) weights.setView(view);
     this.config = config;
-    this.composition = composition;
     this.tied = config.text.tieWordEmbeddings;
     this.weightsBytes = [...weights.shards.files.values()]
       .reduce((a, f) => a + f.mmap.size, 0);
     this.embed = QuantizedEmbedding.load(weights, `${PREFIX}.model.embed_tokens`, config);
     this.layers = Array.from(
       { length: config.text.numHiddenLayers },
-      (_, i) => new Qwen3Layer(weights, config, i),
+      (_, i) => new Qwen3Layer(weights, config, i, GENERIC_TRELLIS),
     );
     this.finalNorm = new RMSNorm(weights.tensor(`${PREFIX}.model.norm.weight`), config.text.rmsNormEps);
     // Tied models (e.g. Qwen3.5-4B) ship no lm_head; the reference uses
     // embed_tokens.as_linear (mlx-lm qwen3_5 TextModel.__call__).
     this.lmHead = this.tied ? null : QuantizedLinear.load(weights, `${PREFIX}.lm_head`, config);
     this.faIdx = config.text.fullAttentionInterval - 1;
-    this.#packMixedMlp = composition.packedMixedMlp;
-    this.knownSpans = this.#qualifiesKnownSpans() ? Object.freeze({
-      maxChunkSize: (state: readonly Cache[]) => qwenAppendChunkSize(state[0]!.offset),
-    }) : undefined;
-    const known: ReadPhase = this.knownSpans ? "committed" : "window";
-    this.appendKnown = rowTableFrom(width => (ids, state) =>
-      this.forwardLayers(this.embed.encode(ids), state, known, undefined, null, width, false), phaseRowLimit(composition));
-
-    this.prompt = [{from: 1, to: 4, operation: (ids, state, capture) => this.#captured(this.forwardLayers(this.embed.encode(ids), state, "window", undefined, capture, 4, false), capture)},
-      {from:5, to:Infinity, operation: (ids,state,capture) => this.#captured(this.forwardLayers(this.embed.encode(ids),state,"window",undefined,capture,9,true),capture)}];
+    const head = this.lmHead ? new QuantizedLinearPlain(this.lmHead) : null;
+    this.#head = head ? hidden => head.forward(hidden) : hidden => this.embed.asLinear(hidden);
+    const narrow = (base: QwenMlp): RowProjection => {
+      if (base.kind === "affine") return affineMlp(base);
+      const down = packedProjection(base.down);
+      if (fusedGateUpEligible(base.gate, base.up)) {
+        const operation = new TrellisFusedMLP(base.gate, base.up, down, this.loraState);
+        this.#adapterOperations.push(operation); return operation;
+      }
+      return new TrellisUnfusedMLP(packedProjection(base.gate), packedProjection(base.up), down);
+    };
+    const windowGate = (base: TrellisLinear): RowProjection =>
+      tiledTrellisPrefillEligible(base.geometry, 5, Dtype.bfloat16, false) ? new TrellisTiledPrompt(base) : expandedProjection(base);
+    const tiledGate = (base: TrellisLinear): RowProjection =>
+      tiledTrellisPrefillEligible(base.geometry, 16, Dtype.bfloat16, false) ? new TrellisTiledPrompt(base) : expandedProjection(base);
+    const splitDown = (base: TrellisLinear): RowProjection =>
+      splitKTrellisPrefillEligible(base.geometry, 5, Dtype.bfloat16) ? new TrellisSplitKPrompt(base) : expandedProjection(base);
+    const five = (base: QwenMlp) => base.kind === "affine" ? affineMlp(base)
+      : new TrellisUnfusedMLP(windowGate(base.gate), windowGate(base.up), splitDown(base.down));
+    const nine = (base: QwenMlp) => base.kind === "affine" ? affineMlp(base)
+      : new TrellisUnfusedMLP(windowGate(base.gate), windowGate(base.up), expandedProjection(base.down));
+    const sixteen = (base: QwenMlp) => base.kind === "affine" ? affineMlp(base)
+      : new TrellisUnfusedMLP(tiledGate(base.gate), tiledGate(base.up), expandedProjection(base.down));
+    const expanded = (base: QwenMlp) => base.kind === "affine" ? affineMlp(base)
+      : new TrellisUnfusedMLP(expandedProjection(base.gate), expandedProjection(base.up), expandedProjection(base.down));
+    const bind = (from: number, to: number, mlp: (base: QwenMlp) => RowProjection): FixedRange => {
+      const operations = this.layers.map(layer => mlp(layer.mlp));
+      return { from, to, layers: this.layers.map((layer, index) => this.#layerView(weights, config, layer, index, operations[index]!, false)),
+        media: this.layers.map((layer, index) => this.#layerView(weights, config, layer, index, operations[index]!, true)) };
+    };
+    this.#ranges = [bind(1, 4, narrow), bind(5, 8, five), bind(9, 15, nine), bind(16, 32, sixteen), bind(33, Infinity, expanded)];
+    this.knownSpans = undefined;
+    const forward = (range: FixedRange, phase: ReadPhase, bounded: boolean): MlxCapturingForward => (ids, state, capture) =>
+      this.#captured(this.forwardLayers(this.embed.encode(ids), state, phase, undefined, capture, range.layers, bounded), capture);
+    const exact = <Op>(build: (range: FixedRange) => Op): MlxRowTable<Op> => {
+      const ranges = this.#ranges.map(range => ({ ...range, operation: build(range) }));
+      return rowTableFrom(rows => ranges.find(range => rows >= range.from && rows <= range.to)!.operation, maxPhaseRows);
+    };
+    this.decode = exact(range => forward(range, "decode", false));
+    this.verify = exact(range => forward(range, "window", false));
+    this.appendKnown = this.#ranges.map(range => ({ from: range.from, to: range.to, operation: (ids, state) =>
+      this.forwardLayers(this.embed.encode(ids), state, "window", undefined, null, range.layers, false) }));
+    this.prompt = this.#ranges.map(range => ({ from: range.from, to: range.to, operation: forward(range, "window", range.from > 4) }));
     this.multiSequencePrompt = this.prompt;
-    this.decode = rowTableFrom(width => (ids, state, capture) =>
-    this.#captured(this.forwardLayers(this.embed.encode(ids), state, "decode", undefined, capture, width, false), capture), phaseRowLimit(composition));
-    this.verify = rowTableFrom(width => (ids, state, capture) =>
-    this.#captured(this.forwardLayers(this.embed.encode(ids), state, "window", undefined, capture, width, false), capture), phaseRowLimit(composition));
-    this.logits = rowTable<MlxHeadForward>(hidden => this.logitsFromHidden(hidden), phaseRowLimit(composition));
+    this.logits = rowTable(hidden => this.logitsFromHidden(hidden), maxPhaseRows);
+    this.sequence = this.#ranges.map(range => ({ from: range.from, to: range.to,
+      operation: (ids, cache) => this.forwardLayers(this.embed.encode(ids), cache, "window", undefined, null, range.layers, range.from > 4) }));
+    this.mediaPrefill = this.#ranges.map(range => ({ from: range.from, to: range.to,
+      operation: (embeds, cache, positions) => this.forwardLayers(ops.contiguous(embeds), cache, "window", positions, null, range.media, range.from > 4) }));
+    this.mediaPrompt = this.#ranges.map(range => ({ from: range.from, to: range.to,
+      operation: (ids, cache, positions) => this.forwardLayers(this.embed.encode(ids), cache, "window", positions, null, range.media, range.from > 4) }));
+    this.mediaDecode = exact(range => (ids, cache, positions) => this.forwardLayers(this.embed.encode(ids), cache, "decode", positions, null, range.media, false));
+    this.embeddingPrompt = this.#ranges.map(range => ({ from: range.from, to: range.to,
+      operation: (embeds, cache) => this.forwardLayers(ops.contiguous(embeds), cache, "window", undefined, null, range.layers, range.from > 4) }));
+    this.mixed = this.#ranges.map(range => ({ from: range.from, to: range.to,
+      operation: groups => this.#mixedForward(groups, range.layers) }));
+    const separated = (phase: ReadPhase) => this.#ranges.map(range => ({ from: range.from, to: range.to,
+      operation: (group: import("../../contracts/mlx/graph").MlxPhaseGroup) => this.#captured(this.forwardLayers(this.embed.encode(group.ids), group.state, phase,
+        undefined, group.capture, range.layers, group.phase === "window" && range.from > 4), group.capture) }));
+    this.mixedSeparate = { decode: separated("decode"), window: separated("window"), verify: separated("window") };
 
-    bindGraphCaches(this, composition);
+    this.cacheLayers = this.layers.map(layer => layer.isLinear ? {kind:"recurrent" as const} : {kind:"full" as const,turboQuant:"dense" as const});
   }
 
-  loraTargets(): Map<string, QuantizedLinear> {
-    const out = new Map<string, QuantizedLinear>();
+  #layerView(weights: Weights, config: ModelConfig, base: Qwen3Layer, index: number, mlp: RowProjection, media: boolean): FixedLayer {
+    const prefix = `${PREFIX}.model.layers.${index}`;
+    if (base.linearAttn) {
+      const b = base.linearAttn;
+      return new QwenDeltaLayer(weights, config, prefix, new QwenGatedDeltaNet(weights, config, `${prefix}.linear_attn`, {
+        inProjQkv: new QuantizedLinearPlain(b.inProjQkv), inProjZ: new QuantizedLinearPlain(b.inProjZ),
+        inProjB: new QuantizedLinearPlain(b.inProjB), inProjA: new QuantizedLinearPlain(b.inProjA), outProj: new QuantizedLinearPlain(b.outProj) }), mlp);
+    }
+    const b = base.selfAttn!;
+    const projections = { qProj: new QuantizedLinearPlain(b.qProj), kProj: new QuantizedLinearPlain(b.kProj),
+      vProj: new QuantizedLinearPlain(b.vProj), oProj: new QuantizedLinearPlain(b.oProj) };
+    const mixer = media ? new Qwen3MediaAttention(weights, config, `${prefix}.self_attn`, projections)
+      : new Qwen3TextAttention(weights, config, `${prefix}.self_attn`, projections);
+    return new QwenAttentionLayer(weights, config, prefix, mixer, mlp);
+  }
+
+  loraTargets(): Map<string, QuantizedLinear | TrellisLinear> {
+    const out = new Map<string, QuantizedLinear | TrellisLinear>();
     for (let i = 0; i < this.layers.length; i++) {
       const l = this.layers[i]!;
       const p = `${PREFIX}.model.layers.${i}`;
@@ -142,18 +211,16 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
         out.set(`${p}.linear_attn.in_proj_a`, l.linearAttn.inProjA);
         out.set(`${p}.linear_attn.out_proj`, l.linearAttn.outProj);
       }
-      // Trellis-coded MLP tensors are not LoRA targets (no adapter seam yet).
-      if (l.mlp.kind === "affine") {
-        out.set(`${p}.mlp.gate_proj`, l.mlp.gate);
-        out.set(`${p}.mlp.up_proj`, l.mlp.up);
-        out.set(`${p}.mlp.down_proj`, l.mlp.down);
-      }
+      out.set(`${p}.mlp.gate_proj`, l.mlp.gate);
+      out.set(`${p}.mlp.up_proj`, l.mlp.up);
+      out.set(`${p}.mlp.down_proj`, l.mlp.down);
     }
     return out;
   }
 
   /** Releases the mRoPE frequencies a vision forward built; the weights are its owner's. */
   dispose(): void {
+    for (const operation of this.#adapterOperations) operation.dispose();
     this.#mropeInvFreq?.dispose();
     this.#mropeInvFreq = null;
   }
@@ -163,39 +230,12 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
    * (`composedFullAttentionCache`). Their TurboQuant read is dense
    * (`denseTurboQuantKernels`): the read decodes keys and values, then runs the
    * fused SDPA. */
-  get cacheLayers(): readonly MlxCacheLayer[] { return this.layers.map(layer => layer.isLinear ? {kind:"recurrent" as const} : {kind:"full" as const,turboQuant:"dense" as const}); }
+  readonly cacheLayers: readonly MlxCacheLayer[];
+  readonly sequence: readonly MlxSequenceRange[];
+  readonly mediaPrefill: readonly import("../../contracts/mlx/media").MlxPositionedEmbeddingsRange[];
+  readonly mediaPrompt: readonly import("../../contracts/mlx/media").MlxPositionedRange[];
+  readonly mediaDecode: import("../../contracts/mlx/graph").MlxRowTable<import("../../contracts/mlx/media").MlxPositionedForward>;
 
-  makeCache!: () => Cache[];
-
-  /** The 27B composition on the M4 Pro qualifies committed known-token spans:
-   * its append keeps the native affine arithmetic while Trellis shares up to
-   * four rows. Read from the composition and the quant table at construction;
-   * every other composition takes known tokens as a window, one position per
-   * fill step. */
-  #qualifiesKnownSpans(): boolean {
-    const t = this.config.text;
-    if (t.hiddenSize !== 5120 || t.intermediateSize !== 17408 || this.layers.length !== 64 ||
-        t.headDim !== 256 || t.numAttentionHeads !== 24 || t.numKeyValueHeads !== 4 ||
-        this.composition.device !== "applegpu_g16s")
-      return false;
-    const qualified = (linear: QuantizedLinear) => {
-      const { mode, bits, groupSize } = linear.spec;
-      return mode === "affine" && [2, 3, 4, 6, 8].includes(bits) && [32, 64, 128].includes(groupSize);
-    };
-    return this.layers.every(layer => {
-      const a = layer.linearAttn, s = layer.selfAttn;
-      const attention = a ? [a.inProjQkv, a.inProjZ, a.inProjB, a.inProjA, a.outProj]
-        : [s!.qProj, s!.kProj, s!.vProj, s!.oProj];
-      const mlp = layer.mlp.kind === "affine" ? [layer.mlp.gate, layer.mlp.up, layer.mlp.down] : [];
-      return attention.every(qualified) && mlp.every(qualified);
-    });
-  }
-
-  /** The scoring and training forward (`MlxSequenceForward`): a window on the
-   * MLP kernels of `width`, above four rows each layer evaluated before the next. */
-  sequenceHidden(ids: MlxArray, cache: Cache[], width: number): MlxArray {
-    return this.forwardLayers(this.embed.encode(ids), cache, "window", undefined, null, width, boundedWindow(width));
-  }
 
   /** One whole chunk of a prompt; rows are sequences times the chunk size, and
    * each layer's output and recurrent state is evaluated before the next. The
@@ -219,7 +259,7 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
   /** Committed known-token spans, when the composition qualifies them (`#qualifiesKnownSpans`). */
   readonly knownSpans: MlxKnownSpans | undefined;
   /** Known tokens: the committed read under `knownSpans`, the window read otherwise. */
-  readonly appendKnown: MlxRowTable<MlxPhaseForward>;
+  readonly appendKnown: import("../../contracts/mlx/graph").MlxKnownOperations;
 
   /** The one output head at every width. */
   readonly logits: MlxRowTable<MlxHeadForward>;
@@ -230,21 +270,6 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
     return hidden;
   }
 
-  /** The vision prefill phase: a prompt's spliced embeddings (borrowed) at request positions. */
-  prefillEmbeddingsAtPositions(embeds: MlxArray, cache: Cache[], positions: MlxArray, width: number): MlxArray {
-    return this.forwardLayers(ops.contiguous(embeds), cache, "window", positions, null, width, boundedWindow(width));
-  }
-
-  /** A prompt's token ids after a reused prefix, at request positions. */
-  prefillAtPositions(ids: MlxArray, cache: Cache[], positions: MlxArray, width: number): MlxArray {
-    return this.forwardLayers(this.embed.encode(ids), cache, "window", positions, null, width, boundedWindow(width));
-  }
-
-  /** One new token per row at request positions, including different positions for each row. */
-  decodeAtPositions(ids: MlxArray, cache: Cache[], positions: MlxArray, width: number): MlxArray {
-    return this.forwardLayers(this.embed.encode(ids), cache, "decode", positions, null, width, false);
-  }
-
   /** Mixed rows in one forward: each group's attention and DeltaNet read its
    * own caches in its own phase (a verify group reads a window). The MLP rows
    * of the groups that may share it run as one call at `width`, the class of
@@ -252,19 +277,20 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
    * keeps its own geometry (`mapTokenGroups`). A prompt group above four rows
    * evaluates each layer and the groups' recurrent state before the next, as
    * the prompt tail does. */
-  readonly mixed: readonly MlxMixedRange[] = [{from:1,to:Infinity,operation:(groups, width) => {
+  readonly mixed: readonly MlxMixedRange[];
+  readonly mixedSeparate: import("../../contracts/mlx/graph").MlxSeparateMixed;
+  #mixedForward(groups: readonly import("../../contracts/mlx/graph").MlxPhaseGroup[], layers: readonly FixedLayer[]): MlxArray[] {
     const hidden: MlxArray[] = [];
     const results: MlxArray[] = [];
-    const bounded = groups.some(group => group.phase === "window" && boundedWindow(group.rows));
+    const bounded = groups.some(group => group.phase === "window" && group.rows > 4);
     try {
       for (const group of groups) hidden.push(this.embed.encode(group.ids));
-      for (const [i, layer] of this.layers.entries()) {
+      for (const [i, layer] of layers.entries()) {
         const mids: MlxArray[] = [];
         try {
           for (const [row, group] of groups.entries())
             mids.push(layer.forwardAttn(hidden[row]!, group.state[i]!, group.phase === "decode" ? "decode" : "window"));
-          const outputs = mapTokenGroups(groups, mids, (h, w) => layer.forwardMlp(h, "window", w), width,
-            this.#packMixedMlp);
+          const outputs = mapPackedTokens(mids, h => layer.forwardMlp(h));
           for (const row of groups.keys()) { hidden[row]!.dispose(); hidden[row] = outputs[row]!; }
           // Materialize every layer's recurrent tail as well as the residual.
           // It is not a dependency of h and otherwise pins prefill buffers.
@@ -285,23 +311,13 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
       return results;
     } catch (error) { for (const result of results) result.dispose(); throw error; }
     finally { for (const h of hidden) h.dispose(); }
-  }}];
+  }
 
   /** The interleaved-mRoPE inverse frequencies, built by the first forward a
    *  media request hands its positions; a text forward keeps the fast rope. */
   #mropeInvFreq: MlxArray | null = null;
 
-  /** The vision prefill phase without request positions: spliced input embeddings [1, L, H] (image features
-   *  overwriting image-token rows — the caller builds them). Caller keeps
-   *  ownership of `embeds`. bidir/ids/multimodal are the Gemma-shaped extras
-   *  and are unused: Qwen3.5 vision attends fully causally. */
-  prefillEmbeddings(
-    embeds: MlxArray, cache: Cache[], _bidir: MlxArray | null,
-    _ids: MlxArray | null, _multimodal: MlxArray | null, width: number,
-  ): MlxArray {
-    const h = ops.contiguous(embeds); // fresh handle — the layer loop consumes it
-    return this.forwardLayers(h, cache, "window", undefined, null, width, boundedWindow(width));
-  }
+  readonly embeddingPrompt: readonly import("../../contracts/mlx/media").MlxEmbeddingsRange[];
 
   /** The decoder over `h0` (consumed), every block reading its cache for
    *  `phase` and every MLP on the kernels of `width`, the class of `h0`'s rows
@@ -309,7 +325,7 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
    *  recurrent state before the next. `capture` receives each layer's residual
    *  output after the layer runs; the caller hands it the final hidden. */
   protected forwardLayers(h0: MlxArray, cache: Cache[], phase: ReadPhase,
-    positions: MlxArray | undefined, capture: MlxLayerCapture | null, width: number, bounded: boolean): MlxArray {
+    positions: MlxArray | undefined, capture: MlxLayerCapture | null, layers: readonly FixedLayer[], bounded: boolean): MlxArray {
     const L = h0.shape[1]!;
     // Vision requests: one interleaved-mRoPE cos/sin table per forward,
     // shared by all 12 full-attention layers (positions are layer-invariant).
@@ -328,8 +344,8 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
     try {
       for (let i = 0; i < this.layers.length; i++) {
         const tl = prof ? performance.now() : 0;
-        const next = this.layers[i]!.forward(h, cache[i]!, phase, mropeFwd, width);
-        h.dispose();
+        const next: MlxArray = layers[i]!.forward(h!, cache[i]!, phase, mropeFwd);
+        h!.dispose();
         h = next;
         if (bounded) {
           // Affine prefills also need bounded evaluation: a retained prefix
@@ -360,6 +376,6 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
   }
 
   logitsFromHidden(h: MlxArray): MlxArray {
-    return this.tied ? this.embed.asLinear(h) : this.lmHead!.forward(h);
+    return this.#head(h);
   }
 }

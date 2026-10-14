@@ -670,6 +670,17 @@ export class PerLayerInputs {
   /** Layer `i`'s input [B, L, width] (owned) from the [B, L, nLayers, width]
    *  tensor `compute` returned (borrowed). A compiled-decode trace slices at an
    *  array start, which replays at every step. */
+  ordinaryLayer(perLayer: MlxArray, i: number, B: number, L: number): MlxArray {
+    using slice = perLayer.slice([0, 0, i, 0], [B, L, i + 1, this.width]);
+    return ops.reshape(slice, [B, L, this.width]);
+  }
+
+  traceLayer(perLayer: MlxArray, i: number, B: number, L: number): MlxArray {
+    using start = ops.fromInt32([i], [1]);
+    using slice = ops.sliceDynamic(perLayer, start, [2], [B, L, 1, this.width]);
+    return ops.reshape(slice, [B, L, this.width]);
+  }
+
   layer(perLayer: MlxArray, i: number, B: number, L: number): MlxArray {
     let pls: MlxArray;
     if (isCompiledTrace()) {

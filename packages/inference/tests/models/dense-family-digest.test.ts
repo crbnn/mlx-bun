@@ -1,3 +1,7 @@
+import { sequenceLogitsOperation } from "../../src/scoring/full-sequence";
+import type { TestGraph } from "./test-composition";
+import { testGraph } from "./test-composition";
+import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
 import { MlxPhaseDispatch } from "../../src/generation/phase-dispatch";
 // The dense graphs no artifact on either machine holds, over small synthetic
 // weights, held to their recorded digest (tests/fixtures/synthetic-digests/
@@ -127,10 +131,10 @@ const denseMlp = (t: Tensors) => (_layer: number, prefix: string) => {
 /** What the digest drives: the head, the caches and the named phases. */
 interface PhasedGraph {
   makeCache(): Cache[];
-  logitsFromHidden(h: MlxArray): MlxArray;
+  logitsFromHidden?(h: MlxArray): MlxArray;
   readonly prompt: readonly MlxPromptRange[];
   readonly multiSequencePrompt: readonly MlxPromptRange[];
-  readonly appendKnown: MlxRowTable<MlxPhaseForward>;
+  readonly appendKnown: import("../../src/contracts/mlx/graph").MlxKnownOperations;
   readonly logits: MlxRowTable<(hidden:MlxArray)=>MlxArray>;
   readonly decode: MlxRowTable<MlxCapturingForward>;
   readonly verify: MlxRowTable<MlxVerifyForward>;
@@ -156,18 +160,18 @@ interface Family {
   delayedStart: number;
 }
 
-function miniCpmGraph(compiledSwiglu = true): MiniCPM5Model {
+function miniCpmGraph(): TestGraph<MiniCPM5Model> {
   const t = new Tensors();
   decoder(t, false, denseMlp(t));
   t.linear("lm_head", [VOCAB, HIDDEN], true, 0.05);
-  return new MiniCPM5Model(t.weights(), textConfig("llama", {}), testComposition(undefined, { compiledSwiglu }));
+  return testGraph(new MiniCPM5Model(t.weights(), textConfig("llama", {}), phaseRowLimit(testComposition(undefined, {  }))), testComposition(undefined, {  }));
 }
-function qwen3Graph(): Qwen3Model {
+function qwen3Graph(): TestGraph<Qwen3Model> {
   const t = new Tensors();
   decoder(t, true, denseMlp(t));
-  return new Qwen3Model(t.weights(), textConfig("qwen3", { tieWordEmbeddings: true, ropeParameters: {} }), testComposition());
+  return testGraph(new Qwen3Model(t.weights(), textConfig("qwen3", { tieWordEmbeddings: true, ropeParameters: {} }), phaseRowLimit(testComposition())), testComposition());
 }
-function qwen3MoeGraph(): Qwen3MoeModel {
+function qwen3MoeGraph(): TestGraph<Qwen3MoeModel> {
   const t = new Tensors();
   decoder(t, true, (layer, prefix) => {
     if (layer === 0) { denseMlp(t)(layer, prefix); return; }
@@ -179,21 +183,21 @@ function qwen3MoeGraph(): Qwen3MoeModel {
   t.linear("lm_head", [VOCAB, HIDDEN], true, 0.05);
   const config = textConfig("qwen3_moe", {
     numExperts: EXPERTS, topKExperts: 2, normTopkProb: true, decoderSparseStep: 1, mlpOnlyLayers: [0], ropeParameters: {} });
-  return new Qwen3MoeModel(t.weights(), config, testComposition());
+  return testGraph(new Qwen3MoeModel(t.weights(), config, phaseRowLimit(testComposition())), testComposition());
 }
 /** llama with alternating full and sliding layers (mistral-style layer types). */
-function llamaSlidingGraph(): UniversalDenseModel {
+function llamaSlidingGraph(): TestGraph<UniversalDenseModel> {
   const t = new Tensors();
   decoder(t, false, denseMlp(t));
   t.linear("lm_head", [VOCAB, HIDDEN], true, 0.05);
   const raw = { model_type: "llama", hidden_size: HIDDEN, num_hidden_layers: LAYERS, num_attention_heads: HEADS,
     num_key_value_heads: KV_HEADS, head_dim: HEAD_DIM, intermediate_size: INTER, vocab_size: VOCAB, rms_norm_eps: 1e-6,
     rope_theta: 10000, tie_word_embeddings: false, layer_types: [F, S, F, S], sliding_window: WINDOW };
-  return new UniversalDenseModel(t.weights(), textConfig("llama", {}, raw), testComposition());
+  return testGraph(new UniversalDenseModel(t.weights(), textConfig("llama", {}, raw), undefined, phaseRowLimit(testComposition())), testComposition());
 }
 /** gemma2: softcapped attention scores over plain KV, bf16 (unquantized)
  * projections, every layer full attention unless `types` makes some sliding. */
-function gemma2Graph(types: string[] | null = null): UniversalDenseModel {
+function gemma2Graph(types: string[] | null = null): TestGraph<UniversalDenseModel> {
   const t = new Tensors();
   t.linear("model.embed_tokens", [VOCAB, HIDDEN], true, 0.5);
   t.norm("model.norm.weight", HIDDEN, 0);
@@ -214,7 +218,7 @@ function gemma2Graph(types: string[] | null = null): UniversalDenseModel {
     query_pre_attn_scalar: HEAD_DIM, attn_logit_softcapping: 30, final_logit_softcapping: 30 };
   const config = textConfig("gemma2", {}, raw);
   const args: UniversalArgs = { ...genericArgsFor(config)!, ...(types ? { layerTypes: types, slidingWindow: WINDOW } : {}) };
-  return new UniversalDenseModel(t.weights(), config, testComposition(), { ...args });
+  return testGraph(new UniversalDenseModel(t.weights(), config, { ...args }, phaseRowLimit(testComposition())), testComposition());
 }
 
 const FAMILIES: Family[] = [
@@ -241,7 +245,7 @@ const disposeAll = (...sets: Cache[][]) => { for (const set of sets) for (const 
 /** Hidden rows, their logits and the caches after a forward, under `label`. */
 function output(digest: DigestCase, label: string, g: PhasedGraph, hidden: MlxArray, caches: Cache[]): void {
   try {
-    using logits = g.logitsFromHidden(hidden);
+    using logits = sequenceLogitsOperation(g, hidden);
     using wide = logits.astype(Dtype.float32);
     expect(wide.toFloat32().every(Number.isFinite), `${label} logits finite`).toBe(true);
     digest.tensors(`${label} hidden`, hidden);
@@ -461,7 +465,7 @@ describe("dense family: what the graphs compose at construction", () => {
 
   test("the universal graph's adapter targets: every projection of a llama layer, none of the bf16 gemma2 layers", () => {
     expect(llamaSlidingGraph().loraTargets().size).toBe(LAYERS * 7);
-    expect((graph(FAMILIES[2]!) as UniversalDenseModel).loraTargets().size).toBe(0);
+    expect((graph(FAMILIES[2]!) as TestGraph<UniversalDenseModel>).loraTargets().size).toBe(0);
   });
 
   test("array masks without a score softcap have no read and are refused at construction", () => {
@@ -471,12 +475,9 @@ describe("dense family: what the graphs compose at construction", () => {
     const raw = { model_type: "llama", hidden_size: HIDDEN, num_hidden_layers: LAYERS, num_attention_heads: HEADS,
       num_key_value_heads: KV_HEADS, head_dim: HEAD_DIM, intermediate_size: INTER, vocab_size: VOCAB, rms_norm_eps: 1e-6 };
     const config = textConfig("llama", {}, raw);
-    expect(() => new UniversalDenseModel(t.weights(), config, testComposition(), { ...genericArgsFor(config)!, maskArray: true }))
+    expect(() => testGraph(new UniversalDenseModel(t.weights(), config, { ...genericArgsFor(config)!, maskArray: true }, phaseRowLimit(testComposition())), testComposition()))
       .toThrow("array masks without a score softcap");
   });
 
-  test("MiniCPM5 builds its MLP from the composition: compiledSwiglu off builds the unfused MLP, on the compiled one", () => {
-    expect(miniCpmGraph(false).layers.every(layer => layer.mlp.kind === "unfused")).toBe(true);
-    expect(miniCpmGraph().layers.every(layer => layer.mlp.kind === "compiled")).toBe(true);
-  });
+
 });
