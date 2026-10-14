@@ -630,11 +630,18 @@ function listedGraphFiles(sources: ReadonlyMap<string, ts.SourceFile>, factory: 
   };
   const walk = (source: ts.SourceFile, node: ts.Node, generic: boolean) => {
     const imported = imports(source);
+    const local = new Set<string>();
+    for (const statement of source.statements) {
+      if (ts.isFunctionDeclaration(statement) && statement.name) local.add(statement.name.text);
+      if (ts.isVariableStatement(statement)) for (const declaration of statement.declarationList.declarations)
+        if (ts.isIdentifier(declaration.name)) local.add(declaration.name.text);
+    }
     const visit = (node: ts.Node, generic: boolean) => {
       if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "generic") generic = true;
       if (ts.isIdentifier(node)) {
         const binding = imported.get(node.text);
         if (binding) follow(binding.file, binding.name, generic);
+        else if (local.has(node.text)) follow(source.fileName, node.text, generic);
       }
       ts.forEachChild(node, child => visit(child, generic));
     };
@@ -687,6 +694,10 @@ function graphFileFindings(source: ts.SourceFile, generic: boolean): { rule: Rat
       const name = ts.isIdentifier(node.typeName) ? node.typeName.text : node.typeName.right.text;
       if (compositionNames.has(name)) found.push({ rule: "graph-composition", node, text: "uses Composition" });
     }
+    if (ts.isImportTypeNode(node) && node.qualifier) {
+      const name = ts.isIdentifier(node.qualifier) ? node.qualifier.text : node.qualifier.right.text;
+      if (name === "Composition") found.push({ rule: "graph-composition", node, text: "uses imported Composition" });
+    }
     if (!generic) {
       if (ts.isIfStatement(node) || ts.isSwitchStatement(node) || ts.isConditionalExpression(node) ||
           ts.isForStatement(node) || ts.isForOfStatement(node) || ts.isForInStatement(node) ||
@@ -721,10 +732,13 @@ test("written graph gate follows loader entries and permits generic layer loops"
   const chosen = write("chosen.ts", "export class Chosen { readonly graphCapabilities = {}; }");
   const generic = write("generic.ts", 'import type { Composition as C } from "./contract"; ' +
     "export class Default { readonly graphCapabilities = {}; constructor(c: C) { for (const layer of []) {} } }");
-  write("list.ts", 'import * as next from "./next"; export const graphs = [{ create: () => new next.Graph() }];');
+  write("list.ts", 'import * as next from "./next"; const entries = [{ create: () => new next.Graph() }]; ' +
+    'const alias = entries; export const graphs = alias;');
   const next = write("next.ts", "export class Graph { readonly graphCapabilities = {}; }");
   expect([...listedGraphFiles(sources, factory)]).toEqual([[chosen, false], [next, false], [generic, true]]);
   expect(graphFileFindings(sources.get(generic)!, true).map(item => item.rule)).toEqual(["graph-composition", "graph-composition"]);
+  write("generic.ts", 'export class Default { readonly graphCapabilities = {}; constructor(c: import("./contract").Composition) {} }');
+  expect(graphFileFindings(sources.get(generic)!, true).map(item => item.rule)).toEqual(["graph-composition"]);
   write("generic.ts", "export class Default { readonly graphCapabilities = {}; constructor() { for (const layer of []) {} } }");
   expect(graphFileFindings(sources.get(generic)!, true)).toEqual([]);
   // Constructor, operation and cleanup all obey the same straight-line rule.
