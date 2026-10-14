@@ -1,3 +1,4 @@
+import { sequenceLogitsOperation } from "../../src/scoring/full-sequence";
 import type { TestGraph } from "./test-composition";
 import { testGraph } from "./test-composition";
 import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
@@ -130,10 +131,10 @@ const denseMlp = (t: Tensors) => (_layer: number, prefix: string) => {
 /** What the digest drives: the head, the caches and the named phases. */
 interface PhasedGraph {
   makeCache(): Cache[];
-  logitsFromHidden(h: MlxArray): MlxArray;
+  logitsFromHidden?(h: MlxArray): MlxArray;
   readonly prompt: readonly MlxPromptRange[];
   readonly multiSequencePrompt: readonly MlxPromptRange[];
-  readonly appendKnown: MlxRowTable<MlxPhaseForward>;
+  readonly appendKnown: import("../../src/contracts/mlx/graph").MlxKnownOperations;
   readonly logits: MlxRowTable<(hidden:MlxArray)=>MlxArray>;
   readonly decode: MlxRowTable<MlxCapturingForward>;
   readonly verify: MlxRowTable<MlxVerifyForward>;
@@ -244,7 +245,7 @@ const disposeAll = (...sets: Cache[][]) => { for (const set of sets) for (const 
 /** Hidden rows, their logits and the caches after a forward, under `label`. */
 function output(digest: DigestCase, label: string, g: PhasedGraph, hidden: MlxArray, caches: Cache[]): void {
   try {
-    using logits = g.logitsFromHidden(hidden);
+    using logits = sequenceLogitsOperation(g, hidden);
     using wide = logits.astype(Dtype.float32);
     expect(wide.toFloat32().every(Number.isFinite), `${label} logits finite`).toBe(true);
     digest.tensors(`${label} hidden`, hidden);

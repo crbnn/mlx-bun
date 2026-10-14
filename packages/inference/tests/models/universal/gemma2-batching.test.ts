@@ -1,3 +1,4 @@
+import { sequenceLogitsOperation } from "../../../src/scoring/full-sequence";
 import type { TestGraph } from "../test-composition";
 import { testGraph } from "../test-composition";
 import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
@@ -816,7 +817,7 @@ test.skipIf(!native || !artifact)("cached Gemma2 plain fill matches main's seria
     const serial = (prompt: number[], fill: Session | null) => {
       const caches = model.makeCache(), logits: string[] = [], tokens: number[] = [];
       const forward = (ids: number[]) => { using input = ops.fromInt32(ids, [1, ids.length]); return phaseHidden(model, input, caches); };
-      const project = (hidden: MlxArray) => { const out = model.logitsFromHidden(hidden); logits.push(...hashRows(out)); return out; };
+      const project = (hidden: MlxArray) => { const out = sequenceLogitsOperation(model, hidden); logits.push(...hashRows(out)); return out; };
       try {
         { using head = forward(prompt.slice(0, -1)); head.eval(); }
         let pending: number | null, generated = 0, finish = "length";
@@ -887,7 +888,7 @@ test.skipIf(!native || !artifact)("cached Gemma2 plain fill matches main's seria
     const runtime = createRuntimeConfig({});
     const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
       hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
-    const logitsFromHidden = model.logitsFromHidden;
+    const logitsFromHidden = model.logitsFromHidden!;
     // Each row joins after the previous row's first token. The B4 case cancels
     // its third row, which is live when the fourth joins, so four rows share
     // the batch; the observed high water must equal the capacity.
@@ -1485,14 +1486,14 @@ describe.skipIf(!native)("dense-read graphs with delayed affine KV", () => {
     view: object;
     model: SpanGraph & import("../../../src/models/factory").RuntimeModel };
   type SpanGraph = Pick<import("../../../src/contracts/mlx/graph").MlxTokenPhases, "prompt" | "multiSequencePrompt" | "decode" | "logits"> &
-    { logitsFromHidden(hidden: MlxArray): MlxArray };
+    { logitsFromHidden?(hidden: MlxArray): MlxArray };
   /** A view of `model` for the scheduler whose phases call the hooks a test adds before each forward. */
   const hooked = <M extends object>(model: M) => {
     const forwardHooks: ((ids: MlxArray, caches: Cache[]) => void)[] = [];
     return { view: observedPhases(model, { forward(ids, caches) { for (const hook of forwardHooks) hook(ids, caches); } }), forwardHooks };
   };
   const projections = (env: SpanEnv) => {
-    const seen: { shape: number[]; dtype: string; sha256: string }[] = [], project = env.model.logitsFromHidden.bind(env.model);
+    const seen: { shape: number[]; dtype: string; sha256: string }[] = [], project = env.model.logitsFromHidden!.bind(env.model);
     env.model.logitsFromHidden = (hidden: MlxArray) => {
       const logits = project(hidden);
       seen.push({ shape: [...logits.shape], dtype: logits.dtypeName,
@@ -1547,7 +1548,7 @@ describe.skipIf(!native)("dense-read graphs with delayed affine KV", () => {
     const project = (hidden: MlxArray) => {
       const [, length, width] = hidden.shape as [number, number, number];
       using last = hidden.slice([0, length - 1, 0], [1, length, width]);
-      const logits = model.logitsFromHidden(last); seen.push(record(logits)); return logits;
+      const logits = sequenceLogitsOperation(model, last); seen.push(record(logits)); return logits;
     };
     // Sampled tokens stay on device until the step commits them to history.
     const draw = (logits: MlxArray, step: number) => sampler.sample(logits, step).token;
@@ -1771,7 +1772,7 @@ describe.skipIf(!native)("dense-read graphs with delayed affine KV", () => {
     const run = (caches: Cache[], phase: string, ids: number[]) => {
       using input = ops.fromInt32(ids, [1, ids.length]);
       using hidden = forward(phase, (ids.length))(input, caches, null);
-      return model.logitsFromHidden(hidden);
+      return sequenceLogitsOperation(model, hidden);
     };
     try {
       for (const [index, [phase, ids]] of steps.entries()) {
@@ -1888,7 +1889,7 @@ describe.skipIf(!native)("dense-read graphs with delayed affine KV", () => {
     const serial = (fill: Session | null) => {
       const caches = model.makeCache(), logits: string[] = [], tokens: number[] = [];
       const forward = (ids: number[]) => { using input = ops.fromInt32(ids, [1, ids.length]); return phaseHidden(model, input, caches); };
-      const project = (hidden: MlxArray) => { const out = model.logitsFromHidden(hidden); logits.push(hash(out)); return out; };
+      const project = (hidden: MlxArray) => { const out = sequenceLogitsOperation(model, hidden); logits.push(hash(out)); return out; };
       try {
         { using head = forward(A.slice(0, -1)); head.eval(); }
         let pending: number | null, generated = 0;
@@ -1924,7 +1925,7 @@ describe.skipIf(!native)("dense-read graphs with delayed affine KV", () => {
       expect(fill.stats.strict).toBeGreaterThan(0);
       expect(expected.kinds).toEqual(types.map(type => type === F ? "QuantizedKVCache" : "RotatingQuantizedKVCache"));
       const binding = bindMlxGateway(model), logits: string[] = [];
-      const logitsFromHidden = model.logitsFromHidden;
+      const logitsFromHidden = model.logitsFromHidden!;
       model.logitsFromHidden = function (this: TestGraph<UniversalDenseModel>, hidden: MlxArray) {
         const out = logitsFromHidden.call(this, hidden); logits.push(hash(out)); return out;
       };
@@ -2349,7 +2350,7 @@ describe.skipIf(!native)("dense-read graphs with delayed affine KV", () => {
             await grammar.ready();
             using ids = ops.fromInt32([suffix], [1, 1]);
             using hidden = phaseHidden(env.model, ids, composed);
-            using logits = env.model.logitsFromHidden(hidden);
+            using logits = sequenceLogitsOperation(env.model, hidden);
             expectedProjection = record(logits);
             using sampled = sampler.sample(logits, 0).token;
             expectedToken = sampled.toIntTokens()[0]!;

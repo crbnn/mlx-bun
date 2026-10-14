@@ -73,7 +73,7 @@ export function trainForward(
   validLengths?: number[],
 ): MlxArray {
   const h = trainForwardHidden(model, ids, validLengths);
-  const logits = model.logitsFromHidden(h);
+  const logits = sequenceLogitsOperation(model,h);
   h.dispose();
   return logits;
 }
@@ -87,4 +87,17 @@ export function sequenceHiddenOperation(model: SequenceOperations | object,
   if (ports.sequence) return ports.sequence.find(range => rows >= range.from && rows <= range.to)!.operation(ids, cache);
   if (!ports.sequenceHidden) throw new TypeError("the graph declares no full-sequence operation");
   return ports.sequenceHidden(ids, cache, rows);
+}
+
+/** Full-sequence heads may cover more rows than the serving scheduler's table. */
+export function sequenceLogitsOperation(model: object, hidden: MlxArray): MlxArray {
+  const ports=model as {readonly sequenceLogits?: readonly import("../contracts/mlx/graph").MlxHeadRange[]; logitsFromHidden?(hidden:MlxArray):MlxArray};
+  const rows=hidden.shape.slice(0,-1).reduce((a,b)=>a*b,1);
+  if (ports.sequenceLogits) {
+    const range=ports.sequenceLogits.find(range=>rows>=range.from && rows<=range.to);
+    if (!range) throw new Error(`graph has no sequence head for ${rows} rows`);
+    return range.operation(hidden);
+  }
+  if (ports.logitsFromHidden) return ports.logitsFromHidden(hidden);
+  throw new TypeError("graph declares no full-sequence head");
 }

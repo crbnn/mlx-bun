@@ -1,3 +1,4 @@
+import { UniversalDenseWideModel } from "./universal/dense-wide";
 import { Qwen35WideModel } from "./qwen/qwen3_5-wide";
 import type { ServedComposition } from "./implementation";
 // Model construction consumes one declared profile and one composition. Exact
@@ -61,11 +62,11 @@ import {
 
 type WrittenGraph = (
   | Gemma4Model | GeneratedGemma4Graph | MiniCPM5Model | Qwen35Model | Qwen35WideModel | Qwen38TrellisM4Pro | Qwen38TrellisM1Max | Qwen3Model | Qwen3MoeModel
-  | DiffusionGemmaModel | Glm52Model | UniversalDenseModel);
+  | DiffusionGemmaModel | Glm52Model | UniversalDenseModel | UniversalDenseWideModel);
 
 export type RuntimeModel = WrittenGraph & { makeCache(): Cache[]; readonly composition?: Composition };
 
-/** A family's generic graph: the table entry that constrains nothing. */
+/** A generic family file, with optional keys used only for default recommendation. */
 function generic(id: string, create: GraphEntry<Weights, WrittenGraph>["create"], serves: ServedComposition = {}): GraphEntry<Weights, RuntimeModel> {
   return loadedEntry({ id, serves, create });
 }
@@ -80,16 +81,13 @@ function loadedGraph(graph: WrittenGraph, composition: Composition): RuntimeMode
   return Object.assign(bindGraphCaches(graph, composition), { composition });
 }
 
-/** Every resident family's graphs, keyed by the graph its family declares. Each
- * table lists its graphs built for particular compositions (each with the
- * composition it was built and qualified for) and the family's generic graph; see {@link GraphTable} for how one is
- * selected. Adding a graph means adding an entry here (or to the list a table
- * spreads in). */
+/** Resident graph files and their default recommendation keys. Explicit
+ * choices are unrestricted; see {@link GraphTable}. */
 export const MLX_GRAPH_TABLES: Readonly<Record<ModelGraph, GraphTable<Weights, RuntimeModel>>> = Object.freeze({
   "diffusion-gemma": new GraphTable([generic("diffusion-gemma", (weights, config, composition) => new DiffusionGemmaModel(weights, config))]),
   "minicpm5": new GraphTable([generic("minicpm5", (weights, config, composition) => new MiniCPM5Model(weights, config, phaseRowLimit(composition)))]),
-  // Our published Trellis quant has its generated graphs (scripts/gen-qwen38.ts), keyed by its graph
-  // fingerprint (architecture plus the complete quantization table) and the GPU each was built for.
+  // Written graph recommendations for the published Trellis artifact.
+  // Explicit caller choices bypass these artifact and device keys.
   "qwen3.5": new GraphTable([
     loadedEntry({ id: QWEN38_TRELLIS_M4PRO_GRAPH, serves: {
         fingerprint:"cfa205c8f5af046a",device:"applegpu_g16s",maxRows:QWEN38_M4PRO_DECODE_ROWS,maxVerifyRows:QWEN38_M4PRO_VERIFY_ROWS,
@@ -108,7 +106,10 @@ export const MLX_GRAPH_TABLES: Readonly<Record<ModelGraph, GraphTable<Weights, R
   "qwen3": new GraphTable([generic("qwen3", (weights, config, composition) => new Qwen3Model(weights, config, phaseRowLimit(composition)))]),
   "gemma4": new GraphTable([...GENERATED_GRAPHS.map(loadedEntry), generic("gemma4", (weights, config, composition) => new Gemma4Model(weights, config, phaseRowLimit(composition)))],
     configFingerprint),
-  "universal-dense": new GraphTable([generic("universal-dense", (weights, config, composition) =>
+  "universal-dense": new GraphTable([
+    generic("universal-dense-wide-m3", (weights, config, composition) => new UniversalDenseWideModel(weights, config, genericArgsFor(config)!, phaseRowLimit(composition)), { device: "applegpu_g15s" }),
+    generic("universal-dense-wide-m4", (weights, config, composition) => new UniversalDenseWideModel(weights, config, genericArgsFor(config)!, phaseRowLimit(composition)), { device: "applegpu_g16s" }),
+    generic("universal-dense", (weights, config, composition) =>
     new UniversalDenseModel(weights, config, genericArgsFor(config)!, phaseRowLimit(composition)))]),
 });
 

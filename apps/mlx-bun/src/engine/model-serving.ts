@@ -1,3 +1,4 @@
+import { sequenceLogitsOperation } from "@mlx-bun/inference/scoring";
 import type { MlxSequenceRange, MlxSequenceForward } from "@mlx-bun/inference/contracts/mlx";
 import type { Composition } from "@mlx-bun/inference/contracts/portable";
 import type { ModelContext, LoadedModelContext } from "./model-host";
@@ -43,7 +44,7 @@ export async function modelServingBinding(context: LoadedModelContext, supplied?
         let hidden;
         try { hidden = sequenceHiddenOperation(scoring, input, caches, ids.length); } finally { input.dispose(); }
         let logits;
-        try { logits = model.logitsFromHidden(hidden); } finally { hidden.dispose(); }
+        try { logits = sequenceLogitsOperation(model, hidden); } finally { hidden.dispose(); }
         let f: Float32Array;
         let vocab: number;
         try {

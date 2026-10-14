@@ -54,6 +54,7 @@ export type MlxVerifyForward = MlxCapturingForward;
 /** The output head over a post-final-norm hidden [.., hidden-width] (borrowed)
  * to logits [.., vocabulary] the caller owns, possibly unevaluated. */
 export type MlxHeadForward = (hidden: MlxArray) => MlxArray;
+export interface MlxHeadRange { readonly from: number; readonly to: number; readonly operation: MlxHeadForward }
 
 /** The scoring and training forward, not a serving phase: every position of
  * `ids` [sequences, tokens] as one causal window over the caller's caches (the
@@ -222,6 +223,7 @@ export interface MlxDeclaredGraph {
   readonly mixedSeparate?: MlxSeparateMixed;
   /** Full-sequence scoring operations, indexed by total token rows. */
   readonly sequence?: readonly MlxSequenceRange[];
+  readonly sequenceLogits?: readonly MlxHeadRange[];
   /** Prepared embeddings without explicit positions, indexed by total rows. */
   readonly embeddingPrompt?: readonly import("./media").MlxEmbeddingsRange[];
 }

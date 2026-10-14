@@ -287,8 +287,8 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
     this.forwardLayers(this.embed.encode(ids), cache, "window");
     this.prompt = [{ from: 1, to: Infinity, operation: multiSequencePrompt }];
     this.multiSequencePrompt = this.prompt;
-    this.appendKnown = rowTable<MlxPhaseForward>((ids, cache) =>
-    this.forwardLayers(this.embed.encode(ids), cache, "window"), maxPhaseRows);
+    this.appendKnown = [{from:1,to:Infinity,operation:(ids, cache) =>
+    this.forwardLayers(this.embed.encode(ids), cache, "window")}];
     this.logits = rowTable<MlxHeadForward>(hidden => this.logitsFromHidden(hidden), maxPhaseRows);
     this.decode = rowTable<MlxPhaseForward>((ids, cache) =>
     this.forwardLayers(this.embed.encode(ids), cache, "decode"), maxPhaseRows);
@@ -342,7 +342,7 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
   /** A prompt's positions that are not a whole chunk: the window read at every width. */
 
   /** Known tokens: this graph declares no committed spans, so they read as a window. */
-  readonly appendKnown: MlxRowTable<MlxPhaseForward>;
+  readonly appendKnown: import("../../contracts/mlx/graph").MlxKnownOperations;
 
   /** The one output head at every width. */
   readonly logits: MlxRowTable<MlxHeadForward>;

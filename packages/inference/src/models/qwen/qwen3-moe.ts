@@ -273,13 +273,13 @@ export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
     this.decode = rowTableFrom(rows => rows < sortFrom ? decodeUnsorted : decodeSorted, maxPhaseRows);
     const windows = rowTableFrom(rows => rows < sortFrom ? windowUnsorted : windowSorted, maxPhaseRows);
     this.verify = windows;
-    this.appendKnown = windows;
     this.logits = rowTable(hidden => this.#head(hidden), maxPhaseRows);
     const sequence: MlxSequenceRange[] = [
       { from: 1, to: sortFrom - 1, operation: (ids, cache) => windowUnsorted(ids, cache) },
       { from: sortFrom, to: Infinity, operation: (ids, cache) => windowSorted(ids, cache) },
     ];
     this.sequence = sequence.filter(range => range.from <= range.to);
+    this.appendKnown = this.sequence;
 
     this.cacheLayers = this.layers.map(() => ({kind:"full" as const,turboQuant:"dense" as const}));
   }
@@ -322,7 +322,7 @@ export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
   /** A prompt's positions that are not a whole chunk: the window read at every width. */
 
   /** Known tokens: this graph declares no committed spans, so they read as a window. */
-  readonly appendKnown: MlxRowTable<MlxPhaseForward>;
+  readonly appendKnown: import("../../contracts/mlx/graph").MlxKnownOperations;
 
   /** The one output head at every width. */
   readonly logits: MlxRowTable<MlxHeadForward>;
