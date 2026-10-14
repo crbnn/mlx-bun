@@ -661,8 +661,6 @@ class SpeculativeGroup implements MlxGroupedMethod {
     if (keep.length !== rows.length) this.host.filterRows(keep);
   }
 
-  /** Deliver one verified sample of a step without drafts, as a round delivers its window: an EOS ends the row
-   *  unpublished, a consumer may stop it, and its budget ends it. */
   /** Start a probe: each row's proposals from `pending`, left on the device and submitted behind the step in flight. */
   #previewShadow(rows: readonly Row[], pending: readonly number[], depth: number, steps: readonly number[]): void {
     const tokens = this.#draft!.preview!(pending, depth, steps);
@@ -697,6 +695,8 @@ class SpeculativeGroup implements MlxGroupedMethod {
     for (const seen of shadow.seen.values()) if (seen > 0) this.#gate?.observe(seen, seen);
   }
 
+  /** Deliver one verified sample of a step without drafts, as a round delivers its window: an EOS ends the row
+   *  unpublished, a consumer may stop it, and its budget ends it. */
   async #deliverSample(row: Row, token: number): Promise<StepOutcome> {
     if (row.req.signal?.aborted) return { kind: "cancelled", reason: row.req.signal.reason };
     this.#compareShadow(row, token);
