@@ -185,6 +185,7 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis against main: logits, greedy tokens
   const { sequenceHiddenOperation, sequenceLogitsOperation } = await import("@mlx-bun/inference/scoring");
   const ops = await import("@mlx-bun/mlx/ops");
   const { Qwen38TrellisM1Max } = await import("@mlx-bun/inference/models/qwen38-27b-trellis-m1max");
+  const { Qwen38TrellisM4Pro } = await import("@mlx-bun/inference/models/qwen38-27b-trellis-m4pro");
   const { clearCache } = await import("@mlx-bun/mlx/ffi");
   const { observedPhases, phaseLogits } = await import("../models/phase-forward");
 
@@ -200,8 +201,10 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis against main: logits, greedy tokens
   const report: Record<string, unknown> = {};
   try {
     const model = createModel(weights, config) as A;
-    // Both trees select the written M1 graph for this artifact; the runtime's GPU family is checked above.
-    expect(model).toBeInstanceOf(Qwen38TrellisM1Max);
+    // The pinned capture names the graph main selected on the matching runtime.
+    assert.equal(model.constructor.name, reference.graph, "loaded graph differs from the reference's pinned graph");
+    assert.equal(model instanceof Qwen38TrellisM1Max || model instanceof Qwen38TrellisM4Pro, true,
+      "the reference requires a known written Qwen Trellis graph");
     report.graph = model.constructor.name;
     const generic = bindGraphCaches(new Qwen35Model(weights,config,phaseRowLimit(model.composition)),model.composition);
     releases.push(()=>generic.dispose());
