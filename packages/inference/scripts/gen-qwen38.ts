@@ -318,7 +318,9 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     // matmul, gains nothing over it.
     ane: { fraction: 0.34, minRows: 640, rows: [1024, 1536, 2048],
       rowMajorMlp: "AneTrellisMlpSplit", k3InterleavedMlp: "AneTrellisMlpSplitK3i", affine: null, projections: [] },
-    // MLX's quantized matmul bit for bit from 640 rows, 1.27x to 1.38x faster (DequantizedLinear).
+    // MLX's quantized matmul bit for bit from 128 rows (k_proj and v_proj from 513, above MLX's split-K GEMM),
+    // 1.1x to 1.3x faster from 192 rows (DequantizedLinear): time to first token of 300-, 400-, 500- and 639-token
+    // prompts 2.76/3.55/4.07/5.00 -> 2.60/3.39/3.80/4.63 s against it from 640 rows, logits bit-identical.
     promptProjection: "DequantizedLinear",
     // The DFlash 2 drafter's 4-bit projections (its five layers' attention and MLP, fc and the context k and v), each
     // kernel per row count: MLX's quantized matmul at one row, the affine row kernel at two to three (MLP 4.48 ->

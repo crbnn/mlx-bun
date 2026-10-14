@@ -1012,9 +1012,10 @@ rows) on the any-row matrix-unit Trellis kernels (`gateUpMmaWide`, `downMmaWide`
 with the split affine kernel for the projections and head, which decode each weight
 once per two or three blocks of 8 rows where the generic blocks re-decode or expand
 every weight (16 rows 0.89 s -> 0.19 s per forward); prompt pieces above 256 rows with their
-attention and DeltaNet projections on `layers/dequantized-linear` (from 640 rows the
-weight dequantized to bf16 and MLX's dense GEMM, MLX's quantized matmul bit for bit
-at the artifact's shapes and about 1.35x faster there); with the bridge and no
+attention and DeltaNet projections on `layers/dequantized-linear` (from 128 rows, and
+above MLX's split-K GEMM range at k_proj and v_proj's outputs, from 513, the weight
+dequantized to bf16 and MLX's dense GEMM, MLX's quantized matmul bit for bit at the
+artifact's shapes and 1.1x to 1.3x faster there); with the bridge and no
 adapters, Neural Engine operations over the M4 Pro's ranges and program sizes that
 split only the MLP, 34% of its channels on the Neural Engine; adapters as on the M4
 Pro; affine 4-bit group-64 KV on the M4 Pro's KV4 lego, its decode kernel at 128 tokens
