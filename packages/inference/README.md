@@ -46,9 +46,9 @@ graph (`models/gemma4/compiled-decode`) and reaches them through `compiledDecode
 it drives caches through the `CompiledDecodeCache` protocol (`contracts/mlx/cache`,
 implemented by the KV caches in `state/`) and names no cache class. Every cache
 lego has that form except direct pages the kernel reads, which declare none
-(`pagedDecodeCompiles` in `state/paged/cache`); the loader resolves
-`Composition.compiledDecode` off for such a composition, once, and nothing asks
-a cache at run time.
+(`pagedDecodeCompiles` in `state/paged/cache`). The autoregressive binding resolves
+replay eligibility from the paging and KV configuration once; requests with active
+adapters use the ordinary declared operations.
 The architecture gate rejects concrete model imports, model-class `instanceof`,
 model-type and `architectures` checks, family predicates and model-scoped flags there,
 in the app's engine, server and CLI, and in `@mlx-bun/training`. What those need to
