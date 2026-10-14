@@ -2,7 +2,7 @@
  * pre-refactor main checkout's own purpose-built graph and native shared MTP path
  * and records what they compute in a JSON file outside this repository.
  *
- *   cd <isolated main checkout at 3ea6ba5e>
+ *   cd <isolated main checkout at the pinned current main revision>
  *   MLX_BUN_LIBMLXC=<libmlxc.dylib> bun --no-env-file <this file> \
  *     --target <qwen38 packed-Trellis snapshot> --draft <folded MTP snapshot> --out main-qwen-trellis.json
  *
@@ -23,6 +23,7 @@ import { createHash } from "node:crypto";
 import { createReadStream, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { observeTargetPhases } from "./reference-phases";
+import { logitsEvidence, cachePositions, acceptedRounds, validateTeacherforce, validateNativeHeads, type LogitsEvidence, type TeacherforceEvidence } from "./reference-logits";
 import { parseArgs } from "node:util";
 
 const sha = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
@@ -108,12 +109,17 @@ async function produce(main: string, targetDir: string, draftDir: string) {
   // Native MTP: record every target forward's input ids, verify rows included.
   const provider = await QwenMtpProvider.load(draftDir);
   let forwards: number[][] = [];
-  const view = observeTargetPhases(model,(ids: Loose)=>forwards.push(ids.toIntTokens()));
+  let heads: LogitsEvidence[][] = [];
+  const view = observeTargetPhases(model,(ids: Loose)=>forwards.push(ids.toIntTokens()), (out: Loose) => {
+    const all: Float32Array = out.toFloat32(), V: number = out.shape.at(-1), L = all.length / V;
+    const rows = forwards.length === 1 ? [L - 1] : Array.from({length: L}, (_, i) => i);
+    heads.push(rows.map(i => logitsEvidence(all.subarray(i * V, (i + 1) * V))));
+  });
   const binding = bindMlxGateway(view, { provider, numDraftTokens: MTP_DEPTH });
   const runs: unknown[] = [];
   try {
     for (const prompt of prompts) {
-      forwards = [];
+      forwards = []; heads = [];
       const emitted: number[] = [];
       const options = { maxTokens: MTP_TOKENS, temperature: 0 };
       const plan = binding.plan({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
@@ -129,7 +135,37 @@ async function produce(main: string, targetDir: string, draftDir: string) {
           onToken(token: number) { emitted.push(token); } });
       } finally { await group.close(); }
       const spec = stats.spec as Record<string, unknown>;
-      runs.push({ prompt: prompt.text, tokens: emitted, forwards, spec: Object.fromEntries(
+      validateNativeHeads(heads, forwards, emitted, config.text.vocabSize);
+      const teacherforce: TeacherforceEvidence = {plain: [], windows: [], phases: []};
+      const cache = model.makeCache();
+      const { rollbackVerifyBlock } = await load(main, "state/rollback.ts");
+      const plain = async (tokens: number[], phase: "prompt" | "decode") => {
+        const before = cachePositions(cache);
+        using ids = ops.fromInt32(tokens, [1, tokens.length]);
+        using hidden = await dispatch.prompt(phase === "decode" ? "decode" : "tail", 1, tokens.length)(ids, cache, null);
+        using out = dispatch.logits(tokens.length)(hidden);
+        teacherforce.plain.push(logitsEvidence(gemma.lastPositionLogits(out)));
+        teacherforce.phases.push({phase, ids: [...tokens], before, after: cachePositions(cache)});
+      };
+      try {
+        await plain(prompt.ids, "prompt");
+        for (const round of acceptedRounds(forwards, emitted)) {
+          const before = cachePositions(cache);
+          for (const c of cache) c.specRoundBegin?.();
+          using ids = ops.fromInt32(round.window, [1, round.window.length]);
+          using hidden = await dispatch.verify(1, round.window.length)(ids, cache, null);
+          using out = dispatch.logits(round.window.length)(hidden);
+          ops.evalAll([out]);
+          const all: Float32Array = out.toFloat32(), V = config.text.vocabSize;
+          for (let j = 0; j < round.kept; j++) teacherforce.windows.push(logitsEvidence(all.subarray(j * V, (j + 1) * V)));
+          const after = cachePositions(cache);
+          rollbackVerifyBlock(cache, 0, round.window.length);
+          teacherforce.phases.push({phase: "verify", ids: round.window, before, after, afterRollback: cachePositions(cache)});
+          for (let j = 0; j < round.kept; j++) await plain([emitted[round.start + j]!], "decode");
+        }
+        validateTeacherforce(teacherforce, forwards, emitted, config.text.vocabSize);
+      } finally { for (const c of cache) c.dispose(); ffi.clearCache(); }
+      runs.push({ prompt: prompt.text, tokens: emitted, forwards, heads, teacherforce, spec: Object.fromEntries(
         ["drafted", "accepted", "rejected", "targetCalls", "rounds", "acceptanceLengths", "draftedByPos", "acceptedByPos"].map(k => [k, spec[k]])) });
       console.log(`mtp ${JSON.stringify(prompt.text.slice(0, 40))}: ${emitted.length} tokens, ${String(spec.accepted)}/${String(spec.drafted)} accepted`);
     }
@@ -157,10 +193,12 @@ for (const root of [main,resolve(import.meta.dir,"../../..")]) {
 if (existsSync(out)) throw new Error("reference output already exists");
 const artifacts = { target: await pin(target), draft: await pin(draft) };
 const reference = await produce(main, target, draft);
-writeFileSync(out, JSON.stringify({ producer: "main-qwen-trellis-reference", schema: 1,
+writeFileSync(out, JSON.stringify({ producer: "main-qwen-trellis-reference", schema: 2,
   provenance: { producerScript: "packages/inference/scripts/main-qwen-trellis-reference.ts",
     producerSha256: await fileSha(import.meta.path), phaseObserverSha256: await fileSha(join(import.meta.dir,"reference-phases.ts")),
+    teacherforceSha256: await fileSha(join(import.meta.dir,"reference-logits.ts")),
     producerRevision: Bun.spawnSync(["git","-C",resolve(import.meta.dir,"../../.."),"rev-parse","HEAD"]).stdout.toString().trim(),
+    producerWorktreeDirty: Bun.spawnSync(["git","-C",resolve(import.meta.dir,"../../.."),"status","--porcelain","--untracked-files=no"]).stdout.length > 0,
     bun: Bun.version },
   mainRevision: Bun.spawnSync(["git", "-C", main, "rev-parse", "HEAD"]).stdout.toString().trim(), artifacts, ...reference }, null, 1) + "\n");
 console.log(`wrote ${out}`);

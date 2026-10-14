@@ -61,3 +61,15 @@ test("producer help runs with unavailable native libraries",()=>{
     expect(result.exitCode).toBe(0);expect(result.stdout.toString()).toContain("--out");
   }
 });
+
+test("native head observers borrow the returned object and preserve named/range contracts", () => {
+  const seen: unknown[] = [], out = {dispose() { throw new Error("unexpected disposal"); }};
+  const named = {logits: {one: () => out}};
+  const a = observeTargetPhases(named, () => {}, value => seen.push(value));
+  expect(a.logits.one()).toBe(out);
+  const ranged = {logits: [{from: 1, to: Infinity, operation: () => out}]};
+  const b = observeTargetPhases(ranged, () => {}, value => seen.push(value));
+  expect(b.logits[0]!.operation()).toBe(out);
+  expect(seen).toEqual([out, out]);
+  expect(b.logits[0]!.to).toBe(Infinity);
+});
