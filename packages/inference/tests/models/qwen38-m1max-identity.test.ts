@@ -35,8 +35,12 @@ const HK = 4, HV = 16, DK = 64, DV = 64, KERNEL = 4;
 const KEY_DIM = HK * DK, VALUE_DIM = HV * DV, CONV_DIM = 2 * KEY_DIM + VALUE_DIM;
 const PREFIX = "language_model.model";
 const CHUNK = 257;
+// Even GPU-only checks construct a graph that eagerly loads its ANE splits.
+// Opt in on real Apple Silicon; hosted macOS cannot compile these programs.
+const ANE = !!process.env.MLX_BUN_TEST_ANE;
 
 beforeAll(()=>{
+  if (!ANE) return;
   for (const program of anePrograms({hidden:HIDDEN,intermediate:INTER,
     projections:[[HIDDEN,CONV_DIM],[HIDDEN,VALUE_DIM],[VALUE_DIM,HIDDEN],[HIDDEN,HEADS*HEAD_DIM*2]]})) AneProgram.compile(program);
 },180_000);
@@ -245,6 +249,7 @@ function graphs(scheme: string, overrides: Partial<Composition> = {}): { current
 }
 afterAll(() => { for (const { current,generic } of built.values()) {current.dispose();generic.dispose();} });
 
+describe.skipIf(!ANE)("M1 Max identity (MLX_BUN_TEST_ANE=1)", () => {
 describe("the written graph declarations", () => {
   test("universal targets, folded caches, tuned rows, ANE programs and measured draft facts", () => {
     for (const scheme of Object.keys(SCHEMES)) {
@@ -441,3 +446,4 @@ test("packed prompt and decode groups preserve hidden, capture order and indepen
     }
   } finally {for (const hidden of [...a,...b]) hidden?.dispose();disposeAll(...mine,...theirs);}
 },180_000);
+});

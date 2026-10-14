@@ -35,6 +35,9 @@ const HIDDEN = 512, INTER = 256, VOCAB = 256, HEADS = 4, KV_HEADS = 2, HEAD_DIM 
 const HK = 4, HV = 16, DK = 64, DV = 64, KERNEL = 4;
 const KEY_DIM = HK * DK, VALUE_DIM = HV * DV, CONV_DIM = 2 * KEY_DIM + VALUE_DIM;
 const PREFIX = "language_model.model";
+// Even GPU-only checks construct a graph that eagerly loads its ANE splits.
+// Opt in on real Apple Silicon; hosted macOS cannot compile these programs.
+const ANE = !!process.env.MLX_BUN_TEST_ANE;
 
 const owned: MlxArray[] = [];
 afterAll(() => { for (const array of owned) array.dispose(); });
@@ -214,11 +217,13 @@ let synthetic: { weights: Weights; config: ModelConfig } | null = null;
 const source = () => synthetic ??= artifact();
 let built: (Qwen38TrellisM4Pro & {makeCache():Cache[]}) | null = null;
 beforeAll(() => {
+  if (!ANE) return;
   for (const program of anePrograms({hidden:HIDDEN,intermediate:INTER,projections:[[HIDDEN,VALUE_DIM],[VALUE_DIM,HIDDEN]]})) AneProgram.compile(program);
 });
 afterAll(() => { built?.dispose(); });
 const graph = () => built ??= bindGraphCaches(new Qwen38TrellisM4Pro(source().weights,source().config),composition());
 
+describe.skipIf(!ANE)("M4 Pro identity (MLX_BUN_TEST_ANE=1)", () => {
 describe("composition", () => {
   test("makeCache composes the lego the composition's KV scheme names; the graph declares what the composition built", () => {
     const current = graph();
@@ -366,4 +371,5 @@ describe("the M4 Pro graph against the generic Qwen 3.5 graph where both run the
       disposeAll(mine,theirs);generic.dispose();
     }
   },180_000);
+});
 });
