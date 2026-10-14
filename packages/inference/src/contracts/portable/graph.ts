@@ -24,12 +24,6 @@ export interface GraphCapabilities {
   /** The method the graph's forward serves. Token-level methods (speculation,
    * grammar proposals, fill) bind only to `autoregressive`. */
   readonly method: "autoregressive" | "denoising";
-  readonly adapters: {
-    /** Named mount points exist: rows select adapters inside one shared group. */
-    readonly batched: boolean;
-    /** The application offers adapter mounting and training for this graph. */
-    readonly mountable: boolean;
-  };
   /** Prepared media the graph accepts, or null. Requests carrying prepared
    * embeddings need a `bindMediaInput` operation; `video` says video frames
    * are accepted input. */

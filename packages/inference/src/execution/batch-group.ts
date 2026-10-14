@@ -63,7 +63,7 @@ import { activeMemory,cacheMemory,clearCache,Dtype,peakMemory } from "@mlx-bun/m
 import * as ops from "@mlx-bun/mlx/ops";
 import { type Cache } from "../contracts/mlx/cache";
 import type { PrefillPolicy } from "../contracts/portable/prefill";
-import { widthClass, type MlxCompiledDecodeStep, type MlxMixedForward } from "../contracts/mlx/graph";
+import { type MlxCompiledDecodeStep, type MlxMixedRange } from "../contracts/mlx/graph";
 import { BF16_KV,COMPOSITION_DEFAULTS } from "../contracts/portable/composition";
 import { resolveMlxPrefillPolicy } from "../generation/bindings/prefill-policy";
 import { acquireModelWiredLimit } from "../generation/index";
@@ -160,7 +160,7 @@ export class MlxBatchExecutionGroup {
   readonly #vectorGreedy: boolean;
   /** The mixed iteration: the graph's mixed-rows forward when it declares one and the composition's
    *  `mixedPrefill` is on (default off), bound once; null otherwise. */
-  readonly #mixed: MlxMixedForward | null;
+  readonly #mixed: readonly MlxMixedRange[] | null;
   /** The composition's `mixedTokenBudget`: prompt tokens one mixed forward carries. */
   readonly #mixedTokenBudget: number;
 
@@ -331,7 +331,7 @@ export class MlxBatchExecutionGroup {
             const closes = [...this.#running, ...(this.#prefill?.rows ?? [])].map(row =>
               row.req.trace?.begin("engine.mixed_forward", { workId,
                 decodeTokens: tokens[0]!, prefillTokens: tokens[1]!, packedTokens: tokens[0]! + tokens[1]! }));
-            try { return mixed(groups, widthClass(rows)); }
+            try { return mixed.find(range => rows >= range.from && rows <= range.to)!.operation(groups, rows); }
             finally { for (const close of closes) close?.(); }
           },
         });
@@ -480,7 +480,6 @@ export class MlxBatchExecutionGroup {
     for (const row of rows) row.reject(error);
     disposeResources(resources);
   }
-
 
   /** The target owns projection geometry; samplers receive individual rows. */
   #projectPrefill(hidden: MlxArray, caches: Cache[], completed: readonly PrefillState[], step: MlxPrefillForward): MlxArray {
@@ -669,10 +668,10 @@ export class MlxBatchExecutionGroup {
   /** One decode forward of the `B` running rows: the media rows' positioned decode or the graph's decode for
    *  their width, through the mixed iteration's hook when it runs one. */
   #decodeForward(ids: MlxArray, caches: Cache[], B: number, work?: MlxForwardWork): Promise<MlxArray> {
-    const width = widthClass(B), decodeState = this.#running[0]?.req.promptInput?.decodeState;
+    const width = (B), decodeState = this.#running[0]?.req.promptInput?.decodeState;
     const states = decodeState ? this.#running.map(row => row.req.promptInput!.decodeState!) : null;
     const own = async () => decodeState ? decodeState.decode(ids, caches, states!, width) : this.#dispatch.decode(B)(ids, caches, null);
-    return work ? work(ids, caches, { phase: "decode", rows: B, width, capture: null, own }) : own();
+    return work ? work(ids, caches, { phase: "decode", rows: B, capture: null, own }) : own();
   }
 
   async #step(forward?: MlxForwardWork): Promise<void> {

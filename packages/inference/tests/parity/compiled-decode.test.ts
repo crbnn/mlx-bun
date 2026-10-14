@@ -176,7 +176,7 @@ for (const [family, checkpoint] of [
             } else {
               const ids = mlx.ops.reshape(cur, [1, 1]);
               let hidden: MlxArray;
-              try { hidden = graph.decode.one(ids, cache, null); }
+              try { hidden = graph.decode[1]!(ids, cache, null) as MlxArray; }
               finally { ids.dispose(); }
               try { logits = graph.logitsFromHidden(hidden); }
               finally { hidden.dispose(); }

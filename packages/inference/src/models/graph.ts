@@ -1,7 +1,8 @@
 import type { ModelConfig } from "../artifacts/config";
 import type { Cache } from "../contracts/mlx/cache";
 import type { MlxArray } from "@mlx-bun/mlx/array";
-import type { MlxDeclaredGraph, MlxModelMemory, MlxTokenPhases, MlxWidthClass, MlxWidthTable } from "../contracts/mlx/graph";
+import type { MlxDeclaredGraph, MlxModelMemory, MlxTokenPhases, MlxRowTable, MlxCacheLayer } from "../contracts/mlx/graph";
+import { DEFAULT_MAX_ROWS, PREFILL_CHUNK_TOKENS } from "./composition";
 import type { Composition } from "../contracts/portable/composition";
 
 /** What the shared token executors (the batch group, its preparation cohorts,
@@ -18,24 +19,30 @@ export interface MlxTokenGraph extends MlxDeclaredGraph, Partial<MlxTokenPhases>
   readonly loraState?: { active: string[] };
   /** One cache per cache layer: the caches the composition's KV scheme names
    * (`composedFullAttentionCache`, `composedSlidingAttentionCache`). */
+  readonly cacheLayers?: readonly MlxCacheLayer[];
   makeCache(): Cache[];
   /** The vision prefill phase over a prompt's prepared embeddings (borrowed), for
    *  direct generation: image tokens attending each other both ways where
    *  `imageMask` marks them, `ids` feeding per-layer inputs; `width` is the class
    *  of the prompt's rows. */
   prefillEmbeddings?(embeddings: MlxArray, state: Cache[], imageMask: MlxArray | null,
-    ids: MlxArray, multimodalMask: MlxArray | null, width: MlxWidthClass): MlxArray;
+    ids: MlxArray, multimodalMask: MlxArray | null, width: number): MlxArray;
 }
 
-/** The width table of a graph whose one operation serves every width class. */
-export function atEveryWidth<Operation>(operation: Operation): MlxWidthTable<Operation> {
-  return Object.freeze({ one: operation, twoToThree: operation, four: operation, fiveToEight: operation, wider: operation });
+/** Materialize the exact row keys the caller's scheduler can supply. */
+export function rowTable<Operation>(operation: Operation, rows: number = DEFAULT_MAX_ROWS * PREFILL_CHUNK_TOKENS): MlxRowTable<Operation> {
+  return Object.freeze(Object.fromEntries(Array.from({ length: rows }, (_, i) => [i + 1, operation])));
 }
 
-/** A width table whose entry for each class `build` makes once, at construction. */
-export function byWidth<Operation>(build: (width: MlxWidthClass) => Operation): MlxWidthTable<Operation> {
-  return Object.freeze({ one: build("one"), twoToThree: build("twoToThree"), four: build("four"),
-    fiveToEight: build("fiveToEight"), wider: build("wider") });
+/** Generic graphs bind their row-specific operations once, before execution. */
+export function rowTableFrom<Operation>(build: (rows: number) => Operation, rows: number = DEFAULT_MAX_ROWS * PREFILL_CHUNK_TOKENS): MlxRowTable<Operation> {
+  return Object.freeze(Object.fromEntries(Array.from({ length: rows }, (_, i) => [i + 1, build(i + 1)])));
+}
+
+/** Maximum token rows the scheduler can present under this configuration. */
+export function phaseRowLimit(composition: Pick<Composition, "maxRows" | "prefillChunkTokens" | "draftDepth">): number {
+  const depth = typeof composition.draftDepth === "number" ? composition.draftDepth : composition.draftDepth.max;
+  return composition.maxRows * Math.max(composition.prefillChunkTokens, depth + 1);
 }
 
 /** The phase a forward runs, named by its caller: one new position per row

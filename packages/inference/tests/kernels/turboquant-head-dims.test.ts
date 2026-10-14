@@ -124,13 +124,13 @@ function forcedLogits(d: number, kv: KvStorageScheme): MlxArray {
   const tokens = Array.from({ length: PROMPT + FORCED }, (_, i) => (i * 37 + 11) % VOCAB);
   try {
     using prompt = ops.fromInt32(tokens.slice(0, PROMPT), [1, PROMPT]);
-    (model.prefillChunk.gpu(prompt, caches, null) as MlxArray).dispose();
+    (model.multiSequencePrompt.at(-1)!.operation(prompt, caches, null) as MlxArray).dispose();
     const rows: MlxArray[] = [];
     try {
       for (let step = 0; step < FORCED; step++) {
         using id = ops.fromInt32([tokens[PROMPT + step]!], [1, 1]);
-        using hidden = model.decode.one(id, caches) as MlxArray;
-        rows.push(model.logits.one(hidden));
+        using hidden = model.decode[1]!(id, caches, null) as MlxArray;
+        rows.push(model.logits[1]!(hidden));
       }
       return ops.concatAxis(rows, 1);
     } finally { for (const row of rows) row.dispose(); }

@@ -1,3 +1,4 @@
+import { MlxPhaseDispatch } from "../../src/generation/phase-dispatch";
 // The dense graphs no artifact on either machine holds, over small synthetic
 // weights, held to their recorded digest (tests/fixtures/synthetic-digests/
 // dense-family.json; tests/models/synthetic-digest.ts): Qwen3, Qwen3-MoE and the
@@ -19,7 +20,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { parseQuantization, type ModelConfig } from "../../src/artifacts/config";
 import type { Weights } from "../../src/artifacts/weights";
 import type { BatchableCache, Cache, PaddedPrefillCache } from "../../src/contracts/mlx/cache";
-import type { MlxPhaseForward, MlxPrefillChunk, MlxVerifyForward, MlxWidthTable } from "../../src/contracts/mlx/graph";
+import type { MlxCapturingForward, MlxPhaseForward, MlxPromptRange, MlxVerifyForward, MlxRowTable } from "../../src/contracts/mlx/graph";
 import type { RuntimeModel } from "../../src/models/factory";
 import { trainForward } from "../../src/scoring/full-sequence";
 import { evalPpl } from "../../src/scoring/perplexity";
@@ -127,10 +128,12 @@ const denseMlp = (t: Tensors) => (_layer: number, prefix: string) => {
 interface PhasedGraph {
   makeCache(): Cache[];
   logitsFromHidden(h: MlxArray): MlxArray;
-  readonly prefillChunk: MlxPrefillChunk;
-  readonly prefillTail: MlxWidthTable<MlxVerifyForward>;
-  readonly decode: MlxWidthTable<MlxPhaseForward>;
-  readonly verify: MlxWidthTable<MlxVerifyForward>;
+  readonly prompt: readonly MlxPromptRange[];
+  readonly multiSequencePrompt: readonly MlxPromptRange[];
+  readonly appendKnown: MlxRowTable<MlxPhaseForward>;
+  readonly logits: MlxRowTable<(hidden:MlxArray)=>MlxArray>;
+  readonly decode: MlxRowTable<MlxCapturingForward>;
+  readonly verify: MlxRowTable<MlxVerifyForward>;
 }
 
 type Scheme = { name: string; kvBits?: number; kernels?: "tiled-causal" | "unfused"; turbo?: { kBits: number; vBits: number } };
@@ -298,24 +301,24 @@ for (const family of FAMILIES) {
         try {
           const prefill = prompt(37, 1);
           step(digest, "prefill37", g, caches, [prefill]);
-          phased(digest, "prefillChunk37", g, phaseCaches, [prefill], (input, set) => g.prefillChunk.gpu(input, set, null));
+          phased(digest, "prefillChunk37", g, phaseCaches, [prefill], (input, set) => g.multiSequencePrompt.at(-1)!.operation(input, set, null));
           convert(scheme, caches, phaseCaches);
           digest.caches("converted", caches);
           digest.caches("converted (phase operation)", phaseCaches);
 
           for (let index = 0; index < 3; index++) {
             step(digest, `decode ${index}`, g, caches, [[200 + index]]);
-            phased(digest, `decode ${index}`, g, phaseCaches, [[200 + index]], (input, set) => g.decode.one(input, set));
+            phased(digest, `decode ${index}`, g, phaseCaches, [[200 + index]], (input, set) => g.decode[1]!(input, set, null));
           }
           step(digest, "window5", g, caches, [prompt(5, 2)]);
-          phased(digest, "prefillTail5", g, phaseCaches, [prompt(5, 2)], (input, set) => g.prefillTail.fiveToEight(input, set, null) as MlxArray);
+          phased(digest, "prefillTail5", g, phaseCaches, [prompt(5, 2)], (input, set) => new MlxPhaseDispatch(g).prompt("tail", 1, 5)(input, set, null) as MlxArray);
           step(digest, "verify4", g, caches, [prompt(4, 3)]);
-          phased(digest, "verify4", g, phaseCaches, [prompt(4, 3)], (input, set) => g.verify.four(input, set, null));
+          phased(digest, "verify4", g, phaseCaches, [prompt(4, 3)], (input, set) => g.verify[4]!(input, set, null));
 
           // A speculative round: arm, verify 5, keep 2, decode.
           roundBegin(caches, phaseCaches);
           step(digest, "spec verify5", g, caches, [prompt(5, 4)]);
-          phased(digest, "spec verify5", g, phaseCaches, [prompt(5, 4)], (input, set) => g.verify.fiveToEight(input, set, null));
+          phased(digest, "spec verify5", g, phaseCaches, [prompt(5, 4)], (input, set) => g.verify[5]!(input, set, null));
           rollback(2, caches, phaseCaches);
           digest.caches("spec rollback keep 2", caches);
           step(digest, "decode after rollback", g, caches, [[77]]);
