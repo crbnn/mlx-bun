@@ -2,7 +2,7 @@ import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { Cache } from "../contracts/mlx/cache";
 import type { MlxPhaseGroup } from "../contracts/mlx/graph";
-import { mapPackedTokens } from "../input/token-groups";
+import { mapPackedTokens } from "./token-groups";
 
 /** Group geometry and ownership for written packed operations. The graph
  * supplies each layer's direct calls; this scope selects no numerical operation. */

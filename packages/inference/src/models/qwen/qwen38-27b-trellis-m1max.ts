@@ -23,7 +23,7 @@ import type { ReadPhase } from "../graph";
 import { QwenDeltaLayer as Delta, QwenAttentionLayer as Attention } from "./blocks";
 import { bindQwenMediaInput, qwenDraftTarget, qwenMediaEncoders, qwenResidualBasis } from "./media-input";
 import { DeltaWeights, AttentionWeights, GateDownMLP, canonicalQwenWeights, type QwenProjectionTarget } from "./written-layers";
-import { PackedMixedScope } from "../../scheduling/packed-mixed";
+import { PackedMixedScope } from "../../input/packed-mixed";
 
 export const QWEN38_TRELLIS_M1MAX_GRAPH="qwen3.8-27b-trellis-3.2bpw-m1max";
 export const DECODE_ROWS=8;
