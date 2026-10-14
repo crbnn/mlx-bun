@@ -156,13 +156,12 @@ describe("the Qwen 3.5 table", () => {
     expect(select(on(M4_PRO, qwen, { maxRows: 16 }))).toBe("qwen3.5-wide-m4");
   });
 
-  test("on applegpu_g13s the generated M1 Max graph serves the artifact whatever its KV scheme or rows; other GPUs get the generic graph", () => {
+  test("on applegpu_g13s the M1 Max graph serves every KV scheme within its declared row caps; other GPUs or larger batches get the generic graph", () => {
     expect(select(on(M1_MAX, qwen))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
     expect(select(on(M1_MAX, qwen, { kv: { override: 8 } }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
-    expect(select(on(M1_MAX, qwen, { kv: { override: 4 }, maxRows: 16 }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
+    expect(select(on(M1_MAX, qwen, { kv: { override: 4 }, maxRows: 16 }))).toBe("qwen3.5");
     expect(select(on(M1_MAX, qwen, { kv: { turboQuant: { kBits: 8, vBits: 3 } } }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
     expect(select(on("applegpu_g15s", qwen))).toBe("qwen3.5-wide-m3");
-
   });
 
   test("another Qwen 3.5 artifact gets the generic graph on every device; the table fingerprints with the Trellis graph fingerprint", () => {

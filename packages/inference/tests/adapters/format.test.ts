@@ -268,6 +268,7 @@ test("fused Trellis gate/up/down adapters follow B1/B4 request contexts and unmo
   // Custom graphs may construct the fused layer before their manager binds its targets.
   const inferred = new TrellisFusedMLP(gate,up,new TrellisScatterPrompt(down));
 
+
   const makeAdapter = (name:string,alpha:number) => {
     const dir=join(root,name);mkdirSync(dir,{recursive:true});
     writeFileSync(join(dir,"adapter_config.json"),JSON.stringify({lora_alpha:alpha,r:RANK}));
@@ -295,6 +296,7 @@ test("fused Trellis gate/up/down adapters follow B1/B4 request contexts and unmo
         let actual:MlxArray;
         try {actual=fused.forward(x); using automatic=inferred.forward(x); bytesEqual(automatic,actual);} finally {restore();}
 
+
         using candidate=actual;
         expect(state.active).toEqual([]);
         using plainGate=new TrellisReducePrompt(gate).forward(x),plainUp=new TrellisReducePrompt(up).forward(x);
@@ -305,6 +307,7 @@ test("fused Trellis gate/up/down adapters follow B1/B4 request contexts and unmo
       using originalHidden=fusedGateUpSwiglu(x,gate,up),original=new TrellisScatterPrompt(down).forward(originalHidden);
       using recovered=fused.forward(x),automaticRecovery=inferred.forward(x);bytesEqual(recovered,original);bytesEqual(automaticRecovery,original);
 
+
       const restore=binding.bindAdapterContext!(["A"],"cancelled").enter();
       try {throw new Error("cancelled request");} catch {} finally {restore();}
       using afterCancel=fused.forward(x);bytesEqual(afterCancel,original);
@@ -312,6 +315,7 @@ test("fused Trellis gate/up/down adapters follow B1/B4 request contexts and unmo
     expect(manager.unmount("A")).toBe(3);expect(manager.unmount("B")).toBe(3);
     expect(manager.list()).toEqual([]);expect(state.active).toEqual([]);
   } finally {manager.unmount("A");manager.unmount("B");fused.dispose();inferred.dispose();for(const array of owned)array.dispose();}
+
 
 });
 

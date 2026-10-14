@@ -18,7 +18,7 @@ import {
   anePrograms as qwen38TrellisM4ProAnePrograms,
 } from "./qwen/qwen38-27b-trellis-m4pro";
 import {
-  COMPOSITION as QWEN38_TRELLIS_M1MAX_COMPOSITION, QWEN38_TRELLIS_M1MAX_GRAPH, Qwen38TrellisM1Max,
+  DECODE_ROWS as QWEN38_M1MAX_DECODE_ROWS, VERIFY_ROWS as QWEN38_M1MAX_VERIFY_ROWS, QWEN38_TRELLIS_M1MAX_GRAPH, Qwen38TrellisM1Max,
 } from "./qwen/qwen38-27b-trellis-m1max";
 import { GENERATED_GRAPHS, type GeneratedGemma4Graph } from "./gemma4/graphs";
 import { MiniCPM5Model } from "./minicpm5/model";
@@ -96,8 +96,9 @@ export const MLX_GRAPH_TABLES: Readonly<Record<ModelGraph, GraphTable<Weights, R
       create: (weights,config) => new Qwen38TrellisM4Pro(weights,config),
       anePrograms: () => qwen38TrellisM4ProAnePrograms() }),
     // The M1 Max composition builds no Neural Engine operation (its device's table has none): no programs to install.
-    loadedEntry({ id: QWEN38_TRELLIS_M1MAX_GRAPH, serves: QWEN38_TRELLIS_M1MAX_COMPOSITION,
-      create: (weights, config, composition) => new Qwen38TrellisM1Max(weights, config, composition) }),
+    loadedEntry({ id: QWEN38_TRELLIS_M1MAX_GRAPH, serves: {
+      fingerprint:"cfa205c8f5af046a",device:"applegpu_g13s",maxRows:QWEN38_M1MAX_DECODE_ROWS,maxVerifyRows:QWEN38_M1MAX_VERIFY_ROWS,
+    }, create: (weights, config) => new Qwen38TrellisM1Max(weights, config) }),
     generic("qwen3.5-wide-m3", (weights, config, composition) => new Qwen35WideModel(weights, config, phaseRowLimit(composition)), { device: "applegpu_g15s" }),
     generic("qwen3.5-wide-m4", (weights, config, composition) => new Qwen35WideModel(weights, config, phaseRowLimit(composition)), { device: "applegpu_g16s" }),
     generic("qwen3.5", (weights, config, composition) => new Qwen35Model(weights, config, phaseRowLimit(composition))),

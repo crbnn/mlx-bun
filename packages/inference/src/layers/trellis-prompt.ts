@@ -79,6 +79,7 @@ export class TrellisFusedMLP {
   constructor(readonly gate: TrellisLinear, readonly up: TrellisLinear, readonly down: RowProjection,
     state?: LoraState) {
 
+
     const adapted = new TrellisUnfusedMLP(new TrellisReducePrompt(gate), new TrellisReducePrompt(up), down);
     this.#operation = new LoraOperation(x => {
       using hidden = fusedGateUpSwiglu(x, gate, up);

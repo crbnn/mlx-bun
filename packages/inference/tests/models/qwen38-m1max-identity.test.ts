@@ -1,17 +1,8 @@
-import type { TestGraph } from "./test-composition";
-import { testGraph } from "./test-composition";
-import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
 import { MlxPhaseDispatch } from "../../src/generation/phase-dispatch";
-// The generated M1 Max graph (src/models/qwen/qwen38-27b-trellis-m1max.ts, an entire graph built from the
-// composition) on small synthetic weights laid out by the generated quant table: 48 DeltaNet and 16 attention layers
-// with the artifact's 3- and 4-bit affine projections, Trellis gate/up at the artifact's widths (mixed in its ten
-// layers) and its 3-bit block-interleaved and row-major downs, scaled down in width. The composition facts it
-// declares (LoRA targets, no committed spans, no Neural Engine operation, its measured verify costs, the residual
-// basis its fold record names, the caches of each KV scheme). From five rows the graph runs the generic blocks: there
-// it is held to the generic Qwen 3.5 graph of its family over the same weights under bf16, affine 4- and 8-bit and
-// TurboQuant KV, hidden, logits and every cache tensor, at maxDiff 0. Its reduce and scatter layers at one to four
-// rows have no generic counterpart: the generator's drift test (qwen38-generated-sync), the real-artifact parity suite
-// on the M1 Max (tests/parity/qwen-trellis-parity.test.ts) and the app digests are their gates. No model, no download.
+// Written M1 operations on a small synthetic artifact with all 64 quantization
+// layouts. Expanded GPU windows preserve exact hidden, head, and cache tensors
+// under every KV scheme. Artifact-sized tiled/reduce/scatter kernels are held
+// to their fixed-layer numerical tests and real-artifact parity gates.
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -25,8 +16,11 @@ import type { Weights } from "../../src/artifacts/weights";
 import type { BatchableCache, Cache } from "../../src/contracts/mlx/cache";
 
 import type { Composition, KvStorageScheme } from "../../src/contracts/portable/composition";
-import { LAYERS, Qwen38TrellisM1Max } from "../../src/models/qwen/qwen38-27b-trellis-m1max";
+import { Qwen38TrellisM1Max } from "../../src/models/qwen/qwen38-27b-trellis-m1max";
+import { LAYERS } from "./qwen38-layout";
+import { bindGraphCaches } from "../../src/models/cache-composition";
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
+import type { TrellisMlp } from "../../src/models/qwen/blocks";
 
 const HIDDEN = 512, INTER = 256, VOCAB = 256, HEADS = 4, KV_HEADS = 2, HEAD_DIM = 256;
 const HK = 4, HV = 8, DK = 64, DV = 64, KERNEL = 4;
@@ -125,7 +119,7 @@ function artifact(): { weights: Weights; config: ModelConfig } {
       linearNumKeyHeads: HK, linearNumValueHeads: HV, linearKeyHeadDim: DK, linearValueHeadDim: DV,
       linearConvKernelDim: KERNEL, fullAttentionInterval: 4, partialRotaryFactor: 0.25,
       ropeParameters: { full_attention: { ropeTheta: 10_000_000, ropeType: "default", partialRotaryFactor: 0.25, factor: 1 } },
-      tieWordEmbeddings: false,
+      tieWordEmbeddings: false,maxPositionEmbeddings:4096,
     },
   } as unknown as ModelConfig;
   return { weights, config };
@@ -133,8 +127,9 @@ function artifact(): { weights: Weights; config: ModelConfig } {
 
 const composition = (overrides: Partial<Composition> = {}): Composition => Object.freeze<Composition>({
   device: "applegpu_g13s", kv: { kind: "bf16" }, pagedKv: null, draftDepth: { adaptive: true, max: 7 },
-  prefillChunkTokens: CHUNK, maxRows: 8, vectorGreedySampling: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
-  grammarJump: false, greedyDraft: false, ...overrides,
+  prefillChunkTokens: CHUNK, adapters: false, maxRows: 8, packedMixedMlp: true,
+  vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
+  grammarJump: false, greedyDraft: false, compiledGeglu: true, compiledSwiglu: true, ...overrides,
 });
 
 /** The KV schemes the composition serves, as `--kv-quant` composes them (fused SDPA unset). */
@@ -217,26 +212,33 @@ const disposeAll = (...sets: Cache[][]) => { for (const set of sets) for (const 
 
 let synthetic: { weights: Weights; config: ModelConfig } | null = null;
 const source = () => synthetic ??= artifact();
-const built = new Map<string, { current: Qwen38TrellisM1Max; generic: TestGraph<Qwen35Model> }>();
-function graphs(scheme: string, overrides: Partial<Composition> = {}): { current: Qwen38TrellisM1Max; generic: TestGraph<Qwen35Model> } {
+type BoundM1=Qwen38TrellisM1Max & {makeCache():Cache[]};
+const built = new Map<string, { current: BoundM1; generic: Qwen35Model }>();
+function graphs(scheme: string, overrides: Partial<Composition> = {}): { current: BoundM1; generic: Qwen35Model } {
   const key = `${scheme} ${JSON.stringify(overrides)}`;
   let found = built.get(key);
   if (!found) {
     const { weights, config } = source();
     const facts = composition({ kv: SCHEMES[scheme]!, ...overrides });
-    found = { current: new Qwen38TrellisM1Max(weights, config, facts), generic: testGraph(new Qwen35Model(weights, config, phaseRowLimit(facts)), facts) };
+    found = { current: bindGraphCaches(new Qwen38TrellisM1Max(weights, config), facts), generic: new Qwen35Model(weights, config, facts) };
     built.set(key, found);
   }
   return found;
 }
-afterAll(() => { for (const { current } of built.values()) current.dispose(); });
+afterAll(() => { for (const { current,generic } of built.values()) {current.dispose();generic.dispose();} });
 
-describe("the composition the generated graph declares", () => {
+describe("the written graph declarations", () => {
   test("LoRA targets, caches, no committed spans, no Neural Engine operation, the verify costs its composition measured", () => {
     for (const scheme of Object.keys(SCHEMES)) {
       const { current, generic } = graphs(scheme);
-      expect([...current.loraTargets().keys()].sort()).toEqual([...generic.loraTargets().keys()].sort());
-      expect(current.loraTargets().size).toBe(48 * 5 + 16 * 4);
+      const expected=LAYERS.flatMap((spec,layer)=>{
+        const prefix=`${PREFIX}.layers.${layer}`;
+        const projections=spec.kind==="deltanet"?["in_proj_qkv","in_proj_z","in_proj_a","in_proj_b","out_proj"]:["q_proj","k_proj","v_proj","o_proj"];
+        const block=spec.kind==="deltanet"?"linear_attn":"self_attn";
+        return [...projections.map(name=>`${prefix}.${block}.${name}`),...(["gate_proj","up_proj","down_proj"] as const).map(name=>`${prefix}.mlp.${name}`)];
+      });
+      expect([...current.loraTargets().keys()].sort()).toEqual(expected.sort());
+      expect(current.loraTargets().size).toBe(48 * 5 + 16 * 4 + 64 * 3);
       expect((current as { knownSpans?: unknown }).knownSpans).toBeUndefined();
       expect([...current.verifyRoundCosts]).toEqual([[1,1],[2,1.89],[3,2.35],[4,2.97],[5,12.22],[6,13.16],[7,13.02],[8,12.88]]);
       expect(current.prompt.filter(range => range.unit === "ane")).toEqual([]);
@@ -254,12 +256,12 @@ describe("the composition the generated graph declares", () => {
     try {
       const at = { ...config, modelDir: dir } as ModelConfig;
       const declared = (graph: { draftTarget(caches: Cache[]): { residualBasis?: unknown } }) => graph.draftTarget([]).residualBasis;
-      const without = new Qwen38TrellisM1Max(weights, at, composition());
+      const without = new Qwen38TrellisM1Max(weights, at);
       expect(declared(without)).toBeUndefined();
       without.dispose();
       writeFileSync(join(dir, TURBOQUANT_FOLD_FILE), JSON.stringify({ seed: 7, r1: true, hiddenSize: HIDDEN,
         final_gain: Array.from({ length: HIDDEN }, (_, i) => 1 + i / HIDDEN) }));
-      const current = new Qwen38TrellisM1Max(weights, at, composition());
+      const current = new Qwen38TrellisM1Max(weights, at);
       expect(declared(current)).toEqual({ r1Seed: 7, finalGain: Float32Array.from({ length: HIDDEN }, (_, i) => 1 + i / HIDDEN) });
       current.dispose();
     } finally { console.error = quiet; rmSync(dir, { recursive: true, force: true }); }
@@ -267,11 +269,11 @@ describe("the composition the generated graph declares", () => {
 });
 
 for (const scheme of Object.keys(SCHEMES)) {
-  test(`${scheme} KV: from five rows, the M1 Max graph equals the generic Qwen 3.5 graph (prompt chunk, tails, verify, decode of several sequences)`, () => {
+  test(`${scheme} KV: expanded GPU windows equal generic Qwen hidden, logits and caches`, () => {
     const { current, generic } = graphs(scheme);
     const mine = current.makeCache(), theirs = generic.makeCache();
     const step = (label: string, width: number, rows: number[][],
-      run: (graph: Qwen38TrellisM1Max | TestGraph<Qwen35Model>, input: MlxArray, caches: Cache[]) => MlxArray | Promise<MlxArray>) => {
+      run: (graph: Qwen38TrellisM1Max | Qwen35Model, input: MlxArray, caches: Cache[]) => MlxArray | Promise<MlxArray>) => {
       using input = ids(rows);
       outputDiff(`${scheme} ${label}`, run(current, input, mine) as MlxArray, run(generic, input, theirs) as MlxArray,
         current.logits[width]!, generic.logits[width]!);
@@ -279,10 +281,70 @@ for (const scheme of Object.keys(SCHEMES)) {
     };
     try {
       step(`prefillChunk.gpu ${CHUNK}`, 9, [prompt(CHUNK, 1)], (g, input, caches) => g.multiSequencePrompt.at(-1)!.operation(input, caches, null));
-      step("prefillTail.fiveToEight 6", 5, [prompt(6, 2)], (g, input, caches) => new MlxPhaseDispatch(g).prompt("tail", 1, 5)(input, caches, null));
-      step("prefillTail.wider 13", 9, [prompt(13, 3)], (g, input, caches) => new MlxPhaseDispatch(g).prompt("tail", 1, 9)(input, caches, null));
-      step("verify.fiveToEight 8", 5, [prompt(8, 4)], (g, input, caches) => g.verify[5]!(input, caches, null));
-      step("verify.wider 12", 9, [prompt(12, 5)], (g, input, caches) => g.verify[9]!(input, caches, null));
+      step("prefillTail 40", 40, [prompt(40, 2)], (g, input, caches) => new MlxPhaseDispatch(g).prompt("tail", 1, 40)(input, caches, null));
+      step("verify 40", 40, [prompt(40, 5)], (g, input, caches) => g.verify[40]!(input, caches, null));
     } finally { disposeAll(mine, theirs); }
   }, 180_000);
 }
+
+test("a long known span keeps one window and reaches beyond verify rows",()=>{
+  const {current,generic}=graphs("bf16"),mine=current.makeCache(),theirs=generic.makeCache();
+  try {
+    using input=ids([prompt(80,71)]);
+    expect(new MlxPhaseDispatch(current).known(80)).toBe(new MlxPhaseDispatch(current).known(262144));
+    outputDiff("known span 80",new MlxPhaseDispatch(current).known(80)(input,mine) as MlxArray,
+      new MlxPhaseDispatch(generic).known(80)(input,theirs) as MlxArray,current.logitsFromHidden.bind(current),generic.logitsFromHidden.bind(generic));
+    stateDiff("known span 80",mine,theirs);
+  } finally {disposeAll(mine,theirs);}
+},180_000);
+
+test("request adapters on gate, up and down overlay the fixed MLP without changing phase bindings",()=>{
+  const {current,generic}=graphs("bf16"),mine=current.makeCache(),theirs=generic.makeCache();
+  const mlp=generic.layers[0]!.mlp as TrellisMlp;
+  const right=[mlp.gate,mlp.up,mlp.down];
+  const left=[current.loraTargets().get(`${PREFIX}.layers.0.mlp.gate_proj`)!,
+    current.loraTargets().get(`${PREFIX}.layers.0.mlp.up_proj`)!,current.loraTargets().get(`${PREFIX}.layers.0.mlp.down_proj`)!];
+  const operation=current.verify[40];
+  for (let i=0;i<3;i++) {
+    const projection=left[i]!;
+    const adapter={a:tensor(noise(projection.inFeatures*2,91+i,0.02),[projection.inFeatures,2],Dtype.float32),
+      b:tensor(noise(2*projection.outFeatures,94+i,0.02),[2,projection.outFeatures],Dtype.float32),rank:2,scale:0.5};
+    projection.adapters=new Map([["synthetic",adapter]]);projection.loraState=current.loraState;
+    right[i]!.adapters=new Map([["synthetic",adapter]]);right[i]!.loraState=generic.loraState;
+  }
+  current.loraState.active=["synthetic"];generic.loraState.active=["synthetic"];
+  try {
+    using input=ids([prompt(40,91)]);
+    outputDiff("request MLP adapters",current.verify[40]!(input,mine,null),generic.verify[40]!(input,theirs,null) as MlxArray,
+      current.logitsFromHidden.bind(current),generic.logitsFromHidden.bind(generic));
+    stateDiff("request MLP adapters",mine,theirs);expect(current.verify[40]).toBe(operation);
+  } finally {
+    current.loraState.active=[];generic.loraState.active=[];
+    for (const projection of [...left,...right]) {projection.adapters=null;projection.loraState=null;}
+    disposeAll(mine,theirs);
+  }
+},180_000);
+
+test("packed prompt and decode groups preserve hidden, capture order and independent cache states",()=>{
+  const {current,generic}=graphs("bf16");
+  const mine=[current.makeCache(),current.makeCache()],theirs=[generic.makeCache(),generic.makeCache()];
+  const leftCaptures:number[][]=[[],[]],rightCaptures:number[][]=[[],[]];
+  using prefill=ids([prompt(40,81)]);
+  using decode=ids([prompt(1,82)]);
+  const left=[{phase:"window" as const,rows:40,ids:prefill,state:mine[0]!,capture:(layer:number)=>leftCaptures[0]!.push(layer)},
+    {phase:"decode" as const,rows:1,ids:decode,state:mine[1]!,capture:(layer:number)=>leftCaptures[1]!.push(layer)}];
+  const right=[{...left[0]!,state:theirs[0]!,capture:(layer:number)=>rightCaptures[0]!.push(layer)},
+    {...left[1]!,state:theirs[1]!,capture:(layer:number)=>rightCaptures[1]!.push(layer)}];
+  let a:MlxArray[]=[],b:MlxArray[]=[];
+  try {
+    a=current.mixed.at(-1)!.operation(left,41);
+    b=generic.mixed.at(-1)!.operation(right,41);
+    for (let row=0;row<2;row++) {
+      outputDiff(`packed group ${row}`,a[row]!,b[row]!,current.logitsFromHidden.bind(current),generic.logitsFromHidden.bind(generic));
+      a[row]=null as unknown as MlxArray;b[row]=null as unknown as MlxArray;
+      stateDiff(`packed group ${row}`,mine[row]!,theirs[row]!);
+      expect(leftCaptures[row]).toEqual(Array.from({length:65},(_,layer)=>layer));
+      expect(leftCaptures[row]).toEqual(rightCaptures[row]);
+    }
+  } finally {for (const hidden of [...a,...b]) hidden?.dispose();disposeAll(...mine,...theirs);}
+},180_000);
