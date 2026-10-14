@@ -64,7 +64,7 @@ export { type MlxForwardWork, type MlxPreparationWork } from "../contracts/mlx/f
 /** The scheduler routes packed rows together and verify geometry per group. */
 export function dispatchMixedGroups(groups: readonly MlxPhaseGroup[], rows: number,
   packed: readonly MlxMixedRange[], separate?: MlxSeparateMixed): MlxArray[] {
-  if (separate && groups.some(group => group.phase === "verify")) {
+  if (separate && (packed.length === 0 || groups.some(group => group.phase === "verify"))) {
     const outputs: MlxArray[] = [];
     try {
       for (const group of groups) {

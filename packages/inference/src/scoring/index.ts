@@ -5,4 +5,3 @@ export { trainForward as forwardSequence, trainForwardHidden as forwardSequenceH
 export * from "./perplexity";
 export * from "./kl";
 
-export { forwardSequence } from "./full-sequence";
