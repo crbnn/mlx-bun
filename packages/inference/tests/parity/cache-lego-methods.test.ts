@@ -124,7 +124,6 @@ test.skipIf(!target)("teacher-forced verification rounds on every lego's verific
   const { MlxStateRows } = await import("../../src/state/rows");
   const { bindRowCacheRollback } = await import("../../src/state/rollback");
   const { phaseHidden } = await import("../models/phase-forward");
-  const { widthClass } = await import("../../src/contracts/mlx/graph");
   const loaded = await loadTarget();
   try {
     const prompts = ["Write a short paragraph about lighthouses and the people who kept them.",
@@ -173,9 +172,9 @@ test.skipIf(!target)("teacher-forced verification rounds on every lego's verific
             rollback.begin(DEPTH);
             using ids = ops.fromInt32(position.flatMap((at, row) => continuations[row]!.slice(at, at + DEPTH + 1)), [rows.length, DEPTH + 1]);
             // The verify phase at the class of the window's rows (rows times depth + 1), as the speculative group calls it.
-            const width = widthClass(rows.length * (DEPTH + 1));
-            using hidden = model.verify[width](ids, state.caches, null);
-            using out = model.logits[width](hidden);
+            const width = (rows.length * (DEPTH + 1));
+            using hidden = model.verify[width]!(ids, state.caches, null);
+            using out = model.logits[width]!(hidden);
             const counts = rows.map((_, row) => accepted(round, row));
             for (const [row, count] of counts.entries()) for (let p = 0; p <= count; p++) {
               using one = out.slice([row, p, 0], [row + 1, p + 1, out.shape[2]!]);

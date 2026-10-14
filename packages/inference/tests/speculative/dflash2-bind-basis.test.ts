@@ -29,8 +29,8 @@ import { QWEN38_TRELLIS_M1MAX_GRAPH } from "../../src/models/qwen/qwen38-27b-tre
 import { qwenDraftTarget, qwenResidualBasis } from "../../src/models/qwen/media-input";
 import { Affine4MmaLinear } from "../../src/layers/affine-verify-linear";
 import type { DraftProjection } from "../../src/contracts/mlx/draft-projection";
-import { atEveryWidth } from "../../src/models/graph";
-import { widthClass } from "../../src/contracts/mlx/graph";
+import { rowTable } from "../../src/models/graph";
+
 import type { ResidualBasis, TargetView } from "../../src/contracts/mlx/draft-target";
 import type { DraftPrefillGroup, GroupedDraftProvider } from "../../src/generation/speculative/source";
 import { Dflash2Provider } from "../../src/generation/speculative/sources/dflash2-source";
@@ -113,7 +113,7 @@ beforeAll(() => {
   projection = {
     embed: { encode: ids => ops.takeAxis(table, ids, 0), scales: { dtype: Dtype.bfloat16 } },
     // One head at every width.
-    logits: atEveryWidth((hidden: MlxArray) => {
+    logits: rowTable((hidden: MlxArray) => {
       const logits = ops.matmul(hidden, headT);
       captured.push(logits.toFloat32());
       return logits;
@@ -223,14 +223,14 @@ test("context projection runs the matrix unit at five to eight rows and MLX's qu
     try {
       // B × L context rows in every class: 1, 2, 4, 6 (one row of six and two of three), 8, 9 and 12.
       for (const [B, L] of [[1, 1], [1, 2], [1, 4], [1, 6], [2, 3], [1, 8], [1, 9], [2, 6]] as const) {
-        const width = widthClass(B * L), calls = mma.mock.calls.length;
+        const width = (B * L), calls = mma.mock.calls.length;
         using taps = bf16([B, L, TAPS.length * H], 1);
-        using context = drafter.projectContext[width](taps);
-        const kv = drafter.projectContextKVRows[width](context, 0);
+        using context = drafter.projectContext[width]!(taps);
+        const kv = drafter.projectContextKVRows[width]!(context, 0);
         ops.evalAll(kv.flatMap(pair => [pair.k, pair.v]));
         for (const pair of kv) { pair.k.dispose(); pair.v.dispose(); }
         // fc, then each layer's k and v.
-        expect(mma.mock.calls.length - calls).toBe(bits && width === "fiveToEight" ? 1 + 2 * LAYERS : 0);
+        expect(mma.mock.calls.length - calls).toBe(bits && width >= 5 && width <= 8 ? 1 + 2 * LAYERS : 0);
       }
     } finally {
       mma.mockRestore();

@@ -56,9 +56,6 @@ export type DraftDepth = number | { readonly adaptive: true; readonly max: numbe
 export interface Composition {
   /** The GPU's architecture identifier as MLX reports it (for example `applegpu_g16s`). */
   readonly device: string;
-  /** The Neural Engine bridge is composed: a graph that builds a Neural Engine
-   * operation builds it at load, and a bridge that fails there fails the load. */
-  readonly aneBridge: boolean;
   /** The storage and reads of every attention cache the graph's `makeCache` composes. */
   readonly kv: KvStorageScheme;
   /** Full-attention keys and values held in pages of `blockSize` positions

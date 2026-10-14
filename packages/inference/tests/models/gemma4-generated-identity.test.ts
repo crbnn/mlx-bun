@@ -184,7 +184,6 @@ function stateDiff(label: string, actual: readonly Cache[], expected: readonly C
   record(`${label} cache`, worst, count);
 }
 
-
 // ── The graphs ──────────────────────────────────────────────────────────────
 
 type Graph = MlxTokenPhases & { makeCache(): Cache[] };
@@ -205,10 +204,10 @@ const disposeAll = (...sets: Cache[][]) => { for (const set of sets) for (const 
 /** Hidden rows and their logits through each graph's head at the class of those rows (owned, disposed here). */
 function outputDiff(label: string, model: Graph, generic: Graph, actual: MlxArray, expected: MlxArray, rows: number): void {
   try {
-    const width = rows === 1 ? "one" : rows <= 3 ? "twoToThree" : rows === 4 ? "four" : rows <= 8 ? "fiveToEight" : "wider";
+    const width = rows;
     const hidden = maxDiff(actual, expected, `${label} hidden`);
-    using la = model.logits[width](actual);
-    using lb = generic.logits[width](expected);
+    using la = model.logits[width]!(actual);
+    using lb = generic.logits[width]!(expected);
     const logits = maxDiff(la, lb, `${label} logits`);
     using wide = lb.astype(Dtype.float32);
     expect(wide.toFloat32().every(Number.isFinite), `${label} logits finite`).toBe(true);

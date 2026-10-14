@@ -39,7 +39,7 @@ const on = (device: string, config: ModelConfig, request: CompositionRequest = {
 
 describe("a graph table", () => {
   const entry = (id: string, serves: ServedComposition): GraphEntry<null, string> => ({ id, serves, create: () => id });
-  const composition = (fields: Partial<Composition> = {}): Composition => ({ device: M4_PRO, aneBridge: true, kv: { kind: "bf16" }, pagedKv: null,
+  const composition = (fields: Partial<Composition> = {}): Composition => ({ device: M4_PRO, kv: { kind: "bf16" }, pagedKv: null,
     draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 8, packedMixedMlp: true,
     vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
     grammarJump: false, greedyDraft: false, compiledGeglu: true, compiledSwiglu: true, ...fields });
@@ -68,21 +68,24 @@ describe("a graph table", () => {
     expect(table.select({ modelDir: "g" } as ModelConfig, composition({ maxRows: 2 })).id).toBe("device");
   });
 
-  test("every field constrains when present: ANE bridge, draft depth, chunk, adapters, per-layer and TurboQuant KV", () => {
+  test("default keys cover draft depth, prompt chunk, verification rows, per-layer and TurboQuant KV", () => {
     const layered = { kind: "affine-layers", layers: [{ layer: 1, bits: 8, groupSize: 64 }, { layer: 0, bits: 4, groupSize: 64 }] } as const;
     const table = new GraphTable([
-      entry("ane", { aneBridge: false }),
-      entry("depth", { draftDepth: { adaptive: true, max: 7 }, device: M1_MAX }),
-      entry("chunk", { prefillChunkTokens: 512, device: M1_MAX, adapters: true }),
+      entry("depth", { draftDepth: { adaptive: true, max: 7 }, device: M1_MAX, maxRows: 8 }),
+      entry("chunk", { prefillChunkTokens: 512, device: M1_MAX }),
+      entry("verify", { device: M4_PRO, maxRows: 8, maxVerifyRows: 64 }),
       entry("layers", { kv: [layered], device: "applegpu_g15s" }),
       entry("turbo", { kv: [{ kind: "turbo", kBits: 8, vBits: 3 }], device: "applegpu_g14s" }),
       entry("generic", {}),
     ]);
-    expect(table.match(undefined, composition({ aneBridge: false })).id).toBe("ane");
+    expect(table.match(undefined, composition({ draftDepth: 7 })).id).toBe("verify");
+    expect(table.match(undefined, composition({ draftDepth: { adaptive: true, max: 7 } })).id).toBe("verify");
+    expect(table.match(undefined, composition({ draftDepth: 8 })).id).toBe("generic");
+    expect(table.match(undefined, composition({ draftDepth: 8, maxRows: 4 })).id).toBe("verify");
     expect(table.match(undefined, composition({ device: M1_MAX, draftDepth: { adaptive: true, max: 7 } })).id).toBe("depth");
     expect(table.match(undefined, composition({ device: M1_MAX, draftDepth: 7 })).id).toBe("generic");
     expect(table.match(undefined, composition({ device: M1_MAX, prefillChunkTokens: 512, adapters: true })).id).toBe("chunk");
-    expect(table.match(undefined, composition({ device: M1_MAX, prefillChunkTokens: 512 })).id).toBe("generic");
+    expect(table.match(undefined, composition({ device: M1_MAX, prefillChunkTokens: 512 })).id).toBe("chunk");
     // Per-layer schemes compare layer by layer, in any order.
     expect(table.match(undefined, composition({ device: "applegpu_g15s",
       kv: { kind: "affine-layers", layers: [{ layer: 0, bits: 4, groupSize: 64 }, { layer: 1, bits: 8, groupSize: 64 }], kernels: "tiled-causal" } })).id).toBe("layers");
@@ -90,6 +93,23 @@ describe("a graph table", () => {
       kv: { kind: "affine-layers", layers: [{ layer: 0, bits: 4, groupSize: 64 }, { layer: 1, bits: 4, groupSize: 64 }], kernels: "tiled-causal" } })).id).toBe("generic");
     expect(table.match(undefined, composition({ device: "applegpu_g14s", kv: { kind: "turbo", kBits: 8, vBits: 3 } })).id).toBe("turbo");
     expect(table.match(undefined, composition({ device: "applegpu_g14s", kv: { kind: "turbo", kBits: 4, vBits: 4 } })).id).toBe("generic");
+  });
+
+  test("an explicit graph bypasses default matching and custom graphs need no registration", () => {
+    let fingerprints = 0;
+    const specialized = entry("m4", { fingerprint: "f", device: M4_PRO, maxRows: 8 });
+    const generic = entry("generic", {});
+    const table = new GraphTable([specialized, generic], () => { fingerprints++; return "different"; });
+    const config = { modelDir: "other-artifact" } as ModelConfig;
+    const otherMachine = composition({ device: M1_MAX, maxRows: 16 });
+    expect(table.select(config, otherMachine).id).toBe("generic");
+    fingerprints = 0;
+    expect(table.select(config, otherMachine, "m4")).toBe(specialized);
+    expect(table.select(config, composition(), "generic")).toBe(generic);
+    const custom = entry("mine", { device: "another-device" });
+    expect(table.select(config, otherMachine, custom)).toBe(custom);
+    expect(fingerprints).toBe(0);
+    expect(() => table.explicit("missing")).toThrow("no graph named missing");
   });
 
   test("construction rejects tables whose selection would refuse or depend on order", () => {
@@ -123,7 +143,7 @@ describe("the Qwen 3.5 table", () => {
       expect(select(on(M4_PRO, qwen, { kv: { override: 4, fusedSdpa } }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     expect(select(on(M4_PRO, qwen, { adapters: true }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     expect(select(on(M4_PRO, qwen, { maxRows: 1, draft: { numDraftTokens: 3 } }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
-    expect(select({ ...on(M4_PRO, qwen, { draft: { numDraftTokens: 7, adaptive: true } }), aneBridge: false, prefillChunkTokens: 512 }))
+    expect(select({ ...on(M4_PRO, qwen, { draft: { numDraftTokens: 7, adaptive: true } }), prefillChunkTokens: 512 }))
       .toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
   });
 

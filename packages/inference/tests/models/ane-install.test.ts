@@ -29,14 +29,13 @@ describe("the install table", () => {
 
   test("the programs follow the composition: the bridge, mounted adapters and the device, not the chunk size", () => {
     expect(labels(record({ prefillChunkTokens: 128 }))).toEqual(labels(record()));
-    expect(labels(record({ aneBridge: false }))).toEqual([]);
-    expect(labels(record({ adapters: true }))).toEqual([]);
+    expect(labels(record({ adapters: true }))).toEqual(labels(record()));
     expect(labels(record({ device: M1_MAX }))).toEqual([]);
   });
 
   test("entries constrained to another device are skipped; a program two entries load is one program naming both", () => {
     const shared = streamedMatmulProgram(64, 32, 32), own = mlpSliceProgram(64, 32, 32);
-    const entry = (id: string, device: string | undefined, programs: (c: Composition) => typeof shared[]): GraphEntry<null, string> =>
+    const entry = (id: string, device: string | undefined, programs: () => typeof shared[]): GraphEntry<null, string> =>
       ({ id, serves: device ? { device } : {}, create: () => id, anePrograms: programs });
     const tables = {
       a: new GraphTable([entry("a-m4", M4_PRO, () => [shared, own]), entry("a-generic", undefined, () => [])]),

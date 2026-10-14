@@ -121,7 +121,7 @@ const { testComposition } = await import("../test-composition");
 const { observedPhases, phaseHidden, phaseLogits } = await import("../phase-forward");
 const { syntheticDigests } = await import("../synthetic-digest");
 const digests = syntheticDigests("gemma2");
-const { widthClass } = await import("../../../src/contracts/mlx/graph");
+
 /** The storage class a cache holds: a composed lego's storage, else the cache itself. */
 const storageKind = (cache: Cache) => (cache.composed?.storage() ?? cache).constructor.name;
 function fixture() {
@@ -729,7 +729,6 @@ test.skipIf(!native || !artifact)("cached Gemma2 preserves B1 and serves ragged 
   } finally { weights.dispose(); }
 }, 600_000);
 
-
 test.skipIf(!native || !artifact || !referencePath)("real Gemma2 ragged B2/B4 logits and KV match the external same-shaped Python reference", async () => {
   const { Weights, loadModelConfig, createModel } = await import("../../../src/index");
   const reference = await Bun.file(referencePath!).json();
@@ -778,7 +777,6 @@ test.skipIf(!native || !artifact || !referencePath)("real Gemma2 ragged B2/B4 lo
     }
   } finally { weights.dispose(); }
 }, 600_000);
-
 
 test.skipIf(!native || !artifact)("cached Gemma2 plain fill matches main's serial fill at B1 and keeps every row through B2/B3/B4 joins and cancellation", async () => {
   const { Weights, loadModelConfig, createModel } = await import("../../../src/index");
@@ -945,7 +943,6 @@ test.skipIf(!native || !artifact)("cached Gemma2 plain fill matches main's seria
   } finally { weights.dispose(); }
 }, 600_000);
 
-
 test.skipIf(!native || !artifact)("cached Gemma2 two-model speculation keeps B1 deterministic and serves ragged joins, cancellation and a clean follow-on", async () => {
   const { Weights, loadModelConfig, createModel } = await import("../../../src/index");
   const { bindMlxGateway, createRuntimeConfig } = await import("../../../src/execution");
@@ -1068,7 +1065,6 @@ test.skipIf(!native || !artifact)("cached Gemma2 two-model speculation keeps B1 
     } finally { await group.close(); }
   } finally { draft?.dispose(); weights.dispose(); }
 }, 900_000);
-
 
 test.skipIf(!native || !artifact)("cached Gemma2 n-gram speculation mixes empty and nonempty proposals, isolates a padded peer, and serves ragged joins, cancellation, grammar and seeded rows", async () => {
   const { Weights, loadModelConfig, createModel } = await import("../../../src/index");
@@ -1304,7 +1300,6 @@ test.skipIf(!native || !artifact)("cached Gemma2 n-gram speculation mixes empty 
   } finally { weights.dispose(); }
 }, 900_000);
 
-
 test.skipIf(!native || !artifact)("a structurally equivalent delegating provider reproduces direct n-gram speculation through joins, cancellation and drain", async () => {
   const { Weights, loadModelConfig, createModel } = await import("../../../src/index");
   const { bindMlxGateway, createRuntimeConfig } = await import("../../../src/execution");
@@ -1486,7 +1481,7 @@ describe.skipIf(!native)("dense-read graphs with delayed affine KV", () => {
     /** The graph the scheduler binds: a view whose phases call the hooks (`forwardHooks`). */
     view: object;
     model: SpanGraph & import("../../../src/models/factory").RuntimeModel };
-  type SpanGraph = Pick<import("../../../src/contracts/mlx/graph").MlxTokenPhases, "prefillTail" | "decode" | "logits"> &
+  type SpanGraph = Pick<import("../../../src/contracts/mlx/graph").MlxTokenPhases, "prompt" | "multiSequencePrompt" | "decode" | "logits"> &
     { logitsFromHidden(hidden: MlxArray): MlxArray };
   /** A view of `model` for the scheduler whose phases call the hooks a test adds before each forward. */
   const hooked = <M extends object>(model: M) => {
@@ -1768,11 +1763,11 @@ describe.skipIf(!native)("dense-read graphs with delayed affine KV", () => {
     const steps: [string, number[]][] = [["prefillChunk", [2, 4, 7, 9, 3, 11]], ["prefillTail", [13]], ["decode", [17]],
       ["decode", [19]], ["decode", [23]], ["verify", [29, 31, 37]], ["appendKnown", [41, 43, 47]], ["decode", [53]], ["decode", [59]]];
     type Forward = (ids: MlxArray, caches: Cache[], capture: null) => MlxArray;
-    const forward = (phase: string, width: ReturnType<typeof widthClass>): Forward => phase === "prefillChunk" ? model.prefillChunk.gpu as Forward
+    const forward = (phase: string, width: number): Forward => phase === "prefillChunk" || phase === "prefillTail" ? model.multiSequencePrompt.at(-1)!.operation as Forward
       : (model as unknown as Record<string, Record<string, Forward>>)[phase]![width]!;
     const run = (caches: Cache[], phase: string, ids: number[]) => {
       using input = ops.fromInt32(ids, [1, ids.length]);
-      using hidden = forward(phase, widthClass(ids.length))(input, caches, null);
+      using hidden = forward(phase, (ids.length))(input, caches, null);
       return model.logitsFromHidden(hidden);
     };
     try {

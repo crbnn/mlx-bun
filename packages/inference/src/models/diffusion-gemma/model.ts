@@ -1,3 +1,5 @@
+import { bindGraphCaches } from "../cache-composition";
+import type { MlxCacheLayer, MlxMixedRange } from "../../contracts/mlx/graph";
 import { cleanupFailure, disposeResources } from "../../runtime/resources";
 // DiffusionGemma-26B-A4B-it (model_type "diffusion_gemma") — the first
 // NON-autoregressive model in the codebase. Instead of a left-to-right AR loop
@@ -33,7 +35,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { disposing } from "../../layers/helpers";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
-import type { MlxDeclaredGraph, MlxDenoisingOperations, MlxWidthClass } from "../../contracts/mlx/graph";
+import type { MlxDeclaredGraph, MlxDenoisingOperations } from "../../contracts/mlx/graph";
 import type { TrainableGraph } from "../../contracts/mlx/trainable";
 import { declareGraph } from "../capabilities";
 import type { PixelInput } from "../../contracts/mlx/media";
@@ -511,6 +513,8 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
     const raw = (config as unknown as { raw: Record<string, any> }).raw;
     this.imageTokenId = (raw.image_token_id as number) ?? 258880;
     this.visionTower = raw.vision_config ? new DiffusionVisionTower(weights, config) : null;
+
+    bindGraphCaches(this, composition);
   }
 
   /** Build the merged prompt embeddings for an image+text turn: embed the text
@@ -587,17 +591,10 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
    *  under the composition's paging the full-attention layers hold pages of
    *  what the scheme names (`maybePageKv`, growing from one block). The encoder
    *  prefill fills them, the decoder canvas pass reads them. */
-  makeCache(): Cache[] {
-    const masks = new AttentionMasks(), { kv, pagedKv } = this.composition;
-    const caches: Cache[] = this.layers.map((l, layer) =>
-      l.layerType === "sliding_attention"
-        ? composedSlidingAttentionCache(kv, layer, this.slidingWindow, masks)
-        : composedFullAttentionCache(kv, layer, masks, deferredTurboQuantKernels),
-    );
-    try { maybePageKv(caches, kv, pagedKv, pagedKv?.blockSize ?? 0); }
-    catch (error) { disposeResources(caches); throw error; }
-    return caches;
-  }
+  readonly cachePaging = true;
+  get cacheLayers(): readonly MlxCacheLayer[] { return this.layers.map(layer=>layer.layerType === "sliding_attention" ? {kind:"sliding" as const,window:this.slidingWindow}:{kind:"full" as const,turboQuant:"deferred" as const}); }
+
+  makeCache!: () => Cache[];
 
   /** Encoder prefill: run all layers over the prompt through the window read,
    *  filling the cache. Discards the hidden. */
@@ -872,7 +869,7 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
   // DiffusionGemma is non-autoregressive: generation routes it to the denoising
   // engine (packages/inference/src/generation/diffusion.ts). This exists so the
   // model fits the RuntimeModel union scoring takes; calling it is a bug.
-  sequenceHidden(_ids: MlxArray, _cache: Cache[], _width: MlxWidthClass): MlxArray {
+  sequenceHidden(_ids: MlxArray, _cache: Cache[], _width: number): MlxArray {
     throw new Error("DiffusionGemma is non-autoregressive — use the diffusion engine, not the scoring forward");
   }
 

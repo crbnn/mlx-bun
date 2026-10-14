@@ -1,7 +1,7 @@
 import type { GraphDescriptor } from "../../contracts/portable/graph";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { Cache } from "../../contracts/mlx/cache";
-import type { MlxCompiledDecodeStep, MlxKnownSpans, MlxModelMemory, MlxWidthClass } from "../../contracts/mlx/graph";
+import type { MlxCompiledDecodeStep, MlxKnownSpans, MlxModelMemory } from "../../contracts/mlx/graph";
 import { compiledDecodeStepOf, tokenPhasesOf } from "../../models/capabilities";
 import { runtimeConfig, type RuntimeConfig } from "../../runtime/config";
 import type { MlxTokenGraph } from "../../models/graph";
@@ -49,7 +49,7 @@ export interface MlxAutoregressiveBinding {
   /** The vision prefill phase over prepared embeddings (borrowed). */
   prefillEmbeddings?(
     embeddings: MlxArray, state: Cache[], imageMask: MlxArray | null,
-    ids: MlxArray, multimodalMask: MlxArray | null, width: MlxWidthClass,
+    ids: MlxArray, multimodalMask: MlxArray | null, width: number,
   ): MlxArray;
   /** The graph's compiled decode step for this run, chosen once after
    * prefill: present when the graph declares one, the run allows replay and

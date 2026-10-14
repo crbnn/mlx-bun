@@ -6,7 +6,6 @@ import type { PreparedStateChange } from "../../../contracts/portable/resources"
 import { targetLacks, type AssistantRowsTarget, type DraftPrefillGroup, type DraftRowGroup, type GroupedDraftProvider, type TargetView } from "../source";
 import { DRAFT_CHECKPOINT_SCHEMA, type DraftRowCheckpoint } from "../../../contracts/mlx/draft-checkpoint";
 import type { AssistantDrafterModel } from "../../../contracts/mlx/drafter";
-import { widthClass } from "../../../contracts/mlx/width";
 
 /** The assistant owns only its last true target hidden and coverage. Donor
  * attention stays with target storage; checkpoints contain no duplicate KV. */
@@ -62,7 +61,7 @@ class AssistantRows implements DraftPrefillGroup, DraftRowGroup {
     const donors=this.target.readDonors();
     let ids=ops.fromInt32([...pending],[B,1]), hidden=this.#hidden!;
     const tokens: MlxArray[]=[];
-    const forward=this.drafter.forwardRows[widthClass(B)];
+    const forward=this.drafter.forwardRows[(B)]!;
     try {
       for(let step=0;step<depth;step++) {
         using emb=this.target.embed(ids);

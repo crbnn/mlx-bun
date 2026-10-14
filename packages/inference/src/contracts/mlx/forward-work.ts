@@ -10,7 +10,6 @@ export interface MlxForwardStep {
   readonly phase: MlxPhaseGroup["phase"];
   /** Rows: sequences times positions. */
   readonly rows: number;
-  readonly width: MlxPhaseGroup["width"];
   readonly capture: MlxLayerCapture | null;
   own(): Promise<MlxArray>;
 }

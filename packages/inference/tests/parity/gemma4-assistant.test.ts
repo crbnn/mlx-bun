@@ -135,13 +135,13 @@ test.skipIf(!inputs)("Gemma4 assistant: donor attention and draft chains equal i
       return f.astype(dtype);
     };
     /** One deterministic draft chain. Partial output is released if a step throws. */
-    const chain = (shared: Parameters<GemmaAssistantDrafter["forwardRows"]["one"]>[2], anchor: MlxArray, pending: number, position: number) => {
+    const chain = (shared: Parameters<GemmaAssistantDrafter["forwardRows"][1]>[2], anchor: MlxArray, pending: number, position: number) => {
       const steps: { token: number; hidden: MlxArray }[] = [];
       let token = pending, hidden = anchor;
       try {
         for (let k = 0; k < STEPS; k++) {
           using e = embed(token);
-          const step = drafter!.forwardRows.one(e, hidden, shared, position + k);
+          const step = drafter!.forwardRows[1]!(e, hidden, shared, position + k);
           const entry = { token: -1, hidden: step.nextHidden };
           steps.push(entry); // owned before the tokens are read or released
           try { entry.token = step.tokens.toIntTokens()[0]!; } finally { step.tokens.dispose(); }
@@ -451,7 +451,6 @@ test("donors must hold the scripted positions: a missing or wrong rollback fails
   expect(() => assertDonorOffsets(rollback[0], { ...at(rollback[1]), full: rollback[1] + 1 }, rollback[1], window)).toThrow("685/686");
   expect(() => assertDonorOffsets(rollback[0], { ...at(rollback[1]), slidingWidth: 513 }, rollback[1], window)).toThrow("donor views 513/685 wide");
 });
-
 
 test("assistant acceptance checks complete verification, EOS, final budget and retained rollback (CPU only)", () => {
   expect(assistantRound([4, 5], [4, 5, 6], 8, [9], 10)).toEqual({ accepted: 2, emitted: [4, 5, 6], retained: 2, disagreed: false });
