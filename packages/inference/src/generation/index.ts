@@ -10,3 +10,5 @@ export type { TokenLogprobs } from "../contracts/portable/generation";
 export { acquireModelWiredLimit, wiredWorkingSetBytes, modelNeedsWiredLimit, withModelWiredLimit, withModelUsageFlush } from "./scopes";
 
 export { generationCheckpointKey } from "./checkpoint-identity";
+
+export { MlxPhaseDispatch } from "./phase-dispatch";

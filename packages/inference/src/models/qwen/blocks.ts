@@ -21,7 +21,6 @@ import type { AttentionRead, Cache, CommittedAttentionCache, GatedDeltaCache, Ga
 import { applyInterleavedRope } from "../../layers/qwen-mrope";
 import type { MropeForwardState } from "../../contracts/mlx/positions";
 import type { ReadPhase } from "../graph";
-import type { MlxWidthClass } from "../../contracts/mlx/graph";
 
 const PREFIX = "language_model";
 
@@ -406,7 +405,7 @@ export class QwenGatedDeltaNet<L extends AttentionLinear = QuantizedLinear> exte
 }
 
 /** The width classes whose rows the fused Trellis gate/up kernel takes (up to `TRELLIS_MATVEC_MAX_M` rows). */
-const FUSED_GATE_UP_WIDTHS: ReadonlySet<MlxWidthClass> = new Set<MlxWidthClass>(["one", "twoToThree", "four"]);
+const FUSED_GATE_UP_WIDTHS: ReadonlySet<number> = new Set<number>([1, 2, 3, 4]);
 
 /** The MLP over Trellis-coded projections (a packed-Trellis artifact's
  *  `mode: "trellis"` entries). Its input is the post-attention norm's output,
@@ -425,7 +424,7 @@ export class TrellisMlp {
   /** `x` [.., hidden] (borrowed, row-contiguous) to an owned [.., hidden].
    *  Every phase computes the same rows; `width` is the class of `x`'s rows,
    *  named by the caller. */
-  forward(x: MlxArray, _phase: ReadPhase, width: MlxWidthClass): MlxArray {
+  forward(x: MlxArray, _phase: ReadPhase, width: number): MlxArray {
     // Packed-trellis decode (up to four rows): gate, up and the swiglu in ONE
     // kernel — x read once, no gate/up vectors materialized. This Lab path
     // retains the packed activation arithmetic documented in
@@ -457,7 +456,7 @@ export class AffineMlp {
 
   /** `x` [.., hidden] (borrowed) to an owned [.., hidden], with the projection
    *  arithmetic `phase` names; every width class takes the same kernels. */
-  forward(x: MlxArray, phase: ReadPhase, _width: MlxWidthClass): MlxArray {
+  forward(x: MlxArray, phase: ReadPhase, _width: number): MlxArray {
     const rowsApart = projectRowsApart[phase];
     const g = this.gate.forward(x, rowsApart);
     const u = this.up.forward(x, rowsApart);
@@ -514,7 +513,7 @@ export class Qwen3Layer {
 
   /** One layer over `x` [.., hidden] (borrowed) for `phase`; `width` is the class of `x`'s rows, which picks the
    *  MLP's kernels. */
-  forward(x: MlxArray, cache: Cache, phase: ReadPhase, mrope: MropeForwardState | null, width: MlxWidthClass): MlxArray {
+  forward(x: MlxArray, cache: Cache, phase: ReadPhase, mrope: MropeForwardState | null, width: number): MlxArray {
     using h = this.forwardAttn(x, cache, phase, mrope);
     return this.forwardMlp(h, phase, width);
   }
@@ -527,7 +526,7 @@ export class Qwen3Layer {
     return ops.add(x, r);
   }
 
-  forwardMlp(h: MlxArray, phase: ReadPhase, width: MlxWidthClass): MlxArray {
+  forwardMlp(h: MlxArray, phase: ReadPhase, width: number): MlxArray {
     using hn = this.postAttnNorm.forward(h);
     // Diagnostic (same switch as the attention/DeltaNet sub-phases): settle the
     // pending attention block first so the MLP is timed alone.

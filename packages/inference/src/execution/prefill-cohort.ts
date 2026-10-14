@@ -6,7 +6,7 @@ import type { Row } from "./batch-types";
 import type { KvMaintenance } from "../contracts/mlx/cache";
 import type { ContinuationState, RequestStateCache } from "../state/cache-service";
 import { MlxPrefillRows, type MlxPrefillForward, type MlxPrefillState } from "./prefill-rows";
-import { widthClass } from "../contracts/mlx/graph";
+
 import { promptWorkStep } from "../generation/phase-dispatch";
 
 export interface PrefillState extends MlxPrefillState {
@@ -76,7 +76,7 @@ export class MlxPrefillCohort extends MlxPrefillRows<PrefillState> {
         tailSplit: host.tailSplit, snapshotAt: state.snapAt }); },
       forward: (ids, caches, states, step, work) => states[0]?.row.req.promptInput
         ? Promise.resolve(states[0].row.req.promptInput.prefill(ids, caches, states[0].pos,
-          step.phase === "decode" ? "decode" : "tail", widthClass(step.tokens)))
+          step.phase === "decode" ? "decode" : "tail", (step.tokens)))
         : work ? work(ids, caches, promptWorkStep(step, null, () => host.forward(ids, caches, step))) : host.forward(ids, caches, step),
       // A media prompt input returns its prompt's last position: one row per sequence to project.
       project: (hidden, caches, completed, step) => host.project(hidden, caches, completed,

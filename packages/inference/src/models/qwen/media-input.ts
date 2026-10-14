@@ -7,7 +7,7 @@ import { type MropeRequestState } from "../../contracts/mlx/positions";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { Cache } from "../../contracts/mlx/cache";
 import type { MediaEncoders, MlxDecodeState, MlxPromptInput, VisionEncoder } from "../../contracts/mlx/media";
-import type { MlxHeadForward, MlxWidthClass, MlxWidthTable } from "../../contracts/mlx/graph";
+import type { MlxHeadForward, MlxRowTable } from "../../contracts/mlx/graph";
 import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
@@ -23,19 +23,19 @@ export interface QwenMediaGraph {
   /** The full-attention layer whose cache supplies logical positions. */
   readonly faIdx: number;
   /** The vision prefill phase: a prompt's prepared embeddings (borrowed) at request positions. */
-  prefillEmbeddingsAtPositions(embeddings: MlxArray, caches: Cache[], positions: MlxArray, width: MlxWidthClass): MlxArray;
+  prefillEmbeddingsAtPositions(embeddings: MlxArray, caches: Cache[], positions: MlxArray, width: number): MlxArray;
   /** A prompt's token ids after a reused prefix, at request positions. */
-  prefillAtPositions(ids: MlxArray, caches: Cache[], positions: MlxArray, width: MlxWidthClass): MlxArray;
+  prefillAtPositions(ids: MlxArray, caches: Cache[], positions: MlxArray, width: number): MlxArray;
   /** One new token per row at request positions. */
-  decodeAtPositions(ids: MlxArray, caches: Cache[], positions: MlxArray, width: MlxWidthClass): MlxArray;
-  readonly logits: MlxWidthTable<MlxHeadForward>;
+  decodeAtPositions(ids: MlxArray, caches: Cache[], positions: MlxArray, width: number): MlxArray;
+  readonly logits: MlxRowTable<MlxHeadForward>;
 }
 
 class QwenMediaDecodeState implements MlxDecodeState {
   readonly key = "qwen-interleaved-mrope";
   constructor(readonly model: QwenMediaGraph, readonly delta: number) {}
 
-  decode(ids: MlxArray, caches: Cache[], rows: readonly MlxDecodeState[], width: MlxWidthClass): MlxArray {
+  decode(ids: MlxArray, caches: Cache[], rows: readonly MlxDecodeState[], width: number): MlxArray {
     const B = rows.length, L = ids.shape[1]!;
     const cache = caches[this.model.faIdx]!;
     // The cache supplies logical positions, including left padding, on device.

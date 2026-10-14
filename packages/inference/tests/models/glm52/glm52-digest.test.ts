@@ -1,3 +1,4 @@
+import { MlxPhaseDispatch } from "../../../src/generation/phase-dispatch";
 // GLM-5.2's graph over synthetic weights, held to its recorded digest
 // (tests/fixtures/synthetic-digests/glm52.json; tests/models/synthetic-digest.ts):
 // a dense layer and two MoE layers (shared and routed experts), DSA on and off
@@ -18,7 +19,7 @@ import type { ModelConfig } from "../../../src/artifacts/config";
 import { parseGlm52Config, type Glm52Config } from "../../../src/artifacts/glm52-config";
 import type { Cache, LatentAttentionCache } from "../../../src/contracts/mlx/cache";
 import type { Glm52WeightSource } from "../../../src/contracts/mlx/glm52-weights";
-import { widthClass } from "../../../src/contracts/mlx/width";
+
 import { Glm52Model } from "../../../src/models/glm52/model";
 import { MLACache } from "../../../src/state/glm52-cache";
 import type { KvStorageScheme } from "../../../src/contracts/portable/composition";
@@ -167,13 +168,13 @@ function expectSame(label: string, actual: MlxArray, expected: MlxArray): void {
 type Phase = "chunk" | "tail" | "decode" | "verify" | "known";
 /** The phase operation for the rows of `ids` (sequences times tokens), as the scheduler indexes it. */
 async function phase(graph: Glm52Model, which: Phase, ids: MlxArray, cache: Cache[]): Promise<MlxArray> {
-  const width = widthClass(ids.shape[0]! * ids.shape[1]!);
+  const width = (ids.shape[0]! * ids.shape[1]!);
   switch (which) {
-    case "chunk": return await graph.prefillChunk.gpu(ids, cache, null);
-    case "tail": return await graph.prefillTail[width](ids, cache, null);
-    case "decode": return await graph.decode[width](ids, cache);
-    case "verify": return await graph.verify[width](ids, cache, null);
-    case "known": return await graph.appendKnown[width](ids, cache);
+    case "chunk": return await graph.multiSequencePrompt.at(-1)!.operation(ids, cache, null);
+    case "tail": return await new MlxPhaseDispatch(graph).prompt("tail", 1, width)(ids, cache, null);
+    case "decode": return await graph.decode[width]!(ids, cache, null);
+    case "verify": return await graph.verify[width]!(ids, cache, null);
+    case "known": return await graph.appendKnown[width]!(ids, cache);
   }
 }
 const tokens = (count: number, salt: number) => Array.from({ length: count }, (_, i) => 3 + (i * 7 + salt * 5) % (VOCAB - 3));
@@ -250,7 +251,7 @@ for (const dsa of [true, false]) describe(`GLM-5.2 graph (DSA ${dsa ? "on" : "of
     const caches = graph.makeCache() as Cache[];
     try {
       using ids = ops.fromInt32(tokens(5, 60), [1, 5]);
-      using hidden = graph.sequenceHidden(ids, caches, "fiveToEight");
+      using hidden = graph.sequenceHidden(ids, caches, 5);
       digest.tensors("scoring hidden", hidden);
       digest.caches("scoring caches", caches);
     } finally { dispose(caches); }
@@ -262,7 +263,7 @@ for (const dsa of [true, false]) describe(`GLM-5.2 graph (DSA ${dsa ? "on" : "of
     const mtpCache = new MLACache({ ...head.cache, role: "mtp" as const });
     try {
       using ids = ops.fromInt32(tokens(4, 70), [1, 4]);
-      using hidden = await graph.prefillChunk.gpu(ids, caches, null);
+      using hidden = await graph.multiSequencePrompt.at(-1)!.operation(ids, caches, null);
       digest.tensors("mtp anchor", hidden);
       for (let index = 0; index < 2; index++) {
         using draftIds = ops.fromInt32(tokens(index === 0 ? 4 : 1, 71 + index), [1, index === 0 ? 4 : 1]);

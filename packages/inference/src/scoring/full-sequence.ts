@@ -21,7 +21,6 @@ import { type Cache } from "../contracts/mlx/cache";
 import { AttentionMasks } from "../state/attention-read";
 import { selectedTrainingAttention, TrainingCache, TrainingSSMCache, trainingStandIn } from "../state/training-cache";
 import type { RuntimeModel } from "../models/factory";
-import { widthClass } from "../contracts/mlx/width";
 
 export { TrainingCache, TrainingSSMCache };
 /** The padded-batch training mask (`paddedTrainingMask`): [B, 1, L, L] bool,
@@ -43,7 +42,7 @@ export function trainForwardHidden(
   validLengths?: number[],
 ): MlxArray {
   const [B, L] = ids.shape as [number, number];
-  const width = widthClass(B * L);
+  const width = (B * L);
   const rowLengths = validLengths !== undefined && validLengths.some((v) => v < L) ? validLengths : null;
   // Stateless offset-0 caches (one per cache the graph composes), so the
   // forward is pure and safe to recompute under gradient checkpointing. Each

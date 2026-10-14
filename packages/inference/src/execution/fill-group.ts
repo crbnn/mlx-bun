@@ -14,7 +14,7 @@ import { targetCacheLayout } from "../state/layout";
 import { leaseCacheStates } from "../state/leases";
 import { MlxPhaseDispatch } from "../generation/phase-dispatch";
 import { tokenPhasesOf } from "../models/capabilities";
-import { widthClass, type MlxKnownSpans } from "../contracts/mlx/graph";
+import { type MlxKnownSpans } from "../contracts/mlx/graph";
 import { appendHiddenRows } from "../generation/fill-append";
 import { advanceSpeculativeOutputs } from "../generation/speculative/round";
 import { bindRowCacheRollback } from "../state/rollback";
@@ -186,7 +186,7 @@ class FillGroup implements MlxGroupedMethod {
     if (anyLive) {
       using input = previous ? ops.reshape(previous, [B, 1]) : ops.fromInt32(rows.map(row => row.current), [B, 1]);
       const own = async () => this.#dispatch.decode(B)(input, this.#target!.caches, null);
-      using hidden = await (work ? work(input, this.#target!.caches, { phase: "decode", rows: B, width: widthClass(B), capture: null, own }) : own());
+      using hidden = await (work ? work(input, this.#target!.caches, { phase: "decode", rows: B, capture: null, own }) : own());
       const selected = rows.map((row, index) => {
         const request = this.#requests.get(row)!;
         // The next selected token is not committed until it becomes input.

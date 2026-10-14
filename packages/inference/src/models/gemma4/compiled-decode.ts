@@ -42,7 +42,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { decodeStepInputs } from "../../state/decode-step-inputs";
 import { setCompiledTrace } from "../../runtime/compiled-trace";
 import type { Cache, CompiledDecodeCache, DecodeSlot, DecodeTrace } from "../../contracts/mlx/cache";
-import type { MlxCompiledDecodeStep } from "../../contracts/mlx/graph";
+import type { MlxCompiledDecodeStep, MlxRowTable, MlxCapturingForward } from "../../contracts/mlx/graph";
 
 /** What the runner reads of the Gemma graph it compiles (the graph passes
  * itself; a structural type keeps the graph file and this one acyclic). */
@@ -60,7 +60,7 @@ export interface CompiledGemmaTarget {
   }[];
   materializeGraphConstants(): void;
   /** The one-row decode operation the trace records. */
-  readonly decode: { readonly one: (ids: MlxArray, cache: Cache[], capture: null) => MlxArray };
+  readonly decode: MlxRowTable<MlxCapturingForward>;
   logitsFromHidden(hidden: MlxArray): MlxArray;
 }
 
@@ -90,7 +90,7 @@ function makeTraceFn(model: CompiledGemmaTarget, slots: DecodeSlot[]) {
     setCompiledTrace(true);
     try {
       const ids = ops.reshape(inputs[0]!, [1, 1]);
-      const h = model.decode.one(ids, adapters, null);
+      const h = model.decode[1]!(ids, adapters, null) as MlxArray;
       ids.dispose();
       const logits = model.logitsFromHidden(h);
       h.dispose();

@@ -17,7 +17,7 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { Gemma4Model } from "../gemma4/model";
 import type { DraftProjection } from "../../contracts/mlx/draft-projection";
-import { widthClass } from "../../contracts/mlx/graph";
+
 import type { DsparkContextAttention, DsparkDrafterModel } from "../../contracts/mlx/drafter";
 import { loadAdapterTensors } from "../../adapters/manager";
 import { writeShardedSafetensors, type NamedTensor } from "../../artifacts/safetensors-writer";
@@ -336,7 +336,7 @@ export class DflashDrafter implements DsparkDrafterModel {
   #baseLogits(model: DraftProjection, block: MlxArray, anchors: number): MlxArray {
     const hOut = ops.matmul(block, this.get("out_proj")); // [A,γ,H]
     const hBf = hOut.astype(model.embed.scales.dtype); hOut.dispose();
-    const logits = model.logits[widthClass(anchors * this.cfg.gamma)](hBf); hBf.dispose();
+    const logits = model.logits[(anchors * this.cfg.gamma)]!(hBf); hBf.dispose();
     return logits;
   }
   #markov(prevToks: MlxArray): { B: MlxArray; emb1: MlxArray } {
@@ -432,7 +432,6 @@ export class DflashDrafter implements DsparkDrafterModel {
       throw err;
     }
   }
-
 
   forwardRows(model: DraftProjection, hCtx: MlxArray | null, anchors: readonly number[], gamma: number,
     opts: DflashDraftOpts = {}, context?: DflashContextAttention): DflashDraftRows {

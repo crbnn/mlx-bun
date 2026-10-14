@@ -44,7 +44,7 @@ export function aneInstallPrograms(options: AneInstallOptions = {}): AneInstallP
   for (const table of Object.values(options.tables ?? MLX_GRAPH_TABLES))
     for (const entry of table.entries) {
       if (!entry.anePrograms || (entry.serves.device !== undefined && entry.serves.device !== composition.device)) continue;
-      for (const spec of entry.anePrograms(composition)) {
+      for (const spec of entry.anePrograms()) {
         const key = aneProgramKey(spec), known = programs.get(key);
         if (known) { if (!known.graphs.includes(entry.id)) known.graphs.push(entry.id); }
         else programs.set(key, { spec, graphs: [entry.id] });

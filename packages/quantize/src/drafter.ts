@@ -78,7 +78,7 @@ export async function quantizeDrafterDir(
       const zeros = MlxArray.fromFloat32(new Float32Array(width), [1, 1, width]);
       const x = zeros.astype(Dtype.bfloat16);
       zeros.dispose();
-      const proj = d.projectContext.one(x); // one context row
+      const proj = d.projectContext[1]!(x); // one context row
       x.dispose();
       const got = proj.shape;
       proj.dispose();

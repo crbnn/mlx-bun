@@ -1,3 +1,5 @@
+import { bindGraphCaches } from "../cache-composition";
+import type { MlxCacheLayer, MlxMixedRange } from "../../contracts/mlx/graph";
 // Concrete model graph for plain Qwen3 (Qwen3ForCausalLM).
 // Port target: mlx_lm.models.qwen3. A standard dense decoder — GQA softmax
 // attention with per-head q/k RMSNorm (applied over head_dim BEFORE RoPE),
@@ -23,11 +25,9 @@ import { AttentionMasks } from "../../state/attention-read";
 import { denseTurboQuantKernels } from "../../state/turboquant-attention";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
-import type {
-  MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward, MlxWidthClass,
-} from "../../contracts/mlx/graph";
+import type { MlxRowTable, MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPromptRange, MlxTokenPhases, MlxVerifyForward } from "../../contracts/mlx/graph";
 import { declareGraph } from "../capabilities";
-import { atEveryWidth, type ReadPhase } from "../graph";
+import { phaseRowLimit,  rowTable, type ReadPhase  } from "../graph";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import { QuantizedLinear } from "../../layers/quantized-linear";
 import { RMSNorm } from "../../layers/normalization";
@@ -195,6 +195,20 @@ export class Qwen3Model implements MlxDeclaredGraph, MlxTokenPhases {
     this.lmHead = config.text.tieWordEmbeddings
       ? null
       : QuantizedLinear.load(weights, "lm_head", config);
+
+    const multiSequencePrompt: MlxCapturingForward = (ids, cache) =>
+    this.forwardLayers(this.embed.encode(ids), cache, "window");
+    this.prompt = [{ from: 1, to: Infinity, operation: multiSequencePrompt }];
+    this.multiSequencePrompt = this.prompt;
+    this.appendKnown = rowTable<MlxPhaseForward>((ids, cache) =>
+    this.forwardLayers(this.embed.encode(ids), cache, "window"), phaseRowLimit(composition));
+    this.logits = rowTable<MlxHeadForward>(hidden => this.logitsFromHidden(hidden), phaseRowLimit(composition));
+    this.decode = rowTable<MlxPhaseForward>((ids, cache) =>
+    this.forwardLayers(this.embed.encode(ids), cache, "decode"), phaseRowLimit(composition));
+    this.verify = rowTable<MlxVerifyForward>((ids, cache) =>
+    this.forwardLayers(this.embed.encode(ids), cache, "window"), phaseRowLimit(composition));
+
+    bindGraphCaches(this, composition);
   }
 
   loraTargets(): Map<string, QuantizedLinear> {
@@ -219,40 +233,33 @@ export class Qwen3Model implements MlxDeclaredGraph, MlxTokenPhases {
   /** One cache per layer, sharing one mask memo. Their TurboQuant read is dense
    * (`denseTurboQuantKernels`): the read decodes keys and values, then runs the
    * fused SDPA. */
-  makeCache(): Cache[] {
-    const masks = new AttentionMasks();
-    return this.layers.map((_, layer) => composedFullAttentionCache(this.composition.kv, layer, masks, denseTurboQuantKernels));
-  }
+  get cacheLayers(): readonly MlxCacheLayer[] { return this.layers.map(() => ({kind:"full" as const,turboQuant:"dense" as const})); }
+
+  makeCache!: () => Cache[];
 
   /** The scoring forward (`MlxSequenceForward`): the window read at every width. */
-  sequenceHidden(ids: MlxArray, cache: Cache[], _width: MlxWidthClass): MlxArray {
+  sequenceHidden(ids: MlxArray, cache: Cache[], _width: number): MlxArray {
     return this.forwardLayers(this.embed.encode(ids), cache, "window");
   }
 
   /** One whole chunk of a prompt; rows are sequences times the chunk size. The GPU is this graph's one unit. */
-  readonly prefillChunk: MlxPrefillChunk = {
-    gpu: (ids, cache) => this.forwardLayers(this.embed.encode(ids), cache, "window"),
-  };
+  readonly prompt: readonly MlxPromptRange[];
+  readonly multiSequencePrompt: readonly MlxPromptRange[];
 
   /** A prompt's positions that are not a whole chunk: the window read at every width. */
-  readonly prefillTail = atEveryWidth<MlxCapturingForward>((ids, cache) =>
-    this.forwardLayers(this.embed.encode(ids), cache, "window"));
 
   /** Known tokens: this graph declares no committed spans, so they read as a window. */
-  readonly appendKnown = atEveryWidth<MlxPhaseForward>((ids, cache) =>
-    this.forwardLayers(this.embed.encode(ids), cache, "window"));
+  readonly appendKnown: MlxRowTable<MlxPhaseForward>;
 
   /** The one output head at every width. */
-  readonly logits = atEveryWidth<MlxHeadForward>(hidden => this.logitsFromHidden(hidden));
+  readonly logits: MlxRowTable<MlxHeadForward>;
 
   /** One new token per sequence: `ids` [sequences, 1]. */
-  readonly decode = atEveryWidth<MlxPhaseForward>((ids, cache) =>
-    this.forwardLayers(this.embed.encode(ids), cache, "decode"));
+  readonly decode: MlxRowTable<MlxCapturingForward>;
 
   /** A speculative window of depth + 1 positions per sequence. This graph
    * declares no hidden-layer taps, so `capture` is always null. */
-  readonly verify = atEveryWidth<MlxVerifyForward>((ids, cache) =>
-    this.forwardLayers(this.embed.encode(ids), cache, "window"));
+  readonly verify: MlxRowTable<MlxCapturingForward>;
 
   /** The decoder over `h0` (consumed), every block reading its cache for `phase`. */
   protected forwardLayers(h0: MlxArray, cache: Cache[], phase: ReadPhase): MlxArray {
