@@ -12,11 +12,9 @@ describe("adaptive speculative draft gate", () => {
     expect(gate.choose(8)).toBe(0);
   });
 
-  test("charges recurrent replay and selects no deeper than the budget", () => {
-    const plain = new AdaptiveDraftGate(costs, { maxDraftTokens: 8 });
-    const replay = new AdaptiveDraftGate(costs, { maxDraftTokens: 8, replayOnReject: true });
-    expect(replay.expectedRate(4)).toBeLessThan(plain.expectedRate(4));
-    expect(plain.choose(2)).toBeLessThanOrEqual(2);
+  test("selects no deeper than the budget", () => {
+    const gate = new AdaptiveDraftGate(costs, { maxDraftTokens: 8 });
+    expect(gate.choose(2)).toBeLessThanOrEqual(2);
   });
 
   test("models acceptance per position: a drafter whose third position falls off drafts two", () => {

@@ -39,8 +39,6 @@ function interpolatedCost(costs: VerifyCostModel, positions: number): number {
  *  - `probeDepth`: the depth a drafter that proposes without committing drafts a probe at (the round's budget). */
 export interface AdaptiveDraftGateOptions extends AdaptiveDraftGateSettings {
   readonly maxDraftTokens: number;
-  /** Whether rejection requires replaying the accepted prefix. */
-  readonly replayOnReject?: boolean;
 }
 
 /** Acceptance is modeled per draft position: the probability that the draft at position i is accepted given that
@@ -59,7 +57,6 @@ export class AdaptiveDraftGate {
   readonly #idleDecay: number;
   readonly #margin: number;
   readonly #maxDraftTokens: number;
-  readonly #replayOnReject: boolean;
   readonly #probeInterval: number;
   readonly #maxProbeInterval: number;
   /** The depth of a probe drafted without a verify round. */
@@ -71,7 +68,6 @@ export class AdaptiveDraftGate {
 
   constructor(readonly costs: VerifyCostModel, options: AdaptiveDraftGateOptions) {
     this.#maxDraftTokens = options.maxDraftTokens;
-    this.#replayOnReject = options.replayOnReject ?? false;
     const accepted = options.priorAccepted ?? 4.5, rejected = options.priorRejected ?? 0.5;
     this.#prior = accepted / (accepted + rejected);
     this.#priorWeight = accepted + rejected;
@@ -120,15 +116,12 @@ export class AdaptiveDraftGate {
   expectedRate(k: number, rows = 1): number {
     // survive: the probability that every draft up to a position is accepted; the round emits one token more
     // than it accepts, so tokens = 1 + the sum of survive over positions 1..k.
-    let survive = 1, tokens = 1, replay = 0;
+    let survive = 1, tokens = 1;
     for (let position = 1; position <= k; position++) {
-      const next = survive * this.acceptance(position);
-      // Exactly position - 1 accepted: the prefix is replayed.
-      if (this.#replayOnReject) replay += (survive - next) * interpolatedCost(this.costs, rows * position);
-      tokens += next;
-      survive = next;
+      survive *= this.acceptance(position);
+      tokens += survive;
     }
-    return tokens * interpolatedCost(this.costs, rows) / (interpolatedCost(this.costs, rows * (k + 1)) + replay);
+    return tokens * interpolatedCost(this.costs, rows) / interpolatedCost(this.costs, rows * (k + 1));
   }
 
   /** The next round's depth: `choose`'s, except that after a run of rounds without drafts it drafts one token,
