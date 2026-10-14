@@ -100,20 +100,21 @@ export class TrellisLinear {
     readonly scales: MlxArray,
     spec: QuantSpec,
     readonly useSharedScatterCodebook = false,
+    representations: TrellisRepresentations = qualifiedRepresentations(deviceArchitecture()),
   ) {
     this.spec = spec;
     this.geometry = trellisGeometry(codes, spec);
     if (this.geometry.blockInterleave && (scales.ndim !== 1 || scales.size !== this.geometry.rows))
       throw new Error("trellis: interleaved codes require one scale per stored row");
-    this.representations = qualifiedRepresentations(deviceArchitecture());
+    this.representations = representations;
   }
 
-  static load(weights: Weights, path: string, config: ModelConfig, useSharedScatterCodebook = false): TrellisLinear {
+  static load(weights: Weights, path: string, config: ModelConfig, useSharedScatterCodebook = false, representations?: TrellisRepresentations): TrellisLinear {
     const spec = quantFor(config.quantization, path);
     if (!spec || spec.mode !== "trellis")
       throw new Error(`${path}: expected a trellis quant spec`);
     if (!weights.has(`${path}.scales`)) throw new Error(`${path}: trellis tensor has no .scales`);
-    return new TrellisLinear(weights.tensor(`${path}.weight`), weights.tensor(`${path}.scales`), spec, useSharedScatterCodebook);
+    return new TrellisLinear(weights.tensor(`${path}.weight`), weights.tensor(`${path}.scales`), spec, useSharedScatterCodebook, representations);
   }
 
   static isTrellis(config: ModelConfig, path: string): boolean {
