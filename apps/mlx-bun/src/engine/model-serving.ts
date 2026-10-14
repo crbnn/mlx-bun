@@ -1,4 +1,3 @@
-import { sequenceLogitsOperation } from "@mlx-bun/inference/scoring";
 import type { MlxSequenceRange, MlxSequenceForward } from "@mlx-bun/inference/contracts/mlx";
 import type { Composition } from "@mlx-bun/inference/contracts/portable";
 import type { ModelContext, LoadedModelContext } from "./model-host";
@@ -17,7 +16,7 @@ function compositionWire(composition: Composition): unknown {
  * supply a binding explicitly and need no forward/makeCache methods. */
 export async function modelServingBinding(context: LoadedModelContext, supplied?: ModelBinding): Promise<ModelBinding> {
   if (supplied) return supplied;
-  const [{ declaredGraph, embeddingDeclarationFor }, { embedMany, embeddingTerminatorId, isEmbeddingModel }, { bindMlxGateway }, { MLX_VERSION, deviceArchitecture }, ops, { sequenceHiddenOperation }] = await Promise.all([
+  const [{ declaredGraph, embeddingDeclarationFor }, { embedMany, embeddingTerminatorId, isEmbeddingModel }, { bindMlxGateway }, { MLX_VERSION, deviceArchitecture }, ops, { sequenceHiddenOperation, sequenceLogitsOperation }] = await Promise.all([
     import("@mlx-bun/inference/models"), import("@mlx-bun/inference/embeddings"),
     import("@mlx-bun/inference/execution"), import("@mlx-bun/mlx/ffi"), import("@mlx-bun/mlx/ops"), import("@mlx-bun/inference/scoring"),
   ]);

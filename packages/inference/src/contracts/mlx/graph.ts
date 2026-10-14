@@ -60,7 +60,7 @@ export interface MlxHeadRange { readonly from: number; readonly to: number; read
  * `ids` [sequences, tokens] as one causal window over the caller's caches (the
  * stateless training caches, which own the mask of an unpadded or right-padded
  * batch and the training attention kernel), on the kernels of `width`, the
- * class of its rows. Returns the post-final-norm hidden the caller owns. */
+ * actual number of its rows. Returns the post-final-norm hidden the caller owns. */
 export type MlxSequenceForward = (ids: MlxArray, state: Cache[], width: number) => MlxArray;
 
 /** One contiguous range of positions in a single sequence's prompt piece.
@@ -106,7 +106,7 @@ export interface MlxPhaseGroup {
   /** `decode` (one position per sequence), `window` (a prompt piece) or
    * `verify` (a speculative window, which keeps its own projection geometry). */
   readonly phase: "decode" | "window" | "verify";
-  /** The class of this group's rows, the caller's to name. */
+  /** The actual number of rows in this group. */
   readonly rows: number;
   readonly ids: MlxArray;
   readonly state: Cache[];
@@ -116,7 +116,7 @@ export interface MlxPhaseGroup {
 /** Declared by a composition that serves mixed rows: decode, prompt and verify
  * groups in one forward, each group's attention and recurrence over its own
  * caches for its own phase, the row-wise layers over the groups' rows packed
- * together unless a verify group keeps its geometry. `width` is the class of
+ * together unless a verify group keeps its geometry. `width` is the actual number of
  * the packed rows, the caller's to name. Borrows inputs and state; returns one
  * owned post-final-norm hidden per group. */
 export type MlxMixedForward = (groups: readonly MlxPhaseGroup[], width: number) => MlxArray[];
