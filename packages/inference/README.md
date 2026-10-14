@@ -1281,6 +1281,10 @@ A graph whose composition measured them declares the kernels of a drafter's own 
 (`draftProjections`; the M1 Max graph: the affine row kernel at two to three rows, the split matrix-unit kernel from
 four, MLX's quantized matmul at one); the DFlash 2 drafter builds them when its first group binds and
 otherwise keeps its own rule (the simdgroup matrix unit at five to eight rows, MLX's quantized matmul otherwise).
+A graph whose composition measured it declares the target's frequency-ranked draft vocabulary on its draft head
+(`DraftProjection.vocabulary`: the M1 Max graph, the artifact's `mtp/draft_vocab.json`, those rows of its head on the
+head's own layers, gathered when a drafter first reads them); DFlash 2 then projects onto those rows and selects among
+them, the target still verifying over its full head.
 A library caller speculates as the app does: `binding.plan` with `hasDraft`, then
 `binding.methodRequest` and `submit` on `binding.createBatchGroup({ maxBatch: 1 })`
 (`@mlx-bun/training/dspark`'s calibration runs this way).

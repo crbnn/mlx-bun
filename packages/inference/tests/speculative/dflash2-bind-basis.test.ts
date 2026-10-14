@@ -13,7 +13,7 @@
 // proposes. The drafter's numbers on the real artifact are the teacher-forced
 // DFlash 2 blocks the parity suites hash.
 import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { MlxArray } from "@mlx-bun/mlx/array";
@@ -26,8 +26,8 @@ import { Weights } from "../../src/artifacts/weights";
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
 import { testComposition } from "../models/test-composition";
 import { QWEN38_TRELLIS_M1MAX_GRAPH } from "../../src/models/qwen/qwen38-27b-trellis-m1max";
-import { qwenDraftTarget, qwenResidualBasis } from "../../src/models/qwen/media-input";
-import { Affine4MmaLinear } from "../../src/layers/affine-verify-linear";
+import { qwenDraftTarget, qwenDraftVocabulary, qwenResidualBasis } from "../../src/models/qwen/media-input";
+import { Affine4MmaLinear, Affine4RowsLinear, AffineSplitMmaLinear } from "../../src/layers/affine-verify-linear";
 import type { DraftProjection } from "../../src/contracts/mlx/draft-projection";
 import { atEveryWidth, byWidth } from "../../src/models/graph";
 import { widthClass, type MlxWidthClass } from "../../src/contracts/mlx/graph";
@@ -413,5 +413,89 @@ test("the rotated Trellis graphs' declaration carries the basis its turboquant_f
     for (const provider of providers) provider.dispose();
     weights?.dispose();
     rmSync(target, { recursive: true, force: true });
+  }
+});
+
+/** Each row's top `k` token ids of logits [rows × V] read back flat. */
+function topIds(logits: Float32Array, k: number): number[] {
+  const ids: number[] = [];
+  for (let row = 0; row < logits.length / V; row++) {
+    const scores = Array.from(logits.subarray(row * V, (row + 1) * V), (score, id) => ({ score, id }));
+    ids.push(...scores.sort((a, b) => b.score - a.score).slice(0, k).map(entry => entry.id));
+  }
+  return ids;
+}
+
+test("a target that declares a draft vocabulary drafts among its rows: a list holding every candidate of the full head proposes the full head's drafts, any list only its own ids", async () => {
+  const provider = await Dflash2Provider.load(dir, { bits: 4 });
+  try {
+    const { anchors, accepted } = CASES[1]!;
+    const B = anchors.length, width = Math.max(...accepted) + 1;
+    using taps = bf16([B, CONTEXT, TAPS.length * H], 1);
+    using commit = bf16([B, width, TAPS.length * H], 1);
+    const full = drafts(provider.grouped, targetOf(basis), taps, commit, anchors, accepted, DEPTHS);
+    // The head over a list: the full head's logits at the listed columns (captured whole, as the full head is).
+    const listedTarget = (list: readonly number[]): TargetView => {
+      using index = ops.fromInt32([...list], [list.length]);
+      const ids = index.astype(Dtype.uint32), columns = ops.fromInt32([...list], [list.length]);
+      resident.push(ids, columns);
+      const vocabulary = { ids, logits: atEveryWidth((hidden: MlxArray) => {
+        using logits = projection.logits.one(hidden);
+        return ops.takeAxis(logits, columns, -1);
+      }) };
+      return Object.freeze({ identity: {}, residualBasis: basis,
+        hiddenLayerTaps: { layerCount: TARGET_LAYERS, projection: { ...projection, vocabulary } } });
+    };
+    const candidates = new Set(full.flatMap(run => topIds(run.logits, TOP_K)));
+    const holding = [...new Set([...candidates, 0, V - 2])].sort((a, b) => a - b);
+    expect(holding.length).toBeLessThan(V);
+    const listed = drafts(provider.grouped, listedTarget(holding), taps, commit, anchors, accepted, DEPTHS);
+    for (const [i, run] of listed.entries()) expect(run.tokens).toEqual(full[i]!.tokens);
+    // Every other id: whatever the full head would draft, only listed ids are proposed.
+    const even = Array.from({ length: V / 2 }, (_, i) => 2 * i);
+    const restricted = drafts(provider.grouped, listedTarget(even), taps, commit, anchors, accepted, DEPTHS);
+    for (const [i, depth] of DEPTHS.entries())
+      expect(restricted[i]!.tokens.every(row => row.length === depth && row.every(id => id % 2 === 0))).toBe(true);
+    expect(full.some(run => run.tokens.flat().some(id => id % 2 === 1))).toBe(true);
+  } finally { provider.dispose(); }
+});
+
+test("the Qwen graphs' draft vocabulary is the head's listed rows on the head's layers, their logits the full head's at those rows", () => {
+  const artifact = mkdtempSync(join(tmpdir(), "mlx-bun-draft-vocabulary-"));
+  const OUT = 256, owned: { dispose(): void }[] = [];
+  const list = Array.from({ length: 96 }, (_, i) => (i * 37 + 11) % OUT);
+  try {
+    mkdirSync(join(artifact, "mtp"));
+    writeFileSync(join(artifact, "mtp", "draft_vocab.json"), JSON.stringify({ ids: [...list, list[0]] }));
+    using weight = bf16([OUT, H], 1 / Math.sqrt(H));
+    const q = ops.quantize(weight, 64, 4);
+    const head = new QuantizedLinear(q.packed, q.scales, q.biases, { bits: 4, groupSize: 64, mode: "affine" });
+    owned.push(q.packed, q.scales, q.biases);
+    // The M1 Max head's layers per width class.
+    const kernels = (linear: QuantizedLinear) => {
+      const rows = new Affine4RowsLinear(linear), split = new AffineSplitMmaLinear(linear);
+      return Object.freeze({ one: (x: MlxArray) => linear.forward(x), twoToThree: (x: MlxArray) => rows.forward(x),
+        four: (x: MlxArray) => split.forward(x), fiveToEight: (x: MlxArray) => split.forward(x), wider: (x: MlxArray) => split.forward(x) });
+    };
+    expect(() => qwenDraftVocabulary(head, artifact, "mtp/draft_vocab.json", 200, kernels, owned)).toThrow(/outside the target vocabulary 200/);
+    const vocabulary = qwenDraftVocabulary(head, artifact, "mtp/draft_vocab.json", OUT, kernels, owned);
+    const sorted = [...new Set(list)].sort((a, b) => a - b);
+    expect(vocabulary.ids.dtype).toBe(Dtype.uint32);
+    expect(vocabulary.ids.toIntTokens()).toEqual(sorted);
+    const fullHead = kernels(head);
+    using columns = ops.fromInt32(sorted, [sorted.length]);
+    for (const rows of [1, 2, 3, 4, 7, 12]) {
+      const width = widthClass(rows);
+      using hidden = bf16([rows, H], 1);
+      using all = fullHead[width](hidden);
+      using taken = ops.takeAxis(all, columns, -1);
+      using expected = ops.contiguous(taken);
+      using actual = vocabulary.logits[width](hidden);
+      expect(actual.shape).toEqual([rows, sorted.length]);
+      expect(maxDiff(actual.toFloat32(), expected.toFloat32())).toBe(0);
+    }
+  } finally {
+    for (const array of owned) array.dispose();
+    rmSync(artifact, { recursive: true, force: true });
   }
 });

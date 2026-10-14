@@ -76,6 +76,10 @@ export interface Qwen38Composition {
    *  composition on its host, where their share of the recommended working set alone would leave them unwired.
    *  Absent: the share decides. */
   readonly wiredWeights?: true;
+  /** The artifact's frequency-ranked draft vocabulary (a path inside the artifact) a bound drafter that selects by
+   *  its scores drafts over (`DraftProjection.vocabulary`: those rows of the head on the head's layers per width
+   *  class), measured for this composition on its host. Absent: drafters select over the full head. */
+  readonly draftVocabulary?: string;
 }
 
 export const QWEN38_COMPOSITIONS: Readonly<Record<string, Qwen38Composition>> = Object.freeze({
@@ -124,6 +128,11 @@ export const QWEN38_COMPOSITIONS: Readonly<Record<string, Qwen38Composition>> = 
     // split 171/173 -> 172/177 and the first GPU step after the split 0.15-1.4 s -> 61-69 ms; one-row decode
     // unchanged (60.0 ms).
     wiredWeights: true,
+    // Measured 2026-10-13 on this graph and artifact: the DFlash 2 drafter over the artifact's 65,536-token list against
+    // the full head, adaptive, in-process serve, bf16 KV, four prompts of 192 tokens, A B A B: greedy 24.75/24.68 ->
+    // 24.75/24.67 tok/s, Qwen's instruct sampling 21.50/21.43 -> 21.67/21.77, its thinking sampling 19.96/20.01 ->
+    // 19.94/20.13 (requests whose drafts did not change: 0.5-3% faster); the M4 Pro lost 3-7% with it (pre-refactor).
+    draftVocabulary: "mtp/draft_vocab.json",
   },
 });
 
@@ -522,6 +531,15 @@ export function emitQwen38Graph(description: Qwen38Description, stem: string,
     ...(wider ? [[blocksName(wider.projections), wider.projections] as const] : [])]).entries()];
   const headName = (layer: string) => `${layer[0]!.toLowerCase()}${layer.slice(1).replace(/Linear$/, "")}Head`;
   const heads = head ? [...new Set([...Object.values(head).filter((layer): layer is string => layer !== null), ...(wider ? [wider.head] : [])])] : [];
+  /** The head's width table over \`linear\` (the head, or its draft-vocabulary rows), its layers named \`layer…Head\`. */
+  const headTable = (indent: string) => `${indent}one: plain,
+${NARROW.filter(cls => cls !== "one").map(cls => {
+  const layer = head![cls as Exclude<Narrow, "one">];
+  return `${indent}${cls}: ${layer ? `hidden => ${headName(layer)}.forward(hidden)` : "plain"},`;
+}).join("\n")}
+${indent}wider: ${wider ? `hidden => hidden.size / hidden.shape.at(-1)! <= WIDER_ROWS ? ${headName(wider.head)}.forward(hidden) : plain(hidden)` : "plain"},`;
+  const vocabulary = c.draftVocabulary ?? null;
+  if (vocabulary && !head) throw new Error(`${stem}: a draft vocabulary runs on the head layers of ${c.device}'s table`);
   /** A layer's construction; a tailed layer takes the mixed-width tail (the split one where those layers are off). */
   const construct = (layer: string) => TAILED.has(layer)
     ? `new ${layer}(gate, up, ${JSON.stringify(mixedTail === "off" ? "split" : mixedTail)})` : `new ${layer}(gate, up)`;
@@ -636,6 +654,8 @@ ${NARROW.map(cls => narrowSet(cls, "      ")).join("\n")}${wider ? `\n${widerSet
       : "The head is QuantizedLinear at every width.",
     ...(drafter ? [`A bound drafter's own 4-bit projections take ${[...NARROW, "wider" as const].filter(cls => drafter[cls] !== null).map(cls =>
       `${drafter[cls]} at ${cls}`).join(", ")}, QuantizedLinear otherwise (TargetView.draftProjections).`] : []),
+    ...(vocabulary ? [`A drafter that selects by its scores selects over the artifact's draft vocabulary (${vocabulary}), those rows of the`,
+      "head on the head's layers (DraftProjection.vocabulary)."] : []),
     asyncEvery !== null ? `Decode, verify, prompt tails and embeddings up to ${widest} rows${wider
       ? ", and decode, verify windows and prompt tails on the wider layers," : ""} submit the graph every ${asyncEvery} layers; wider decode${
       k.widerVerify === "lazy" ? " and verify windows" : ""}${k.knownSpans ? "" : " and known-token appends"} are ${wider ? "otherwise " : ""}one lazy graph;`
@@ -730,7 +750,8 @@ import * as ops from "@mlx-bun/mlx/ops";
 import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
 import type { Cache, GatedDeltaCache } from "../../contracts/mlx/cache";
-import type { ${drafter ? "DraftProjectionKernel, " : ""}ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
+${vocabulary ? `import type { DraftProjection } from "../../contracts/mlx/draft-projection";
+` : ""}import type { ${drafter ? "DraftProjectionKernel, " : ""}ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
 import type {
 ${k.knownSpans ? `  MlxDeclaredGraph, MlxHeadForward, MlxKnownSpans, MlxLayerCapture, MlxMixedForward, MlxPhaseForward,
   MlxPrefillChunk, MlxTokenPhases, MlxWidthClass, MlxWidthTable,` : `  MlxDeclaredGraph, MlxHeadForward, MlxLayerCapture, MlxMixedForward, MlxPhaseForward, MlxPrefillChunk,
@@ -772,7 +793,7 @@ ${projectionSets.length || ane || promptProjection ? `import {
   GatedDeltaNet, Qwen3Attention, Qwen3Layer, type AttentionLinear, type AttentionLinearLoader, type TrellisMlp,
 } from "./blocks";` : `import { Qwen3Layer, type AttentionLinear, type GatedDeltaNet, type Qwen3Attention, type TrellisMlp } from "./blocks";`}
 import { qwen35WeightsView } from "./checkpoint";
-import { bindQwenMediaInput, qwenDraftTarget, qwenMediaEncoders, qwenResidualBasis } from "./media-input";
+import { bindQwenMediaInput, qwenDraftTarget, ${vocabulary ? "qwenDraftVocabulary, " : ""}qwenMediaEncoders, qwenResidualBasis } from "./media-input";
 
 export const ${constName(c)} = ${JSON.stringify(c.graph)};
 
@@ -958,6 +979,8 @@ ${packedWider ? `  /** Each layer's MLP on the wider layers (the post-attention-
   readonly #residualBasis: ResidualBasis | undefined;
 ${drafter ? `  /** The kernels a bound drafter's own 4-bit projections run, per width class of their rows. */
   readonly #draftProjections: MlxWidthTable<DraftProjectionKernel>;
+` : ""}${vocabulary ? `  /** The head's rows of the artifact's draft vocabulary on the head's layers, built when a drafter first reads them. */
+  #draftVocabulary: NonNullable<DraftProjection["vocabulary"]> | undefined;
 ` : ""}  /** What this graph created and frees in \`dispose\`: its constants${ane ? " and the Neural Engine layers' programs" : ""}. */
   readonly #owned: { dispose(): void }[] = [];
   /** The attention cache of layer \`layer\` the composition's KV scheme names, over one \`makeCache\` call's masks. */
@@ -1135,12 +1158,7 @@ ${head ? `    if (composition.adapters) this.logits = atEveryWidth(plain);
     else {
       const ${heads.map(layer => `${headName(layer)} = new ${layer}(head)`).join(", ")};
       this.logits = Object.freeze<MlxWidthTable<MlxHeadForward>>({
-        one: plain,
-${NARROW.filter(cls => cls !== "one").map(cls => {
-  const layer = head[cls as Exclude<Narrow, "one">];
-  return `        ${cls}: ${layer ? `hidden => ${headName(layer)}.forward(hidden)` : "plain"},`;
-}).join("\n")}
-        wider: ${wider ? `hidden => hidden.size / hidden.shape.at(-1)! <= WIDER_ROWS ? ${headName(wider.head)}.forward(hidden) : plain(hidden)` : "plain"},
+${headTable("        ")}
       });
     }` : "    this.logits = atEveryWidth(plain);"}
     console.error(\`[graph] \${this.graph} \${COMPOSITION.fingerprint}${ane ? ` ane-prefill=\${ane ? "on" : "off"}` : ""} adapters=\${composition.adapters ? "on" : "off"}\`);
@@ -1169,10 +1187,29 @@ ${legoKv ? `  /** One cache per layer, the attention caches sharing one mask mem
 
   bindMediaInput(input: Vision): MlxPromptInput { return bindQwenMediaInput(this, input.embeddings, input.mrope!); }
   mediaEncoders(modelDir: string): Promise<MediaEncoders> { return qwenMediaEncoders(this, modelDir); }
-  /** The drafter's ports: its hidden-layer taps (verify's capture), embedding and head, ${drafter ? "the" : "and the"} residual basis
+${vocabulary ? `  /** The drafter's ports: its hidden-layer taps (verify's capture), embedding and head, the residual basis (R1 seed,
+   *  final-norm gain) the artifact's fold record declares, ${drafter ? "the kernels of its own projections, " : ""}and the head's rows of
+   *  the artifact's draft vocabulary. */
+  draftTarget(_caches: Cache[]): TargetView {
+    return qwenDraftTarget(this, this.#residualBasis, ${drafter ? "this.#draftProjections" : "undefined"}, () => this.#vocabularyHead());
+  }
+` : `  /** The drafter's ports: its hidden-layer taps (verify's capture), embedding and head, ${drafter ? "the" : "and the"} residual basis
    *  (R1 seed, final-norm gain) the artifact's fold record declares${drafter ? ", and the kernels of its own projections" : ""}. */
   draftTarget(_caches: Cache[]): TargetView { return qwenDraftTarget(this, this.#residualBasis${drafter ? ", this.#draftProjections" : ""}); }
-
+`}${vocabulary ? `
+  /** The head's rows of the artifact's draft vocabulary (\`${vocabulary}\`) on the head's layers per width class,
+   *  built once, when a drafter first reads them. */
+  #vocabularyHead(): NonNullable<DraftProjection["vocabulary"]> {
+    return this.#draftVocabulary ??= qwenDraftVocabulary(this.lmHead, this.config.modelDir, ${JSON.stringify(vocabulary)},
+      this.config.text.vocabSize, rows => {
+        const plain: MlxHeadForward = hidden => rows.forward(hidden);
+        const ${heads.map(layer => `${headName(layer)} = new ${layer}(rows)`).join(", ")};
+        return Object.freeze<MlxWidthTable<MlxHeadForward>>({
+${headTable("          ")}
+        });
+      }, this.#owned);
+  }
+` : ""}
   // ── The layer loops. Each consumes h0 and returns the post-final-norm hidden,
   // owned by the caller; \`capture\` sees every layer's output, then the final hidden.
 ${asyncEvery !== null ? `

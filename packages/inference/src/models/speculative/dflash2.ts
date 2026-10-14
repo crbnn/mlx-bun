@@ -11,7 +11,9 @@
 //            x += Conv₁(MLP(Conv₀(m)))
 //            Conv(y)[t,c] = Σ_τ (base[τ,c] + D[t,τ,c/16])·y[t−τ,c], y[−1] = 0
 //   output   rows 1..G−1 → norm → the TARGET's lm_head (the drafter has no
-//            embedding or head of its own).
+//            embedding or head of its own), or the head's rows of the draft
+//            vocabulary a target's composition declares
+//            (`DraftProjection.vocabulary`): the walk then selects among them.
 //   selector top-16 per position; greedy left-to-right walk scoring
 //            logit + Σ_r pred[prev,r]·z[r]·succ[cand,r], z = hidden_projection(h).
 // Attention is bidirectional within the block. The 2048-row sliding window
@@ -458,9 +460,11 @@ export class Dflash2Drafter implements Dflash2DrafterModel {
       using rows = x.slice([0, 1, 0], [B, G, H]);
       using h = this.#rms(rows, this.#norm);
       using headInput = this.#toTargetHead(h);
-      using logits = projection.logits[widthClass(B * (G - 1))](headInput);
+      // A target that declares its draft vocabulary is projected onto those rows only (its candidates their ids).
+      const listed = projection.vocabulary;
+      using logits = (listed?.logits ?? projection.logits)[widthClass(B * (G - 1))](headInput);
       using z = this.#selProj.forward(h);
-      using columns = this.#select(logits, z, anchors, G - 1); // [steps, B]
+      using columns = this.#select(logits, z, anchors, G - 1, listed?.ids ?? null); // [steps, B]
       using rowsMajor = ops.transposeAxes(columns, [1, 0]);
       return ops.contiguous(rowsMajor);
     } finally { x.dispose(); }
@@ -468,8 +472,9 @@ export class Dflash2Drafter implements Dflash2DrafterModel {
 
   /** Greedy candidate-path walk (fp32 scores, as vLLM requires). Every position's top-K candidates and their
    *  scores come from one partition over all positions (each row partitions alone, as one position's would);
-   *  only the path term walks position by position. */
-  #select(logits: MlxArray, z: MlxArray, anchors: readonly number[], steps: number): MlxArray {
+   *  only the path term walks position by position. `ids` (uint32 [N]) maps the columns of logits over a draft
+   *  vocabulary to token ids; null: the columns are the token ids. */
+  #select(logits: MlxArray, z: MlxArray, anchors: readonly number[], steps: number, ids: MlxArray | null): MlxArray {
     const B = anchors.length, R = z.shape[2]!, K = this.cfg.topK;
     const tokens: MlxArray[] = [];
     using scoresAll = logits.astype(Dtype.float32);
@@ -477,11 +482,13 @@ export class Dflash2Drafter implements Dflash2DrafterModel {
     using orderAll = ops.argpartitionAxis(negatedAll, K - 1, -1);
     using localAll = orderAll.slice([0, 0, 0], [B, steps, K]);
     using unaryAll = ops.takeAlongAxis(scoresAll, localAll, -1); // [B, steps, K]
+    using listedAll = ids ? ops.takeAxis(ids, localAll, 0) : null; // their token ids over a draft vocabulary
+    const candidateAll = listedAll ?? localAll;
     using anchorIds = ops.fromInt32([...anchors], [B]);
     let previous = anchorIds.astype(Dtype.uint32);
     try {
       for (let p = 0; p < steps; p++) {
-        using localRow = localAll.slice([0, p, 0], [B, p + 1, K]);
+        using localRow = candidateAll.slice([0, p, 0], [B, p + 1, K]);
         using local = ops.reshape(localRow, [B, K]);
         using unaryRow = unaryAll.slice([0, p, 0], [B, p + 1, K]);
         using unary = ops.reshape(unaryRow, [B, K]);
