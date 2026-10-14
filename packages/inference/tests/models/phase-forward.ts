@@ -1,3 +1,5 @@
+import { rowTable } from "../../src/models/graph";
+import { MlxPhaseDispatch } from "../../src/generation/phase-dispatch";
 // A test's forwards through a graph's named phases. The test is the scheduler
 // here: it names the phase of each call from the tokens it hands over, as the
 // planner does, one position per sequence a decode and more a prompt tail, and
@@ -5,7 +7,7 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { Cache } from "../../src/contracts/mlx/cache";
-import { widthClass, type MlxLayerCapture, type MlxTokenPhases, type MlxWidthTable } from "../../src/contracts/mlx/graph";
+import { type MlxLayerCapture, type MlxTokenPhases, type MlxRowTable } from "../../src/contracts/mlx/graph";
 import { argmaxLastPosition } from "../../src/kernels/logits";
 
 /** A forward the test knows runs synchronously (every resident graph's operations do). */
@@ -16,22 +18,22 @@ function settled(result: MlxArray | Promise<MlxArray>): MlxArray {
 
 /** `ids` [sequences, tokens] appended to `caches`: one token per sequence through
  *  `decode`, more through `prefillTail`, each at the class of its rows. */
-export function phaseHidden(model: Pick<MlxTokenPhases, "decode" | "prefillTail">, ids: MlxArray, caches: Cache[],
+export function phaseHidden(model: Pick<MlxTokenPhases, "decode" | "prompt" | "multiSequencePrompt">, ids: MlxArray, caches: Cache[],
   capture: MlxLayerCapture | null = null): MlxArray {
   const [sequences, tokens] = ids.shape as [number, number];
-  return settled(tokens === 1 ? model.decode[widthClass(sequences)](ids, caches, capture)
-    : model.prefillTail[widthClass(sequences * tokens)](ids, caches, capture));
+  return settled(tokens === 1 ? model.decode[(sequences)]!(ids, caches, capture)
+    : new MlxPhaseDispatch(model as MlxTokenPhases).prompt("tail", sequences, tokens)(ids, caches, capture));
 }
 
 /** Logits [1, L, vocabulary] for `tokens` appended to `caches` (`phaseHidden`, then
  *  the head for every position at the class of those rows). */
-export function phaseLogits(model: Pick<MlxTokenPhases, "decode" | "prefillTail" | "logits">,
+export function phaseLogits(model: Pick<MlxTokenPhases, "decode" | "prompt" | "multiSequencePrompt" | "logits">,
   tokens: readonly number[] | MlxArray, caches: Cache[]): MlxArray {
   const ids = Array.isArray(tokens) ? ops.fromInt32([...tokens], [1, tokens.length]) : tokens as MlxArray;
   try {
     using hidden = phaseHidden(model, ids, caches);
     const [sequences, length] = ids.shape as [number, number];
-    return model.logits[widthClass(sequences * length)](hidden);
+    return model.logits[(sequences * length)]!(hidden);
   } finally { if (Array.isArray(tokens)) ids.dispose(); }
 }
 
@@ -39,21 +41,20 @@ export function phaseLogits(model: Pick<MlxTokenPhases, "decode" | "prefillTail"
  *  and every width (the forward takes the capture a phase hands it, which a fixture may ignore). */
 export function stubPhases(forward: (ids: MlxArray, caches: Cache[], capture: MlxLayerCapture | null) => MlxArray | Promise<MlxArray>,
   head: (hidden: MlxArray) => MlxArray): MlxTokenPhases {
-  const every = <Operation>(operation: Operation) =>
-    Object.freeze({ one: operation, twoToThree: operation, four: operation, fiveToEight: operation, wider: operation });
+  const every = rowTable;
   const run = (ids: MlxArray, caches: Cache[], capture: MlxLayerCapture | null = null) => forward(ids, caches, capture);
-  return { prefillChunk: Object.freeze({ gpu: run }), prefillTail: every(run), decode: every(run), verify: every(run),
+  return { prompt: [{from:1,to:Infinity,operation:run}], multiSequencePrompt: [{from:1,to:Infinity,operation:run}], decode: every(run), verify: every(run),
     appendKnown: every((ids: MlxArray, caches: Cache[]) => run(ids, caches)), logits: every(head) };
 }
 
 /** A stand-in recurrent MTP block whose one forward serves its decode table and its window. */
-export function mtpModule<Forward>(forward: Forward): { readonly decode: MlxWidthTable<Forward>; readonly window: Forward } {
-  return { decode: Object.freeze({ one: forward, twoToThree: forward, four: forward, fiveToEight: forward, wider: forward }),
+export function mtpModule<Forward>(forward: Forward): { readonly decode: MlxRowTable<Forward>; readonly window: Forward } {
+  return { decode: rowTable(forward),
     window: forward };
 }
 
 /** What a test observes of the phases a scheduler calls. */
-export type ObservedPhase = "prefillChunk" | "prefillTail" | "decode" | "verify" | "appendKnown";
+export type ObservedPhase = "prefillChunk" | "prompt" | "multiSequencePrompt" | "decode" | "verify" | "appendKnown";
 export interface PhaseObserver {
   /** Before each forward runs: its input, caches and the phase the scheduler named. */
   forward?(ids: MlxArray, caches: Cache[], phase: ObservedPhase): void;
@@ -79,16 +80,14 @@ export function observedPhases<Model extends object>(model: Model, observer: Pha
     };
     return out instanceof Promise ? out.then(after) : after(out);
   };
-  const forwards = (entries: MlxWidthTable<Forward>, name: ObservedPhase) =>
+  const forwards = (entries: MlxRowTable<Forward>, name: ObservedPhase) =>
     Object.freeze(Object.fromEntries(Object.entries(entries).map(([width, run]) => [width, watch(name, run as Forward)])));
-  const ane = phases.prefillChunk.ane;
   const overrides: Record<string, unknown> = {
-    prefillChunk: Object.freeze({ gpu: watch("prefillChunk", phases.prefillChunk.gpu),
-      ...(ane ? { ane: Object.freeze(ane.map(unit => Object.freeze({ ...unit, forward: watch("prefillChunk", unit.forward) }))) } : {}) }),
-    prefillTail: forwards(phases.prefillTail, "prefillTail"),
+    prompt: phases.prompt.map(range => ({...range, operation: watch("prompt", range.operation)})),
+    multiSequencePrompt: phases.multiSequencePrompt.map(range => ({...range, operation: watch("prompt", range.operation)})),
     decode: forwards(phases.decode, "decode"),
     verify: forwards(phases.verify, "verify"),
-    appendKnown: forwards(phases.appendKnown as MlxWidthTable<Forward>, "appendKnown"),
+    appendKnown: forwards(phases.appendKnown as MlxRowTable<Forward>, "appendKnown"),
     logits: Object.freeze(Object.fromEntries(Object.entries(phases.logits).map(([width, head]) =>
       [width, (hidden: MlxArray) => {
         const out = (head as Head)(hidden);
@@ -106,7 +105,7 @@ export function observedPhases<Model extends object>(model: Model, observer: Pha
 }
 
 /** Greedy tokens after `prompt` on fresh caches, stopping at an EOS id. */
-export function phaseGreedy(model: Pick<MlxTokenPhases, "decode" | "prefillTail" | "logits"> & { makeCache(): Cache[] },
+export function phaseGreedy(model: Pick<MlxTokenPhases, "decode" | "prompt" | "multiSequencePrompt" | "logits"> & { makeCache(): Cache[] },
   prompt: readonly number[], maxTokens: number, eosIds: readonly number[] = []): number[] {
   const caches = model.makeCache();
   const out: number[] = [];

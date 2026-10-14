@@ -113,7 +113,7 @@ test.skipIf(!artifact)("shared-M kernels preserve full Qwen logits, recurrent st
         try { hidden = phaseHidden(model, ids, caches); }
         finally { ids.dispose(); }
         const last = hidden.slice([0, tokens.length - 1, 0], [1, tokens.length, hidden.shape[2]!]);
-        try { return model.logits.one(last); }
+        try { return model.logits[1]!(last); }
         finally { last.dispose(); hidden.dispose(); }
       })();
       try {

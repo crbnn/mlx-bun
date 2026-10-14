@@ -21,7 +21,7 @@ export async function runMixedTokenIteration(options: {
   let preparationError: unknown;
   let preparationFailed = false;
   const groupOf = (ids: MlxArray, state: MlxPhaseGroup["state"], step: MlxForwardStep): MlxPhaseGroup =>
-    ({ phase: step.phase, width: step.width, ids, state, capture: step.capture });
+    ({ phase: step.phase, rows: step.rows, ids, state, capture: step.capture });
   const preparing = options.prepare(async (ids, cache, step) => {
     if (captured) return step.own();
     captured = true;

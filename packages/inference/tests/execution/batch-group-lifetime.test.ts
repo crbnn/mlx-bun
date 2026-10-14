@@ -28,7 +28,7 @@ const keeping = (model: StandIn, prefixes: { take: PromptCache["take"] | (() => 
 
 /** The fixture graph: its one forward and head, which tests replace, and the mixed forward a test may declare. */
 type StandIn = RuntimeModel & { forward(ids: MlxArray, caches: Cache[]): MlxArray; logitsFromHidden(hidden: MlxArray): MlxArray;
-  mixed?: MlxMixedForward };
+  mixed?: readonly import("../../src/contracts/mlx/graph").MlxMixedRange[] };
 
 function fixture() {
   const calls = { allocations: 0, disposals: 0, retains: 0 };
@@ -350,7 +350,6 @@ test("published output flushes before preparation resumes its remaining state wo
   } finally { await group.close(); }
 });
 
-
 test("failure after method state admission retires only the admitted row", async () => {
   const f = fixture(), events: string[] = [], output: number[] = [];
   const method = methodFixture(f, "shared", events);
@@ -383,7 +382,6 @@ test("ordinary preparation admits a cohort before its first shared forward and r
     expect(f.calls.disposals).toBe(f.calls.allocations);
   } finally { await group.close(); }
 });
-
 
 test("a request arriving during a forward joins the next prefill chunk", async () => {
   const f = fixture(), shapes: number[][] = [];
@@ -457,10 +455,10 @@ test.each(["finish", "cancel", "consumer", "grammar"])("mixed work preserves row
   f.model.forward = forward;
   f.model.logitsFromHidden = hidden => ops.copyOf(hidden);
   // The fixture graph declares a mixed forward: each group in its own phase over its own caches.
-  f.model.mixed = groups => {
+  f.model.mixed = [{from:1,to:Infinity,operation: groups => {
     shapes.push(groups.map(group => [...group.ids.shape]));
     return groups.map(group => forward(group.ids, group.state));
-  };
+  }}];
   // Its composition turns the mixed iteration on, nine prompt tokens beside the decode rows.
   (f.model as { composition?: unknown }).composition = testComposition(undefined, { mixedPrefill: true, mixedTokenBudget: 9 });
   const group = new MlxBatchExecutionGroup(f.model, { maxBatch: 4, prefillChunkSize: 32 });
@@ -492,7 +490,6 @@ test.each(["finish", "cancel", "consumer", "grammar"])("mixed work preserves row
     expect(group.activeRows + group.pendingRows).toBe(0);
   } finally { await group.close(); }
 });
-
 
 test("the forced-span binding names its method", () => {
   expect(bindGrammarGroupRequests(fixture().model)({}).key).toBe("grammar-forced-span");
@@ -628,7 +625,6 @@ test("forced-span pending disposal failure rejects without publishing final cach
   expect(f.calls.allocations).toBe(f.calls.disposals);
 });
 
-
 test("shared nonterminal grammar preserves seeded draw positions and committed processor history", async () => {
   const f = grammarGroupFixture();
   f.model.logitsFromHidden = hidden => MlxArray.fromFloat32(new Float32Array(hidden.shape[1]! * 16), [1, hidden.shape[1]!, 16]);
@@ -684,7 +680,6 @@ for (const maxTokens of [1, 3]) {
     expect(f.calls.allocations).toBe(f.calls.disposals);
   });
 }
-
 
 for (const failCleanup of [false, true]) {
   test(`shared grammar cleans cancellation between advances before settling: cleanup failure ${failCleanup}`, async () => {

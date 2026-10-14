@@ -12,7 +12,7 @@
 
 import { artifactIdentity } from "../../../artifacts/identity";
 import { projectedDraftGroups, type ProjectedDraftMethod } from "../bindings/projected-draft-rows";
-import { widthClass } from "../../../contracts/mlx/graph";
+
 import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { DraftProvider, GroupedDraftProvider } from "../source";
@@ -41,15 +41,15 @@ export class Dflash2Provider implements DraftProvider {
       // The block for the rows drafted this round: anchors × columns rows index the drafter's draft table.
       const draftDevice: NonNullable<ProjectedDraftMethod["draftDevice"]> = (context, pending, positions, depth) => {
         const columns = drafter.blockColumns(depth);
-        return drafter.draft[widthClass(pending.length * columns)](context, projection, pending, positions, columns);
+        return drafter.draft[(pending.length * columns)]!(context, projection, pending, positions, columns);
       };
       return {
         namespace, schema: "dflash2-context-v1", layers: drafter.cfg.layers,
         // The B × L context rows a prefill or a commit appends index the drafter's context tables.
         project(hidden, positions) {
-          const width = widthClass(hidden.shape[0]! * hidden.shape[1]!);
-          using context = drafter.projectContext[width](hidden);
-          return drafter.projectContextKVRows[width](context, positions);
+          const width = (hidden.shape[0]! * hidden.shape[1]!);
+          using context = drafter.projectContext[width]!(hidden);
+          return drafter.projectContextKVRows[width]!(context, positions);
         },
         draft(context, pending, positions, depth) {
           const steps = drafter.blockColumns(depth) - 1;

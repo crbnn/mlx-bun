@@ -3,7 +3,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import type { Cache } from "../../contracts/mlx/cache";
 import type { TargetView } from "../../contracts/mlx/draft-target";
 import type { MediaEncoders, MediaSidecarProbes, MlxPromptInput, Vision } from "../../contracts/mlx/media";
-import type { MlxHeadForward, MlxLayerCapture, MlxWidthTable } from "../../contracts/mlx/graph";
+import type { MlxHeadForward, MlxLayerCapture, MlxRowTable, MlxPromptRange } from "../../contracts/mlx/graph";
 import { bindEmbeddingsInput } from "../media-input";
 import { readAssistantDonors } from "./assistant-target";
 import type { ModelConfig } from "../../artifacts/config";
@@ -21,9 +21,9 @@ export interface Gemma4MediaGraph {
   prefillEmbeddings(embeddings: MlxArray, caches: Cache[], imageMask: MlxArray | null,
     ids: MlxArray, multimodalMask: MlxArray | null): MlxArray;
   /** A prompt's token ids after a reused prefix: the window read, or one position the decode read. */
-  readonly prefillTail: MlxWidthTable<(ids: MlxArray, caches: Cache[], capture: MlxLayerCapture | null) => MlxArray>;
-  readonly decode: MlxWidthTable<(ids: MlxArray, caches: Cache[], capture: MlxLayerCapture | null) => MlxArray>;
-  readonly logits: MlxWidthTable<MlxHeadForward>;
+  readonly prompt: readonly MlxPromptRange[];
+  readonly decode: MlxRowTable<import("../../contracts/mlx/graph").MlxCapturingForward>;
+  readonly logits: MlxRowTable<MlxHeadForward>;
 }
 
 /** Prepared embeddings enter the vision prefill phase; a prompt continuing after a reused prefix and decode
@@ -31,7 +31,7 @@ export interface Gemma4MediaGraph {
 export function bindGemma4MediaInput(model: Gemma4MediaGraph, input: Vision): MlxPromptInput {
   return bindEmbeddingsInput((ids, caches, start, phase, width) => start === 0
     ? model.prefillEmbeddings(input.embeddings, caches, input.imageMask ?? null, ids, input.multimodalMask ?? null)
-    : (phase === "decode" ? model.decode : model.prefillTail)[width](ids, caches, null));
+    : (phase === "decode" ? model.decode[width]! : model.prompt.find(range => width >= range.from && width <= range.to)!.operation)(ids, caches, null) as MlxArray);
 }
 
 /** The graph's ports for draft sources over its live caches: donor KV for the

@@ -18,7 +18,7 @@ synchronize
 import * as ops from "@mlx-bun/mlx/ops";
 import { appendFileSync } from "node:fs";
 import { type Cache } from "../contracts/mlx/cache";
-import { widthClass, type MlxKnownSpans } from "../contracts/mlx/graph";
+import { type MlxKnownSpans } from "../contracts/mlx/graph";
 import { nextPrefillStep } from "../contracts/portable/prefill";
 import {
 assertMlxAutoregressiveBinding,
@@ -483,7 +483,7 @@ async function* generateInner(
       const embedIds = ops.fromInt32(promptTokens, [1, promptTokens.length]);
       h0 = binding.prefillEmbeddings!(
         options.promptEmbeddings, cache, options.imageMask ?? null, embedIds,
-        options.multimodalMask ?? null, widthClass(promptTokens.length),
+        options.multimodalMask ?? null, (promptTokens.length),
       );
       embedIds.dispose();
     } else {

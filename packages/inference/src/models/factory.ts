@@ -76,7 +76,7 @@ export const MLX_GRAPH_TABLES: Readonly<Record<ModelGraph, GraphTable<Weights, R
   "qwen3.5": new GraphTable([
     { id: QWEN38_TRELLIS_M4PRO_GRAPH, serves: QWEN38_TRELLIS_M4PRO_COMPOSITION,
       create: (weights, config, composition) => new Qwen38TrellisM4Pro(weights, config, composition),
-      anePrograms: composition => qwen38TrellisM4ProAnePrograms(composition) },
+      anePrograms: () => qwen38TrellisM4ProAnePrograms() },
     // The M1 Max composition builds no Neural Engine operation (its device's table has none): no programs to install.
     { id: QWEN38_TRELLIS_M1MAX_GRAPH, serves: QWEN38_TRELLIS_M1MAX_COMPOSITION,
       create: (weights, config, composition) => new Qwen38TrellisM1Max(weights, config, composition) },

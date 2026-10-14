@@ -1,3 +1,4 @@
+import { MlxPhaseDispatch } from "../../src/generation/phase-dispatch";
 // The generated M1 Max graph (src/models/qwen/qwen38-27b-trellis-m1max.ts, an entire graph built from the
 // composition) on small synthetic weights laid out by the generated quant table: 48 DeltaNet and 16 attention layers
 // with the artifact's 3- and 4-bit affine projections, Trellis gate/up at the artifact's widths (mixed in its ten
@@ -19,18 +20,16 @@ import { parseQuantization, type ModelConfig } from "../../src/artifacts/config"
 import { TURBOQUANT_FOLD_FILE } from "../../src/artifacts/turboquant-fold";
 import type { Weights } from "../../src/artifacts/weights";
 import type { BatchableCache, Cache } from "../../src/contracts/mlx/cache";
-import type { MlxWidthClass } from "../../src/contracts/mlx/graph";
+
 import type { Composition, KvStorageScheme } from "../../src/contracts/portable/composition";
 import { LAYERS, Qwen38TrellisM1Max } from "../../src/models/qwen/qwen38-27b-trellis-m1max";
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
-import { QWEN38_COMPOSITIONS } from "../../scripts/gen-qwen38";
 
 const HIDDEN = 512, INTER = 256, VOCAB = 256, HEADS = 4, KV_HEADS = 2, HEAD_DIM = 256;
 const HK = 4, HV = 8, DK = 64, DV = 64, KERNEL = 4;
 const KEY_DIM = HK * DK, VALUE_DIM = HV * DV, CONV_DIM = 2 * KEY_DIM + VALUE_DIM;
 const PREFIX = "language_model.model";
 const CHUNK = 40;
-
 
 const owned: MlxArray[] = [];
 afterAll(() => { for (const array of owned) array.dispose(); });
@@ -130,7 +129,7 @@ function artifact(): { weights: Weights; config: ModelConfig } {
 }
 
 const composition = (overrides: Partial<Composition> = {}): Composition => Object.freeze<Composition>({
-  device: "applegpu_g13s", aneBridge: false, kv: { kind: "bf16" }, pagedKv: null, draftDepth: { adaptive: true, max: 7 },
+  device: "applegpu_g13s", kv: { kind: "bf16" }, pagedKv: null, draftDepth: { adaptive: true, max: 7 },
   prefillChunkTokens: CHUNK, adapters: false, maxRows: 8, packedMixedMlp: true,
   vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
   grammarJump: false, greedyDraft: false, compiledGeglu: true, compiledSwiglu: true, ...overrides,
@@ -237,8 +236,8 @@ describe("the composition the generated graph declares", () => {
       expect([...current.loraTargets().keys()].sort()).toEqual([...generic.loraTargets().keys()].sort());
       expect(current.loraTargets().size).toBe(48 * 5 + 16 * 4);
       expect((current as { knownSpans?: unknown }).knownSpans).toBeUndefined();
-      expect([...current.verifyRoundCosts]).toEqual(QWEN38_COMPOSITIONS["qwen38-27b-trellis-m1max"]!.verifyRoundCosts!.costs.map(([rows, cost]) => [rows, cost]));
-      expect(current.prefillChunk.ane).toBeUndefined();
+      expect([...current.verifyRoundCosts]).toEqual([[1,1],[2,1.89],[3,2.35],[4,2.97],[5,12.22],[6,13.16],[7,13.02],[8,12.88]]);
+      expect(current.prompt.filter(range => range.unit === "ane")).toEqual([]);
       const a = current.makeCache(), b = generic.makeCache();
       try { expect(a.map(cache => `${cache.constructor.name} ${cache.signature()}`)).toEqual(b.map(cache => `${cache.constructor.name} ${cache.signature()}`)); }
       finally { disposeAll(a, b); }
@@ -269,19 +268,19 @@ for (const scheme of Object.keys(SCHEMES)) {
   test(`${scheme} KV: from five rows, the M1 Max graph equals the generic Qwen 3.5 graph (prompt chunk, tails, verify, decode of several sequences)`, () => {
     const { current, generic } = graphs(scheme);
     const mine = current.makeCache(), theirs = generic.makeCache();
-    const step = (label: string, width: MlxWidthClass, rows: number[][],
+    const step = (label: string, width: number, rows: number[][],
       run: (graph: Qwen38TrellisM1Max | Qwen35Model, input: MlxArray, caches: Cache[]) => MlxArray | Promise<MlxArray>) => {
       using input = ids(rows);
       outputDiff(`${scheme} ${label}`, run(current, input, mine) as MlxArray, run(generic, input, theirs) as MlxArray,
-        current.logits[width], generic.logits[width]);
+        current.logits[width]!, generic.logits[width]!);
       stateDiff(`${scheme} ${label}`, mine, theirs);
     };
     try {
-      step(`prefillChunk.gpu ${CHUNK}`, "wider", [prompt(CHUNK, 1)], (g, input, caches) => g.prefillChunk.gpu(input, caches, null));
-      step("prefillTail.fiveToEight 6", "fiveToEight", [prompt(6, 2)], (g, input, caches) => g.prefillTail.fiveToEight(input, caches, null));
-      step("prefillTail.wider 13", "wider", [prompt(13, 3)], (g, input, caches) => g.prefillTail.wider(input, caches, null));
-      step("verify.fiveToEight 8", "fiveToEight", [prompt(8, 4)], (g, input, caches) => g.verify.fiveToEight(input, caches, null));
-      step("verify.wider 12", "wider", [prompt(12, 5)], (g, input, caches) => g.verify.wider(input, caches, null));
+      step(`prefillChunk.gpu ${CHUNK}`, 9, [prompt(CHUNK, 1)], (g, input, caches) => g.multiSequencePrompt.at(-1)!.operation(input, caches, null));
+      step("prefillTail.fiveToEight 6", 5, [prompt(6, 2)], (g, input, caches) => new MlxPhaseDispatch(g).prompt("tail", 1, 5)(input, caches, null));
+      step("prefillTail.wider 13", 9, [prompt(13, 3)], (g, input, caches) => new MlxPhaseDispatch(g).prompt("tail", 1, 9)(input, caches, null));
+      step("verify.fiveToEight 8", 5, [prompt(8, 4)], (g, input, caches) => g.verify[5]!(input, caches, null));
+      step("verify.wider 12", 9, [prompt(12, 5)], (g, input, caches) => g.verify[9]!(input, caches, null));
     } finally { disposeAll(mine, theirs); }
   }, 180_000);
 }

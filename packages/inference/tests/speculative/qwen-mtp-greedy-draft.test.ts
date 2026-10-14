@@ -5,7 +5,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { QwenMtpRows } from "../../src/generation/speculative/bindings/qwen-mtp-rows";
 import type { MtpModule } from "../../src/models/qwen/mtp";
 import type { Cache } from "../../src/contracts/mlx/cache";
-import { atEveryWidth } from "../../src/models/graph";
+import { rowTable } from "../../src/models/graph";
 import { mtpModule } from "../models/phase-forward";
 import { toLogprobs } from "../../src/sampling/index";
 import { createRuntimeConfig, withRuntimeConfig } from "../../src/runtime/config";
@@ -22,7 +22,7 @@ function fixture(sampling: ConstructorParameters<typeof QwenMtpRows>[2]) {
       using floats = ids.astype(Dtype.float32);
       return ops.reshape(floats, [...ids.shape, 1]);
     },
-    logits: atEveryWidth((hidden: MlxArray): MlxArray => {
+    logits: rowTable((hidden: MlxArray): MlxArray => {
       const B = hidden.shape[0]!;
       const values = Float32Array.from({ length: B * V }, (_, i) => {
         const row = Math.floor(i / V), token = i % V;
@@ -72,7 +72,7 @@ function listedFixture(sampling: ConstructorParameters<typeof QwenMtpRows>[2], v
   const projection = ops.copyOf(transposed);
   const target = { hiddenSize: H, layerCount: 1,
     embed(ids: MlxArray) { return ops.zeros([...ids.shape, H], Dtype.float32); },
-    logits: atEveryWidth((hidden: MlxArray): MlxArray => ops.matmul(hidden, projection)),
+    logits: rowTable((hidden: MlxArray): MlxArray => ops.matmul(hidden, projection)),
     ...(vocabularyHead ? { vocabularyHead: { w: q.packed, scales: q.scales, biases: q.biases,
       spec: { bits: 4, groupSize: 64, mode: "affine" }, vocabSize: VL } } : {}),
   };
