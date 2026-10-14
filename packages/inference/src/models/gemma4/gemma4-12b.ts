@@ -4,7 +4,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
 import type { Cache } from "../../contracts/mlx/cache";
-import type { MlxDeclaredGraph, MlxTokenPhases, MlxRowTable, MlxCapturingForward, MlxHeadForward, MlxPhaseForward, MlxLayerCapture, MlxPromptRange, MlxMixedRange, MlxCacheLayer } from "../../contracts/mlx/graph";
+import type { MlxDeclaredGraph, MlxTokenPhases, MlxRowTable, MlxCapturingForward, MlxHeadForward, MlxPhaseForward, MlxLayerCapture, MlxPromptRange, MlxMixedRange, MlxPhaseGroup, MlxCacheLayer } from "../../contracts/mlx/graph";
 import type { Vision, MediaSidecarProbes } from "../../contracts/mlx/media";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import { RMSNorm } from "../../layers/normalization";
@@ -20,7 +20,7 @@ import { CompiledDecode } from "./compiled-decode";
 import { bindGemma4MediaInput, gemma4DraftTarget, gemma4MediaEncoders } from "./media";
 import { PerLayerInputs, type Gemma4Phase } from "./blocks";
 import { SlidingAttention, FullAttention, FullKEqVAttention, SharedSlidingAttention, SharedFullAttention, GemmaLayerWeights, GemmaInputLayerWeights, GemmaMoeLayerWeights, GemmaDenseLayer, GemmaInputLayer, GemmaMoeLayer, CompiledGegluMLP, PlainGegluMLP, CompiledGeglu, SortedSwitchGLU, UnsortedSwitchGLU, FixedExperts } from "./written-blocks";
-import { GemmaForwardScope, GemmaInputForwardScope, GemmaMixedScope, ownMixed, donorMixed, sharedMixed, denseLoraTargets, inputLoraTargets, graphConstants, moeGraphConstants, weightBytes } from "./written-forward";
+import { GemmaForwardScope, GemmaInputForwardScope, GemmaMixedScope, ownMixed, donorMixed, sharedMixed, denseLoraTargets, inputLoraTargets, graphConstants, moeGraphConstants, weightBytes, GemmaBuildScope } from "./written-forward";
 export const FINGERPRINT = GEMMA_GRAPH_FINGERPRINTS["12b"];
 
 /** One decoder layer as the composition fixes it: its attention type; the layer
@@ -156,6 +156,9 @@ export const COMPOSITION: ServedComposition = Object.freeze({
 });
 
 
+export const DECODE_ROWS = 8;
+export const VERIFY_ROWS = 64;
+
 export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
   readonly prefixBase = PREFIX;
   readonly loraState = new LoraState();
@@ -168,6 +171,7 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
   readonly perLayerWidth = 0;
   readonly graphCapabilities = declareGraph({ media: { input: "embeddings", video: false }, hiddenLayerTaps: true, compiledDecode: true });
   readonly cachePaging = true;
+  makeCache!: () => Cache[];
   readonly cacheLayers: readonly MlxCacheLayer[];
   readonly layers: readonly GemmaDenseLayer[];
   readonly traceLayers: readonly GemmaDenseLayer[];
@@ -277,159 +281,160 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
   readonly #l47: GemmaDenseLayer;
   readonly #t47: GemmaDenseLayer;
   constructor(weights: Weights, readonly config: ModelConfig) {
+    using resources = new GemmaBuildScope();
     this.weightsBytes = weightBytes(weights);
     this.embed = QuantizedEmbedding.load(weights, `${PREFIX}.embed_tokens`, config);
     this.finalNorm = new RMSNorm(weights.tensor(`${PREFIX}.norm.weight`), config.text.rmsNormEps);
     this.embedScale = Math.sqrt(config.text.hiddenSize);
     this.windowSize = config.text.slidingWindow;
-    const p0 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.0`, new SlidingAttention(weights, config, `${PREFIX}.layers.0.self_attn`));
+    const p0 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.0`, new SlidingAttention(weights, config, `${PREFIX}.layers.0.self_attn`)));
     this.#l0 = new GemmaDenseLayer(p0, new CompiledGegluMLP(p0.mlp));
     this.#t0 = new GemmaDenseLayer(p0, new PlainGegluMLP(p0.mlp));
-    const p1 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.1`, new SlidingAttention(weights, config, `${PREFIX}.layers.1.self_attn`));
+    const p1 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.1`, new SlidingAttention(weights, config, `${PREFIX}.layers.1.self_attn`)));
     this.#l1 = new GemmaDenseLayer(p1, new CompiledGegluMLP(p1.mlp));
     this.#t1 = new GemmaDenseLayer(p1, new PlainGegluMLP(p1.mlp));
-    const p2 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.2`, new SlidingAttention(weights, config, `${PREFIX}.layers.2.self_attn`));
+    const p2 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.2`, new SlidingAttention(weights, config, `${PREFIX}.layers.2.self_attn`)));
     this.#l2 = new GemmaDenseLayer(p2, new CompiledGegluMLP(p2.mlp));
     this.#t2 = new GemmaDenseLayer(p2, new PlainGegluMLP(p2.mlp));
-    const p3 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.3`, new SlidingAttention(weights, config, `${PREFIX}.layers.3.self_attn`));
+    const p3 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.3`, new SlidingAttention(weights, config, `${PREFIX}.layers.3.self_attn`)));
     this.#l3 = new GemmaDenseLayer(p3, new CompiledGegluMLP(p3.mlp));
     this.#t3 = new GemmaDenseLayer(p3, new PlainGegluMLP(p3.mlp));
-    const p4 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.4`, new SlidingAttention(weights, config, `${PREFIX}.layers.4.self_attn`));
+    const p4 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.4`, new SlidingAttention(weights, config, `${PREFIX}.layers.4.self_attn`)));
     this.#l4 = new GemmaDenseLayer(p4, new CompiledGegluMLP(p4.mlp));
     this.#t4 = new GemmaDenseLayer(p4, new PlainGegluMLP(p4.mlp));
-    const p5 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.5`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.5.self_attn`));
+    const p5 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.5`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.5.self_attn`)));
     this.#l5 = new GemmaDenseLayer(p5, new CompiledGegluMLP(p5.mlp));
     this.#t5 = new GemmaDenseLayer(p5, new PlainGegluMLP(p5.mlp));
-    const p6 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.6`, new SlidingAttention(weights, config, `${PREFIX}.layers.6.self_attn`));
+    const p6 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.6`, new SlidingAttention(weights, config, `${PREFIX}.layers.6.self_attn`)));
     this.#l6 = new GemmaDenseLayer(p6, new CompiledGegluMLP(p6.mlp));
     this.#t6 = new GemmaDenseLayer(p6, new PlainGegluMLP(p6.mlp));
-    const p7 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.7`, new SlidingAttention(weights, config, `${PREFIX}.layers.7.self_attn`));
+    const p7 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.7`, new SlidingAttention(weights, config, `${PREFIX}.layers.7.self_attn`)));
     this.#l7 = new GemmaDenseLayer(p7, new CompiledGegluMLP(p7.mlp));
     this.#t7 = new GemmaDenseLayer(p7, new PlainGegluMLP(p7.mlp));
-    const p8 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.8`, new SlidingAttention(weights, config, `${PREFIX}.layers.8.self_attn`));
+    const p8 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.8`, new SlidingAttention(weights, config, `${PREFIX}.layers.8.self_attn`)));
     this.#l8 = new GemmaDenseLayer(p8, new CompiledGegluMLP(p8.mlp));
     this.#t8 = new GemmaDenseLayer(p8, new PlainGegluMLP(p8.mlp));
-    const p9 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.9`, new SlidingAttention(weights, config, `${PREFIX}.layers.9.self_attn`));
+    const p9 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.9`, new SlidingAttention(weights, config, `${PREFIX}.layers.9.self_attn`)));
     this.#l9 = new GemmaDenseLayer(p9, new CompiledGegluMLP(p9.mlp));
     this.#t9 = new GemmaDenseLayer(p9, new PlainGegluMLP(p9.mlp));
-    const p10 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.10`, new SlidingAttention(weights, config, `${PREFIX}.layers.10.self_attn`));
+    const p10 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.10`, new SlidingAttention(weights, config, `${PREFIX}.layers.10.self_attn`)));
     this.#l10 = new GemmaDenseLayer(p10, new CompiledGegluMLP(p10.mlp));
     this.#t10 = new GemmaDenseLayer(p10, new PlainGegluMLP(p10.mlp));
-    const p11 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.11`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.11.self_attn`));
+    const p11 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.11`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.11.self_attn`)));
     this.#l11 = new GemmaDenseLayer(p11, new CompiledGegluMLP(p11.mlp));
     this.#t11 = new GemmaDenseLayer(p11, new PlainGegluMLP(p11.mlp));
-    const p12 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.12`, new SlidingAttention(weights, config, `${PREFIX}.layers.12.self_attn`));
+    const p12 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.12`, new SlidingAttention(weights, config, `${PREFIX}.layers.12.self_attn`)));
     this.#l12 = new GemmaDenseLayer(p12, new CompiledGegluMLP(p12.mlp));
     this.#t12 = new GemmaDenseLayer(p12, new PlainGegluMLP(p12.mlp));
-    const p13 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.13`, new SlidingAttention(weights, config, `${PREFIX}.layers.13.self_attn`));
+    const p13 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.13`, new SlidingAttention(weights, config, `${PREFIX}.layers.13.self_attn`)));
     this.#l13 = new GemmaDenseLayer(p13, new CompiledGegluMLP(p13.mlp));
     this.#t13 = new GemmaDenseLayer(p13, new PlainGegluMLP(p13.mlp));
-    const p14 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.14`, new SlidingAttention(weights, config, `${PREFIX}.layers.14.self_attn`));
+    const p14 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.14`, new SlidingAttention(weights, config, `${PREFIX}.layers.14.self_attn`)));
     this.#l14 = new GemmaDenseLayer(p14, new CompiledGegluMLP(p14.mlp));
     this.#t14 = new GemmaDenseLayer(p14, new PlainGegluMLP(p14.mlp));
-    const p15 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.15`, new SlidingAttention(weights, config, `${PREFIX}.layers.15.self_attn`));
+    const p15 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.15`, new SlidingAttention(weights, config, `${PREFIX}.layers.15.self_attn`)));
     this.#l15 = new GemmaDenseLayer(p15, new CompiledGegluMLP(p15.mlp));
     this.#t15 = new GemmaDenseLayer(p15, new PlainGegluMLP(p15.mlp));
-    const p16 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.16`, new SlidingAttention(weights, config, `${PREFIX}.layers.16.self_attn`));
+    const p16 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.16`, new SlidingAttention(weights, config, `${PREFIX}.layers.16.self_attn`)));
     this.#l16 = new GemmaDenseLayer(p16, new CompiledGegluMLP(p16.mlp));
     this.#t16 = new GemmaDenseLayer(p16, new PlainGegluMLP(p16.mlp));
-    const p17 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.17`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.17.self_attn`));
+    const p17 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.17`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.17.self_attn`)));
     this.#l17 = new GemmaDenseLayer(p17, new CompiledGegluMLP(p17.mlp));
     this.#t17 = new GemmaDenseLayer(p17, new PlainGegluMLP(p17.mlp));
-    const p18 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.18`, new SlidingAttention(weights, config, `${PREFIX}.layers.18.self_attn`));
+    const p18 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.18`, new SlidingAttention(weights, config, `${PREFIX}.layers.18.self_attn`)));
     this.#l18 = new GemmaDenseLayer(p18, new CompiledGegluMLP(p18.mlp));
     this.#t18 = new GemmaDenseLayer(p18, new PlainGegluMLP(p18.mlp));
-    const p19 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.19`, new SlidingAttention(weights, config, `${PREFIX}.layers.19.self_attn`));
+    const p19 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.19`, new SlidingAttention(weights, config, `${PREFIX}.layers.19.self_attn`)));
     this.#l19 = new GemmaDenseLayer(p19, new CompiledGegluMLP(p19.mlp));
     this.#t19 = new GemmaDenseLayer(p19, new PlainGegluMLP(p19.mlp));
-    const p20 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.20`, new SlidingAttention(weights, config, `${PREFIX}.layers.20.self_attn`));
+    const p20 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.20`, new SlidingAttention(weights, config, `${PREFIX}.layers.20.self_attn`)));
     this.#l20 = new GemmaDenseLayer(p20, new CompiledGegluMLP(p20.mlp));
     this.#t20 = new GemmaDenseLayer(p20, new PlainGegluMLP(p20.mlp));
-    const p21 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.21`, new SlidingAttention(weights, config, `${PREFIX}.layers.21.self_attn`));
+    const p21 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.21`, new SlidingAttention(weights, config, `${PREFIX}.layers.21.self_attn`)));
     this.#l21 = new GemmaDenseLayer(p21, new CompiledGegluMLP(p21.mlp));
     this.#t21 = new GemmaDenseLayer(p21, new PlainGegluMLP(p21.mlp));
-    const p22 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.22`, new SlidingAttention(weights, config, `${PREFIX}.layers.22.self_attn`));
+    const p22 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.22`, new SlidingAttention(weights, config, `${PREFIX}.layers.22.self_attn`)));
     this.#l22 = new GemmaDenseLayer(p22, new CompiledGegluMLP(p22.mlp));
     this.#t22 = new GemmaDenseLayer(p22, new PlainGegluMLP(p22.mlp));
-    const p23 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.23`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.23.self_attn`));
+    const p23 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.23`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.23.self_attn`)));
     this.#l23 = new GemmaDenseLayer(p23, new CompiledGegluMLP(p23.mlp));
     this.#t23 = new GemmaDenseLayer(p23, new PlainGegluMLP(p23.mlp));
-    const p24 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.24`, new SlidingAttention(weights, config, `${PREFIX}.layers.24.self_attn`));
+    const p24 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.24`, new SlidingAttention(weights, config, `${PREFIX}.layers.24.self_attn`)));
     this.#l24 = new GemmaDenseLayer(p24, new CompiledGegluMLP(p24.mlp));
     this.#t24 = new GemmaDenseLayer(p24, new PlainGegluMLP(p24.mlp));
-    const p25 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.25`, new SlidingAttention(weights, config, `${PREFIX}.layers.25.self_attn`));
+    const p25 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.25`, new SlidingAttention(weights, config, `${PREFIX}.layers.25.self_attn`)));
     this.#l25 = new GemmaDenseLayer(p25, new CompiledGegluMLP(p25.mlp));
     this.#t25 = new GemmaDenseLayer(p25, new PlainGegluMLP(p25.mlp));
-    const p26 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.26`, new SlidingAttention(weights, config, `${PREFIX}.layers.26.self_attn`));
+    const p26 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.26`, new SlidingAttention(weights, config, `${PREFIX}.layers.26.self_attn`)));
     this.#l26 = new GemmaDenseLayer(p26, new CompiledGegluMLP(p26.mlp));
     this.#t26 = new GemmaDenseLayer(p26, new PlainGegluMLP(p26.mlp));
-    const p27 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.27`, new SlidingAttention(weights, config, `${PREFIX}.layers.27.self_attn`));
+    const p27 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.27`, new SlidingAttention(weights, config, `${PREFIX}.layers.27.self_attn`)));
     this.#l27 = new GemmaDenseLayer(p27, new CompiledGegluMLP(p27.mlp));
     this.#t27 = new GemmaDenseLayer(p27, new PlainGegluMLP(p27.mlp));
-    const p28 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.28`, new SlidingAttention(weights, config, `${PREFIX}.layers.28.self_attn`));
+    const p28 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.28`, new SlidingAttention(weights, config, `${PREFIX}.layers.28.self_attn`)));
     this.#l28 = new GemmaDenseLayer(p28, new CompiledGegluMLP(p28.mlp));
     this.#t28 = new GemmaDenseLayer(p28, new PlainGegluMLP(p28.mlp));
-    const p29 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.29`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.29.self_attn`));
+    const p29 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.29`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.29.self_attn`)));
     this.#l29 = new GemmaDenseLayer(p29, new CompiledGegluMLP(p29.mlp));
     this.#t29 = new GemmaDenseLayer(p29, new PlainGegluMLP(p29.mlp));
-    const p30 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.30`, new SlidingAttention(weights, config, `${PREFIX}.layers.30.self_attn`));
+    const p30 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.30`, new SlidingAttention(weights, config, `${PREFIX}.layers.30.self_attn`)));
     this.#l30 = new GemmaDenseLayer(p30, new CompiledGegluMLP(p30.mlp));
     this.#t30 = new GemmaDenseLayer(p30, new PlainGegluMLP(p30.mlp));
-    const p31 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.31`, new SlidingAttention(weights, config, `${PREFIX}.layers.31.self_attn`));
+    const p31 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.31`, new SlidingAttention(weights, config, `${PREFIX}.layers.31.self_attn`)));
     this.#l31 = new GemmaDenseLayer(p31, new CompiledGegluMLP(p31.mlp));
     this.#t31 = new GemmaDenseLayer(p31, new PlainGegluMLP(p31.mlp));
-    const p32 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.32`, new SlidingAttention(weights, config, `${PREFIX}.layers.32.self_attn`));
+    const p32 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.32`, new SlidingAttention(weights, config, `${PREFIX}.layers.32.self_attn`)));
     this.#l32 = new GemmaDenseLayer(p32, new CompiledGegluMLP(p32.mlp));
     this.#t32 = new GemmaDenseLayer(p32, new PlainGegluMLP(p32.mlp));
-    const p33 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.33`, new SlidingAttention(weights, config, `${PREFIX}.layers.33.self_attn`));
+    const p33 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.33`, new SlidingAttention(weights, config, `${PREFIX}.layers.33.self_attn`)));
     this.#l33 = new GemmaDenseLayer(p33, new CompiledGegluMLP(p33.mlp));
     this.#t33 = new GemmaDenseLayer(p33, new PlainGegluMLP(p33.mlp));
-    const p34 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.34`, new SlidingAttention(weights, config, `${PREFIX}.layers.34.self_attn`));
+    const p34 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.34`, new SlidingAttention(weights, config, `${PREFIX}.layers.34.self_attn`)));
     this.#l34 = new GemmaDenseLayer(p34, new CompiledGegluMLP(p34.mlp));
     this.#t34 = new GemmaDenseLayer(p34, new PlainGegluMLP(p34.mlp));
-    const p35 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.35`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.35.self_attn`));
+    const p35 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.35`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.35.self_attn`)));
     this.#l35 = new GemmaDenseLayer(p35, new CompiledGegluMLP(p35.mlp));
     this.#t35 = new GemmaDenseLayer(p35, new PlainGegluMLP(p35.mlp));
-    const p36 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.36`, new SlidingAttention(weights, config, `${PREFIX}.layers.36.self_attn`));
+    const p36 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.36`, new SlidingAttention(weights, config, `${PREFIX}.layers.36.self_attn`)));
     this.#l36 = new GemmaDenseLayer(p36, new CompiledGegluMLP(p36.mlp));
     this.#t36 = new GemmaDenseLayer(p36, new PlainGegluMLP(p36.mlp));
-    const p37 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.37`, new SlidingAttention(weights, config, `${PREFIX}.layers.37.self_attn`));
+    const p37 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.37`, new SlidingAttention(weights, config, `${PREFIX}.layers.37.self_attn`)));
     this.#l37 = new GemmaDenseLayer(p37, new CompiledGegluMLP(p37.mlp));
     this.#t37 = new GemmaDenseLayer(p37, new PlainGegluMLP(p37.mlp));
-    const p38 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.38`, new SlidingAttention(weights, config, `${PREFIX}.layers.38.self_attn`));
+    const p38 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.38`, new SlidingAttention(weights, config, `${PREFIX}.layers.38.self_attn`)));
     this.#l38 = new GemmaDenseLayer(p38, new CompiledGegluMLP(p38.mlp));
     this.#t38 = new GemmaDenseLayer(p38, new PlainGegluMLP(p38.mlp));
-    const p39 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.39`, new SlidingAttention(weights, config, `${PREFIX}.layers.39.self_attn`));
+    const p39 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.39`, new SlidingAttention(weights, config, `${PREFIX}.layers.39.self_attn`)));
     this.#l39 = new GemmaDenseLayer(p39, new CompiledGegluMLP(p39.mlp));
     this.#t39 = new GemmaDenseLayer(p39, new PlainGegluMLP(p39.mlp));
-    const p40 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.40`, new SlidingAttention(weights, config, `${PREFIX}.layers.40.self_attn`));
+    const p40 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.40`, new SlidingAttention(weights, config, `${PREFIX}.layers.40.self_attn`)));
     this.#l40 = new GemmaDenseLayer(p40, new CompiledGegluMLP(p40.mlp));
     this.#t40 = new GemmaDenseLayer(p40, new PlainGegluMLP(p40.mlp));
-    const p41 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.41`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.41.self_attn`));
+    const p41 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.41`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.41.self_attn`)));
     this.#l41 = new GemmaDenseLayer(p41, new CompiledGegluMLP(p41.mlp));
     this.#t41 = new GemmaDenseLayer(p41, new PlainGegluMLP(p41.mlp));
-    const p42 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.42`, new SlidingAttention(weights, config, `${PREFIX}.layers.42.self_attn`));
+    const p42 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.42`, new SlidingAttention(weights, config, `${PREFIX}.layers.42.self_attn`)));
     this.#l42 = new GemmaDenseLayer(p42, new CompiledGegluMLP(p42.mlp));
     this.#t42 = new GemmaDenseLayer(p42, new PlainGegluMLP(p42.mlp));
-    const p43 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.43`, new SlidingAttention(weights, config, `${PREFIX}.layers.43.self_attn`));
+    const p43 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.43`, new SlidingAttention(weights, config, `${PREFIX}.layers.43.self_attn`)));
     this.#l43 = new GemmaDenseLayer(p43, new CompiledGegluMLP(p43.mlp));
     this.#t43 = new GemmaDenseLayer(p43, new PlainGegluMLP(p43.mlp));
-    const p44 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.44`, new SlidingAttention(weights, config, `${PREFIX}.layers.44.self_attn`));
+    const p44 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.44`, new SlidingAttention(weights, config, `${PREFIX}.layers.44.self_attn`)));
     this.#l44 = new GemmaDenseLayer(p44, new CompiledGegluMLP(p44.mlp));
     this.#t44 = new GemmaDenseLayer(p44, new PlainGegluMLP(p44.mlp));
-    const p45 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.45`, new SlidingAttention(weights, config, `${PREFIX}.layers.45.self_attn`));
+    const p45 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.45`, new SlidingAttention(weights, config, `${PREFIX}.layers.45.self_attn`)));
     this.#l45 = new GemmaDenseLayer(p45, new CompiledGegluMLP(p45.mlp));
     this.#t45 = new GemmaDenseLayer(p45, new PlainGegluMLP(p45.mlp));
-    const p46 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.46`, new SlidingAttention(weights, config, `${PREFIX}.layers.46.self_attn`));
+    const p46 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.46`, new SlidingAttention(weights, config, `${PREFIX}.layers.46.self_attn`)));
     this.#l46 = new GemmaDenseLayer(p46, new CompiledGegluMLP(p46.mlp));
     this.#t46 = new GemmaDenseLayer(p46, new PlainGegluMLP(p46.mlp));
-    const p47 = new GemmaLayerWeights(weights, config, `${PREFIX}.layers.47`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.47.self_attn`));
+    const p47 = resources.hold(new GemmaLayerWeights(weights, config, `${PREFIX}.layers.47`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.47.self_attn`)));
     this.#l47 = new GemmaDenseLayer(p47, new CompiledGegluMLP(p47.mlp));
     this.#t47 = new GemmaDenseLayer(p47, new PlainGegluMLP(p47.mlp));
     this.layers = Object.freeze([this.#l0, this.#l1, this.#l2, this.#l3, this.#l4, this.#l5, this.#l6, this.#l7, this.#l8, this.#l9, this.#l10, this.#l11, this.#l12, this.#l13, this.#l14, this.#l15, this.#l16, this.#l17, this.#l18, this.#l19, this.#l20, this.#l21, this.#l22, this.#l23, this.#l24, this.#l25, this.#l26, this.#l27, this.#l28, this.#l29, this.#l30, this.#l31, this.#l32, this.#l33, this.#l34, this.#l35, this.#l36, this.#l37, this.#l38, this.#l39, this.#l40, this.#l41, this.#l42, this.#l43, this.#l44, this.#l45, this.#l46, this.#l47]);
     this.traceLayers = Object.freeze([this.#t0, this.#t1, this.#t2, this.#t3, this.#t4, this.#t5, this.#t6, this.#t7, this.#t8, this.#t9, this.#t10, this.#t11, this.#t12, this.#t13, this.#t14, this.#t15, this.#t16, this.#t17, this.#t18, this.#t19, this.#t20, this.#t21, this.#t22, this.#t23, this.#t24, this.#t25, this.#t26, this.#t27, this.#t28, this.#t29, this.#t30, this.#t31, this.#t32, this.#t33, this.#t34, this.#t35, this.#t36, this.#t37, this.#t38, this.#t39, this.#t40, this.#t41, this.#t42, this.#t43, this.#t44, this.#t45, this.#t46, this.#t47]);
     this.#parts = Object.freeze([p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15, p16, p17, p18, p19, p20, p21, p22, p23, p24, p25, p26, p27, p28, p29, p30, p31, p32, p33, p34, p35, p36, p37, p38, p39, p40, p41, p42, p43, p44, p45, p46, p47]);
-    this.#constants = ownResource(graphConstants(this.#parts), disposeResources);
+    this.#constants = resources.finish();
     this.cacheLayers = Object.freeze([
       { kind: "sliding", window: config.text.slidingWindow },
       { kind: "sliding", window: config.text.slidingWindow },
@@ -483,9 +488,9 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
     this.prompt = Object.freeze([{ from: 1, to: Infinity, operation: this.#window }]);
     this.multiSequencePrompt = this.prompt;
     this.decode = Object.freeze({ 1: this.#decode, 2: this.#decode, 3: this.#decode, 4: this.#decode, 5: this.#decode, 6: this.#decode, 7: this.#decode, 8: this.#decode });
-    this.verify = Object.freeze({ 1: this.#window, 2: this.#window, 3: this.#window, 4: this.#window, 5: this.#window, 6: this.#window, 7: this.#window, 8: this.#window });
-    this.appendKnown = Object.freeze({ 1: this.#known, 2: this.#known, 3: this.#known, 4: this.#known, 5: this.#known, 6: this.#known, 7: this.#known, 8: this.#known });
-    this.logits = Object.freeze({ 1: this.#head, 2: this.#head, 3: this.#head, 4: this.#head, 5: this.#head, 6: this.#head, 7: this.#head, 8: this.#head });
+    this.verify = Object.freeze({ 1: this.#window, 2: this.#window, 3: this.#window, 4: this.#window, 5: this.#window, 6: this.#window, 7: this.#window, 8: this.#window, 9: this.#window, 10: this.#window, 11: this.#window, 12: this.#window, 13: this.#window, 14: this.#window, 15: this.#window, 16: this.#window, 17: this.#window, 18: this.#window, 19: this.#window, 20: this.#window, 21: this.#window, 22: this.#window, 23: this.#window, 24: this.#window, 25: this.#window, 26: this.#window, 27: this.#window, 28: this.#window, 29: this.#window, 30: this.#window, 31: this.#window, 32: this.#window, 33: this.#window, 34: this.#window, 35: this.#window, 36: this.#window, 37: this.#window, 38: this.#window, 39: this.#window, 40: this.#window, 41: this.#window, 42: this.#window, 43: this.#window, 44: this.#window, 45: this.#window, 46: this.#window, 47: this.#window, 48: this.#window, 49: this.#window, 50: this.#window, 51: this.#window, 52: this.#window, 53: this.#window, 54: this.#window, 55: this.#window, 56: this.#window, 57: this.#window, 58: this.#window, 59: this.#window, 60: this.#window, 61: this.#window, 62: this.#window, 63: this.#window, 64: this.#window });
+    this.appendKnown = Object.freeze({ 1: this.#known, 2: this.#known, 3: this.#known, 4: this.#known, 5: this.#known, 6: this.#known, 7: this.#known, 8: this.#known, 9: this.#known, 10: this.#known, 11: this.#known, 12: this.#known, 13: this.#known, 14: this.#known, 15: this.#known, 16: this.#known, 17: this.#known, 18: this.#known, 19: this.#known, 20: this.#known, 21: this.#known, 22: this.#known, 23: this.#known, 24: this.#known, 25: this.#known, 26: this.#known, 27: this.#known, 28: this.#known, 29: this.#known, 30: this.#known, 31: this.#known, 32: this.#known, 33: this.#known, 34: this.#known, 35: this.#known, 36: this.#known, 37: this.#known, 38: this.#known, 39: this.#known, 40: this.#known, 41: this.#known, 42: this.#known, 43: this.#known, 44: this.#known, 45: this.#known, 46: this.#known, 47: this.#known, 48: this.#known, 49: this.#known, 50: this.#known, 51: this.#known, 52: this.#known, 53: this.#known, 54: this.#known, 55: this.#known, 56: this.#known, 57: this.#known, 58: this.#known, 59: this.#known, 60: this.#known, 61: this.#known, 62: this.#known, 63: this.#known, 64: this.#known });
+    this.logits = Object.freeze({ 1: this.#head, 2: this.#head, 3: this.#head, 4: this.#head, 5: this.#head, 6: this.#head, 7: this.#head, 8: this.#head, 9: this.#head, 10: this.#head, 11: this.#head, 12: this.#head, 13: this.#head, 14: this.#head, 15: this.#head, 16: this.#head, 17: this.#head, 18: this.#head, 19: this.#head, 20: this.#head, 21: this.#head, 22: this.#head, 23: this.#head, 24: this.#head, 25: this.#head, 26: this.#head, 27: this.#head, 28: this.#head, 29: this.#head, 30: this.#head, 31: this.#head, 32: this.#head, 33: this.#head, 34: this.#head, 35: this.#head, 36: this.#head, 37: this.#head, 38: this.#head, 39: this.#head, 40: this.#head, 41: this.#head, 42: this.#head, 43: this.#head, 44: this.#head, 45: this.#head, 46: this.#head, 47: this.#head, 48: this.#head, 49: this.#head, 50: this.#head, 51: this.#head, 52: this.#head, 53: this.#head, 54: this.#head, 55: this.#head, 56: this.#head, 57: this.#head, 58: this.#head, 59: this.#head, 60: this.#head, 61: this.#head, 62: this.#head, 63: this.#head, 64: this.#head });
     this.mixed = Object.freeze([{ from: 1, to: Infinity, operation: this.#mixed }]);
   }
   readonly #window = (ids: MlxArray, caches: Cache[], capture: MlxLayerCapture | null): MlxArray => this.#windowHidden(this.#embedTokens(ids), caches, "window", ids, capture);
@@ -713,8 +718,15 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
   mediaEncoders(modelDir: string, probes: MediaSidecarProbes) { return gemma4MediaEncoders(this, modelDir, probes); }
   draftTarget(caches: Cache[]) { return gemma4DraftTarget(this, caches); }
   logitsFromHidden(hidden: MlxArray): MlxArray { return this.#head(hidden); }
-  sequenceHidden(ids: MlxArray, caches: Cache[], rows: number): MlxArray { return writtenSequence(this.prompt, ids, caches, rows); }
-  prefillEmbeddings(embeds: MlxArray, caches: Cache[], bidir: MlxArray | null, ids: MlxArray, multimodal: MlxArray | null = null): MlxArray { return writtenMedia(this, embeds, caches, bidir, ids, multimodal); }
-  readonly embeddingPrompt = Object.freeze([{ from: 1, to: Infinity, operation: (hidden: MlxArray, cache: Cache[], phase: Gemma4Phase, ids: MlxArray) => this.#windowHidden(hidden, cache, phase, ids, null) }]);
+  readonly mixedSeparate = Object.freeze({
+    decode: Object.freeze([{ from: 1, to: Infinity, operation: (group: MlxPhaseGroup) => this.#decode(group.ids, group.state, group.capture) }]),
+    window: Object.freeze([{ from: 1, to: Infinity, operation: (group: MlxPhaseGroup) => this.#window(group.ids, group.state, group.capture) }]),
+    verify: Object.freeze([{ from: 1, to: Infinity, operation: (group: MlxPhaseGroup) => this.#window(group.ids, group.state, group.capture) }]),
+  });
+  readonly sequence = Object.freeze([{ from: 1, to: Infinity, operation: (ids: MlxArray, caches: Cache[]) => this.#window(ids, caches, null) }]);
+  sequenceHidden(ids: MlxArray, caches: Cache[], _rows: number): MlxArray { return this.#window(ids, caches, null); }
+
+  readonly mediaPrefill = Object.freeze([{ from: 1, to: Infinity, operation: (embeds: MlxArray, caches: Cache[], bidir: MlxArray | null, ids: MlxArray, multimodal: MlxArray | null) => writtenMedia(this.embedScale, (hidden, cache, phase, tokens) => this.#windowHidden(hidden, cache, phase, tokens, null), embeds, caches, bidir, ids) }]);
+  prefillEmbeddings(embeds: MlxArray, caches: Cache[], bidir: MlxArray | null, ids: MlxArray, multimodal: MlxArray | null = null): MlxArray { return this.mediaPrefill[0]!.operation(embeds, caches, bidir, ids, multimodal); }
 }
-import { writtenSequence, writtenMedia } from "./written-input";
+import { writtenMedia, writtenInputMedia } from "./written-input";

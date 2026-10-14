@@ -148,3 +148,19 @@ import { mapPackedTokens } from "../../input/token-groups";
 export function weightBytes(weights: { shards: { files: Map<string, { mmap: { size: number } }> } }): number {
   return [...weights.shards.files.values()].reduce((total, file) => total + file.mmap.size, 0);
 }
+
+/** Construction ownership until the written graph transfers its constants. */
+export class GemmaBuildScope {
+  readonly #constants: MlxArray[] = [];
+  hold<T extends GemmaLayerWeights>(layer: T): T {
+    if (layer.attn.ropeFreqs) this.#constants.push(layer.attn.ropeFreqs);
+    return layer;
+  }
+  holdMoe(layer: GemmaMoeLayerWeights): GemmaMoeLayerWeights {
+    this.hold(layer); this.#constants.push(layer.router.normWeight); return layer;
+  }
+  finish() { return ownResource(this.#constants.splice(0), disposeResources); }
+  [Symbol.dispose](): void { disposeResources(this.#constants.splice(0)); }
+}
+
+import { ownResource, disposeResources } from "../../runtime/resources";

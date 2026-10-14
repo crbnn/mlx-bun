@@ -94,7 +94,7 @@ export class GemmaMoeLayerWeights extends GemmaLayerWeights {
   readonly preFfNorm2: RMSNorm;
   constructor(weights: Weights, config: ModelConfig, prefix: string, attn: Attention) {
     super(weights, config, prefix, attn);
-    this.router = new Router(weights, config, `${prefix}.router`);
+    this.router = new PlainRouter(weights, config, `${prefix}.router`);
     this.experts = new SwitchGLU(weights, config, `${prefix}.experts.switch_glu`, true);
     const norm = (name: string) => new RMSNorm(weights.tensor(`${prefix}.${name}.weight`), config.text.rmsNormEps);
     this.postFfNorm1 = norm("post_feedforward_layernorm_1"); this.postFfNorm2 = norm("post_feedforward_layernorm_2");
@@ -201,3 +201,26 @@ export class TracePerLayerInputs extends FixedPerLayerInputs {
 }
 
 import { PerLayerInputs } from "./blocks";
+
+/** Ordinary router slice, with no compiled-trace form selection. */
+export class PlainRouter extends Router {
+  readonly #projection: QuantizedLinearPlain;
+  constructor(weights: Weights, config: ModelConfig, prefix: string) {
+    super(weights, config, prefix); this.#projection = new QuantizedLinearPlain(this.proj);
+  }
+  override forward(x: MlxArray): { indices: MlxArray; weights: MlxArray } {
+    using normed = ops.rmsNorm(x, this.normWeight, this.eps);
+    using scores = this.#projection.forward(normed);
+    using part = ops.argpartitionAxis(scores, this.numExperts - this.topK, -1);
+    const [B, L] = scores.shape;
+    const indices = part.slice([0, 0, this.numExperts - this.topK], [B!, L!, this.numExperts]);
+    let weights = ops.takeAlongAxis(scores, indices, -1);
+    weights = disposing(weights, ops.softmaxAxis(weights, -1, false));
+    using gathered = ops.takeAxis(this.perExpertScale, indices, 0);
+    weights = disposing(weights, ops.mul(weights, gathered));
+    if (isExpertTracing()) recordRouting(this.layerIdx, indices);
+    return { indices, weights };
+  }
+}
+
+import { isExpertTracing, recordRouting } from "../../runtime/expert-trace";

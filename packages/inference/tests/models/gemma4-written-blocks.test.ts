@@ -26,31 +26,31 @@ function fixture(inputs: boolean, moe: boolean, kEqV: boolean) {
     if (name.endsWith("layer_scalar")) {
       const result = MlxArray.fromFloat32(new Float32Array([0.9]), []); arrays.set(name, result); return result;
     }
-    if (/norm\.weight$/.test(name) || /\.scale$/.test(name) || /per_expert_scale$/.test(name)) {
+    if (/norm(?:_[12])?\.weight$/.test(name) || /\.scale$/.test(name) || /per_expert_scale$/.test(name)) {
       const width = /[qk]_norm/.test(name) ? 64 : /per_expert_scale$/.test(name) ? 4 : 128;
       using raw = MlxArray.fromFloat32(new Float32Array(width).fill(1), [width]);
       const result = raw.astype(Dtype.bfloat16); arrays.set(name, result); return result;
     }
     let rows = 128, cols = 128;
     if (module.endsWith("router.proj")) rows = 4;
-    if (module.endsWith("per_layer_input_gate")) rows = 16;
-    if (module.endsWith("per_layer_projection")) cols = 16;
+    if (module.endsWith("per_layer_input_gate")) rows = 64;
+    if (module.endsWith("per_layer_projection")) cols = 64;
     const experts = module.includes("switch_glu") ? 4 : 1;
     const shape = experts > 1 ? [experts, rows, cols] : [rows, cols];
     let seed = 0; for (const char of module) seed += char.charCodeAt(0);
     using raw = MlxArray.fromFloat32(Float32Array.from({ length: experts * rows * cols }, (_, i) => Math.sin(i * 0.11 + seed) * 0.03), shape);
     using bf16 = raw.astype(Dtype.bfloat16);
-    const q = ops.quantize(bf16, 16, 4);
+    const q = ops.quantize(bf16, 64, 4);
     arrays.set(`${module}.weight`, q.packed); arrays.set(`${module}.scales`, q.scales); arrays.set(`${module}.biases`, q.biases!);
     return arrays.get(name)!;
   };
   const weights = { tensor: value, has: (name: string) => !name.endsWith(".bias") } as unknown as Weights;
   const config = { text: { hiddenSize: 128, intermediateSize: 128, numAttentionHeads: 2, numKeyValueHeads: 2,
     numGlobalKeyValueHeads: 2, headDim: 64, globalHeadDim: 64, attentionKEqV: kEqV,
-    hiddenSizePerLayerInput: inputs ? 16 : 0, layerTypes: ["sliding_attention", "full_attention"],
+    hiddenSizePerLayerInput: inputs ? 64 : 0, layerTypes: ["sliding_attention", "full_attention"],
     rmsNormEps: 1e-6, slidingWindow: 64, numExperts: 4, topKExperts: 2, enableMoeBlock: moe,
     ropeParameters: { sliding_attention: { ropeType: "default", ropeTheta: 10000 }, full_attention: { ropeType: "default", ropeTheta: 10000 } } },
-    quantization: { default: { groupSize: 16, bits: 4, mode: "affine" }, perLayer: new Map() } } as unknown as ModelConfig;
+    quantization: { default: { groupSize: 64, bits: 4, mode: "affine" }, perLayer: new Map() } } as unknown as ModelConfig;
   return { config, weights, dispose() { for (const array of arrays.values()) array.dispose(); } };
 }
 
@@ -65,7 +65,7 @@ numerical("written dense and per-layer-input blocks retain outputs, donor reads 
     const a = new KVCache(), b = new KVCache();
     try {
       for (const rows of [3, 1, 1]) {
-        using x = input(rows, 128), layerInput = input(rows, 16);
+        using x = input(rows, 128), layerInput = input(rows, 64);
         const control = original.forward(x, a, rows === 1 ? "decode" : "window", null, inputs ? layerInput : null);
         const actual = fixed.forward(x, b, rows === 1 ? "decode" : "window", null, layerInput);
         try { equal(actual.h, control.h); equal(a.keys!, b.keys!); equal(a.values!, b.values!); expect(a.offset).toBe(b.offset); }

@@ -7,7 +7,7 @@ import { configFingerprint } from "../../src/artifacts/fingerprint";
 import { resolveComposition } from "../../src/models/composition";
 import { MLX_GRAPH_TABLES, MLX_MODEL_IMPLEMENTATIONS } from "../../src/models/factory";
 import { MODEL_FAMILIES } from "../../src/models/families";
-import { GENERATED_GRAPHS } from "../../src/models/gemma4/generated";
+import { GENERATED_GRAPHS } from "../../src/models/gemma4/graphs";
 import { Gemma4Model } from "../../src/models/gemma4/model";
 import { implementationIdFor } from "../../src/models/implementation";
 import { resolveModelProfile } from "../../src/models/profile";
@@ -80,7 +80,7 @@ describe("family implementations", () => {
       expect(generated.id).toBe(GENERATED_GRAPHS.find(entry => entry.serves.fingerprint === configFingerprint(config))!.id);
       expect(table.select(config, resolveComposition(config))).toBe(table.generic);
       expect(Object.getOwnPropertyDescriptor(Gemma4Model.prototype, "trainable")?.get).toBeDefined();
-      const module = await import(`../../src/models/gemma4/generated/${generated.id}`);
+      const module = await import(`../../src/models/gemma4/${generated.id}`);
       expect("trainable" in module.GeneratedGemma4.prototype).toBe(false);
     }
   });

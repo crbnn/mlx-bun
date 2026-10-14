@@ -1,33 +1,29 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { Cache } from "../../contracts/mlx/cache";
-import type { MlxPromptRange } from "../../contracts/mlx/graph";
 import type { Gemma4Phase } from "./blocks";
 
-/** Compatibility boundary for a caller's whole-sequence scoring operation.
- * The table is the graph's declared prompt ranges, indexed by caller rows. */
-export function writtenSequence(ranges: readonly MlxPromptRange[], ids: MlxArray, caches: Cache[], rows: number): MlxArray {
-  const range = ranges.find(range => rows >= range.from && rows <= range.to)!;
-  return range.operation(ids, caches, null) as MlxArray;
+type MediaForward = (hidden: MlxArray, caches: Cache[], phase: Gemma4Phase, ids: MlxArray) => MlxArray;
+
+/** Prepared media request data before entering the fixed operation its range
+ * names. A request's image mask declares its bidirectional attention spans. */
+export function writtenMedia(embedScale: number, operation: MediaForward,
+  embeds: MlxArray, caches: Cache[], bidir: MlxArray | null, ids: MlxArray): MlxArray {
+  const hidden = ops.mulScalar(embeds, embedScale);
+  return operation(hidden, caches, bidir ? { bidirectional: bidir } : "window", ids);
 }
 
-/** Prepared request data is normalized before entering the named media phase.
- * The row range selects only an operation the file declared. */
-export function writtenMedia(graph: {
-  readonly embedScale: number;
-  readonly perLayerWidth: number;
-  readonly embeddingPrompt: readonly { from: number; to: number; operation(hidden: MlxArray, caches: Cache[], phase: Gemma4Phase, ids: MlxArray): MlxArray }[];
-}, embeds: MlxArray, caches: Cache[], bidir: MlxArray | null, ids: MlxArray, multimodal: MlxArray | null): MlxArray {
-  const hidden = ops.mulScalar(embeds, graph.embedScale);
+/** Per-layer-input media positions take token zero's input, as the reference
+ * does. The masks are request data; the file names this input operation. */
+export function writtenInputMedia(embedScale: number, operation: MediaForward,
+  embeds: MlxArray, caches: Cache[], bidir: MlxArray | null, ids: MlxArray, multimodal: MlxArray | null): MlxArray {
   const zeroing = multimodal ?? bidir;
   let inputIds = ids;
-  if (graph.perLayerWidth && zeroing) {
+  if (zeroing) {
     using condition = ops.reshape(zeroing, ids.shape);
     using zero = ops.zeros(ids.shape, ids.dtype);
     inputIds = ops.where(condition, zero, ids);
   }
-  const rows = ids.shape[0]! * ids.shape[1]!;
-  const range = graph.embeddingPrompt.find(range => rows >= range.from && rows <= range.to)!;
-  try { return range.operation(hidden, caches, bidir ? { bidirectional: bidir } : "window", inputIds); }
+  try { return writtenMedia(embedScale, operation, embeds, caches, bidir, inputIds); }
   finally { if (inputIds !== ids) inputIds.dispose(); }
 }

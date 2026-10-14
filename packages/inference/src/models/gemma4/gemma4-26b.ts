@@ -4,7 +4,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
 import type { Cache } from "../../contracts/mlx/cache";
-import type { MlxDeclaredGraph, MlxTokenPhases, MlxRowTable, MlxCapturingForward, MlxHeadForward, MlxPhaseForward, MlxLayerCapture, MlxPromptRange, MlxMixedRange, MlxCacheLayer } from "../../contracts/mlx/graph";
+import type { MlxDeclaredGraph, MlxTokenPhases, MlxRowTable, MlxCapturingForward, MlxHeadForward, MlxPhaseForward, MlxLayerCapture, MlxPromptRange, MlxMixedRange, MlxPhaseGroup, MlxCacheLayer } from "../../contracts/mlx/graph";
 import type { Vision, MediaSidecarProbes } from "../../contracts/mlx/media";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import { RMSNorm } from "../../layers/normalization";
@@ -20,7 +20,7 @@ import { CompiledDecode } from "./compiled-decode";
 import { bindGemma4MediaInput, gemma4DraftTarget, gemma4MediaEncoders } from "./media";
 import { PerLayerInputs, type Gemma4Phase } from "./blocks";
 import { SlidingAttention, FullAttention, FullKEqVAttention, SharedSlidingAttention, SharedFullAttention, GemmaLayerWeights, GemmaInputLayerWeights, GemmaMoeLayerWeights, GemmaDenseLayer, GemmaInputLayer, GemmaMoeLayer, CompiledGegluMLP, PlainGegluMLP, CompiledGeglu, SortedSwitchGLU, UnsortedSwitchGLU, FixedExperts } from "./written-blocks";
-import { GemmaForwardScope, GemmaInputForwardScope, GemmaMixedScope, ownMixed, donorMixed, sharedMixed, denseLoraTargets, inputLoraTargets, graphConstants, moeGraphConstants, weightBytes } from "./written-forward";
+import { GemmaForwardScope, GemmaInputForwardScope, GemmaMixedScope, ownMixed, donorMixed, sharedMixed, denseLoraTargets, inputLoraTargets, graphConstants, moeGraphConstants, weightBytes, GemmaBuildScope } from "./written-forward";
 export const FINGERPRINT = GEMMA_GRAPH_FINGERPRINTS["26b"];
 
 /** One decoder layer as the composition fixes it: its attention type; the layer
@@ -120,6 +120,9 @@ export const COMPOSITION: ServedComposition = Object.freeze({
 });
 
 
+export const DECODE_ROWS = 8;
+export const VERIFY_ROWS = 64;
+
 export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
   readonly prefixBase = PREFIX;
   readonly loraState = new LoraState();
@@ -132,6 +135,7 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
   readonly perLayerWidth = 0;
   readonly graphCapabilities = declareGraph({ media: { input: "embeddings", video: false }, hiddenLayerTaps: true });
   readonly cachePaging = true;
+  makeCache!: () => Cache[];
   readonly cacheLayers: readonly MlxCacheLayer[];
   readonly layers: readonly GemmaMoeLayer[];
   readonly traceLayers: readonly GemmaDenseLayer[];
@@ -205,105 +209,106 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
   readonly #l29: GemmaMoeLayer;
   readonly #t29: GemmaMoeLayer;
   constructor(weights: Weights, readonly config: ModelConfig) {
+    using resources = new GemmaBuildScope();
     this.weightsBytes = weightBytes(weights);
     this.embed = QuantizedEmbedding.load(weights, `${PREFIX}.embed_tokens`, config);
     this.finalNorm = new RMSNorm(weights.tensor(`${PREFIX}.norm.weight`), config.text.rmsNormEps);
     this.embedScale = Math.sqrt(config.text.hiddenSize);
     this.windowSize = config.text.slidingWindow;
-    const p0 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.0`, new SlidingAttention(weights, config, `${PREFIX}.layers.0.self_attn`));
+    const p0 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.0`, new SlidingAttention(weights, config, `${PREFIX}.layers.0.self_attn`)));
     this.#l0 = new GemmaMoeLayer(p0, new CompiledGegluMLP(p0.mlp), new FixedExperts(new UnsortedSwitchGLU(p0.experts, new CompiledGeglu())));
     this.#t0 = new GemmaMoeLayer(p0, new CompiledGegluMLP(p0.mlp), new FixedExperts(new SortedSwitchGLU(p0.experts, new CompiledGeglu())));
-    const p1 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.1`, new SlidingAttention(weights, config, `${PREFIX}.layers.1.self_attn`));
+    const p1 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.1`, new SlidingAttention(weights, config, `${PREFIX}.layers.1.self_attn`)));
     this.#l1 = new GemmaMoeLayer(p1, new CompiledGegluMLP(p1.mlp), new FixedExperts(new UnsortedSwitchGLU(p1.experts, new CompiledGeglu())));
     this.#t1 = new GemmaMoeLayer(p1, new CompiledGegluMLP(p1.mlp), new FixedExperts(new SortedSwitchGLU(p1.experts, new CompiledGeglu())));
-    const p2 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.2`, new SlidingAttention(weights, config, `${PREFIX}.layers.2.self_attn`));
+    const p2 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.2`, new SlidingAttention(weights, config, `${PREFIX}.layers.2.self_attn`)));
     this.#l2 = new GemmaMoeLayer(p2, new CompiledGegluMLP(p2.mlp), new FixedExperts(new UnsortedSwitchGLU(p2.experts, new CompiledGeglu())));
     this.#t2 = new GemmaMoeLayer(p2, new CompiledGegluMLP(p2.mlp), new FixedExperts(new SortedSwitchGLU(p2.experts, new CompiledGeglu())));
-    const p3 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.3`, new SlidingAttention(weights, config, `${PREFIX}.layers.3.self_attn`));
+    const p3 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.3`, new SlidingAttention(weights, config, `${PREFIX}.layers.3.self_attn`)));
     this.#l3 = new GemmaMoeLayer(p3, new CompiledGegluMLP(p3.mlp), new FixedExperts(new UnsortedSwitchGLU(p3.experts, new CompiledGeglu())));
     this.#t3 = new GemmaMoeLayer(p3, new CompiledGegluMLP(p3.mlp), new FixedExperts(new SortedSwitchGLU(p3.experts, new CompiledGeglu())));
-    const p4 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.4`, new SlidingAttention(weights, config, `${PREFIX}.layers.4.self_attn`));
+    const p4 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.4`, new SlidingAttention(weights, config, `${PREFIX}.layers.4.self_attn`)));
     this.#l4 = new GemmaMoeLayer(p4, new CompiledGegluMLP(p4.mlp), new FixedExperts(new UnsortedSwitchGLU(p4.experts, new CompiledGeglu())));
     this.#t4 = new GemmaMoeLayer(p4, new CompiledGegluMLP(p4.mlp), new FixedExperts(new SortedSwitchGLU(p4.experts, new CompiledGeglu())));
-    const p5 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.5`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.5.self_attn`));
+    const p5 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.5`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.5.self_attn`)));
     this.#l5 = new GemmaMoeLayer(p5, new CompiledGegluMLP(p5.mlp), new FixedExperts(new UnsortedSwitchGLU(p5.experts, new CompiledGeglu())));
     this.#t5 = new GemmaMoeLayer(p5, new CompiledGegluMLP(p5.mlp), new FixedExperts(new SortedSwitchGLU(p5.experts, new CompiledGeglu())));
-    const p6 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.6`, new SlidingAttention(weights, config, `${PREFIX}.layers.6.self_attn`));
+    const p6 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.6`, new SlidingAttention(weights, config, `${PREFIX}.layers.6.self_attn`)));
     this.#l6 = new GemmaMoeLayer(p6, new CompiledGegluMLP(p6.mlp), new FixedExperts(new UnsortedSwitchGLU(p6.experts, new CompiledGeglu())));
     this.#t6 = new GemmaMoeLayer(p6, new CompiledGegluMLP(p6.mlp), new FixedExperts(new SortedSwitchGLU(p6.experts, new CompiledGeglu())));
-    const p7 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.7`, new SlidingAttention(weights, config, `${PREFIX}.layers.7.self_attn`));
+    const p7 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.7`, new SlidingAttention(weights, config, `${PREFIX}.layers.7.self_attn`)));
     this.#l7 = new GemmaMoeLayer(p7, new CompiledGegluMLP(p7.mlp), new FixedExperts(new UnsortedSwitchGLU(p7.experts, new CompiledGeglu())));
     this.#t7 = new GemmaMoeLayer(p7, new CompiledGegluMLP(p7.mlp), new FixedExperts(new SortedSwitchGLU(p7.experts, new CompiledGeglu())));
-    const p8 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.8`, new SlidingAttention(weights, config, `${PREFIX}.layers.8.self_attn`));
+    const p8 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.8`, new SlidingAttention(weights, config, `${PREFIX}.layers.8.self_attn`)));
     this.#l8 = new GemmaMoeLayer(p8, new CompiledGegluMLP(p8.mlp), new FixedExperts(new UnsortedSwitchGLU(p8.experts, new CompiledGeglu())));
     this.#t8 = new GemmaMoeLayer(p8, new CompiledGegluMLP(p8.mlp), new FixedExperts(new SortedSwitchGLU(p8.experts, new CompiledGeglu())));
-    const p9 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.9`, new SlidingAttention(weights, config, `${PREFIX}.layers.9.self_attn`));
+    const p9 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.9`, new SlidingAttention(weights, config, `${PREFIX}.layers.9.self_attn`)));
     this.#l9 = new GemmaMoeLayer(p9, new CompiledGegluMLP(p9.mlp), new FixedExperts(new UnsortedSwitchGLU(p9.experts, new CompiledGeglu())));
     this.#t9 = new GemmaMoeLayer(p9, new CompiledGegluMLP(p9.mlp), new FixedExperts(new SortedSwitchGLU(p9.experts, new CompiledGeglu())));
-    const p10 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.10`, new SlidingAttention(weights, config, `${PREFIX}.layers.10.self_attn`));
+    const p10 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.10`, new SlidingAttention(weights, config, `${PREFIX}.layers.10.self_attn`)));
     this.#l10 = new GemmaMoeLayer(p10, new CompiledGegluMLP(p10.mlp), new FixedExperts(new UnsortedSwitchGLU(p10.experts, new CompiledGeglu())));
     this.#t10 = new GemmaMoeLayer(p10, new CompiledGegluMLP(p10.mlp), new FixedExperts(new SortedSwitchGLU(p10.experts, new CompiledGeglu())));
-    const p11 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.11`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.11.self_attn`));
+    const p11 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.11`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.11.self_attn`)));
     this.#l11 = new GemmaMoeLayer(p11, new CompiledGegluMLP(p11.mlp), new FixedExperts(new UnsortedSwitchGLU(p11.experts, new CompiledGeglu())));
     this.#t11 = new GemmaMoeLayer(p11, new CompiledGegluMLP(p11.mlp), new FixedExperts(new SortedSwitchGLU(p11.experts, new CompiledGeglu())));
-    const p12 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.12`, new SlidingAttention(weights, config, `${PREFIX}.layers.12.self_attn`));
+    const p12 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.12`, new SlidingAttention(weights, config, `${PREFIX}.layers.12.self_attn`)));
     this.#l12 = new GemmaMoeLayer(p12, new CompiledGegluMLP(p12.mlp), new FixedExperts(new UnsortedSwitchGLU(p12.experts, new CompiledGeglu())));
     this.#t12 = new GemmaMoeLayer(p12, new CompiledGegluMLP(p12.mlp), new FixedExperts(new SortedSwitchGLU(p12.experts, new CompiledGeglu())));
-    const p13 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.13`, new SlidingAttention(weights, config, `${PREFIX}.layers.13.self_attn`));
+    const p13 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.13`, new SlidingAttention(weights, config, `${PREFIX}.layers.13.self_attn`)));
     this.#l13 = new GemmaMoeLayer(p13, new CompiledGegluMLP(p13.mlp), new FixedExperts(new UnsortedSwitchGLU(p13.experts, new CompiledGeglu())));
     this.#t13 = new GemmaMoeLayer(p13, new CompiledGegluMLP(p13.mlp), new FixedExperts(new SortedSwitchGLU(p13.experts, new CompiledGeglu())));
-    const p14 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.14`, new SlidingAttention(weights, config, `${PREFIX}.layers.14.self_attn`));
+    const p14 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.14`, new SlidingAttention(weights, config, `${PREFIX}.layers.14.self_attn`)));
     this.#l14 = new GemmaMoeLayer(p14, new CompiledGegluMLP(p14.mlp), new FixedExperts(new UnsortedSwitchGLU(p14.experts, new CompiledGeglu())));
     this.#t14 = new GemmaMoeLayer(p14, new CompiledGegluMLP(p14.mlp), new FixedExperts(new SortedSwitchGLU(p14.experts, new CompiledGeglu())));
-    const p15 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.15`, new SlidingAttention(weights, config, `${PREFIX}.layers.15.self_attn`));
+    const p15 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.15`, new SlidingAttention(weights, config, `${PREFIX}.layers.15.self_attn`)));
     this.#l15 = new GemmaMoeLayer(p15, new CompiledGegluMLP(p15.mlp), new FixedExperts(new UnsortedSwitchGLU(p15.experts, new CompiledGeglu())));
     this.#t15 = new GemmaMoeLayer(p15, new CompiledGegluMLP(p15.mlp), new FixedExperts(new SortedSwitchGLU(p15.experts, new CompiledGeglu())));
-    const p16 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.16`, new SlidingAttention(weights, config, `${PREFIX}.layers.16.self_attn`));
+    const p16 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.16`, new SlidingAttention(weights, config, `${PREFIX}.layers.16.self_attn`)));
     this.#l16 = new GemmaMoeLayer(p16, new CompiledGegluMLP(p16.mlp), new FixedExperts(new UnsortedSwitchGLU(p16.experts, new CompiledGeglu())));
     this.#t16 = new GemmaMoeLayer(p16, new CompiledGegluMLP(p16.mlp), new FixedExperts(new SortedSwitchGLU(p16.experts, new CompiledGeglu())));
-    const p17 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.17`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.17.self_attn`));
+    const p17 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.17`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.17.self_attn`)));
     this.#l17 = new GemmaMoeLayer(p17, new CompiledGegluMLP(p17.mlp), new FixedExperts(new UnsortedSwitchGLU(p17.experts, new CompiledGeglu())));
     this.#t17 = new GemmaMoeLayer(p17, new CompiledGegluMLP(p17.mlp), new FixedExperts(new SortedSwitchGLU(p17.experts, new CompiledGeglu())));
-    const p18 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.18`, new SlidingAttention(weights, config, `${PREFIX}.layers.18.self_attn`));
+    const p18 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.18`, new SlidingAttention(weights, config, `${PREFIX}.layers.18.self_attn`)));
     this.#l18 = new GemmaMoeLayer(p18, new CompiledGegluMLP(p18.mlp), new FixedExperts(new UnsortedSwitchGLU(p18.experts, new CompiledGeglu())));
     this.#t18 = new GemmaMoeLayer(p18, new CompiledGegluMLP(p18.mlp), new FixedExperts(new SortedSwitchGLU(p18.experts, new CompiledGeglu())));
-    const p19 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.19`, new SlidingAttention(weights, config, `${PREFIX}.layers.19.self_attn`));
+    const p19 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.19`, new SlidingAttention(weights, config, `${PREFIX}.layers.19.self_attn`)));
     this.#l19 = new GemmaMoeLayer(p19, new CompiledGegluMLP(p19.mlp), new FixedExperts(new UnsortedSwitchGLU(p19.experts, new CompiledGeglu())));
     this.#t19 = new GemmaMoeLayer(p19, new CompiledGegluMLP(p19.mlp), new FixedExperts(new SortedSwitchGLU(p19.experts, new CompiledGeglu())));
-    const p20 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.20`, new SlidingAttention(weights, config, `${PREFIX}.layers.20.self_attn`));
+    const p20 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.20`, new SlidingAttention(weights, config, `${PREFIX}.layers.20.self_attn`)));
     this.#l20 = new GemmaMoeLayer(p20, new CompiledGegluMLP(p20.mlp), new FixedExperts(new UnsortedSwitchGLU(p20.experts, new CompiledGeglu())));
     this.#t20 = new GemmaMoeLayer(p20, new CompiledGegluMLP(p20.mlp), new FixedExperts(new SortedSwitchGLU(p20.experts, new CompiledGeglu())));
-    const p21 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.21`, new SlidingAttention(weights, config, `${PREFIX}.layers.21.self_attn`));
+    const p21 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.21`, new SlidingAttention(weights, config, `${PREFIX}.layers.21.self_attn`)));
     this.#l21 = new GemmaMoeLayer(p21, new CompiledGegluMLP(p21.mlp), new FixedExperts(new UnsortedSwitchGLU(p21.experts, new CompiledGeglu())));
     this.#t21 = new GemmaMoeLayer(p21, new CompiledGegluMLP(p21.mlp), new FixedExperts(new SortedSwitchGLU(p21.experts, new CompiledGeglu())));
-    const p22 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.22`, new SlidingAttention(weights, config, `${PREFIX}.layers.22.self_attn`));
+    const p22 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.22`, new SlidingAttention(weights, config, `${PREFIX}.layers.22.self_attn`)));
     this.#l22 = new GemmaMoeLayer(p22, new CompiledGegluMLP(p22.mlp), new FixedExperts(new UnsortedSwitchGLU(p22.experts, new CompiledGeglu())));
     this.#t22 = new GemmaMoeLayer(p22, new CompiledGegluMLP(p22.mlp), new FixedExperts(new SortedSwitchGLU(p22.experts, new CompiledGeglu())));
-    const p23 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.23`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.23.self_attn`));
+    const p23 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.23`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.23.self_attn`)));
     this.#l23 = new GemmaMoeLayer(p23, new CompiledGegluMLP(p23.mlp), new FixedExperts(new UnsortedSwitchGLU(p23.experts, new CompiledGeglu())));
     this.#t23 = new GemmaMoeLayer(p23, new CompiledGegluMLP(p23.mlp), new FixedExperts(new SortedSwitchGLU(p23.experts, new CompiledGeglu())));
-    const p24 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.24`, new SlidingAttention(weights, config, `${PREFIX}.layers.24.self_attn`));
+    const p24 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.24`, new SlidingAttention(weights, config, `${PREFIX}.layers.24.self_attn`)));
     this.#l24 = new GemmaMoeLayer(p24, new CompiledGegluMLP(p24.mlp), new FixedExperts(new UnsortedSwitchGLU(p24.experts, new CompiledGeglu())));
     this.#t24 = new GemmaMoeLayer(p24, new CompiledGegluMLP(p24.mlp), new FixedExperts(new SortedSwitchGLU(p24.experts, new CompiledGeglu())));
-    const p25 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.25`, new SlidingAttention(weights, config, `${PREFIX}.layers.25.self_attn`));
+    const p25 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.25`, new SlidingAttention(weights, config, `${PREFIX}.layers.25.self_attn`)));
     this.#l25 = new GemmaMoeLayer(p25, new CompiledGegluMLP(p25.mlp), new FixedExperts(new UnsortedSwitchGLU(p25.experts, new CompiledGeglu())));
     this.#t25 = new GemmaMoeLayer(p25, new CompiledGegluMLP(p25.mlp), new FixedExperts(new SortedSwitchGLU(p25.experts, new CompiledGeglu())));
-    const p26 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.26`, new SlidingAttention(weights, config, `${PREFIX}.layers.26.self_attn`));
+    const p26 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.26`, new SlidingAttention(weights, config, `${PREFIX}.layers.26.self_attn`)));
     this.#l26 = new GemmaMoeLayer(p26, new CompiledGegluMLP(p26.mlp), new FixedExperts(new UnsortedSwitchGLU(p26.experts, new CompiledGeglu())));
     this.#t26 = new GemmaMoeLayer(p26, new CompiledGegluMLP(p26.mlp), new FixedExperts(new SortedSwitchGLU(p26.experts, new CompiledGeglu())));
-    const p27 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.27`, new SlidingAttention(weights, config, `${PREFIX}.layers.27.self_attn`));
+    const p27 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.27`, new SlidingAttention(weights, config, `${PREFIX}.layers.27.self_attn`)));
     this.#l27 = new GemmaMoeLayer(p27, new CompiledGegluMLP(p27.mlp), new FixedExperts(new UnsortedSwitchGLU(p27.experts, new CompiledGeglu())));
     this.#t27 = new GemmaMoeLayer(p27, new CompiledGegluMLP(p27.mlp), new FixedExperts(new SortedSwitchGLU(p27.experts, new CompiledGeglu())));
-    const p28 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.28`, new SlidingAttention(weights, config, `${PREFIX}.layers.28.self_attn`));
+    const p28 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.28`, new SlidingAttention(weights, config, `${PREFIX}.layers.28.self_attn`)));
     this.#l28 = new GemmaMoeLayer(p28, new CompiledGegluMLP(p28.mlp), new FixedExperts(new UnsortedSwitchGLU(p28.experts, new CompiledGeglu())));
     this.#t28 = new GemmaMoeLayer(p28, new CompiledGegluMLP(p28.mlp), new FixedExperts(new SortedSwitchGLU(p28.experts, new CompiledGeglu())));
-    const p29 = new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.29`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.29.self_attn`));
+    const p29 = resources.holdMoe(new GemmaMoeLayerWeights(weights, config, `${PREFIX}.layers.29`, new FullKEqVAttention(weights, config, `${PREFIX}.layers.29.self_attn`)));
     this.#l29 = new GemmaMoeLayer(p29, new CompiledGegluMLP(p29.mlp), new FixedExperts(new UnsortedSwitchGLU(p29.experts, new CompiledGeglu())));
     this.#t29 = new GemmaMoeLayer(p29, new CompiledGegluMLP(p29.mlp), new FixedExperts(new SortedSwitchGLU(p29.experts, new CompiledGeglu())));
     this.layers = Object.freeze([this.#l0, this.#l1, this.#l2, this.#l3, this.#l4, this.#l5, this.#l6, this.#l7, this.#l8, this.#l9, this.#l10, this.#l11, this.#l12, this.#l13, this.#l14, this.#l15, this.#l16, this.#l17, this.#l18, this.#l19, this.#l20, this.#l21, this.#l22, this.#l23, this.#l24, this.#l25, this.#l26, this.#l27, this.#l28, this.#l29]);
     this.traceLayers = Object.freeze([]);
     this.#parts = Object.freeze([p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15, p16, p17, p18, p19, p20, p21, p22, p23, p24, p25, p26, p27, p28, p29]);
-    this.#constants = ownResource(moeGraphConstants(this.#parts), disposeResources);
+    this.#constants = resources.finish();
     this.cacheLayers = Object.freeze([
       { kind: "sliding", window: config.text.slidingWindow },
       { kind: "sliding", window: config.text.slidingWindow },
@@ -339,9 +344,9 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
     this.prompt = Object.freeze([{ from: 1, to: 7, operation: this.#window }, { from: 8, to: Infinity, operation: this.#sortedWindow }]);
     this.multiSequencePrompt = this.prompt;
     this.decode = Object.freeze({ 1: this.#decode, 2: this.#decode, 3: this.#decode, 4: this.#decode, 5: this.#decode, 6: this.#decode, 7: this.#decode, 8: this.#sortedDecode });
-    this.verify = Object.freeze({ 1: this.#window, 2: this.#window, 3: this.#window, 4: this.#window, 5: this.#window, 6: this.#window, 7: this.#window, 8: this.#sortedWindow });
-    this.appendKnown = Object.freeze({ 1: this.#known, 2: this.#known, 3: this.#known, 4: this.#known, 5: this.#known, 6: this.#known, 7: this.#known, 8: this.#sortedKnown });
-    this.logits = Object.freeze({ 1: this.#head, 2: this.#head, 3: this.#head, 4: this.#head, 5: this.#head, 6: this.#head, 7: this.#head, 8: this.#head });
+    this.verify = Object.freeze({ 1: this.#window, 2: this.#window, 3: this.#window, 4: this.#window, 5: this.#window, 6: this.#window, 7: this.#window, 8: this.#sortedWindow, 9: this.#sortedWindow, 10: this.#sortedWindow, 11: this.#sortedWindow, 12: this.#sortedWindow, 13: this.#sortedWindow, 14: this.#sortedWindow, 15: this.#sortedWindow, 16: this.#sortedWindow, 17: this.#sortedWindow, 18: this.#sortedWindow, 19: this.#sortedWindow, 20: this.#sortedWindow, 21: this.#sortedWindow, 22: this.#sortedWindow, 23: this.#sortedWindow, 24: this.#sortedWindow, 25: this.#sortedWindow, 26: this.#sortedWindow, 27: this.#sortedWindow, 28: this.#sortedWindow, 29: this.#sortedWindow, 30: this.#sortedWindow, 31: this.#sortedWindow, 32: this.#sortedWindow, 33: this.#sortedWindow, 34: this.#sortedWindow, 35: this.#sortedWindow, 36: this.#sortedWindow, 37: this.#sortedWindow, 38: this.#sortedWindow, 39: this.#sortedWindow, 40: this.#sortedWindow, 41: this.#sortedWindow, 42: this.#sortedWindow, 43: this.#sortedWindow, 44: this.#sortedWindow, 45: this.#sortedWindow, 46: this.#sortedWindow, 47: this.#sortedWindow, 48: this.#sortedWindow, 49: this.#sortedWindow, 50: this.#sortedWindow, 51: this.#sortedWindow, 52: this.#sortedWindow, 53: this.#sortedWindow, 54: this.#sortedWindow, 55: this.#sortedWindow, 56: this.#sortedWindow, 57: this.#sortedWindow, 58: this.#sortedWindow, 59: this.#sortedWindow, 60: this.#sortedWindow, 61: this.#sortedWindow, 62: this.#sortedWindow, 63: this.#sortedWindow, 64: this.#sortedWindow });
+    this.appendKnown = Object.freeze({ 1: this.#known, 2: this.#known, 3: this.#known, 4: this.#known, 5: this.#known, 6: this.#known, 7: this.#known, 8: this.#sortedKnown, 9: this.#sortedKnown, 10: this.#sortedKnown, 11: this.#sortedKnown, 12: this.#sortedKnown, 13: this.#sortedKnown, 14: this.#sortedKnown, 15: this.#sortedKnown, 16: this.#sortedKnown, 17: this.#sortedKnown, 18: this.#sortedKnown, 19: this.#sortedKnown, 20: this.#sortedKnown, 21: this.#sortedKnown, 22: this.#sortedKnown, 23: this.#sortedKnown, 24: this.#sortedKnown, 25: this.#sortedKnown, 26: this.#sortedKnown, 27: this.#sortedKnown, 28: this.#sortedKnown, 29: this.#sortedKnown, 30: this.#sortedKnown, 31: this.#sortedKnown, 32: this.#sortedKnown, 33: this.#sortedKnown, 34: this.#sortedKnown, 35: this.#sortedKnown, 36: this.#sortedKnown, 37: this.#sortedKnown, 38: this.#sortedKnown, 39: this.#sortedKnown, 40: this.#sortedKnown, 41: this.#sortedKnown, 42: this.#sortedKnown, 43: this.#sortedKnown, 44: this.#sortedKnown, 45: this.#sortedKnown, 46: this.#sortedKnown, 47: this.#sortedKnown, 48: this.#sortedKnown, 49: this.#sortedKnown, 50: this.#sortedKnown, 51: this.#sortedKnown, 52: this.#sortedKnown, 53: this.#sortedKnown, 54: this.#sortedKnown, 55: this.#sortedKnown, 56: this.#sortedKnown, 57: this.#sortedKnown, 58: this.#sortedKnown, 59: this.#sortedKnown, 60: this.#sortedKnown, 61: this.#sortedKnown, 62: this.#sortedKnown, 63: this.#sortedKnown, 64: this.#sortedKnown });
+    this.logits = Object.freeze({ 1: this.#head, 2: this.#head, 3: this.#head, 4: this.#head, 5: this.#head, 6: this.#head, 7: this.#head, 8: this.#head, 9: this.#head, 10: this.#head, 11: this.#head, 12: this.#head, 13: this.#head, 14: this.#head, 15: this.#head, 16: this.#head, 17: this.#head, 18: this.#head, 19: this.#head, 20: this.#head, 21: this.#head, 22: this.#head, 23: this.#head, 24: this.#head, 25: this.#head, 26: this.#head, 27: this.#head, 28: this.#head, 29: this.#head, 30: this.#head, 31: this.#head, 32: this.#head, 33: this.#head, 34: this.#head, 35: this.#head, 36: this.#head, 37: this.#head, 38: this.#head, 39: this.#head, 40: this.#head, 41: this.#head, 42: this.#head, 43: this.#head, 44: this.#head, 45: this.#head, 46: this.#head, 47: this.#head, 48: this.#head, 49: this.#head, 50: this.#head, 51: this.#head, 52: this.#head, 53: this.#head, 54: this.#head, 55: this.#head, 56: this.#head, 57: this.#head, 58: this.#head, 59: this.#head, 60: this.#head, 61: this.#head, 62: this.#head, 63: this.#head, 64: this.#head });
     this.mixed = Object.freeze([{ from: 1, to: 7, operation: this.#mixed }, { from: 8, to: Infinity, operation: this.#sortedMixed }]);
   }
   readonly #window = (ids: MlxArray, caches: Cache[], capture: MlxLayerCapture | null): MlxArray => this.#windowHidden(this.#embedTokens(ids), caches, "window", ids, capture);
@@ -564,8 +569,13 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
   mediaEncoders(modelDir: string, probes: MediaSidecarProbes) { return gemma4MediaEncoders(this, modelDir, probes); }
   draftTarget(caches: Cache[]) { return gemma4DraftTarget(this, caches); }
   logitsFromHidden(hidden: MlxArray): MlxArray { return this.#head(hidden); }
-  sequenceHidden(ids: MlxArray, caches: Cache[], rows: number): MlxArray { return writtenSequence(this.prompt, ids, caches, rows); }
-  prefillEmbeddings(embeds: MlxArray, caches: Cache[], bidir: MlxArray | null, ids: MlxArray, multimodal: MlxArray | null = null): MlxArray { return writtenMedia(this, embeds, caches, bidir, ids, multimodal); }
-  readonly embeddingPrompt = Object.freeze([{ from: 1, to: 7, operation: (hidden: MlxArray, cache: Cache[], phase: Gemma4Phase, ids: MlxArray) => this.#windowHidden(hidden, cache, phase, ids, null) }, { from: 8, to: Infinity, operation: (hidden: MlxArray, cache: Cache[], phase: Gemma4Phase, ids: MlxArray) => this.#sortedWindowHidden(hidden, cache, phase, ids, null) }]);
+  readonly mixedSeparate = Object.freeze({
+    decode: Object.freeze([{ from: 1, to: 7, operation: (group: MlxPhaseGroup) => this.#decode(group.ids, group.state, group.capture) }, { from: 8, to: Infinity, operation: (group: MlxPhaseGroup) => this.#sortedDecode(group.ids, group.state, group.capture) }]),
+    window: Object.freeze([{ from: 1, to: 7, operation: (group: MlxPhaseGroup) => this.#window(group.ids, group.state, group.capture) }, { from: 8, to: Infinity, operation: (group: MlxPhaseGroup) => this.#sortedWindow(group.ids, group.state, group.capture) }]),
+    verify: Object.freeze([{ from: 1, to: 7, operation: (group: MlxPhaseGroup) => this.#window(group.ids, group.state, group.capture) }, { from: 8, to: Infinity, operation: (group: MlxPhaseGroup) => this.#sortedWindow(group.ids, group.state, group.capture) }]),
+  });
+  readonly sequence = Object.freeze([{ from: 1, to: 7, operation: (ids: MlxArray, caches: Cache[]) => this.#window(ids, caches, null) }, { from: 8, to: Infinity, operation: (ids: MlxArray, caches: Cache[]) => this.#sortedWindow(ids, caches, null) }]);
+
+  readonly mediaPrefill = Object.freeze([{ from: 1, to: 7, operation: (embeds: MlxArray, caches: Cache[], bidir: MlxArray | null, ids: MlxArray, multimodal: MlxArray | null) => writtenMedia(this.embedScale, (hidden, cache, phase, tokens) => this.#windowHidden(hidden, cache, phase, tokens, null), embeds, caches, bidir, ids) }, { from: 8, to: Infinity, operation: (embeds: MlxArray, caches: Cache[], bidir: MlxArray | null, ids: MlxArray, multimodal: MlxArray | null) => writtenMedia(this.embedScale, (hidden, cache, phase, tokens) => this.#sortedWindowHidden(hidden, cache, phase, tokens, null), embeds, caches, bidir, ids) }]);
 }
-import { writtenSequence, writtenMedia } from "./written-input";
+import { writtenMedia, writtenInputMedia } from "./written-input";
