@@ -4,9 +4,9 @@ import type { MixedGateUpTail } from "../kernels/trellis/mixed-gate-up";
 import type { TrellisLinear } from "./trellis-linear";
 
 // The fused gate/up/SwiGLU layer over a Qwen MLP's axis-1 Trellis gate and up
-// projections at one row with the reduce kernels' output bits (one SIMD group per
-// output row, the decoded weight times the scale per weight; kernels/trellis/index.ts).
-// It runs one kernel and takes everything that kernel varies on at construction.
+// projections at one row, decoding through a threadgroup codebook with the reduce
+// kernels' output bits (kernels/trellis/gate-up-codebook.ts). It runs one kernel
+// and takes everything that kernel varies on at construction.
 
 /** `sameWidth` null: either. */
 function sameAxis1(name: string, gate: TrellisLinear, up: TrellisLinear, sameWidth: boolean | null): void {

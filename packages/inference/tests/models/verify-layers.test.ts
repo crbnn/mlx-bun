@@ -2,8 +2,8 @@
 // layers/affine-verify-linear) on small synthetic projections against the
 // projections they replace: TrellisLinear (+ compiled SwiGLU) and
 // QuantizedLinear. Each layer runs one kernel that reassociates the reduction,
-// so they agree to bf16 precision. The codebook layers (layers/trellis-reduce-gate-up,
-// layers/trellis-scatter-down) and the one-row affine layer reproduce the one-row
+// so they agree to bf16 precision. The one-row codebook layers (layers/trellis-codebook-gate-up,
+// layers/trellis-codebook-down) and the one-row affine layer reproduce the one-row
 // paths they replace bit for bit. Each layer also refuses weights it was not built for.
 // TrellisLinear itself, at prompt rows, leaves its weight expansion unbounded on request
 // with the same bits.
@@ -13,8 +13,8 @@ import { QuantizedLinear } from "../../src/layers/quantized-linear";
 import { TrellisLinear, fusedGateUpSwiglu } from "../../src/layers/trellis-linear";
 import { compiledSwiglu } from "../../src/layers/swiglu";
 import { fusedGateUpSwigluMixed as mixedGateUpKernel } from "../../src/kernels/trellis/mixed-gate-up";
-import { CodebookGateUpRow } from "../../src/layers/trellis-reduce-gate-up";
-import { CodebookDownK3iRow, CodebookDownRow } from "../../src/layers/trellis-scatter-down";
+import { CodebookGateUpRow } from "../../src/layers/trellis-codebook-gate-up";
+import { CodebookDownK3iRow, CodebookDownRow } from "../../src/layers/trellis-codebook-down";
 import {
   CodebookMmaGateUp, FactoredGateUpRow, FactoredGateUpRows, FactoredMixedGateUp, MmaGateUp, MmaGateUpWide,
 } from "../../src/layers/trellis-gate-up";

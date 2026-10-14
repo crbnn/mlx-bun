@@ -933,7 +933,7 @@ the M4 Pro, 128 on the M1 Max); `kernels/attention/multi-query` is causal
 flash decoding for 2..8 query rows over a BF16 cache. `kernels/ane` holds the
 Neural Engine programs (`linear`) and the GPU kernels that fill their buffers
 (`fill`). The layers in `layers/trellis-gate-up`, `layers/trellis-down`,
-`layers/affine-verify-linear`, `layers/kv4-decode-attention` and
+`layers/trellis-codebook-gate-up`, `layers/trellis-codebook-down`, `layers/affine-verify-linear`, `layers/kv4-decode-attention` and
 `layers/ane-prefill-split` bind loaded weights to these kernels, one kernel per
 layer.
 

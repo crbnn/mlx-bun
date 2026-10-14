@@ -285,7 +285,7 @@ const LAYER_MODULES: Readonly<Record<string, string>> = Object.freeze({
   FactoredDownK3iRows: "trellis-down", MmaDown: "trellis-down", MmaDownK3i: "trellis-down",
   MmaDownWide: "trellis-down", MmaDownWideK3i: "trellis-down",
   CodebookMmaGateUp: "trellis-gate-up", CodebookMmaDown: "trellis-down", CodebookMmaDownK3i: "trellis-down",
-  CodebookGateUpRow: "trellis-reduce-gate-up", CodebookDownRow: "trellis-scatter-down", CodebookDownK3iRow: "trellis-scatter-down",
+  CodebookGateUpRow: "trellis-codebook-gate-up", CodebookDownRow: "trellis-codebook-down", CodebookDownK3iRow: "trellis-codebook-down",
 });
 
 /** Gate/up layers that take the composition's mixed-width SwiGLU tail (`mixedGateUp`) as their third argument. */
