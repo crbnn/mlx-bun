@@ -3,8 +3,8 @@
 // built with, the dense and mixture-of-experts feed-forward pieces, the
 // per-layer-input pieces (e2b/e4b), the KV-sharing pieces (a donor layer's read
 // and the donor each sharer attends) and the decoder layer composing them. The
-// generic graph (`Gemma4Model`, model.ts) and the generated graphs
-// (generated/*.ts, from scripts/gen-gemma4.ts) build their layers from these.
+// generic graph (`Gemma4Model`, model.ts) and the written graphs
+// (gemma4-e4b.ts, gemma4-12b.ts, gemma4-26b.ts) compose these blocks.
 // Each block is built once from the weights and the config and reads its cache
 // through the read its caller's phase names: no block inspects its input to
 // choose a phase, builds a mask or chooses an attention kernel. The training
