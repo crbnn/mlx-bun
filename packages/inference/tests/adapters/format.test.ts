@@ -16,7 +16,7 @@ import { AdapterManager, type AdapterTarget } from "../../src/adapters/manager";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 
-import { LoraDelta, LoraState, type LoraWeights } from "../../src/layers/lora";
+import { LoraDelta, LoraState, LoraOperation, type LoraWeights } from "../../src/layers/lora";
 
 
 const root = mkdtempSync(join(tmpdir(), "mlx-bun-lora-format-"));
@@ -234,4 +234,110 @@ test("mounted adapters apply after an arbitrary projection and follow request se
     using base = project();
     expect([...base.toFloat32()]).toEqual([-3, -1, 1, 3]);
   } finally { manager.unmount("request-a"); }
+});
+
+
+test("fused Trellis gate/up/down adapters follow B1/B4 request contexts and unmount", async () => {
+  const { TrellisLinear, fusedGateUpSwiglu } = await import("../../src/layers/trellis-linear");
+  const { TrellisFusedMLP, TrellisReducePrompt, TrellisScatterPrompt } = await import("../../src/layers/trellis-prompt");
+  const { bindMlxGateway } = await import("../../src/execution/gateway-binding");
+  const { declareGraph } = await import("../../src/models/capabilities");
+  const { stubPhases } = await import("../models/phase-forward");
+  const { compiledSwiglu } = await import("../../src/layers/swiglu");
+  const { Dtype } = await import("@mlx-bun/mlx/ffi");
+  const DIM = 512, RANK = 2;
+  const owned: MlxArray[] = [];
+  const packed = (axis: 0 | 1) => {
+    using codes = ops.fromInt32(Array.from({length:DIM*64}, (_,i)=>(i*7919+17)|0), [DIM,64]);
+    using scaleValues = MlxArray.fromFloat32(new Float32Array(DIM).fill(0.01), [DIM]);
+    const ints = codes.astype(Dtype.uint32), scales = scaleValues.astype(Dtype.bfloat16);
+    owned.push(ints, scales);
+    return new TrellisLinear(ints, scales, {mode:"trellis",bits:4,groupSize:256,
+      trellis:{L:12,code:"1mad",axis}});
+  };
+  const gate = packed(1), up = packed(1), down = packed(0), state = new LoraState();
+  const projections = [gate,up,down];
+  const targets = new Map(projections.map((projection,index)=>[`model.layers.0.mlp.${["gate_proj","up_proj","down_proj"][index]}`,projection]));
+  const never=()=>{throw new Error("request context never forwards");};
+  const graph = {prefixBase:"model",loraState:state,loraTargets:()=>targets, weightsBytes:0, dispose(){}, makeCache:()=>[],
+    config:{modelType:"adapter-test",eosTokenIds:[],text:{numHiddenLayers:0}},
+    graphCapabilities:declareGraph(), ...stubPhases(never,never)};
+  const manager = new AdapterManager(graph);
+  const binding = bindMlxGateway(graph as unknown as import("../../src/models/graph").MlxTokenGraph);
+  const fused = new TrellisFusedMLP(gate,up,new TrellisScatterPrompt(down),state);
+  const makeAdapter = (name:string,alpha:number) => {
+    const dir=join(root,name);mkdirSync(dir,{recursive:true});
+    writeFileSync(join(dir,"adapter_config.json"),JSON.stringify({lora_alpha:alpha,r:RANK}));
+    const tensors:Parameters<typeof writeF32Safetensors>[1]={};
+    for(const path of targets.keys()) {
+      tensors[`${path}.lora_a`]={shape:[DIM,RANK],values:Array.from({length:DIM*RANK},(_,i)=>Math.sin(i*0.31)*0.01)};
+      tensors[`${path}.lora_b`]={shape:[RANK,DIM],values:Array.from({length:DIM*RANK},(_,i)=>Math.cos(i*0.17)*0.01)};
+    }
+    writeF32Safetensors(join(dir,"adapters.safetensors"),tensors);return dir;
+  };
+  const bytesEqual=(a:MlxArray,b:MlxArray)=>expect(Buffer.from(a.rawBytesView())).toEqual(Buffer.from(b.rawBytesView()));
+  const residual=(x:MlxArray,target:typeof gate,id:string,base:MlxArray)=>{
+    const lw=target.adapters!.get(id)!;
+    using xa=ops.matmul(x,lw.a), z=ops.matmul(xa,lw.b), zs=ops.mulScalar(z,lw.scale), cast=zs.astype(x.dtype);
+    return ops.add(base,cast);
+  };
+  try {
+    expect((await manager.mount("A",makeAdapter("trellis-a",2))).mountedLayers).toBe(3);
+    expect((await manager.mount("B",makeAdapter("trellis-b",4))).mountedLayers).toBe(3);
+    for(const rows of [1,4]) {
+      using raw=MlxArray.fromFloat32(Float32Array.from({length:rows*DIM},(_,i)=>Math.sin(i*0.07)*0.2),[rows,1,DIM]);
+      using x=raw.astype(Dtype.bfloat16);
+      for(const id of ["A","B"]) {
+        const restore=binding.bindAdapterContext!([id],id).enter();
+        let actual:MlxArray;
+        try {actual=fused.forward(x);} finally {restore();}
+        using candidate=actual;
+        expect(state.active).toEqual([]);
+        using plainGate=new TrellisReducePrompt(gate).forward(x),plainUp=new TrellisReducePrompt(up).forward(x);
+        using g=residual(x,gate,id,plainGate),u=residual(x,up,id,plainUp),hidden=compiledSwiglu(g,u);
+        using plainDown=new TrellisScatterPrompt(down).forward(hidden),expected=residual(hidden,down,id,plainDown);
+        bytesEqual(candidate,expected);
+      }
+      using originalHidden=fusedGateUpSwiglu(x,gate,up),original=new TrellisScatterPrompt(down).forward(originalHidden);
+      using recovered=fused.forward(x);bytesEqual(recovered,original);
+      const restore=binding.bindAdapterContext!(["A"],"cancelled").enter();
+      try {throw new Error("cancelled request");} catch {} finally {restore();}
+      using afterCancel=fused.forward(x);bytesEqual(afterCancel,original);
+    }
+    expect(manager.unmount("A")).toBe(3);expect(manager.unmount("B")).toBe(3);
+    expect(manager.list()).toEqual([]);expect(state.active).toEqual([]);
+  } finally {manager.unmount("A");manager.unmount("B");fused.dispose();for(const array of owned)array.dispose();}
+});
+
+test("optimized affine projections add the mounted delta after their B1/B4 kernel", async () => {
+  const { QuantizedLinear } = await import("../../src/layers/quantized-linear");
+  const { Affine3RowsLinear, Affine3MmaLinear, Affine4RowsLinear, Affine4MmaLinear } = await import("../../src/layers/affine-verify-linear");
+  const { Dtype } = await import("@mlx-bun/mlx/ffi");
+  const DIM = 512;
+  using weightWide = MlxArray.fromFloat32(Float32Array.from({length:DIM*DIM},(_,i)=>Math.sin(i*0.11)*0.02),[DIM,DIM]);
+  using weight = weightWide.astype(Dtype.bfloat16);
+  for(const bits of [3,4]) {
+    const q=ops.quantize(weight,64,bits),state=new LoraState();
+    const linear=new QuantizedLinear(q.packed,q.scales,q.biases,{mode:"affine",bits,groupSize:64});
+    const manager=new AdapterManager({prefixBase:"model",loraState:state,loraTargets:()=>new Map([[MODULE,linear]])});
+    const dir=join(root,`optimized-affine-${bits}`);
+    writePeftAdapter(dir,{shape:[2,DIM],values:Array.from({length:2*DIM},(_,i)=>Math.sin(i*0.3)*0.01)},
+      {shape:[DIM,2],values:Array.from({length:2*DIM},(_,i)=>Math.cos(i*0.2)*0.01)});
+    try {
+      await manager.mount("adapter",dir);
+      for(const rows of [1,4]) {
+        using xWide=MlxArray.fromFloat32(Float32Array.from({length:rows*DIM},(_,i)=>Math.sin(i*0.07)*0.2),[rows,1,DIM]);
+        using x=xWide.astype(Dtype.bfloat16);
+        const layers=bits===3?[new Affine3MmaLinear(linear),...(rows>1?[new Affine3RowsLinear(linear)]:[])]:
+          [new Affine4MmaLinear(linear),...(rows>1?[new Affine4RowsLinear(linear)]:[])];
+        for(const layer of layers) {
+          state.active=[];using base=layer.forward(x);
+          state.active=["adapter"];using actual=layer.forward(x);
+          const lw=linear.adapters!.get("adapter")!;
+          using xa=ops.matmul(x,lw.a),z=ops.matmul(xa,lw.b),zs=ops.mulScalar(z,lw.scale),cast=zs.astype(x.dtype),expected=ops.add(base,cast);
+          expect(Buffer.compare(Buffer.from(actual.rawBytes()),Buffer.from(expected.rawBytes()))).toBe(0);
+        }
+      }
+    } finally {manager.unmount("adapter");q.packed.dispose();q.scales.dispose();q.biases?.dispose();}
+  }
 });
