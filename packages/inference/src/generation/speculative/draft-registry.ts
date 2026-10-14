@@ -37,6 +37,9 @@ export interface DraftLoadRequest {
   readonly target: DraftTarget;
   /** Requested draft tokens per round; each kind applies its own default and bound. */
   readonly numDraftTokens?: number;
+  /** Each round's count is chosen up to the width (`--num-draft-tokens adaptive`): a kind whose default width is a
+   *  trained block it can draft past may widen it. */
+  readonly adaptive?: boolean;
   /** Prompt-lookup window, for the kind that has one. */
   readonly ngram?: { readonly max?: number; readonly min?: number };
 }

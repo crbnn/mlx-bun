@@ -307,7 +307,7 @@ export async function loadContext(
         throw new Error(`--draft-kind ${resolvedDraftKind} requires --draft-model`);
       draft = await draftRegistry.load(resolvedDraftKind, {
         dir: opts.draftModelDir, target: { vocabSize: config.text.vocabSize, tokenizer },
-        numDraftTokens: opts.numDraftTokens, ngram: { max: opts.ngramMax, min: opts.ngramMin },
+        numDraftTokens: opts.numDraftTokens, adaptive: opts.adaptiveDraftDepth, ngram: { max: opts.ngramMax, min: opts.ngramMin },
       });
       owned.add(draft.provider);
       // A model-free provider has no pairing to probe and no weights to budget.

@@ -217,3 +217,36 @@ describe("processor history retention", () => {
     } finally { allocate.mockRestore(); }
   });
 });
+
+describe("unread draws", () => {
+  test("draw what sample() would and commit the same processor history without a read", async () => {
+    // Qwen's instruct settings: the presence penalty reads every committed token.
+    const options: StepSamplerOptions = { temperature: 0.7, topP: 0.8, topK: 20, presencePenalty: 1.5, seed: 7 };
+    const config = { tokenRepresentation: "number", grammarWait: "before-sample", historyUpdate: "after-sample",
+      initialHistory: [3, 1] } as const;
+    const read = makeStepSampler(options, config), unread = makeStepSampler(options, config);
+    const steps = 12, vocabulary = 32;
+    const drawn: number[] = [], left: MlxArray[] = [];
+    try {
+      expect(unread.unread).toBeDefined();
+      for (let step = 0; step < steps; step++) {
+        // Flat scores so the penalty decides: a token drawn once is unlikely again.
+        using logits = MlxArray.fromFloat32(Float32Array.from({ length: vocabulary }, (_, i) => Math.sin(i + step) * 0.3), [1, vocabulary]);
+        drawn.push((await read.sample(logits, step)).token);
+        left.push(unread.unread!.sample(logits, step));
+      }
+      using all = ops.concatAxis(left, 0);
+      expect(all.toIntTokens()).toEqual(drawn);
+    } finally { read.dispose(); unread.dispose(); for (const token of left) token.dispose(); }
+  });
+
+  test("are absent where a draw needs a grammar or captured probabilities", () => {
+    const config = { tokenRepresentation: "number", grammarWait: "before-sample", historyUpdate: "after-sample" } as const;
+    const grammar = makeStepSampler({ temperature: 0.7, grammar: new ScriptedGrammar() as never }, config);
+    const capture = makeStepSampler({ temperature: 0.7 }, { ...config, captureSelectedLogprob: true });
+    try {
+      expect(grammar.unread).toBeUndefined();
+      expect(capture.unread).toBeUndefined();
+    } finally { grammar.dispose(); capture.dispose(); }
+  });
+});

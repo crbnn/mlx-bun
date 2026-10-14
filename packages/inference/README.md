@@ -1242,8 +1242,12 @@ draft source. DFlash 2 (`incoai/Qwen3.8-27B-DFlash2`) drafts a whole block in on
 five tapped target layers, with
 its projections quantized at load to the width the registry passes (4 bits). `bindMlxGateway(model, { provider,
 numDraftTokens, adaptiveDepth })` drafts `numDraftTokens` every round, or with
-`adaptiveDepth` chooses each round's count (up to that) from the decayed
-acceptance rate and the graph's declared `verifyRoundCosts`. A target graph whose residual stream
+`adaptiveDepth` chooses each round's count (up to that, none included) from the decayed
+acceptance at each draft position and the graph's declared `verifyRoundCosts`. A round
+without drafts is the graph's decode step, pipelined as plain decode is: built from the
+previous step's samples on the device before they are read, its input dropped again
+(`bindRowStepRollback`) if that sample ends its row. A run of such rounds drafts one
+token at intervals that double while drafting keeps not paying. A target graph whose residual stream
 carries a TurboQuant R1 fold declares it on its draft target (`residualBasis`: the R1 seed and the
 final-norm gain the fold moved into the head); the drafter loads unrotated and applies it when a draft group binds.
 A graph whose composition measured them declares the kernels of a drafter's own 4-bit projections per width class

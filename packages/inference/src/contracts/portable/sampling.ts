@@ -17,6 +17,11 @@ export interface SamplingSession<Scores, DeviceToken, Result> {
    * Draws are those sample() would make at each step: seeded sampling keys by
    * (seed, step), never by a shared stream, so unused positions cost nothing. */
   readonly positional?: { sample(scores: Scores, steps: readonly number[]): DeviceToken };
+  /** Optional draw left on the device for a request whose selection depends on
+   * its processor history but on no grammar or probability capture: borrows
+   * [1,V] scores and returns the owned device token sample() would draw at
+   * `step`, committing it to history unread when sample() would commit it. */
+  readonly unread?: { sample(scores: Scores, step: number): DeviceToken };
   readonly isPlainGreedy: boolean;
   readonly capturesLogprobs: boolean;
   readonly needsHistory: boolean;

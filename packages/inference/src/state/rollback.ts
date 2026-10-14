@@ -57,6 +57,21 @@ export function bindRowCacheRollback(
     accepted.every(count => Number.isSafeInteger(count) && count >= 0 && count <= drafts));
 }
 
+/** A one-position window whose input may itself be rejected: a step built from a sample not yet read. `resolve`
+ * keeps each row's input (1) or drops it (0), restoring that row's state from before the window. */
+export function bindRowStepRollback(
+  caches: readonly RowSpeculativeState[], rows: number,
+): SpeculativeTransaction<readonly number[]> {
+  return bindTransaction(caches.map(cache => ({
+    fits: () => true,
+    begin: () => cache.specRoundBegin(),
+    resolve(kept: readonly number[]) {
+      if (kept.every(count => count === 1)) cache.specRoundCommit();
+      else cache.specRoundRollback(kept.every(count => count === kept[0]) ? kept[0]! : kept);
+    },
+  })), (kept, inputs) => inputs === 1 && kept.length === rows && kept.every(count => count === 0 || count === 1));
+}
+
 /** Bind the recurrent transaction or the trim implementation once.
  * Ring-capacity checks still happen at each safe boundary before any writes. */
 export function bindCacheRollback(caches: readonly Cache[]): SpeculativeTransaction {
