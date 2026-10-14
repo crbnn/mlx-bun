@@ -66,7 +66,17 @@ export function loraInputDropout(x: MlxArray, p: number, seed: number, id: numbe
 export class LoraDelta {
   constructor(readonly inFeatures = 0, readonly outFeatures = 0) {}
   adapters: Map<string, LoraWeights> | null = null;
-  loraState: LoraState | null = null;
+  #state: LoraState | null = null;
+  readonly #stateBindings = new Set<() => void>();
+  get loraState(): LoraState | null { return this.#state; }
+  set loraState(value: LoraState | null) {
+    this.#state = value;
+    for (const bind of this.#stateBindings) bind();
+  }
+  observeState(binding: () => void): () => void {
+    this.#stateBindings.add(binding); binding();
+    return () => { this.#stateBindings.delete(binding); };
+  }
   dropoutId = 0;
 
   forward(x: MlxArray, out: MlxArray): MlxArray {
@@ -111,14 +121,28 @@ export class LoraDelta {
  * exposes projections so their deltas precede activation. */
 export class LoraOperation {
   #forward: (x: MlxArray) => MlxArray;
-  readonly #unbind: () => void;
+  readonly #unbind: (() => void)[] = [];
+  readonly #states = new Map<LoraState, () => void>();
   constructor(plain: (x: MlxArray) => MlxArray, adapted: (x: MlxArray) => MlxArray,
-    state: LoraState, targets: readonly LoraDelta[]) {
+    state: LoraState | undefined, targets: readonly LoraDelta[]) {
     this.#forward = plain;
-    this.#unbind = state.bindOperation(ids => {
-      this.#forward = targets.some(target => ids.some(id => target.adapters?.has(id))) ? adapted : plain;
-    });
+    const refresh = () => {
+      this.#forward = targets.some(target => (state?.active ?? target.loraState?.active ?? [])
+        .some(id => target.adapters?.has(id))) ? adapted : plain;
+    };
+    const bind = () => {
+      const states = new Set(state ? [state] : targets.flatMap(target => target.loraState ? [target.loraState] : []));
+      for (const [previous, unbind] of this.#states) if (!states.has(previous)) { unbind(); this.#states.delete(previous); }
+      for (const current of states) if (!this.#states.has(current)) this.#states.set(current, current.bindOperation(refresh));
+      refresh();
+    };
+    if (state) bind();
+    else for (const target of targets) this.#unbind.push(target.observeState(bind));
   }
   forward(x: MlxArray): MlxArray { return this.#forward(x); }
-  dispose(): void { this.#unbind(); }
+  dispose(): void {
+    for (const unbind of this.#unbind) unbind();
+    for (const unbind of this.#states.values()) unbind();
+    this.#states.clear();
+  }
 }
