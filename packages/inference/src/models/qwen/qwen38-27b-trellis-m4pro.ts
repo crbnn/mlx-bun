@@ -23,7 +23,7 @@ import { TrellisFusedMLP, TrellisUnfusedMLP, TrellisReducePrompt as Reduce, Trel
 import { GraphForwardScope, BoundedGraphForwardScope, SubmittedGraphForwardScope } from "../../runtime/graph-forward";
 import { disposeResources } from "../../runtime/resources";
 import { declareGraph } from "../capabilities";
-import type { ReadPhase } from "../graph";
+import { fixedRowBindings, type ReadPhase } from "../graph";
 import { QwenDeltaLayer as Delta, QwenAttentionLayer as Attention } from "./blocks";
 import { bindQwenMediaInput, qwenDraftTarget, qwenMediaEncoders, qwenResidualBasis } from "./media-input";
 import { DeltaWeights, AttentionWeights, GateDownMLP, AneBoundMlp, AneWeightShares, canonicalQwenWeights, type QwenProjectionTarget } from "./written-layers";
@@ -857,6 +857,7 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
     const knownTiled:MlxPhaseForward=(ids,state)=>this.#bounded(this.#knownTiled,ids,state,"committed",null);
     const knownExpanded:MlxPhaseForward=(ids,state)=>this.#bounded(this.#knownExpanded,ids,state,"committed",null);
     this.appendKnown={
+      ...fixedRowBindings(65,t.maxPositionEmbeddings,knownExpanded),
       1:knownNarrow,2:knownNarrow,3:knownNarrow,4:knownNarrow,5:knownFiveToEight,6:knownFiveToEight,7:knownFiveToEight,8:knownFiveToEight,
       9:knownWide,10:knownWide,11:knownWide,12:knownWide,13:knownWide,14:knownWide,15:knownWide,
       16:knownTiled,17:knownTiled,18:knownTiled,19:knownTiled,20:knownTiled,21:knownTiled,22:knownTiled,23:knownTiled,
