@@ -1,3 +1,5 @@
+import { testGraph } from "./test-composition";
+import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
 import { MlxPhaseDispatch } from "../../src/generation/phase-dispatch";
 import { generateText } from "../../examples/qwen3-generate";
 import { forwardTokens } from "../../examples/qwen3-forward";
@@ -63,7 +65,7 @@ test("a caller loads a graph, owns its state, names each phase, selects logits a
     await checkpoint(dir);
     const config = await loadModelConfig(dir), weights = await Weights.open(dir);
     try {
-      const model = new Qwen3Model(weights, config, testComposition()), state = model.makeCache();
+      const model = testGraph(new Qwen3Model(weights, config, phaseRowLimit(testComposition())), testComposition()), state = model.makeCache();
       try {
         // A prompt of three tokens is a prompt tail of three rows; its head is the entry for those rows.
         using ids = ops.fromInt32([1, 2, 3], [1, 3]);

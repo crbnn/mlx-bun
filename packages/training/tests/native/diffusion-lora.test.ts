@@ -1,3 +1,5 @@
+import { bindGraphCaches } from "@mlx-bun/inference/models";
+import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
 // OPT-IN DiffusionGemma LoRA (D5) gate over a real cached checkpoint — the port
 // of `02d723a:tests/parity/diffusion-lora.test.ts`. The denoising-objective LoRA
 // trainer (`trainDiffusionLora`) must: mount LoRA on the decoder blocks, run
@@ -97,7 +99,7 @@ const TARGET_LEN = 16;
 const GENERATION = { maxTokens: 32, seed: 7n } as const;
 const ADAPTER_ID = "diffusion-lora";
 
-type Model = InstanceType<typeof DiffusionGemmaModel>;
+type Model = InstanceType<typeof DiffusionGemmaModel> & { makeCache(): import("../../../inference/src/contracts/mlx/cache").Cache[] };
 /** Softcapped fp32 canvas logits, read back as bytes. */
 function canvasBytes(model: Model, promptIds: number[], canvas: number[]): Uint8Array {
   const logits = model.forwardCanvasLogits(promptIds, canvas);
@@ -118,7 +120,7 @@ describe.skipIf(!optIn)("DiffusionGemma LoRA (denoising objective)", () => {
     let baseGeneration: ReturnType<typeof generate> | undefined, adaptedGeneration: ReturnType<typeof generate> | undefined;
     try {
       const weights = await Weights.open(modelDir);
-      const model = new DiffusionGemmaModel(weights, config, resolveComposition(config));
+      const model = bindGraphCaches(new DiffusionGemmaModel(weights, config), resolveComposition(config));
       try {
         const tok = await loadTokenizer(modelDir);
         const tmpl = await ChatTemplate.load(modelDir);
@@ -195,7 +197,7 @@ describe.skipIf(!optIn)("DiffusionGemma LoRA (denoising objective)", () => {
       // A fresh graph from the checkpoint mounts the saved adapter through the public manager.
       const fresh = await Weights.open(modelDir);
       try {
-        const reloaded = new DiffusionGemmaModel(fresh, config, resolveComposition(config));
+        const reloaded = bindGraphCaches(new DiffusionGemmaModel(fresh, config), resolveComposition(config));
         const manager = new AdapterManager(reloaded);
         const info = await manager.mount(ADAPTER_ID, adapterDir);
         expect(info.mountedLayers).toBe(targets);

@@ -1,3 +1,4 @@
+import type { TestGraph } from "../models/test-composition";
 import { describe, expect, test } from "bun:test";
 import { bindMlxGateway, type MlxGatewayBinding } from "../../src/execution/gateway-binding";
 import { createRuntimeConfig, withRuntimeConfig } from "../../src/runtime/config";
@@ -63,14 +64,14 @@ const environments: Record<string, string>[] = [{}, { MLX_BUN_GRAMMAR_BATCH: "0"
 const placementPhases = stubPhases(() => { throw new Error("placement never forwards"); },
   () => { throw new Error("placement never projects"); });
 
-function gemma4(): Gemma4Model {
+function gemma4(): TestGraph<Gemma4Model> {
   return Object.assign(Object.create(Gemma4Model.prototype), {
     config: { modelType: "gemma4", text: { enableMoeBlock: false }, eosTokenIds: [] },
     makeCache: () => [new KVCache()], loraState: { active: [] }, ...placementPhases
   });
 }
 
-function softcapUniversal(): UniversalDenseModel {
+function softcapUniversal(): TestGraph<UniversalDenseModel> {
   return Object.assign(Object.create(UniversalDenseModel.prototype), {
     args: { modelType: "gemma2", maskArray: true, attnLogitSoftcap: 50, layerTypes: null }, encodedKvAttention: false,
     config: { modelType: "gemma2", text: { enableMoeBlock: false }, eosTokenIds: [] },
@@ -78,7 +79,7 @@ function softcapUniversal(): UniversalDenseModel {
   });
 }
 
-const planUnder = (env: Record<string, string>, model: Gemma4Model | UniversalDenseModel, request = grammar) =>
+const planUnder = (env: Record<string, string>, model: TestGraph<Gemma4Model> | TestGraph<UniversalDenseModel>, request = grammar) =>
   withRuntimeConfig(createRuntimeConfig(env), () => bindMlxGateway(model)).plan(request, {}, schedule);
 
 const standIn = (prototype: object, modelType: string, extra: object = {}): RuntimeModel =>
@@ -216,7 +217,7 @@ test.each(families)("%s places grammar with a bound grouped draft exactly as the
 });
 
 describe("DiffusionGemma interleaved denoising binding", () => {
-  const diffusion = () => standIn(DiffusionGemmaModel.prototype, "diffusion_gemma") as DiffusionGemmaModel;
+  const diffusion = () => standIn(DiffusionGemmaModel.prototype, "diffusion_gemma") as TestGraph<DiffusionGemmaModel>;
   const planWith = (binding: MlxGatewayBinding, request: typeof shape, options: GenerateOptions = {}) =>
     binding.plan(request, options, schedule);
 
@@ -274,7 +275,7 @@ describe("DiffusionGemma interleaved denoising binding", () => {
   });
 });
 
-function minicpm5(layers = 4): MiniCPM5Model {
+function minicpm5(layers = 4): TestGraph<MiniCPM5Model> {
   return Object.assign(Object.create(MiniCPM5Model.prototype), {
     config: { modelType: "minicpm5", text: { enableMoeBlock: false, numHiddenLayers: layers, layerTypes: Array(layers).fill("full_attention") }, eosTokenIds: [] },
     makeCache: () => Array.from({ length: layers }, () => new KVCache()), loraState: { active: [] }, ...placementPhases
@@ -282,7 +283,7 @@ function minicpm5(layers = 4): MiniCPM5Model {
 }
 
 /** A universal descriptor with the graph's own cache layout: caches follow the descriptor. */
-function universal(args: Record<string, unknown> = {}, layers = 4): UniversalDenseModel {
+function universal(args: Record<string, unknown> = {}, layers = 4): TestGraph<UniversalDenseModel> {
   const descriptor = { modelType: "qwen2", maskArray: false, attnLogitSoftcap: null, layerTypes: null, slidingWindow: null,
     numHiddenLayers: layers, ...args };
   return Object.assign(Object.create(UniversalDenseModel.prototype), {
@@ -610,7 +611,7 @@ test("gateway policy follows the graph as bound, not a later descriptor", () => 
 const LAYERS = ["full_attention", "sliding_attention", "full_attention", "sliding_attention"];
 
 test("universal graphs batch and bind drafts, whatever their cache layout", () => {
-  const graphs: [string, UniversalDenseModel][] = [
+  const graphs: [string, TestGraph<UniversalDenseModel>][] = [
     ["plain", universal()],
     ["sliding, full first", universal({ modelType: "llama", layerTypes: LAYERS, slidingWindow: 16 })],
     ["sliding, sliding first", universal({ modelType: "llama", layerTypes: [...LAYERS].reverse(), slidingWindow: 16 })],

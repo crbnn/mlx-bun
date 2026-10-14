@@ -1,6 +1,8 @@
+import { phaseRowLimit } from "../../src/models/graph";
 // The written Gemma graphs against the generic family over deterministic
 // synthetic weights: exact hidden/logits/cache bytes through prompt, decode,
 // verify, ring wrap and the 256-position cache boundary. No artifact download.
+
 import { afterAll, describe, expect, test } from "bun:test";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
@@ -202,6 +204,7 @@ type Graph = MlxTokenPhases & { makeCache(): Cache[]; logitsFromHidden(hidden: M
 interface Generated {
   readonly COMPOSITION: ServedComposition;
   readonly GeneratedGemma4: { new (weights: Weights, config: ModelConfig): Graph & { readonly cacheLayers: readonly MlxCacheLayer[] }; readonly prototype: object };
+
 }
 const COMPOSITIONS: readonly { stem: string; repo: string; module: Generated }[] = [
   { stem: "gemma4-e4b", repo: "gemma-4-e4b-it-OptiQ-4bit", module: currentE4b as unknown as Generated },
@@ -247,7 +250,8 @@ for (const c of COMPOSITIONS) {
       const kv = artifactScheme(c.repo);
       expect(c.module.COMPOSITION.kv![0]).toEqual({ kind: "affine-layers", layers: kv.layers });
       const composition = testComposition(kv);
-      return graphs = { model: bindGraphCaches(new c.module.GeneratedGemma4(weights, config), composition), generic: bindGraphCaches(new Gemma4Model(weights, config, composition), composition) };
+      return graphs = { model: bindGraphCaches(new c.module.GeneratedGemma4(weights, config), composition), generic: bindGraphCaches(new Gemma4Model(weights, config, phaseRowLimit(composition)), composition) };
+
     };
 
     test(`${c.stem}: prefill 37, decodes, a window across the sliding boundary, verify 4, decodes`, async () => {
@@ -272,6 +276,18 @@ for (const c of COMPOSITIONS) {
         both("decode after", model, generic, mine, theirs, [[19]]);
       } finally { disposeAll(mine, theirs); }
     }, 120_000);
+
+    test(`${c.stem}: known spans above the verify row cap stay one fixed forward`,async()=>{
+      const {model,generic}=await pair();
+      const mine=model.makeCache(),theirs=generic.makeCache();
+      try {
+        using ids=ops.fromInt32(prompt(129,8),[1,129]);
+        const left=knownOperationFor(model.appendKnown,129)(ids,mine) as MlxArray;
+        const right=knownOperationFor(generic.appendKnown,129)(ids,theirs) as MlxArray;
+        try { maxDiff(left,right,`${c.stem} known129`);stateDiff(`${c.stem} known129`,mine,theirs); }
+        finally {left.dispose();right.dispose();}
+      } finally {disposeAll(mine,theirs);}
+    },120_000);
 
     if (c.stem !== "gemma4-26b") test(`${c.stem}: the literal plain trace preserves compiled decode logits and cache`, async () => {
       const { model, generic } = await pair();
@@ -299,3 +315,5 @@ import type { MlxCacheLayer } from "../../src/contracts/mlx/graph";
 import { bindGraphCaches } from "../../src/models/cache-composition";
 
 import type { MlxCompiledDecodeStep } from "../../src/contracts/mlx/graph";
+
+import { knownOperationFor } from "../../src/generation/phase-dispatch";

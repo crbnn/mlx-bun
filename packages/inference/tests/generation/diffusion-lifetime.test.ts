@@ -1,3 +1,4 @@
+import type { TestGraph } from "../models/test-composition";
 import { describe, expect, test } from "bun:test";
 import { diffusionGenerate } from "../../src/generation/diffusion";
 import type { DiffusionGemmaModel } from "../../src/models/diffusion-gemma/model";
@@ -9,7 +10,7 @@ const VOCAB = 4;
 const CANVAS = 2;
 const HIDDEN = 7; // unique shape marker for self-conditioning tensors
 
-function stubModel(): DiffusionGemmaModel {
+function stubModel(): TestGraph<DiffusionGemmaModel> {
   return {
     graphCapabilities: declareGraph({ method: "denoising" }),
     config: { text: { vocabSize: VOCAB } },
@@ -28,7 +29,7 @@ function stubModel(): DiffusionGemmaModel {
         Float32Array.from({ length: CANVAS * VOCAB }, (_, i) => (i % VOCAB === 0 ? 10 : 0)),
         [1, CANVAS, VOCAB],
       ),
-  } as unknown as DiffusionGemmaModel;
+  } as unknown as TestGraph<DiffusionGemmaModel>;
 }
 
 describe("diffusion generation ownership", () => {

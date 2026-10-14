@@ -1,3 +1,4 @@
+import { sequenceLogitsOperation } from "../../src/scoring/full-sequence";
 // Gemma4 assistant drafter against a real target's donor caches, past the
 // sliding window. The target's plain rotating and full caches go through a
 // prefill of N tokens (longer than the window), a 4-token verify block, a
@@ -103,7 +104,7 @@ test.skipIf(!inputs)("Gemma4 assistant: donor attention and draft chains equal i
     caches = model.makeCache();
     assert(caches[slidingAt] instanceof RotatingKVCache && caches[fullAt] instanceof KVCacheClass, "unexpected donor cache kinds");
     const embed = (token: number) => { using ids = ops.fromInt32([token], [1, 1]); using e = model.embed.encode(ids); return ops.mulScalar(e, model.embedScale); };
-    const greedy = (h: MlxArray) => { using logits = model.logitsFromHidden(h); using arg = ops.argmaxAxis(logits, -1); return arg.toIntTokens()[0]!; };
+    const greedy = (h: MlxArray) => { using logits = sequenceLogitsOperation(model, h); using arg = ops.argmaxAxis(logits, -1); return arg.toIntTokens()[0]!; };
     const forward = (ids: number[]) => { using x = ops.fromInt32(ids, [1, ids.length]); return phaseHidden(model as never, x, caches); };
     const at = (h: MlxArray, i: number) => h.slice([0, i, 0], [1, i + 1, h.shape[2]!]);
     /** Donor rows chosen independently of temporalView, each registered as it is made. */
@@ -342,7 +343,7 @@ test.skipIf(!inputs)("Gemma4 assistant: shared generation accepts, rejects and c
       forwarded(ids, caches, hidden) {
         const values = ids.toIntTokens();
         using reference = phaseHidden(replay as never, ids, replayCaches);
-        using actualLogits = model.logitsFromHidden(hidden), wantedLogits = replay.logitsFromHidden(reference);
+        using actualLogits = sequenceLogitsOperation(model, hidden), wantedLogits = sequenceLogitsOperation(replay, reference);
         const logits = same(actualLogits, wantedLogits, [1, values.length, vocab], "full target logits");
         processed.push(...values);
         forwards.push({ ids: [...values], offset: processed.length, logits, state: state(caches, processed.length) });

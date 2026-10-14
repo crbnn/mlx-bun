@@ -16,7 +16,7 @@ import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { RuntimeModel } from "@mlx-bun/inference/models";
 import type { LoraWeights } from "@mlx-bun/inference/layers/lora";
-import type { QuantizedLinear } from "@mlx-bun/inference/layers";
+import type { LoraTarget } from "@mlx-bun/inference/adapters";
 import { loadAdapterTensors } from "@mlx-bun/inference/adapters";
 
 const cstr = (s: string) => Buffer.from(s + "\0", "utf8");
@@ -24,7 +24,7 @@ const cstr = (s: string) => Buffer.from(s + "\0", "utf8");
 /** One trainable LoRA target: the owning linear + its A/B leaves. */
 export interface TrainableTarget {
   modulePath: string;
-  linear: QuantizedLinear;
+  linear: LoraTarget & { dropoutId?: number };
   lw: LoraWeights;
 }
 

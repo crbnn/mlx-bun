@@ -39,9 +39,8 @@ const on = (device: string, config: ModelConfig, request: CompositionRequest = {
 describe("a graph table", () => {
   const entry = (id: string, serves: ServedComposition): GraphEntry<null, string> => ({ id, serves, create: () => id });
   const composition = (fields: Partial<Composition> = {}): Composition => ({ device: M4_PRO, kv: { kind: "bf16" }, pagedKv: null,
-    draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 8, packedMixedMlp: true,
-    vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
-    grammarJump: false, greedyDraft: false, compiledGeglu: true, compiledSwiglu: true, ...fields });
+    draftDepth: 0, prefillChunkTokens: 2048, maxRows: 8, vectorGreedySampling: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
+    grammarJump: false, greedyDraft: false, ...fields });
 
   test("the most constrained entry the composition meets wins; the generic entry serves the rest", () => {
     const table = new GraphTable([
@@ -83,7 +82,7 @@ describe("a graph table", () => {
     expect(table.match(undefined, composition({ draftDepth: 8, maxRows: 4 })).id).toBe("verify");
     expect(table.match(undefined, composition({ device: M1_MAX, draftDepth: { adaptive: true, max: 7 } })).id).toBe("depth");
     expect(table.match(undefined, composition({ device: M1_MAX, draftDepth: 7 })).id).toBe("generic");
-    expect(table.match(undefined, composition({ device: M1_MAX, prefillChunkTokens: 512, adapters: true })).id).toBe("chunk");
+    expect(table.match(undefined, composition({ device: M1_MAX, prefillChunkTokens: 512 })).id).toBe("chunk");
     expect(table.match(undefined, composition({ device: M1_MAX, prefillChunkTokens: 512 })).id).toBe("chunk");
     // Per-layer schemes compare layer by layer, in any order.
     expect(table.match(undefined, composition({ device: "applegpu_g15s",
@@ -140,37 +139,45 @@ describe("the Qwen 3.5 table", () => {
     expect(select(on(M4_PRO, qwen, { kv: { override: 4, quantizedKvStart: 512 } }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     for (const fusedSdpa of [true, false])
       expect(select(on(M4_PRO, qwen, { kv: { override: 4, fusedSdpa } }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
-    expect(select(on(M4_PRO, qwen, { adapters: true }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
+    expect(select(on(M4_PRO, qwen, {}))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
+
     expect(select(on(M4_PRO, qwen, { maxRows: 1, draft: { numDraftTokens: 3 } }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     expect(select({ ...on(M4_PRO, qwen, { draft: { numDraftTokens: 7, adaptive: true } }), prefillChunkTokens: 512 }))
       .toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
   });
 
   test("the same artifact on applegpu_g16s with another KV scheme or more rows gets the generic graph", () => {
-    expect(select(on(M4_PRO, qwen, { kv: { override: 8 } }))).toBe("qwen3.5");
+    expect(select(on(M4_PRO, qwen, { kv: { override: 8 } }))).toBe("qwen3.5-wide-m4");
     const layered = { ...qwen, kvQuant: [{ layerIdx: 1, bits: 4, groupSize: 64 }] };
     expect(on(M4_PRO, layered, { kv: { override: "config" } }).kv.kind).toBe("affine-layers");
-    expect(select(on(M4_PRO, layered, { kv: { override: "config" } }))).toBe("qwen3.5");
-    expect(select(on(M4_PRO, qwen, { kv: { turboQuant: { kBits: 8, vBits: 3 } } }))).toBe("qwen3.5");
-    expect(select(on(M4_PRO, qwen, { maxRows: 9 }))).toBe("qwen3.5");
-    expect(select(on(M4_PRO, qwen, { maxRows: 16 }))).toBe("qwen3.5");
+    expect(select(on(M4_PRO, layered, { kv: { override: "config" } }))).toBe("qwen3.5-wide-m4");
+    expect(select(on(M4_PRO, qwen, { kv: { turboQuant: { kBits: 8, vBits: 3 } } }))).toBe("qwen3.5-wide-m4");
+    expect(select(on(M4_PRO, qwen, { maxRows: 9 }))).toBe("qwen3.5-wide-m4");
+    expect(select(on(M4_PRO, qwen, { maxRows: 16 }))).toBe("qwen3.5-wide-m4");
   });
 
   test("on applegpu_g13s the M1 Max graph serves every KV scheme within its declared row caps; other GPUs or larger batches get the generic graph", () => {
     expect(select(on(M1_MAX, qwen))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
     expect(select(on(M1_MAX, qwen, { kv: { override: 8 } }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
     expect(select(on(M1_MAX, qwen, { kv: { override: 4 }, maxRows: 16 }))).toBe("qwen3.5");
-    expect(select(on(M1_MAX, qwen, { kv: { turboQuant: { kBits: 8, vBits: 3 } }, adapters: true }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
-    expect(select(on("applegpu_g15s", qwen))).toBe("qwen3.5");
+    expect(select(on(M1_MAX, qwen, { kv: { turboQuant: { kBits: 8, vBits: 3 } } }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
+    expect(select(on("applegpu_g15s", qwen))).toBe("qwen3.5-wide-m3");
   });
 
   test("another Qwen 3.5 artifact gets the generic graph on every device; the table fingerprints with the Trellis graph fingerprint", () => {
     const fingerprint = qwen35GraphFingerprint(qwen);
     expect(fingerprint).not.toBe(TRELLIS);
     for (const device of [M4_PRO, M1_MAX]) {
-      expect(table.select(qwen, on(device, qwen)).id).toBe("qwen3.5");
-      expect(select(on(device, qwen), fingerprint)).toBe("qwen3.5");
+      expect(table.select(qwen, on(device, qwen)).id).toBe(device === M4_PRO ? "qwen3.5-wide-m4" : "qwen3.5");
+      expect(select(on(device, qwen), fingerprint)).toBe(device === M4_PRO ? "qwen3.5-wide-m4" : "qwen3.5");
     }
+  });
+
+  test("portable tiled is the unknown-device default and explicit generic choices bypass recommendation keys", () => {
+    const config = qwen;
+    expect(table.select(config, on("unlisted-gpu", config)).id).toBe("qwen3.5");
+    expect(table.select(config, on(M4_PRO, config), "qwen3.5").id).toBe("qwen3.5");
+    expect(table.select(config, on(M1_MAX, config), "qwen3.5-wide-m4").id).toBe("qwen3.5-wide-m4");
   });
 
   test("the published Trellis config selects by its own fingerprint (config only; skips when the snapshot is not downloaded)", async () => {
@@ -180,7 +187,7 @@ describe("the Qwen 3.5 table", () => {
     expect(qwen35GraphFingerprint(config)).toBe(TRELLIS);
     expect(table.select(config, on(M4_PRO, config)).id).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     expect(table.select(config, on(M1_MAX, config)).id).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
-    expect(table.select(config, on(M4_PRO, config, { kv: { override: 8 } })).id).toBe("qwen3.5");
+    expect(table.select(config, on(M4_PRO, config, { kv: { override: 8 } })).id).toBe("qwen3.5-wide-m4");
   });
 });
 
@@ -201,11 +208,12 @@ describe("the Gemma 4 table", () => {
       expect(pick({ kv: { override: "config" } })).toBe(stem);
       expect(pick({ kv: { override: "config", quantizedKvStart: 100 } })).toBe(stem);
       for (const fusedSdpa of [true, false]) expect(pick({ kv: { override: "config", fusedSdpa } })).toBe(stem);
-      const otherMachine = on(M1_MAX, config, { kv: { override: "config" }, maxRows: 32, adapters: true });
+      const otherMachine = on(M1_MAX, config, { kv: { override: "config" }, maxRows: 32 });
       expect(table.match(graph.FINGERPRINT, otherMachine).id).toBe("gemma4");
       expect(table.select(config, otherMachine, stem).id).toBe(stem);
       expect(pick({ kv: { override: "config" }, maxRows: 8, draft: { numDraftTokens: 7 } })).toBe(stem);
       expect(pick({ kv: { override: "config" }, maxRows: 8, draft: { numDraftTokens: 8 } })).toBe("gemma4");
+
       for (const other of [{}, { kv: { override: "off" as const } }, { kv: { override: 4 } }, { kv: { override: 8 } },
         { kv: { turboQuant: { kBits: 8, vBits: 3 } } }]) expect(pick(other)).toBe("gemma4");
     });

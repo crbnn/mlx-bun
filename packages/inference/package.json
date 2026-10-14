@@ -33,6 +33,7 @@
     "./models/gemma4/blocks": "./src/models/gemma4/written-blocks.ts",
     "./models/minicpm5": "./src/models/minicpm5/model.ts",
     "./models/universal": "./src/models/universal/dense.ts",
+    "./models/universal/blocks": "./src/models/universal/blocks.ts",
     "./models/graph": "./src/models/graph.ts",
     "./kernels/attention/flash": "./src/kernels/attention/flash.ts",
     "./scoring": "./src/scoring/index.ts",

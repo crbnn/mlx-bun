@@ -5,7 +5,7 @@ import { AttentionMasks } from "../state/attention-read";
 import { Bf16FirstKv4Head256Cache, composedFullAttentionCache, composedSlidingAttentionCache } from "../state/bf16-first-kv";
 import { composedAffineKernels } from "../state/affine-attention";
 import { SSMCache } from "../state/ssm";
-import { composedLatentCache } from "../state/latent-legos";
+import { composedLatentCache, latentLegoCodecs } from "../state/latent-legos";
 import { maybePageKv } from "../state/request-policy";
 import { disposeResources } from "../runtime/resources";
 import { denseTurboQuantKernels, deferredTurboQuantKernels } from "../state/turboquant-attention";
@@ -36,6 +36,8 @@ export function composeGraphCaches(graph: { readonly cacheLayers: readonly MlxCa
 
 /** Bind request-state construction at load; the graph only declares layout. */
 export function bindGraphCaches<Graph extends { readonly cacheLayers: readonly MlxCacheLayer[]; readonly cachePaging?: boolean }>(graph: Graph,
-  composition: {readonly kv: Composition["kv"]; readonly pagedKv: {readonly blockSize: number; readonly direct?: boolean} | null}): Graph & { makeCache(): Cache[] } {
-  return Object.assign(graph, { makeCache: () => composeGraphCaches(graph, composition) });
+  composition: {readonly kv: Composition["kv"]; readonly pagedKv: {readonly blockSize: number; readonly direct?: boolean} | null}): Graph & { makeCache(): Cache[]; readonly stateCodecs?: import("../state/persistence-types").CacheCodecProvider } {
+  return Object.assign(graph, { makeCache: () => composeGraphCaches(graph, composition),
+    ...(graph.cacheLayers.some(layer => layer.kind === "latent") && (composition.kv.kind !== "bf16" || composition.pagedKv)
+      ? { stateCodecs: latentLegoCodecs } : {}) });
 }
