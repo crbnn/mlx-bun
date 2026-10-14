@@ -5,50 +5,39 @@ import { HEADER } from "../trellis/codebook";
 import type { TrellisGeometry } from "../trellis/geometry";
 
 // Fill an ANE weight buffer straight from Trellis codes: the vector-expand
-// decode (four weights per thread from one circular word window, the same
+// decode (four weights from one circular word window, the same
 // trellis_val_rcp · scale values) of stored rows [0, ROWS) written as fp16 at
-// OFFSET into `dst`, a zero-copy MLX wrap of the ANE IOSurface. Reads the full
-// code tensor, so block-interleaved axis-0 codes need no slicing copy. `dst` is
-// an MLX input the kernel writes through; `done` only carries the dependency.
-// One kernel per code layout: row-major [rows, cols·K/32] and the 3-bit block
-// interleave [cols/512, rows, 48].
-const ROW_MAJOR_SOURCE = String.raw`
-  const uint c = thread_position_in_grid.x * 4u;
-  const uint r = thread_position_in_grid.y;
-  if (c >= (uint)C || r >= (uint)ROWS) return;
-  constexpr uint wpb = BT * BITS / 32;
-  const uint block = c / BT, t = c % BT;
-  const device uint* bw = codes + (ulong)r * (C / BT) * wpb + block * wpb;
-  const float scale = float(scales[r]);
-  const uint pos = (BT - 1 - (t + 3)) * BITS, wi = pos >> 5, off = pos & 31u;
-  const ulong window = (ulong(bw[wi]) | (ulong(bw[wi + 1 == wpb ? 0 : wi + 1]) << 32)) >> off;
-  device half* out = (device half*)dst + (ulong)OFFSET + (ulong)r * (uint)C + c;
-  #pragma clang loop unroll(full)
-  for (uint i = 0; i < 4u; i++) {
-    const uint s = uint(window >> ((3 - i) * BITS)) & ((1u << L) - 1);
-    out[i] = half(trellis_val_rcp(s) * scale);
-  }
-  if (c == 0u && r == 0u) done[0] = 1;
-`;
+// OFFSET into `dst`, a zero-copy MLX wrap of the ANE IOSurface. Each thread
+// decodes PER consecutive weights of a row, each four from one window and
+// stored as one half4 (OFFSET a multiple of 4). Reads the full code tensor, so
+// block-interleaved axis-0 codes need no slicing copy. `dst` is an MLX input
+// the kernel writes through; `done` only carries the dependency. One kernel
+// per code layout: row-major [rows, cols·K/32] and the 3-bit block interleave
+// [cols/512, rows, 48].
 
-const K3_INTERLEAVED_SOURCE = String.raw`
-  const uint c = thread_position_in_grid.x * 4u;
+/** The kernel body for one code layout, `blockWords` the address of the PER weights' code block. */
+const source = (blockWords: string) => String.raw`
+  const uint c = thread_position_in_grid.x * PER;
   const uint r = thread_position_in_grid.y;
   if (c >= (uint)C || r >= (uint)ROWS) return;
   constexpr uint wpb = BT * BITS / 32;
   const uint block = c / BT, t = c % BT;
-  const device uint* bw = codes + (ulong)(block / 2) * (ulong)R * 2 * wpb + (ulong)r * 2 * wpb + (block % 2) * wpb;
+  const device uint* bw = ${blockWords};
   const float scale = float(scales[r]);
-  const uint pos = (BT - 1 - (t + 3)) * BITS, wi = pos >> 5, off = pos & 31u;
-  const ulong window = (ulong(bw[wi]) | (ulong(bw[wi + 1 == wpb ? 0 : wi + 1]) << 32)) >> off;
-  device half* out = (device half*)dst + (ulong)OFFSET + (ulong)r * (uint)C + c;
+  device half4* out = (device half4*)((device half*)dst + (ulong)OFFSET + (ulong)r * (uint)C + c);
   #pragma clang loop unroll(full)
-  for (uint i = 0; i < 4u; i++) {
-    const uint s = uint(window >> ((3 - i) * BITS)) & ((1u << L) - 1);
-    out[i] = half(trellis_val_rcp(s) * scale);
+  for (uint q = 0; q < PER / 4; q++) {
+    const uint pos = (BT - 1 - (t + 4 * q + 3)) * BITS, wi = pos >> 5, off = pos & 31u;
+    const ulong window = (ulong(bw[wi]) | (ulong(bw[wi + 1 == wpb ? 0 : wi + 1]) << 32)) >> off;
+    half4 v;
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 4u; i++) v[i] = half(trellis_val_rcp(uint(window >> ((3 - i) * BITS)) & ((1u << L) - 1)) * scale);
+    out[q] = v;
   }
   if (c == 0u && r == 0u) done[0] = 1;
 `;
+const ROW_MAJOR_SOURCE = source("codes + (ulong)r * (C / BT) * wpb + block * wpb");
+const K3_INTERLEAVED_SOURCE = source("codes + (ulong)(block / 2) * (ulong)R * 2 * wpb + (ulong)r * 2 * wpb + (block % 2) * wpb");
 
 let rowMajor: MetalKernel | undefined, interleaved: MetalKernel | undefined;
 
@@ -59,11 +48,18 @@ export function trellisFillK3InterleavedEligible(g: TrellisGeometry): boolean {
   return g.L === 12 && g.T === 256 && g.k === 3 && g.cols % 512 === 0 && g.blockInterleave === 2;
 }
 
+/** Weights per thread by code width, measured on the M1 Max on one layer's 5888 rows against four weights and four
+ *  half stores per thread (the same values): 2-bit gate 0.57 -> 0.45 ms, 3-bit gate 0.95 -> 0.79, 3-bit interleaved
+ *  down 1.01 -> 0.72 at 16; 4-bit gate 0.97 -> 0.51 at 8 (0.70 at 16). */
+const perThread = (g: TrellisGeometry) => g.k === 4 ? 8 : 16;
+
 function launch(kernel: MetalKernel, codes: MlxArray, scales: MlxArray, g: TrellisGeometry, rows: number, dst: MlxArray, offset: number): MlxArray {
+  if (offset % 4) throw new Error(`ANE fill: offset ${offset} is not a multiple of 4 (half4 stores)`);
+  const per = perThread(g);
   const [done] = kernel.apply([codes, scales, dst], {
     outputs: [{ shape: [1], dtype: Dtype.int32 }],
-    grid: [g.cols / 4, rows, 1], threadGroup: [128, 1, 1],
-    templateInts: { R: g.rows, ROWS: rows, C: g.cols, BT: g.T, BITS: g.k, L: g.L, OFFSET: offset },
+    grid: [g.cols / per, rows, 1], threadGroup: [128, 1, 1],
+    templateInts: { R: g.rows, ROWS: rows, C: g.cols, BT: g.T, BITS: g.k, L: g.L, OFFSET: offset, PER: per },
   });
   return done!;
 }

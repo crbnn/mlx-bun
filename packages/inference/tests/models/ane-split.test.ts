@@ -10,6 +10,7 @@
 import { beforeAll, expect, test } from "bun:test";
 import { Dtype, MlxArray, ops } from "@mlx-bun/mlx";
 import { AneBridgeError, AneProgram } from "../../src/kernels/ane/linear";
+import { DequantizedLinear } from "../../src/layers/dequantized-linear";
 import { QuantizedLinear } from "../../src/layers/quantized-linear";
 import { TrellisLinear } from "../../src/layers/trellis-linear";
 import {
@@ -22,7 +23,8 @@ const D = 512, R = 1024, M = 96;
 beforeAll(() => {
   if (!process.env.MLX_BUN_TEST_ANE) return;
   for (const spec of [aneAffineSplitProgram(D, 256, 0.5, M), aneAffineSplitProgram(D, 256, 0.5, 2 * M), aneMlpSplitProgram(D, R, 0.5, M),
-    aneMlpSplitProgram(D, R, 0.5, 2 * M), aneMlpSplitProgram(2 * D, 2 * R, 0.5, 2 * M)]) AneProgram.compile(spec);
+    aneMlpSplitProgram(D, R, 0.5, 2 * M), aneMlpSplitProgram(2 * D, 2 * R, 0.5, 2 * M), aneMlpSplitProgram(D, R, 0.5, M, 4),
+    aneAffineSplitProgram(D, 256, 0.5, M, 4)]) AneProgram.compile(spec);
 });
 
 function relErr(actual: MlxArray, expected: MlxArray): number {
@@ -88,6 +90,20 @@ for (const interleave of [false, true])
     expect(relErr(actual, expected)).toBeLessThan(2e-2);
     expected.dispose();
   }, 120_000);
+
+test.skipIf(!process.env.MLX_BUN_TEST_ANE)("splits whose programs sum their reductions in other slices, the projection's GPU rows on another layer, match the GPU path", () => {
+  using x = hidden();
+  const { gate, up, down, expected } = mlp(D, R, false, 11, x);
+  using split = AneTrellisMlpSplit.build(gate, up, down, 0.5, M, undefined, 4);
+  using actual = split.forward(x, compiledSwiglu);
+  expect(relErr(actual, expected)).toBeLessThan(2e-2);
+  const lin = affine(256, D, 3);
+  using gpuProjection = lin.forward(x);
+  using projection = AneAffineSplit.build(lin, 0.5, M, undefined, 4, rest => new DequantizedLinear(rest));
+  using projected = projection.forward(x);
+  expect(relErr(projected, gpuProjection)).toBeLessThan(2e-2);
+  expected.dispose();
+}, 120_000);
 
 test.skipIf(!process.env.MLX_BUN_TEST_ANE)("two split layers of different shapes each own their program; disposing one leaves the other", () => {
   using xa = hidden(M, D), xb = hidden(2 * M, 2 * D);

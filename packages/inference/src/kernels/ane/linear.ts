@@ -92,6 +92,48 @@ function source(spec: AneProgramSpec): [Pointer, number, Pointer | null, Pointer
     text, names, namePtrs, dataPtrs, dataLens];
 }
 
+/** Bytes the bridge allocates for a buffer of `bytes` (native/ane-bridge.m make_surface: whole 64 KiB units), so a
+ *  wrap of the allocation is a page multiple, which Metal maps without a copy. */
+const allocated = (bytes: number) => Math.max(65536, Math.ceil(bytes / 65536) * 65536);
+
+/** The MLX wraps of one set of program buffers (IOSurfaces), each a no-copy
+ *  Metal buffer that MLX also enters in its residency set: made once per
+ *  buffer, on first use, and shared by every program loaded on the buffers, the
+ *  last of which releases them before the buffers. Also the one array that may
+ *  still read the output lazily (`defer`), evaluated before the next run. */
+class Surfaces {
+  holders = 1;
+  readonly #inputs = new Map<number, MlxArray>();
+  #output: MlxArray | undefined;
+  #reader: MlxArray | undefined;
+  /** Byte sizes of the buffers: the first program's (any program loaded on them needs no more). */
+  constructor(readonly inputBytes: readonly number[], readonly outputBytes: number) {}
+  input(i: number, address: number): MlxArray {
+    let wrap = this.#inputs.get(i);
+    if (!wrap) this.#inputs.set(i, wrap = MlxArray.fromPointer(address, [allocated(this.inputBytes[i]!) / 2], Dtype.float16));
+    return wrap;
+  }
+  output(address: number): MlxArray {
+    return this.#output ??= MlxArray.fromPointer(address, [allocated(this.outputBytes) / 2], Dtype.float16);
+  }
+  defer(reader: MlxArray): void { this.settle(); this.#reader = reader; }
+  /** Evaluates and releases the deferred reader, if any (nothing to wait for once its graph ran). */
+  settle(): void {
+    const reader = this.#reader;
+    if (!reader) return;
+    this.#reader = undefined;
+    try { reader.eval(); } finally { reader.dispose(); }
+  }
+  dispose(): void {
+    this.#reader?.dispose();
+    this.#reader = undefined;
+    for (const wrap of this.#inputs.values()) wrap.dispose();
+    this.#inputs.clear();
+    this.#output?.dispose();
+    this.#output = undefined;
+  }
+}
+
 /** One loaded ANE program. Inputs follow MIL symbol order (input names sorted).
  *  A loaded program holds one of the ANE driver's direct-path clients, about a
  *  thousand on the whole machine, until its last holder is disposed; creating
@@ -99,10 +141,12 @@ function source(spec: AneProgramSpec): [Pointer, number, Pointer | null, Pointer
 export class AneProgram implements Disposable {
   readonly #lib: Lib;
   #handle: Pointer | null;
+  readonly #surfaces: Surfaces;
 
-  private constructor(lib: Lib, handle: Pointer, readonly inputBytes: readonly number[], readonly outputBytes: number) {
+  private constructor(lib: Lib, handle: Pointer, surfaces: Surfaces, readonly inputBytes: readonly number[], readonly outputBytes: number) {
     this.#lib = lib;
     this.#handle = handle;
+    this.#surfaces = surfaces;
   }
 
   /** Loads `spec` from the system compile cache (about 4 ms); never compiles.
@@ -122,7 +166,9 @@ export class AneProgram implements Disposable {
     if (!handle) throw new AneBridgeError(uncompiled[0]
       ? `Neural Engine program ${spec.label} is not compiled on this Mac; ${INSTALL_STEP}`
       : `${spec.label}: ${errorText() || "ANE program creation failed"}`);
-    return new AneProgram(l, handle, spec.inputBytes, spec.outputBytes);
+    const surfaces = share ? share.#surfaces : new Surfaces(spec.inputBytes, spec.outputBytes);
+    if (share) surfaces.holders++;
+    return new AneProgram(l, handle, surfaces, spec.inputBytes, spec.outputBytes);
   }
 
   /** The install step for one program: compiles `spec` into the system compile
@@ -160,18 +206,42 @@ export class AneProgram implements Disposable {
   /** Base address of input i, locked for writes until the next evaluation. */
   input(i: number): number { return Number(this.#lib.mbane_input(this.#handle!, i)); }
   inputView(i: number): Uint8Array { return new Uint8Array(toArrayBuffer(this.#lib.mbane_input(this.#handle!, i)!, 0, this.inputBytes[i]!)); }
-  /** Zero-copy MLX wrap of input i (the GPU may write it through a kernel). */
-  inputArray(i: number, shape: number[], dtype: Dtype): MlxArray { return MlxArray.fromPointer(this.input(i), shape, dtype); }
-  /** Zero-copy MLX view of the output; valid until the next evaluation. */
-  output(shape: number[], dtype: Dtype): MlxArray { return MlxArray.fromPointer(Number(this.#lib.mbane_output(this.#handle!)), shape, dtype); }
+  /** Zero-copy fp16 MLX wrap of input i's whole buffer (at least its
+   *  `inputBytes`), locked for writes until the next evaluation (the GPU writes
+   *  it through a kernel). Borrowed: the buffers own it, and every program
+   *  loaded on them returns the same array, so a caller never disposes it. Made
+   *  per call, these no-copy wraps cost the M1 Max's Neural Engine prompt pieces
+   *  1 to 4%. */
+  inputArray(i: number): MlxArray { return this.#surfaces.input(i, this.input(i)); }
+  /** Zero-copy fp16 MLX wrap of the whole output buffer, valid until the next
+   *  evaluation; borrowed as {@link inputArray}. */
+  outputArray(): MlxArray { return this.#surfaces.output(Number(this.#lib.mbane_output(this.#handle!))); }
+  /** The output's first `shape` elements as an owned fp16 view (row-major). */
+  output(shape: number[]): MlxArray {
+    using front = this.outputArray().slice([0], [shape.reduce((a, b) => a * b, 1)]);
+    return ops.reshape(front, shape);
+  }
+  /** Takes `reader` (owned), an array that reads the output lazily: the next
+   *  evaluation of any program on these buffers evaluates it first, so an
+   *  output is never overwritten before it is read, and then releases it. */
+  deferOutput(reader: MlxArray): void { this.#surfaces.defer(reader); }
 
-  evalAsync(): void { if (!this.#lib.mbane_eval_async(this.#handle!)) throw new Error("ANE evaluation already pending"); }
+  /** Starts the evaluation, once a deferred output reader (`deferOutput`) has run. */
+  evalAsync(): void {
+    if (this.#handle) this.#surfaces.settle();
+    if (!this.#lib.mbane_eval_async(this.#handle!)) throw new Error("ANE evaluation already pending");
+  }
   wait(): void {
     errorBuffer.fill(0);
     if (!this.#lib.mbane_wait(this.#handle!, ptr(errorBuffer), errorBuffer.length)) throw new Error(errorText());
   }
   [Symbol.dispose](): void { this.dispose(); }
-  dispose(): void { if (this.#handle) { this.#lib.mbane_free(this.#handle); this.#handle = null; } }
+  dispose(): void {
+    if (!this.#handle) return;
+    if (--this.#surfaces.holders === 0) this.#surfaces.dispose();
+    this.#lib.mbane_free(this.#handle);
+    this.#handle = null;
+  }
 }
 
 // ---- MIL builders ----------------------------------------------------------
@@ -195,14 +265,16 @@ export function weightBlob(bytes: Uint8Array): Uint8Array {
 
 const BOOLS = [`    bool ff = const()[name=string("ff"), val=bool(false)];`, `    bool tt = const()[name=string("tt"), val=bool(true)];`];
 
-/** Reduction slices summed inside a streamed-weight program: 8 runs ~2.5x
- *  faster than one on M4 Pro. A reduction not divisible by 8 stays whole. */
+/** Reduction slices summed inside a streamed-weight program unless its caller
+ *  names others: 8 runs ~2.5x faster than one on M4 Pro. A reduction not
+ *  divisible by the slices stays whole. */
 const CHUNKS = 8;
 
-/** a[1,1,rows,red] · b[1,1,cols,red]ᵀ → out, the reduction split into CHUNKS
+/** a[1,1,rows,red] · b[1,1,cols,red]ᵀ → out, the reduction split into `slices`
  *  slices summed inside the program. `tag` keeps value names unique. */
-function chunkedMatmulT(lines: string[], out: string, a: string, b: string, rows: number, cols: number, red: number, tag: string): void {
-  const chunks = red % CHUNKS ? 1 : CHUNKS;
+function chunkedMatmulT(lines: string[], out: string, a: string, b: string, rows: number, cols: number, red: number, tag: string,
+  slices = CHUNKS): void {
+  const chunks = red % slices ? 1 : slices;
   const cc = red / chunks;
   let last = "";
   for (let c = 0; c < chunks; c++) {
@@ -221,31 +293,34 @@ function chunkedMatmulT(lines: string[], out: string, a: string, b: string, rows
   lines.push(`    tensor<fp16, [1, 1, ${rows}, ${cols}]> ${out} = identity(x=${last})[name=string("${out}")];`);
 }
 
-/** y[S, Cout] = x[S, Cin] · w[Cout, Cin]ᵀ, w streamed (inputs: w=0, x=1). */
-export function streamedMatmulProgram(cin: number, cout: number, seq: number): AneProgramSpec {
+/** y[S, Cout] = x[S, Cin] · w[Cout, Cin]ᵀ, w streamed (inputs: w=0, x=1), the
+ *  reduction in `slices` slices (default CHUNKS). */
+export function streamedMatmulProgram(cin: number, cout: number, seq: number, slices = CHUNKS): AneProgramSpec {
   const lines = [`  func main<ios18>(tensor<fp16, [1, 1, ${seq}, ${cin}]> x, tensor<fp16, [1, 1, ${cout}, ${cin}]> w) {`, ...BOOLS];
-  chunkedMatmulT(lines, "y", "x", "w", seq, cout, cin, "m");
-  return { label: `projection ${cin}→${cout}, ${seq} rows`, mil: MIL_HEADER + lines.join("\n") + `\n  } -> (y);\n}\n`,
+  chunkedMatmulT(lines, "y", "x", "w", seq, cout, cin, "m", slices);
+  return { label: `projection ${cin}→${cout}, ${seq} rows${slices === CHUNKS ? "" : `, ${slices} slices`}`,
+    mil: MIL_HEADER + lines.join("\n") + `\n  } -> (y);\n}\n`,
     inputBytes: [cout * cin * 2, seq * cin * 2], outputBytes: seq * cout * 2 };
 }
 
 /** One MLP channel slice with streamed weights:
  *  y[S, D] = (silu(x·wgᵀ) ⊙ (x·wuᵀ)) · wd, wg/wu/wd [N, D] (wd: the down
- *  projection's rows for the same N channels). Inputs in symbol order: wd=0,
- *  wg=1, wu=2, x=3. Measured 10.2 TFLOPS (D 5120, N 9600, S 2048). */
-export function mlpSliceProgram(D: number, N: number, S: number): AneProgramSpec {
-  return { label: `MLP slice ${D}×${N}, ${S} rows`, mil: mlpSliceMil(D, N, S),
+ *  projection's rows for the same N channels), each matmul's reduction in
+ *  `slices` slices (default CHUNKS). Inputs in symbol order: wd=0, wg=1, wu=2,
+ *  x=3. Measured 10.2 TFLOPS (D 5120, N 9600, S 2048, 8 slices, M4 Pro). */
+export function mlpSliceProgram(D: number, N: number, S: number, slices = CHUNKS): AneProgramSpec {
+  return { label: `MLP slice ${D}×${N}, ${S} rows${slices === CHUNKS ? "" : `, ${slices} slices`}`, mil: mlpSliceMil(D, N, S, slices),
     inputBytes: [N * D * 2, N * D * 2, N * D * 2, S * D * 2], outputBytes: S * D * 2 };
 }
 
-function mlpSliceMil(D: number, N: number, S: number): string {
+function mlpSliceMil(D: number, N: number, S: number, slices: number): string {
   const lines = [`  func main<ios18>(tensor<fp16, [1, 1, ${N}, ${D}]> wd, tensor<fp16, [1, 1, ${N}, ${D}]> wg, ` +
     `tensor<fp16, [1, 1, ${N}, ${D}]> wu, tensor<fp16, [1, 1, ${S}, ${D}]> x) {`, ...BOOLS];
-  chunkedMatmulT(lines, "g", "x", "wg", S, N, D, "G");
-  chunkedMatmulT(lines, "u", "x", "wu", S, N, D, "U");
+  chunkedMatmulT(lines, "g", "x", "wg", S, N, D, "G", slices);
+  chunkedMatmulT(lines, "u", "x", "wu", S, N, D, "U", slices);
   lines.push(`    tensor<fp16, [1, 1, ${S}, ${N}]> sg = silu(x=g)[name=string("sg")];`,
     `    tensor<fp16, [1, 1, ${S}, ${N}]> h = mul(x=sg, y=u)[name=string("h")];`);
-  const chunksDown = N % CHUNKS ? 1 : CHUNKS;
+  const chunksDown = N % slices ? 1 : slices;
   const cc = N / chunksDown;
   let last = "";
   for (let c = 0; c < chunksDown; c++) {
@@ -299,7 +374,7 @@ export class AneLinear implements Disposable {
   writeInput(bytes: Uint8Array): void { this.program.inputView(0).set(bytes); }
   evalAsync(): void { this.program.evalAsync(); }
   wait(): void { this.program.wait(); }
-  output(): MlxArray { return this.program.output([this.cout, this.seq], Dtype.float16); }
+  output(): MlxArray { return this.program.output([this.cout, this.seq]); }
   [Symbol.dispose](): void { this.dispose(); }
   dispose(): void { this.program.dispose(); }
 }
@@ -307,16 +382,17 @@ export class AneLinear implements Disposable {
 /** Streamed-weight matmul y[S, Cout] = x[S, Cin] · w[Cout, Cin]ᵀ (row-major fp16). */
 export class AneStreamedMatmul implements Disposable {
   private constructor(readonly program: AneProgram, readonly cin: number, readonly cout: number, readonly seq: number) {}
-  /** Loads `streamedMatmulProgram(cin, cout, seq)`, compiled by the install step. */
-  static create(cin: number, cout: number, seq: number, share?: AneStreamedMatmul): AneStreamedMatmul {
-    return new AneStreamedMatmul(AneProgram.create(streamedMatmulProgram(cin, cout, seq), share?.program), cin, cout, seq);
+  /** Loads `streamedMatmulProgram(cin, cout, seq, slices)`, compiled by the install step. */
+  static create(cin: number, cout: number, seq: number, share?: AneStreamedMatmul, slices?: number): AneStreamedMatmul {
+    return new AneStreamedMatmul(AneProgram.create(streamedMatmulProgram(cin, cout, seq, slices), share?.program), cin, cout, seq);
   }
-  get weightsPointer(): number { return this.program.input(0); }
-  get inputPointer(): number { return this.program.input(1); }
-  prepare(): void { this.program.input(0); this.program.input(1); }
+  /** The weight buffer [Cout·Cin] and the input buffer [S·Cin], borrowed fp16 wraps (AneProgram.inputArray). */
+  weights(): MlxArray { return this.program.inputArray(0); }
+  input(): MlxArray { return this.program.inputArray(1); }
   evalAsync(): void { this.program.evalAsync(); }
   wait(): void { this.program.wait(); }
-  output(): MlxArray { return this.program.output([this.seq, this.cout], Dtype.float16); }
+  /** The first `rows` rows of y [S, Cout], an owned fp16 view; valid until the next evaluation. */
+  output(rows = this.seq): MlxArray { return this.program.output([rows, this.cout]); }
   [Symbol.dispose](): void { this.dispose(); }
   dispose(): void { this.program.dispose(); }
 }

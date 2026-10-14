@@ -235,8 +235,17 @@ interface DeviceKernels {
   readonly bf16WindowRead: string | null;
   /** The Neural Engine operations: the channel fraction, the split layers, and the row counts their programs are built
    *  for (ascending), the smallest of which a one-sequence prompt piece of `minRows` positions or more runs. `affine`
-   *  splits the named `projections`; none (`null`, `[]`): the MLP alone is split. */
-  readonly ane: { readonly fraction: number; readonly minRows: number; readonly rows: readonly number[];
+   *  splits the named `projections`; none (`null`, `[]`): the MLP alone is split. `fraction` is every program's, or each
+   *  MLP program's in `rows` order (never falling: the widest program's buffers serve the others; the projection splits
+   *  then name their own, `affineFraction`). `loop`: each layer's output and recurrent state evaluated before the next layer is built
+   *  (`bounded`), or queued without waiting (`queued`: each split waits for the GPU before its ANE run). `slices`: the
+   *  reduction slices of the MLP programs' matmuls (kernels/ane/linear's mlpSliceProgram; absent: its default).
+   *  `affineFraction` and `affineSlices`: the projection splits' own (absent: `fraction`, the program's default); their
+   *  GPU rows run the device's `promptProjection` layer where it names one. `affineMinRows`: the fewest rows of a program
+   *  whose range splits the projections (absent: every range; a range below it keeps the prompt projections whole). */
+  readonly ane: { readonly fraction: number | readonly number[]; readonly loop: "bounded" | "queued"; readonly slices?: number;
+    readonly affineFraction?: number; readonly affineSlices?: number; readonly affineMinRows?: number;
+    readonly minRows: number; readonly rows: readonly number[];
     readonly rowMajorMlp: string; readonly k3InterleavedMlp: string; readonly affine: string | null; readonly projections: readonly string[] } | null;
   /** The attention and DeltaNet projections of the prompt operations (prefillChunk.gpu, prefillTail.wider, and the
    *  Neural Engine operations' projections it does not split), when the composition mounts no adapters: a layer of
@@ -300,7 +309,7 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     bf16WindowRead: null,
     // Main's Neural Engine prefill plan (9593d881, from a8a5ba45): every one-sequence prompt piece of 640 to 2048
     // positions, a chunk or a tail, on the smallest of the programs built every 512 positions up to 2048.
-    ane: { fraction: 0.55, minRows: 640, rows: [1024, 1536, 2048],
+    ane: { fraction: 0.55, loop: "bounded", minRows: 640, rows: [1024, 1536, 2048],
       rowMajorMlp: "AneTrellisMlpSplit", k3InterleavedMlp: "AneTrellisMlpSplitK3i", affine: "AneAffineSplit",
       projections: ["in_proj_z", "out_proj", "o_proj"] },
     promptProjection: null,
@@ -357,20 +366,38 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     // Measured 2026-10-13 on one layer's MLP at 1024 and 2048 rows: the Neural Engine's 34% of the channels (5888,
     // 23 tiles of 256, which it runs faster than 5760) beside the GPU's 66% in 0.70 of the GPU-only time (fractions
     // 0.25 to 0.45 swept; the Neural Engine at about 4 TFLOPS against the GPU's 8; 2% faster prompts than 0.31).
-    // Projections stay whole on the dense GEMM (promptProjection): a split there, its GPU share on MLX's quantized
-    // matmul, gains nothing over it. A program runs all its rows whatever the piece holds (one layer's MLP share
-    // 14.7 ms at 256 rows, 25.3 at 512, 46.7 at 1024, 88.8 at 2048) after the GPU fills its weights (4 to 5 ms a
-    // layer), so programs every 64 positions to 768, every 128 to 1024 and every 256 to 2048, from 224 positions,
-    // where the 256-row program overtakes the wider layers (a layer's MLP at 512 rows 38.0 -> 29.6 ms against the
-    // generic blocks; time to first token, one sequence, with promptProjection from 128 rows, against three programs
-    // from 640 positions and promptProjection from 640 rows before: prompts of 230/300/400/500/639/700 tokens
-    // 2.11/2.74/3.55/4.09/5.00/5.09 -> 1.99/2.43/2.98/3.28/3.94/4.26 s, 1100 and 1600 7.23/9.73 -> 6.65/9.03, 16 to
-    // 200, 1024 and 8192 unchanged; bit-identical but for the pieces it moves from the GPU, mean KL 3e-5 to 2.6e-3 at
-    // 14 lengths from 230 to 639 tokens, since a program's rows do not depend on its size (700, 1100 and 1600 on the
-    // smaller programs: bit-identical); 0.31 on the same programs gains 2-3% below 300 tokens and loses 2% at 1024).
-    ane: { fraction: 0.34, minRows: 224,
+    // A projection split whose GPU share ran MLX's quantized matmul gained nothing over the dense GEMM
+    // (promptProjection); one whose share runs the dense GEMM does (below). A program runs all its rows whatever the
+    // piece holds (one layer's MLP share 14.7 ms at 256 rows, 25.3 at 512, 46.7 at 1024, 88.8 at 2048) after the GPU
+    // fills its weights (4 to 5 ms a layer), so programs every 64 positions to 768, every 128 to 1024 and every 256 to
+    // 2048, from 224 positions, where the 256-row program overtakes the wider layers (a layer's MLP at 512 rows 38.0 ->
+    // 29.6 ms against the generic blocks; time to first token, one sequence, with promptProjection from 128 rows,
+    // against three programs from 640 positions and promptProjection from 640 rows before: prompts of
+    // 230/300/400/500/639/700 tokens 2.11/2.74/3.55/4.09/5.00/5.09 -> 1.99/2.43/2.98/3.28/3.94/4.26 s, 1100 and 1600
+    // 7.23/9.73 -> 6.65/9.03, 16 to 200, 1024 and 8192 unchanged; bit-identical but for the pieces it moves from the
+    // GPU, mean KL 3e-5 to 2.6e-3 at 14 lengths from 230 to 639 tokens, since a program's rows do not depend on its
+    // size (700, 1100 and 1600 on the smaller programs: bit-identical); 0.31 on the same programs gains 2-3% below 300
+    // tokens and loses 2% at 1024).
+    // The layers queue without waiting for the GPU (`queued`): each split starts the Neural Engine once the GPU has
+    // filled its buffers (wrapped once for MLX), queues its GPU share whole and leaves its sum for the next layer to
+    // evaluate. Measured 2026-10-14, alternated sessions, two each, with the fill at 16 weights a thread: pieces of
+    // 320, 1024 and 2048 positions 2.42/5.71/11.01 -> 2.25/5.50/10.78 s (each layer evaluated before the next: 1-1.5%
+    // slower).
+    // Each program's matmuls sum their reductions in four slices (`slices`), which this Neural Engine runs faster than
+    // eight (one layer's MLP slice of 5888 channels at 320 rows 19.3 -> 16.7 ms, at 1024 47.7 -> 40.0; two slices fail
+    // to compile at some shapes); that moves the MLP's balance to 35% of its channels to 768 positions and 38% above
+    // (fractions 0.338 to 0.397 swept, two sessions each: pieces of 512 and 640 positions 2.94/3.57 -> 2.93/3.53 s, of
+    // 1024, 1536 and 2048 positions 5.51/8.09/10.76 -> 5.43/7.86/10.42 against 34%). From 768 positions the attention
+    // and DeltaNet projections split too, 37.5% of their rows on the Neural Engine, the rest on DequantizedLinear
+    // (two sessions each: pieces of 768, 1024 and 2048 positions 4.26/5.51/10.79 -> 4.14/5.17/9.75 s; 30% and 45%
+    // both slower at 2048; at 640 positions about 1% faster, at 512 slower, a split costing more than it saves: 500
+    // positions 3.05 -> 3.68 s).
+    ane: { fraction: [0.353, 0.353, 0.353, 0.353, 0.353, 0.353, 0.353, 0.353, 0.353, 0.382, 0.382, 0.382, 0.382, 0.382,
+      0.382], loop: "queued", slices: 4, minRows: 224,
       rows: [256, 320, 384, 448, 512, 576, 640, 704, 768, 896, 1024, 1280, 1536, 1792, 2048],
-      rowMajorMlp: "AneTrellisMlpSplit", k3InterleavedMlp: "AneTrellisMlpSplitK3i", affine: null, projections: [] },
+      rowMajorMlp: "AneTrellisMlpSplit", k3InterleavedMlp: "AneTrellisMlpSplitK3i", affine: "AneAffineSplit",
+      projections: ["in_proj_qkv", "in_proj_z", "out_proj", "q_proj", "o_proj"],
+      affineFraction: 0.375, affineSlices: 4, affineMinRows: 768 },
     // MLX's quantized matmul bit for bit from 128 rows (k_proj and v_proj from 513, above MLX's split-K GEMM),
     // 1.1x to 1.3x faster from 192 rows (DequantizedLinear): time to first token of 300-, 400-, 500- and 639-token
     // prompts 2.76/3.55/4.07/5.00 -> 2.60/3.39/3.80/4.63 s against it from 640 rows, logits bit-identical.
@@ -531,6 +558,21 @@ export function emitQwen38Graph(description: Qwen38Description, stem: string,
   const aneRanges = (ane?.rows ?? []).map((rows, j, all) => [j === 0 ? ane!.minRows : all[j - 1]! + 1, rows] as const);
   if (aneRanges.some(([minRows, rows]) => minRows > rows))
     throw new Error(`${stem}: ${c.device}'s Neural Engine programs ascend from at least the fewest positions a piece runs`);
+  /** The projection splits' fraction and slices, and the GPU rows' layer, as the template passes them. */
+  const affineFraction = ane?.affineFraction === undefined ? "ANE_FRACTION" : "ANE_AFFINE_FRACTION";
+  const affineSlicesArg = ane?.affineSlices === undefined ? "" : ", ANE_AFFINE_SLICES";
+  const affineBuildArgs = promptProjection ? `, ${ane?.affineSlices === undefined ? "undefined" : "ANE_AFFINE_SLICES"}, rest => new ${promptProjection}(rest)`
+    : affineSlicesArg;
+  /** Each program's channel fraction, in `rows` order, where the device's table names one per program; else null. */
+  const aneFractions = ane && typeof ane.fraction !== "number" ? ane.fraction : null;
+  if (aneFractions && (aneFractions.length !== ane!.rows.length || aneFractions.some((f, j) => j > 0 && f < aneFractions[j - 1]!)))
+    throw new Error(`${stem}: ${c.device}'s per-program Neural Engine fractions are one per program, never falling`);
+  if (aneFractions && splitsProjections && ane!.affineFraction === undefined)
+    throw new Error(`${stem}: ${c.device}'s per-program MLP fractions need the projection splits' own (affineFraction)`);
+  if (ane?.affineMinRows !== undefined && (!splitsProjections || promptProjection === null))
+    throw new Error(`${stem}: ${c.device}'s affineMinRows keeps the prompt projections (promptProjection) below it, so it needs both`);
+  /** The MLP split's fraction as the template passes it: the range's own, or the device's one. */
+  const mlpFraction = aneFractions ? "fraction" : "ANE_FRACTION";
   const one = k.mlp.one;
   if (!one) throw new Error(`${stem}: ${c.device}'s table names no one-row MLP layers`);
   if (c.mixedGateUp !== undefined && !NARROW.some(cls => TAILED.has(k.mlp[cls]?.mixedGateUp ?? "")))
@@ -715,7 +757,7 @@ ${NARROW.map(cls => narrowSet(cls, "      ")).join("\n")}${wider ? `\n${widerSet
       } are one lazy graph${k.widerVerify === "lazy" ? " at every width" : ""};`,
     wider ? `prompt chunks, prompt tails above ${wider.maxRows} rows and embeddings above ${widest} rows${k.widerVerify === "bounded" ? ", and wider verify windows" : ""},`
       : `prompt chunks, and prompt tails and embeddings above ${widest} rows${k.widerVerify === "bounded" ? ", and wider verify windows" : ""},`,
-    "evaluate each layer and its recurrent state.",
+    `evaluate each layer and its recurrent state${ane?.loop === "queued" ? ", which the Neural Engine operations queue without waiting (each split waits for the GPU before its ANE run)" : ""}.`,
   ].join(" "))}`;
   const kvText = c.kv !== "every" ? `bf16, or affine ${c.kv.bits}-bit group ${c.kv.groupSize} (composes ${kvLego})`
     : legoKv ? `every scheme: affine ${legoKv.bits}-bit group ${legoKv.groupSize} composing ${kvLego}, each other its own cache lego
@@ -765,7 +807,8 @@ ${row(wider ? `prefillChunk.gpu/Tail ${wider.maxRows + 1}+` : "prefillChunk.gpu/
   : `${row("decode/verify.wider,", "the generic blocks (TrellisMlp)", "QuantizedLinear")}
 ${row("prefillChunk.gpu, prefillTail", "", "")}`}${ane ? `
 ${row(`prefillChunk.ane, ${ane.minRows}..${ane.rows.at(-1)}`, `${ane.rowMajorMlp}/K3i`,
-  splitsProjections ? `${ane.projections.join(", ")} split` : promptProjection ?? "QuantizedLinear")}` : ""}
+  splitsProjections ? `${ane.projections.join(", ")} split${ane.affineMinRows === undefined ? "" : ` from ${ane.affineMinRows} rows`}`
+    : promptProjection ?? "QuantizedLinear")}` : ""}
 //
 ${summary}
 //
@@ -876,14 +919,28 @@ const ASYNC_EVERY = ${asyncEvery};
 ` : ""}${wider ? `/** Every operation above eight rows of at most WIDER_ROWS rows runs this GPU's wider layers, more rows the generic
  *  blocks: the boundary measured on the whole forward, from this machine's kernel table. */
 export const WIDER_ROWS = ${wider.maxRows};
-` : ""}${ane ? `/** The Neural Engine's channel fraction in each split. */
+` : ""}${ane ? `${aneFractions ? `/** The Neural Engine operations' row ranges, ascending: a one-sequence prompt piece, a chunk or a tail, whose positions
+ *  one holds runs on it, over programs built for its \`rows\` with \`fraction\` of the MLP's channels on the Neural
+ *  Engine. From this machine's kernel table. */
+const ANE_RANGES: readonly { readonly minRows: number; readonly rows: number; readonly fraction: number }[] = Object.freeze([
+  ${wrapItems(aneRanges.map(([minRows, rows], j) => `{ minRows: ${minRows}, rows: ${rows}, fraction: ${aneFractions[j]} }`), "  ")},
+]);
+` : `/** The Neural Engine's channel fraction in each split. */
 const ANE_FRACTION = ${ane.fraction};
 /** The Neural Engine operations' row ranges, ascending: a one-sequence prompt piece, a chunk or a tail, whose positions
  *  one holds runs on it, over programs built for its \`rows\`. From this machine's kernel table. */
 const ANE_RANGES: readonly { readonly minRows: number; readonly rows: number }[] = Object.freeze([
   ${wrapItems(aneRanges.map(([minRows, rows]) => `{ minRows: ${minRows}, rows: ${rows} }`), "  ")},
 ]);
-
+`}${ane.slices === undefined ? "" : `/** The reduction slices of each MLP program's matmuls. From this machine's kernel table. */
+const ANE_SLICES = ${ane.slices};
+`}${ane.affineFraction === undefined ? "" : `/** The Neural Engine's channel fraction in each projection split. */
+const ANE_AFFINE_FRACTION = ${ane.affineFraction};
+`}${ane.affineSlices === undefined ? "" : `/** The reduction slices of each projection program's matmul. */
+const ANE_AFFINE_SLICES = ${ane.affineSlices};
+`}${ane.affineMinRows === undefined ? "" : `/** The fewest rows of a program whose range splits the projections; the ranges below keep them whole. */
+const ANE_AFFINE_MIN_ROWS = ${ane.affineMinRows};
+`}
 ${splitsProjections ? `/** The widths a graph's Neural Engine programs are built at: the MLP's hidden and intermediate widths, and the input
  *  and output widths of each distinct split projection shape. */
 export interface AneWidths {
@@ -900,14 +957,17 @@ export const ANE_WIDTHS: AneWidths = Object.freeze({
 
 /** The distinct Neural Engine programs this graph loads for \`composition\`, at the artifact's widths unless
  *  \`widths\` names others (a synthetic artifact laid out like it): none without the bridge or with adapters mounted,
- *  otherwise, for each range in \`ANE_RANGES\`, the whole-MLP slice every layer shares and one program per split
+${ane.affineMinRows === undefined ? ` *  otherwise, for each range in \`ANE_RANGES\`, the whole-MLP slice every layer shares and one program per split
  *  projection shape, each for that range's rows. The install step compiles them into the system cache
  *  (\`compileAnePrograms\`, models/ane-install); the constructor only loads them, so one missing there fails
- *  construction with \`AneBridgeError\`. */
+ *  construction with \`AneBridgeError\`. */` : ` *  otherwise, for each range in \`ANE_RANGES\`, the whole-MLP slice every layer shares and, from ANE_AFFINE_MIN_ROWS
+ *  rows, one program per split projection shape, each for that range's rows. The install step compiles them into the
+ *  system cache (\`compileAnePrograms\`, models/ane-install); the constructor only loads them, so one missing there
+ *  fails construction with \`AneBridgeError\`. */`}
 export function anePrograms(composition: Composition, widths: AneWidths = ANE_WIDTHS): AneProgramSpec[] {
   if (!composition.aneBridge || composition.adapters) return [];
-  return ANE_RANGES.flatMap(({ rows }) => [aneMlpSplitProgram(widths.hidden, widths.intermediate, ANE_FRACTION, rows),
-    ...widths.projections.map(([inputs, outputs]) => aneAffineSplitProgram(inputs, outputs, ANE_FRACTION, rows))]);
+  return ANE_RANGES.flatMap(({ rows${aneFractions ? ", fraction" : ""} }) => [aneMlpSplitProgram(widths.hidden, widths.intermediate, ${mlpFraction}, rows${ane.slices === undefined ? "" : ", ANE_SLICES"}),
+    ...${ane.affineMinRows === undefined ? "" : "(rows < ANE_AFFINE_MIN_ROWS ? [] : "}widths.projections.map(([inputs, outputs]) => aneAffineSplitProgram(inputs, outputs, ${affineFraction}, rows${affineSlicesArg}))${ane.affineMinRows === undefined ? "" : ")"}]);
 }
 ` : `/** The widths a graph's Neural Engine programs are built at: the MLP's hidden and intermediate widths (no projection
  *  is split). */
@@ -921,12 +981,12 @@ export const ANE_WIDTHS: AneWidths = Object.freeze({ hidden: ${description.width
 
 /** The distinct Neural Engine programs this graph loads for \`composition\`, at the artifact's widths unless
  *  \`widths\` names others (a synthetic artifact laid out like it): none without the bridge or with adapters mounted,
- *  otherwise the whole-MLP slice every layer shares, for each range in \`ANE_RANGES\` at that range's rows. The
+ *  otherwise the whole-MLP slice every layer shares, for each range in \`ANE_RANGES\` at ${aneFractions ? "its rows and fraction" : "that range's rows"}. The
  *  install step compiles them into the system cache (\`compileAnePrograms\`, models/ane-install); the constructor
  *  only loads them, so one missing there fails construction with \`AneBridgeError\`. */
 export function anePrograms(composition: Composition, widths: AneWidths = ANE_WIDTHS): AneProgramSpec[] {
   if (!composition.aneBridge || composition.adapters) return [];
-  return ANE_RANGES.map(({ rows }) => aneMlpSplitProgram(widths.hidden, widths.intermediate, ANE_FRACTION, rows));
+  return ANE_RANGES.map(({ rows${aneFractions ? ", fraction" : ""} }) => aneMlpSplitProgram(widths.hidden, widths.intermediate, ${mlpFraction}, rows${ane.slices === undefined ? "" : ", ANE_SLICES"}));
 }
 `}` : ""}
 /** One layer: input norm, mixer, residual, post-attention norm, MLP, residual. Consumes nothing; returns an owned output.
@@ -1116,15 +1176,15 @@ ${ane ? `${splitsProjections ? `    // The Neural Engine operations, one per ran
       const started = performance.now();
 ${splitsProjections ? `      const affineShares = new Map<string, ${ane.affine}>();
 ` : ""}      let mlpShare: AneMlpSplit | undefined;
-      ane = [...ANE_RANGES].reverse().map(({ minRows, rows }) => ({ minRows, rows, steps: generic.map((layer, i) => {
+      ane = [...ANE_RANGES].reverse().map(({ minRows, rows${aneFractions ? ", fraction" : ""} }) => ({ minRows, rows, steps: generic.map((layer, i) => {
         const spec = LAYERS[i]!, { gate, up, down } = mlpOf(i);
         const split = mlpShare = (spec.downLayout === "k3Interleaved" ? ${ane.k3InterleavedMlp} : ${ane.rowMajorMlp})
-          .build(gate, up, down, ANE_FRACTION, rows, mlpShare);
+          .build(gate, up, down, ${mlpFraction}, rows, mlpShare${ane.slices === undefined ? "" : ", ANE_SLICES"});
         this.#owned.push(split);
-${splitsProjections ? `        const block = blockOf(i, (linear, path) => {
+${splitsProjections ? `        const block = ${ane.affineMinRows === undefined ? "" : "rows < ANE_AFFINE_MIN_ROWS ? promptBlocks![i]! : "}blockOf(i, (linear, path) => {
           if (!ANE_PROJECTIONS.has(path.slice(path.lastIndexOf(".") + 1))) return ${promptProjection ? `new ${promptProjection}(linear)` : "linear"};
           const shape = \`\${linear.inFeatures}:\${linear.outFeatures}\`;
-          const projection = ${ane.affine}.build(linear, ANE_FRACTION, rows, affineShares.get(shape));
+          const projection = ${ane.affine}.build(linear, ${affineFraction}, rows, affineShares.get(shape)${affineBuildArgs});
           affineShares.set(shape, projection);
           this.#owned.push(projection);
           return projection;
@@ -1175,7 +1235,7 @@ ${promptProjection ? `    // Prompt pieces above ${wider ? "WIDER_ROWS" : "eight
 ${ane ? `    this.prefillChunk = Object.freeze(split
       ? { gpu, ane: Object.freeze(split.map(({ minRows, rows, steps }) => Object.freeze({ minRows, rows,
         forward: (ids: MlxArray, state: Cache[], capture: MlxLayerCapture | null) =>
-          this.#bounded(steps, embed.encode(ids), state, "window", capture, null, "wider") }))) }
+          this.#${ane.loop}(steps, embed.encode(ids), state, "window", capture${ane.loop === "bounded" ? ", null" : ""}, "wider") }))) }
       : { gpu });` : "    this.prefillChunk = Object.freeze({ gpu });"}
     this.prefillTail = Object.freeze({
 ${NARROW.map(cls => entry(cls, "window", "bounded")).join("\n")}
@@ -1310,7 +1370,29 @@ ${asyncEvery !== null ? `
     } finally { h?.dispose(); }
   }
 
-  /** Every layer, nothing evaluated. */
+${ane?.loop === "queued" ? `  /** Every layer, each layer's output and recurrent state queued for the GPU, not waited for, before the next is
+   *  built: the Neural Engine operations, whose splits wait for the GPU before each ANE run. */
+  #queued(steps: Step[], h0: MlxArray, cache: Cache[], phase: ReadPhase, capture: MlxLayerCapture | null,
+    width: MlxWidthClass): MlxArray {
+    let h: MlxArray | null = h0;
+    try {
+      for (let i = 0; i < steps.length; i++) {
+        const next = steps[i]!(h, cache[i]!, phase, null, width);
+        h.dispose();
+        h = next;
+        const state = cache[i]!.state();
+        try { ops.asyncEvalAll([h, ...state]); }
+        finally { if (cache[i]!.stateNeedsDispose) for (const a of state) a.dispose(); }
+        capture?.(i, h);
+      }
+      const out = disposing(h, this.finalNorm.forward(h));
+      h = null;
+      capture?.(steps.length, out);
+      return out;
+    } finally { h?.dispose(); }
+  }
+
+` : ""}  /** Every layer, nothing evaluated. */
   #lazy(steps: Step[], h0: MlxArray, cache: Cache[], phase: ReadPhase, capture: MlxLayerCapture | null,
     mrope: MropeForwardState | null, width: MlxWidthClass): MlxArray {
     let h: MlxArray | null = h0;

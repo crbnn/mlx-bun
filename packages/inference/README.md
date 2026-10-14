@@ -1021,12 +1021,16 @@ attention and DeltaNet projections on `layers/dequantized-linear` (from 128 rows
 above MLX's split-K GEMM range at k_proj and v_proj's outputs, from 513, the weight
 dequantized to bf16 and MLX's dense GEMM, MLX's quantized matmul bit for bit at the
 artifact's shapes and 1.1x to 1.3x faster there); with the bridge and no adapters,
-Neural Engine operations that split only the MLP, 34% of its channels on the Neural
-Engine, for one-sequence pieces of 224 to 2048 positions over programs every 64
-positions to 768, every 128 to 1024 and every 256 to 2048 (a program runs all its
-rows, so the smallest one holding a piece wastes the least); adapters as on the M4
-Pro; affine 4-bit group-64 KV on the M4 Pro's KV4 lego, its decode kernel at 128 tokens
-per threadgroup; bf16 KV on the plain cache whose verify windows of six to eight rows
+Neural Engine operations for one-sequence pieces of 224 to 2048 positions over programs
+every 64 positions to 768, every 128 to 1024 and every 256 to 2048 (a program runs all
+its rows, so the smallest one holding a piece wastes the least), each splitting the MLP
+(35% of its channels on the Neural Engine to 768 positions, 38% above) and, from 768
+positions, the in_proj_qkv, in_proj_z, out_proj, q_proj and o_proj projections (37.5%,
+their GPU rows on `layers/dequantized-linear`), every program summing its matmuls'
+reductions in four slices; an operation queues its layers without waiting, each split
+waiting for the GPU only before its Neural Engine run; adapters as on the M4 Pro; affine
+4-bit group-64 KV on the M4 Pro's KV4 lego, its decode kernel at 128 tokens per
+threadgroup; bf16 KV on the plain cache whose verify windows of six to eight rows
 fold GQA into rows (`foldedWindowRead`, MLX's fused SDPA bit for bit).
 On both, decode and verify up to eight rows submit the graph every four layers (on
 the M1 Max also the operations of its wider layers); wider windows, prompt chunks
