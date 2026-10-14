@@ -1,3 +1,4 @@
+import { sequenceLogitsOperation } from "../../src/scoring/full-sequence";
 import { expect, test } from "bun:test";
 import { bindSpeculativeGroupRequests } from "../../src/execution/speculative-group";
 import type { MlxGroupMethodHost, MlxGroupPreparation, Row } from "../../src/execution/batch-types";
@@ -57,7 +58,7 @@ function fixture(provider: Pick<DraftProvider, "id" | "grouped"> & { dispose(): 
       return ops.reshape(ids, [ids.shape[0]!, ids.shape[1]!, 1]);
     },
     logitsFromHidden(hidden: MlxArray) { return ops.copyOf(hidden); },
-    ...stubPhases((ids, caches) => model.forwardStub(ids, caches), hidden => model.logitsFromHidden(hidden)),
+    ...stubPhases((ids, caches) => model.forwardStub(ids, caches), hidden => sequenceLogitsOperation(model, hidden)),
     ...graph,
   } as unknown as RuntimeModel & { forwardStub(ids: MlxArray, caches: Cache[]): MlxArray };
   const cache = new PromptCache(1024 ** 2);

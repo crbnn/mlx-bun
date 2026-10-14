@@ -749,8 +749,6 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
     expertRuntime: Glm52ExpertRuntime | null = null,
     dsaPrefillMode: "exact" | "dense-benchmark" = "exact",
     dsaBenchmarkPrefillTokens = 0,
-    /** The composition's KV scheme and paging, which `makeCache` composes. */
-    readonly caches: Glm52LatentCaches = GLM52_F32_CACHES,
   ) {
     if (config.modelType !== "glm_moe_dsa" ||
         glmConfig.modelType !== "glm_moe_dsa") {
@@ -817,10 +815,9 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
     finally { executor?.setFixedKernelFamily(false); }
   }, this.glmConfig.maxPositionEmbeddings);
 
-    bindGraphCaches(this, this.caches);
   }
 
-  static async open(modelDir: string, caches: Glm52LatentCaches = GLM52_F32_CACHES): Promise<Glm52Model> {
+  static async open(modelDir: string, caches: Glm52LatentCaches = GLM52_F32_CACHES): Promise<Glm52LoadedModel> {
     const glmConfig = await loadGlm52Config(modelDir);
     const config = await loadModelConfig(modelDir);
     const weights = ColibriGlm52Weights.open(modelDir);
@@ -829,10 +826,10 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
         weights.container,
         glmConfig,
       );
-      return new Glm52Model(weights, config, glmConfig, {
+      return bindGraphCaches(new Glm52Model(weights, config, glmConfig, {
         dsa: detected.hasDsa,
         mtpMetadata: detected.hasMtp,
-      }, null, null, "exact", 0, caches);
+      }, null, null, "exact", 0), caches);
     } catch (error) {
       weights.dispose();
       throw error;
@@ -842,7 +839,7 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
   static async openStreamed(
     modelDir: string,
     options: Glm52StreamedOpenOptions,
-  ): Promise<Glm52Model> {
+  ): Promise<Glm52LoadedModel> {
     const glmConfig = await loadGlm52Config(modelDir);
     const config = await loadModelConfig(modelDir);
     const weights = ColibriGlm52ResidentWeights.open(modelDir, {
@@ -865,7 +862,7 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
         ...runtimeOptions,
         fixedBytes: weights.weightsBytes + options.reserveBytes,
       });
-      return new Glm52Model(
+      return bindGraphCaches(new Glm52Model(
         weights,
         config,
         glmConfig,
@@ -879,8 +876,7 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
         runtime,
         dsaPrefillMode ?? "exact",
         dsaBenchmarkPrefillTokens ?? 0,
-        caches ?? GLM52_F32_CACHES,
-      );
+      ), caches ?? GLM52_F32_CACHES);
     } catch (error) {
       runtime?.close();
       weights.dispose();
@@ -898,13 +894,6 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
    *  quantized scheme, in pages under paging. */
   get cacheLayers(): readonly MlxCacheLayer[] { return this.layers.map(layer=>({kind:"latent" as const,geometry:{kvLoraRank:this.glmConfig.kvLoraRank,ropeHeadDim:this.glmConfig.qkRopeHeadDim,maxTokens:this.glmConfig.maxPositionEmbeddings,...(this.capabilities.dsa && layer.dsa ? {indexHeadDim:this.glmConfig.indexHeadDim}:{})}})); }
 
-  makeCache!: () => Cache[];
-
-  /** The persistence codecs of the caches `makeCache` composes: the latent
-   *  legos' beside the default set, where the scheme or paging composes them. */
-  get stateCodecs(): CacheCodecProvider | undefined {
-    return this.caches.kv.kind === "bf16" && !this.caches.pagedKv ? undefined : latentLegoCodecs;
-  }
 
   /** Attach probe-only telemetry for selections computed by FULL DSA layers. */
   setDsaSelectionObserver(observer: Glm52DsaSelectionObserver | null): void {
@@ -1124,3 +1113,5 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
 
 import { Glm52WeightSource } from "../../contracts/mlx/glm52-weights";
 export { type Glm52WeightSource } from "../../contracts/mlx/glm52-weights";
+
+export type Glm52LoadedModel = Glm52Model & { makeCache(): Cache[]; readonly stateCodecs?: CacheCodecProvider };

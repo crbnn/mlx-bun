@@ -65,7 +65,7 @@ async function setup(dir: string) {
   type Layers = (h0: MlxArray, caches: Cache[], phase: string) => MlxArray;
   const graph = model as unknown as { forwardLayers: Layers };
   const layers = graph.forwardLayers.bind(model);
-  const project = model.logitsFromHidden.bind(model);
+  const project = model.logitsFromHidden!.bind(model);
   const step = (kind: string, input: unknown, out: MlxArray, caches: Cache[]) => {
     if (!trace) return;
     const rows = Array.isArray(input) ? 1 : (input as MlxArray).shape[0]!;

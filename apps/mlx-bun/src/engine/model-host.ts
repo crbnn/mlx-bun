@@ -325,7 +325,7 @@ export async function loadContext(
     if (!draft && planned) draft = await declaredDraftHead();
     // Resolved once, before the resident graph is built, which receives it. A
     // planned runtime built its graph from its own memory plan above.
-    const composition = resolveComposition(config, { kv: opts.kv, pagedKv: opts.pagedKv, adapters: opts.adapters, maxRows: opts.maxRows,
+    const composition = resolveComposition(config, { kv: opts.kv, pagedKv: opts.pagedKv, maxRows: opts.maxRows,
       draft: draft && { numDraftTokens: draft.numDraftTokens, adaptive: opts.adaptiveDraftDepth } });
     if (!planned) {
       model = createModel(weights!, config, composition, profile);

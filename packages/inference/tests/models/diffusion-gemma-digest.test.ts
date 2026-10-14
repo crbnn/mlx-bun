@@ -1,3 +1,5 @@
+import { testGraph } from "./test-composition";
+import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
 // DiffusionGemma's graph over small synthetic weights, held to its recorded
 // digest (tests/fixtures/synthetic-digests/diffusion-gemma.json;
 // tests/models/synthetic-digest.ts): six layers (sliding, sliding, full,
@@ -153,7 +155,7 @@ function artifact(): { weights: Weights; config: ModelConfig } {
 
 const digests = syntheticDigests("diffusion-gemma");
 const { weights, config } = artifact();
-const current = new DiffusionGemmaModel(weights, config, testComposition());
+const current = testGraph(new DiffusionGemmaModel(weights, config), testComposition());
 
 /** Same shape, dtype and bytes; both owned by the caller and disposed here. */
 function expectSame(label: string, actual: MlxArray, expected: MlxArray): void {
@@ -225,7 +227,7 @@ function extend(digest: DigestCase, label: string, caches: Cache[], length: numb
 
 // 5 < window - 1, 15 = window - 1 (no block mask), 16 and 37 past it (block mask and cut).
 for (const length of [2, 5, 15, 16, 37]) digests.test(`text ${length}: prefill, canvas passes and continuations across the window`, digest => {
-  const caches = current.prefill(prompt(length, length));
+  const caches = bindLegacyDenoisingModel(current).graph.prefill(prompt(length, length));
   try {
     digest.caches(`text prefill ${length}`, caches);
     canvasSteps(digest, `text ${length}`, caches, BigInt(length), 4);
@@ -241,7 +243,7 @@ for (const [before, after] of [[0, 1], [2, 3], [8, 13]] as const) {
   digests.test(`vision ${before}+${after}: the encoder window over synthetic pixels, inside and past the sliding window`, digest => {
     const ids = visionPrompt(before, VISION.output, after);
     using image = pixels(before + 1);
-    const caches = current.prefillVision(ids, image);
+    const caches = bindLegacyDenoisingModel(current).graph.prefill(ids,image);
     try {
       digest.caches(`vision prefill ${ids.length}`, caches);
       canvasSteps(digest, `vision ${ids.length}`, caches, BigInt(ids.length), 3);
@@ -312,13 +314,13 @@ for (const run of runs) digests.test(`seeded generation, ${run.label}: the denoi
 // continuations. The quantized forms have no oracle: their canvas logits are
 // compared with the bf16 graph's on the same canvases, by KL, and reported.
 const composedGraph = (kv: KvStorageScheme, paged: boolean) =>
-  new DiffusionGemmaModel(weights, config, testComposition(kv, paged ? { pagedKv: { blockSize: 16, direct: false } } : {}));
+  testGraph(new DiffusionGemmaModel(weights, config), testComposition(kv, paged ? { pagedKv: { blockSize: 16, direct: false } } : {}));
 
 test("the composition's paging: paged bf16 canvas passes equal the bf16 lego's", () => {
   const paged = composedGraph({ kind: "bf16" }, true);
   for (const length of [5, 37]) {
     const ids = prompt(length, length);
-    const caches = { paged: paged.prefill(ids), plain: current.prefill(ids) };
+    const caches = { paged: bindLegacyDenoisingModel(paged).graph.prefill(ids), plain: bindLegacyDenoisingModel(current).graph.prefill(ids) };
     try {
       expect(caches.paged.filter(cache => cache.signature() === "kv:paged").length).toBe(2);
       const step = (label: string, salt: number) => {
@@ -334,7 +336,7 @@ test("the composition's paging: paged bf16 canvas passes equal the bf16 lego's",
   }
   const ids = visionPrompt(8, VISION.output, 13);
   using image = pixels(9);
-  const caches = { paged: paged.prefillVision(ids, image), plain: current.prefillVision(ids, image) };
+  const caches = { paged: bindLegacyDenoisingModel(paged).graph.prefill(ids,image), plain: bindLegacyDenoisingModel(current).graph.prefill(ids,image) };
   try {
     using canvas = ops.fromInt32(prompt(CANVAS, 5), [1, CANVAS]);
     expectSame("paged vision", paged.decoderLogits(canvas, caches.paged, null), current.decoderLogits(canvas, caches.plain, null));
@@ -375,7 +377,7 @@ test("the composition's KV scheme: quantized and paged quantized forms serve the
     const totals = { mean: 0, max: 0, agree: 0, passes: 0 };
     for (const length of [5, 37]) {
       const ids = prompt(length, length);
-      const caches = { form: graph.prefill(ids), reference: reference.prefill(ids) };
+      const caches = { form: bindLegacyDenoisingModel(graph).graph.prefill(ids), reference: bindLegacyDenoisingModel(reference).graph.prefill(ids) };
       try {
         for (const salt of [3, 4]) {
           using canvas = ops.fromInt32(prompt(CANVAS, salt), [1, CANVAS]);
@@ -394,3 +396,42 @@ test("the composition's KV scheme: quantized and paged quantized forms serve the
   }
   console.log(`diffusion-gemma composed KV (synthetic weights, canvas KL vs bf16): ${JSON.stringify(report)}`);
 }, 240_000);
+
+test("declared denoising ranges preserve prompt, canvas and continuation arithmetic across the expert threshold", () => {
+  const binding = bindLegacyDenoisingModel(current).graph;
+  for (const length of [1,31,32,37]) {
+    const ids = prompt(length,length);
+    const candidate = binding.prefill(ids), control = current.makeCache();
+    current.encodePrompt(ids,control);
+    const sameState = () => {
+      expect(candidate.length).toBe(control.length);
+      for (let i=0; i<control.length; i++) {
+        expect(candidate[i]!.offset).toBe(control[i]!.offset);
+        const a=candidate[i]!.state(), b=control[i]!.state();
+        try {
+          expect(a.length).toBe(b.length);
+          for (let j=0;j<a.length;j++) {
+            using left=ops.contiguous(a[j]!), right=ops.contiguous(b[j]!);
+            expect(Buffer.from(left.rawBytes()).equals(Buffer.from(right.rawBytes()))).toBe(true);
+          }
+        } finally {
+          if(candidate[i]!.stateNeedsDispose) disposeResources(a);
+          if(control[i]!.stateNeedsDispose) disposeResources(b);
+        }
+      }
+    };
+    try {
+      sameState();
+      for (const rows of [1,7,31,32,37]) {
+        using canvas=ops.fromInt32(prompt(rows,3),[1,rows]);
+        using hidden=current.decodeCanvasArr(canvas,control);
+        expectSame(`range canvas ${rows}`,binding.decoderLogits(canvas,candidate,null),current.logitsFromHidden(hidden));
+        sameState();
+      }
+      for(const rows of [1,31,32]) {
+        using tokens=ops.fromInt32(prompt(rows,4),[1,rows]);
+        binding.extendPrefill(tokens,candidate); current.extendPrefill(tokens,control); sameState();
+      }
+    } finally { disposeResources([...candidate,...control]); }
+  }
+},120_000);

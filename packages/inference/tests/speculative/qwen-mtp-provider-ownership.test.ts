@@ -1,3 +1,4 @@
+import type { TestGraph } from "../models/test-composition";
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -285,7 +286,7 @@ test("Qwen MTP declares the target tap its grouped rows consume, resolved from t
         embed: { encode: unused }, lmHead: null, makeCache: () => [], composition: testComposition(), ...stubPhases(unused, unused) });
       const declared = Object.getOwnPropertyDescriptor(Qwen35Model.prototype, "graphCapabilities")!.get!.call(graph);
       Object.defineProperty(graph, "graphCapabilities", { value: { ...declared, hiddenLayerTaps: tap } });
-      return graph as Qwen35Model;
+      return graph as TestGraph<Qwen35Model>;
     };
     expect(bindSpeculativeGroupRequests(qwen(true), provider, 2)).toBeDefined();
     expect(bindSpeculativeGroupRequests(qwen(false), provider, 2)).toBeUndefined();
