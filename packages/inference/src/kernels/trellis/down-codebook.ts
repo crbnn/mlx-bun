@@ -3,7 +3,8 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { MetalKernel } from "@mlx-bun/mlx/metal-kernel";
 import type { TrellisGeometry } from "./geometry";
-import { HEADER } from "./codebook";
+import { CODEBOOK_WINDOW, HEADER } from "./codebook";
+import { TRELLIS_CODEBOOK_DOWN_THREADS } from "./launch";
 
 // Axis-0 (down) projection of one activation row over T 256 Trellis codes,
 // decoding through a threadgroup codebook (every code value y·(1/147.8) of the
@@ -11,23 +12,15 @@ import { HEADER } from "./codebook";
 // consecutive positions of one block: it loads the words they span (plus the
 // next lane's first word for the last windows) for U input rows ahead, aligns
 // them to its first bit once per row where P·K is not a multiple of 32 (the
-// 3-bit codes, whose odd lanes start at bit 16), then extracts every window at
-// a compile-time shift, already scaled to the table's byte offset. No lane exchanges data, so
-// lanes past the last block return at once. Split-K over input rows into
-// SPLITS f32 partials folded by one MLX sum. Every position accumulates the
-// same f32 code·scale weights over the same rows in the same order as
-// trellisScatter's single-row kernels at variant 13 (the balanced one for the
-// 3-bit block interleave), so the output is theirs bit for bit.
-const SPLITS = 128, THREADS = 256, P = 16, U = 2;
-
-// Bits [off, off + L) of the word pair (hi:lo) times four, the window's byte offset in a float table; `off` is a
-// compile-time constant at every call.
-const WINDOW = String.raw`
-static inline uint trellis_window_bytes(uint lo, uint hi, uint off, uint l) {
-  const uint bits = off + l > 32u ? (lo >> (off - 2u)) | (hi << (34u - off)) : off >= 2u ? lo >> (off - 2u) : lo << (2u - off);
-  return bits & (((1u << l) - 1u) << 2);
-}
-`;
+// 3-bit codes, whose odd lanes start at bit 16), then reads every window with
+// one bit-field extract at a compile-time shift (CODEBOOK_WINDOW, codebook.ts).
+// No lane exchanges data, so lanes past the last block return at once.
+// Split-K over input rows into SPLITS f32 partials folded by one MLX sum.
+// Every position accumulates the same f32 code·scale weights over the same
+// rows in the same order as trellisScatter's single-row kernels at variant 13
+// (the balanced one for the 3-bit block interleave), so the output is theirs
+// bit for bit.
+const SPLITS = 128, P = 16, U = 2;
 
 const SOURCE = String.raw`
   threadgroup float codebook[1 << L];
@@ -78,14 +71,15 @@ const SOURCE = String.raw`
     }
     #pragma clang loop unroll(full)
     for (uint u = 0; u < (uint)U; ++u) {
-      uint w[NA + 1];
+      uint w[NA], v[NA];
       #pragma clang loop unroll(full)
       for (uint i = 0; i < NA; ++i) w[i] = shifted ? (ld[u][i] >> SHIFT) | (ld[u][i + 1] << (32u - SHIFT)) : ld[u][i];
-      w[NA] = 0u;
+      v[0] = w[0] << 16;
+      #pragma clang loop unroll(full)
+      for (uint i = 1; i < NA; ++i) v[i] = (w[i - 1] >> 16) | (w[i] << 16);
       #pragma clang loop unroll(full)
       for (uint i = 0; i < (uint)P; ++i) {
-        const uint bit = i * (uint)K;
-        const float code = *(const threadgroup float*)(table + trellis_window_bytes(w[bit >> 5], w[(bit >> 5) + 1], bit & 31u, (uint)L));
+        const float code = trellis_codebook_window(table, w, v, i * (uint)K, (uint)L);
         acc[i] = metal::fma(code * sr[u], xr[u], acc[i]);
       }
     }
@@ -97,14 +91,15 @@ const SOURCE = String.raw`
     for (uint i = 0; i < NL; ++i) ld[i] = rowWords[idx[i]];
     const float xr = float(x[r0 + r]);
     const float sr = float(scales[r0 + r]);
-    uint w[NA + 1];
+    uint w[NA], v[NA];
     #pragma clang loop unroll(full)
     for (uint i = 0; i < NA; ++i) w[i] = shifted ? (ld[i] >> SHIFT) | (ld[i + 1] << (32u - SHIFT)) : ld[i];
-    w[NA] = 0u;
+    v[0] = w[0] << 16;
+    #pragma clang loop unroll(full)
+    for (uint i = 1; i < NA; ++i) v[i] = (w[i - 1] >> 16) | (w[i] << 16);
     #pragma clang loop unroll(full)
     for (uint i = 0; i < (uint)P; ++i) {
-      const uint bit = i * (uint)K;
-      const float code = *(const threadgroup float*)(table + trellis_window_bytes(w[bit >> 5], w[(bit >> 5) + 1], bit & 31u, (uint)L));
+      const float code = trellis_codebook_window(table, w, v, i * (uint)K, (uint)L);
       acc[i] = metal::fma(code * sr, xr, acc[i]);
     }
   }
@@ -120,14 +115,14 @@ function launch(x2: MlxArray, codes: MlxArray, scales: MlxArray, g: TrellisGeome
   if (x2.shape[0] !== 1) throw new Error("downCodebookRow: expects one activation row");
   if (g.axis !== 0 || g.T !== 256 || g.L > 12 || g.cols % 256) throw new Error("downCodebookRow: needs axis-0 codes at T 256, L <= 12");
   kernel ??= new MetalKernel({ name: "mlx_bun_trellis_down_codebook_row", inputNames: ["x", "codes", "scales"],
-    outputNames: ["partial"], source: SOURCE, header: HEADER + WINDOW, ensureRowContiguous: true });
+    outputNames: ["partial"], source: SOURCE, header: HEADER + CODEBOOK_WINDOW, ensureRowContiguous: true });
   const [partial] = kernel.apply([x2, codes, scales], {
     outputs: [{ shape: [1, SPLITS, g.cols], dtype: Dtype.float32 }],
-    grid: [THREADS, SPLITS * groupsPerSplit / (THREADS / 32), 1],
-    threadGroup: [THREADS, 1, 1],
+    grid: [TRELLIS_CODEBOOK_DOWN_THREADS, SPLITS * groupsPerSplit / (TRELLIS_CODEBOOK_DOWN_THREADS / 32), 1],
+    threadGroup: [TRELLIS_CODEBOOK_DOWN_THREADS, 1, 1],
     templateDtypes: { T: x2.dtype },
-    templateInts: { R: g.rows, C: g.cols, K: g.k, L: g.L, P, U, SPLITS, SG_TG: THREADS / 32, THREADS,
-      INTERLEAVE: Number(interleave) },
+    templateInts: { R: g.rows, C: g.cols, K: g.k, L: g.L, P, U, SPLITS, SG_TG: TRELLIS_CODEBOOK_DOWN_THREADS / 32,
+      THREADS: TRELLIS_CODEBOOK_DOWN_THREADS, INTERLEAVE: Number(interleave) },
   });
   const sum = ops.sumAxis(partial!, 1, false);
   partial!.dispose();

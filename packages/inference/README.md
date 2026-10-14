@@ -919,7 +919,8 @@ Outside the Trellis family, `kernels/quantization/affine{3,4}-{rows,mma}` run
 in blocks of 8, on the matrix unit with output tiles sharing each activation
 fragment and K split across the threadgroup (the M1 Max form); `kernels/attention/kvq4-decode` is one-row attention
 over a 4-bit group-64 KV cache with head dim 256, reading each packed row once
-for all query heads of its KV head; `kernels/attention/multi-query` is causal
+for all query heads of its KV head, the tokens per threadgroup the caller's (512 on
+the M4 Pro, 128 on the M1 Max); `kernels/attention/multi-query` is causal
 flash decoding for 2..8 query rows over a BF16 cache. `kernels/ane` holds the
 Neural Engine programs (`linear`) and the GPU kernels that fill their buffers
 (`fill`). The layers in `layers/trellis-gate-up`, `layers/trellis-down`,
@@ -1016,7 +1017,9 @@ weight dequantized to bf16 and MLX's dense GEMM, MLX's quantized matmul bit for 
 at the artifact's shapes and about 1.35x faster there); with the bridge and no
 adapters, Neural Engine operations over the M4 Pro's ranges and program sizes that
 split only the MLP, 34% of its channels on the Neural Engine; adapters as on the M4
-Pro.
+Pro; affine 4-bit group-64 KV on the M4 Pro's KV4 lego, its decode kernel at 128 tokens
+per threadgroup; bf16 KV on the plain cache whose verify windows of six to eight rows
+fold GQA into rows (`foldedWindowRead`, MLX's fused SDPA bit for bit).
 On both, decode and verify up to eight rows submit the graph every four layers (on
 the M1 Max also the operations of its wider layers); wider windows, prompt chunks
 on the GPU, tails above eight rows (above 256 on the M1 Max) and vision positions
@@ -1089,6 +1092,12 @@ checks below.
   port, OptiQ's tiled port, the folded and grouped-heads forms). An affine lego
   takes its kernel set at construction (`state/affine-attention`: unfused or
   tiled-causal as the composition names, or the opt-in always-tiled set).
+- `layers/folded-attention.ts`: bf16 causal windows of up to eight queries that MLX's
+  fused SDPA hands to its unfused fallback (more than 32 query vectors per KV head),
+  with GQA folded into rows: that fallback bit for bit, each KV head's keys and values
+  read once instead of once per query head. A bf16 storage reads its windows with the
+  read its composition names (`KVCache.windowRead`: `sdpaRead`, or `foldedWindowRead`),
+  and its row layouts and clones with the same.
 - `kernels/turboquant/`: packing, rotation, codebooks, and packed decode kernels.
 - `kernels/delta/gated.ts`: DeltaNet kernels; recurrent storage and its
   `recurDecode`/`recurWindow` live in `state/ssm.ts`. The training cache

@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import { SSMCache } from "../../src/state/ssm";
+import type { GatedDeltaParameters } from "../../src/contracts/mlx/cache";
 import { gatedDeltaUpdate } from "../../src/kernels/delta/gated";
 import { gatedDeltaState } from "../../src/kernels/delta/state";
 import { createHash } from "node:crypto";
@@ -118,22 +119,14 @@ describe("SSMCache speculative round lifecycle", () => {
     MlxArray.fromFloat32(Float32Array.from([fill]), [1, 1, 1]);
 
   /** Play the layer's part of an armed round: stash the replaced slots and
-   *  install a spy replay (the real layer installs #replaySpecPrefix). */
-  const recordRound = (
-    c: SSMCache, S: number, calls: number[],
-  ): { conv: MlxArray; recurrent: MlxArray } => {
+   *  record the window's rows (the real layer records its projections). */
+  const recordRound = (c: SSMCache, S: number): { conv: MlxArray; recurrent: MlxArray } => {
     const r = c.specRound!;
     expect(r.armed).toBe(true);
     r.armed = false;
     r.S = S;
-    r.qkv = tiny(9);
-    r.a = tiny(9);
-    r.b = tiny(9);
-    r.replay = (cache, keep) => {
-      calls.push(typeof keep === "number" ? keep : Math.max(...keep));
-      if (typeof keep === "number") cache.advance(keep);
-      else cache.advanceRows(keep);
-    };
+    r.rows = { qkv: tiny(9), k: tiny(9), v: tiny(9), a: tiny(9), b: tiny(9),
+      layer: {} as unknown as GatedDeltaParameters };
     const conv = tiny(101);
     const recurrent = tiny(102);
     r.prevConv = c.conv;
@@ -144,24 +137,35 @@ describe("SSMCache speculative round lifecycle", () => {
     return { conv, recurrent };
   };
 
-  test("rollback restores the snapshot, replays the kept prefix, fixes offset", () => {
+  test("rollback(0) restores the exact snapshot and its offset", () => {
     const c = new SSMCache();
     const conv0 = tiny(1);
     const rec0 = tiny(2);
     c.conv = conv0;
     c.recurrent = rec0;
     c.offset = 7;
-    const calls: number[] = [];
     c.specRoundBegin();
-    recordRound(c, 4, calls);
+    recordRound(c, 4);
     expect(c.offset).toBe(11); // the verify forward advanced the window
-    c.specRoundRollback(3);
-    expect(c.conv).toBe(conv0); // the exact pre-round arrays are back
+    c.specRoundRollback(0);
+    expect(c.conv).toBe(conv0); // the exact pre-round arrays are back, nothing pending
     expect(c.recurrent).toBe(rec0);
-    expect(calls).toEqual([3]); // replay asked for exactly the kept tokens
-    expect(c.offset).toBe(10); // 7 + keep, advanced by the spy replay
+    expect(c.offset).toBe(7);
     expect(c.specRound).toBeNull();
     c.dispose();
+  });
+
+  test("rollback(keep) retains the kept rows and advances the offset by them", () => {
+    const c = new SSMCache();
+    c.conv = tiny(1);
+    c.recurrent = tiny(2);
+    c.offset = 7;
+    c.specRoundBegin();
+    recordRound(c, 4);
+    c.specRoundRollback(3);
+    expect(c.offset).toBe(10); // 7 + keep; the rows fold in at the next read
+    expect(c.specRound).toBeNull();
+    c.dispose(); // frees the snapshot and the retained rows unread
   });
 
   test("commit keeps the post-round state and frees the round", () => {
@@ -169,14 +173,12 @@ describe("SSMCache speculative round lifecycle", () => {
     c.conv = tiny(1);
     c.recurrent = tiny(2);
     c.offset = 3;
-    const calls: number[] = [];
     c.specRoundBegin();
-    const { conv, recurrent } = recordRound(c, 2, calls);
+    const { conv, recurrent } = recordRound(c, 2);
     c.specRoundCommit();
     expect(c.conv).toBe(conv);
     expect(c.recurrent).toBe(recurrent);
     expect(c.offset).toBe(5);
-    expect(calls).toEqual([]);
     expect(c.specRound).toBeNull();
     c.dispose();
   });
@@ -187,18 +189,16 @@ describe("SSMCache speculative round lifecycle", () => {
     c.recurrent = tiny(2);
     c.offset = 7;
     c.offsets = [7, 3];
-    const calls: number[] = [];
     c.specRoundBegin();
-    recordRound(c, 4, calls);
+    recordRound(c, 4);
     expect(c.offsets).toEqual([11, 7]);
-    c.specRoundRollback(2);
-    expect(c.offset).toBe(9);
-    expect(c.offsets).toEqual([9, 5]);
-    expect(calls).toEqual([2]);
+    c.specRoundRollback(0);
+    expect(c.offset).toBe(7);
+    expect(c.offsets).toEqual([7, 3]);
     c.specRoundBegin();
-    recordRound(c, 3, calls);
+    recordRound(c, 3);
     c.specRoundCommit();
-    expect(c.offsets).toEqual([12, 8]);
+    expect(c.offsets).toEqual([10, 6]);
     c.dispose();
   });
 
@@ -211,8 +211,7 @@ describe("SSMCache speculative round lifecycle", () => {
     // Armed but never recorded (forward threw before the SSM layer ran).
     expect(() => c.specRoundRollback(1)).toThrow(/before the verify forward/);
     c.specRoundBegin(); // re-arm over the stale round — must not leak/throw
-    const calls: number[] = [];
-    recordRound(c, 2, calls);
+    recordRound(c, 2);
     expect(() => c.specRoundRollback(5)).toThrow(/outside window/);
     c.dispose(); // mid-round dispose frees snapshot + recordings
     expect(c.specRound).toBeNull();
