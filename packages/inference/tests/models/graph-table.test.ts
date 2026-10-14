@@ -78,11 +78,14 @@ describe("a graph table", () => {
       entry("turbo", { kv: [{ kind: "turbo", kBits: 8, vBits: 3 }], device: "applegpu_g14s" }),
       entry("generic", {}),
     ]);
-    expect(table.match(undefined, composition({ aneBridge: false })).id).toBe("ane");
+    expect(table.match(undefined, composition({ draftDepth: 7 })).id).toBe("verify");
+    expect(table.match(undefined, composition({ draftDepth: { adaptive: true, max: 7 } })).id).toBe("verify");
+    expect(table.match(undefined, composition({ draftDepth: 8 })).id).toBe("generic");
+    expect(table.match(undefined, composition({ draftDepth: 8, maxRows: 4 })).id).toBe("verify");
     expect(table.match(undefined, composition({ device: M1_MAX, draftDepth: { adaptive: true, max: 7 } })).id).toBe("depth");
     expect(table.match(undefined, composition({ device: M1_MAX, draftDepth: 7 })).id).toBe("generic");
     expect(table.match(undefined, composition({ device: M1_MAX, prefillChunkTokens: 512, adapters: true })).id).toBe("chunk");
-    expect(table.match(undefined, composition({ device: M1_MAX, prefillChunkTokens: 512 })).id).toBe("generic");
+    expect(table.match(undefined, composition({ device: M1_MAX, prefillChunkTokens: 512 })).id).toBe("chunk");
     // Per-layer schemes compare layer by layer, in any order.
     expect(table.match(undefined, composition({ device: "applegpu_g15s",
       kv: { kind: "affine-layers", layers: [{ layer: 0, bits: 4, groupSize: 64 }, { layer: 1, bits: 8, groupSize: 64 }], kernels: "tiled-causal" } })).id).toBe("layers");
@@ -90,6 +93,23 @@ describe("a graph table", () => {
       kv: { kind: "affine-layers", layers: [{ layer: 0, bits: 4, groupSize: 64 }, { layer: 1, bits: 4, groupSize: 64 }], kernels: "tiled-causal" } })).id).toBe("generic");
     expect(table.match(undefined, composition({ device: "applegpu_g14s", kv: { kind: "turbo", kBits: 8, vBits: 3 } })).id).toBe("turbo");
     expect(table.match(undefined, composition({ device: "applegpu_g14s", kv: { kind: "turbo", kBits: 4, vBits: 4 } })).id).toBe("generic");
+  });
+
+  test("an explicit graph bypasses default matching and custom graphs need no registration", () => {
+    let fingerprints = 0;
+    const specialized = entry("m4", { fingerprint: "f", device: M4_PRO, maxRows: 8 });
+    const generic = entry("generic", {});
+    const table = new GraphTable([specialized, generic], () => { fingerprints++; return "different"; });
+    const config = { modelDir: "other-artifact" } as ModelConfig;
+    const otherMachine = composition({ device: M1_MAX, maxRows: 16 });
+    expect(table.select(config, otherMachine).id).toBe("generic");
+    fingerprints = 0;
+    expect(table.select(config, otherMachine, "m4")).toBe(specialized);
+    expect(table.select(config, composition(), "generic")).toBe(generic);
+    const custom = entry("mine", { device: "another-device" });
+    expect(table.select(config, otherMachine, custom)).toBe(custom);
+    expect(fingerprints).toBe(0);
+    expect(() => table.explicit("missing")).toThrow("no graph named missing");
   });
 
   test("construction rejects tables whose selection would refuse or depend on order", () => {

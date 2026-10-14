@@ -89,23 +89,23 @@ export type ServedKv =
   | { readonly kind: "affine-layers"; readonly layers: readonly AffineKvLayer[] }
   | { readonly kind: "turbo"; readonly kBits: number; readonly vBits: number };
 
-/** The composition a graph was built and qualified for, as its {@link GraphTable}
- * entry states it. Each field present constrains the composition; an absent
- * field accepts every value. */
+/** The configurations for which a graph is recommended by default. Each field
+ * present participates in default selection; explicit graph choices bypass it. */
 export interface ServedComposition {
   /** The artifact's fingerprint, as the table's `fingerprint` computes it from the config. */
   readonly fingerprint?: string;
   /** The GPU architecture (`Composition.device`). */
   readonly device?: string;
-  readonly aneBridge?: boolean;
   /** The KV schemes served. A composition matches one with the same kind and
    * widths (every layer's, for a per-layer scheme). */
   readonly kv?: readonly ServedKv[];
   readonly draftDepth?: DraftDepth;
   readonly prefillChunkTokens?: number;
-  readonly adapters?: boolean;
   /** The most rows per forward the graph was built for: a composition with at most this many matches. */
   readonly maxRows?: number;
+  /** The most verification rows the file lists. The scheduler's row cap times
+   * its maximum drafted-window length must fit for default selection. */
+  readonly maxVerifyRows?: number;
 }
 
 /** One graph of a family and the composition it serves. `create` borrows the
@@ -116,9 +116,9 @@ export interface GraphEntry<Source, Model> {
   readonly id: string;
   readonly serves: ServedComposition;
   create(source: Source, config: ModelConfig, composition: Composition): Model;
-  /** The Neural Engine programs `create` loads for `composition`, a function of the composition alone (no
-   * weights, no artifact files): what the install step compiles (`compileAnePrograms`). Absent: none. */
-  anePrograms?(composition: Composition): readonly AneProgramSpec[];
+  /** The programs this file loads, compiled by the install step before loading
+   * weights. The graph's program list takes no composition. Absent: none. */
+  anePrograms?(): readonly AneProgramSpec[];
 }
 
 const kvKey = (scheme: ServedKv): string => {
@@ -133,7 +133,7 @@ const kvKey = (scheme: ServedKv): string => {
 };
 const depthKey = (depth: DraftDepth): string => typeof depth === "number" ? `${depth}` : `adaptive ${depth.max}`;
 const SERVED_FIELDS: readonly (keyof ServedComposition)[] =
-  ["fingerprint", "device", "aneBridge", "kv", "draftDepth", "prefillChunkTokens", "adapters", "maxRows"];
+  ["fingerprint", "device", "kv", "draftDepth", "prefillChunkTokens", "maxRows", "maxVerifyRows"];
 const constraintCount = (serves: ServedComposition): number =>
   SERVED_FIELDS.filter(field => serves[field] !== undefined).length;
 
@@ -141,12 +141,12 @@ const constraintCount = (serves: ServedComposition): number =>
 function meets(serves: ServedComposition, fingerprint: string | undefined, composition: Composition): boolean {
   return (serves.fingerprint === undefined || serves.fingerprint === fingerprint) &&
     (serves.device === undefined || serves.device === composition.device) &&
-    (serves.aneBridge === undefined || serves.aneBridge === composition.aneBridge) &&
     (serves.kv === undefined || serves.kv.some(scheme => kvKey(scheme) === kvKey(composition.kv))) &&
     (serves.draftDepth === undefined || depthKey(serves.draftDepth) === depthKey(composition.draftDepth)) &&
     (serves.prefillChunkTokens === undefined || serves.prefillChunkTokens === composition.prefillChunkTokens) &&
-    (serves.adapters === undefined || serves.adapters === composition.adapters) &&
-    (serves.maxRows === undefined || composition.maxRows <= serves.maxRows);
+    (serves.maxRows === undefined || composition.maxRows <= serves.maxRows) &&
+    (serves.maxVerifyRows === undefined || composition.maxRows *
+      (typeof composition.draftDepth === "number" ? composition.draftDepth + 1 : composition.draftDepth.max + 1) <= serves.maxVerifyRows);
 }
 
 /** Whether one composition could meet both: every field both constrain admits a common value. */
@@ -154,20 +154,18 @@ function overlap(a: ServedComposition, b: ServedComposition): boolean {
   const both = <T>(x: T | undefined, y: T | undefined, joint: (x: T, y: T) => boolean) =>
     x === undefined || y === undefined || joint(x, y);
   return both(a.fingerprint, b.fingerprint, (x, y) => x === y) && both(a.device, b.device, (x, y) => x === y) &&
-    both(a.aneBridge, b.aneBridge, (x, y) => x === y) &&
     both(a.kv, b.kv, (x, y) => x.some(scheme => y.some(other => kvKey(scheme) === kvKey(other)))) &&
     both(a.draftDepth, b.draftDepth, (x, y) => depthKey(x) === depthKey(y)) &&
-    both(a.prefillChunkTokens, b.prefillChunkTokens, (x, y) => x === y) &&
-    both(a.adapters, b.adapters, (x, y) => x === y);
+    both(a.prefillChunkTokens, b.prefillChunkTokens, (x, y) => x === y);
 }
 
 /**
- * A family's graphs, selected by composition. An entry is a composition its
- * graph was built and qualified for; adding a graph means adding an entry. The
+ * A family's default graph recommendations, selected by composition. Adding a
+ * recommended graph means adding an entry. Callers may supply any graph directly. The
  * family's generic graph is the one entry that constrains nothing.
  *
- * Selection runs once, when the loader builds the graph, and its result is the
- * graph: among the entries whose every constraint the composition meets, the one
+ * Default selection runs once, when the loader loads the graph: among the entries
+ * whose every constraint the composition meets, the one
  * constraining the most fields wins. The generic entry meets every composition,
  * so the table never refuses; a request the built graph cannot serve is refused
  * before it runs, by the gateway's planning from the graph's declared
@@ -202,9 +200,20 @@ export class GraphTable<Source, Model> {
     this.#fingerprint = fingerprint;
   }
 
-  /** The entry serving `composition` for the artifact `config` describes. */
-  select(config: ModelConfig, composition: Composition): GraphEntry<Source, Model> {
+  /** Recommend a default, or return the caller's explicit choice unchanged.
+   * A supplied entry needs no registration and is not checked against the
+   * recommendation's device, artifact or configuration keys. */
+  select(config: ModelConfig, composition: Composition, graph?: string | GraphEntry<Source, Model>): GraphEntry<Source, Model> {
+    if (graph !== undefined) return this.explicit(graph);
     return this.match(this.#fingerprint?.(config), composition);
+  }
+
+  /** Resolve a named shipped graph or accept the caller's own graph entry. */
+  explicit(graph: string | GraphEntry<Source, Model>): GraphEntry<Source, Model> {
+    if (typeof graph !== "string") return graph;
+    const entry = this.entries.find(entry => entry.id === graph);
+    if (!entry) throw new Error(`graph table has no graph named ${graph}`);
+    return entry;
   }
 
   /** The entry serving `composition` on an artifact with `fingerprint` (as the table computes it). */
