@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { Cache } from "../../src/contracts/mlx/cache";
+import type { ModelConfig } from "../../src/artifacts/config";
+import type { MlxTokenGraph } from "../../src/models/graph";
+import { declareGraph } from "../../src/models/capabilities";
+import { bindMlxAutoregressiveGraph } from "../../src/generation/bindings/autoregressive";
 import type { MlxCapturingForward, MlxTokenPhases } from "../../src/contracts/mlx/graph";
 import { MlxPhaseDispatch, promptWorkStep, verifyWorkStep } from "../../src/generation/phase-dispatch";
 
@@ -73,6 +77,21 @@ test("known-span ranges preserve a whole grammar span beyond decode and verify c
   expect(calls).toEqual([{ids:input,state}]);
 });
 
+test("prepared embedding dispatch selects total rows and preserves every borrowed argument",()=>{
+  const embeddings={} as MlxArray,ids={} as MlxArray,imageMask={} as MlxArray,multimodalMask={} as MlxArray,state:Cache[]=[];
+  const calls:unknown[][]=[];
+  const narrow=(...args:unknown[])=>{calls.push(["narrow",...args]);return embeddings;};
+  const wide=(...args:unknown[])=>{calls.push(["wide",...args]);return embeddings;};
+  const model={...graph(false),weightsBytes:0,makeCache:()=>[],dispose:()=>{},
+    config:{modelType:"test",eosTokenIds:[]} as unknown as ModelConfig,
+    graphCapabilities:declareGraph({prefill:{boundedWorkspace:false}}),
+    embeddingPrompt:[{from:1,to:4,operation:narrow},{from:5,to:Infinity,operation:wide}],
+  } satisfies MlxTokenGraph;
+  const binding=bindMlxAutoregressiveGraph(model);
+  expect(binding.prefillEmbeddings!(embeddings,state,imageMask,ids,multimodalMask,4)).toBe(embeddings);
+  expect(binding.prefillEmbeddings!(embeddings,state,imageMask,ids,multimodalMask,40)).toBe(embeddings);
+  expect(calls).toEqual([["narrow",embeddings,state,imageMask,ids,multimodalMask],["wide",embeddings,state,imageMask,ids,multimodalMask]]);
+});
 
 test("literal row tables can reuse one operation, alternate operations, or declare eight distinct operations",()=>{
   const shared=op("shared"),odd=op("odd"),even=op("even");
