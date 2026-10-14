@@ -238,6 +238,11 @@ export interface MlxDeclaredGraph {
    *  single-row decode step (rows 1 = 1). Declared only by a graph measured on
    *  the hardware it serves; speculative depth scheduling reads it. */
   readonly verifyRoundCosts?: ReadonlyMap<number, number>;
+  /** The widest adaptive round per draft provider kind, measured on the hardware
+   *  it serves: an adaptive drafter of a listed kind drafts up to it instead of
+   *  its own width, unless the request names a width. Absent, or a kind it does
+   *  not list: the drafter's own width. */
+  readonly adaptiveDraftWidths?: ReadonlyMap<string, number>;
   /** Committed known-token spans, declared when the composition qualifies them
    *  (`appendKnown` then reads committed). */
   readonly knownSpans?: MlxKnownSpans;

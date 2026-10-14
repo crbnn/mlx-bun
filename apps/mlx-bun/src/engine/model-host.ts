@@ -81,6 +81,8 @@ export interface ModelContext<Model = RuntimeModel> {
     adaptiveDepth?: boolean;
     /** The provider is the checkpoint's own draft head, not a configured drafter. */
     native?: true;
+    /** The registered kind that loaded it (a graph may declare an adaptive width for it). */
+    kind?: string;
   } | null;
   /** The composition this load resolved before building the graph: device,
    * Neural Engine bridge, KV scheme, draft depth, prefill chunk, adapters and
@@ -307,7 +309,7 @@ export async function loadContext(
         throw new Error(`--draft-kind ${resolvedDraftKind} requires --draft-model`);
       draft = await draftRegistry.load(resolvedDraftKind, {
         dir: opts.draftModelDir, target: { vocabSize: config.text.vocabSize, tokenizer },
-        numDraftTokens: opts.numDraftTokens, adaptive: opts.adaptiveDraftDepth, ngram: { max: opts.ngramMax, min: opts.ngramMin },
+        numDraftTokens: opts.numDraftTokens, ngram: { max: opts.ngramMax, min: opts.ngramMin },
       });
       owned.add(draft.provider);
       // A model-free provider has no pairing to probe and no weights to budget.
@@ -384,9 +386,12 @@ export async function loadContext(
     if (draft) owned.add(draft.provider);
     if (opts.adaptiveDraftDepth) {
       if (!draft) throw new Error("--num-draft-tokens adaptive needs a drafter (--draft-model, --draft-kind or the checkpoint's MTP head)");
-      if (!declaredGraph(model).verifyRoundCosts)
+      const graph = declaredGraph(model);
+      if (!graph.verifyRoundCosts)
         throw new Error("--num-draft-tokens adaptive needs a graph measured on this machine (one that declares its verify costs); this model's graph does not");
-      draft = { ...draft, adaptiveDepth: true };
+      // A drafter kind whose adaptive width the graph measured drafts up to it, unless the request named a width.
+      const width = opts.numDraftTokens === undefined && draft.kind !== undefined ? graph.adaptiveDraftWidths?.get(draft.kind) : undefined;
+      draft = { ...draft, adaptiveDepth: true, ...(width === undefined ? {} : { numDraftTokens: width }) };
     }
     const adapters = new AdapterManager(model);
     owned.add({ dispose() { disposeResources(adapters.list().map(({ id }) => ({ dispose() { adapters.unmount(id); } }))); } });

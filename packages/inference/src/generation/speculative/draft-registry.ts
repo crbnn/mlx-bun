@@ -37,9 +37,6 @@ export interface DraftLoadRequest {
   readonly target: DraftTarget;
   /** Requested draft tokens per round; each kind applies its own default and bound. */
   readonly numDraftTokens?: number;
-  /** Each round's count is chosen up to the width (`--num-draft-tokens adaptive`): a kind whose default width is a
-   *  trained block it can draft past may widen it. */
-  readonly adaptive?: boolean;
   /** Prompt-lookup window, for the kind that has one. */
   readonly ngram?: { readonly max?: number; readonly min?: number };
 }
@@ -47,6 +44,8 @@ export interface DraftLoadRequest {
 export interface LoadedDraft {
   readonly provider: DraftProvider;
   readonly numDraftTokens: number;
+  /** The registered kind that loaded it (a graph may declare an adaptive width for it). */
+  readonly kind?: string;
 }
 
 export interface DraftProviderKind {
@@ -105,7 +104,7 @@ export class DraftProviderRegistry {
   async load(kind: string, request: DraftLoadRequest): Promise<LoadedDraft> {
     const entry = this.#kinds.get(kind);
     if (!entry) throw new Error(`unknown draft provider kind ${kind} (registered: ${this.kinds().join(", ")})`);
-    return entry.load(request);
+    return { ...await entry.load(request), kind };
   }
 
   /** The draft the graph declares it carries, or null when it declares none. */
@@ -114,6 +113,6 @@ export class DraftProviderRegistry {
     if (!declared) return null;
     const kind = this.#native.get(declared.kind);
     if (!kind) throw new Error(`the graph declares native draft ${declared.kind}, which no provider is registered for`);
-    return { provider: await kind.create(graph), numDraftTokens: declared.numDraftTokens };
+    return { provider: await kind.create(graph), numDraftTokens: declared.numDraftTokens, kind: declared.kind };
   }
 }

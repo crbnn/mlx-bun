@@ -68,6 +68,10 @@ export interface Qwen38Composition {
    *  against the decayed acceptance rate. Absent: the graph declares none, and `--num-draft-tokens adaptive` is
    *  refused on it. */
   readonly verifyRoundCosts?: { readonly host: string; readonly costs: readonly (readonly [number, number])[] };
+  /** The widest adaptive round per draft provider kind, measured for this composition on its host
+   *  (\`MlxDeclaredGraph.adaptiveDraftWidths\`): an adaptive drafter of a listed kind drafts up to it instead of its own
+   *  width. Absent: every drafter its own width. */
+  readonly adaptiveDraftWidths?: readonly (readonly [string, number])[];
   /** The graph declares its weights wired for each generation (`MlxModelMemory.wiredWeights`), measured for this
    *  composition on its host, where their share of the recommended working set alone would leave them unwired.
    *  Absent: the share decides. */
@@ -112,6 +116,9 @@ export const QWEN38_COMPOSITIONS: Readonly<Record<string, Qwen38Composition>> = 
     // the DFlash 2 drafter at depths 1..7 against the depth-0 plain arm (54.5-55.9 ms per token), bf16 KV, greedy,
     // two prompts, 128 tokens, four sessions of two repetitions, whose ratios span under 2.5% at every width.
     verifyRoundCosts: { host: "M1 Max 32 GB", costs: [[1, 1], [2, 2.01], [3, 2.42], [4, 2.56], [5, 2.69], [6, 2.78], [7, 2.87], [8, 2.96]] },
+    // Measured 2026-10-13 on this graph and artifact: scripts/bench-mtp.ts, the MTP head adaptive up to 2 (its
+    // trained block) 18.0 tok/s, up to 4 19.9, up to 7 19.1 (fixed depth 3 18.6), greedy, three prompts, 128 tokens.
+    adaptiveDraftWidths: [["mtp", 4]],
     // Measured 2026-10-13 on the M1 Max 32 GB, where the 11.96e9 B weights are under half the 26.8e9 B recommended
     // set: wired, bit-identical, paired A/B, GPU prefill 1k/8k 136/142 -> 143/145 tok/s; with the Neural Engine
     // split 171/173 -> 172/177 and the first GPU step after the split 0.15-1.4 s -> 61-69 ms; one-row decode
@@ -908,6 +915,10 @@ ${c.wiredWeights ? `  /** Its weights are wired for each generation, whatever th
 ${c.verifyRoundCosts ? `  /** Verify forward cost by rows relative to one decode step (${c.verifyRoundCosts.host}). */
   readonly verifyRoundCosts: ReadonlyMap<number, number> = new Map([
     ${c.verifyRoundCosts.costs.map(([rows, cost]) => `[${rows}, ${cost}]`).join(", ")},
+  ]);
+` : ""}${c.adaptiveDraftWidths ? `  /** The widest adaptive round per draft provider kind${c.verifyRoundCosts ? ` (${c.verifyRoundCosts.host})` : ""}. */
+  readonly adaptiveDraftWidths: ReadonlyMap<string, number> = new Map([
+    ${c.adaptiveDraftWidths.map(([kind, width]) => `[${JSON.stringify(kind)}, ${width}]`).join(", ")},
   ]);
 ` : ""}
   readonly prefillChunk: MlxPrefillChunk;

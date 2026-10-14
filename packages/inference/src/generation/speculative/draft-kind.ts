@@ -79,12 +79,6 @@ const assistant: DraftProviderKind = {
   },
 };
 
-/** The widest adaptive MTP round, measured on the M1 Max 32 GB (Qwen3.8-27B Trellis, scripts/bench-mtp.ts, greedy,
- *  three prompts, 128 tokens, 2026-10-13): adaptive up to 2 (the trained block) 18.0 tok/s, up to 4 19.9, up to 7
- *  19.1, fixed depth 3 18.6. Past four drafts the head's acceptance falls faster than the shared verify costs assume
- *  (they are the DFlash 2 rounds'), so deeper caps lose. */
-const ADAPTIVE_MTP_WIDTH = 4;
-
 /** Native MTP heads split from a qwen3_5-family release
  *  (mlx-community/Qwen3.8-27B-MTP-*). The target's recurrent DeltaNet caches
  *  roll back via the serve loop's spec-round snapshot/replay contract
@@ -99,11 +93,11 @@ const mtp: DraftProviderKind = {
     // Default the round width to the head's trained block (block_size 3 → 2
     // recursive drafts + the pending row per round; the head was trained
     // multi-step, so an explicit larger width is allowed but acceptance
-    // decides whether it pays). Adaptive rounds draft up to ADAPTIVE_MTP_WIDTH:
-    // the gate's per-position acceptance stops the recursion where it stops paying.
+    // decides whether it pays). A graph may declare the adaptive width it
+    // measured for this kind (`adaptiveDraftWidths`).
     const block = (await Bun.file(`${dir}/config.json`).json() as { block_size?: number }).block_size;
-    const numDraftTokens = request.numDraftTokens === undefined && request.adaptive ? ADAPTIVE_MTP_WIDTH
-      : request.numDraftTokens === undefined && typeof block === "number" ? Math.max(1, block - 1) : fixedWidth(request, 3);
+    const numDraftTokens = request.numDraftTokens === undefined && typeof block === "number"
+      ? Math.max(1, block - 1) : fixedWidth(request, 3);
     return { provider, numDraftTokens };
   },
 };

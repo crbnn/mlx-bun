@@ -301,6 +301,10 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
   readonly verifyRoundCosts: ReadonlyMap<number, number> = new Map([
     [1, 1], [2, 2.01], [3, 2.42], [4, 2.56], [5, 2.69], [6, 2.78], [7, 2.87], [8, 2.96],
   ]);
+  /** The widest adaptive round per draft provider kind (M1 Max 32 GB). */
+  readonly adaptiveDraftWidths: ReadonlyMap<string, number> = new Map([
+    ["mtp", 4],
+  ]);
 
   readonly prefillChunk: MlxPrefillChunk;
   readonly prefillTail: MlxWidthTable<RowsForward>;
