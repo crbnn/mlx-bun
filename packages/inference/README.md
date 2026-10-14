@@ -3,7 +3,7 @@
 Composable inference components built on [`@mlx-bun/mlx`](../mlx/README.md).
 Callers choose artifacts and graphs, own state, and invoke inference directly.
 The package includes the kernels, the layers that bind them, the entire graphs
-the loader builds for each composition, the cache legos, input processing,
+selected by the loader for each composition, the cache legos, input processing,
 sampling, generation, embeddings, transcription, and optional execution.
 
 ## Contracts and composition
@@ -23,7 +23,7 @@ targets; prompt preparation accepts encoder interfaces. Callers can supply their
 own implementations without subclassing a concrete model or cache.
 
 Each graph declares what it can do (`GraphCapabilities`, portable; a model exposes
-it as `graphCapabilities`): its method, adapters (batched rows, mountable), media
+it as `graphCapabilities`): its method, media
 input, compiled decode, sparse attention, pooled embeddings, hidden-layer taps for
 drafts, a draft head its checkpoint carries (`nativeDraft`), whether long prompts prefill in workspace-bounded
 chunks, and what its verifier qualifies (adapters, logprobs, external tokens,
@@ -46,9 +46,9 @@ graph (`models/gemma4/compiled-decode`) and reaches them through `compiledDecode
 it drives caches through the `CompiledDecodeCache` protocol (`contracts/mlx/cache`,
 implemented by the KV caches in `state/`) and names no cache class. Every cache
 lego has that form except direct pages the kernel reads, which declare none
-(`pagedDecodeCompiles` in `state/paged/cache`); the loader resolves
-`Composition.compiledDecode` off for such a composition, once, and nothing asks
-a cache at run time.
+(`pagedDecodeCompiles` in `state/paged/cache`). The autoregressive binding resolves
+replay eligibility from the paging and KV configuration once; requests with active
+adapters use the ordinary declared operations.
 The architecture gate rejects concrete model imports, model-class `instanceof`,
 model-type and `architectures` checks, family predicates and model-scoped flags there,
 in the app's engine, server and CLI, and in `@mlx-bun/training`. What those need to
@@ -72,18 +72,14 @@ out). `trainable`
 `lmHead` for fused linear-CE heads, `segmented` backward (how a range of layers
 runs and which reused K/V crosses segment boundaries), `prefixShared` forwards,
 `gradCheckpoint`, the `flashAttention` constraint, and the `denoising` objective.
-The trainer names the declaration a graph lacks. A model-level option is a field
-of the composition record (`contracts/portable/composition`, defaults in
-`COMPOSITION_DEFAULTS`), resolved once at load by `resolveComposition`
-(`models/composition`) from the caller's `CompositionRequest` and the machine: the
-GPU (`device`), the Neural Engine bridge (`aneBridge`), the KV scheme and paging
-(`kv`, `pagedKv`), draft depth, the prefill chunk, adapters, rows per forward
-(`maxRows`), and the layers' and scheduler's choices (`packedMixedMlp`,
-`vectorGreedySampling`, `compiledDecode`, `mixedPrefill`, `mixedTokenBudget`,
-`prefillTailSplit`, `grammarJump`, `greedyDraft`, `compiledGeglu`, `compiledSwiglu`). The app sets
-the KV scheme, paging, adapters, rows and drafter from `serve`'s flags; the other
-fields keep their defaults there. Nothing below the loader reads them from the
-environment.
+The trainer names the declaration a graph lacks. The loader resolves module configuration once
+(`contracts/portable/composition`, `models/composition`) from the caller's request
+and the machine: KV scheme and paging, scheduler row cap and prompt chunk size,
+draft method and depth, sampling and request policy. The file names its kernel
+and compilation choices. Alternative layer forms remain importable for callers
+writing their own graphs. Each request names its adapter file; its trained delta
+adds to the outputs of the projections it targets, under that request's scheduler
+context, independently of the file's projection kernel choices.
 
 ## Numerical and execution policy
 
@@ -180,24 +176,16 @@ requires bytes equal to the generic graph's; it caught the committed e4b graph s
 its per-layer inputs for one row, and passes on e4b and 12B after regeneration
 (2026-09-29, M1 Max).
 
-The generated files are compiled from the model description by
-`bun packages/inference/scripts/gen-gemma4.ts <model-dir> <composition>`
-(`gemma4-12b`, `gemma4-e4b`, `gemma4-26b`; `--help` for usage), which reads `config.json`,
-`kv_config.json` and the index's tensor names, never weights. A change to
-the shared blocks (`models/gemma4/blocks.ts`) or the generator is a regeneration, not a hand edit.
-[`tests/models/gemma4-generated-sync.test.ts`](tests/models/gemma4-generated-sync.test.ts)
-regenerates all three from the committed inputs in `tests/fixtures/gemma4-graphs`
-(stripped hub-layout copies of the three snapshots) and fails when a committed
-file differs; it does not say the regenerated graph is numerically right, which
-is the real-weight test above.
+The three Gemma files are written directly under `models/gemma4/`. Each names
+its sliding/full attention, KV donors, per-layer inputs, activation and expert
+operations in order. Changes to one file are checked by that file's numerical
+gates. A shared block or kernel change reaches the files that import it.
 
-What says a generated graph is numerically right: the identity tests compare each generated
-graph against its family's generic graph at maxDiff 0 wherever both serve the composition (the
-M4 Pro graph's chunk, tail and verify, the M1 Max graph's every phase from five rows, each
-generated Gemma graph under its `kv_config`); the real-weight parity suites and the app-path
-digests (`scripts/digest.ts`) hold the served numbers; recorded synthetic digests
-(`scripts/synthetic-digests.ts`) hold the cases no artifact covers. The tree keeps no frozen
-copy of replaced code.
+The identity tests compare each specialized file with its family's generic graph
+at maxDiff 0 where both serve the same operation. Real-weight parity suites and
+app-path digests (`scripts/digest.ts`) hold the served numbers; recorded synthetic
+digests (`scripts/synthetic-digests.ts`) cover cases without an artifact. There is
+no source generator, parallel input description or generator drift test.
 
 On 2026-09-27 UTC, the rotating live-window correction (source `5ec1f4ae`) was
 checked on the same M1 Max (MLX 0.32.2, pinned native library) against selections
@@ -945,9 +933,9 @@ and `models/universal`.
 `models/glm52`, `models/diffusion-gemma`, and `models/whisper` provide the other
 graph families.
 `@mlx-bun/inference/models` exposes the profile/implementation registry, the
-composition resolver and model construction helpers: `createModel` builds the graph
-its family's selection table (`MLX_GRAPH_TABLES`) picks for the composition, the most
-constrained entry that serves it, else the family's generic graph. Direct graph
+composition resolver and loading helpers: `createModel` loads the graph
+its family's selection table (`MLX_GRAPH_TABLES`) recommends for the composition,
+else the family's generic graph. Direct graph
 constructors remain available. Runtimes
 that plan memory before opening weights (streamed experts) are opened with
 `openPlannedRuntime` from generic `RuntimeOpenOptions` and return a generic
@@ -956,43 +944,32 @@ returns the plan from artifact headers, or null for models without one. A graph
 that carries its own draft head declares it (`GraphCapabilities.nativeDraft`), and
 `DraftProviderRegistry.native(graph)` builds the provider.
 
-`models/qwen38-27b-trellis-m4pro` and `models/qwen38-27b-trellis-m1max` are the
-entire graphs `scripts/gen-qwen38.ts` generates for `mlx-bun/Qwen3.8-27B-Trellis-3.2bpw`
-from the shared blocks (`models/qwen/blocks.ts`);
-[`tests/models/qwen38-generated-sync.test.ts`](tests/models/qwen38-generated-sync.test.ts)
-regenerates both from `tests/fixtures/qwen38-graphs` and fails on a diff. The Qwen 3.5
-table selects the M4 Pro graph for that artifact on M4 Pro GPUs (`applegpu_g16s`)
-under bf16 or affine 4-bit group-64 KV with at most 8 rows per forward, the M1 Max
-graph on M1 Max GPUs (`applegpu_g13s`) under every KV scheme and row count, and the
-family's generic Qwen 3.5 graph for any other composition of that artifact.
-Each builds, at construction, one operation per phase and width class from the
-composition and its device's one-kernel layers. On the M4 Pro: factored Trellis row
-kernels at one to four rows (the matrix-unit down at four) and the matrix-unit set
-at five to eight for decode and verify, with the affine projections and the head on
-the affine row kernels at two to four rows and the matrix-unit ones at five to eight;
-and, when the composition has the
-Neural Engine bridge (`aneBridge`, on by default; a bridge that does not load fails
-the load with `AneBridgeError`) and mounts no adapters, Neural Engine operations that
-split each layer between the Neural Engine and the GPU (`prefillChunk.ane`), each
-declaring the row range it takes: the scheduler runs any one-sequence prompt piece,
-a whole chunk or a tail, of 640 to 2048 positions on the one whose programs (1024,
-1536 or 2048 positions) hold it, as main's M4 Pro graph did; a
-composition that mounts adapters builds every operation on the generic blocks. On
-the M1 Max: the reduce and scatter kernels at one to four rows and the generic
-blocks above. On both, wider windows, prompt chunks on the GPU, tails and vision
-positions run the generic blocks inside the graph; known-token spans do too on the
-M4 Pro, and append as windows on the block set of their width on the M1 Max. Each
-generated file's header lists its operations and the request shapes it serves.
-Each declares `verifyRoundCosts`, the verify cost by row count measured for
-its composition on its GPU (a field of the generator's composition), which adaptive
-draft depth reads.
+`models/qwen38-27b-trellis-m4pro` and `models/qwen38-27b-trellis-m1max` are
+separate written files for `mlx-bun/Qwen3.8-27B-Trellis-3.2bpw`. Each lists all 64
+layers and the literal projection and MLP classes for its row bindings. M4 Pro
+uses factored row kernels, the matrix-unit down at four rows and the matrix-unit
+set at five to eight; M1 Max uses its Reduce and Scatter layers. GPU prompt
+operations are explicit contiguous ranges, retaining each measured kernel's
+existing arithmetic. The M4 Pro file also declares its Neural Engine operations
+for 640..1024, 1025..1536 and 1537..2048 positions. The scheduler indexes that
+range for a one-sequence prompt piece; installation compiles the listed programs
+before loading. The graph has no bridge flag or adapter-dependent fallback.
 
-For explicit state and tensor operations, use `graph.makeCache()`, the graph's
-named phases (`prefillChunk.gpu`, `prefillTail[width]`, `decode[width]`,
-`verify[width]`, `appendKnown[width]`) and its head (`logits[width]`), each
-indexed by the class of the rows passed (`widthClass` from `contracts/mlx`);
-`examples/qwen3-forward.ts` runs a prompt tail and a decode. Release state with
-each cache's `dispose()` and release returned arrays when finished.
+The loader recommends a file from its artifact, device and module-configuration
+keys. These are defaults: callers can explicitly choose a differently tuned file,
+a portable or device-tuned generic family graph, or supply an ordinary load function to `openModel`'s
+`graph` option. A custom function needs no family registration and returns the
+operations its caller needs, including a graph with prefill and scoring alone.
+The code-authoring rules do not restrict those choices.
+
+For explicit state and tensor operations, compose the cache legos with
+`composeGraphCaches(graph, configuration)` or use the loader-bound `makeCache`.
+Use `MlxPhaseDispatch` to index prompt ranges and exact-row `decode`, `verify`
+and serving `logits` tables. Known appends use whole-span ranges, preserving
+arbitrarily long accepted grammar spans without imposing the verifier's row cap.
+Scoring heads, media and denoising consumers index their own declared ranges. Each file declares verification costs and known-span operations
+where measured. `examples/qwen3-forward.ts` runs a prompt and a decode through
+these public components. Dispose each cache and returned array when finished.
 
 Shared dense/quantized layers, activations, normalization, and RoPE live under
 `layers/`; architecture assembly lives under `models/<family>/`. DeltaNet

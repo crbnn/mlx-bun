@@ -28,7 +28,7 @@ layers. Device matching guides default selection and does not restrict that choi
 govern the code we write, not which graphs people may use. The scheduler routes the work: the phase, the row count, a
 prompt piece to the Neural Engine operation whose range the file lists, a request's adapter to that
 request's rows. Nothing is checked at load or at run time. The checks happened before the user
-installed mlx-bun: profiling decided which kernel each layer runs at each width on each machine,
+installed mlx-bun: profiling decided which kernel each layer runs at each row count on each machine,
 and the bit gates recorded what the file produces. Users who write their own graph import the same
 layers and arrange whatever they want; nothing registers them and nothing generates for them.
 
@@ -74,11 +74,13 @@ Binding for every graph file in the tree, held by the architecture gate where me
   M4 Pro exports its Neural Engine operations the way it exports any layer, the install step compiles
   the programs that file lists, and a program missing at load is an install that did not finish,
   which fails loudly. The composition's bridge field goes.
-- A phase table is keyed by the row count itself: decode, verify, logits and known appends by
-  exact rows from one up to the composition's cap, several rows naming the same operation where the
-  kernels are the same; prompt pieces by contiguous position ranges (the Neural Engine entries are
-  already this). The scheduler describes the work as N rows and indexes, choosing nothing. The five
-  width names and `widthClass` leave the contract. New kernels change lines in a file, never what the
+- A phase table is keyed by the row count itself: decode, verify and serving logits by
+  exact rows from one up to the scheduler's cap. Every row can name the same operation,
+  alternate operations or name a different one; evidence populates the table, not the API.
+  Prompt pieces use contiguous position ranges. Whole known appends and full-sequence heads
+  use row ranges without the verifier's cap, preserving accepted grammar spans and scoring
+  sequences as one forward. The scheduler describes the work as N rows and indexes, choosing
+  nothing. The five width names and `widthClass` leave the contract. New kernels change lines in a file, never what the
   scheduler understands.
 - A layer binds exactly one kernel and decides nothing at call time either. Where a layer today
   picks a kernel by row count, width, compiled form or adapter state, it becomes one class per
@@ -118,9 +120,9 @@ One PR per item, targeting `refactor/graph-files` and merged there as its gate p
 matrix runs once at the end. Agents do the work; Josh reviews the plan, I review and merge the PRs.
 
 - [ ] **G1. The contract and the scheduler.** `MlxTokenPhases` becomes row-keyed: `decode`,
-      `verify`, `logits`, `appendKnown` as tables from exact row count to operation, up to the
-      composition's cap; `prompt` as an ordered list of `{ from, to, operation }` position ranges for
-      one-sequence pieces (replacing `prefillChunk.gpu`, `prefillChunk.ane` and `prefillTail`), plus
+      `verify` and serving `logits` as tables from exact row count to operation, up to the
+      scheduler's cap; whole `appendKnown` spans use declared row ranges; `prompt` as an ordered
+      list of `{ from, to, operation }` position ranges for one-sequence pieces (replacing `prefillChunk.gpu`, `prefillChunk.ane` and `prefillTail`), plus
       the multi-sequence chunk operation. `phase-dispatch.ts` indexes by rows and by range.
       `widthClass`, `MlxWidthClass`, `byWidth`, `atEveryWidth` go. Adapters: the delta that
       `QuantizedLinear` applies inside its forward today becomes a layer applied after any
@@ -199,13 +201,13 @@ matrix runs once at the end. Agents do the work; Josh reviews the plan, I review
 ## Composition refactor
 
 Landed on `refactor/composition` (PR #323 to `main`), 2026-10-10 to 2026-10-12. Every served
-configuration is one composition built at load; the loader selects the graph from a table keyed
-on the composition; the scheduler names the phase and the width; the cache owns storage, the
+configuration is one composition resolved at load; the loader selects the graph from a table keyed
+on the composition; the scheduler names the phase and the row count; the cache owns storage, the
 read, prefix reuse, paging, SSD offload and eviction; drafters bind one selection operation;
-every graph is an entire graph built for a composition and extends nothing; the architecture
+every graph is a written arrangement selected at load and extends nothing; the architecture
 gate holds the rules with an empty ratchet. The rules and the ownership live in
 [ARCHITECTURE.md](ARCHITECTURE.md); the evidence per step is in the PR description, the merged
-PRs' descriptions and this file's history; the gates are the generator drift tests, the
+PRs' descriptions and this file's history; the gates are the written-file architecture rules, the
 conformance suites, the identity tests against each family's generic graph, the recorded
 synthetic digests, the real-weight parity suites, `packages/inference/scripts/digest.ts` and
 `teacher-forced-kl.ts`, and the paired check in `.github/workflows/perf.yml`.
