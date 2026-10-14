@@ -119,8 +119,9 @@ owns prefix reuse, paging, SSD offload and eviction behind that interface and
 answers hit or miss. The graph names its phases (`MlxTokenPhases`:
 `decode`, `verify` and serving `logits` indexed by exact positive row count;
 prompt operations, known appends and full-sequence heads listed over contiguous
-row or position ranges). The scheduler
-indexes the rows it batched and dispatches prompt pieces to the GPU or Neural Engine as a
+row or position ranges). Exact-row tables can declare a fixed default for counts
+beyond their explicit entries; prompt chunks and tails can bind different ranges.
+The scheduler indexes the rows it batched and dispatches prompt pieces to the GPU or Neural Engine as a
 resource it manages. Row-wise layers take M rows and do not know whether they
 are one sequence or M; only `attend` and the recurrence see the row layout.
 

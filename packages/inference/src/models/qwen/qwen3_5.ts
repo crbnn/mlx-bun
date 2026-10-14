@@ -144,6 +144,8 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
       return { from, to, layers: this.layers.map((layer, index) => this.#layerView(weights, config, layer, index, operations[index]!, false)),
         media: this.layers.map((layer, index) => this.#layerView(weights, config, layer, index, operations[index]!, true)) };
     };
+    const unfusedNarrow=bind(1,4,base=>base.kind==="affine" ? affineMlp(base)
+      : new TrellisUnfusedMLP(packedProjection(base.gate),packedProjection(base.up),packedProjection(base.down)));
     this.#ranges = [bind(1, 4, narrow), bind(5, 8, five), bind(9, 15, nine), bind(16, 32, sixteen), bind(33, Infinity, expanded)];
     this.knownSpans = undefined;
     const forward = (range: FixedRange, phase: ReadPhase, bounded: boolean): MlxCapturingForward => (ids, state, capture) =>
@@ -170,10 +172,15 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
       operation: (embeds, cache) => this.forwardLayers(ops.contiguous(embeds), cache, "window", undefined, null, range.layers, range.from > 4) }));
     this.mixed = this.#ranges.map(range => ({ from: range.from, to: range.to,
       operation: groups => this.#mixedForward(groups, range.layers) }));
+    const packedWithVerification: import("../../contracts/mlx/graph").MlxMixedRange[] = this.#ranges.map(range => ({ from: range.from, to: range.to,
+      totalTo: range.from === 1 ? 4 : undefined,
+      operation: (groups: readonly import("../../contracts/mlx/graph").MlxPhaseGroup[]) => this.#mixedForward(groups, range.layers) }));
+    packedWithVerification.push({ from: 1, to: 4, totalTo: undefined, totalFrom: 5,
+      operation: groups => this.#mixedForward(groups, unfusedNarrow.layers) });
     const separated = (phase: ReadPhase) => this.#ranges.map(range => ({ from: range.from, to: range.to,
       operation: (group: import("../../contracts/mlx/graph").MlxPhaseGroup) => this.#captured(this.forwardLayers(this.embed.encode(group.ids), group.state, phase,
         undefined, group.capture, range.layers, group.phase === "window" && range.from > 4), group.capture) }));
-    this.mixedSeparate = { decode: separated("decode"), window: separated("window"), verify: separated("window") };
+    this.mixedSeparate = { packed: packedWithVerification, decode: separated("decode"), window: separated("window"), verify: separated("window") };
 
     this.cacheLayers = this.layers.map(layer => layer.isLinear ? {kind:"recurrent" as const} : {kind:"full" as const,turboQuant:"dense" as const});
   }
@@ -243,9 +250,6 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly prompt: readonly MlxPromptRange[];
   readonly multiSequencePrompt: readonly MlxPromptRange[];
 
-  /** A prompt's positions that are not a whole chunk, on the MLP kernels of
-   * their width; above four rows each layer is evaluated before the next. */
-
   /** One new token per sequence: `ids` [sequences, 1], so rows are sequences. */
   readonly decode: MlxRowTable<MlxCapturingForward>;
 
@@ -256,12 +260,12 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
    * caller's speculative transaction, begun before this call. */
   readonly verify: MlxRowTable<MlxVerifyForward>;
 
-  /** Committed known-token spans, when the composition qualifies them (`#qualifiesKnownSpans`). */
+  /** This generic graph does not declare specialized known-span cache behavior. */
   readonly knownSpans: MlxKnownSpans | undefined;
   /** Known tokens: the committed read under `knownSpans`, the window read otherwise. */
   readonly appendKnown: import("../../contracts/mlx/graph").MlxKnownOperations;
 
-  /** The one output head at every width. */
+  /** The same output head at every declared numeric row. */
   readonly logits: MlxRowTable<MlxHeadForward>;
 
   /** Hands `capture` the post-final-norm output after its layers, and returns it. */
@@ -270,13 +274,9 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
     return hidden;
   }
 
-  /** Mixed rows in one forward: each group's attention and DeltaNet read its
-   * own caches in its own phase (a verify group reads a window). The MLP rows
-   * of the groups that may share it run as one call at `width`, the class of
-   * the groups' rows, when the composition packs mixed MLP; a verify group
-   * keeps its own geometry (`mapTokenGroups`). A prompt group above four rows
-   * evaluates each layer and the groups' recurrent state before the next, as
-   * the prompt tail does. */
+  /** Each group's attention reads its own caches and phase. Declared packed
+   * operations share the nonverify MLP rows; verification keeps its own geometry.
+   * Prompt groups above four rows evaluate each layer and recurrent state. */
   readonly mixed: readonly MlxMixedRange[];
   readonly mixedSeparate: import("../../contracts/mlx/graph").MlxSeparateMixed;
   #mixedForward(groups: readonly import("../../contracts/mlx/graph").MlxPhaseGroup[], layers: readonly FixedLayer[]): MlxArray[] {

@@ -8,20 +8,25 @@ import { MetalKernel } from "@mlx-bun/mlx/metal-kernel";
 // (sdpa_vector_2pass_1_gqa: each simdgroup reads a K/V row once into registers
 // and serves several query heads) with dequantize-on-load. Each lane owns 8 of
 // the 256 dims: one 4-byte load of packed K (and V) per row plus its group's
-// scale and bias. A threadgroup = one KV head × one block of BLOCK = 512
-// tokens, split across SUB = 4 token sub-chunks × 2 head groups (REP/2 heads
-// each; threadgroup memory bounds SUB at 4 for D 256); the sub-chunks combine
-// in threadgroup memory and a second kernel merges blocks. K/V bytes per token
-// vs bf16: ~0.28× (with scales). Online softmax in f32: agrees with the
-// unfused path to bf16 precision, not bit for bit.
-const BLOCK = 512, SUB = 4;
+// scale and bias. A threadgroup = one KV head × one block of BLOCK tokens
+// (the caller's `block`), split across SUB = 4 token sub-chunks × 2 head groups
+// (REP/2 heads each; threadgroup memory bounds SUB at 4 for D 256); the
+// sub-chunks combine in threadgroup memory and a second kernel merges blocks.
+// The cache length is an argument, not a specialization: one pipeline serves
+// every decode step. K/V bytes per token vs bf16: ~0.28× (with scales). Online
+// softmax in f32: agrees with the unfused path to bf16 precision, not bit for
+// bit; the block partitions the softmax, so it is part of the numbers.
+const SUB = 4;
+/** The tokens per threadgroup of the M4 Pro composition, which measured it. */
+export const KV4_DECODE_BLOCK = 512;
 const PARTIAL_SOURCE = String.raw`
   const uint lane = thread_index_in_simdgroup;
   const uint sg = simdgroup_index_in_threadgroup;
   const uint hk = threadgroup_position_in_grid.y, block = threadgroup_position_in_grid.x;
   const uint hg = sg % 2u, sc = sg / 2u;              // head group, token sub-chunk
   constexpr uint HPG = REP / 2;                       // heads per group
-  const uint t0 = block * (uint)BLOCK, tEnd = metal::min((uint)N, t0 + (uint)BLOCK);
+  const uint N = kp_shape[2];                         // cached positions: an argument, not a specialization
+  const uint t0 = block * (uint)BLOCK, tEnd = metal::min(N, t0 + (uint)BLOCK);
   const uint sub = ((uint)BLOCK + (uint)SUB - 1u) / (uint)SUB;
   const uint s0 = t0 + sc * sub, s1 = metal::min(tEnd, s0 + sub);
   // Queries (pre-scaled), 8 dims per lane.
@@ -94,10 +99,11 @@ const PARTIAL_SOURCE = String.raw`
 const MERGE_SOURCE = String.raw`
   const uint d = thread_position_in_grid.x, qv = thread_position_in_grid.y;
   if (d >= (uint)D || qv >= (uint)(KVH * REP)) return;
+  const uint BLOCKS = mpart_shape[0];
   float mmax = -INFINITY;
-  for (uint s = 0; s < (uint)BLOCKS; ++s) mmax = metal::max(mmax, mpart[(ulong)s * (uint)(KVH * REP) + qv]);
+  for (uint s = 0; s < BLOCKS; ++s) mmax = metal::max(mmax, mpart[(ulong)s * (uint)(KVH * REP) + qv]);
   float num = 0.0f, den = 0.0f;
-  for (uint s = 0; s < (uint)BLOCKS; ++s) {
+  for (uint s = 0; s < BLOCKS; ++s) {
     const ulong b = (ulong)s * (uint)(KVH * REP) + qv;
     const float ms = mpart[b];
     if (ms == -INFINITY) continue;
@@ -117,11 +123,13 @@ export function kvq4DecodeEligible(q: MlxArray, keys: ops.QuantizedTensor, group
   return B === 1 && L === 1 && D === 256 && bits === 4 && groupSize === 64 && H % KVH === 0 && (H / KVH) % 2 === 0;
 }
 
-/** q [1, H, 1, 256]; keys/values: 4-bit group-64 affine [1, KVH, N, ·] (any strides) → [1, H, 1, 256]. */
-export function kvq4DecodeSdpa(q: MlxArray, keys: ops.QuantizedTensor, values: ops.QuantizedTensor, scale: number): MlxArray {
+/** q [1, H, 1, 256]; keys/values: 4-bit group-64 affine [1, KVH, N, ·] (any strides) → [1, H, 1, 256].
+ *  `block`: tokens per threadgroup, a device's measured choice. */
+export function kvq4DecodeSdpa(q: MlxArray, keys: ops.QuantizedTensor, values: ops.QuantizedTensor, scale: number,
+  block = KV4_DECODE_BLOCK): MlxArray {
   const [, H, , D] = q.shape as [number, number, number, number];
   const KVH = keys.packed.shape[1]!, N = keys.packed.shape[2]!, REP = H / KVH;
-  const blocks = Math.ceil(N / BLOCK);
+  const blocks = Math.ceil(N / block);
   partial ??= new MetalKernel({ name: "mlx_bun_kvq4_decode_partial", inputNames: ["q", "kp", "ks", "kb", "vp", "vs", "vb"],
     outputNames: ["opart", "mpart", "lpart"], source: PARTIAL_SOURCE, ensureRowContiguous: false });
   merge ??= new MetalKernel({ name: "mlx_bun_kvq4_decode_merge", inputNames: ["opart", "mpart", "lpart"],
@@ -133,14 +141,14 @@ export function kvq4DecodeSdpa(q: MlxArray, keys: ops.QuantizedTensor, values: o
       { shape: [blocks, KVH, REP], dtype: Dtype.float32 }],
     grid: [32 * 2 * SUB * blocks, KVH, 1], threadGroup: [32 * 2 * SUB, 1, 1],
     templateDtypes: { T: q.dtype },
-    templateInts: { D, N, KVH, REP, BLOCK, SUB },
+    templateInts: { D, KVH, REP, BLOCK: block, SUB },
   });
   try {
     const [out] = merge.apply([opart!, mpart!, lpart!], {
       outputs: [{ shape: [1, H, 1, D], dtype: q.dtype }],
       grid: [D, KVH * REP, 1], threadGroup: [Math.min(256, D), 1, 1],
       templateDtypes: { T: q.dtype },
-      templateInts: { D, KVH, REP, BLOCKS: blocks },
+      templateInts: { D, KVH, REP },
     });
     return out!;
   } finally { opart!.dispose(); mpart!.dispose(); lpart!.dispose(); }

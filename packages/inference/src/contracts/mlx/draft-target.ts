@@ -20,7 +20,7 @@ export interface RecurrentMtpTarget {
   readonly hiddenSize: number;
   readonly layerCount: number;
   embed(ids: MlxArray): MlxArray;
-  /** The output head per width class, indexed by the rows the drafter projects. */
+  /** The output head per row count or range, indexed by the rows the drafter projects. */
   readonly logits: MlxRowTable<(hidden: MlxArray) => MlxArray>;
   /** The untied quantized vocabulary projection, when the drafter may project
    *  onto a row subset of it (frequency-ranked draft vocabulary). Borrowed. */
@@ -49,6 +49,13 @@ export interface ResidualBasis {
   readonly finalGain: Float32Array;
 }
 
+/** A projection kernel the target's composition measured on its device, built over a 4-bit, group-64 affine
+ *  projection a drafter quantized itself (its packed weight, scales and biases, borrowed for the kernel's life):
+ *  the forward over [.., inputs] activations, caller-owned output. */
+export type DraftProjectionKernel = (w: MlxArray, scales: MlxArray, biases: MlxArray) => (x: MlxArray) => MlxArray;
+export interface DraftProjectionRange { readonly from: number; readonly to: number; readonly operation: DraftProjectionKernel }
+export type DraftProjectionKernels = MlxRowTable<DraftProjectionKernel> | readonly DraftProjectionRange[];
+
 /** Graph-declared ports over the target's live state, named for what they
  * provide. Sources request only the ports they consume and never inspect a
  * concrete model or cache; a source refuses a target that lacks one with
@@ -62,6 +69,10 @@ export interface TargetView {
   /** Declared by a graph whose residual stream carries a rotation fold; absent,
    *  the stream is in the trained model's basis. The same object on every view. */
   readonly residualBasis?: ResidualBasis;
+  /** Declared by a graph whose composition measured the kernels a drafter's own 4-bit projections run on its
+   *  device: one per row count or range of the rows they project. Absent, the drafter keeps its own rule. The same
+   *  table on every view. */
+  readonly draftProjections?: DraftProjectionKernels;
 }
 
 export type TargetPort = "assistantRows" | "hiddenLayerTaps" | "recurrentMtp";

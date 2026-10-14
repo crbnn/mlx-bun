@@ -8,7 +8,7 @@ import type { RowProjection } from "../../layers/trellis-prompt";
 import { TrellisUnfusedMLP,TrellisReducePrompt,TrellisExpandReducePrompt,TrellisExpandScatterPrompt } from "../../layers/trellis-prompt";
 import { LoraOperation,LoraState } from "../../layers/lora";
 import { QwenGatedDeltaNet, Qwen3TextAttention, Qwen3MediaAttention, QwenDeltaLayer, QwenAttentionLayer } from "./blocks";
-import { AneAffineSplit, type AneMlpSplit } from "../../layers/ane-prefill-split";
+import { AneAffineSplit, type AneMlpSplit, type AneGpuRows } from "../../layers/ane-prefill-split";
 import { compiledSwiglu } from "../../layers/swiglu";
 import { qwen35WeightsView } from "./checkpoint";
 
@@ -35,9 +35,9 @@ export class AneWeightShares {
   readonly affine = new Map<string, AneAffineSplit>();
   mlp: AneMlpSplit | undefined;
   readonly owned: { dispose(): void }[] = [];
-  projection(linear: QuantizedLinear, Split: typeof AneAffineSplit, fraction: number, rows: number): AneAffineSplit {
+  projection(linear: QuantizedLinear, Split: typeof AneAffineSplit, fraction: number, rows: number, slices?: number, gpuRows?: AneGpuRows): AneAffineSplit {
     const shape = `${linear.inFeatures}:${linear.outFeatures}`;
-    const projection = Split.build(linear, fraction, rows, this.affine.get(shape));
+    const projection = Split.build(linear, fraction, rows, this.affine.get(shape), slices, gpuRows);
     this.affine.set(shape, projection);
     this.owned.push(projection);
     return projection;
@@ -47,13 +47,13 @@ export class AneWeightShares {
 
 export interface AneMlpClass {
   build(gate: TrellisLinear, up: TrellisLinear, down: TrellisLinear,
-    fraction: number, rows: number, share?: AneMlpSplit): AneMlpSplit;
+    fraction: number, rows: number, share?: AneMlpSplit, slices?: number): AneMlpSplit;
 }
 export class AneBoundMlp {
   readonly split: AneMlpSplit;
   readonly #operation:LoraOperation;
-  constructor(trellis: TrellisWeights, Split: AneMlpClass, fraction: number, rows: number, shares: AneWeightShares) {
-    this.split = Split.build(trellis.gate, trellis.up, trellis.down, fraction, rows, shares.mlp);
+  constructor(trellis: TrellisWeights, Split: AneMlpClass, fraction: number, rows: number, shares: AneWeightShares, slices?: number) {
+    this.split = Split.build(trellis.gate, trellis.up, trellis.down, fraction, rows, shares.mlp, slices);
     shares.mlp = this.split;
     shares.owned.push(this.split);
     const overlay=new TrellisUnfusedMLP(new TrellisExpandReducePrompt(trellis.gate),new TrellisExpandReducePrompt(trellis.up),new TrellisExpandScatterPrompt(trellis.down));
@@ -136,6 +136,29 @@ export class DeltaWeights {
     mlp: RowProjection, Projection: AffineProjectionClass, qkScale: { q: MlxArray; k: MlxArray }): QwenDeltaLayer {
     return new Layer(weights, config, this.prefix, this.bind(weights, config, Projection, Projection, Projection, Projection, Projection, qkScale), mlp);
   }
+  withProjections(weights: Weights, config: ModelConfig, Layer: typeof QwenDeltaLayer,
+    mlp: RowProjection, Qkv: AffineProjectionClass, Z: AffineProjectionClass, A: AffineProjectionClass,
+    B: AffineProjectionClass, Out: AffineProjectionClass, qkScale: {q:MlxArray;k:MlxArray}): QwenDeltaLayer {
+    return new Layer(weights,config,this.prefix,this.bind(weights,config,Qkv,Z,A,B,Out,qkScale),mlp);
+  }
+  withBoundProjections(weights: Weights,config:ModelConfig,Layer:typeof QwenDeltaLayer,
+    mlp:RowProjection,qkv:RowProjection,z:RowProjection,a:RowProjection,b:RowProjection,out:RowProjection,
+    qkScale:{q:MlxArray;k:MlxArray}):QwenDeltaLayer {
+    const block=new QwenGatedDeltaNet(weights,config,`${this.prefix}.linear_attn`,{
+      inProjQkv:qkv,inProjZ:z,inProjA:a,inProjB:b,outProj:out,
+    });
+    block.qkScale=qkScale;
+    return new Layer(weights,config,this.prefix,block,mlp);
+  }
+  aneProjections(weights:Weights,config:ModelConfig,Layer:typeof QwenDeltaLayer,mlp:RowProjection,
+    Split:typeof AneAffineSplit,Dense:AffineProjectionClass,Plain:AffineProjectionClass,rows:number,shares:AneWeightShares,
+    qkScale:{q:MlxArray;k:MlxArray}):QwenDeltaLayer {
+    return this.withBoundProjections(weights,config,Layer,mlp,
+      shares.projection(this.inProjQkv,Split,0.375,rows,4,rest=>new Dense(rest)),
+      shares.projection(this.inProjZ,Split,0.375,rows,4,rest=>new Dense(rest)),
+      new Plain(this.inProjA),new Plain(this.inProjB),
+      shares.projection(this.outProj,Split,0.375,rows,4,rest=>new Dense(rest)),qkScale);
+  }
   aneStage(weights: Weights, config: ModelConfig, Layer: typeof QwenDeltaLayer,
     Mlp: typeof AneBoundMlp, Split: AneMlpClass, Affine: typeof AneAffineSplit,
     Plain: AffineProjectionClass, fraction: number, rows: number, shares: AneWeightShares,
@@ -208,6 +231,21 @@ export class AttentionWeights {
   withMlp(weights: Weights, config: ModelConfig, Layer: typeof QwenAttentionLayer,
     mlp: RowProjection, Projection: AffineProjectionClass): QwenAttentionLayer {
     return new Layer(weights, config, this.prefix, this.text(weights, config, Projection, Projection, Projection, Projection), mlp);
+  }
+  withProjections(weights: Weights, config: ModelConfig, Layer: typeof QwenAttentionLayer,
+    mlp: RowProjection, Q: AffineProjectionClass, K: AffineProjectionClass, V: AffineProjectionClass, O: AffineProjectionClass): QwenAttentionLayer {
+    return new Layer(weights,config,this.prefix,this.text(weights,config,Q,K,V,O),mlp);
+  }
+  withBoundProjections(weights:Weights,config:ModelConfig,Layer:typeof QwenAttentionLayer,
+    mlp:RowProjection,q:RowProjection,k:RowProjection,v:RowProjection,o:RowProjection):QwenAttentionLayer {
+    const block=new Qwen3TextAttention(weights,config,`${this.prefix}.self_attn`,{qProj:q,kProj:k,vProj:v,oProj:o});
+    return new Layer(weights,config,this.prefix,block,mlp);
+  }
+  aneProjections(weights:Weights,config:ModelConfig,Layer:typeof QwenAttentionLayer,mlp:RowProjection,
+    Split:typeof AneAffineSplit,Dense:AffineProjectionClass,_Plain:AffineProjectionClass,rows:number,shares:AneWeightShares):QwenAttentionLayer {
+    return this.withBoundProjections(weights,config,Layer,mlp,
+      shares.projection(this.qProj,Split,0.375,rows,4,rest=>new Dense(rest)),new Dense(this.kProj),new Dense(this.vProj),
+      shares.projection(this.oProj,Split,0.375,rows,4,rest=>new Dense(rest)));
   }
   mediaLayer(weights: Weights, config: ModelConfig, Layer: typeof QwenAttentionLayer,
     mlp: RowProjection, Projection: AffineProjectionClass): QwenAttentionLayer {

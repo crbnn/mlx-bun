@@ -1,3 +1,4 @@
+import { rowOperationFor } from "@mlx-bun/inference/models/graph";
 // Drafter training loop (DSpark paper §3.3): the KV-injection drafter learns
 // from a frozen target's regenerated shards (regen.ts), driven by the DSpark
 // objective (loss.ts). The target contributes only its embedding and LM head
@@ -109,7 +110,7 @@ export async function trainDrafter(
       for (let k = 0; k < gamma; k++) next.push(batch.blockToks[a]![k]!);
     }
     previous = ops.fromInt32(prev, [A, gamma]); xStar = ops.fromInt32(next, [A, gamma]);
-    const logits = projection.logits[(batch.targetHidden.size / batch.targetHidden.shape.at(-1)!)]!(batch.targetHidden);
+    const logits = rowOperationFor(projection.logits,(batch.targetHidden.size / batch.targetHidden.shape.at(-1)!))(batch.targetHidden);
     targetLogits = logits.dtype === Dtype.float32 ? logits : logits.astype(Dtype.float32);
     if (targetLogits !== logits) logits.dispose();
     batch.targetHidden.dispose();

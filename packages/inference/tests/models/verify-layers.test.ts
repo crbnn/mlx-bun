@@ -2,21 +2,29 @@
 // layers/affine-verify-linear) on small synthetic projections against the
 // projections they replace: TrellisLinear (+ compiled SwiGLU) and
 // QuantizedLinear. Each layer runs one kernel that reassociates the reduction,
-// so they agree to bf16 precision. The reduce and scatter layers
-// (layers/trellis-reduce-gate-up, layers/trellis-scatter-down) run the kernels
-// of the paths they replace and agree bit for bit. Each layer also refuses
-// weights it was not built for.
+// so they agree to bf16 precision. The one-row codebook layers (layers/trellis-codebook-gate-up,
+// layers/trellis-codebook-down) and the one-row affine layer reproduce the one-row
+// paths they replace bit for bit. Each layer also refuses weights it was not built for.
+// TrellisLinear itself, at prompt rows, leaves its weight expansion unbounded on request
+// with the same bits.
 import { describe, expect, test } from "bun:test";
 import { Dtype, MlxArray, ops } from "@mlx-bun/mlx";
 import { QuantizedLinear } from "../../src/layers/quantized-linear";
 import { TrellisLinear, fusedGateUpSwiglu } from "../../src/layers/trellis-linear";
 import { compiledSwiglu } from "../../src/layers/swiglu";
 import { fusedGateUpSwigluMixed as mixedGateUpKernel } from "../../src/kernels/trellis/mixed-gate-up";
-import { ReduceGateUpRow, ReduceGateUpRows, ReduceMixedGateUp } from "../../src/layers/trellis-reduce-gate-up";
-import { ScatterDownK3iRow, ScatterDownK3iRows, ScatterDownRow, ScatterDownRows } from "../../src/layers/trellis-scatter-down";
-import { FactoredGateUpRow, FactoredGateUpRows, FactoredMixedGateUp, MmaGateUp } from "../../src/layers/trellis-gate-up";
-import { FactoredDownK3iRow, FactoredDownK3iRows, FactoredDownRow, FactoredDownRows, MmaDown, MmaDownK3i } from "../../src/layers/trellis-down";
-import { Affine3MmaLinear, Affine3RowsLinear, Affine4MmaLinear, Affine4RowsLinear } from "../../src/layers/affine-verify-linear";
+import { CodebookGateUpRow } from "../../src/layers/trellis-codebook-gate-up";
+import { CodebookDownK3iRow, CodebookDownRow } from "../../src/layers/trellis-codebook-down";
+import {
+  CodebookMmaGateUp, FactoredGateUpRow, FactoredGateUpRows, FactoredMixedGateUp, MmaGateUp, MmaGateUpWide,
+} from "../../src/layers/trellis-gate-up";
+import {
+  CodebookMmaDown, CodebookMmaDownK3i, FactoredDownK3iRow, FactoredDownK3iRows, FactoredDownRow, FactoredDownRows, MmaDown,
+  MmaDownK3i, MmaDownWide, MmaDownWideK3i,
+} from "../../src/layers/trellis-down";
+import {
+  Affine3MmaLinear, Affine3RowsLinear, Affine4MmaLinear, Affine4RowsLinear, AffineRowLinear, AffineSplitMmaLinear,
+} from "../../src/layers/affine-verify-linear";
 
 const D = 512, R = 256;
 
@@ -54,6 +62,22 @@ describe("Trellis verify layers", () => {
         using actual = layer.forward(x);
         expect(relErr(actual, expected), `k${kg}/${ku} m${m}`).toBeLessThan(2e-2);
       }
+      const codebook = new CodebookMmaGateUp(gate, up);
+      for (const m of [1, 2, 3, 4, 8]) {
+        using x = rows(m, D);
+        using g = gate.forward(x, true), u = up.forward(x, true);
+        using expected = compiledSwiglu(g, u);
+        using actual = codebook.forward(x);
+        expect(relErr(actual, expected), `codebook k${kg}/${ku} m${m}`).toBeLessThan(2e-2);
+      }
+      const wide = new MmaGateUpWide(gate, up);
+      for (const m of [1, 9, 16, 40]) {
+        using x = rows(m, D);
+        using g = gate.forward(x, true), u = up.forward(x, true);
+        using expected = compiledSwiglu(g, u);
+        using actual = wide.forward(x);
+        expect(relErr(actual, expected), `wide k${kg}/${ku} m${m}`).toBeLessThan(2e-2);
+      }
     }
   }, 60_000);
 
@@ -69,6 +93,20 @@ describe("Trellis verify layers", () => {
         using actual = layer.forward(x);
         expect(relErr(actual, expected), `${interleave ? "k3i" : "row-major"} m${m}`).toBeLessThan(2e-2);
       }
+      const codebook = interleave ? new CodebookMmaDownK3i(down) : new CodebookMmaDown(down);
+      for (const m of [1, 2, 3, 4, 8]) {
+        using x = rows(m, R);
+        using expected = down.forward(x, true);
+        using actual = codebook.forward(x);
+        expect(relErr(actual, expected), `codebook ${interleave ? "k3i" : "row-major"} m${m}`).toBeLessThan(2e-2);
+      }
+      const wide = interleave ? new MmaDownWideK3i(down) : new MmaDownWide(down);
+      for (const m of [1, 9, 16, 40]) {
+        using x = rows(m, R);
+        using expected = down.forward(x, true);
+        using actual = wide.forward(x);
+        expect(relErr(actual, expected), `wide ${interleave ? "k3i" : "row-major"} m${m}`).toBeLessThan(2e-2);
+      }
     }
   }, 60_000);
 
@@ -79,6 +117,12 @@ describe("Trellis verify layers", () => {
     expect(() => new FactoredDownK3iRows(rowMajor)).toThrow();
     expect(() => new FactoredGateUpRows(gate, up)).toThrow();
     expect(() => new FactoredMixedGateUp(gate, gate)).toThrow();
+    expect(() => new MmaDownWide(interleaved)).toThrow();
+    expect(() => new MmaDownWideK3i(rowMajor)).toThrow();
+    expect(() => new MmaGateUpWide(gate, rowMajor)).toThrow();
+    expect(() => new CodebookMmaGateUp(gate, rowMajor)).toThrow();
+    expect(() => new CodebookMmaDown(interleaved)).toThrow();
+    expect(() => new CodebookMmaDownK3i(rowMajor)).toThrow();
   });
 });
 
@@ -91,49 +135,39 @@ function sameBits(actual: MlxArray, expected: MlxArray): boolean {
   return Buffer.from(x.buffer, x.byteOffset, x.byteLength).equals(Buffer.from(y.buffer, y.byteOffset, y.byteLength));
 }
 
-describe("Trellis reduce and scatter layers", () => {
-  // The paths they replace keep their kernels: the reduce gate/up (fusedGateUpSwiglu, and the mixed kernel at the
-  // projections' variant and qualified bits) and TrellisLinear's own up-to-four-row down projection.
-  test("each layer computes its replaced path's bits at its rows", () => {
+describe("Trellis codebook layers", () => {
+  // The paths they replace: the reduce gate/up (fusedGateUpSwiglu, and the mixed kernel at the projections' variant and qualified bits)
+  // and TrellisLinear's own one-row down projection.
+  test("each layer computes its replaced path's bits at one row", () => {
     for (const [kg, ku] of [[3, 3], [2, 3], [4, 3]] as const) {
       const gate = trellis(R, D, 1, kg, 61), up = trellis(R, D, 1, ku, 67);
-      for (const m of [1, 2, 3, 4]) {
-        using x = rows(m, D);
-        if (kg === ku) {
-          using expected = fusedGateUpSwiglu(x, gate, up);
-          using actual = (m === 1 ? new ReduceGateUpRow(gate, up) : new ReduceGateUpRows(gate, up)).forward(x);
-          expect(sameBits(actual, expected), `k${kg} m${m}`).toBe(true);
-        } else for (const tail of ["split", "fused"] as const) {
-          using expected = mixedGateUpKernel(x, gate, up, gate.variant, tail, gate.representations.mixedExactBits);
-          using actual = new ReduceMixedGateUp(gate, up, tail).forward(x);
-          expect(sameBits(actual, expected), `k${kg}/${ku} ${tail} m${m}`).toBe(true);
-        }
+      using x = rows(1, D);
+      if (kg === ku) {
+        using expected = fusedGateUpSwiglu(x, gate, up);
+        using actual = new CodebookGateUpRow(gate, up, "split").forward(x);
+        expect(sameBits(actual, expected), `k${kg}`).toBe(true);
+      } else for (const tail of ["split", "fused"] as const) {
+        using expected = mixedGateUpKernel(x, gate, up, gate.variant, tail, gate.representations.mixedExactBits);
+        using actual = new CodebookGateUpRow(gate, up, tail).forward(x);
+        expect(sameBits(actual, expected), `k${kg}/${ku} ${tail}`).toBe(true);
       }
     }
-    for (const [k, interleave, shared] of [[2, false, false], [4, false, false], [3, true, false], [3, true, true]] as const) {
+    for (const [k, interleave] of [[2, false], [4, false], [3, true]] as const) {
       const down = trellis(R, D, 0, k, 71, interleave);
-      const composed = new TrellisLinear(down.codes, down.scales, down.spec, shared);
-      for (const m of [1, 2, 3, 4]) {
-        using x = rows(m, R);
-        using expected = composed.forward(x);
-        const layer = interleave ? m === 1 ? new ScatterDownK3iRow(composed) : new ScatterDownK3iRows(composed)
-          : m === 1 ? new ScatterDownRow(composed) : new ScatterDownRows(composed);
-        using actual = layer.forward(x);
-        expect(sameBits(actual, expected), `k${k}${interleave ? " interleaved" : ""}${shared ? " shared codebook" : ""} m${m}`).toBe(true);
-      }
+      using x = rows(1, R);
+      using expected = down.forward(x);
+      using actual = (interleave ? new CodebookDownK3iRow(down) : new CodebookDownRow(down)).forward(x);
+      expect(sameBits(actual, expected), `k${k}${interleave ? " interleaved" : ""}`).toBe(true);
     }
   }, 60_000);
 
   test("layers refuse weights they were not built for", () => {
     const rowMajor3 = trellis(R, D, 0, 3, 73), rowMajor2 = trellis(R, D, 0, 2, 79), interleaved = trellis(R, D, 0, 3, 83, true);
-    const gate = trellis(R, D, 1, 3, 89), up = trellis(R, D, 1, 2, 97);
-    expect(() => new ScatterDownRow(interleaved)).toThrow();
-    expect(() => new ScatterDownRows(rowMajor3)).toThrow();
-    expect(() => new ScatterDownK3iRow(rowMajor2)).toThrow();
-    expect(() => new ScatterDownK3iRows(rowMajor3)).toThrow();
-    expect(() => new ReduceGateUpRow(gate, up)).toThrow();
-    expect(() => new ReduceGateUpRows(gate, up)).toThrow();
-    expect(() => new ReduceMixedGateUp(gate, gate, "split")).toThrow();
+    const gate = trellis(R, D, 1, 3, 89);
+    expect(() => new CodebookDownRow(interleaved)).toThrow();
+    expect(() => new CodebookDownRow(rowMajor3)).toThrow();
+    expect(() => new CodebookDownK3iRow(rowMajor2)).toThrow();
+    expect(() => new CodebookGateUpRow(gate, rowMajor2, "split")).toThrow();
   });
 });
 
@@ -155,6 +189,50 @@ describe("affine verify layers", () => {
         expect(relErr(b, expected), `mma ${bits}-bit m${m}`).toBeLessThan(1e-2);
       }
       expect(() => bits === 3 ? new Affine4RowsLinear(lin) : new Affine3RowsLinear(lin)).toThrow();
+      // The one-row layer takes either width, as stored, and gives QuantizedLinear's bits.
+      {
+        using x = rows(1, D);
+        using expected = lin.forward(x);
+        using actual = new AffineRowLinear(lin).forward(x);
+        using same = ops.equal(actual, expected);
+        using all = ops.allReduce(same);
+        expect(all.toFloat32()[0], `one row ${bits}-bit`).toBe(1);
+      }
+      // The M1 Max layer takes either width, as stored.
+      const splitLayer = new AffineSplitMmaLinear(lin);
+      // Against the float32 product of the dequantized weights: from 14 rows MLX's quantized matmul here is its
+      // matrix kernel, which rounds its weights to bf16.
+      using scales32 = q.scales.astype(Dtype.float32), biases32 = q.biases!.astype(Dtype.float32);
+      using dense32 = ops.dequantize(q.packed, scales32, biases32, { bits, groupSize: 64, mode: "affine" });
+      using weightT = ops.transposeAxes(dense32, [1, 0]);
+      for (const m of [1, 3, 8, 9, 16, 40]) {
+        using x = rows(m, D);
+        using x32 = x.astype(Dtype.float32);
+        using expected = ops.matmul(x32, weightT);
+        using split = splitLayer.forward(x);
+        expect(relErr(split, expected), `split mma ${bits}-bit m${m}`).toBeLessThan(1e-2);
+      }
+    }
+    // It takes no 8-bit weights.
+    const q8 = ops.quantize(wb, 64, 8);
+    try {
+      const lin8 = new QuantizedLinear(q8.packed, q8.scales, q8.biases, { bits: 8, groupSize: 64, mode: "affine" });
+      expect(() => new AffineSplitMmaLinear(lin8)).toThrow();
+      expect(() => new AffineRowLinear(lin8)).toThrow();
+    } finally { q8.packed.dispose(); q8.scales.dispose(); q8.biases?.dispose(); }
+  }, 60_000);
+});
+
+describe("TrellisLinear at prompt rows", () => {
+  test("an unbounded weight expansion gives the bounded product's bits", () => {
+    using x = rows(96, D);
+    // Gate/up form, row-major down, 3-bit interleaved down: each takes D inputs.
+    for (const lin of [trellis(R, D, 1, 3, 7), trellis(D, R, 0, 2, 19), trellis(D, 1024, 0, 3, 23, true)]) {
+      using bounded = lin.forward(x, true);
+      using unbounded = lin.forward(x, true, false);
+      expect(unbounded.shape).toEqual(bounded.shape);
+      expect(Buffer.from(unbounded.rawBytes()).equals(Buffer.from(bounded.rawBytes()))).toBe(true);
+      lin.codes.dispose(); lin.scales.dispose();
     }
   }, 60_000);
 });

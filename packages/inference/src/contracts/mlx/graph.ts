@@ -1,3 +1,5 @@
+import type { MlxHeadForward, MlxHeadRange } from "./head";
+export type { MlxHeadForward, MlxHeadRange } from "./head";
 import type { GraphCapabilities } from "../portable/graph";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { Cache } from "./cache";
@@ -11,6 +13,9 @@ export type { MlxRowTable } from "./row-table";
 /** Weight and expert-residency facts the wired-limit scope reads. */
 export interface MlxModelMemory {
   readonly weightsBytes: number;
+  /** The graph's composition measured that its weights are wired for a generation whatever their share of the
+   *  recommended working set; absent: the share decides. */
+  readonly wiredWeights?: boolean;
   readonly expertRuntime?: {
     readonly plan: { readonly plannedBytes: number };
     flushUsage?: () => void;
@@ -51,10 +56,6 @@ export type MlxCapturingForward = (ids: MlxArray, state: Cache[], capture: MlxLa
 /** A speculative verify forward (`MlxCapturingForward`). */
 export type MlxVerifyForward = MlxCapturingForward;
 
-/** The output head over a post-final-norm hidden [.., hidden-width] (borrowed)
- * to logits [.., vocabulary] the caller owns, possibly unevaluated. */
-export type MlxHeadForward = (hidden: MlxArray) => MlxArray;
-export interface MlxHeadRange { readonly from: number; readonly to: number; readonly operation: MlxHeadForward }
 
 /** The scoring and training forward, not a serving phase: every position of
  * `ids` [sequences, tokens] as one causal window over the caller's caches (the
@@ -80,7 +81,10 @@ export type MlxKnownOperations = MlxRowTable<MlxPhaseForward> | readonly MlxKnow
 /** Operations selected by exact row count or prompt position range. */
 export interface MlxTokenPhases {
   readonly prompt: readonly MlxPromptRange[];
+  /** Optional chunk bindings when a file distinguishes chunks from prompt tails. */
+  readonly promptChunk?: readonly MlxPromptRange[];
   readonly multiSequencePrompt: readonly MlxPromptRange[];
+  readonly multiSequencePromptChunk?: readonly MlxPromptRange[];
   readonly decode: MlxRowTable<MlxCapturingForward>;
   readonly verify: MlxRowTable<MlxVerifyForward>;
   readonly appendKnown: MlxKnownOperations;
@@ -116,10 +120,10 @@ export interface MlxPhaseGroup {
 /** Declared by a composition that serves mixed rows: decode, prompt and verify
  * groups in one forward, each group's attention and recurrence over its own
  * caches for its own phase, the row-wise layers over the groups' rows packed
- * together unless a verify group keeps its geometry. `width` is the actual number of
- * the packed rows, the caller's to name. Borrows inputs and state; returns one
+ * together unless a verify group keeps its geometry. `totalRows` is the full
+ * round's row count, including its separate verification groups. Borrows inputs and state; returns one
  * owned post-final-norm hidden per group. */
-export type MlxMixedForward = (groups: readonly MlxPhaseGroup[], width: number) => MlxArray[];
+export type MlxMixedForward = (groups: readonly MlxPhaseGroup[], totalRows: number) => MlxArray[];
 
 /** A graph's compiled single-token decode step: the whole forward replayed from
  * one recorded graph instead of rebuilt per token. The scheduler chooses it
@@ -168,6 +172,29 @@ export interface MlxDenoisingOperations {
   softEmbeddings(logits: MlxArray, weight: MlxArray): MlxArray;
 }
 
+/** The adaptive draft gate's constants for one drafter on one machine
+ *  (`MlxDeclaredGraph.adaptiveDraftGates`); each absent one keeps the gate's
+ *  default (`AdaptiveDraftGateOptions`). */
+export interface AdaptiveDraftGateSettings {
+  /** Accepted and rejected counts every draft position starts from: their ratio
+   *  is the acceptance the gate assumes before it observes the text, their sum
+   *  how many rounds of evidence that assumption weighs. */
+  readonly priorAccepted?: number;
+  readonly priorRejected?: number;
+  /** The factor a position's counts keep per round that observes it, and every
+   *  count per round without drafts. */
+  readonly decay?: number;
+  readonly idleDecay?: number;
+  /** How much a round's expected rate must exceed a step without drafts. */
+  readonly margin?: number;
+  /** Rounds without drafts before a probe, doubling after each probe that
+   *  leaves the gate drafting nothing, up to `maxProbeInterval`. */
+  readonly probeInterval?: number;
+  readonly maxProbeInterval?: number;
+  /** The depth of a probe a drafter proposes without a verify round. */
+  readonly probeDepth?: number;
+}
+
 /** The operations behind a graph's declared capabilities. A graph implements
  * the ones its `graphCapabilities` promise; composition checks the pairing once
  * when it binds (`declaredGraph`), so execution never probes for them. */
@@ -213,6 +240,15 @@ export interface MlxDeclaredGraph {
    *  single-row decode step (rows 1 = 1). Declared only by a graph measured on
    *  the hardware it serves; speculative depth scheduling reads it. */
   readonly verifyRoundCosts?: ReadonlyMap<number, number>;
+  /** The widest adaptive round per draft provider kind, measured on the hardware
+   *  it serves: an adaptive drafter of a listed kind drafts up to it instead of
+   *  its own width, unless the request names a width. Absent, or a kind it does
+   *  not list: the drafter's own width. */
+  readonly adaptiveDraftWidths?: ReadonlyMap<string, number>;
+  /** The adaptive draft gate's settings per draft provider kind, measured on the
+   *  hardware it serves (an adaptive drafter of a listed kind gates with them).
+   *  Absent, or a kind it does not list: the gate's defaults. */
+  readonly adaptiveDraftGates?: ReadonlyMap<string, AdaptiveDraftGateSettings>;
   /** Committed known-token spans, declared when the composition qualifies them
    *  (`appendKnown` then reads committed). */
   readonly knownSpans?: MlxKnownSpans;
@@ -230,7 +266,7 @@ export interface MlxDeclaredGraph {
 
 /** Cache layout written by the graph, independent of request storage policy. */
 export type MlxCacheLayer =
-  | { readonly kind: "full"; readonly turboQuant: "dense" | "deferred"; readonly kv4Head256?: boolean }
+  | { readonly kind: "full"; readonly turboQuant: "dense" | "deferred"; readonly kv4Head256?: boolean; readonly kv4DecodeBlock?: number; readonly windowRead?: "folded" }
   | { readonly kind: "sliding"; readonly window: number }
   | { readonly kind: "recurrent" }
   | { readonly kind: "latent"; readonly geometry: {
@@ -241,6 +277,9 @@ export type MlxCacheLayer =
 export interface MlxMixedRange {
   readonly from: number;
   readonly to: number;
+  /** Optional bounds on all round rows, including independently routed verify groups. */
+  readonly totalFrom?: number;
+  readonly totalTo?: number;
   readonly operation: MlxMixedForward;
 }
 
@@ -260,6 +299,8 @@ export interface MlxMixedGroupRange {
 }
 
 export interface MlxSeparateMixed {
+  /** Optional packing of multiple nonverify groups alongside separately routed verification. */
+  readonly packed?: readonly MlxMixedRange[];
   readonly decode: readonly MlxMixedGroupRange[];
   readonly window: readonly MlxMixedGroupRange[];
   readonly verify: readonly MlxMixedGroupRange[];

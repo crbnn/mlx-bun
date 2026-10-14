@@ -2,86 +2,160 @@
  *
  * Adapted from mlx-optiq 0.5.8's AcceptanceGate (MIT). The scheduler models
  * the expected emitted tokens for a proposal depth and divides that by the
- * measured cost of its verification forward. It uses acceptance rather than
+ * measured cost of its round, by the rows its forward carries: a group of B
+ * sequences drafting k each verifies B(k + 1) rows, and its round without
+ * drafts is a decode step of B rows. It uses acceptance rather than
  * observed wall-clock throughput as the online signal, so unrelated machine
  * load does not make it oscillate.
  */
 
+import type { AdaptiveDraftGateSettings } from "../../contracts/mlx/graph";
+
 export type VerifyCostModel = ReadonlyMap<number, number>;
 
+/** The cost of a forward of `positions` rows: the measured one, interpolated between measured rows, and past the
+ *  widest measured forward the widest one's cost per row (a forward's cost per row does not rise with its rows, so
+ *  an unmeasured wider forward is charged at most that). */
 function interpolatedCost(costs: VerifyCostModel, positions: number): number {
   const keys = [...costs.keys()].sort((a, b) => a - b);
   if (keys.length < 2 || !costs.has(1))
     throw new Error("adaptive draft costs need position 1 and at least one larger position");
   const exact = costs.get(positions);
   if (exact !== undefined) return exact;
-  if (positions > keys.at(-1)!) {
-    const hi = keys.at(-1)!;
-    const lo = keys.at(-2)!;
-    return costs.get(hi)! +
-      ((costs.get(hi)! - costs.get(lo)!) / (hi - lo)) * (positions - hi);
-  }
+  if (positions > keys.at(-1)!) return costs.get(keys.at(-1)!)! * positions / keys.at(-1)!;
   const lo = keys.filter((key) => key < positions).at(-1)!;
   const hi = keys.find((key) => key > positions)!;
   return costs.get(lo)! +
     ((costs.get(hi)! - costs.get(lo)!) / (hi - lo)) * (positions - lo);
 }
 
-export interface AdaptiveDraftGateOptions {
-  maxDraftTokens: number;
-  /** Whether rejection requires replaying the accepted prefix. */
-  replayOnReject?: boolean;
-  priorAccepted?: number;
-  priorRejected?: number;
-  decay?: number;
-  margin?: number;
+/** The defaults of each setting a graph may declare for its machine (`AdaptiveDraftGateSettings`):
+ *  - `priorAccepted`, `priorRejected`: every position's counts before any round is observed, 4.5 and 0.5 (an
+ *    acceptance of 0.9, so a new gate drafts deeply and backs off as rejections arrive);
+ *  - `decay` 0.85, and `idleDecay` 1: a round without drafts leaves the counts as they are;
+ *  - `margin` 0.03;
+ *  - `probeInterval`: rounds without drafts before `next` drafts one token to observe acceptance again (8); each probe
+ *    after which the gate still drafts nothing doubles the interval, up to `maxProbeInterval` (32);
+ *  - `probeDepth`: the depth a drafter that proposes without committing drafts a probe at (the round's budget). */
+export interface AdaptiveDraftGateOptions extends AdaptiveDraftGateSettings {
+  readonly maxDraftTokens: number;
 }
 
+/** Acceptance is modeled per draft position: the probability that the draft at position i is accepted given that
+ *  every draft before it was. Each position's decayed counts are shrunk toward the position before it (weight 1;
+ *  position 1 toward the prior), so a position seldom reached follows the ones that are, and a drafter whose later
+ *  positions fall off (a recurrent MTP head trained for two steps) and one that stays flat (a block drafter) are
+ *  both modeled. A round decays the positions it drafted; with `idleDecay` a round without drafts decays them all,
+ *  so what the gate observed ages with the text it decodes and not only with the rounds it drafts. */
 export class AdaptiveDraftGate {
-  #accepted: number;
-  #rejected: number;
+  /** Decayed accepted and rejected drafts at each position (index 0 is position 1). */
+  readonly #accepted: number[];
+  readonly #rejected: number[];
+  readonly #prior: number;
+  readonly #priorWeight: number;
   readonly #decay: number;
+  readonly #idleDecay: number;
   readonly #margin: number;
   readonly #maxDraftTokens: number;
-  readonly #replayOnReject: boolean;
+  readonly #probeInterval: number;
+  readonly #maxProbeInterval: number;
+  /** The depth of a probe drafted without a verify round. */
+  readonly probeDepth: number;
+  /** Rounds in a row `next` has run without drafts, and the rounds before its next probe. */
+  #idle = 0;
+  #interval: number;
+  #probing = false;
 
   constructor(readonly costs: VerifyCostModel, options: AdaptiveDraftGateOptions) {
     this.#maxDraftTokens = options.maxDraftTokens;
-    this.#replayOnReject = options.replayOnReject ?? false;
-    this.#accepted = options.priorAccepted ?? 3;
-    this.#rejected = options.priorRejected ?? 2;
+    const accepted = options.priorAccepted ?? 4.5, rejected = options.priorRejected ?? 0.5;
+    this.#prior = accepted / (accepted + rejected);
+    this.#priorWeight = accepted + rejected;
+    this.#accepted = Array<number>(options.maxDraftTokens).fill(accepted);
+    this.#rejected = Array<number>(options.maxDraftTokens).fill(rejected);
     this.#decay = options.decay ?? 0.85;
+    this.#idleDecay = options.idleDecay ?? 1;
     this.#margin = options.margin ?? 0.03;
+    this.#probeInterval = this.#interval = options.probeInterval ?? 8;
+    this.#maxProbeInterval = options.maxProbeInterval ?? 32;
+    this.probeDepth = options.probeDepth ?? Infinity;
   }
 
-  get acceptanceProbability(): number {
-    return this.#accepted / Math.max(this.#accepted + this.#rejected, Number.EPSILON);
+  /** Forget what the gate observed: back to the prior, probing at the first interval. For new text (a request
+   *  joining), whose acceptance the rounds before say little about. */
+  reset(): void {
+    this.#accepted.fill(this.#prior * this.#priorWeight);
+    this.#rejected.fill((1 - this.#prior) * this.#priorWeight);
+    this.#idle = 0;
+    this.#interval = this.#probeInterval;
   }
 
-  observe(accepted: number, rejected: number): void {
-    this.#accepted = this.#accepted * this.#decay + accepted;
-    this.#rejected = this.#rejected * this.#decay + rejected;
+  /** The probability that the draft at `position` (1-based) is accepted, given that the drafts before it were. */
+  acceptance(position: number): number {
+    let shrunk = this.#prior;
+    for (let i = 0; i < position; i++)
+      shrunk = (this.#accepted[i]! + shrunk) / (this.#accepted[i]! + this.#rejected[i]! + 1);
+    return shrunk;
   }
 
-  expectedRate(k: number, p = this.acceptanceProbability): number {
-    let tokens = 0;
-    let replay = 0;
-    for (let accepted = 0; accepted < k; accepted++) {
-      const probability = p ** accepted * (1 - p);
-      tokens += (accepted + 1) * probability;
-      if (this.#replayOnReject)
-        replay += probability * interpolatedCost(this.costs, accepted + 1);
+  /** One round's outcome: `drafted` proposals, the first `accepted` of them accepted. Positions 1..accepted count an
+   *  acceptance and the first rejected position a rejection, after the counts decay: every position's when every
+   *  draft was accepted (the text may have turned predictable, so the positions past the round follow the ones it
+   *  accepted), only the drafted positions' otherwise (a rejected probe says nothing about deeper drafts). A round
+   *  without drafts observes nothing. */
+  observe(drafted: number, accepted: number): void {
+    const decayed = drafted > 0 && accepted === drafted ? this.#maxDraftTokens : Math.min(drafted, this.#maxDraftTokens);
+    for (let i = 0; i < decayed; i++) {
+      this.#accepted[i] = this.#accepted[i]! * this.#decay + Number(i < Math.min(accepted, drafted));
+      this.#rejected[i] = this.#rejected[i]! * this.#decay + Number(i === accepted && accepted < drafted);
     }
-    tokens += (k + 1) * p ** k;
-    return tokens / (interpolatedCost(this.costs, k + 1) + replay);
   }
 
-  choose(budget: number): number {
+  /** Expected emitted tokens per sequence of a round drafting `k` for each of `rows` sequences, per unit of cost,
+   *  where a round without drafts over those sequences costs 1 (a plain decode step emits 1 per 1). */
+  expectedRate(k: number, rows = 1): number {
+    // survive: the probability that every draft up to a position is accepted; the round emits one token more
+    // than it accepts, so tokens = 1 + the sum of survive over positions 1..k.
+    let survive = 1, tokens = 1;
+    for (let position = 1; position <= k; position++) {
+      survive *= this.acceptance(position);
+      tokens += survive;
+    }
+    return tokens * interpolatedCost(this.costs, rows) / interpolatedCost(this.costs, rows * (k + 1));
+  }
+
+  /** The next round's depth: `choose`'s, except that after a run of rounds without drafts it drafts one token,
+   *  the cheapest round that observes acceptance, so the estimate keeps following the text (a round without drafts
+   *  observes nothing). The run starts at `probeInterval` rounds and doubles after each probe that leaves the gate
+   *  drafting nothing, up to `maxProbeInterval`: a probe costs more than the plain step it replaces, so text that
+   *  stays hard to draft pays for fewer of them. `rows`: the sequences the round drafts for. */
+  next(budget: number, rows = 1): number {
+    this.#probing = false;
+    const depth = this.choose(budget, rows);
+    if (depth > 0 || budget < 1) { this.#idle = 0; this.#interval = this.#probeInterval; return depth; }
+    if (this.#idleDecay < 1) for (let i = 0; i < this.#maxDraftTokens; i++) {
+      this.#accepted[i] = this.#accepted[i]! * this.#idleDecay;
+      this.#rejected[i] = this.#rejected[i]! * this.#idleDecay;
+    }
+    if (++this.#idle <= this.#interval) return 0;
+    this.#idle = 0;
+    this.#interval = Math.min(2 * this.#interval, this.#maxProbeInterval);
+    this.#probing = true;
+    return 1;
+  }
+
+  /** Whether the depth `next` last returned is a probe: drafts the estimate does not pay for, drafted only to observe
+   *  acceptance. A drafter that can propose without committing may observe them without a verify round. */
+  get probing(): boolean { return this.#probing; }
+
+  /** The depth whose expected rate for a group of `rows` sequences beats a round without drafts by the margin, the
+   *  best such, up to `budget`; none when no depth does. */
+  choose(budget: number, rows = 1): number {
     const limit = Math.min(this.#maxDraftTokens, budget);
     let bestDepth = 0;
     let bestRate = 1 + this.#margin;
     for (let depth = 1; depth <= limit; depth++) {
-      const rate = this.expectedRate(depth);
+      const rate = this.expectedRate(depth, rows);
       if (rate > bestRate) {
         bestDepth = depth;
         bestRate = rate;

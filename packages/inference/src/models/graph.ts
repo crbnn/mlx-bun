@@ -55,3 +55,5 @@ export function phaseRowLimit(composition: Pick<Composition, "maxRows" | "prefil
  * (`AttentionCache.appendDecode`, `appendWindow`,
  * `CommittedAttentionCache.appendCommitted`). */
 export type ReadPhase = "decode" | "window" | "committed";
+
+export { rowOperationFor, rowTableWithDefault } from "./row-table";

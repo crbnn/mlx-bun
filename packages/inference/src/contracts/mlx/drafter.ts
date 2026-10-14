@@ -6,8 +6,11 @@ import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { AssistantDonors } from "./attention";
 import type { Cache } from "./cache";
 import type { DraftProjection } from "./draft-projection";
-import type { ResidualBasis } from "./draft-target";
+import type { DraftProjectionKernels, ResidualBasis } from "./draft-target";
 import type { MlxRowTable } from "./row-table";
+
+export interface DrafterOperationRange<Operation> { readonly from: number; readonly to: number; readonly operation: Operation }
+export type DrafterOperations<Operation> = MlxRowTable<Operation> | readonly DrafterOperationRange<Operation>[];
 
 /** One drafted step of a KV-borrowing assistant: owned token ids and the post-projected hidden. */
 export interface DrafterRowsStep { tokens: MlxArray; nextHidden: MlxArray }
@@ -19,8 +22,8 @@ export type AssistantDraftStep = (lastTokenEmb: MlxArray, targetHidden: MlxArray
 
 /** The optiq KV-borrowing assistant: no cache of its own, it reads the target's donor attention. */
 export interface AssistantDrafterModel {
-  /** The draft step per width class of the rows it drafts for, each with the token selection its head
-   *  bound for that class at construction; the caller indexes it by its rows (`rows`). */
+  /** The draft step per row count or range of the rows it drafts for, each with the token selection its head
+   *  bound for that class at construction; the caller indexes it by its rows (actual positive row count). */
   readonly forwardRows: MlxRowTable<AssistantDraftStep>;
   dispose(): void;
 }
@@ -86,10 +89,10 @@ export interface DeepspecDrafterModel {
   /** The trained block width. */
   readonly gamma: number;
   readonly hidden: number;
-  /** The context projection per width class of the rows projected (B × L), indexed by the caller
-   *  (`rows(B × L)`): MLX's quantized matmul (matmul for a BF16 checkpoint) at every class. */
+  /** The context projection per row count or range of the rows projected (B × L), indexed by the caller
+   *  (`B × L`): MLX's quantized matmul (matmul for a BF16 checkpoint) at every class. */
   readonly projectContext: MlxRowTable<DrafterContextProjection>;
-  /** Each layer's context K/V per width class of the context rows (B × L), indexed like `projectContext`:
+  /** Each layer's context K/V per row count or range of the context rows (B × L), indexed like `projectContext`:
    *  the same kernel at every class. */
   readonly projectContextKVRows: MlxRowTable<DrafterContextKV>;
   draftRows(context: DeepspecContextAttention, anchors: readonly number[], position: number | MlxArray,
@@ -105,7 +108,7 @@ export type RecurrentMtpForward = (tokenEmbeds: MlxArray, hiddens: MlxArray, cac
 /** The recurrent multi-token-prediction block split from a Qwen release, its phases named by the
  * caller like a graph's: the draft step indexed by the rows it drafts for. */
 export interface RecurrentMtpModule {
-  /** One position per row (a draft step, the round's bridge or full-accept row), by the rows' width class. */
+  /** One position per row (a draft step, the round's bridge or full-accept row), by the rows' row count. */
   readonly decode: MlxRowTable<RecurrentMtpForward>;
   /** Several positions per row (prompt rows, a verified continuation). */
   readonly window: RecurrentMtpForward;
@@ -142,31 +145,32 @@ export interface Dflash2DrafterModel {
   readonly tapLayers: number[];
   /** Draft tokens per block (block size minus the anchor). */
   readonly gamma: number;
-  /** Apply the target's declared residual basis (null: the trained basis) before any projection.
-   *  The first call applies it; every later call must pass the same declaration. */
-  bindResidualBasis(basis: ResidualBasis | null): void;
-  /** The context projection (fc over the target's taps, then the hidden norm) per width class of the rows
+  /** Apply the target's declarations before any projection: its residual basis (null: the trained basis) and
+   *  the kernels its composition names for the drafter's 4-bit projections (null: the drafter's own rule). The
+   *  first call applies them; every later call must pass the same declarations. */
+  bindTarget(basis: ResidualBasis | null, projections: DraftProjectionKernels | null): void;
+  /** The context projection (fc over the target's taps, then the hidden norm) per row count or range of the rows
    *  projected (B × L: a prompt's rows at prefill, a commit's accepted rows), indexed by the caller
-   *  (`rows(B × L)`). A 4-bit fc runs the simdgroup matrix unit (`Affine4MmaLinear`, where the weight's
-   *  shape fits it) at `fiveToEight` and MLX's quantized matmul (`QuantizedLinear`) at every other class; a BF16
-   *  fc runs one matmul at every class. No entry runs before `bindResidualBasis`. */
-  readonly projectContext: MlxRowTable<DrafterContextProjection>;
-  /** Each layer's k and v over the context rows (k norm, RoPE), per width class of those rows (B × L), indexed
+   *  (`B × L`). A 4-bit fc runs the kernel the target declares for the class or, by the drafter's
+   *  own rule, the simdgroup matrix unit (`Affine4MmaLinear`, where the weight's shape fits it) at 5..8
+   *  and MLX's quantized matmul (`QuantizedLinear`) at every other class; a BF16 fc runs one matmul at every
+   *  class. No entry runs before `bindTarget`. */
+  readonly projectContext: DrafterOperations<DrafterContextProjection>;
+  /** Each layer's k and v over the context rows (k norm, RoPE), per row count or range of those rows (B × L), indexed
    *  like `projectContext` and on the kernel it names for the class. */
-  readonly projectContextKVRows: MlxRowTable<DrafterContextKV>;
+  readonly projectContextKVRows: DrafterOperations<DrafterContextKV>;
   /** The columns of a block drafting `depth` tokens: its anchor and up to `depth` mask positions, at most the
    *  trained block size. */
   blockColumns(depth: number): number;
-  /** The draft block per width class of its rows (anchors times columns), indexed by the scheduler: every 4-bit
-   *  projection on the simdgroup matrix unit (`Affine4MmaLinear`, where the weight's shape fits it) at
-   *  `fiveToEight` and MLX's quantized matmul (`QuantizedLinear`) at every other class; BF16 projections run one
-   *  matmul at every class. */
-  readonly draft: MlxRowTable<Dflash2DraftBlock>;
+  /** The draft block per row count or range of its rows (anchors times columns), indexed by the scheduler: every 4-bit
+   *  projection on the kernel `projectContext` runs for the class; BF16 projections run one matmul at every
+   *  class. */
+  readonly draft: DrafterOperations<Dflash2DraftBlock>;
   dispose(): void;
 }
 
 /** One DFlash 2 draft block: one row per anchor, each the anchor and `columns - 1` mask positions, over the
  *  projected context; the greedy proposals left on the device, [anchors, columns - 1] uint32 row-major. Every
- *  projection in the block runs the kernel its width class names. */
+ *  projection in the block runs the kernel its row count names. */
 export type Dflash2DraftBlock = (context: Dflash2ContextAttention, projection: DraftProjection, anchors: readonly number[],
   position: number | MlxArray, columns: number) => MlxArray;

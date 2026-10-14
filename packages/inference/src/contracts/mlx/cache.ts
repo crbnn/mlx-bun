@@ -174,8 +174,8 @@ export interface GatedDeltaParameters {
    * into q, k and v heads, and their norms and scaling. Pure. `convolved`
    * [B, S, convDim] is the raw convolution output (before activation) and is
    * borrowed. The cache owns and disposes the returned heads. The cache calls
-   * this once per recurrence call, and again over the accepted prefix when it
-   * replays a speculative round. */
+   * this once per recurrence call; a speculative round keeps the window's k and
+   * v for the rows a rollback retains. */
   heads(convolved: MlxArray): GatedDeltaHeads;
 }
 

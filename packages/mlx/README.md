@@ -11,12 +11,18 @@ Arrays own native handles. Release them with `using` or `.dispose()`. Operations
 are lazy; reading the result evaluates it. Zero-copy constructors have additional
 buffer lifetime contracts documented on their methods.
 
+Loading the binding sets MLX's command-buffer limits (`MLX_MAX_OPS_PER_BUFFER`,
+`MLX_MAX_MB_PER_BUFFER`) on GPU architectures with measured values, currently the
+M1 Max, before MLX builds its Metal device, which reads them once. A value already
+in the environment wins; other architectures keep MLX's own limits.
+
 ## Source ownership
 
 | File | Responsibility |
 | --- | --- |
 | `src/native.ts` | Native artifact locations and pinned MLX version |
 | `src/ffi.ts` | C ABI declarations, errors, device and memory controls |
+| `src/command-buffers.ts` | MLX's command-buffer limits per GPU architecture, set before MLX loads |
 | `src/array.ts` | Array handles, metadata, host access, and ownership |
 | `src/host-buffer.ts` | Aligned native host allocations |
 | `src/ops.ts` | Tensor operations exposed by the existing bindings |

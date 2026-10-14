@@ -217,3 +217,82 @@ describe("processor history retention", () => {
     } finally { allocate.mockRestore(); }
   });
 });
+
+describe("unread draws", () => {
+  test("draw what sample() would and commit the same processor history without a read", async () => {
+    // Qwen's instruct settings: the presence penalty reads every committed token.
+    const options: StepSamplerOptions = { temperature: 0.7, topP: 0.8, topK: 20, presencePenalty: 1.5, seed: 7 };
+    const config = { tokenRepresentation: "number", grammarWait: "before-sample", historyUpdate: "after-sample",
+      initialHistory: [3, 1] } as const;
+    const read = makeStepSampler(options, config), unread = makeStepSampler(options, config);
+    const steps = 12, vocabulary = 32;
+    const drawn: number[] = [], left: MlxArray[] = [];
+    try {
+      expect(unread.unread).toBeDefined();
+      for (let step = 0; step < steps; step++) {
+        // Flat scores so the penalty decides: a token drawn once is unlikely again.
+        using logits = MlxArray.fromFloat32(Float32Array.from({ length: vocabulary }, (_, i) => Math.sin(i + step) * 0.3), [1, vocabulary]);
+        drawn.push((await read.sample(logits, step)).token);
+        left.push(unread.unread!.sample(logits, step));
+      }
+      using all = ops.concatAxis(left, 0);
+      expect(all.toIntTokens()).toEqual(drawn);
+    } finally { read.dispose(); unread.dispose(); for (const token of left) token.dispose(); }
+  });
+
+  test("are absent where a draw needs a grammar or captured probabilities", () => {
+    const config = { tokenRepresentation: "number", grammarWait: "before-sample", historyUpdate: "after-sample" } as const;
+    const grammar = makeStepSampler({ temperature: 0.7, grammar: new ScriptedGrammar() as never }, config);
+    const capture = makeStepSampler({ temperature: 0.7 }, { ...config, captureSelectedLogprob: true });
+    try {
+      expect(grammar.unread).toBeUndefined();
+      expect(capture.unread).toBeUndefined();
+    } finally { grammar.dispose(); capture.dispose(); }
+  });
+});
+
+describe("positional draws over processor history", () => {
+  // Flat scores so the penalties decide; position p's history is the request's
+  // history extended by the window's inputs up to p.
+  const vocabulary = 48, width = 5;
+  const scoresFor = (salt: number) => MlxArray.fromFloat32(Float32Array.from({ length: width * vocabulary },
+    (_, i) => Math.sin(i * 0.37 + salt) * 0.4 + (i % vocabulary === 9 ? 0.3 : 0)), [width, vocabulary]);
+  const inputs = [4, 9, 4, 17, 2];
+  for (const [name, options] of [
+    ["Qwen's instruct settings", { temperature: 0.7, topP: 0.8, topK: 20, presencePenalty: 1.5, seed: 7 }],
+    ["greedy with a presence penalty", { temperature: 0, presencePenalty: 1.5 }],
+    ["repetition, frequency and bias under min-p", { temperature: 1, minP: 0.02, repetitionPenalty: 1.3,
+      frequencyPenalty: 0.4, frequencyContextSize: 3, logitBias: { 9: -0.5 }, seed: 3 }],
+  ] as const) test(`draw what sample() would after each earlier input (${name})`, async () => {
+    const history = [3, 9, 1];
+    const config = { tokenRepresentation: "number", grammarWait: "before-sample", initialHistory: history } as const;
+    const reference = makeStepSampler(options, { ...config, historyUpdate: "manual" });
+    const window = makeStepSampler(options, { ...config, historyUpdate: "after-sample" });
+    try {
+      for (const salt of [0, 1, 2]) {
+        using scores = scoresFor(salt);
+        const expected: number[] = [];
+        for (let position = 0; position < width; position++) {
+          using row = scores.slice([position, 0], [position + 1, vocabulary]);
+          expected.push((await reference.sample(row, 10 * salt + position)).token);
+          if (position + 1 < width) reference.commitNumbers([inputs[position + 1]!]);
+        }
+        using ids = ops.fromInt32(inputs, [width]);
+        using drawn = window.positional!.sample(scores, expected.map((_, position) => 10 * salt + position), ids);
+        expect(drawn.toIntTokens()).toEqual(expected);
+        // The walk used every position: both histories now end with the inputs after the pending token.
+        reference.commitNumbers([expected.at(-1)!]);
+        window.positional!.commit([...inputs.slice(1), expected.at(-1)!]);
+      }
+    } finally { reference.dispose(); window.dispose(); }
+  });
+
+  test("need the window's inputs where a processor reads history", () => {
+    const sampling = makeStepSampler({ temperature: 0.7, presencePenalty: 1.5 }, {
+      tokenRepresentation: "number", grammarWait: "before-sample", historyUpdate: "after-sample", initialHistory: [1] });
+    try {
+      using scores = MlxArray.fromFloat32(new Float32Array(2 * 4), [2, 4]);
+      expect(() => sampling.positional!.sample(scores, [0, 1])).toThrow("needs the window's 2 inputs");
+    } finally { sampling.dispose(); }
+  });
+});

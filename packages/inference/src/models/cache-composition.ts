@@ -1,7 +1,7 @@
 import type { Cache } from "../contracts/mlx/cache";
 import type { MlxCacheLayer } from "../contracts/mlx/graph";
 import type { Composition } from "../contracts/portable/composition";
-import { AttentionMasks } from "../state/attention-read";
+import { AttentionMasks, foldedWindowRead, sdpaRead } from "../state/attention-read";
 import { Bf16FirstKv4Head256Cache, composedFullAttentionCache, composedSlidingAttentionCache } from "../state/bf16-first-kv";
 import { composedAffineKernels } from "../state/affine-attention";
 import { SSMCache } from "../state/ssm";
@@ -22,9 +22,10 @@ export function composeGraphCaches(graph: { readonly cacheLayers: readonly MlxCa
       case "latent": return composedLatentCache(kv, pagedKv, index, layer.geometry);
       case "full":
         if (layer.kv4Head256 && kv.kind === "affine" && kv.bits === 4 && kv.groupSize === 64)
-          return new Bf16FirstKv4Head256Cache(kv.quantizedKvStart ?? 0, composedAffineKernels(kv.kernels), masks);
+          return new Bf16FirstKv4Head256Cache(kv.quantizedKvStart ?? 0, composedAffineKernels(kv.kernels), masks, layer.kv4DecodeBlock);
         return composedFullAttentionCache(kv, index, masks,
-          layer.turboQuant === "deferred" ? deferredTurboQuantKernels : denseTurboQuantKernels);
+          layer.turboQuant === "deferred" ? deferredTurboQuantKernels : denseTurboQuantKernels,
+          layer.windowRead === "folded" ? foldedWindowRead : sdpaRead);
     }
   });
   if (graph.cachePaging) {

@@ -1,3 +1,4 @@
+import { rowOperationFor } from "../../../models/graph";
 // Dflash2Provider — the DFlash 2 block drafter (models/speculative/dflash2.ts)
 // behind the grouped draft seam. Context rows are the target's tapped layer
 // outputs over the accepted stream (prefill seeds them; each commit appends
@@ -8,7 +9,9 @@
 // to the width its composer passes (the draft registry passes 4: 1.0 GB
 // resident instead of the 3.85 GB BF16 checkpoint). A target whose residual
 // stream carries a TurboQuant R1 fold declares it on its draft target
-// (`residualBasis`); binding a draft group applies it before the first draft.
+// (`residualBasis`), and one whose composition measured them the kernels of
+// those projections (`draftProjections`); binding a draft group applies both
+// before the first draft.
 
 import { artifactIdentity } from "../../../artifacts/identity";
 import { projectedDraftGroups, type ProjectedDraftMethod } from "../bindings/projected-draft-rows";
@@ -36,20 +39,20 @@ export class Dflash2Provider implements DraftProvider {
       if (target.hiddenLayerTaps.layerCount !== layers) throw new Error(
         `DFlash 2 drafter was trained for a ${layers}-layer target; this model has ` +
         `${target.hiddenLayerTaps.layerCount} layers — wrong (target, drafter) pairing`);
-      drafter.bindResidualBasis(target.residualBasis ?? null);
+      drafter.bindTarget(target.residualBasis ?? null, target.draftProjections ?? null);
       const projection = target.hiddenLayerTaps.projection;
       // The block for the rows drafted this round: anchors × columns rows index the drafter's draft table.
       const draftDevice: NonNullable<ProjectedDraftMethod["draftDevice"]> = (context, pending, positions, depth) => {
         const columns = drafter.blockColumns(depth);
-        return drafter.draft[(pending.length * columns)]!(context, projection, pending, positions, columns);
+        return rowOperationFor(drafter.draft,(pending.length * columns))(context, projection, pending, positions, columns);
       };
       return {
         namespace, schema: "dflash2-context-v1", layers: drafter.cfg.layers,
         // The B × L context rows a prefill or a commit appends index the drafter's context tables.
         project(hidden, positions) {
           const width = (hidden.shape[0]! * hidden.shape[1]!);
-          using context = drafter.projectContext[width]!(hidden);
-          return drafter.projectContextKVRows[width]!(context, positions);
+          using context = rowOperationFor(drafter.projectContext,width)(hidden);
+          return rowOperationFor(drafter.projectContextKVRows,width)(context, positions);
         },
         draft(context, pending, positions, depth) {
           const steps = drafter.blockColumns(depth) - 1;

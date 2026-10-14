@@ -3,8 +3,11 @@ import * as ops from "@mlx-bun/mlx/ops";
 import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
 import type { Cache } from "../../contracts/mlx/cache";
+import type { DraftProjectionKernels } from "../../contracts/mlx/draft-target";
+import type { DraftProjection } from "../../contracts/mlx/draft-projection";
+import type { AneProgramSpec } from "../../kernels/ane/linear";
 import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
-import type { MlxDeclaredGraph, MlxTokenPhases, MlxLayerCapture, MlxHeadForward, MlxRowTable, MlxPromptRange, MlxCacheLayer, MlxPhaseForward, MlxSequenceRange, MlxMixedRange, MlxPhaseGroup, MlxMixedGroupRange, MlxSeparateMixed, MlxKnownRange } from "../../contracts/mlx/graph";
+import type { MlxDeclaredGraph, MlxTokenPhases, MlxLayerCapture, MlxHeadForward, MlxRowTable, MlxPromptRange, MlxCacheLayer, MlxSequenceRange, MlxMixedRange, MlxPhaseGroup, MlxMixedGroupRange, MlxSeparateMixed, MlxKnownRange } from "../../contracts/mlx/graph";
 import type { MediaEncoders, MlxPromptInput, Vision, MlxPositionedForward, MlxPositionedRange, MlxPositionedEmbeddingsRange, MlxEmbeddingsRange } from "../../contracts/mlx/media";
 import type { MropeForwardState } from "../../contracts/mlx/positions";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
@@ -13,21 +16,48 @@ import { RMSNorm } from "../../layers/normalization";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import { QuantizedLinear, QuantizedLinearPlain as Plain } from "../../layers/quantized-linear";
 import { mropeInvFreq } from "../../layers/qwen-mrope";
-import { ReduceGateUpRow as GateRow, ReduceGateUpRows as GateRows, ReduceSplitMixedGateUp as MixedGate } from "../../layers/trellis-reduce-gate-up";
-import { ScatterDownK3iRow as DownK3iRow, ScatterDownK3iRows as DownK3iRows, ScatterDownRow as DownRow, ScatterDownRows as DownRows } from "../../layers/trellis-scatter-down";
-import { TrellisFusedMLP, TrellisUnfusedMLP, TrellisScatterPrompt as Scatter, TrellisSplitKPrompt as SplitK, TrellisTiledPrompt as Tiled, TrellisExpandReducePrompt as ExpandGate, TrellisExpandScatterPrompt as ExpandDown } from "../../layers/trellis-prompt";
-import { GraphForwardScope, BoundedGraphForwardScope } from "../../runtime/graph-forward";
+import { ReduceSplitMixedGateUp as MixedGate } from "../../layers/trellis-reduce-gate-up";
+import { CodebookSplitGateUpRow as GateRow } from "../../layers/trellis-codebook-gate-up";
+import { CodebookDownK3iRow as DownK3iRow, CodebookDownRow as DownRow } from "../../layers/trellis-codebook-down";
+import { CodebookMmaGateUp as GateRows, MmaGateUpWide as WideGate } from "../../layers/trellis-gate-up";
+import { CodebookMmaDown as DownRows, CodebookMmaDownK3i as DownK3iRows, MmaDownWide as WideDown, MmaDownWideK3i as WideDownK3i } from "../../layers/trellis-down";
+import { AffineRowLinear as AffineRow, Affine3RowsLinear as Affine3, Affine4RowsLinear as Affine4, AffineSplitMmaLinear as AffineMma } from "../../layers/affine-verify-linear";
+import { DequantizedMatmulLinear as Dense } from "../../layers/dequantized-linear";
+import { AneAffineSplit, AneTrellisExpandedMlpSplit as AneSplit, AneTrellisExpandedMlpSplitK3i as AneSplitK3i, aneAffineSplitProgram, aneMlpSplitProgram } from "../../layers/ane-prefill-split";
+import { TrellisFusedMLP, TrellisUnfusedMLP, TrellisReducePrompt as Reduce, TrellisScatterPrompt as Scatter, TrellisSplitKPrompt as SplitK, TrellisTiledPrompt as Tiled, TrellisExpandReducePrompt as ExpandGate, TrellisExpandScatterPrompt as ExpandDown } from "../../layers/trellis-prompt";
+import { GraphForwardScope, BoundedGraphForwardScope, SubmittedGraphForwardScope, QueuedGraphForwardScope } from "../../runtime/graph-forward";
 import { disposeResources } from "../../runtime/resources";
 import { declareGraph } from "../capabilities";
-import type { ReadPhase } from "../graph";
+import { rowTableWithDefault, type ReadPhase } from "../graph";
 import { QwenDeltaLayer as Delta, QwenAttentionLayer as Attention } from "./blocks";
-import { bindQwenMediaInput, qwenDraftTarget, qwenMediaEncoders, qwenResidualBasis } from "./media-input";
-import { DeltaWeights, AttentionWeights, GateDownMLP, canonicalQwenWeights, type QwenProjectionTarget } from "./written-layers";
+import { bindQwenMediaInput, qwenDraftTarget, qwenDraftVocabularyMemo, qwenMediaEncoders, qwenResidualBasis } from "./media-input";
+import { DeltaWeights, AttentionWeights, GateDownMLP, AneWeightShares, AneBoundMlp, canonicalQwenWeights, type QwenProjectionTarget } from "./written-layers";
 import { PackedMixedScope } from "../../input/packed-mixed";
 
 export const QWEN38_TRELLIS_M1MAX_GRAPH="qwen3.8-27b-trellis-3.2bpw-m1max";
-export const DECODE_ROWS=8;
-export const VERIFY_ROWS=64;
+/** Tuned exact entries. Larger rows use the declared operations in this file. */
+export const DECODE_ROWS=256;
+export const VERIFY_ROWS=256;
+export interface AneWidths {hidden:number;intermediate:number;projections:readonly [readonly [number,number],readonly [number,number],readonly [number,number],readonly [number,number]]}
+export const ANE_WIDTHS:AneWidths={hidden:5120,intermediate:17408,projections:[[5120,10240],[5120,6144],[6144,5120],[5120,12288]]};
+/** Programs are installed beforehand. Loading this graph loads these fixed programs. */
+export function anePrograms(widths:AneWidths=ANE_WIDTHS):AneProgramSpec[] {
+  const h=widths.hidden,i=widths.intermediate,[[qi,qo],[zi,zo],[oi,oo],[ai,ao]]=widths.projections;
+  return [
+    aneMlpSplitProgram(h,i,.353,256,4),aneMlpSplitProgram(h,i,.353,320,4),aneMlpSplitProgram(h,i,.353,384,4),
+    aneMlpSplitProgram(h,i,.353,448,4),aneMlpSplitProgram(h,i,.353,512,4),aneMlpSplitProgram(h,i,.353,576,4),
+    aneMlpSplitProgram(h,i,.353,640,4),aneMlpSplitProgram(h,i,.353,704,4),aneMlpSplitProgram(h,i,.353,768,4),
+    aneMlpSplitProgram(h,i,.382,896,4),aneMlpSplitProgram(h,i,.382,1024,4),aneMlpSplitProgram(h,i,.382,1280,4),
+    aneMlpSplitProgram(h,i,.382,1536,4),aneMlpSplitProgram(h,i,.382,1792,4),aneMlpSplitProgram(h,i,.382,2048,4),
+    aneAffineSplitProgram(qi,qo,.375,768,4),aneAffineSplitProgram(zi,zo,.375,768,4),aneAffineSplitProgram(oi,oo,.375,768,4),aneAffineSplitProgram(ai,ao,.375,768,4),
+    aneAffineSplitProgram(qi,qo,.375,896,4),aneAffineSplitProgram(zi,zo,.375,896,4),aneAffineSplitProgram(oi,oo,.375,896,4),aneAffineSplitProgram(ai,ao,.375,896,4),
+    aneAffineSplitProgram(qi,qo,.375,1024,4),aneAffineSplitProgram(zi,zo,.375,1024,4),aneAffineSplitProgram(oi,oo,.375,1024,4),aneAffineSplitProgram(ai,ao,.375,1024,4),
+    aneAffineSplitProgram(qi,qo,.375,1280,4),aneAffineSplitProgram(zi,zo,.375,1280,4),aneAffineSplitProgram(oi,oo,.375,1280,4),aneAffineSplitProgram(ai,ao,.375,1280,4),
+    aneAffineSplitProgram(qi,qo,.375,1536,4),aneAffineSplitProgram(zi,zo,.375,1536,4),aneAffineSplitProgram(oi,oo,.375,1536,4),aneAffineSplitProgram(ai,ao,.375,1536,4),
+    aneAffineSplitProgram(qi,qo,.375,1792,4),aneAffineSplitProgram(zi,zo,.375,1792,4),aneAffineSplitProgram(oi,oo,.375,1792,4),aneAffineSplitProgram(ai,ao,.375,1792,4),
+    aneAffineSplitProgram(qi,qo,.375,2048,4),aneAffineSplitProgram(zi,zo,.375,2048,4),aneAffineSplitProgram(oi,oo,.375,2048,4),aneAffineSplitProgram(ai,ao,.375,2048,4),
+  ];
+}
 const PREFIX="language_model.model";
 const REPRESENTATIONS={gateUpCodebook:true,mixedExactBits:true,scatter:{bits:true,genericBits:true,floatCodebook:true},widePrefill:false};
 type Layers=readonly [
@@ -37,40 +67,51 @@ type Layers=readonly [
   Delta,Delta,Delta,Attention,Delta,Delta,Delta,Attention,Delta,Delta,Delta,Attention,Delta,Delta,Delta,Attention,
 ];
 export type RowsForward=(ids:MlxArray,state:Cache[],capture:MlxLayerCapture|null)=>MlxArray;
+type LayerWeights=readonly [
+  DeltaWeights,DeltaWeights,DeltaWeights,AttentionWeights,DeltaWeights,DeltaWeights,DeltaWeights,AttentionWeights,DeltaWeights,DeltaWeights,DeltaWeights,AttentionWeights,DeltaWeights,DeltaWeights,DeltaWeights,AttentionWeights,
+  DeltaWeights,DeltaWeights,DeltaWeights,AttentionWeights,DeltaWeights,DeltaWeights,DeltaWeights,AttentionWeights,DeltaWeights,DeltaWeights,DeltaWeights,AttentionWeights,DeltaWeights,DeltaWeights,DeltaWeights,AttentionWeights,
+  DeltaWeights,DeltaWeights,DeltaWeights,AttentionWeights,DeltaWeights,DeltaWeights,DeltaWeights,AttentionWeights,DeltaWeights,DeltaWeights,DeltaWeights,AttentionWeights,DeltaWeights,DeltaWeights,DeltaWeights,AttentionWeights,
+  DeltaWeights,DeltaWeights,DeltaWeights,AttentionWeights,DeltaWeights,DeltaWeights,DeltaWeights,AttentionWeights,DeltaWeights,DeltaWeights,DeltaWeights,AttentionWeights,DeltaWeights,DeltaWeights,DeltaWeights,AttentionWeights,
+];
 
-/** The M1 Max arrangement, with its own reduce/scatter decode operations and
- * GPU prompt operations. The loader recommends it; callers may choose it. */
+/** The M1 Max arrangement, with fixed codebook, MMA, and split ANE operations.
+ * The loader recommends it; callers may choose it on any machine. */
 export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
   readonly graph=QWEN38_TRELLIS_M1MAX_GRAPH;
   readonly prefixBase=PREFIX;
   readonly loraState=new LoraState();
   readonly faIdx=3;
+  readonly wiredWeights=true;
   readonly weightsBytes:number;
   readonly embed:QuantizedEmbedding;
   readonly finalNorm:RMSNorm;
   readonly lmHead:QuantizedLinear;
   readonly graphCapabilities:GraphCapabilities=declareGraph({media:{input:"embeddings+positions",video:true},hiddenLayerTaps:true,prefill:{boundedWorkspace:true}});
-  readonly verifyRoundCosts=new Map([[1,1],[2,1.89],[3,2.35],[4,2.97],[5,12.22],[6,13.16],[7,13.02],[8,12.88]]);
+  readonly verifyRoundCosts=new Map([[1,1],[2,1.77],[3,1.95],[4,1.98],[5,2],[6,2.03],[7,2.04],[8,2.05],[16,3.46],[32,6.4]]);
+  readonly adaptiveDraftWidths=new Map([["mtp",4]]);
+  readonly adaptiveDraftGates=new Map([["dflash2",{decay:.95,idleDecay:.93,probeDepth:1}],["mtp",{decay:.95,idleDecay:.93}]]);
   readonly cacheLayers:readonly MlxCacheLayer[]=[
-    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense"},
-    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense"},
-    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense"},
-    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense"},
-    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense"},
-    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense"},
-    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense"},
-    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense"},
-    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense"},
-    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense"},
-    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense"},
-    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense"},
-    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense"},
-    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense"},
-    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense"},
-    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense"},
+    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense",kv4Head256:true,kv4DecodeBlock:128,windowRead:"folded"},
+    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense",kv4Head256:true,kv4DecodeBlock:128,windowRead:"folded"},
+    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense",kv4Head256:true,kv4DecodeBlock:128,windowRead:"folded"},
+    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense",kv4Head256:true,kv4DecodeBlock:128,windowRead:"folded"},
+    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense",kv4Head256:true,kv4DecodeBlock:128,windowRead:"folded"},
+    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense",kv4Head256:true,kv4DecodeBlock:128,windowRead:"folded"},
+    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense",kv4Head256:true,kv4DecodeBlock:128,windowRead:"folded"},
+    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense",kv4Head256:true,kv4DecodeBlock:128,windowRead:"folded"},
+    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense",kv4Head256:true,kv4DecodeBlock:128,windowRead:"folded"},
+    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense",kv4Head256:true,kv4DecodeBlock:128,windowRead:"folded"},
+    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense",kv4Head256:true,kv4DecodeBlock:128,windowRead:"folded"},
+    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense",kv4Head256:true,kv4DecodeBlock:128,windowRead:"folded"},
+    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense",kv4Head256:true,kv4DecodeBlock:128,windowRead:"folded"},
+    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense",kv4Head256:true,kv4DecodeBlock:128,windowRead:"folded"},
+    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense",kv4Head256:true,kv4DecodeBlock:128,windowRead:"folded"},
+    {kind:"recurrent"},{kind:"recurrent"},{kind:"recurrent"},{kind:"full",turboQuant:"dense",kv4Head256:true,kv4DecodeBlock:128,windowRead:"folded"},
   ];
   readonly prompt:readonly MlxPromptRange[];
   readonly multiSequencePrompt:readonly MlxPromptRange[];
+  readonly promptChunk:readonly MlxPromptRange[];
+  readonly multiSequencePromptChunk:readonly MlxPromptRange[];
   readonly decode:MlxRowTable<RowsForward>;
   readonly verify:MlxRowTable<RowsForward>;
   readonly appendKnown:readonly MlxKnownRange[];
@@ -89,6 +130,10 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
   readonly #mrope:{invFreq:MlxArray;rotaryDims:number};
   readonly #one:Layers;
   readonly #rows:Layers;
+  readonly #mma:Layers;
+  readonly #wide:Layers;
+  readonly #draftProjections:DraftProjectionKernels;
+  readonly #vocabulary:()=>NonNullable<DraftProjection["vocabulary"]>;
   readonly #stockNarrow:Layers;
   readonly #fiveToEight:Layers;
   readonly #tiled:Layers;
@@ -102,10 +147,20 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
     this.finalNorm=new RMSNorm(w.tensor(`${PREFIX}.norm.weight`),t.rmsNormEps);
     this.lmHead=QuantizedLinear.load(w,"language_model.lm_head",c);
     this.#head=new Plain(this.lmHead);
+    this.#draftProjections=[
+      {from:1,to:1,operation:(w,scales,biases)=>{const kernel=new Plain(new QuantizedLinear(w,scales,biases,{bits:4,groupSize:64,mode:"affine"}));return x=>kernel.forward(x);}},
+      {from:2,to:3,operation:(w,scales,biases)=>{const kernel=new Affine4(new QuantizedLinear(w,scales,biases,{bits:4,groupSize:64,mode:"affine"}));return x=>kernel.forward(x);}},
+      {from:4,to:Infinity,operation:(w,scales,biases)=>{const kernel=new AffineMma(new QuantizedLinear(w,scales,biases,{bits:4,groupSize:64,mode:"affine"}));return x=>kernel.forward(x);}},
+    ];
     const invScale=Math.pow(t.linearKeyHeadDim,-0.5),qk={q:ops.filledBf16(invScale*invScale,t.linearKeyHeadDim),k:ops.filledBf16(invScale,t.linearKeyHeadDim)};
     const rotaryDims=Math.trunc(t.headDim*t.partialRotaryFactor);
     this.#mrope={invFreq:mropeInvFreq(rotaryDims,t.ropeParameters.full_attention!.ropeTheta),rotaryDims};
     this.#owned=[qk.q,qk.k,this.#mrope.invFreq];
+    this.#vocabulary=qwenDraftVocabularyMemo(this.lmHead,c.modelDir,"mtp/draft_vocab.json",t.vocabSize,head=>{
+      const row=new AffineRow(head),rows=new Affine4(head),mma=new AffineMma(head),plain=new Plain(head);
+      return [{from:1,to:1,operation:hidden=>row.forward(hidden)},{from:2,to:3,operation:hidden=>rows.forward(hidden)},
+        {from:4,to:256,operation:hidden=>mma.forward(hidden)},{from:257,to:Infinity,operation:hidden=>plain.forward(hidden)}];
+    },this.#owned);
     const state=this.loraState;
     const d0=new DeltaWeights(w,c,`${PREFIX}.layers.0`,REPRESENTATIONS,state);
     const d1=new DeltaWeights(w,c,`${PREFIX}.layers.1`,REPRESENTATIONS,state);
@@ -189,135 +244,268 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
       ...d56.targets(),...d57.targets(),...d58.targets(),...a59.targets(),...d60.targets(),...d61.targets(),...d62.targets(),...a63.targets()]);
     this.#one=[
       d0.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d1.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d2.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
+      d1.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,Plain,qk),
+      d2.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,Plain,qk),
       a3.stage(w,c,Attention,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain),
-      d4.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d5.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d6.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
+      d4.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,Plain,Plain,Plain,Plain,qk),
+      d5.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,Plain,Plain,Plain,Plain,qk),
+      d6.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
       a7.stage(w,c,Attention,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain),
-      d8.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d9.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d10.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
+      d8.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      d9.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      d10.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
       a11.stage(w,c,Attention,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain),
-      d12.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d13.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d14.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
-      a15.stage(w,c,Attention,GateDownMLP,MixedGate,DownRow,Plain,Plain,Plain,Plain),
-      d16.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d17.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d18.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain,Plain,qk),
+      d12.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      d13.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      d14.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      a15.stage(w,c,Attention,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain),
+      d16.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      d17.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      d18.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
       a19.stage(w,c,Attention,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain),
-      d20.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d21.stage(w,c,Delta,GateDownMLP,MixedGate,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d22.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
+      d20.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      d21.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      d22.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
       a23.stage(w,c,Attention,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain),
-      d24.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d25.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d26.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
+      d24.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      d25.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,Plain,Plain,Plain,AffineRow,qk),
+      d26.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
       a27.stage(w,c,Attention,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain),
-      d28.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d29.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d30.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
+      d28.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      d29.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      d30.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
       a31.stage(w,c,Attention,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain),
-      d32.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d33.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d34.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
-      a35.stage(w,c,Attention,GateDownMLP,MixedGate,DownK3iRow,Plain,Plain,Plain,Plain),
-      d36.stage(w,c,Delta,GateDownMLP,MixedGate,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d37.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d38.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
+      d32.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      d33.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      d34.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      a35.stage(w,c,Attention,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain),
+      d36.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      d37.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      d38.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
       a39.stage(w,c,Attention,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain),
-      d40.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d41.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d42.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
-      a43.stage(w,c,Attention,GateDownMLP,MixedGate,DownK3iRow,Plain,Plain,Plain,Plain),
-      d44.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d45.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d46.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain,Plain,qk),
+      d40.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      d41.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      d42.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      a43.stage(w,c,Attention,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain),
+      d44.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      d45.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      d46.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
       a47.stage(w,c,Attention,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain),
-      d48.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d49.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d50.stage(w,c,Delta,GateDownMLP,MixedGate,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
-      a51.stage(w,c,Attention,GateDownMLP,MixedGate,DownK3iRow,Plain,Plain,Plain,Plain),
-      d52.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d53.stage(w,c,Delta,GateDownMLP,MixedGate,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
+      d48.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      d49.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      d50.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      a51.stage(w,c,Attention,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain),
+      d52.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,AffineRow,Plain,Plain,AffineRow,qk),
+      d53.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,AffineRow,Plain,Plain,Plain,AffineRow,qk),
       d54.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain,Plain,qk),
       a55.stage(w,c,Attention,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain),
-      d56.stage(w,c,Delta,GateDownMLP,MixedGate,DownRow,Plain,Plain,Plain,Plain,Plain,qk),
+      d56.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain,Plain,qk),
       d57.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d58.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain,Plain,qk),
+      d58.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,Plain,AffineRow,Plain,Plain,AffineRow,qk),
       a59.stage(w,c,Attention,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain),
-      d60.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain,Plain,qk),
+      d60.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain,AffineRow,qk),
       d61.stage(w,c,Delta,GateDownMLP,GateRow,DownRow,Plain,Plain,Plain,Plain,Plain,qk),
-      d62.stage(w,c,Delta,GateDownMLP,MixedGate,DownK3iRow,Plain,Plain,Plain,Plain,Plain,qk),
+      d62.stage(w,c,Delta,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain,AffineRow,qk),
       a63.stage(w,c,Attention,GateDownMLP,GateRow,DownK3iRow,Plain,Plain,Plain,Plain),
     ];
     this.#rows=[
-      d0.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d1.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d2.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      a3.stage(w,c,Attention,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain),
-      d4.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d5.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d6.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      a7.stage(w,c,Attention,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain),
-      d8.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d9.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d10.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      a11.stage(w,c,Attention,GateDownMLP,GateRows,DownRows,Plain,Plain,Plain,Plain),
-      d12.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d13.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d14.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      a15.stage(w,c,Attention,GateDownMLP,MixedGate,DownRows,Plain,Plain,Plain,Plain),
-      d16.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d17.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d18.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Plain,Plain,Plain,Plain,Plain,qk),
-      a19.stage(w,c,Attention,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain),
-      d20.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d21.stage(w,c,Delta,GateDownMLP,MixedGate,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d22.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      a23.stage(w,c,Attention,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain),
-      d24.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d25.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d26.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      a27.stage(w,c,Attention,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain),
-      d28.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d29.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d30.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      a31.stage(w,c,Attention,GateDownMLP,GateRows,DownRows,Plain,Plain,Plain,Plain),
-      d32.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d33.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d34.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      a35.stage(w,c,Attention,GateDownMLP,MixedGate,DownK3iRows,Plain,Plain,Plain,Plain),
-      d36.stage(w,c,Delta,GateDownMLP,MixedGate,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d37.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d38.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      a39.stage(w,c,Attention,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain),
-      d40.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d41.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d42.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      a43.stage(w,c,Attention,GateDownMLP,MixedGate,DownK3iRows,Plain,Plain,Plain,Plain),
-      d44.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d45.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d46.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Plain,Plain,Plain,Plain,Plain,qk),
-      a47.stage(w,c,Attention,GateDownMLP,GateRows,DownRows,Plain,Plain,Plain,Plain),
-      d48.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d49.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d50.stage(w,c,Delta,GateDownMLP,MixedGate,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      a51.stage(w,c,Attention,GateDownMLP,MixedGate,DownK3iRows,Plain,Plain,Plain,Plain),
-      d52.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d53.stage(w,c,Delta,GateDownMLP,MixedGate,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d54.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Plain,Plain,Plain,Plain,Plain,qk),
-      a55.stage(w,c,Attention,GateDownMLP,GateRows,DownRows,Plain,Plain,Plain,Plain),
-      d56.stage(w,c,Delta,GateDownMLP,MixedGate,DownRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d57.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d58.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Plain,Plain,Plain,Plain,Plain,qk),
-      a59.stage(w,c,Attention,GateDownMLP,GateRows,DownRows,Plain,Plain,Plain,Plain),
-      d60.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d61.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Plain,Plain,Plain,Plain,Plain,qk),
-      d62.stage(w,c,Delta,GateDownMLP,MixedGate,DownK3iRows,Plain,Plain,Plain,Plain,Plain,qk),
-      a63.stage(w,c,Attention,GateDownMLP,GateRows,DownK3iRows,Plain,Plain,Plain,Plain),
+      d0.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Affine4,Affine4,Affine4,Affine4,Affine4,qk),
+      d1.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine4,qk),
+      d2.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine4,qk),
+      a3.stage(w,c,Attention,GateDownMLP,GateRows,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
+      d4.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine4,Affine4,Affine4,Affine4,qk),
+      d5.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine4,Affine4,Affine4,Affine4,qk),
+      d6.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      a7.stage(w,c,Attention,GateDownMLP,GateRows,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
+      d8.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d9.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d10.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      a11.stage(w,c,Attention,GateDownMLP,GateRows,DownRows,Affine4,Affine4,Affine4,Affine4),
+      d12.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d13.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d14.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      a15.stage(w,c,Attention,GateDownMLP,GateRows,DownRows,Affine4,Affine4,Affine4,Affine4),
+      d16.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d17.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d18.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      a19.stage(w,c,Attention,GateDownMLP,GateRows,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
+      d20.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d21.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d22.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      a23.stage(w,c,Attention,GateDownMLP,GateRows,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
+      d24.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d25.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine4,Affine4,Affine4,Affine3,qk),
+      d26.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      a27.stage(w,c,Attention,GateDownMLP,GateRows,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
+      d28.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d29.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d30.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      a31.stage(w,c,Attention,GateDownMLP,GateRows,DownRows,Affine4,Affine4,Affine4,Affine4),
+      d32.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d33.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d34.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      a35.stage(w,c,Attention,GateDownMLP,GateRows,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
+      d36.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d37.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d38.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      a39.stage(w,c,Attention,GateDownMLP,GateRows,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
+      d40.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d41.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d42.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      a43.stage(w,c,Attention,GateDownMLP,GateRows,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
+      d44.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d45.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d46.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      a47.stage(w,c,Attention,GateDownMLP,GateRows,DownRows,Affine4,Affine4,Affine4,Affine4),
+      d48.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d49.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d50.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      a51.stage(w,c,Attention,GateDownMLP,GateRows,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
+      d52.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d53.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine3,Affine4,Affine4,Affine4,Affine3,qk),
+      d54.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Affine4,Affine4,Affine4,Affine4,Affine4,qk),
+      a55.stage(w,c,Attention,GateDownMLP,GateRows,DownRows,Affine4,Affine4,Affine4,Affine4),
+      d56.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Affine4,Affine4,Affine4,Affine4,Affine4,qk),
+      d57.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Affine4,Affine4,Affine4,Affine4,Affine4,qk),
+      d58.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Affine4,Affine3,Affine4,Affine4,Affine3,qk),
+      a59.stage(w,c,Attention,GateDownMLP,GateRows,DownRows,Affine4,Affine4,Affine4,Affine4),
+      d60.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Affine4,Affine4,Affine4,Affine4,Affine3,qk),
+      d61.stage(w,c,Delta,GateDownMLP,GateRows,DownRows,Affine4,Affine4,Affine4,Affine4,Affine4,qk),
+      d62.stage(w,c,Delta,GateDownMLP,GateRows,DownK3iRows,Affine4,Affine4,Affine4,Affine4,Affine3,qk),
+      a63.stage(w,c,Attention,GateDownMLP,GateRows,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
+    ];
+    const rowLayers=this.#rows;
+    this.#mma=[
+      d0.withProjections(w,c,Delta,rowLayers[0].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d1.withProjections(w,c,Delta,rowLayers[1].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d2.withProjections(w,c,Delta,rowLayers[2].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a3.withProjections(w,c,Attention,rowLayers[3].mlp,AffineMma,AffineMma,AffineMma,AffineMma),
+      d4.withProjections(w,c,Delta,rowLayers[4].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d5.withProjections(w,c,Delta,rowLayers[5].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d6.withProjections(w,c,Delta,rowLayers[6].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a7.withProjections(w,c,Attention,rowLayers[7].mlp,AffineMma,AffineMma,AffineMma,AffineMma),
+      d8.withProjections(w,c,Delta,rowLayers[8].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d9.withProjections(w,c,Delta,rowLayers[9].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d10.withProjections(w,c,Delta,rowLayers[10].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a11.withProjections(w,c,Attention,rowLayers[11].mlp,AffineMma,AffineMma,AffineMma,AffineMma),
+      d12.withProjections(w,c,Delta,rowLayers[12].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d13.withProjections(w,c,Delta,rowLayers[13].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d14.withProjections(w,c,Delta,rowLayers[14].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a15.withProjections(w,c,Attention,rowLayers[15].mlp,AffineMma,AffineMma,AffineMma,AffineMma),
+      d16.withProjections(w,c,Delta,rowLayers[16].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d17.withProjections(w,c,Delta,rowLayers[17].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d18.withProjections(w,c,Delta,rowLayers[18].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a19.withProjections(w,c,Attention,rowLayers[19].mlp,AffineMma,AffineMma,AffineMma,AffineMma),
+      d20.withProjections(w,c,Delta,rowLayers[20].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d21.withProjections(w,c,Delta,rowLayers[21].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d22.withProjections(w,c,Delta,rowLayers[22].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a23.withProjections(w,c,Attention,rowLayers[23].mlp,AffineMma,AffineMma,AffineMma,AffineMma),
+      d24.withProjections(w,c,Delta,rowLayers[24].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d25.withProjections(w,c,Delta,rowLayers[25].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d26.withProjections(w,c,Delta,rowLayers[26].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a27.withProjections(w,c,Attention,rowLayers[27].mlp,AffineMma,AffineMma,AffineMma,AffineMma),
+      d28.withProjections(w,c,Delta,rowLayers[28].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d29.withProjections(w,c,Delta,rowLayers[29].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d30.withProjections(w,c,Delta,rowLayers[30].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a31.withProjections(w,c,Attention,rowLayers[31].mlp,AffineMma,AffineMma,AffineMma,AffineMma),
+      d32.withProjections(w,c,Delta,rowLayers[32].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d33.withProjections(w,c,Delta,rowLayers[33].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d34.withProjections(w,c,Delta,rowLayers[34].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a35.withProjections(w,c,Attention,rowLayers[35].mlp,AffineMma,AffineMma,AffineMma,AffineMma),
+      d36.withProjections(w,c,Delta,rowLayers[36].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d37.withProjections(w,c,Delta,rowLayers[37].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d38.withProjections(w,c,Delta,rowLayers[38].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a39.withProjections(w,c,Attention,rowLayers[39].mlp,AffineMma,AffineMma,AffineMma,AffineMma),
+      d40.withProjections(w,c,Delta,rowLayers[40].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d41.withProjections(w,c,Delta,rowLayers[41].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d42.withProjections(w,c,Delta,rowLayers[42].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a43.withProjections(w,c,Attention,rowLayers[43].mlp,AffineMma,AffineMma,AffineMma,AffineMma),
+      d44.withProjections(w,c,Delta,rowLayers[44].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d45.withProjections(w,c,Delta,rowLayers[45].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d46.withProjections(w,c,Delta,rowLayers[46].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a47.withProjections(w,c,Attention,rowLayers[47].mlp,AffineMma,AffineMma,AffineMma,AffineMma),
+      d48.withProjections(w,c,Delta,rowLayers[48].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d49.withProjections(w,c,Delta,rowLayers[49].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d50.withProjections(w,c,Delta,rowLayers[50].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a51.withProjections(w,c,Attention,rowLayers[51].mlp,AffineMma,AffineMma,AffineMma,AffineMma),
+      d52.withProjections(w,c,Delta,rowLayers[52].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d53.withProjections(w,c,Delta,rowLayers[53].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d54.withProjections(w,c,Delta,rowLayers[54].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a55.withProjections(w,c,Attention,rowLayers[55].mlp,AffineMma,AffineMma,AffineMma,AffineMma),
+      d56.withProjections(w,c,Delta,rowLayers[56].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d57.withProjections(w,c,Delta,rowLayers[57].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d58.withProjections(w,c,Delta,rowLayers[58].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a59.withProjections(w,c,Attention,rowLayers[59].mlp,AffineMma,AffineMma,AffineMma,AffineMma),
+      d60.withProjections(w,c,Delta,rowLayers[60].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d61.withProjections(w,c,Delta,rowLayers[61].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d62.withProjections(w,c,Delta,rowLayers[62].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a63.withProjections(w,c,Attention,rowLayers[63].mlp,AffineMma,AffineMma,AffineMma,AffineMma),
+    ];
+    this.#wide=[
+      d0.stage(w,c,Delta,GateDownMLP,WideGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d1.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d2.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a3.stage(w,c,Attention,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma),
+      d4.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d5.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d6.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a7.stage(w,c,Attention,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma),
+      d8.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d9.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d10.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a11.stage(w,c,Attention,GateDownMLP,WideGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma),
+      d12.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d13.stage(w,c,Delta,GateDownMLP,WideGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d14.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a15.stage(w,c,Attention,GateDownMLP,WideGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma),
+      d16.stage(w,c,Delta,GateDownMLP,WideGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d17.stage(w,c,Delta,GateDownMLP,WideGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d18.stage(w,c,Delta,GateDownMLP,WideGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a19.stage(w,c,Attention,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma),
+      d20.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d21.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d22.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a23.stage(w,c,Attention,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma),
+      d24.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d25.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d26.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a27.stage(w,c,Attention,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma),
+      d28.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d29.stage(w,c,Delta,GateDownMLP,WideGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d30.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a31.stage(w,c,Attention,GateDownMLP,WideGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma),
+      d32.stage(w,c,Delta,GateDownMLP,WideGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d33.stage(w,c,Delta,GateDownMLP,WideGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d34.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a35.stage(w,c,Attention,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma),
+      d36.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d37.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d38.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a39.stage(w,c,Attention,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma),
+      d40.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d41.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d42.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a43.stage(w,c,Attention,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma),
+      d44.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d45.stage(w,c,Delta,GateDownMLP,WideGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d46.stage(w,c,Delta,GateDownMLP,WideGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a47.stage(w,c,Attention,GateDownMLP,WideGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma),
+      d48.stage(w,c,Delta,GateDownMLP,WideGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d49.stage(w,c,Delta,GateDownMLP,WideGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d50.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a51.stage(w,c,Attention,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma),
+      d52.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d53.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d54.stage(w,c,Delta,GateDownMLP,WideGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a55.stage(w,c,Attention,GateDownMLP,WideGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma),
+      d56.stage(w,c,Delta,GateDownMLP,WideGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d57.stage(w,c,Delta,GateDownMLP,WideGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d58.stage(w,c,Delta,GateDownMLP,WideGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a59.stage(w,c,Attention,GateDownMLP,WideGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma),
+      d60.stage(w,c,Delta,GateDownMLP,WideGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d61.stage(w,c,Delta,GateDownMLP,WideGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d62.stage(w,c,Delta,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a63.stage(w,c,Attention,GateDownMLP,WideGate,WideDownK3i,AffineMma,AffineMma,AffineMma,AffineMma),
     ];
     this.#stockNarrow=[
       d0.fused(w,c,Delta,TrellisFusedMLP,Scatter,Plain,qk),
@@ -584,6 +772,79 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
       a63.prompt(w,c,Attention,TrellisUnfusedMLP,ExpandGate,ExpandDown,Plain),
     ];
     const stock=this.#stockNarrow,five=this.#fiveToEight,tiled=this.#tiled,expanded=this.#expanded;
+    const mixedUnfused:Layers=[
+      d0.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d1.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d2.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),a3.prompt(w,c,Attention,TrellisUnfusedMLP,Reduce,Scatter,Plain),
+      d4.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d5.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d6.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),a7.prompt(w,c,Attention,TrellisUnfusedMLP,Reduce,Scatter,Plain),
+      d8.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d9.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d10.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),a11.prompt(w,c,Attention,TrellisUnfusedMLP,Reduce,Scatter,Plain),
+      d12.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d13.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d14.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),a15.prompt(w,c,Attention,TrellisUnfusedMLP,Reduce,Scatter,Plain),
+      d16.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d17.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d18.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),a19.prompt(w,c,Attention,TrellisUnfusedMLP,Reduce,Scatter,Plain),
+      d20.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d21.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d22.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),a23.prompt(w,c,Attention,TrellisUnfusedMLP,Reduce,Scatter,Plain),
+      d24.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d25.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d26.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),a27.prompt(w,c,Attention,TrellisUnfusedMLP,Reduce,Scatter,Plain),
+      d28.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d29.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d30.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),a31.prompt(w,c,Attention,TrellisUnfusedMLP,Reduce,Scatter,Plain),
+      d32.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d33.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d34.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),a35.prompt(w,c,Attention,TrellisUnfusedMLP,Reduce,Scatter,Plain),
+      d36.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d37.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d38.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),a39.prompt(w,c,Attention,TrellisUnfusedMLP,Reduce,Scatter,Plain),
+      d40.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d41.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d42.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),a43.prompt(w,c,Attention,TrellisUnfusedMLP,Reduce,Scatter,Plain),
+      d44.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d45.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d46.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),a47.prompt(w,c,Attention,TrellisUnfusedMLP,Reduce,Scatter,Plain),
+      d48.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d49.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d50.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),a51.prompt(w,c,Attention,TrellisUnfusedMLP,Reduce,Scatter,Plain),
+      d52.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d53.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d54.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),a55.prompt(w,c,Attention,TrellisUnfusedMLP,Reduce,Scatter,Plain),
+      d56.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d57.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d58.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),a59.prompt(w,c,Attention,TrellisUnfusedMLP,Reduce,Scatter,Plain),
+      d60.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d61.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),d62.prompt(w,c,Delta,TrellisUnfusedMLP,Reduce,Scatter,Plain,qk),a63.prompt(w,c,Attention,TrellisUnfusedMLP,Reduce,Scatter,Plain),
+    ];
+    const wide=this.#wide,mma=this.#mma;
+    const prompt512:Layers=[
+      d0.withProjections(w,c,Delta,expanded[0].mlp,Dense,Dense,Plain,Plain,Dense,qk),d1.withProjections(w,c,Delta,expanded[1].mlp,Dense,Dense,Plain,Plain,Dense,qk),d2.withProjections(w,c,Delta,expanded[2].mlp,Dense,Dense,Plain,Plain,Dense,qk),a3.withProjections(w,c,Attention,expanded[3].mlp,Dense,Plain,Plain,Dense),
+      d4.withProjections(w,c,Delta,expanded[4].mlp,Dense,Dense,Plain,Plain,Dense,qk),d5.withProjections(w,c,Delta,expanded[5].mlp,Dense,Dense,Plain,Plain,Dense,qk),d6.withProjections(w,c,Delta,expanded[6].mlp,Dense,Dense,Plain,Plain,Dense,qk),a7.withProjections(w,c,Attention,expanded[7].mlp,Dense,Plain,Plain,Dense),
+      d8.withProjections(w,c,Delta,expanded[8].mlp,Dense,Dense,Plain,Plain,Dense,qk),d9.withProjections(w,c,Delta,expanded[9].mlp,Dense,Dense,Plain,Plain,Dense,qk),d10.withProjections(w,c,Delta,expanded[10].mlp,Dense,Dense,Plain,Plain,Dense,qk),a11.withProjections(w,c,Attention,expanded[11].mlp,Dense,Plain,Plain,Dense),
+      d12.withProjections(w,c,Delta,expanded[12].mlp,Dense,Dense,Plain,Plain,Dense,qk),d13.withProjections(w,c,Delta,expanded[13].mlp,Dense,Dense,Plain,Plain,Dense,qk),d14.withProjections(w,c,Delta,expanded[14].mlp,Dense,Dense,Plain,Plain,Dense,qk),a15.withProjections(w,c,Attention,expanded[15].mlp,Dense,Plain,Plain,Dense),
+      d16.withProjections(w,c,Delta,expanded[16].mlp,Dense,Dense,Plain,Plain,Dense,qk),d17.withProjections(w,c,Delta,expanded[17].mlp,Dense,Dense,Plain,Plain,Dense,qk),d18.withProjections(w,c,Delta,expanded[18].mlp,Dense,Dense,Plain,Plain,Dense,qk),a19.withProjections(w,c,Attention,expanded[19].mlp,Dense,Plain,Plain,Dense),
+      d20.withProjections(w,c,Delta,expanded[20].mlp,Dense,Dense,Plain,Plain,Dense,qk),d21.withProjections(w,c,Delta,expanded[21].mlp,Dense,Dense,Plain,Plain,Dense,qk),d22.withProjections(w,c,Delta,expanded[22].mlp,Dense,Dense,Plain,Plain,Dense,qk),a23.withProjections(w,c,Attention,expanded[23].mlp,Dense,Plain,Plain,Dense),
+      d24.withProjections(w,c,Delta,expanded[24].mlp,Dense,Dense,Plain,Plain,Dense,qk),d25.withProjections(w,c,Delta,expanded[25].mlp,Dense,Dense,Plain,Plain,Dense,qk),d26.withProjections(w,c,Delta,expanded[26].mlp,Dense,Dense,Plain,Plain,Dense,qk),a27.withProjections(w,c,Attention,expanded[27].mlp,Dense,Plain,Plain,Dense),
+      d28.withProjections(w,c,Delta,expanded[28].mlp,Dense,Dense,Plain,Plain,Dense,qk),d29.withProjections(w,c,Delta,expanded[29].mlp,Dense,Dense,Plain,Plain,Dense,qk),d30.withProjections(w,c,Delta,expanded[30].mlp,Dense,Dense,Plain,Plain,Dense,qk),a31.withProjections(w,c,Attention,expanded[31].mlp,Dense,Plain,Plain,Dense),
+      d32.withProjections(w,c,Delta,expanded[32].mlp,Dense,Dense,Plain,Plain,Dense,qk),d33.withProjections(w,c,Delta,expanded[33].mlp,Dense,Dense,Plain,Plain,Dense,qk),d34.withProjections(w,c,Delta,expanded[34].mlp,Dense,Dense,Plain,Plain,Dense,qk),a35.withProjections(w,c,Attention,expanded[35].mlp,Dense,Plain,Plain,Dense),
+      d36.withProjections(w,c,Delta,expanded[36].mlp,Dense,Dense,Plain,Plain,Dense,qk),d37.withProjections(w,c,Delta,expanded[37].mlp,Dense,Dense,Plain,Plain,Dense,qk),d38.withProjections(w,c,Delta,expanded[38].mlp,Dense,Dense,Plain,Plain,Dense,qk),a39.withProjections(w,c,Attention,expanded[39].mlp,Dense,Plain,Plain,Dense),
+      d40.withProjections(w,c,Delta,expanded[40].mlp,Dense,Dense,Plain,Plain,Dense,qk),d41.withProjections(w,c,Delta,expanded[41].mlp,Dense,Dense,Plain,Plain,Dense,qk),d42.withProjections(w,c,Delta,expanded[42].mlp,Dense,Dense,Plain,Plain,Dense,qk),a43.withProjections(w,c,Attention,expanded[43].mlp,Dense,Plain,Plain,Dense),
+      d44.withProjections(w,c,Delta,expanded[44].mlp,Dense,Dense,Plain,Plain,Dense,qk),d45.withProjections(w,c,Delta,expanded[45].mlp,Dense,Dense,Plain,Plain,Dense,qk),d46.withProjections(w,c,Delta,expanded[46].mlp,Dense,Dense,Plain,Plain,Dense,qk),a47.withProjections(w,c,Attention,expanded[47].mlp,Dense,Plain,Plain,Dense),
+      d48.withProjections(w,c,Delta,expanded[48].mlp,Dense,Dense,Plain,Plain,Dense,qk),d49.withProjections(w,c,Delta,expanded[49].mlp,Dense,Dense,Plain,Plain,Dense,qk),d50.withProjections(w,c,Delta,expanded[50].mlp,Dense,Dense,Plain,Plain,Dense,qk),a51.withProjections(w,c,Attention,expanded[51].mlp,Dense,Plain,Plain,Dense),
+      d52.withProjections(w,c,Delta,expanded[52].mlp,Dense,Dense,Plain,Plain,Dense,qk),d53.withProjections(w,c,Delta,expanded[53].mlp,Dense,Dense,Plain,Plain,Dense,qk),d54.withProjections(w,c,Delta,expanded[54].mlp,Dense,Dense,Plain,Plain,Dense,qk),a55.withProjections(w,c,Attention,expanded[55].mlp,Dense,Plain,Plain,Dense),
+      d56.withProjections(w,c,Delta,expanded[56].mlp,Dense,Dense,Plain,Plain,Dense,qk),d57.withProjections(w,c,Delta,expanded[57].mlp,Dense,Dense,Plain,Plain,Dense,qk),d58.withProjections(w,c,Delta,expanded[58].mlp,Dense,Dense,Plain,Plain,Dense,qk),a59.withProjections(w,c,Attention,expanded[59].mlp,Dense,Plain,Plain,Dense),
+      d60.withProjections(w,c,Delta,expanded[60].mlp,Dense,Dense,Plain,Plain,Dense,qk),d61.withProjections(w,c,Delta,expanded[61].mlp,Dense,Dense,Plain,Plain,Dense,qk),d62.withProjections(w,c,Delta,expanded[62].mlp,Dense,Dense,Plain,Plain,Dense,qk),a63.withProjections(w,c,Attention,expanded[63].mlp,Dense,Plain,Plain,Dense),
+    ];
+    const promptDense:Layers=[
+      prompt512[0],prompt512[1],prompt512[2],a3.withProjections(w,c,Attention,expanded[3].mlp,Dense,Dense,Dense,Dense),
+      prompt512[4],prompt512[5],prompt512[6],a7.withProjections(w,c,Attention,expanded[7].mlp,Dense,Dense,Dense,Dense),
+      prompt512[8],prompt512[9],prompt512[10],a11.withProjections(w,c,Attention,expanded[11].mlp,Dense,Dense,Dense,Dense),
+      prompt512[12],prompt512[13],prompt512[14],a15.withProjections(w,c,Attention,expanded[15].mlp,Dense,Dense,Dense,Dense),
+      prompt512[16],prompt512[17],prompt512[18],a19.withProjections(w,c,Attention,expanded[19].mlp,Dense,Dense,Dense,Dense),
+      prompt512[20],prompt512[21],prompt512[22],a23.withProjections(w,c,Attention,expanded[23].mlp,Dense,Dense,Dense,Dense),
+      prompt512[24],prompt512[25],prompt512[26],a27.withProjections(w,c,Attention,expanded[27].mlp,Dense,Dense,Dense,Dense),
+      prompt512[28],prompt512[29],prompt512[30],a31.withProjections(w,c,Attention,expanded[31].mlp,Dense,Dense,Dense,Dense),
+      prompt512[32],prompt512[33],prompt512[34],a35.withProjections(w,c,Attention,expanded[35].mlp,Dense,Dense,Dense,Dense),
+      prompt512[36],prompt512[37],prompt512[38],a39.withProjections(w,c,Attention,expanded[39].mlp,Dense,Dense,Dense,Dense),
+      prompt512[40],prompt512[41],prompt512[42],a43.withProjections(w,c,Attention,expanded[43].mlp,Dense,Dense,Dense,Dense),
+      prompt512[44],prompt512[45],prompt512[46],a47.withProjections(w,c,Attention,expanded[47].mlp,Dense,Dense,Dense,Dense),
+      prompt512[48],prompt512[49],prompt512[50],a51.withProjections(w,c,Attention,expanded[51].mlp,Dense,Dense,Dense,Dense),
+      prompt512[52],prompt512[53],prompt512[54],a55.withProjections(w,c,Attention,expanded[55].mlp,Dense,Dense,Dense,Dense),
+      prompt512[56],prompt512[57],prompt512[58],a59.withProjections(w,c,Attention,expanded[59].mlp,Dense,Dense,Dense,Dense),
+      prompt512[60],prompt512[61],prompt512[62],a63.withProjections(w,c,Attention,expanded[63].mlp,Dense,Dense,Dense,Dense),
+    ];
+    const mixedWide:Layers=[
+      d0.withMlp(w,c,Delta,wide[0].mlp,Plain,qk),d1.withMlp(w,c,Delta,wide[1].mlp,Plain,qk),d2.withMlp(w,c,Delta,wide[2].mlp,Plain,qk),a3.withMlp(w,c,Attention,wide[3].mlp,Plain),
+      d4.withMlp(w,c,Delta,wide[4].mlp,Plain,qk),d5.withMlp(w,c,Delta,wide[5].mlp,Plain,qk),d6.withMlp(w,c,Delta,wide[6].mlp,Plain,qk),a7.withMlp(w,c,Attention,wide[7].mlp,Plain),
+      d8.withMlp(w,c,Delta,wide[8].mlp,Plain,qk),d9.withMlp(w,c,Delta,wide[9].mlp,Plain,qk),d10.withMlp(w,c,Delta,wide[10].mlp,Plain,qk),a11.withMlp(w,c,Attention,wide[11].mlp,Plain),
+      d12.withMlp(w,c,Delta,wide[12].mlp,Plain,qk),d13.withMlp(w,c,Delta,wide[13].mlp,Plain,qk),d14.withMlp(w,c,Delta,wide[14].mlp,Plain,qk),a15.withMlp(w,c,Attention,wide[15].mlp,Plain),
+      d16.withMlp(w,c,Delta,wide[16].mlp,Plain,qk),d17.withMlp(w,c,Delta,wide[17].mlp,Plain,qk),d18.withMlp(w,c,Delta,wide[18].mlp,Plain,qk),a19.withMlp(w,c,Attention,wide[19].mlp,Plain),
+      d20.withMlp(w,c,Delta,wide[20].mlp,Plain,qk),d21.withMlp(w,c,Delta,wide[21].mlp,Plain,qk),d22.withMlp(w,c,Delta,wide[22].mlp,Plain,qk),a23.withMlp(w,c,Attention,wide[23].mlp,Plain),
+      d24.withMlp(w,c,Delta,wide[24].mlp,Plain,qk),d25.withMlp(w,c,Delta,wide[25].mlp,Plain,qk),d26.withMlp(w,c,Delta,wide[26].mlp,Plain,qk),a27.withMlp(w,c,Attention,wide[27].mlp,Plain),
+      d28.withMlp(w,c,Delta,wide[28].mlp,Plain,qk),d29.withMlp(w,c,Delta,wide[29].mlp,Plain,qk),d30.withMlp(w,c,Delta,wide[30].mlp,Plain,qk),a31.withMlp(w,c,Attention,wide[31].mlp,Plain),
+      d32.withMlp(w,c,Delta,wide[32].mlp,Plain,qk),d33.withMlp(w,c,Delta,wide[33].mlp,Plain,qk),d34.withMlp(w,c,Delta,wide[34].mlp,Plain,qk),a35.withMlp(w,c,Attention,wide[35].mlp,Plain),
+      d36.withMlp(w,c,Delta,wide[36].mlp,Plain,qk),d37.withMlp(w,c,Delta,wide[37].mlp,Plain,qk),d38.withMlp(w,c,Delta,wide[38].mlp,Plain,qk),a39.withMlp(w,c,Attention,wide[39].mlp,Plain),
+      d40.withMlp(w,c,Delta,wide[40].mlp,Plain,qk),d41.withMlp(w,c,Delta,wide[41].mlp,Plain,qk),d42.withMlp(w,c,Delta,wide[42].mlp,Plain,qk),a43.withMlp(w,c,Attention,wide[43].mlp,Plain),
+      d44.withMlp(w,c,Delta,wide[44].mlp,Plain,qk),d45.withMlp(w,c,Delta,wide[45].mlp,Plain,qk),d46.withMlp(w,c,Delta,wide[46].mlp,Plain,qk),a47.withMlp(w,c,Attention,wide[47].mlp,Plain),
+      d48.withMlp(w,c,Delta,wide[48].mlp,Plain,qk),d49.withMlp(w,c,Delta,wide[49].mlp,Plain,qk),d50.withMlp(w,c,Delta,wide[50].mlp,Plain,qk),a51.withMlp(w,c,Attention,wide[51].mlp,Plain),
+      d52.withMlp(w,c,Delta,wide[52].mlp,Plain,qk),d53.withMlp(w,c,Delta,wide[53].mlp,Plain,qk),d54.withMlp(w,c,Delta,wide[54].mlp,Plain,qk),a55.withMlp(w,c,Attention,wide[55].mlp,Plain),
+      d56.withMlp(w,c,Delta,wide[56].mlp,Plain,qk),d57.withMlp(w,c,Delta,wide[57].mlp,Plain,qk),d58.withMlp(w,c,Delta,wide[58].mlp,Plain,qk),a59.withMlp(w,c,Attention,wide[59].mlp,Plain),
+      d60.withMlp(w,c,Delta,wide[60].mlp,Plain,qk),d61.withMlp(w,c,Delta,wide[61].mlp,Plain,qk),d62.withMlp(w,c,Delta,wide[62].mlp,Plain,qk),a63.withMlp(w,c,Attention,wide[63].mlp,Plain),
+    ];
     const mediaStock:Layers=[
       stock[0],stock[1],stock[2],a3.mediaLayer(w,c,Attention,stock[3].mlp,Plain),
       stock[4],stock[5],stock[6],a7.mediaLayer(w,c,Attention,stock[7].mlp,Plain),
@@ -657,49 +918,114 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
       expanded[60],expanded[61],expanded[62],a63.mediaLayer(w,c,Attention,expanded[63].mlp,Plain),
     ];
     const one=this.#one,rows=this.#rows;
-    const decodeOne:RowsForward=(ids,cache,capture)=>this.#lazy(one,ids,cache,"decode",capture);
-    const decodeRows:RowsForward=(ids,cache,capture)=>this.#lazy(rows,ids,cache,"decode",capture);
-    const decodeFive:RowsForward=(ids,cache,capture)=>this.#lazy(five,ids,cache,"decode",capture);
-    this.decode={1:decodeOne,2:decodeRows,3:decodeRows,4:decodeRows,5:decodeFive,6:decodeFive,7:decodeFive,8:decodeFive};
-    const windowOne:RowsForward=(ids,cache,capture)=>this.#lazy(one,ids,cache,"window",capture);
-    const windowRows:RowsForward=(ids,cache,capture)=>this.#lazy(rows,ids,cache,"window",capture);
-    const windowFive:RowsForward=(ids,cache,capture)=>this.#lazy(five,ids,cache,"window",capture);
-    const windowTiled:RowsForward=(ids,cache,capture)=>this.#lazy(tiled,ids,cache,"window",capture);
+    const bindings:LayerWeights=[d0,d1,d2,a3,d4,d5,d6,a7,d8,d9,d10,a11,d12,d13,d14,a15,d16,d17,d18,a19,d20,d21,d22,a23,d24,d25,d26,a27,d28,d29,d30,a31,d32,d33,d34,a35,d36,d37,d38,a39,d40,d41,d42,a43,d44,d45,d46,a47,d48,d49,d50,a51,d52,d53,d54,a55,d56,d57,d58,a59,d60,d61,d62,a63];
+    const shares=new AneWeightShares();
+    this.#owned.push({dispose:()=>shares[Symbol.dispose]()});
+    const ane2048=this.#aneAffine(w,c,bindings,qk,shares,.382,2048),ane1792=this.#aneAffine(w,c,bindings,qk,shares,.382,1792),ane1536=this.#aneAffine(w,c,bindings,qk,shares,.382,1536);
+    const ane1280=this.#aneAffine(w,c,bindings,qk,shares,.382,1280),ane1024=this.#aneAffine(w,c,bindings,qk,shares,.382,1024),ane896=this.#aneAffine(w,c,bindings,qk,shares,.382,896),ane768=this.#aneAffine(w,c,bindings,qk,shares,.353,768);
+    const ane704=this.#aneDense(w,c,bindings,qk,shares,.353,704),ane640=this.#aneDense(w,c,bindings,qk,shares,.353,640),ane576=this.#aneDense(w,c,bindings,qk,shares,.353,576);
+    const ane512=this.#aneSmall(w,c,bindings,qk,shares,.353,512),ane448=this.#aneSmall(w,c,bindings,qk,shares,.353,448),ane384=this.#aneSmall(w,c,bindings,qk,shares,.353,384),ane320=this.#aneSmall(w,c,bindings,qk,shares,.353,320),ane256=this.#aneSmall(w,c,bindings,qk,shares,.353,256);
+    const aneRanges:readonly MlxPromptRange[]=[
+      {from:224,to:256,unit:"ane",operation:(ids,cache,capture)=>this.#queued(ane256,ids,cache,capture)},
+      {from:257,to:320,unit:"ane",operation:(ids,cache,capture)=>this.#queued(ane320,ids,cache,capture)},
+      {from:321,to:384,unit:"ane",operation:(ids,cache,capture)=>this.#queued(ane384,ids,cache,capture)},
+      {from:385,to:448,unit:"ane",operation:(ids,cache,capture)=>this.#queued(ane448,ids,cache,capture)},
+      {from:449,to:512,unit:"ane",operation:(ids,cache,capture)=>this.#queued(ane512,ids,cache,capture)},
+      {from:513,to:576,unit:"ane",operation:(ids,cache,capture)=>this.#queued(ane576,ids,cache,capture)},
+      {from:577,to:640,unit:"ane",operation:(ids,cache,capture)=>this.#queued(ane640,ids,cache,capture)},
+      {from:641,to:704,unit:"ane",operation:(ids,cache,capture)=>this.#queued(ane704,ids,cache,capture)},
+      {from:705,to:768,unit:"ane",operation:(ids,cache,capture)=>this.#queued(ane768,ids,cache,capture)},
+      {from:769,to:896,unit:"ane",operation:(ids,cache,capture)=>this.#queued(ane896,ids,cache,capture)},
+      {from:897,to:1024,unit:"ane",operation:(ids,cache,capture)=>this.#queued(ane1024,ids,cache,capture)},
+      {from:1025,to:1280,unit:"ane",operation:(ids,cache,capture)=>this.#queued(ane1280,ids,cache,capture)},
+      {from:1281,to:1536,unit:"ane",operation:(ids,cache,capture)=>this.#queued(ane1536,ids,cache,capture)},
+      {from:1537,to:1792,unit:"ane",operation:(ids,cache,capture)=>this.#queued(ane1792,ids,cache,capture)},
+      {from:1793,to:2048,unit:"ane",operation:(ids,cache,capture)=>this.#queued(ane2048,ids,cache,capture)},
+    ];
+    const D1:RowsForward=(ids,cache,capture)=>this.#submitted(one,ids,cache,"decode",capture);
+    const D23:RowsForward=(ids,cache,capture)=>this.#submitted(rows,ids,cache,"decode",capture);
+    const D48:RowsForward=(ids,cache,capture)=>this.#submitted(mma,ids,cache,"decode",capture);
+    const DW:RowsForward=(ids,cache,capture)=>this.#submitted(wide,ids,cache,"decode",capture);
+    const decodeExpanded:RowsForward=(ids,cache,capture)=>this.#lazy(expanded,ids,cache,"decode",capture);
+    this.decode=rowTableWithDefault({
+      1:D1,2:D23,3:D23,4:D48,5:D48,6:D48,7:D48,8:D48,9:DW,10:DW,11:DW,12:DW,13:DW,14:DW,15:DW,16:DW,
+      17:DW,18:DW,19:DW,20:DW,21:DW,22:DW,23:DW,24:DW,25:DW,26:DW,27:DW,28:DW,29:DW,30:DW,31:DW,32:DW,
+      33:DW,34:DW,35:DW,36:DW,37:DW,38:DW,39:DW,40:DW,41:DW,42:DW,43:DW,44:DW,45:DW,46:DW,47:DW,48:DW,
+      49:DW,50:DW,51:DW,52:DW,53:DW,54:DW,55:DW,56:DW,57:DW,58:DW,59:DW,60:DW,61:DW,62:DW,63:DW,64:DW,
+      65:DW,66:DW,67:DW,68:DW,69:DW,70:DW,71:DW,72:DW,73:DW,74:DW,75:DW,76:DW,77:DW,78:DW,79:DW,80:DW,
+      81:DW,82:DW,83:DW,84:DW,85:DW,86:DW,87:DW,88:DW,89:DW,90:DW,91:DW,92:DW,93:DW,94:DW,95:DW,96:DW,
+      97:DW,98:DW,99:DW,100:DW,101:DW,102:DW,103:DW,104:DW,105:DW,106:DW,107:DW,108:DW,109:DW,110:DW,111:DW,112:DW,
+      113:DW,114:DW,115:DW,116:DW,117:DW,118:DW,119:DW,120:DW,121:DW,122:DW,123:DW,124:DW,125:DW,126:DW,127:DW,128:DW,
+      129:DW,130:DW,131:DW,132:DW,133:DW,134:DW,135:DW,136:DW,137:DW,138:DW,139:DW,140:DW,141:DW,142:DW,143:DW,144:DW,
+      145:DW,146:DW,147:DW,148:DW,149:DW,150:DW,151:DW,152:DW,153:DW,154:DW,155:DW,156:DW,157:DW,158:DW,159:DW,160:DW,
+      161:DW,162:DW,163:DW,164:DW,165:DW,166:DW,167:DW,168:DW,169:DW,170:DW,171:DW,172:DW,173:DW,174:DW,175:DW,176:DW,
+      177:DW,178:DW,179:DW,180:DW,181:DW,182:DW,183:DW,184:DW,185:DW,186:DW,187:DW,188:DW,189:DW,190:DW,191:DW,192:DW,
+      193:DW,194:DW,195:DW,196:DW,197:DW,198:DW,199:DW,200:DW,201:DW,202:DW,203:DW,204:DW,205:DW,206:DW,207:DW,208:DW,
+      209:DW,210:DW,211:DW,212:DW,213:DW,214:DW,215:DW,216:DW,217:DW,218:DW,219:DW,220:DW,221:DW,222:DW,223:DW,224:DW,
+      225:DW,226:DW,227:DW,228:DW,229:DW,230:DW,231:DW,232:DW,233:DW,234:DW,235:DW,236:DW,237:DW,238:DW,239:DW,240:DW,
+      241:DW,242:DW,243:DW,244:DW,245:DW,246:DW,247:DW,248:DW,249:DW,250:DW,251:DW,252:DW,253:DW,254:DW,255:DW,256:DW,
+    },decodeExpanded);
+    const V1:RowsForward=(ids,cache,capture)=>this.#submitted(one,ids,cache,"window",capture);
+    const V23:RowsForward=(ids,cache,capture)=>this.#submitted(rows,ids,cache,"window",capture);
+    const V48:RowsForward=(ids,cache,capture)=>this.#submitted(mma,ids,cache,"window",capture);
+    const VW:RowsForward=(ids,cache,capture)=>this.#submitted(wide,ids,cache,"window",capture);
     const windowExpanded:RowsForward=(ids,cache,capture)=>this.#lazy(expanded,ids,cache,"window",capture);
-    this.verify={
-      1:windowOne,2:windowRows,3:windowRows,4:windowRows,5:windowFive,6:windowFive,7:windowFive,8:windowFive,
-      9:windowTiled,10:windowTiled,11:windowTiled,12:windowTiled,13:windowTiled,14:windowTiled,15:windowTiled,16:windowTiled,
-      17:windowTiled,18:windowTiled,19:windowTiled,20:windowTiled,21:windowTiled,22:windowTiled,23:windowTiled,24:windowTiled,
-      25:windowTiled,26:windowTiled,27:windowTiled,28:windowTiled,29:windowTiled,30:windowTiled,31:windowTiled,32:windowTiled,
-      33:windowExpanded,34:windowExpanded,35:windowExpanded,36:windowExpanded,37:windowExpanded,38:windowExpanded,39:windowExpanded,40:windowExpanded,
-      41:windowExpanded,42:windowExpanded,43:windowExpanded,44:windowExpanded,45:windowExpanded,46:windowExpanded,47:windowExpanded,48:windowExpanded,
-      49:windowExpanded,50:windowExpanded,51:windowExpanded,52:windowExpanded,53:windowExpanded,54:windowExpanded,55:windowExpanded,56:windowExpanded,
-      57:windowExpanded,58:windowExpanded,59:windowExpanded,60:windowExpanded,61:windowExpanded,62:windowExpanded,63:windowExpanded,64:windowExpanded,
-    };
-    const knownOne:MlxPhaseForward=(ids,cache)=>windowOne(ids,cache,null);
-    const knownRows:MlxPhaseForward=(ids,cache)=>windowRows(ids,cache,null);
-    const knownFive:MlxPhaseForward=(ids,cache)=>windowFive(ids,cache,null);
-    const knownTiled:MlxPhaseForward=(ids,cache)=>windowTiled(ids,cache,null);
-    const knownExpanded:MlxPhaseForward=(ids,cache)=>windowExpanded(ids,cache,null);
-    this.appendKnown=[{from:1,to:1,operation:knownOne},{from:2,to:4,operation:knownRows},
-      {from:5,to:8,operation:knownFive},{from:9,to:32,operation:knownTiled},{from:33,to:Infinity,operation:knownExpanded}];
+    this.verify=rowTableWithDefault({
+      1:V1,2:V23,3:V23,4:V48,5:V48,6:V48,7:V48,8:V48,9:VW,10:VW,11:VW,12:VW,13:VW,14:VW,15:VW,16:VW,
+      17:VW,18:VW,19:VW,20:VW,21:VW,22:VW,23:VW,24:VW,25:VW,26:VW,27:VW,28:VW,29:VW,30:VW,31:VW,32:VW,
+      33:VW,34:VW,35:VW,36:VW,37:VW,38:VW,39:VW,40:VW,41:VW,42:VW,43:VW,44:VW,45:VW,46:VW,47:VW,48:VW,
+      49:VW,50:VW,51:VW,52:VW,53:VW,54:VW,55:VW,56:VW,57:VW,58:VW,59:VW,60:VW,61:VW,62:VW,63:VW,64:VW,
+      65:VW,66:VW,67:VW,68:VW,69:VW,70:VW,71:VW,72:VW,73:VW,74:VW,75:VW,76:VW,77:VW,78:VW,79:VW,80:VW,
+      81:VW,82:VW,83:VW,84:VW,85:VW,86:VW,87:VW,88:VW,89:VW,90:VW,91:VW,92:VW,93:VW,94:VW,95:VW,96:VW,
+      97:VW,98:VW,99:VW,100:VW,101:VW,102:VW,103:VW,104:VW,105:VW,106:VW,107:VW,108:VW,109:VW,110:VW,111:VW,112:VW,
+      113:VW,114:VW,115:VW,116:VW,117:VW,118:VW,119:VW,120:VW,121:VW,122:VW,123:VW,124:VW,125:VW,126:VW,127:VW,128:VW,
+      129:VW,130:VW,131:VW,132:VW,133:VW,134:VW,135:VW,136:VW,137:VW,138:VW,139:VW,140:VW,141:VW,142:VW,143:VW,144:VW,
+      145:VW,146:VW,147:VW,148:VW,149:VW,150:VW,151:VW,152:VW,153:VW,154:VW,155:VW,156:VW,157:VW,158:VW,159:VW,160:VW,
+      161:VW,162:VW,163:VW,164:VW,165:VW,166:VW,167:VW,168:VW,169:VW,170:VW,171:VW,172:VW,173:VW,174:VW,175:VW,176:VW,
+      177:VW,178:VW,179:VW,180:VW,181:VW,182:VW,183:VW,184:VW,185:VW,186:VW,187:VW,188:VW,189:VW,190:VW,191:VW,192:VW,
+      193:VW,194:VW,195:VW,196:VW,197:VW,198:VW,199:VW,200:VW,201:VW,202:VW,203:VW,204:VW,205:VW,206:VW,207:VW,208:VW,
+      209:VW,210:VW,211:VW,212:VW,213:VW,214:VW,215:VW,216:VW,217:VW,218:VW,219:VW,220:VW,221:VW,222:VW,223:VW,224:VW,
+      225:VW,226:VW,227:VW,228:VW,229:VW,230:VW,231:VW,232:VW,233:VW,234:VW,235:VW,236:VW,237:VW,238:VW,239:VW,240:VW,
+      241:VW,242:VW,243:VW,244:VW,245:VW,246:VW,247:VW,248:VW,249:VW,250:VW,251:VW,252:VW,253:VW,254:VW,255:VW,256:VW,
+    },windowExpanded);
+    this.appendKnown=[
+      {from:1,to:1,operation:(ids,cache)=>this.#lazy(one,ids,cache,"window",null)},
+      {from:2,to:3,operation:(ids,cache)=>this.#lazy(rows,ids,cache,"window",null)},
+      {from:4,to:8,operation:(ids,cache)=>this.#lazy(mma,ids,cache,"window",null)},
+      {from:9,to:256,operation:(ids,cache)=>this.#lazy(wide,ids,cache,"window",null)},
+      {from:257,to:Infinity,operation:(ids,cache)=>this.#lazy(expanded,ids,cache,"window",null)},
+    ];
+    const rowHead=new AffineRow(this.lmHead),rowsHead=new Affine4(this.lmHead),mmaHead=new AffineMma(this.lmHead);
+    const H1:MlxHeadForward=hidden=>rowHead.forward(hidden),H23:MlxHeadForward=hidden=>rowsHead.forward(hidden),HW:MlxHeadForward=hidden=>mmaHead.forward(hidden);
     const head:MlxHeadForward=hidden=>this.#head.forward(hidden);
-    this.logits={
-      1:head,2:head,3:head,4:head,5:head,6:head,7:head,8:head,9:head,10:head,11:head,12:head,13:head,14:head,15:head,16:head,
-      17:head,18:head,19:head,20:head,21:head,22:head,23:head,24:head,25:head,26:head,27:head,28:head,29:head,30:head,31:head,32:head,
-      33:head,34:head,35:head,36:head,37:head,38:head,39:head,40:head,41:head,42:head,43:head,44:head,45:head,46:head,47:head,48:head,
-      49:head,50:head,51:head,52:head,53:head,54:head,55:head,56:head,57:head,58:head,59:head,60:head,61:head,62:head,63:head,64:head,
-    };
-    const promptFive:RowsForward=(ids,cache,capture)=>this.#bounded(five,ids,cache,"window",capture);
-    const promptTiled:RowsForward=(ids,cache,capture)=>this.#bounded(tiled,ids,cache,"window",capture);
-    const promptExpanded:RowsForward=(ids,cache,capture)=>this.#bounded(expanded,ids,cache,"window",capture);
-    this.prompt=[{from:1,to:1,operation:windowOne,unit:"gpu"},{from:2,to:4,operation:windowRows,unit:"gpu"},
-      {from:5,to:8,operation:promptFive,unit:"gpu"},{from:9,to:32,operation:promptTiled,unit:"gpu"},{from:33,to:Infinity,operation:promptExpanded,unit:"gpu"}];
-    this.multiSequencePrompt=[{from:1,to:1,operation:windowOne},{from:2,to:4,operation:windowRows},
-      {from:5,to:8,operation:promptFive},{from:9,to:32,operation:promptTiled},{from:33,to:Infinity,operation:promptExpanded}];
-    this.sequence=[{from:1,to:1,operation:(ids,cache)=>windowOne(ids,cache,null)},{from:2,to:4,operation:(ids,cache)=>windowRows(ids,cache,null)},
-      {from:5,to:8,operation:(ids,cache)=>promptFive(ids,cache,null)},{from:9,to:32,operation:(ids,cache)=>promptTiled(ids,cache,null)},
-      {from:33,to:Infinity,operation:(ids,cache)=>promptExpanded(ids,cache,null)}];
+    this.logits=rowTableWithDefault({
+      1:H1,2:H23,3:H23,4:HW,5:HW,6:HW,7:HW,8:HW,9:HW,10:HW,11:HW,12:HW,13:HW,14:HW,15:HW,16:HW,
+      17:HW,18:HW,19:HW,20:HW,21:HW,22:HW,23:HW,24:HW,25:HW,26:HW,27:HW,28:HW,29:HW,30:HW,31:HW,32:HW,
+      33:HW,34:HW,35:HW,36:HW,37:HW,38:HW,39:HW,40:HW,41:HW,42:HW,43:HW,44:HW,45:HW,46:HW,47:HW,48:HW,
+      49:HW,50:HW,51:HW,52:HW,53:HW,54:HW,55:HW,56:HW,57:HW,58:HW,59:HW,60:HW,61:HW,62:HW,63:HW,64:HW,
+      65:HW,66:HW,67:HW,68:HW,69:HW,70:HW,71:HW,72:HW,73:HW,74:HW,75:HW,76:HW,77:HW,78:HW,79:HW,80:HW,
+      81:HW,82:HW,83:HW,84:HW,85:HW,86:HW,87:HW,88:HW,89:HW,90:HW,91:HW,92:HW,93:HW,94:HW,95:HW,96:HW,
+      97:HW,98:HW,99:HW,100:HW,101:HW,102:HW,103:HW,104:HW,105:HW,106:HW,107:HW,108:HW,109:HW,110:HW,111:HW,112:HW,
+      113:HW,114:HW,115:HW,116:HW,117:HW,118:HW,119:HW,120:HW,121:HW,122:HW,123:HW,124:HW,125:HW,126:HW,127:HW,128:HW,
+      129:HW,130:HW,131:HW,132:HW,133:HW,134:HW,135:HW,136:HW,137:HW,138:HW,139:HW,140:HW,141:HW,142:HW,143:HW,144:HW,
+      145:HW,146:HW,147:HW,148:HW,149:HW,150:HW,151:HW,152:HW,153:HW,154:HW,155:HW,156:HW,157:HW,158:HW,159:HW,160:HW,
+      161:HW,162:HW,163:HW,164:HW,165:HW,166:HW,167:HW,168:HW,169:HW,170:HW,171:HW,172:HW,173:HW,174:HW,175:HW,176:HW,
+      177:HW,178:HW,179:HW,180:HW,181:HW,182:HW,183:HW,184:HW,185:HW,186:HW,187:HW,188:HW,189:HW,190:HW,191:HW,192:HW,
+      193:HW,194:HW,195:HW,196:HW,197:HW,198:HW,199:HW,200:HW,201:HW,202:HW,203:HW,204:HW,205:HW,206:HW,207:HW,208:HW,
+      209:HW,210:HW,211:HW,212:HW,213:HW,214:HW,215:HW,216:HW,217:HW,218:HW,219:HW,220:HW,221:HW,222:HW,223:HW,224:HW,
+      225:HW,226:HW,227:HW,228:HW,229:HW,230:HW,231:HW,232:HW,233:HW,234:HW,235:HW,236:HW,237:HW,238:HW,239:HW,240:HW,
+      241:HW,242:HW,243:HW,244:HW,245:HW,246:HW,247:HW,248:HW,249:HW,250:HW,251:HW,252:HW,253:HW,254:HW,255:HW,256:HW,
+    },head);
+    const promptSmall:RowsForward=(ids,cache,capture)=>this.#bounded(prompt512,ids,cache,"window",capture);
+    const promptLarge:RowsForward=(ids,cache,capture)=>this.#bounded(promptDense,ids,cache,"window",capture);
+    const gpuTail:readonly MlxPromptRange[]=[{from:1,to:1,operation:V1},{from:2,to:3,operation:V23},{from:4,to:8,operation:V48},{from:9,to:256,operation:VW},{from:257,to:512,operation:promptSmall},{from:513,to:Infinity,operation:promptLarge}];
+    this.multiSequencePrompt=gpuTail;
+    this.multiSequencePromptChunk=[{from:1,to:256,operation:VW},{from:257,to:512,operation:promptSmall},{from:513,to:Infinity,operation:promptLarge}];
+    this.prompt=[{from:1,to:1,operation:V1,unit:"gpu"},{from:2,to:3,operation:V23,unit:"gpu"},{from:4,to:8,operation:V48,unit:"gpu"},{from:9,to:223,operation:VW,unit:"gpu"},...aneRanges,{from:2049,to:Infinity,operation:promptLarge,unit:"gpu"}];
+    this.promptChunk=[{from:1,to:223,operation:VW,unit:"gpu"},...aneRanges,{from:2049,to:Infinity,operation:promptLarge,unit:"gpu"}];
+    this.sequence=[{from:1,to:1,operation:(ids,cache)=>V1(ids,cache,null)},{from:2,to:3,operation:(ids,cache)=>V23(ids,cache,null)},
+      {from:4,to:8,operation:(ids,cache)=>V48(ids,cache,null)},{from:9,to:256,operation:(ids,cache)=>VW(ids,cache,null)},
+      {from:257,to:512,operation:(ids,cache)=>promptSmall(ids,cache,null)},{from:513,to:Infinity,operation:(ids,cache)=>promptLarge(ids,cache,null)}];
     this.mediaPrefill=[
       {from:1,to:4,operation:(hidden,cache,positions)=>this.#positioned(mediaStock,ops.contiguous(hidden),cache,"window",positions)},
       {from:5,to:8,operation:(hidden,cache,positions)=>this.#positionedBounded(mediaFive,ops.contiguous(hidden),cache,positions)},
@@ -714,43 +1040,181 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
     ];
     const mediaDecodeNarrow:MlxPositionedForward=(ids,cache,positions)=>this.#positioned(mediaStock,this.embed.encode(ids),cache,"decode",positions);
     const mediaDecodeFive:MlxPositionedForward=(ids,cache,positions)=>this.#positioned(mediaFive,this.embed.encode(ids),cache,"decode",positions);
-    this.mediaDecode={1:mediaDecodeNarrow,2:mediaDecodeNarrow,3:mediaDecodeNarrow,4:mediaDecodeNarrow,5:mediaDecodeFive,6:mediaDecodeFive,7:mediaDecodeFive,8:mediaDecodeFive};
+    const mediaDecodeTiled:MlxPositionedForward=(ids,cache,positions)=>this.#positioned(mediaTiled,this.embed.encode(ids),cache,"decode",positions);
+    const mediaDecodeExpanded:MlxPositionedForward=(ids,cache,positions)=>this.#positioned(mediaExpanded,this.embed.encode(ids),cache,"decode",positions);
+    this.mediaDecode=rowTableWithDefault({
+      1:mediaDecodeNarrow,2:mediaDecodeNarrow,3:mediaDecodeNarrow,4:mediaDecodeNarrow,5:mediaDecodeFive,6:mediaDecodeFive,7:mediaDecodeFive,8:mediaDecodeFive,
+      9:mediaDecodeTiled,10:mediaDecodeTiled,11:mediaDecodeTiled,12:mediaDecodeTiled,13:mediaDecodeTiled,14:mediaDecodeTiled,15:mediaDecodeTiled,16:mediaDecodeTiled,
+      17:mediaDecodeTiled,18:mediaDecodeTiled,19:mediaDecodeTiled,20:mediaDecodeTiled,21:mediaDecodeTiled,22:mediaDecodeTiled,23:mediaDecodeTiled,24:mediaDecodeTiled,
+      25:mediaDecodeTiled,26:mediaDecodeTiled,27:mediaDecodeTiled,28:mediaDecodeTiled,29:mediaDecodeTiled,30:mediaDecodeTiled,31:mediaDecodeTiled,32:mediaDecodeTiled,
+    },mediaDecodeExpanded);
     this.embeddingPrompt=[
-      {from:1,to:1,operation:(hidden,cache)=>this.#embeddingLazy(one,hidden,cache)},
-      {from:2,to:4,operation:(hidden,cache)=>this.#embeddingLazy(rows,hidden,cache)},
-      {from:5,to:8,operation:(hidden,cache)=>this.#embeddingBounded(five,hidden,cache)},
+      {from:1,to:1,operation:(hidden,cache)=>this.#embeddingSubmitted(one,hidden,cache)},
+      {from:2,to:3,operation:(hidden,cache)=>this.#embeddingSubmitted(rows,hidden,cache)},
+      {from:4,to:8,operation:(hidden,cache)=>this.#embeddingSubmitted(mma,hidden,cache)},
       {from:9,to:32,operation:(hidden,cache)=>this.#embeddingBounded(tiled,hidden,cache)},
       {from:33,to:Infinity,operation:(hidden,cache)=>this.#embeddingBounded(expanded,hidden,cache)},
     ];
     this.mixed=[{from:1,to:4,operation:groups=>this.#packed(stock,groups)},
       {from:5,to:8,operation:groups=>this.#packed(five,groups)},
-      {from:9,to:32,operation:groups=>this.#packed(tiled,groups)},
-      {from:33,to:Infinity,operation:groups=>this.#packed(expanded,groups)}];
+      {from:9,to:256,operation:groups=>this.#packed(mixedWide,groups)},
+      {from:257,to:Infinity,operation:groups=>this.#packed(expanded,groups)}];
     const separateWindow:readonly MlxMixedGroupRange[]=[
       {from:1,to:4,operation:group=>this.#lazy(stock,group.ids,group.state,"window",group.capture)},
-      {from:5,to:8,operation:group=>windowFive(group.ids,group.state,group.capture)},
-      {from:9,to:32,operation:group=>windowTiled(group.ids,group.state,group.capture)},
-      {from:33,to:Infinity,operation:group=>windowExpanded(group.ids,group.state,group.capture)},
+      {from:5,to:8,operation:group=>this.#bounded(five,group.ids,group.state,"window",group.capture)},
+      {from:9,to:256,operation:group=>this.#bounded(mixedWide,group.ids,group.state,"window",group.capture)},
+      {from:257,to:Infinity,operation:group=>this.#bounded(expanded,group.ids,group.state,"window",group.capture)},
     ];
     this.mixedSeparate={decode:[
       {from:1,to:4,operation:group=>this.#lazy(stock,group.ids,group.state,"decode",group.capture)},
-      {from:5,to:8,operation:group=>decodeFive(group.ids,group.state,group.capture)},
-    ],window:separateWindow,verify:separateWindow};
+      {from:5,to:8,operation:group=>this.#lazy(five,group.ids,group.state,"decode",group.capture)},
+      {from:9,to:256,operation:group=>this.#lazy(mixedWide,group.ids,group.state,"decode",group.capture)},
+      {from:257,to:Infinity,operation:group=>decodeExpanded(group.ids,group.state,group.capture)},
+    ],window:separateWindow,verify:[
+      {from:1,to:4,operation:group=>this.#lazy(stock,group.ids,group.state,"window",group.capture)},
+      {from:5,to:8,operation:group=>this.#lazy(five,group.ids,group.state,"window",group.capture)},
+      {from:9,to:256,operation:group=>this.#lazy(mixedWide,group.ids,group.state,"window",group.capture)},
+      {from:257,to:Infinity,operation:group=>windowExpanded(group.ids,group.state,group.capture)},
+    ],packed:[
+      {from:1,to:4,totalTo:4,operation:groups=>this.#packed(stock,groups)},
+      {from:1,to:4,totalFrom:5,totalTo:8,operation:groups=>this.#packed(mixedUnfused,groups)},
+      {from:5,to:8,totalTo:8,operation:groups=>this.#packed(five,groups)},
+      {from:1,to:256,totalFrom:9,operation:groups=>this.#packed(mixedWide,groups)},
+      {from:257,to:Infinity,operation:groups=>this.#packed(expanded,groups)},
+    ]};
     console.error(`[graph] ${this.graph}`);
   }
 
   dispose():void { disposeResources(this.#owned.splice(0)); }
+  #aneSmall(w:Weights,c:ModelConfig,b:LayerWeights,qk:{q:MlxArray;k:MlxArray},shares:AneWeightShares,fraction:number,capacity:number):Layers {
+    return [
+      b[0].withProjections(w,c,Delta,new AneBoundMlp(b[0].trellis,AneSplit,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[1].withProjections(w,c,Delta,new AneBoundMlp(b[1].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[2].withProjections(w,c,Delta,new AneBoundMlp(b[2].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[3].withProjections(w,c,Attention,new AneBoundMlp(b[3].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Plain,Plain,Dense),
+      b[4].withProjections(w,c,Delta,new AneBoundMlp(b[4].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[5].withProjections(w,c,Delta,new AneBoundMlp(b[5].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[6].withProjections(w,c,Delta,new AneBoundMlp(b[6].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[7].withProjections(w,c,Attention,new AneBoundMlp(b[7].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Plain,Plain,Dense),
+      b[8].withProjections(w,c,Delta,new AneBoundMlp(b[8].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[9].withProjections(w,c,Delta,new AneBoundMlp(b[9].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[10].withProjections(w,c,Delta,new AneBoundMlp(b[10].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[11].withProjections(w,c,Attention,new AneBoundMlp(b[11].trellis,AneSplit,fraction,capacity,shares,4),Dense,Plain,Plain,Dense),
+      b[12].withProjections(w,c,Delta,new AneBoundMlp(b[12].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[13].withProjections(w,c,Delta,new AneBoundMlp(b[13].trellis,AneSplit,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[14].withProjections(w,c,Delta,new AneBoundMlp(b[14].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[15].withProjections(w,c,Attention,new AneBoundMlp(b[15].trellis,AneSplit,fraction,capacity,shares,4),Dense,Plain,Plain,Dense),
+      b[16].withProjections(w,c,Delta,new AneBoundMlp(b[16].trellis,AneSplit,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[17].withProjections(w,c,Delta,new AneBoundMlp(b[17].trellis,AneSplit,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[18].withProjections(w,c,Delta,new AneBoundMlp(b[18].trellis,AneSplit,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[19].withProjections(w,c,Attention,new AneBoundMlp(b[19].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Plain,Plain,Dense),
+      b[20].withProjections(w,c,Delta,new AneBoundMlp(b[20].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[21].withProjections(w,c,Delta,new AneBoundMlp(b[21].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[22].withProjections(w,c,Delta,new AneBoundMlp(b[22].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[23].withProjections(w,c,Attention,new AneBoundMlp(b[23].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Plain,Plain,Dense),
+      b[24].withProjections(w,c,Delta,new AneBoundMlp(b[24].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[25].withProjections(w,c,Delta,new AneBoundMlp(b[25].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[26].withProjections(w,c,Delta,new AneBoundMlp(b[26].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[27].withProjections(w,c,Attention,new AneBoundMlp(b[27].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Plain,Plain,Dense),
+      b[28].withProjections(w,c,Delta,new AneBoundMlp(b[28].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[29].withProjections(w,c,Delta,new AneBoundMlp(b[29].trellis,AneSplit,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[30].withProjections(w,c,Delta,new AneBoundMlp(b[30].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[31].withProjections(w,c,Attention,new AneBoundMlp(b[31].trellis,AneSplit,fraction,capacity,shares,4),Dense,Plain,Plain,Dense),
+      b[32].withProjections(w,c,Delta,new AneBoundMlp(b[32].trellis,AneSplit,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[33].withProjections(w,c,Delta,new AneBoundMlp(b[33].trellis,AneSplit,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[34].withProjections(w,c,Delta,new AneBoundMlp(b[34].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[35].withProjections(w,c,Attention,new AneBoundMlp(b[35].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Plain,Plain,Dense),
+      b[36].withProjections(w,c,Delta,new AneBoundMlp(b[36].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[37].withProjections(w,c,Delta,new AneBoundMlp(b[37].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[38].withProjections(w,c,Delta,new AneBoundMlp(b[38].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[39].withProjections(w,c,Attention,new AneBoundMlp(b[39].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Plain,Plain,Dense),
+      b[40].withProjections(w,c,Delta,new AneBoundMlp(b[40].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[41].withProjections(w,c,Delta,new AneBoundMlp(b[41].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[42].withProjections(w,c,Delta,new AneBoundMlp(b[42].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[43].withProjections(w,c,Attention,new AneBoundMlp(b[43].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Plain,Plain,Dense),
+      b[44].withProjections(w,c,Delta,new AneBoundMlp(b[44].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[45].withProjections(w,c,Delta,new AneBoundMlp(b[45].trellis,AneSplit,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[46].withProjections(w,c,Delta,new AneBoundMlp(b[46].trellis,AneSplit,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[47].withProjections(w,c,Attention,new AneBoundMlp(b[47].trellis,AneSplit,fraction,capacity,shares,4),Dense,Plain,Plain,Dense),
+      b[48].withProjections(w,c,Delta,new AneBoundMlp(b[48].trellis,AneSplit,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[49].withProjections(w,c,Delta,new AneBoundMlp(b[49].trellis,AneSplit,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[50].withProjections(w,c,Delta,new AneBoundMlp(b[50].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[51].withProjections(w,c,Attention,new AneBoundMlp(b[51].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Plain,Plain,Dense),
+      b[52].withProjections(w,c,Delta,new AneBoundMlp(b[52].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[53].withProjections(w,c,Delta,new AneBoundMlp(b[53].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[54].withProjections(w,c,Delta,new AneBoundMlp(b[54].trellis,AneSplit,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[55].withProjections(w,c,Attention,new AneBoundMlp(b[55].trellis,AneSplit,fraction,capacity,shares,4),Dense,Plain,Plain,Dense),
+      b[56].withProjections(w,c,Delta,new AneBoundMlp(b[56].trellis,AneSplit,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[57].withProjections(w,c,Delta,new AneBoundMlp(b[57].trellis,AneSplit,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[58].withProjections(w,c,Delta,new AneBoundMlp(b[58].trellis,AneSplit,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[59].withProjections(w,c,Attention,new AneBoundMlp(b[59].trellis,AneSplit,fraction,capacity,shares,4),Dense,Plain,Plain,Dense),
+      b[60].withProjections(w,c,Delta,new AneBoundMlp(b[60].trellis,AneSplit,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[61].withProjections(w,c,Delta,new AneBoundMlp(b[61].trellis,AneSplit,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[62].withProjections(w,c,Delta,new AneBoundMlp(b[62].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Dense,Plain,Plain,Dense,qk),
+      b[63].withProjections(w,c,Attention,new AneBoundMlp(b[63].trellis,AneSplitK3i,fraction,capacity,shares,4),Dense,Plain,Plain,Dense),
+    ];
+  }
+  #aneDense(w:Weights,c:ModelConfig,b:LayerWeights,qk:{q:MlxArray;k:MlxArray},shares:AneWeightShares,fraction:number,capacity:number):Layers {
+    const small=this.#aneSmall(w,c,b,qk,shares,fraction,capacity);
+    return [
+      small[0],small[1],small[2],b[3].withProjections(w,c,Attention,small[3].mlp,Dense,Dense,Dense,Dense),
+      small[4],small[5],small[6],b[7].withProjections(w,c,Attention,small[7].mlp,Dense,Dense,Dense,Dense),
+      small[8],small[9],small[10],b[11].withProjections(w,c,Attention,small[11].mlp,Dense,Dense,Dense,Dense),
+      small[12],small[13],small[14],b[15].withProjections(w,c,Attention,small[15].mlp,Dense,Dense,Dense,Dense),
+      small[16],small[17],small[18],b[19].withProjections(w,c,Attention,small[19].mlp,Dense,Dense,Dense,Dense),
+      small[20],small[21],small[22],b[23].withProjections(w,c,Attention,small[23].mlp,Dense,Dense,Dense,Dense),
+      small[24],small[25],small[26],b[27].withProjections(w,c,Attention,small[27].mlp,Dense,Dense,Dense,Dense),
+      small[28],small[29],small[30],b[31].withProjections(w,c,Attention,small[31].mlp,Dense,Dense,Dense,Dense),
+      small[32],small[33],small[34],b[35].withProjections(w,c,Attention,small[35].mlp,Dense,Dense,Dense,Dense),
+      small[36],small[37],small[38],b[39].withProjections(w,c,Attention,small[39].mlp,Dense,Dense,Dense,Dense),
+      small[40],small[41],small[42],b[43].withProjections(w,c,Attention,small[43].mlp,Dense,Dense,Dense,Dense),
+      small[44],small[45],small[46],b[47].withProjections(w,c,Attention,small[47].mlp,Dense,Dense,Dense,Dense),
+      small[48],small[49],small[50],b[51].withProjections(w,c,Attention,small[51].mlp,Dense,Dense,Dense,Dense),
+      small[52],small[53],small[54],b[55].withProjections(w,c,Attention,small[55].mlp,Dense,Dense,Dense,Dense),
+      small[56],small[57],small[58],b[59].withProjections(w,c,Attention,small[59].mlp,Dense,Dense,Dense,Dense),
+      small[60],small[61],small[62],b[63].withProjections(w,c,Attention,small[63].mlp,Dense,Dense,Dense,Dense),
+    ];
+  }
+  #aneAffine(w:Weights,c:ModelConfig,b:LayerWeights,qk:{q:MlxArray;k:MlxArray},shares:AneWeightShares,fraction:number,capacity:number):Layers {
+    const dense=this.#aneDense(w,c,b,qk,shares,fraction,capacity);
+    return [
+      b[0].aneProjections(w,c,Delta,dense[0].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[1].aneProjections(w,c,Delta,dense[1].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[2].aneProjections(w,c,Delta,dense[2].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[3].aneProjections(w,c,Attention,dense[3].mlp,AneAffineSplit,Dense,Plain,capacity,shares),
+      b[4].aneProjections(w,c,Delta,dense[4].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[5].aneProjections(w,c,Delta,dense[5].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[6].aneProjections(w,c,Delta,dense[6].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[7].aneProjections(w,c,Attention,dense[7].mlp,AneAffineSplit,Dense,Plain,capacity,shares),
+      b[8].aneProjections(w,c,Delta,dense[8].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[9].aneProjections(w,c,Delta,dense[9].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[10].aneProjections(w,c,Delta,dense[10].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[11].aneProjections(w,c,Attention,dense[11].mlp,AneAffineSplit,Dense,Plain,capacity,shares),
+      b[12].aneProjections(w,c,Delta,dense[12].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[13].aneProjections(w,c,Delta,dense[13].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[14].aneProjections(w,c,Delta,dense[14].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[15].aneProjections(w,c,Attention,dense[15].mlp,AneAffineSplit,Dense,Plain,capacity,shares),
+      b[16].aneProjections(w,c,Delta,dense[16].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[17].aneProjections(w,c,Delta,dense[17].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[18].aneProjections(w,c,Delta,dense[18].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[19].aneProjections(w,c,Attention,dense[19].mlp,AneAffineSplit,Dense,Plain,capacity,shares),
+      b[20].aneProjections(w,c,Delta,dense[20].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[21].aneProjections(w,c,Delta,dense[21].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[22].aneProjections(w,c,Delta,dense[22].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[23].aneProjections(w,c,Attention,dense[23].mlp,AneAffineSplit,Dense,Plain,capacity,shares),
+      b[24].aneProjections(w,c,Delta,dense[24].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[25].aneProjections(w,c,Delta,dense[25].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[26].aneProjections(w,c,Delta,dense[26].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[27].aneProjections(w,c,Attention,dense[27].mlp,AneAffineSplit,Dense,Plain,capacity,shares),
+      b[28].aneProjections(w,c,Delta,dense[28].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[29].aneProjections(w,c,Delta,dense[29].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[30].aneProjections(w,c,Delta,dense[30].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[31].aneProjections(w,c,Attention,dense[31].mlp,AneAffineSplit,Dense,Plain,capacity,shares),
+      b[32].aneProjections(w,c,Delta,dense[32].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[33].aneProjections(w,c,Delta,dense[33].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[34].aneProjections(w,c,Delta,dense[34].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[35].aneProjections(w,c,Attention,dense[35].mlp,AneAffineSplit,Dense,Plain,capacity,shares),
+      b[36].aneProjections(w,c,Delta,dense[36].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[37].aneProjections(w,c,Delta,dense[37].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[38].aneProjections(w,c,Delta,dense[38].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[39].aneProjections(w,c,Attention,dense[39].mlp,AneAffineSplit,Dense,Plain,capacity,shares),
+      b[40].aneProjections(w,c,Delta,dense[40].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[41].aneProjections(w,c,Delta,dense[41].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[42].aneProjections(w,c,Delta,dense[42].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[43].aneProjections(w,c,Attention,dense[43].mlp,AneAffineSplit,Dense,Plain,capacity,shares),
+      b[44].aneProjections(w,c,Delta,dense[44].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[45].aneProjections(w,c,Delta,dense[45].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[46].aneProjections(w,c,Delta,dense[46].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[47].aneProjections(w,c,Attention,dense[47].mlp,AneAffineSplit,Dense,Plain,capacity,shares),
+      b[48].aneProjections(w,c,Delta,dense[48].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[49].aneProjections(w,c,Delta,dense[49].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[50].aneProjections(w,c,Delta,dense[50].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[51].aneProjections(w,c,Attention,dense[51].mlp,AneAffineSplit,Dense,Plain,capacity,shares),
+      b[52].aneProjections(w,c,Delta,dense[52].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[53].aneProjections(w,c,Delta,dense[53].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[54].aneProjections(w,c,Delta,dense[54].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[55].aneProjections(w,c,Attention,dense[55].mlp,AneAffineSplit,Dense,Plain,capacity,shares),
+      b[56].aneProjections(w,c,Delta,dense[56].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[57].aneProjections(w,c,Delta,dense[57].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[58].aneProjections(w,c,Delta,dense[58].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[59].aneProjections(w,c,Attention,dense[59].mlp,AneAffineSplit,Dense,Plain,capacity,shares),
+      b[60].aneProjections(w,c,Delta,dense[60].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[61].aneProjections(w,c,Delta,dense[61].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[62].aneProjections(w,c,Delta,dense[62].mlp,AneAffineSplit,Dense,Plain,capacity,shares,qk),b[63].aneProjections(w,c,Attention,dense[63].mlp,AneAffineSplit,Dense,Plain,capacity,shares),
+    ];
+  }
   loraTargets():Map<string,QwenProjectionTarget> { return new Map(this.#targets); }
   bindMediaInput(input:Vision):MlxPromptInput { return bindQwenMediaInput(this,input.embeddings,input.mrope!); }
   mediaEncoders(modelDir:string):Promise<MediaEncoders> { return qwenMediaEncoders(this,modelDir); }
-  draftTarget(_state:Cache[]):TargetView { return qwenDraftTarget(this,this.#residualBasis); }
+  draftTarget(_state:Cache[]):TargetView { return qwenDraftTarget(this,this.#residualBasis,this.#draftProjections,this.#vocabulary); }
   logitsFromHidden(hidden:MlxArray):MlxArray { return this.#head.forward(hidden); }
   #lazy(layers:Layers,ids:MlxArray,state:Cache[],phase:ReadPhase,capture:MlxLayerCapture|null):MlxArray {
     using scope=new GraphForwardScope(this.embed.encode(ids),capture);
     return this.#run(layers,state,phase,scope);
   }
-  #embeddingLazy(layers:Layers,hidden:MlxArray,state:Cache[]):MlxArray {
-    using scope=new GraphForwardScope(ops.contiguous(hidden),null);
+  #submitted(layers:Layers,ids:MlxArray,state:Cache[],phase:ReadPhase,capture:MlxLayerCapture|null):MlxArray {
+    using scope=new SubmittedGraphForwardScope(this.embed.encode(ids),capture,64,4);
+    return this.#run(layers,state,phase,scope);
+  }
+  #queued(layers:Layers,ids:MlxArray,state:Cache[],capture:MlxLayerCapture|null):MlxArray {
+    using scope=new QueuedGraphForwardScope(this.embed.encode(ids),capture,state);
+    return this.#run(layers,state,"window",scope);
+  }
+  #embeddingSubmitted(layers:Layers,hidden:MlxArray,state:Cache[]):MlxArray {
+    using scope=new SubmittedGraphForwardScope(ops.contiguous(hidden),null,64,4);
     return this.#run(layers,state,"window",scope);
   }
   #embeddingBounded(layers:Layers,hidden:MlxArray,state:Cache[]):MlxArray {

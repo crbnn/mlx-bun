@@ -1,3 +1,4 @@
+import { rowOperationFor } from "../graph";
 // Faithful DFlash drafter (DSpark paper §3.1, Eq 2–3) — the KV-injection
 // architecture. Selected by variant="dspark" (or legacy "dflash") in the
 // checkpoint metadata. The superseded v1 single-vector module (target context
@@ -336,7 +337,7 @@ export class DflashDrafter implements DsparkDrafterModel {
   #baseLogits(model: DraftProjection, block: MlxArray, anchors: number): MlxArray {
     const hOut = ops.matmul(block, this.get("out_proj")); // [A,γ,H]
     const hBf = hOut.astype(model.embed.scales.dtype); hOut.dispose();
-    const logits = model.logits[(anchors * this.cfg.gamma)]!(hBf); hBf.dispose();
+    const logits = rowOperationFor(model.logits,anchors * this.cfg.gamma)(hBf); hBf.dispose();
     return logits;
   }
   #markov(prevToks: MlxArray): { B: MlxArray; emb1: MlxArray } {

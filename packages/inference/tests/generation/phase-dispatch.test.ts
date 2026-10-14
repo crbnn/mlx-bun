@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { Cache } from "../../src/contracts/mlx/cache";
 import type { ModelConfig } from "../../src/artifacts/config";
-import type { MlxTokenGraph } from "../../src/models/graph";
+import { rowTableWithDefault, rowOperationFor, type MlxTokenGraph } from "../../src/models/graph";
 import { declareGraph } from "../../src/models/capabilities";
 import { bindMlxAutoregressiveGraph } from "../../src/generation/bindings/autoregressive";
 import type { MlxCapturingForward, MlxTokenPhases } from "../../src/contracts/mlx/graph";
@@ -109,4 +109,35 @@ test("literal row tables can reuse one operation, alternate operations, or decla
   expect(parity.decode(3)).toBe(parity.decode(7));
   expect(parity.decode(2)).toBe(parity.decode(8));
   expect(individual.decode(2)).not.toBe(individual.decode(3));
+});
+
+
+test("chunk ranges preserve different short-chunk and short-tail bindings",()=>{
+  const chunk=op("chunk"),tail=op("tail");
+  const dispatch=new MlxPhaseDispatch({...graph(false),
+    prompt:[{from:1,to:Infinity,operation:tail}],multiSequencePrompt:[{from:1,to:Infinity,operation:tail}],
+    promptChunk:[{from:1,to:256,operation:chunk},{from:257,to:Infinity,operation:tail}],
+    multiSequencePromptChunk:[{from:1,to:256,operation:chunk},{from:257,to:Infinity,operation:tail}],
+  });
+  for(const rows of [1,4,8,256]) {
+    expect(dispatch.prompt("chunk",1,rows)).toBe(chunk);
+    expect(dispatch.prompt("tail",1,rows)).toBe(tail);
+  }
+  expect(dispatch.prompt("chunk",2,4)).toBe(chunk);
+  expect(dispatch.prompt("tail",2,4)).toBe(tail);
+  expect(dispatch.prompt("chunk",2,128)).toBe(chunk);
+  expect(dispatch.prompt("chunk",2,129)).toBe(tail);
+  expect(dispatch.prompt("chunk",1,257)).toBe(tail);
+});
+
+
+test("exact-row defaults keep one declared operation for unbounded positive rows",()=>{
+  const one=op("one"),last=op("last"),expanded=op("expanded");
+  const table=rowTableWithDefault({1:one,256:last},expanded);
+  expect(table[1]).toBe(one);expect(table[256]).toBe(last);
+  expect(table[257]).toBe(expanded);expect(table[1_000_000]).toBe(expanded);
+  expect(Object.keys(table)).toEqual(["1","256"]);
+  for(const key of ["0","-1","1.5","01","then","missing"]) expect(Reflect.get(table,key)).toBeUndefined();
+  expect(Reflect.get(table,Symbol.iterator)).toBeUndefined();
+  expect(rowOperationFor([{from:1,to:8,operation:one},{from:9,to:Infinity,operation:expanded}],1_000_000)).toBe(expanded);
 });

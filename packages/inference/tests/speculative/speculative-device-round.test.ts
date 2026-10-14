@@ -15,10 +15,12 @@ const logits = () => MlxArray.fromFloat32(Float32Array.from({ length: 2 * 3 * 16
   return (choices[row]![position] === token ? 3 : 0) + ((token * 5 + position) % 4) * 0.25;
 }), [2, 3, 16]);
 
-async function round(deviceFirst: boolean, options: Parameters<typeof makeStepSampler>[0]) {
+async function round(deviceFirst: boolean, options: Parameters<typeof makeStepSampler>[0], { walk = false } = {}) {
   const samplers = [0, 1].map(() => makeStepSampler(options, {
-    tokenRepresentation: "number", grammarWait: "before-sample", historyUpdate: "after-sample",
+    tokenRepresentation: "number", grammarWait: "before-sample", historyUpdate: "after-sample", initialHistory: [7, 2],
   }));
+  // The position-by-position walk: sample() at each position, committing each draw.
+  if (walk) for (const sampling of samplers) Object.assign(sampling, { independent: undefined, positional: undefined });
   const calls = { draft: 0, draftDevice: 0, resolved: [] as number[][], forwardIds: [] as number[] };
   const run = () => advanceSpeculativeRows(samplers.map((sampling, row) => ({
     pending: row + 1, step: row * 10 + 2, remaining: 20, eosTokenIds: [], sampling,
@@ -36,7 +38,13 @@ async function round(deviceFirst: boolean, options: Parameters<typeof makeStepSa
   });
   try {
     const result = await withRuntimeConfig(createRuntimeConfig({ MLX_BUN_SPEC_DEVICE_ROUND: deviceFirst ? "1" : "0" }), run);
-    return { calls, emitted: result.map(row => row.acceptance.emitted), accepted: result.map(row => row.acceptance.accepted),
+    // The draw each row makes next over flat scores, which its processor history decides.
+    const next: number[] = [];
+    for (const sampling of samplers) {
+      using flat = MlxArray.fromFloat32(Float32Array.from({ length: 16 }, (_, token) => (token % 3) * 0.01), [1, 16]);
+      next.push((await sampling.sample(flat, 40)).token);
+    }
+    return { calls, next, emitted: result.map(row => row.acceptance.emitted), accepted: result.map(row => row.acceptance.accepted),
       correction: result.map(row => row.acceptance.correction) };
   } finally { for (const sampler of samplers) sampler.dispose(); }
 }
@@ -59,7 +67,19 @@ for (const [name, options] of [
   });
 }
 
-test("rows whose sampling depends on history keep the host-first order", async () => {
-  const result = await round(true, { temperature: 0.8, seed: 3, repetitionPenalty: 1.2 });
-  expect(result.calls).toMatchObject({ draft: 1, draftDevice: 0 });
+for (const [name, options] of [
+  ["Qwen's instruct settings (top-k within the 16-token vocabulary)", { temperature: 0.7, topP: 0.8, topK: 6, presencePenalty: 1.5, seed: 7 }],
+  ["repetition penalty", { temperature: 0.8, seed: 3, repetitionPenalty: 1.2 }],
+] as const) test(`rows whose sampling reads processor history verify device-first with the draws of the position walk (${name})`, async () => {
+  const device = await round(true, options), host = await round(false, options);
+  expect(device.calls).toMatchObject({ draft: 0, draftDevice: 1 });
+  expect(device.emitted).toEqual(host.emitted);
+  expect(device.accepted).toEqual(host.accepted);
+  expect(device.correction).toEqual(host.correction);
+  const walked = await round(false, options, { walk: true });
+  expect(walked.emitted).toEqual(host.emitted);
+  expect(walked.correction).toEqual(host.correction);
+  // Each walk commits the tokens it used: the next draw reads the same history.
+  expect(device.next).toEqual(walked.next);
+  expect(host.next).toEqual(walked.next);
 });

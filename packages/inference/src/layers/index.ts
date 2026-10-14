@@ -25,3 +25,10 @@ export * from "./trellis-down";
 export * from "./trellis-reduce-gate-up";
 export * from "./trellis-scatter-down";
 export { LoraDelta, LoraOperation, LoraState } from "./lora";
+
+export * from "./dequantized-linear";
+export * from "./trellis-codebook-down";
+export * from "./trellis-codebook-gate-up";
+export * from "./folded-attention";
+
+export { AneTrellisExpandReduce, AneTrellisExpandScatter, AneTrellisExpandedMlpSplit, AneTrellisExpandedMlpSplitK3i, type AneGpuMlpRows } from "./ane-prefill-split";

@@ -1,13 +1,15 @@
+import { KV4_DECODE_BLOCK } from "../kernels/attention/kvq4-decode";
 import { kv4DecodeAttention } from "../layers/kv4-decode-attention";
 import { foldedQuantizedSdpa } from "../layers/quantized-attention";
 import { unfusedKernel, type AffineKernels } from "./affine-attention";
 import { AttentionMasks } from "./attention-read";
 import { QuantizedKVCache } from "./quantized-kv";
 
-/** The kernels of the Qwen3.8-27B Trellis M4 Pro composition's full-attention
- * layers for one sequence: the fused one-row KV4 decode kernel
- * (`kv4DecodeAttention`, each packed key and value row read once for every
- * query head of its KV head) and the folded-GQA window kernel
+/** The kernels of the Qwen3.8-27B Trellis compositions' full-attention layers
+ * for one sequence: the fused one-row KV4 decode kernel (`kv4DecodeAttention`,
+ * each packed key and value row read once for every query head of its KV head,
+ * `decodeBlock` tokens per threadgroup: the M4 Pro's 512 by default, the M1
+ * Max's 128 as its composition names) and the folded-GQA window kernel
  * (`foldedQuantizedSdpa`, one quantized matmul per KV head for its query rows,
  * causal over the last L positions). Neither reads the mask, and both take one
  * row (B = 1), head dim 256 and an even GQA factor. `multiRow` is the
@@ -15,9 +17,9 @@ import { QuantizedKVCache } from "./quantized-kv";
  * more than one row or one behind left padding: the old graph served several
  * sequences on the generic path. A masked window on serial storage takes the
  * unfused port, which this storage never needs (its mask is plain causal). */
-export function kv4Head256Kernels(multiRow: AffineKernels): AffineKernels {
+export function kv4Head256Kernels(multiRow: AffineKernels, decodeBlock = KV4_DECODE_BLOCK): AffineKernels {
   return {
-    decode: (q, keys, values, scale) => kv4DecodeAttention(q, keys, values, scale, 64, 4),
+    decode: (q, keys, values, scale) => kv4DecodeAttention(q, keys, values, scale, 64, 4, decodeBlock),
     window: (q, keys, values, scale) => foldedQuantizedSdpa(q, keys, values, scale, 64, 4),
     maskedWindow: unfusedKernel(64, 4),
     multiRow,
