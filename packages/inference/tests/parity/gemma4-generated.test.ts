@@ -202,7 +202,7 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the generic graph under kv_c
             console.log(`[generated ${fingerprint}] uncompiled: ${forwards} generated forwards, every listed cache quantized after the first`);
           }
           // The compiled run took compiled steps where the composition declares them (not the MoE 26B).
-          if (!compiled || !configured.gen.graphCapabilities.compiledDecode) expect(steps).toBe(0);
+          if (!compiled || typeof configured.gen.compiledDecodeStep !== "function") expect(steps).toBe(0);
           else expect(steps).toBeGreaterThan(0);
           digest(`compiled ${compiled} trajectory`, [specialized]);
           console.log(`[generated ${fingerprint}] compiled ${compiled}: ${specialized.length} tokens identical, ${steps} compiled steps`);
@@ -237,15 +237,18 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the generic graph under kv_c
         } finally { ids.dispose(); }
       } finally { releaseAll(caches.map(cache => () => cache.dispose())); ffi.clearCache(); }
     };
-    const batched = (gen);
-    expect(batched.equals((mono))).toBe(true);
+    const batched = rows(gen);
+    expect(batched.equals(rows(mono))).toBe(true);
     digest("two rows hidden", [batched]);
   } finally {
     // Compiled closures borrow weight arrays: release their tapes before the weights.
     try { releaseAll([mono, gen].filter(Boolean).map(model => () => CompiledDecode.release(model))); }
     finally {
-      try { weights.dispose(); }
-      finally { releaseAll([...weights.shards.files.values()].map(file => () => file.mmap.unmap()).concat([() => ffi.clearCache()])); }
+      try { releaseAll([mono, gen].filter(Boolean).map(model => () => model.dispose?.())); }
+      finally {
+        try { weights.dispose(); }
+        finally { releaseAll([...weights.shards.files.values()].map(file => () => file.mmap.unmap()).concat([() => ffi.clearCache()])); }
+      }
     }
   }
 }, 900_000);
