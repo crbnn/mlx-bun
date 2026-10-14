@@ -1,14 +1,8 @@
 import { MlxPhaseDispatch } from "../../src/generation/phase-dispatch";
-// The generated M1 Max graph (src/models/qwen/qwen38-27b-trellis-m1max.ts, an entire graph built from the
-// composition) on small synthetic weights laid out by the generated quant table: 48 DeltaNet and 16 attention layers
-// with the artifact's 3- and 4-bit affine projections, Trellis gate/up at the artifact's widths (mixed in its ten
-// layers) and its 3-bit block-interleaved and row-major downs, scaled down in width. The composition facts it
-// declares (LoRA targets, no committed spans, no Neural Engine operation, its measured verify costs, the residual
-// basis its fold record names, the caches of each KV scheme). From five rows the graph runs the generic blocks: there
-// it is held to the generic Qwen 3.5 graph of its family over the same weights under bf16, affine 4- and 8-bit and
-// TurboQuant KV, hidden, logits and every cache tensor, at maxDiff 0. Its reduce and scatter layers at one to four
-// rows have no generic counterpart: the generator's drift test (qwen38-generated-sync), the real-artifact parity suite
-// on the M1 Max (tests/parity/qwen-trellis-parity.test.ts) and the app digests are their gates. No model, no download.
+// Written M1 operations on a small synthetic artifact with all 64 quantization
+// layouts. Expanded GPU windows preserve exact hidden, head, and cache tensors
+// under every KV scheme. Artifact-sized tiled/reduce/scatter kernels are held
+// to their fixed-layer numerical tests and real-artifact parity gates.
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -232,7 +226,7 @@ function graphs(scheme: string, overrides: Partial<Composition> = {}): { current
 }
 afterAll(() => { for (const { current,generic } of built.values()) {current.dispose();generic.dispose();} });
 
-describe("the composition the generated graph declares", () => {
+describe("the written graph declarations", () => {
   test("LoRA targets, caches, no committed spans, no Neural Engine operation, the verify costs its composition measured", () => {
     for (const scheme of Object.keys(SCHEMES)) {
       const { current, generic } = graphs(scheme);
@@ -268,7 +262,7 @@ describe("the composition the generated graph declares", () => {
 });
 
 for (const scheme of Object.keys(SCHEMES)) {
-  test(`${scheme} KV: from five rows, the M1 Max graph equals the generic Qwen 3.5 graph (prompt chunk, tails, verify, decode of several sequences)`, () => {
+  test(`${scheme} KV: expanded GPU windows equal generic Qwen hidden, logits and caches`, () => {
     const { current, generic } = graphs(scheme);
     const mine = current.makeCache(), theirs = generic.makeCache();
     const step = (label: string, width: number, rows: number[][],
@@ -280,10 +274,8 @@ for (const scheme of Object.keys(SCHEMES)) {
     };
     try {
       step(`prefillChunk.gpu ${CHUNK}`, 9, [prompt(CHUNK, 1)], (g, input, caches) => g.multiSequencePrompt.at(-1)!.operation(input, caches, null));
-      step("prefillTail.fiveToEight 6", 6, [prompt(6, 2)], (g, input, caches) => new MlxPhaseDispatch(g).prompt("tail", 1, 6)(input, caches, null));
-      step("prefillTail.wider 13", 13, [prompt(13, 3)], (g, input, caches) => new MlxPhaseDispatch(g).prompt("tail", 1, 13)(input, caches, null));
-      step("verify.fiveToEight 8", 8, [prompt(8, 4)], (g, input, caches) => g.verify[8]!(input, caches, null));
-      step("verify.wider 12", 12, [prompt(12, 5)], (g, input, caches) => g.verify[12]!(input, caches, null));
+      step("prefillTail 40", 40, [prompt(40, 2)], (g, input, caches) => new MlxPhaseDispatch(g).prompt("tail", 1, 40)(input, caches, null));
+      step("verify 40", 40, [prompt(40, 5)], (g, input, caches) => g.verify[40]!(input, caches, null));
     } finally { disposeAll(mine, theirs); }
   }, 180_000);
 }
