@@ -1,5 +1,5 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
-import type { MlxPhaseGroup } from "../contracts/mlx/graph";
+import type { MlxPhaseGroup, MlxMixedRange, MlxSeparateMixed } from "../contracts/mlx/graph";
 import type { MlxForwardStep, MlxForwardWork } from "../contracts/mlx/forward-work";
 
 /** Join two method-owned work producers at their forward boundary: the first
@@ -59,3 +59,20 @@ export async function runMixedTokenIteration(options: {
 }
 
 export { type MlxForwardWork, type MlxPreparationWork } from "../contracts/mlx/forward-work";
+
+
+/** The scheduler routes packed rows together and verify geometry per group. */
+export function dispatchMixedGroups(groups: readonly MlxPhaseGroup[], rows: number,
+  packed: readonly MlxMixedRange[], separate?: MlxSeparateMixed): MlxArray[] {
+  if (separate && groups.some(group => group.phase === "verify")) {
+    const outputs: MlxArray[] = [];
+    try {
+      for (const group of groups) {
+        const operation = separate[group.phase].find(range => group.rows >= range.from && group.rows <= range.to)!.operation;
+        outputs.push(operation(group));
+      }
+      return outputs;
+    } catch (error) { for (const output of outputs) output.dispose(); throw error; }
+  }
+  return packed.find(range => rows >= range.from && rows <= range.to)!.operation(groups, rows);
+}
