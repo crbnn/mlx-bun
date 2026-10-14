@@ -179,10 +179,7 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis against main: logits, greedy tokens
   const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
   const { argmaxLastPosition, klPerToken, lastPositionLogits } = await import("@mlx-bun/inference/scoring");
   const { rollbackVerifyBlock } = await import("@mlx-bun/inference/state");
-  const { bindGraphCaches } = await import("@mlx-bun/inference/models");
-  const { Qwen35Model } = await import("@mlx-bun/inference/models/qwen3_5");
-  const { phaseRowLimit } = await import("@mlx-bun/inference/models/graph");
-  const { sequenceHiddenOperation, sequenceLogitsOperation } = await import("@mlx-bun/inference/scoring");
+  const { bindMlxAutoregressiveGraph } = await import("../../src/generation/bindings/autoregressive");
   const ops = await import("@mlx-bun/mlx/ops");
   const { Qwen38TrellisM1Max } = await import("@mlx-bun/inference/models/qwen38-27b-trellis-m1max");
   const { Qwen38TrellisM4Pro } = await import("@mlx-bun/inference/models/qwen38-27b-trellis-m4pro");
@@ -206,8 +203,7 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis against main: logits, greedy tokens
     assert.equal(model instanceof Qwen38TrellisM1Max || model instanceof Qwen38TrellisM4Pro, true,
       "the reference requires a known written Qwen Trellis graph");
     report.graph = model.constructor.name;
-    const generic = bindGraphCaches(new Qwen35Model(weights,config,phaseRowLimit(model.composition)),model.composition);
-    releases.push(()=>generic.dispose());
+    const controlBinding = bindMlxAutoregressiveGraph(model);
 
     const promptRows = { prompts: 0, identical: 0, klMax: 0 };
     const promptExact: boolean[] = [];
@@ -222,12 +218,13 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis against main: logits, greedy tokens
       promptExact[i] = sha256(new Uint8Array(last.buffer, last.byteOffset, last.byteLength)) === hash;
       if (promptExact[i]) { promptRows.identical++; return { cache, out }; }
       expect(ids.length, `prompt ${i}: the stock control takes prompts above eight rows`).toBeGreaterThan(8);
-      const mains = generic.makeCache();
+      const mains = model.makeCache();
       let main: A;
       {
         using tokens = ops.fromInt32([...ids], [1, ids.length]);
-        using hidden = sequenceHiddenOperation(generic,tokens,mains,ids.length);
-        main = sequenceLogitsOperation(generic,hidden);
+        using embeds = model.embed.encode(tokens);
+        using hidden = controlBinding.prefillEmbeddings!(embeds, mains, null, tokens, null, ids.length);
+        main = model.logitsFromHidden(hidden);
       }
       try {
         const expected: Float32Array = lastPositionLogits(main);

@@ -254,10 +254,38 @@ describe("composition", () => {
     expect(current.prompt.filter(range => range.unit === "ane").map(({from,to})=>[from,to])).toEqual([[640,1024],[1025,1536],[1537,2048]]);
     expect(LAYERS.filter(layer => layer.downLayout === "k3Interleaved").length).toBe(40);
     expect(LAYERS.filter(layer => layer.kind === "deltanet").length).toBe(48);
-  });
+    expect(current.verify[65]).toBe(current.verify[4104]);
+    expect(current.logits[65]).toBe(current.logits[4104]);
+    expect(current.decode[33]).toBe(current.decode[262144]);
+    expect(current.mediaDecode[33]).toBe(current.mediaDecode[262144]);
+  },120_000);
 });
 
 describe("the M4 Pro graph against the generic Qwen 3.5 graph where both run the generic blocks (bf16 KV)", () => {
+  test("unbounded verify, explicit decode and positioned decode retain the expanded operations",()=>{
+    const current=graph(),{weights,config}=source(),facts=composition();
+    const generic=testGraph(new Qwen35Model(weights,config,513),facts);
+    try {
+      const mine=current.makeCache(),theirs=generic.makeCache();
+      try {
+        using input=ids([prompt(513,73)]);
+        outputDiff("verify513",current.verify[513]!(input,mine,null),generic.verify[513]!(input,theirs,null) as MlxArray,
+          current.logits[513]!,generic.logits[513]!);
+        stateDiff("verify513",mine,theirs);
+      } finally {disposeAll(mine,theirs);}
+      for (const positioned of [false,true]) {
+        const mine=current.makeCache(),theirs=generic.makeCache();
+        try {
+          using input=ids(Array.from({length:33},(_,row)=>prompt(1,74+row)));
+          using positions=ops.fromInt32(Array(3*33).fill(0),[3,33,1]);
+          const actual=positioned?current.mediaDecode[33]!(input,mine,positions):current.decode[33]!(input,mine,null);
+          const expected=positioned?generic.mediaDecode[33]!(input,theirs,positions):generic.decode[33]!(input,theirs,null);
+          outputDiff(positioned?"positioned decode33":"decode33",actual,expected as MlxArray,current.logits[33]!,generic.logits[33]!);
+          stateDiff(positioned?"positioned decode33":"decode33",mine,theirs);
+        } finally {disposeAll(mine,theirs);}
+      }
+    } finally {generic.dispose();}
+  },180_000);
   test("prepared embeddings use their declared text operation and preserve borrowed input",()=>{
     const current=graph(),{weights,config}=source(),generic=testGraph(new Qwen35Model(weights,config,phaseRowLimit(composition())),composition());
     const mine=current.makeCache(),theirs=generic.makeCache();
@@ -270,7 +298,7 @@ describe("the M4 Pro graph against the generic Qwen 3.5 graph where both run the
       stateDiff("plain embeddings 40",mine,theirs);expect(Buffer.from(embeddings.rawBytes())).toEqual(before);
     } finally {disposeAll(mine,theirs);generic.dispose();}
   },180_000);
-  test("a known grammar span beyond the verify cap retains one full committed forward",()=>{
+  test("a long known grammar span retains one full committed forward",()=>{
     const current=graph(),{weights,config}=source(),generic=testGraph(new Qwen35Model(weights, config, phaseRowLimit(composition())), composition());
     const committed=(input:MlxArray,cache:Cache[]):MlxArray=>{
       let hidden=generic.embed.encode(input);

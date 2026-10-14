@@ -24,13 +24,14 @@ import { GraphForwardScope, BoundedGraphForwardScope, SubmittedGraphForwardScope
 import { disposeResources } from "../../runtime/resources";
 import { declareGraph } from "../capabilities";
 import type { ReadPhase } from "../graph";
+import { rowTableWithDefault } from "../row-table";
 import { QwenDeltaLayer as Delta, QwenAttentionLayer as Attention } from "./blocks";
 import { bindQwenMediaInput, qwenDraftTarget, qwenMediaEncoders, qwenResidualBasis } from "./media-input";
 import { DeltaWeights, AttentionWeights, GateDownMLP, AneBoundMlp, AneWeightShares, canonicalQwenWeights, type QwenProjectionTarget } from "./written-layers";
 
 export const QWEN38_TRELLIS_M4PRO_GRAPH = "qwen3.8-27b-trellis-3.2bpw-m4pro";
 export const DECODE_ROWS = 8;
-/** Eight request rows, each verifying a qualified depth-seven round. */
+/** Exact entries through64 rows; larger rows use this file's expanded operation. */
 export const VERIFY_ROWS = 64;
 const PREFIX = "language_model.model";
 const REPRESENTATIONS = { gateUpCodebook: false, mixedExactBits: false,
@@ -820,6 +821,9 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
     const rowsDecode:RowsForward=(ids,state,capture)=>this.#submitted(this.#rows,ids,state,"decode",capture);
     const fourDecode:RowsForward=(ids,state,capture)=>this.#submitted(this.#four,ids,state,"decode",capture);
     const mmaDecode:RowsForward=(ids,state,capture)=>this.#submitted(this.#mma,ids,state,"decode",capture);
+    const wideDecode:RowsForward=(ids,state,capture)=>this.#lazy(this.#wide,ids,state,"decode",capture);
+    const tiledDecode:RowsForward=(ids,state,capture)=>this.#lazy(this.#tiled,ids,state,"decode",capture);
+    const expandedDecode:RowsForward=(ids,state,capture)=>this.#lazy(this.#expanded,ids,state,"decode",capture);
     const oneWindow:RowsForward=(ids,state,capture)=>this.#submitted(this.#one,ids,state,"window",capture);
     const rowsWindow:RowsForward=(ids,state,capture)=>this.#submitted(this.#rows,ids,state,"window",capture);
     const fourWindow:RowsForward=(ids,state,capture)=>this.#submitted(this.#four,ids,state,"window",capture);
@@ -827,8 +831,13 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
     const wideWindow:RowsForward=(ids,state,capture)=>this.#bounded(this.#wide,ids,state,"window",capture);
     const tiledWindow:RowsForward=(ids,state,capture)=>this.#bounded(this.#tiled,ids,state,"window",capture);
     const expandedWindow:RowsForward=(ids,state,capture)=>this.#bounded(this.#expanded,ids,state,"window",capture);
-    this.decode={1:oneDecode,2:rowsDecode,3:rowsDecode,4:fourDecode,5:mmaDecode,6:mmaDecode,7:mmaDecode,8:mmaDecode};
-    this.verify={
+    this.decode=rowTableWithDefault({
+      1:oneDecode,2:rowsDecode,3:rowsDecode,4:fourDecode,5:mmaDecode,6:mmaDecode,7:mmaDecode,8:mmaDecode,
+      9:wideDecode,10:wideDecode,11:wideDecode,12:wideDecode,13:wideDecode,14:wideDecode,15:wideDecode,
+      16:tiledDecode,17:tiledDecode,18:tiledDecode,19:tiledDecode,20:tiledDecode,21:tiledDecode,22:tiledDecode,23:tiledDecode,
+      24:tiledDecode,25:tiledDecode,26:tiledDecode,27:tiledDecode,28:tiledDecode,29:tiledDecode,30:tiledDecode,31:tiledDecode,32:tiledDecode,
+    },expandedDecode);
+    this.verify=rowTableWithDefault({
       1:oneWindow,2:rowsWindow,3:rowsWindow,4:fourWindow,5:mmaWindow,6:mmaWindow,7:mmaWindow,8:mmaWindow,
       9:wideWindow,10:wideWindow,11:wideWindow,12:wideWindow,13:wideWindow,14:wideWindow,15:wideWindow,
       16:tiledWindow,17:tiledWindow,18:tiledWindow,19:tiledWindow,20:tiledWindow,21:tiledWindow,22:tiledWindow,23:tiledWindow,
@@ -837,7 +846,7 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
       41:expandedWindow,42:expandedWindow,43:expandedWindow,44:expandedWindow,45:expandedWindow,46:expandedWindow,47:expandedWindow,48:expandedWindow,
       49:expandedWindow,50:expandedWindow,51:expandedWindow,52:expandedWindow,53:expandedWindow,54:expandedWindow,55:expandedWindow,56:expandedWindow,
       57:expandedWindow,58:expandedWindow,59:expandedWindow,60:expandedWindow,61:expandedWindow,62:expandedWindow,63:expandedWindow,64:expandedWindow,
-    };
+    },expandedWindow);
     this.prompt=[
       {from:1,to:1,operation:oneWindow},{from:2,to:3,operation:rowsWindow},{from:4,to:4,operation:fourWindow},
       {from:5,to:8,operation:mmaWindow},{from:9,to:15,operation:wideWindow},{from:16,to:32,operation:tiledWindow},
@@ -861,7 +870,7 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
       {from:9,to:15,operation:knownWide},{from:16,to:32,operation:knownTiled},{from:33,to:Infinity,operation:knownExpanded}];
     const headRows=new Affine4Rows(this.lmHead),headMma=new Affine4Mma(this.lmHead);
     const plainHead:MlxHeadForward=hidden=>this.#head.forward(hidden),rowsHead:MlxHeadForward=hidden=>headRows.forward(hidden),mmaHead:MlxHeadForward=hidden=>headMma.forward(hidden);
-    this.logits={
+    this.logits=rowTableWithDefault({
       1:plainHead,2:rowsHead,3:rowsHead,4:rowsHead,5:mmaHead,6:mmaHead,7:mmaHead,8:mmaHead,
       9:plainHead,10:plainHead,11:plainHead,12:plainHead,13:plainHead,14:plainHead,15:plainHead,16:plainHead,
       17:plainHead,18:plainHead,19:plainHead,20:plainHead,21:plainHead,22:plainHead,23:plainHead,24:plainHead,
@@ -870,7 +879,7 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
       41:plainHead,42:plainHead,43:plainHead,44:plainHead,45:plainHead,46:plainHead,47:plainHead,48:plainHead,
       49:plainHead,50:plainHead,51:plainHead,52:plainHead,53:plainHead,54:plainHead,55:plainHead,56:plainHead,
       57:plainHead,58:plainHead,59:plainHead,60:plainHead,61:plainHead,62:plainHead,63:plainHead,64:plainHead,
-    };
+    },plainHead);
     this.sequence=[
       {from:1,to:1,operation:(ids,state)=>oneWindow(ids,state,null)},
       {from:2,to:3,operation:(ids,state)=>rowsWindow(ids,state,null)},
@@ -896,7 +905,15 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
     ];
     const mediaSmallDecode:MlxPositionedForward=(ids,state,positions)=>this.#positioned(mediaNarrow,this.embed.encode(ids),state,"decode",positions);
     const mediaLargeDecode:MlxPositionedForward=(ids,state,positions)=>this.#positioned(mediaFiveToEight,this.embed.encode(ids),state,"decode",positions);
-    this.mediaDecode={1:mediaSmallDecode,2:mediaSmallDecode,3:mediaSmallDecode,4:mediaSmallDecode,5:mediaLargeDecode,6:mediaLargeDecode,7:mediaLargeDecode,8:mediaLargeDecode};
+    const mediaWideDecode:MlxPositionedForward=(ids,state,positions)=>this.#positioned(mediaWide,this.embed.encode(ids),state,"decode",positions);
+    const mediaTiledDecode:MlxPositionedForward=(ids,state,positions)=>this.#positioned(mediaTiled,this.embed.encode(ids),state,"decode",positions);
+    const mediaExpandedDecode:MlxPositionedForward=(ids,state,positions)=>this.#positioned(mediaExpanded,this.embed.encode(ids),state,"decode",positions);
+    this.mediaDecode=rowTableWithDefault({
+      1:mediaSmallDecode,2:mediaSmallDecode,3:mediaSmallDecode,4:mediaSmallDecode,5:mediaLargeDecode,6:mediaLargeDecode,7:mediaLargeDecode,8:mediaLargeDecode,
+      9:mediaWideDecode,10:mediaWideDecode,11:mediaWideDecode,12:mediaWideDecode,13:mediaWideDecode,14:mediaWideDecode,15:mediaWideDecode,
+      16:mediaTiledDecode,17:mediaTiledDecode,18:mediaTiledDecode,19:mediaTiledDecode,20:mediaTiledDecode,21:mediaTiledDecode,22:mediaTiledDecode,23:mediaTiledDecode,
+      24:mediaTiledDecode,25:mediaTiledDecode,26:mediaTiledDecode,27:mediaTiledDecode,28:mediaTiledDecode,29:mediaTiledDecode,30:mediaTiledDecode,31:mediaTiledDecode,32:mediaTiledDecode,
+    },mediaExpandedDecode);
     const separatedWindow=[
       {from:1,to:1,operation:(group:Parameters<MlxSeparateMixed["window"][number]["operation"]>[0])=>oneWindow(group.ids,group.state,group.capture)},
       {from:2,to:3,operation:(group:Parameters<MlxSeparateMixed["window"][number]["operation"]>[0])=>rowsWindow(group.ids,group.state,group.capture)},
@@ -920,6 +937,9 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
       {from:2,to:3,operation:group=>rowsDecode(group.ids,group.state,group.capture)},
       {from:4,to:4,operation:group=>fourDecode(group.ids,group.state,group.capture)},
       {from:5,to:8,operation:group=>mmaDecode(group.ids,group.state,group.capture)},
+      {from:9,to:15,operation:group=>wideDecode(group.ids,group.state,group.capture)},
+      {from:16,to:32,operation:group=>tiledDecode(group.ids,group.state,group.capture)},
+      {from:33,to:Infinity,operation:group=>expandedDecode(group.ids,group.state,group.capture)},
     ],window:separatedWindow,verify:separatedWindow};
     console.error(`[graph] ${this.graph}`);
   }

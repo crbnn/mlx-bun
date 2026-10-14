@@ -14,7 +14,7 @@ import { Gemma4Model } from "./gemma4/model";
 import { configFingerprint } from "../artifacts/fingerprint";
 import { qwen35GraphFingerprint } from "./qwen/checkpoint";
 import {
-  DECODE_ROWS as QWEN38_M4PRO_DECODE_ROWS, VERIFY_ROWS as QWEN38_M4PRO_VERIFY_ROWS, QWEN38_TRELLIS_M4PRO_GRAPH, Qwen38TrellisM4Pro,
+  DECODE_ROWS as QWEN38_M4PRO_DECODE_ROWS, QWEN38_TRELLIS_M4PRO_GRAPH, Qwen38TrellisM4Pro,
   anePrograms as qwen38TrellisM4ProAnePrograms,
 } from "./qwen/qwen38-27b-trellis-m4pro";
 import {
@@ -91,7 +91,7 @@ export const MLX_GRAPH_TABLES: Readonly<Record<ModelGraph, GraphTable<Weights, R
   // Explicit caller choices bypass these artifact and device keys.
   "qwen3.5": new GraphTable([
     loadedEntry({ id: QWEN38_TRELLIS_M4PRO_GRAPH, serves: {
-        fingerprint:"cfa205c8f5af046a",device:"applegpu_g16s",maxRows:QWEN38_M4PRO_DECODE_ROWS,maxVerifyRows:QWEN38_M4PRO_VERIFY_ROWS,
+        fingerprint:"cfa205c8f5af046a",device:"applegpu_g16s",maxRows:QWEN38_M4PRO_DECODE_ROWS,
         kv:[{kind:"bf16"},{kind:"affine",bits:4,groupSize:64}],
       },
       create: (weights,config) => new Qwen38TrellisM4Pro(weights,config),

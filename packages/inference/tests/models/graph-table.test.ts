@@ -133,7 +133,7 @@ describe("the Qwen 3.5 table", () => {
   const table = MLX_GRAPH_TABLES["qwen3.5"]!;
   const select = (composition: Composition, fingerprint = TRELLIS) => table.match(fingerprint, composition).id;
 
-  test("the M4 Pro graph serves the Trellis artifact on applegpu_g16s with bf16 or affine 4/64, adapters or not, up to 8 rows", () => {
+  test("the M4 Pro graph serves the Trellis artifact on applegpu_g16s with bf16 or affine 4/64 and up to 8 decode rows", () => {
     expect(select(on(M4_PRO, qwen))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     expect(select(on(M4_PRO, qwen, { kv: { override: 4 } }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     expect(select(on(M4_PRO, qwen, { kv: { override: 4, quantizedKvStart: 512 } }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
@@ -144,6 +144,25 @@ describe("the Qwen 3.5 table", () => {
     expect(select(on(M4_PRO, qwen, { maxRows: 1, draft: { numDraftTokens: 3 } }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     expect(select({ ...on(M4_PRO, qwen, { draft: { numDraftTokens: 7, adaptive: true } }), prefillChunkTokens: 512 }))
       .toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
+  });
+
+  test("M4 recommendations preserve MTP depth 8, default ngram depth 10 and larger verification rounds", () => {
+    const shapes = [
+      { numDraftTokens: 8, verificationRows: 72 },
+      { numDraftTokens: 10, verificationRows: 88 },
+      { numDraftTokens: 512, verificationRows: 4104 },
+    ];
+    for (const shape of shapes) {
+      for (const adaptive of [false, true]) {
+        for (const kv of [undefined, { override: 4 as const }]) {
+          const composition = on(M4_PRO, qwen, { maxRows: 8, kv,
+            draft: { numDraftTokens: shape.numDraftTokens, adaptive } });
+          const depth = typeof composition.draftDepth === "number" ? composition.draftDepth : composition.draftDepth.max;
+          expect(composition.maxRows * (depth + 1)).toBe(shape.verificationRows);
+          expect(select(composition)).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
+        }
+      }
+    }
   });
 
   test("the same artifact on applegpu_g16s with another KV scheme or more rows gets the generic graph", () => {
@@ -217,7 +236,7 @@ describe("the Gemma 4 table", () => {
       text: { ...qwen.text, numHiddenLayers: graph.LAYERS.length, layerTypes: graph.LAYERS.map(layer => layer.attention === "sliding" ? "sliding_attention" : "full_attention") } };
   };
   for (const [index, stem] of ["gemma4-e4b", "gemma4-12b", "gemma4-26b"].entries()) {
-    test(`${stem}: declared fingerprint and cache scheme select the file within its row tables`, () => {
+    test(`${stem}: declared fingerprint and cache scheme select the file across devices and row counts`, () => {
       const graph = graphs[index]!, config = configFor(graph);
       const pick = (request: CompositionRequest) => table.match(graph.FINGERPRINT, on(M4_PRO, config, request)).id;
       expect(on(M4_PRO, config, { kv: { override: "config" } }).kv.kind).toBe("affine-layers");
@@ -225,10 +244,22 @@ describe("the Gemma 4 table", () => {
       expect(pick({ kv: { override: "config", quantizedKvStart: 100 } })).toBe(stem);
       for (const fusedSdpa of [true, false]) expect(pick({ kv: { override: "config", fusedSdpa } })).toBe(stem);
       const otherMachine = on(M1_MAX, config, { kv: { override: "config" }, maxRows: 32 });
-      expect(table.match(graph.FINGERPRINT, otherMachine).id).toBe("gemma4");
+      expect(table.match(graph.FINGERPRINT, otherMachine).id).toBe(stem);
       expect(table.select(config, otherMachine, stem).id).toBe(stem);
       expect(pick({ kv: { override: "config" }, maxRows: 8, draft: { numDraftTokens: 7 } })).toBe(stem);
-      expect(pick({ kv: { override: "config" }, maxRows: 8, draft: { numDraftTokens: 8 } })).toBe("gemma4");
+      for (const device of [M4_PRO, M1_MAX, "unlisted-gpu"]) {
+        for (const maxRows of [8, 16, 257, 4096]) {
+          expect(table.match(graph.FINGERPRINT, on(device, config, { kv: { override: "config" }, maxRows })).id).toBe(stem);
+          // Depth 10 is the default model-free ngram round; 8 also covers MTP.
+          for (const numDraftTokens of [8, 10, 512]) {
+            for (const adaptive of [false, true]) {
+              const composition = on(device, config, { kv: { override: "config" }, maxRows,
+                draft: { numDraftTokens, adaptive } });
+              expect(table.match(graph.FINGERPRINT, composition).id).toBe(stem);
+            }
+          }
+        }
+      }
 
       for (const other of [{}, { kv: { override: "off" as const } }, { kv: { override: 4 } }, { kv: { override: 8 } },
         { kv: { turboQuant: { kBits: 8, vBits: 3 } } }]) expect(pick(other)).toBe("gemma4");

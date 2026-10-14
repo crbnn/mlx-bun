@@ -46,15 +46,20 @@ export function anePrograms(widths:AneWidths=ANE_WIDTHS):AneProgramSpec[] {
   return [
     aneMlpSplitProgram(h,i,.353,256,4),aneMlpSplitProgram(h,i,.353,320,4),aneMlpSplitProgram(h,i,.353,384,4),
     aneMlpSplitProgram(h,i,.353,448,4),aneMlpSplitProgram(h,i,.353,512,4),aneMlpSplitProgram(h,i,.353,576,4),
-    aneMlpSplitProgram(h,i,.353,640,4),aneMlpSplitProgram(h,i,.353,704,4),aneMlpSplitProgram(h,i,.353,768,4),
-    aneMlpSplitProgram(h,i,.382,896,4),aneMlpSplitProgram(h,i,.382,1024,4),aneMlpSplitProgram(h,i,.382,1280,4),
-    aneMlpSplitProgram(h,i,.382,1536,4),aneMlpSplitProgram(h,i,.382,1792,4),aneMlpSplitProgram(h,i,.382,2048,4),
+    aneMlpSplitProgram(h,i,.353,640,4),aneMlpSplitProgram(h,i,.353,704,4),
+    aneMlpSplitProgram(h,i,.353,768,4),
     aneAffineSplitProgram(qi,qo,.375,768,4),aneAffineSplitProgram(zi,zo,.375,768,4),aneAffineSplitProgram(oi,oo,.375,768,4),aneAffineSplitProgram(ai,ao,.375,768,4),
+    aneMlpSplitProgram(h,i,.382,896,4),
     aneAffineSplitProgram(qi,qo,.375,896,4),aneAffineSplitProgram(zi,zo,.375,896,4),aneAffineSplitProgram(oi,oo,.375,896,4),aneAffineSplitProgram(ai,ao,.375,896,4),
+    aneMlpSplitProgram(h,i,.382,1024,4),
     aneAffineSplitProgram(qi,qo,.375,1024,4),aneAffineSplitProgram(zi,zo,.375,1024,4),aneAffineSplitProgram(oi,oo,.375,1024,4),aneAffineSplitProgram(ai,ao,.375,1024,4),
+    aneMlpSplitProgram(h,i,.382,1280,4),
     aneAffineSplitProgram(qi,qo,.375,1280,4),aneAffineSplitProgram(zi,zo,.375,1280,4),aneAffineSplitProgram(oi,oo,.375,1280,4),aneAffineSplitProgram(ai,ao,.375,1280,4),
+    aneMlpSplitProgram(h,i,.382,1536,4),
     aneAffineSplitProgram(qi,qo,.375,1536,4),aneAffineSplitProgram(zi,zo,.375,1536,4),aneAffineSplitProgram(oi,oo,.375,1536,4),aneAffineSplitProgram(ai,ao,.375,1536,4),
+    aneMlpSplitProgram(h,i,.382,1792,4),
     aneAffineSplitProgram(qi,qo,.375,1792,4),aneAffineSplitProgram(zi,zo,.375,1792,4),aneAffineSplitProgram(oi,oo,.375,1792,4),aneAffineSplitProgram(ai,ao,.375,1792,4),
+    aneMlpSplitProgram(h,i,.382,2048,4),
     aneAffineSplitProgram(qi,qo,.375,2048,4),aneAffineSplitProgram(zi,zo,.375,2048,4),aneAffineSplitProgram(oi,oo,.375,2048,4),aneAffineSplitProgram(ai,ao,.375,2048,4),
   ];
 }

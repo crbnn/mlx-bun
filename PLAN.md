@@ -111,7 +111,8 @@ Binding for every graph file in the tree, held by the architecture gate where me
   files' own gates, never by regenerating anything.
 - This program changes no numbers: bit identity with main (3743321e) on every served composition
   where main served it (the digests, the parity suites, the captured texts), and performance
-  checked with a short scoped regression run (paired, preflight-gated). Performance work
+  checked with a short scoped paired regression run, retaining preflight readings and
+  reporting the current machine conditions Josh has accepted for this check. Performance work
   is not this program.
 
 ### Items
@@ -201,7 +202,7 @@ matrix runs once at the end. Agents do the work; Josh reviews the plan, I review
       matrix on every artifact in the served set, the parity suites, the captured texts on the M4
       Pro and the identity tests on both machines. Performance qualification for this refactor
       is a short scoped paired regression check of the affected graphs against latest main,
-      on a clean machine. Create one final merge request from `refactor/graph-files` to `main`;
+      with preflight failures retained and machine-condition limitations reported. Create one final merge request from `refactor/graph-files` to `main`;
       Josh decides when it merges.
 
 ## Composition refactor

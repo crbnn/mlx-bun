@@ -289,6 +289,29 @@ for (const c of COMPOSITIONS) {
       } finally {disposeAll(mine,theirs);}
     },120_000);
 
+    test(`${c.stem}: decode nine rows and verify 65 rows preserve hidden, head and cache bytes`, async () => {
+      const { model, generic } = await pair();
+      const compare = async (phase: "decode" | "verify", rows: number[][]) => {
+        const mine = model.makeCache(), theirs = generic.makeCache();
+        using input = ids(rows);
+        const count = input.size;
+        try {
+          const actual = await model[phase][count]!(input, mine, null);
+          let expected: MlxArray | undefined;
+          try {
+            expected = await generic[phase][count]!(input, theirs, null);
+            maxDiff(actual, expected, `${c.stem} ${phase}${count} hidden`);
+            using left = model.logits[count]!(actual);
+            using right = generic.logits[count]!(expected);
+            maxDiff(left, right, `${c.stem} ${phase}${count} head`);
+            stateDiff(`${c.stem} ${phase}${count}`, mine, theirs);
+          } finally { actual.dispose(); expected?.dispose(); }
+        } finally { disposeAll(mine, theirs); }
+      };
+      await compare("decode", Array.from({ length: 9 }, (_, row) => [31 + row]));
+      await compare("verify", [prompt(65, 12)]);
+    }, 120_000);
+
     if (c.stem !== "gemma4-26b") test(`${c.stem}: the literal plain trace preserves compiled decode logits and cache`, async () => {
       const { model, generic } = await pair();
       const compiled = model as Graph & { compiledDecodeStep(): MlxCompiledDecodeStep; releaseCompiledDecode(): void };
