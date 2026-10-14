@@ -50,6 +50,8 @@ import {
   type ResolvedModelProfile,
   type ResolveModelProfileOptions,
   type ModelGraph,
+  type ModelLoader,
+  type GenerationLoop,
 } from "./profile";
 
 export type RuntimeModel =
@@ -110,6 +112,18 @@ export interface ModelOpenOptions<Model = RuntimeModel> extends Glm52RuntimeOpen
    * (`resolveComposition(config)`). The direct Colibri runtime plans its own
    * resources from the options above and takes none. */
   readonly composition?: Composition;
+  /** A named shipped graph or the caller's own graph entry. Explicit choices
+   * bypass device and configuration recommendations and need no registration. */
+  readonly graph?: string | ((weights: Weights, config: ModelConfig) => Model);
+}
+
+/** A loader entry cannot provide the requested artifact/operation pairing. */
+export class UnsupportedModelLoadError extends Error {
+  readonly code = "unsupported-model-load";
+  constructor(readonly profile: ResolvedModelProfile, message: string) {
+    super(message);
+    this.name = "UnsupportedModelLoadError";
+  }
 }
 
 export interface Glm52RuntimeOpenOptions {
@@ -205,6 +219,10 @@ export async function openWhisperModel(
  */
 export function openModel<Model>(
   modelDir: string,
+  options: ModelOpenOptions<Model> & { readonly graph: (weights: Weights, config: ModelConfig) => Model },
+): Promise<Model>;
+export function openModel<Model>(
+  modelDir: string,
   options: ModelOpenOptions<Model> & { readonly implementations: ModelImplementationProvider<Weights, Model> },
 ): Promise<Model>;
 export function openModel(modelDir: string, options?: ModelOpenOptions): Promise<RuntimeModel>;
@@ -213,25 +231,80 @@ export async function openModel<Model>(
   options: ModelOpenOptions<Model> = {},
 ): Promise<Model | RuntimeModel> {
   const config = await loadModelConfig(modelDir);
-  const profile = resolveModelProfile(config, options.profiles);
-  if (profile.profile.execution.loader === "colibri") {
-    if (options.implementations || profile.profile.execution.implementation !== undefined)
-      throw new Error("custom Colibri implementations require a streamed loader binding; refusing to fall back");
-    return (await openGlm52RuntimeModel(modelDir, options.composition
-      ? { ...options, caches: { kv: options.composition.kv, pagedKv: options.composition.pagedKv } } : options)).model;
-  }
-  if (profile.profile.execution.loop === "encoder-decoder")
-    throw new Error(
-      `${modelDir} is a speech model (${profile.profile.id}); open it with openWhisperModel ` +
-      "or serve it as a transcription model — it has no chat/completion loop",
-    );
-  // Resolve before opening weights; missing or incompatible code allocates nothing.
-  const implementation = (options.implementations ?? MLX_MODEL_IMPLEMENTATIONS).select(config, profile);
   const composition = options.composition ?? resolveComposition(config);
-  const weights = await Weights.open(modelDir);
-  try { return implementation.create(weights, config, profile, composition); }
-  catch (error) { weights.dispose(); throw error; }
+  // A caller's graph is the complete arrangement. Loading it does not require
+  // a family profile or participation in the default recommendation table.
+  if (typeof options.graph === "function") {
+    const weights = await Weights.open(modelDir);
+    try { return options.graph(weights, config); }
+    catch (error) { weights.dispose(); throw error; }
+  }
+  const profile = resolveModelProfile(config, options.profiles);
+  if (options.graph !== undefined) {
+    const entry = MLX_GRAPH_TABLES[profile.profile.execution.graph]?.explicit(options.graph);
+    if (!entry) throw new Error(`no shipped graph table for ${profile.profile.execution.graph}`);
+    const weights = await Weights.open(modelDir);
+    try { return entry.create(weights, config, composition); }
+    catch (error) { weights.dispose(); throw error; }
+  }
+  return ARTIFACT_LOADERS[profile.profile.execution.loader][profile.profile.execution.loop]
+    .open({ modelDir, config, profile, composition, options });
 }
+
+interface ArtifactLoad<Model> {
+  readonly modelDir: string;
+  readonly config: ModelConfig;
+  readonly profile: ResolvedModelProfile;
+  readonly composition: Composition;
+  readonly options: ModelOpenOptions<Model>;
+}
+
+interface ArtifactLoader {
+  open<Model>(load: ArtifactLoad<Model>): Promise<Model | RuntimeModel>;
+  create<Model>(weights: Weights, config: ModelConfig, profile: ResolvedModelProfile,
+    composition: Composition, implementations: ModelImplementationProvider<Weights, Model>): Model;
+}
+
+const residentLoader: ArtifactLoader = {
+  async open({ modelDir, config, profile, composition, options }) {
+    const implementation = (options.implementations ?? MLX_MODEL_IMPLEMENTATIONS).select(config, profile);
+    const weights = await Weights.open(modelDir);
+    try { return implementation.create(weights, config, profile, composition); }
+    catch (error) { weights.dispose(); throw error; }
+  },
+  create: (weights, config, profile, composition, implementations) =>
+    implementations.select(config, profile).create(weights, config, profile, composition),
+};
+
+const streamedLoader: ArtifactLoader = {
+  async open({ modelDir, profile, composition, options }) {
+    if (options.implementations || profile.profile.execution.implementation !== undefined)
+      throw new UnsupportedModelLoadError(profile, "custom Colibri implementations require a streamed loader binding; refusing to fall back");
+    return (await openGlm52RuntimeModel(modelDir, options.composition
+      ? { ...options, caches: { kv: composition.kv, pagedKv: composition.pagedKv } } : options)).model;
+  },
+  create(_weights, _config, profile) {
+    throw new UnsupportedModelLoadError(profile, `${profile.profile.id} uses the direct Colibri container; construct it with ` +
+      "openModel(modelDir) or Glm52Model.open(modelDir)");
+  },
+};
+
+const speechLoader: ArtifactLoader = {
+  async open({ modelDir, profile }) {
+    throw new UnsupportedModelLoadError(profile, `${modelDir} is a speech model (${profile.profile.id}); open it with openWhisperModel ` +
+      "or serve it as a transcription model — it has no chat/completion loop");
+  },
+  create(_weights, _config, profile) {
+    throw new UnsupportedModelLoadError(profile, `${profile.profile.id} has an encoder-decoder graph; open it with openWhisperModel`);
+  },
+};
+
+/** Artifact loading follows declared table facts, including streamed weights
+ * and the separate speech operation. It never selects by a model predicate. */
+const ARTIFACT_LOADERS: Readonly<Record<ModelLoader, Readonly<Record<GenerationLoop, ArtifactLoader>>>> = {
+  safetensors: { autoregressive: residentLoader, diffusion: residentLoader, "encoder-decoder": speechLoader },
+  colibri: { autoregressive: streamedLoader, diffusion: streamedLoader, "encoder-decoder": speechLoader },
+};
 
 /** Construct the binding named by a validated profile for `composition`, which
  * the implementation receives (absent: the default record,
@@ -254,10 +327,6 @@ export function createModel<Model>(
   implementations: ModelImplementationProvider<Weights, Model> | ModelImplementationProvider<Weights, RuntimeModel> = MLX_MODEL_IMPLEMENTATIONS,
 ): Model | RuntimeModel {
   assertResolvedModelProfile(config, resolved);
-  if (resolved.profile.execution.loader === "colibri")
-    throw new Error(
-      `${resolved.profile.id} uses the direct Colibri container; construct it with ` +
-      "openModel(modelDir) or Glm52Model.open(modelDir)",
-    );
-  return implementations.select(config, resolved).create(weights, config, resolved, composition);
+  return ARTIFACT_LOADERS[resolved.profile.execution.loader][resolved.profile.execution.loop]
+    .create<Model | RuntimeModel>(weights, config, resolved, composition, implementations);
 }
