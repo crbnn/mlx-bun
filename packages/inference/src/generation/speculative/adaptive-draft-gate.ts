@@ -9,6 +9,8 @@
  * load does not make it oscillate.
  */
 
+import type { AdaptiveDraftGateSettings } from "../../contracts/mlx/graph";
+
 export type VerifyCostModel = ReadonlyMap<number, number>;
 
 /** The cost of a forward of `positions` rows: the measured one, interpolated between measured rows, and past the
@@ -27,27 +29,26 @@ function interpolatedCost(costs: VerifyCostModel, positions: number): number {
     ((costs.get(hi)! - costs.get(lo)!) / (hi - lo)) * (positions - lo);
 }
 
-export interface AdaptiveDraftGateOptions {
-  maxDraftTokens: number;
+/** The defaults of each setting a graph may declare for its machine (`AdaptiveDraftGateSettings`):
+ *  - `priorAccepted`, `priorRejected`: every position's counts before any round is observed, 4.5 and 0.5 (an
+ *    acceptance of 0.9, so a new gate drafts deeply and backs off as rejections arrive);
+ *  - `decay` 0.85, and `idleDecay` 1: a round without drafts leaves the counts as they are;
+ *  - `margin` 0.03;
+ *  - `probeInterval`: rounds without drafts before `next` drafts one token to observe acceptance again (8); each probe
+ *    after which the gate still drafts nothing doubles the interval, up to `maxProbeInterval` (32);
+ *  - `probeDepth`: the depth a drafter that proposes without committing drafts a probe at (the round's budget). */
+export interface AdaptiveDraftGateOptions extends AdaptiveDraftGateSettings {
+  readonly maxDraftTokens: number;
   /** Whether rejection requires replaying the accepted prefix. */
-  replayOnReject?: boolean;
-  /** Every position's counts before any round is observed: accepted and rejected drafts (4.5 and 0.5, an acceptance
-   *  of 0.9, so a new gate drafts deeply and backs off as rejections arrive). */
-  priorAccepted?: number;
-  priorRejected?: number;
-  decay?: number;
-  margin?: number;
-  /** Rounds without drafts before `next` drafts one token to observe acceptance again (default 8). Each probe after
-   *  which the gate still drafts nothing doubles the interval, up to `maxProbeInterval` (default 32). */
-  probeInterval?: number;
-  maxProbeInterval?: number;
+  readonly replayOnReject?: boolean;
 }
 
 /** Acceptance is modeled per draft position: the probability that the draft at position i is accepted given that
  *  every draft before it was. Each position's decayed counts are shrunk toward the position before it (weight 1;
  *  position 1 toward the prior), so a position seldom reached follows the ones that are, and a drafter whose later
  *  positions fall off (a recurrent MTP head trained for two steps) and one that stays flat (a block drafter) are
- *  both modeled. A round decays the positions it drafted. */
+ *  both modeled. A round decays the positions it drafted; with `idleDecay` a round without drafts decays them all,
+ *  so what the gate observed ages with the text it decodes and not only with the rounds it drafts. */
 export class AdaptiveDraftGate {
   /** Decayed accepted and rejected drafts at each position (index 0 is position 1). */
   readonly #accepted: number[];
@@ -55,11 +56,14 @@ export class AdaptiveDraftGate {
   readonly #prior: number;
   readonly #priorWeight: number;
   readonly #decay: number;
+  readonly #idleDecay: number;
   readonly #margin: number;
   readonly #maxDraftTokens: number;
   readonly #replayOnReject: boolean;
   readonly #probeInterval: number;
   readonly #maxProbeInterval: number;
+  /** The depth of a probe drafted without a verify round. */
+  readonly probeDepth: number;
   /** Rounds in a row `next` has run without drafts, and the rounds before its next probe. */
   #idle = 0;
   #interval: number;
@@ -74,9 +78,11 @@ export class AdaptiveDraftGate {
     this.#accepted = Array<number>(options.maxDraftTokens).fill(accepted);
     this.#rejected = Array<number>(options.maxDraftTokens).fill(rejected);
     this.#decay = options.decay ?? 0.85;
+    this.#idleDecay = options.idleDecay ?? 1;
     this.#margin = options.margin ?? 0.03;
     this.#probeInterval = this.#interval = options.probeInterval ?? 8;
     this.#maxProbeInterval = options.maxProbeInterval ?? 32;
+    this.probeDepth = options.probeDepth ?? Infinity;
   }
 
   /** Forget what the gate observed: back to the prior, probing at the first interval. For new text (a request
@@ -134,6 +140,10 @@ export class AdaptiveDraftGate {
     this.#probing = false;
     const depth = this.choose(budget, rows);
     if (depth > 0 || budget < 1) { this.#idle = 0; this.#interval = this.#probeInterval; return depth; }
+    if (this.#idleDecay < 1) for (let i = 0; i < this.#maxDraftTokens; i++) {
+      this.#accepted[i] = this.#accepted[i]! * this.#idleDecay;
+      this.#rejected[i] = this.#rejected[i]! * this.#idleDecay;
+    }
     if (++this.#idle <= this.#interval) return 0;
     this.#idle = 0;
     this.#interval = Math.min(2 * this.#interval, this.#maxProbeInterval);

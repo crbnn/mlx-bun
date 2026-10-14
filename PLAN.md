@@ -56,16 +56,19 @@ above 256 rows still the generic blocks, a one-sequence prompt piece of 224 to 2
 Neural Engine split over programs every 64 positions to 768, every 128 to 1024 and every 256 to 2048
 (time to first token of 300-, 400-, 500-, 639-, 700- and 1100-token prompts 2.74/3.55/4.09/5.00/5.09/7.23
 -> 2.43/2.98/3.28/3.94/4.26/6.65 s); DFlash 2 adaptive on that chip (in-process serve, four
-prompts, 192 tokens, 2026-10-14) decodes greedy text at 24.7 against 19.1 tok/s plain, 21.7 against 18.7 under
-Qwen's instruct sampling and 20.3 against 18.7 under its thinking sampling, the MTP head (adaptive up to four
-drafts, the graph's `adaptiveDraftWidths`) at 20.5, 19.7 and 18.6; with two and four concurrent requests DFlash 2
+prompts, 192 tokens, 2026-10-14, with the gate settings the graph declares for it) decodes greedy text at 26.0 against
+19.5 tok/s plain, 22.9 against 19.1 under Qwen's instruct sampling and 21.0 against 19.1 under its thinking sampling,
+the MTP head (adaptive up to four drafts, the graph's `adaptiveDraftWidths`) at 21.1, 20.2 and 19.2; with two and four concurrent requests DFlash 2
 decodes 30.4, 28.5 and 27.1 and 43-46, 39-42 and 38.2 tok/s in aggregate against plain's 19.9, 19.3 and 19.1 and
 30.5, 29.8 and 28.6 (the gate weighs a group's round by the rows it verifies, 16- and 32-row rounds measured);
 the adaptive gate drafts nothing where drafting does not pay (such rounds are the pipelined decode step, at plain
-decode's step time), yet on text the drafter predicts poorly (the short-story prompt; the explanation prompt under
-instruct sampling) DFlash 2 still trails plain decode by 2 to 5% and the MTP head by 1 to 4%: the first rounds
-after a request joins draft on an optimistic prior (about 2.5%), each DFlash 2 probe drafts a block (15 to 35 ms
-every 8 to 32 steps) and each return from drafted rounds to pipelined steps costs about one step; the M1
+decode's step time), yet on the short-story prompt DFlash 2 still trails plain decode by up to 5% (instruct sampling)
+and the MTP head by 2 to 4%; a replay of the gate over measured acceptance at every position of 96 texts puts the loss
+on text it loses on into its rounds before it first stops (2.0%) and after probes (1.3%), its probes (0.7%; a DFlash 2
+probe costs 8.7 to 11.5 ms by depth) and its transitions (0.3%: the first step without drafts after a round starts 3 to
+5 ms later than a pipelined one, a round after steps without drafts 6 to 8 ms), and no setting of the gate's prior,
+decay, margin, probe intervals or depth drafts at plain decode's rate or better on every such text without losing on
+text it drafts well; the M1
 Max composition prefills 1k and 8k-token prompts at about 175 tok/s (2026-10-13, alternated sessions of the graph's own prefill
 operations, against 129 to 130 before its dense-GEMM prompt projections and Neural Engine MLP split;
 mean KL of the split 1.3e-3 to 2.0e-3) against 200 on the M4 Pro; the paired check's band is

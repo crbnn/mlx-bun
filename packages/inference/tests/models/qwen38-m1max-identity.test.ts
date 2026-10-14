@@ -269,6 +269,7 @@ describe("the composition the generated graph declares", () => {
       expect([...current.verifyRoundCosts]).toEqual(QWEN38_COMPOSITIONS["qwen38-27b-trellis-m1max"]!.verifyRoundCosts!.costs.map(([rows, cost]) => [rows, cost]));
       expect(current.wiredWeights).toBe(QWEN38_COMPOSITIONS["qwen38-27b-trellis-m1max"]!.wiredWeights!);
       expect([...current.adaptiveDraftWidths]).toEqual(QWEN38_COMPOSITIONS["qwen38-27b-trellis-m1max"]!.adaptiveDraftWidths!.map(([kind, width]) => [kind, width]));
+      expect([...current.adaptiveDraftGates]).toEqual(QWEN38_COMPOSITIONS["qwen38-27b-trellis-m1max"]!.adaptiveDraftGates!.map(([kind, settings]) => [kind, settings]));
       expect(current.prefillChunk.ane).toBeUndefined();
       const a = current.makeCache(), b = generic.makeCache();
       try {
