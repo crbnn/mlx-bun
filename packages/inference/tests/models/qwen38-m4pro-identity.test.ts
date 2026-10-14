@@ -260,8 +260,7 @@ describe("the M4 Pro graph against the generic Qwen 3.5 graph where both run the
     const mine=current.makeCache(),theirs=generic.makeCache();
     try {
       using input=ids([prompt(80,71)]);
-      expect(current.appendKnown[80]).toBe(current.appendKnown[4096]);
-      expect(current.appendKnown[4097]).toBeUndefined();
+      expect(new MlxPhaseDispatch(current).known(80)).toBe(new MlxPhaseDispatch(current).known(262144));
       outputDiff("known span 80",new MlxPhaseDispatch(current).known(80)(input,mine) as MlxArray,
         new MlxPhaseDispatch(generic).known(80)(input,theirs) as MlxArray,current.logitsFromHidden.bind(current),generic.logitsFromHidden.bind(generic));
       stateDiff("known span 80",mine,theirs);

@@ -71,13 +71,18 @@ export interface MlxPromptRange {
   readonly unit?: "gpu" | "ane";
 }
 
+/** A whole accepted span uses one declared operation; callers must not split
+ * it to fit a verification table because that can change attention arithmetic. */
+export interface MlxKnownRange { readonly from: number; readonly to: number; readonly operation: MlxPhaseForward }
+export type MlxKnownOperations = MlxRowTable<MlxPhaseForward> | readonly MlxKnownRange[];
+
 /** Operations selected by exact row count or prompt position range. */
 export interface MlxTokenPhases {
   readonly prompt: readonly MlxPromptRange[];
   readonly multiSequencePrompt: readonly MlxPromptRange[];
   readonly decode: MlxRowTable<MlxCapturingForward>;
   readonly verify: MlxRowTable<MlxVerifyForward>;
-  readonly appendKnown: MlxRowTable<MlxPhaseForward>;
+  readonly appendKnown: MlxKnownOperations;
   readonly logits: MlxRowTable<MlxHeadForward>;
 }
 
