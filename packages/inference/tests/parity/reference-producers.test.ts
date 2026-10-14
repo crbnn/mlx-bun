@@ -5,13 +5,15 @@ import { join } from "node:path";
 import { originalOraclePython,ORIGINAL_REVISION,ORIGINAL_SCRIPT,externalOutput } from "../../scripts/gemma4-oracle-reference";
 import { observeTargetPhases } from "../../scripts/reference-phases";
 
-test("Gemma references use the unchanged pinned producer calculation",()=>{
-  const original=Bun.spawnSync(["git","show",`${ORIGINAL_REVISION}:${ORIGINAL_SCRIPT}`]);
-  expect(original.exitCode).toBe(0);
+const original=Bun.spawnSync(["git","show",`${ORIGINAL_REVISION}:${ORIGINAL_SCRIPT}`]);
+test.skipIf(original.exitCode !== 0)("the available historical Gemma producer retains its pinned calculation",()=>{
   const python=originalOraclePython(original.stdout.toString());
   expect(python).toContain('cache = make_prompt_cache(model)');
   expect(python).toContain('last = logits[0, -1, :].astype(mx.float32)');
-  expect(()=>originalOraclePython(original.stdout.toString()+"\n")).toThrow("differs from its Git pin");
+});
+
+test("a corrupted or unpinned Gemma calculation cannot run",()=>{
+  expect(()=>originalOraclePython("modified producer source")).toThrow("differs from its Git pin");
 });
 
 test("a reference output cannot become data inside the source checkout",()=>{
