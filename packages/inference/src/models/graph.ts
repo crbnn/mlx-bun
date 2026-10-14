@@ -23,7 +23,7 @@ export interface MlxTokenGraph extends MlxDeclaredGraph, Partial<MlxTokenPhases>
   makeCache(): Cache[];
   /** The vision prefill phase over a prompt's prepared embeddings (borrowed), for
    *  direct generation: image tokens attending each other both ways where
-   *  `imageMask` marks them, `ids` feeding per-layer inputs; `width` is the class
+   *  `imageMask` marks them, `ids` feeding per-layer inputs; `width` is the actual number
    *  of the prompt's rows. */
   prefillEmbeddings?(embeddings: MlxArray, state: Cache[], imageMask: MlxArray | null,
     ids: MlxArray, multimodalMask: MlxArray | null, width: number): MlxArray;
