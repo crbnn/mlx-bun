@@ -5,6 +5,9 @@ import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { TrellisLinear } from "../../src/layers/trellis-linear";
+import type { TrellisRepresentations } from "../../src/kernels/trellis/index";
+import { tiledTrellisPrefillEligible } from "../../src/kernels/trellis/tiled-prefill";
+import { splitKTrellisPrefillEligible } from "../../src/kernels/trellis/splitk-prefill";
 import { TrellisReducePrompt, TrellisScatterPrompt, TrellisWidePrompt, TrellisTiledPrompt, TrellisSplitKPrompt, TrellisExpandReducePrompt, TrellisExpandScatterPrompt } from "../../src/layers/trellis-prompt";
 import { QuantizedLinear, QuantizedLinearPlain, QuantizedLinearRows } from "../../src/layers/quantized-linear";
 import { PlainGeglu, CompiledGeglu, geglu } from "../../src/layers/geglu";
@@ -23,12 +26,12 @@ function input(rows: number, width: number) {
   using wide = MlxArray.fromFloat32(Float32Array.from({ length: rows * width }, (_, i) => Math.sin(i * 0.073 + 0.4) / 3), [1, rows, width]);
   return wide.astype(Dtype.bfloat16);
 }
-function trellis(rows: number, cols: number, axis: 0 | 1): TrellisLinear {
-  const words = new Uint32Array(rows * cols * 3 / 32);
+function trellis(rows: number, cols: number, axis: 0 | 1,representations?:TrellisRepresentations,bits=3,interleaved=false): TrellisLinear {
+  const words = new Uint32Array(rows * cols * bits / 32);
   for (let i = 0; i < words.length; i++) words[i] = Math.imul(i + 31, 0x9e3779b1) >>> 0;
-  const codes = MlxArray.fromBytesCopy(new Uint8Array(words.buffer), [rows, cols * 3 / 32], Dtype.uint32);
+  const codes = MlxArray.fromBytesCopy(new Uint8Array(words.buffer), interleaved?[cols/512,rows,48]:[rows, cols * bits / 32], Dtype.uint32);
   using wide = MlxArray.fromFloat32(Float32Array.from({ length: rows }, (_, i) => (i % 23 + 1) / 400), [rows]);
-  return new TrellisLinear(codes, wide.astype(Dtype.float16), { bits: 3, groupSize: 256, mode: "trellis", trellis: { L: 12, code: "1mad", axis } });
+  return new TrellisLinear(codes, wide.astype(Dtype.float16), { bits, groupSize: 256, mode: "trellis", trellis: { L: 12, code: "1mad", axis } },false,representations);
 }
 function release(lin: TrellisLinear) { lin.codes.dispose(); lin.scales.dispose(); }
 
@@ -67,6 +70,34 @@ numerical("fixed Trellis prompt kernels retain dispatcher bits over the served 2
     }
   } finally { release(gate); release(down); }
 }, 120_000);
+
+numerical("fixed M1 tiled and split-K classes preserve dispatcher bits with explicit representations",()=>{
+  const representations:TrellisRepresentations={gateUpCodebook:true,mixedExactBits:true,
+    scatter:{bits:true,genericBits:true,floatCodebook:true},widePrefill:false};
+  for (const bits of [2,3,4]) {
+    const gate=trellis(17408,5120,1,representations,bits),down=trellis(17408,5120,0,representations,bits);
+    try {
+      for (const rows of [5,6,8,12,13,16,32]) {
+        expect(tiledTrellisPrefillEligible(gate.geometry,rows,Dtype.bfloat16,representations.widePrefill)).toBe(true);
+        using x=input(rows,5120),expected=gate.forward(x,true),actual=new TrellisTiledPrompt(gate).forward(x);
+        bitsEqual(actual,expected);
+      }
+      for (const rows of [5,6,7,8]) {
+        expect(splitKTrellisPrefillEligible(down.geometry,rows,Dtype.bfloat16)).toBe(true);
+        using x=input(rows,17408),expected=down.forward(x,true),actual=new TrellisSplitKPrompt(down).forward(x);
+        bitsEqual(actual,expected);
+      }
+    } finally {release(gate);release(down);}
+  }
+  const down=trellis(17408,5120,0,representations,3,true);
+  try {
+    for (const rows of [5,6,7,8]) {
+      expect(splitKTrellisPrefillEligible(down.geometry,rows,Dtype.bfloat16)).toBe(true);
+      using x=input(rows,17408),expected=down.forward(x,true),actual=new TrellisSplitKPrompt(down).forward(x);
+      bitsEqual(actual,expected);
+    }
+  } finally {release(down);}
+},120_000);
 
 numerical("fixed affine plain and independent rows retain bias and mounted delta arithmetic", () => {
   using w = input(128, 128);
