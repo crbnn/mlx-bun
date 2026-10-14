@@ -1294,8 +1294,8 @@ committing (`preview`: the DFlash 2 block, or the Qwen MTP head's first draft un
 its own cache that it rolls back) proposes from a step's input and the steps that follow compare
 its proposals with their samples; any other drafter verifies one draft. A graph whose composition measured them
 declares the gate's constants per drafter kind (`adaptiveDraftGates`: the prior's acceptance and weight, the decay per
-round and per step without drafts, the margin, the probe intervals and depth; the M1 Max graph, for DFlash 2, a prior
-that weighs three rounds instead of five, counts that age by 1% per step without drafts and probes three drafts deep);
+round and per step without drafts, the margin, the probe intervals and depth; the M1 Max graph, for DFlash 2 and the
+MTP head, counts that keep 95% per observing round and 93% per step without drafts, DFlash 2 probing one draft deep);
 other graphs and kinds keep the gate's defaults. A target graph whose residual stream
 carries a TurboQuant R1 fold declares it on its draft target (`residualBasis`: the R1 seed and the
 final-norm gain the fold moved into the head); the drafter loads unrotated and applies it when a draft group binds.

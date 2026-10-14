@@ -131,16 +131,22 @@ export const QWEN38_COMPOSITIONS: Readonly<Record<string, Qwen38Composition>> = 
       [16, 3.46], [32, 6.4]] },
     // Measured 2026-10-13 on this graph and artifact: scripts/bench-mtp.ts, the MTP head adaptive up to 2 (its
     // trained block) 18.0 tok/s, up to 4 19.9, up to 7 19.1 (fixed depth 3 18.6), greedy, three prompts, 128 tokens.
+    // Remeasured 2026-10-14 on the verify costs above (in-process serve, bf16 KV, eight prompts of 192 tokens, greedy
+    // and Qwen's thinking and instruct sampling, two sessions each, the gate settings below): up to 4
+    // 26.70/22.69/24.79 tok/s, up to 5 26.26/22.06/25.15, up to 7 25.61/20.56/23.71 (its drafts past the fourth are
+    // accepted 0.52-0.56 of the time).
     adaptiveDraftWidths: [["mtp", 4]],
-    // Measured 2026-10-14 on this graph and artifact: a replay of the gate over the DFlash 2 drafter's acceptance at
-    // every position of 96 texts (32 prompts, greedy and Qwen's thinking and instruct sampling, up to 192 tokens,
-    // decoded plainly), with this graph's verify costs and the measured step (51.1-52.2 ms) and probe (8.7-11.5 ms by
-    // depth): a prior that weighs three rounds instead of five, counts that age by 1% per step without drafts and
-    // probes three drafts deep gain on every prompt set (0.1-1.3%; text that loses to plain decode 1.2%), more than
-    // any other setting tried. In-process serve, bf16 KV, four prompts of 192 tokens, A B A B: DFlash 2 adaptive greedy
-    // 25.75 -> 26.04 tok/s, instruct 22.54 -> 22.88, thinking 20.91 -> 20.98. The MTP head's gate keeps the defaults:
-    // no setting gained on every prompt set.
-    adaptiveDraftGates: [["dflash2", { priorAccepted: 2.7, priorRejected: 0.3, idleDecay: 0.99, probeDepth: 3 }]],
+    // Measured 2026-10-14 on this graph and artifact with the verify costs above: a replay of the gate over the DFlash 2
+    // drafter's and the MTP head's acceptance at every position of 96 texts (32 prompts, greedy and Qwen's thinking and
+    // instruct sampling, up to 192 tokens, decoded plainly), with these verify costs (and 15% cheaper or dearer rounds)
+    // and the measured step (51.1-52.2 ms) and probe (8.7-11.5 ms by depth): counts that keep 95% per observing round
+    // instead of 85% and 93% per step without drafts, DFlash 2 probing one draft deep, gain on every prompt set and
+    // every mode for both drafters (DFlash 2 2.4%, the MTP head 2.0% by geometric mean). In-process serve, bf16 KV, the
+    // four standard prompts and the replay's four hardest, 192 tokens, A B A B, sampled modes over three seeds: DFlash 2
+    // adaptive greedy 29.34 -> 30.47 tok/s, thinking 23.77 -> 24.45, instruct 28.26 -> 28.50; the MTP head greedy
+    // 25.59 -> 26.70, thinking 22.02 -> 22.42, instruct 24.51 -> 24.77 (against 2.7/0.3 priors, 1% idle aging and
+    // three-deep probes for DFlash 2 and the defaults for the MTP head, chosen on the costs before these kernels).
+    adaptiveDraftGates: [["dflash2", { decay: 0.95, idleDecay: 0.93, probeDepth: 1 }], ["mtp", { decay: 0.95, idleDecay: 0.93 }]],
     // Measured 2026-10-13 on the M1 Max 32 GB, where the 11.96e9 B weights are under half the 26.8e9 B recommended
     // set: wired, bit-identical, paired A/B, GPU prefill 1k/8k 136/142 -> 143/145 tok/s; with the Neural Engine
     // split 171/173 -> 172/177 and the first GPU step after the split 0.15-1.4 s -> 61-69 ms; one-row decode

@@ -333,7 +333,8 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
   ]);
   /** The adaptive draft gate's settings per draft provider kind (M1 Max 32 GB). */
   readonly adaptiveDraftGates: NonNullable<MlxDeclaredGraph["adaptiveDraftGates"]> = new Map([
-    ["dflash2", { priorAccepted: 2.7, priorRejected: 0.3, idleDecay: 0.99, probeDepth: 3 }],
+    ["dflash2", { decay: 0.95, idleDecay: 0.93, probeDepth: 1 }],
+    ["mtp", { decay: 0.95, idleDecay: 0.93 }],
   ]);
 
   readonly prefillChunk: MlxPrefillChunk;
