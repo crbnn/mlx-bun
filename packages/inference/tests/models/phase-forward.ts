@@ -87,7 +87,9 @@ export function observedPhases<Model extends object>(model: Model, observer: Pha
     multiSequencePrompt: phases.multiSequencePrompt.map(range => ({...range, operation: watch("prompt", range.operation)})),
     decode: forwards(phases.decode, "decode"),
     verify: forwards(phases.verify, "verify"),
-    appendKnown: forwards(phases.appendKnown as MlxRowTable<Forward>, "appendKnown"),
+    appendKnown: Array.isArray(phases.appendKnown)
+      ? phases.appendKnown.map(range=>({...range,operation: watch("appendKnown",range.operation)}))
+      : forwards(phases.appendKnown as MlxRowTable<Forward>, "appendKnown"),
     logits: Object.freeze(Object.fromEntries(Object.entries(phases.logits).map(([width, head]) =>
       [width, (hidden: MlxArray) => {
         const out = (head as Head)(hidden);

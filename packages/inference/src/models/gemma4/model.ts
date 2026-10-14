@@ -31,7 +31,7 @@ import type { Weights } from "../../artifacts/weights";
 import { Checkpoint } from "@mlx-bun/mlx/checkpoint";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
-import type { MlxCapturingForward, MlxRowTable, MlxCompiledDecodeStep, MlxDeclaredGraph, MlxHeadForward, MlxLayerCapture, MlxMixedForward, MlxPhaseForward, MlxPromptRange, MlxTokenPhases, MlxVerifyForward } from "../../contracts/mlx/graph";
+import type { MlxCapturingForward, MlxRowTable, MlxCompiledDecodeStep, MlxDeclaredGraph, MlxHeadForward, MlxLayerCapture, MlxMixedForward, MlxPhaseForward, MlxKnownOperations, MlxPromptRange, MlxTokenPhases, MlxVerifyForward } from "../../contracts/mlx/graph";
 import { CompiledDecode } from "./compiled-decode";
 import type { TargetView } from "../../contracts/mlx/draft-target";
 import type { TrainableGraph } from "../../contracts/mlx/trainable";
@@ -285,7 +285,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
     const views = [{from:1,to:boundary-1,layers:this.#servingLayers}, {from:boundary,to:Infinity,layers:this.#sortedLayers}].filter(view=>Number.isFinite(view.from) && view.from<=view.to);
     this.prompt = views.map(view => ({from:view.from,to:view.to,operation:(ids,cache,capture)=>this.#window(ids,cache,capture,view.layers)}));
     this.multiSequencePrompt = this.prompt;
-    const decode: Record<number,MlxCapturingForward> = {}, verify: Record<number,MlxCapturingForward> = {}, known: Record<number,MlxPhaseForward> = {};
+    const decode: Record<number,MlxCapturingForward> = {}, verify: Record<number,MlxCapturingForward> = {};
     for (let rows=1; rows<=maxPhaseRows; rows++) {
       const layers = rows < boundary ? this.#servingLayers : this.#sortedLayers;
       decode[rows] = (ids,cache,capture) => {
@@ -293,9 +293,8 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
         capture?.(this.layers.length,hidden); return hidden;
       };
       verify[rows] = (ids,cache,capture) => this.#window(ids,cache,capture,layers);
-      known[rows] = (ids,cache) => this.#window(ids,cache,null,layers);
     }
-    this.decode = decode; this.verify = verify; this.appendKnown = known;
+    this.decode = decode; this.verify = verify; this.appendKnown = views.map(view=>({from:view.from,to:view.to,operation:(ids,cache)=>this.#window(ids,cache,null,view.layers)}));
     this.logits = rowTable<MlxHeadForward>(hidden=>this.logitsFromHidden(hidden),maxPhaseRows);
     this.sequence = views.map(view=>({from:view.from,to:view.to,operation:(ids,cache)=>this.gradCkpt
       ? this.#forwardTraining(this.embedTokens(ids),cache,ids)
@@ -381,7 +380,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
   /** A prompt's positions that are not a whole chunk: the window read at every width. */
 
   /** Known tokens: this graph declares no committed spans, so they read as a window. */
-  readonly appendKnown: MlxRowTable<MlxPhaseForward>;
+  readonly appendKnown: MlxKnownOperations;
 
   /** A causal window of token ids over every layer, `capture` seeing every layer and then the final hidden. */
   #window(ids: MlxArray, cache: Cache[], capture: MlxLayerCapture | null, layers = this.#servingLayers): MlxArray {

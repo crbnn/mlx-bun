@@ -277,6 +277,18 @@ for (const c of COMPOSITIONS) {
       } finally { disposeAll(mine, theirs); }
     }, 120_000);
 
+    test(`${c.stem}: known spans above the verify row cap stay one fixed forward`,async()=>{
+      const {model,generic}=await pair();
+      const mine=model.makeCache(),theirs=generic.makeCache();
+      try {
+        using ids=ops.fromInt32(prompt(129,8),[1,129]);
+        const left=knownOperationFor(model.appendKnown,129)(ids,mine) as MlxArray;
+        const right=knownOperationFor(generic.appendKnown,129)(ids,theirs) as MlxArray;
+        try { maxDiff(left,right,`${c.stem} known129`);stateDiff(`${c.stem} known129`,mine,theirs); }
+        finally {left.dispose();right.dispose();}
+      } finally {disposeAll(mine,theirs);}
+    },120_000);
+
     if (c.stem !== "gemma4-26b") test(`${c.stem}: the literal plain trace preserves compiled decode logits and cache`, async () => {
       const { model, generic } = await pair();
       const compiled = model as Graph & { compiledDecodeStep(): MlxCompiledDecodeStep; releaseCompiledDecode(): void };
@@ -303,3 +315,5 @@ import type { MlxCacheLayer } from "../../src/contracts/mlx/graph";
 import { bindGraphCaches } from "../../src/models/cache-composition";
 
 import type { MlxCompiledDecodeStep } from "../../src/contracts/mlx/graph";
+
+import { knownOperationFor } from "../../src/generation/phase-dispatch";
