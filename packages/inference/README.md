@@ -1283,8 +1283,9 @@ without drafts is the graph's decode step, pipelined as plain decode is: built f
 previous step's samples on the device before they are read, its input dropped again
 (`bindRowStepRollback`) if that sample ends its row. A run of such rounds probes at
 intervals that double while drafting keeps not paying: a drafter whose rows draft without
-committing (`preview`: the DFlash 2 block) proposes a full block from a step's input and the
-steps that follow compare it with their samples; any other drafter verifies one draft. A target graph whose residual stream
+committing (`preview`: the DFlash 2 block, or the Qwen MTP head's first draft under a round of
+its own cache that it rolls back) proposes from a step's input and the steps that follow compare
+its proposals with their samples; any other drafter verifies one draft. A target graph whose residual stream
 carries a TurboQuant R1 fold declares it on its draft target (`residualBasis`: the R1 seed and the
 final-norm gain the fold moved into the head); the drafter loads unrotated and applies it when a draft group binds.
 A graph whose composition measured them declares the kernels of a drafter's own 4-bit projections per width class

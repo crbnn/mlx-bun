@@ -114,6 +114,59 @@ test("a listed draft vocabulary binds its projection once and draws over the lis
     sample() { throw new Error("unused"); } } }, false)).toThrow("needs the target's quantized vocabulary head");
 });
 
+test("a preview proposes the head's first draft under a round of its cache that rolls back, leaving the rows' state", () => {
+  // The module reads its whole cache: an appended row the preview left would move every later draft.
+  const H = 64, VL = 8;
+  const make = () => {
+    const dense = Float32Array.from({ length: VL * H }, (_, i) => Math.sin(i * 0.7) * 0.5);
+    using weights = MlxArray.fromFloat32(dense, [VL, H]);
+    using transposed = ops.transposeAxes(weights, [1, 0]);
+    const projection = ops.copyOf(transposed);
+    const target = { hiddenSize: H, layerCount: 1,
+      embed(ids: MlxArray) {
+        using floats = ids.astype(Dtype.float32);
+        using column = ops.reshape(floats, [...ids.shape, 1]);
+        return ops.broadcastTo(column, [...ids.shape, H]);
+      },
+      logits: atEveryWidth((hidden: MlxArray): MlxArray => ops.matmul(hidden, projection)),
+    };
+    const module = mtpModule((embeds: MlxArray, hidden: MlxArray, cache: Cache) => {
+      const [B, N] = embeds.shape;
+      using k = ops.reshape(embeds, [B!, 1, N!, H]);
+      using v = ops.reshape(hidden, [B!, 1, N!, H]);
+      const [keys, values] = kvStorage(cache).updateAndFetch(k, v);
+      using total = ops.sumAxis(keys!, 2, true); keys!.dispose(); values!.dispose();
+      using scaled = ops.mulScalar(total, 0.01);
+      using mixed = ops.reshape(scaled, [B!, N! === 1 ? 1 : 1, H]);
+      return ops.add(hidden, mixed);
+    }) as unknown as MtpModule;
+    const rows = new QwenMtpRows(target, module, { selection: { kind: "greedy" }, sample() { throw new Error("greedy"); } }, []);
+    rows.append([null, null]);
+    using ids = ops.fromInt32([1, 2, 3, 4, 5, 6], [2, 3]);
+    using context = MlxArray.fromFloat32(Float32Array.from({ length: 2 * 3 * H }, (_, i) => Math.cos(i * 0.31)), [2, 3, H]);
+    rows.prefill(ids, context);
+    return { rows, release: () => projection.dispose() };
+  };
+  const previewed = make(), control = make();
+  try {
+    const before = previewed.rows.extractRow(1);
+    using tokens = previewed.rows.preview([4, 7], 3, [0, 10])!;
+    const after = previewed.rows.extractRow(1);
+    try {
+      expect(after.cache.offset).toBe(before.cache.offset);
+      expect(tokens.shape).toEqual([2, 1]);
+      const drafted = previewed.rows.draft([4, 7], 3, [0, 10]);
+      expect(tokens.toIntTokens()).toEqual(drafted.map(row => row[0]!));
+      // The same draft as rows that never previewed, and the next round's too.
+      expect(drafted).toEqual(control.rows.draft([4, 7], 3, [0, 10]));
+      using context = MlxArray.fromFloat32(Float32Array.from({ length: 2 * 4 * H }, (_, i) => Math.sin(i * 0.13)), [2, 4, H]);
+      previewed.rows.commit([1, 2], context); control.rows.commit([1, 2], context);
+      expect(previewed.rows.draft([5, 6], 2, [4, 14])).toEqual(control.rows.draft([5, 6], 2, [4, 14]));
+    } finally { for (const state of [before, after]) { state.cache.dispose(); state.hidden.dispose(); } }
+    expect(previewed.rows.preview([1, 1], 0, [0, 0])).toBeNull();
+  } finally { for (const fixture of [previewed, control]) { fixture.rows.dispose(); fixture.release(); } }
+});
+
 test("greedy drafting is the composition's opt-in field: it argmaxes the draft sampler, and the runtime configuration does not reach it", () => {
   expect(COMPOSITION_DEFAULTS.greedyDraft).toBe(false);
   const options = { temperature: 0.7, topP: 0.9 };

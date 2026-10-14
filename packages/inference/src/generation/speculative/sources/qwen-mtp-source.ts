@@ -135,7 +135,7 @@ export class QwenMtpProvider implements DraftProvider {
       get rowCount() { return rows.rowCount; },
       append, prepareAppend, prefill: (tokens, context) => rows.prefill(tokens, context!), materialize: rows.materialize.bind(rows),
       filterRows: rows.filterRows.bind(rows),
-      draft: rows.draft.bind(rows), draftDevice: rows.draftDevice.bind(rows), commit: rows.commit.bind(rows),
+      draft: rows.draft.bind(rows), draftDevice: rows.draftDevice.bind(rows), preview: rows.preview.bind(rows), commit: rows.commit.bind(rows),
       consume: rows.consume.bind(rows),
       capture(row) {
         const state = rows.extractRow(row);
