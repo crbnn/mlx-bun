@@ -36,7 +36,9 @@ import { WhisperModel } from "./whisper/model";
 import { genericArgsFor } from "./universal/archs";
 import { familyForGraph } from "./families";
 import { resolveComposition } from "./composition";
+import { bindGraphCaches } from "./cache-composition";
 import type { Composition } from "../contracts/portable/composition";
+import type { Cache } from "../contracts/mlx/cache";
 import {
   GraphTable,
   ModelImplementationRegistry,
@@ -54,13 +56,25 @@ import {
   type GenerationLoop,
 } from "./profile";
 
-export type RuntimeModel =
+type WrittenGraph = (
   | Gemma4Model | GeneratedGemma4Graph | MiniCPM5Model | Qwen35Model | Qwen38TrellisM4Pro | Qwen38TrellisM1Max | Qwen3Model | Qwen3MoeModel
-  | DiffusionGemmaModel | Glm52Model | UniversalDenseModel;
+  | DiffusionGemmaModel | Glm52Model | UniversalDenseModel);
+
+export type RuntimeModel = WrittenGraph & { makeCache(): Cache[]; readonly composition?: Composition };
 
 /** A family's generic graph: the table entry that constrains nothing. */
-function generic(id: string, create: GraphEntry<Weights, RuntimeModel>["create"]): GraphEntry<Weights, RuntimeModel> {
-  return { id, serves: {}, create };
+function generic(id: string, create: GraphEntry<Weights, WrittenGraph>["create"]): GraphEntry<Weights, RuntimeModel> {
+  return loadedEntry({ id, serves: {}, create });
+}
+
+function loadedEntry(entry: GraphEntry<Weights, WrittenGraph>): GraphEntry<Weights, RuntimeModel> {
+  return { ...entry, create: (weights, config, composition) => loadedGraph(entry.create(weights, config, composition), composition) };
+}
+
+/** Attach the loader's cache and scheduler configuration to a shipped graph.
+ * Its written implementation only provides the layer layout and operations. */
+function loadedGraph(graph: WrittenGraph, composition: Composition): RuntimeModel {
+  return Object.assign(bindGraphCaches(graph, composition), { composition });
 }
 
 /** Every resident family's graphs, keyed by the graph its family declares. Each
@@ -74,17 +88,17 @@ export const MLX_GRAPH_TABLES: Readonly<Record<ModelGraph, GraphTable<Weights, R
   // Our published Trellis quant has its generated graphs (scripts/gen-qwen38.ts), keyed by its graph
   // fingerprint (architecture plus the complete quantization table) and the GPU each was built for.
   "qwen3.5": new GraphTable([
-    { id: QWEN38_TRELLIS_M4PRO_GRAPH, serves: QWEN38_TRELLIS_M4PRO_COMPOSITION,
+    loadedEntry({ id: QWEN38_TRELLIS_M4PRO_GRAPH, serves: QWEN38_TRELLIS_M4PRO_COMPOSITION,
       create: (weights, config, composition) => new Qwen38TrellisM4Pro(weights, config, composition),
-      anePrograms: () => qwen38TrellisM4ProAnePrograms() },
+      anePrograms: () => qwen38TrellisM4ProAnePrograms() }),
     // The M1 Max composition builds no Neural Engine operation (its device's table has none): no programs to install.
-    { id: QWEN38_TRELLIS_M1MAX_GRAPH, serves: QWEN38_TRELLIS_M1MAX_COMPOSITION,
-      create: (weights, config, composition) => new Qwen38TrellisM1Max(weights, config, composition) },
+    loadedEntry({ id: QWEN38_TRELLIS_M1MAX_GRAPH, serves: QWEN38_TRELLIS_M1MAX_COMPOSITION,
+      create: (weights, config, composition) => new Qwen38TrellisM1Max(weights, config, composition) }),
     generic("qwen3.5", (weights, config, composition) => new Qwen35Model(weights, config, composition)),
   ], qwen35GraphFingerprint),
   "qwen3-moe": new GraphTable([generic("qwen3-moe", (weights, config, composition) => new Qwen3MoeModel(weights, config, composition))]),
   "qwen3": new GraphTable([generic("qwen3", (weights, config, composition) => new Qwen3Model(weights, config, composition))]),
-  "gemma4": new GraphTable([...GENERATED_GRAPHS, generic("gemma4", (weights, config, composition) => new Gemma4Model(weights, config, composition))],
+  "gemma4": new GraphTable([...GENERATED_GRAPHS.map(loadedEntry), generic("gemma4", (weights, config, composition) => new Gemma4Model(weights, config, composition))],
     configFingerprint),
   "universal-dense": new GraphTable([generic("universal-dense", (weights, config, composition) =>
     new UniversalDenseModel(weights, config, composition, genericArgsFor(config)!))]),
@@ -96,7 +110,8 @@ function residentImplementation(graph: ModelGraph, table: GraphTable<Weights, Ru
   const family = familyForGraph(graph);
   if (!family) throw new Error(`graph table ${graph} names a graph no model family declares`);
   return { id: graph, graph, loader: family.loader, loop: family.loop,
-    create: (weights, config, _profile, composition) => table.select(config, composition).create(weights, config, composition) };
+    create: (weights, config, _profile, composition) =>
+      table.select(config, composition).create(weights, config, composition) };
 }
 
 /** Engine-owned registrations, one per resident graph of `MODEL_FAMILIES`. Exact
@@ -112,7 +127,7 @@ export interface ModelOpenOptions<Model = RuntimeModel> extends Glm52RuntimeOpen
    * (`resolveComposition(config)`). The direct Colibri runtime plans its own
    * resources from the options above and takes none. */
   readonly composition?: Composition;
-  /** A named shipped graph or the caller's own graph entry. Explicit choices
+  /** A named shipped graph or the caller's own load function. Explicit choices
    * bypass device and configuration recommendations and need no registration. */
   readonly graph?: string | ((weights: Weights, config: ModelConfig) => Model);
 }
