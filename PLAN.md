@@ -46,9 +46,11 @@ synthetic digests, the real-weight parity suites, `packages/inference/scripts/di
       any other host until recorded there (`scripts/synthetic-digests.ts record`).
 
 Facts recorded for the program after the merge, not planned here: on the M1 Max a two-row verify
-round costs 2.01 plain decode steps (1.30 on the M4 Pro) and eight rows 2.96 (1.94), on the
-factored, matrix-unit and split-K affine kernels, the one-row bit-field reads and the drafter
-kernels the graph declares since 2026-10-13; since then operations of nine to 256 rows run the
+round costs 1.77 plain decode steps (1.30 on the M4 Pro) and eight rows 2.05 (1.94), on the
+matrix-unit Trellis kernels reading code values from a threadgroup codebook since 2026-10-14 (2.01
+and 2.96 on the factored and arithmetic-decode matrix-unit kernels before), the split-K affine
+kernels, the one-row bit-field reads and the drafter kernels the graph declares; since 2026-10-13
+operations of nine to 256 rows run the
 graph's wider layers (any-row matrix-unit Trellis kernels and the split-K affine kernel: verify
 windows of 16 rows 0.89 -> 0.19 s, 32 0.89 -> 0.34, 64 0.77 -> 0.63; time to first token of 16-, 64-
 and 200-token prompts 0.97 -> 0.24, 0.87 -> 0.64 and 2.28 -> 1.90 s), and windows and prompt pieces
@@ -60,8 +62,11 @@ slices and, from 768 positions, the projections split as well, prompts of 300, 5
 tokens 2.43/3.26/3.89/5.83/11.18/45.85 -> 2.16/2.92/3.58/4.95/9.36/38.54 s with the weights wired);
 DFlash 2 adaptive on that chip (in-process serve, four
 prompts, 192 tokens, 2026-10-14) decodes greedy text at 24.7 against 19.1 tok/s plain, 21.7 against 18.7 under
-Qwen's instruct sampling and 20.3 against 18.7 under its thinking sampling, the MTP head (adaptive up to four
-drafts, the graph's `adaptiveDraftWidths`) at 20.5, 19.7 and 18.6; with two and four concurrent requests DFlash 2
+Qwen's instruct sampling and 20.3 against 18.7 under its thinking sampling (on the codebook matrix-unit kernels,
+2026-10-14: 33.1, 30.1 and 23.7, from 26.1, 22.8 and 21.0 on the head before them), the MTP head (adaptive up to four
+drafts, the graph's `adaptiveDraftWidths`) at 20.5, 19.7 and 18.6 (26.9, 25.3 and 21.4 on the codebook kernels, from
+21.1, 20.3 and 19.0); with two and four concurrent requests (before
+the codebook kernels) DFlash 2
 decodes 30.4, 28.5 and 27.1 and 43-46, 39-42 and 38.2 tok/s in aggregate against plain's 19.9, 19.3 and 19.1 and
 30.5, 29.8 and 28.6 (the gate weighs a group's round by the rows it verifies, 16- and 32-row rounds measured);
 the adaptive gate drafts nothing where drafting does not pay (such rounds are the pipelined decode step, at plain

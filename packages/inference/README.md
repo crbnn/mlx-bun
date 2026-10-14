@@ -353,14 +353,16 @@ On M1 Max 32 GB, MLX 0.32.2 (`applegpu_g13s`), Bun 1.4.2, the candidate
 matched main `02d723a2875153196f8c6c10bce2daf6f0044655`: 96 complete
 last-position float32 logit vectors and greedy tokens across three prompts;
 three 64-token MTP runs with every target input and speculation counter equal.
-Since 2026-10-13 the M1 Max graph verifies two to three rows on the factored and
-affine row kernels, which reassociate relative to its one-row decode (the
-width-class decision, KL-gated), so the test teacher-forces main's MTP windows
-and holds each window row to the one-row decode of its position instead: 192
-rows, mean KL 2.4e-4, largest 1.1e-2, one argmax difference at an exact bf16
-tie; the one-row decode still selects all 192 of main's emitted tokens. Two runs
-still equal main's in every token, target input and counter; the third emits
-974 for main's 303 at token 8, where the one-row logits tie exactly. The test
+Since 2026-10-13 the M1 Max graph verifies two to three rows on kernels that
+reassociate relative to its one-row decode (the width-class decision, KL-gated;
+since 2026-10-14 the matrix-unit Trellis kernels that read code values from a
+threadgroup codebook, with the affine row kernels), so the test teacher-forces
+main's MTP windows and holds each window row to the one-row decode of its
+position instead: 192 rows, mean KL 3.1e-4, largest 1.2e-2, every window's
+argmax the one-row top or tied with it (on the factored kernels before: 2.4e-4,
+1.1e-2 and one argmax difference at an exact bf16 tie); the one-row decode
+still selects all 192 of main's emitted tokens. Two runs emit main's tokens
+(one with main's counters), the third differs from main's at token 17. The test
 keeps the exact MTP comparison wherever the windows are bit-identical to
 one-row decode. Since 2026-10-13 the M1 Max graph also runs prompt pieces of nine
 to 256 positions (these prompts' 23 to 32) on its wider layers, which reassociate:
