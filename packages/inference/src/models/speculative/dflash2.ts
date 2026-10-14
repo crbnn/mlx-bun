@@ -50,6 +50,7 @@ import type {
   ContextKV, Dflash2ContextAttention, Dflash2DraftBlock, Dflash2DrafterModel, DrafterContextKV, DrafterContextProjection, DrafterOperations,
 } from "../../contracts/mlx/drafter";
 import { rowOperationFor } from "../graph";
+import { mapOperations } from "./dflash2-operations";
 import { isDflash2Architecture } from "./dflash2-artifact";
 import { QuantizedLinear, QuantizedLinearPlain } from "../../layers/quantized-linear";
 import { Affine4MmaLinear } from "../../layers/affine-verify-linear";
@@ -107,12 +108,6 @@ function quantizedWeight(source: MlxArray, bits: number): Weight {
   };
 }
 
-/** Bind fixed operations over a declaration's exact rows or whole ranges. */
-function mapOperations<Input,Output>(operations: DrafterOperations<Input>, bind:(operation:Input,rows:number)=>Output): DrafterOperations<Output> {
-  return Array.isArray(operations)
-    ? operations.map(range=>({from:range.from,to:range.to,operation:bind(range.operation,range.from)}))
-    : Object.fromEntries(Object.entries(operations).map(([rows,operation])=>[rows,bind(operation,Number(rows))]));
-}
 const DEFAULT_PROJECTION_ROWS=[{from:1,to:4,operation:true},{from:5,to:8,operation:true},{from:9,to:Infinity,operation:true}];
 type LayerProjections=Record<"q"|"k"|"v"|"o"|"gate"|"up"|"down",Projection>;
 
