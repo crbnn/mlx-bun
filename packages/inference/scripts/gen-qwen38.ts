@@ -206,9 +206,9 @@ interface DeviceKernels {
    *  `PROMPT_PROJECTION_MODULES`; `null` keeps the generic blocks' QuantizedLinear. */
   readonly promptProjection: string | null;
   /** The layer a bound drafter's own 4-bit projections run at each width class of their rows (`null` at a class:
-   *  QuantizedLinear, as at \`wider\`), declared on the graph's draft target (\`TargetView.draftProjections\`); \`null\`:
-   *  the graph declares none and the drafter keeps its own rule. */
-  readonly drafter: Readonly<Record<Narrow, string | null>> | null;
+   *  QuantizedLinear), declared on the graph's draft target (\`TargetView.draftProjections\`); \`null\`: the graph
+   *  declares none and the drafter keeps its own rule. */
+  readonly drafter: Readonly<Record<Narrow | "wider", string | null>> | null;
   /** Every operation above eight rows of at most \`maxRows\` rows (decode and verify windows, prompt tails, known-token
    *  appends, a mixed forward's packed MLP rows, the head) on these layers, which take any number of rows: the MLP's,
    *  the attention and DeltaNet projections' and the head's. More rows run the generic blocks. \`maxRows\` is the
@@ -323,8 +323,11 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     // The DFlash 2 drafter's 4-bit projections (its five layers' attention and MLP, fc and the context k and v), each
     // kernel per row count: MLX's quantized matmul at one row, the affine row kernel at two to three (MLP 4.48 ->
     // 3.57 ms at two rows), the split-K matrix-unit kernel at four to eight (MLP 8.49 -> 4.46 ms at four rows,
-    // 16.2 -> 4.45 at eight on the matrix unit before it).
-    drafter: { one: null, twoToThree: "Affine4RowsLinear", four: "AffineSplitMmaLinear", fiveToEight: "AffineSplitMmaLinear" },
+    // 16.2 -> 4.45 at eight on the matrix unit before it), and above eight rows (two or more sequences' blocks) the
+    // split-K kernel in blocks of 8 (a draft pass's projections at 16 rows 25.0 -> 12.2 ms, 24 rows 25.4 -> 17.3, level
+    // with MLX's quantized matmul from 32).
+    drafter: { one: null, twoToThree: "Affine4RowsLinear", four: "AffineSplitMmaLinear", fiveToEight: "AffineSplitMmaLinear",
+      wider: "AffineSplitMmaLinear" },
     // Nine to 256 rows on the matrix unit's any-row kernels, each decoded weight fragment feeding several 8-row blocks
     // (one Qwen MLP, 3-bit, gate/up + down: 16 rows 1.0 + 0.85 ms against 10.9 + 1.7 on the prefill tiles and weight
     // expansion; 64 rows 3.7 + 2.5 against 5.3 + 2.9), the split-K affine kernel for the projections and head (16 rows
@@ -624,7 +627,7 @@ ${NARROW.map(cls => narrowSet(cls, "      ")).join("\n")}${wider ? `\n${widerSet
       `logits.${cls} ${head[cls as Exclude<Narrow, "one">] ?? "QuantizedLinear"}`).join(", ")}${wider
       ? `, logits.wider ${wider.head} up to ${wider.maxRows} rows` : ""}, QuantizedLinear otherwise.`
       : "The head is QuantizedLinear at every width.",
-    ...(drafter ? [`A bound drafter's own 4-bit projections take ${NARROW.filter(cls => drafter[cls] !== null).map(cls =>
+    ...(drafter ? [`A bound drafter's own 4-bit projections take ${[...NARROW, "wider" as const].filter(cls => drafter[cls] !== null).map(cls =>
       `${drafter[cls]} at ${cls}`).join(", ")}, QuantizedLinear otherwise (TargetView.draftProjections).`] : []),
     asyncEvery !== null ? `Decode, verify, prompt tails and embeddings up to ${widest} rows${wider
       ? ", and decode, verify windows and prompt tails on the wider layers," : ""} submit the graph every ${asyncEvery} layers; wider decode${
@@ -963,7 +966,7 @@ ${drafter ? `    // A bound drafter's own 4-bit, group-64 projections, over the 
       new QuantizedLinear(w, scales, biases, { bits: 4, groupSize: 64, mode: "affine" });
     this.#draftProjections = Object.freeze<MlxWidthTable<DraftProjectionKernel>>({
 ${[...NARROW, "wider" as const].map(cls => {
-  const layer = cls === "wider" ? null : drafter[cls];
+  const layer = drafter[cls];
   return `      ${cls}: (w, scales, biases) => { const kernel = ${layer ? `new ${layer}(draftAffine(w, scales, biases))` : "draftAffine(w, scales, biases)"}; return x => kernel.forward(x); },`;
 }).join("\n")}
     });

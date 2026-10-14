@@ -297,7 +297,7 @@ describe("the composition the generated graph declares", () => {
     const linear = new QuantizedLinear(q.packed, q.scales, q.biases, { bits: 4, groupSize: 64, mode: "affine" });
     const named: Record<MlxWidthClass, [number, { forward(x: MlxArray): MlxArray }]> = {
       one: [1, linear], twoToThree: [3, new Affine4RowsLinear(linear)], four: [4, new AffineSplitMmaLinear(linear)],
-      fiveToEight: [8, new AffineSplitMmaLinear(linear)], wider: [12, linear],
+      fiveToEight: [8, new AffineSplitMmaLinear(linear)], wider: [12, new AffineSplitMmaLinear(linear)],
     };
     try {
       for (const [width, [rows, layer]] of Object.entries(named) as [MlxWidthClass, [number, { forward(x: MlxArray): MlxArray }]][]) {

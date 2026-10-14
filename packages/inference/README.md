@@ -1273,8 +1273,8 @@ token at intervals that double while drafting keeps not paying. A target graph w
 carries a TurboQuant R1 fold declares it on its draft target (`residualBasis`: the R1 seed and the
 final-norm gain the fold moved into the head); the drafter loads unrotated and applies it when a draft group binds.
 A graph whose composition measured them declares the kernels of a drafter's own 4-bit projections per width class
-(`draftProjections`; the M1 Max graph: the affine row kernel at two to three rows, the split matrix-unit kernel at
-four to eight, MLX's quantized matmul otherwise); the DFlash 2 drafter builds them when its first group binds and
+(`draftProjections`; the M1 Max graph: the affine row kernel at two to three rows, the split matrix-unit kernel from
+four, MLX's quantized matmul at one); the DFlash 2 drafter builds them when its first group binds and
 otherwise keeps its own rule (the simdgroup matrix unit at five to eight rows, MLX's quantized matmul otherwise).
 A library caller speculates as the app does: `binding.plan` with `hasDraft`, then
 `binding.methodRequest` and `submit` on `binding.createBatchGroup({ maxBatch: 1 })`

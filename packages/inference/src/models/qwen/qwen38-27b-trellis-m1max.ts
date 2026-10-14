@@ -41,10 +41,11 @@
 // blocks. The head is part of each phase: logits.twoToThree Affine4RowsLinear, logits.four AffineSplitMmaLinear,
 // logits.fiveToEight AffineSplitMmaLinear, logits.wider AffineSplitMmaLinear up to 256 rows, QuantizedLinear otherwise.
 // A bound drafter's own 4-bit projections take Affine4RowsLinear at twoToThree, AffineSplitMmaLinear at four,
-// AffineSplitMmaLinear at fiveToEight, QuantizedLinear otherwise (TargetView.draftProjections). Decode, verify, prompt
-// tails and embeddings up to eight rows, and decode, verify windows and prompt tails on the wider layers, submit the
-// graph every 4 layers; wider decode and verify windows and known-token appends are otherwise one lazy graph; prompt
-// chunks, prompt tails above 256 rows and embeddings above eight rows, evaluate each layer and its recurrent state.
+// AffineSplitMmaLinear at fiveToEight, AffineSplitMmaLinear at wider, QuantizedLinear otherwise
+// (TargetView.draftProjections). Decode, verify, prompt tails and embeddings up to eight rows, and decode, verify
+// windows and prompt tails on the wider layers, submit the graph every 4 layers; wider decode and verify windows and
+// known-token appends are otherwise one lazy graph; prompt chunks, prompt tails above 256 rows and embeddings above
+// eight rows, evaluate each layer and its recurrent state.
 //
 // Request shapes this graph serves:
 //   - prompt chunks of exactly the composition's chunk size (prefillChunk.gpu) and prompt tails (prefillTail),
@@ -354,7 +355,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
       twoToThree: (w, scales, biases) => { const kernel = new Affine4RowsLinear(draftAffine(w, scales, biases)); return x => kernel.forward(x); },
       four: (w, scales, biases) => { const kernel = new AffineSplitMmaLinear(draftAffine(w, scales, biases)); return x => kernel.forward(x); },
       fiveToEight: (w, scales, biases) => { const kernel = new AffineSplitMmaLinear(draftAffine(w, scales, biases)); return x => kernel.forward(x); },
-      wider: (w, scales, biases) => { const kernel = draftAffine(w, scales, biases); return x => kernel.forward(x); },
+      wider: (w, scales, biases) => { const kernel = new AffineSplitMmaLinear(draftAffine(w, scales, biases)); return x => kernel.forward(x); },
     });
     this.weightsBytes = [...weights.shards.files.values()].reduce((a, f) => a + f.mmap.size, 0);
     this.faIdx = t.fullAttentionInterval - 1;
