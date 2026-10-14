@@ -31,19 +31,29 @@ const tensor = (values: Float32Array, shape: number[], dtype = Dtype.bfloat16): 
   return keep(wide.astype(dtype));
 };
 
-/** The graph's fixed layer facts with compact synthetic dimensions. */
+/** Independent artifact facts, recorded before the graph-file rewrite.
+ * All three artifacts have full attention at indices 5, 11, 17, ... .
+ * Cache widths are the original artifact kv_config, independent of the file. */
+const ARTIFACT_FACTS = {
+  e4b: { layers: 42, shared: 18, kEqV: false, input: PER_LAYER, moe: false, caches: 24, kv8: [3, 4, 9, 10, 11, 14] },
+  twelve: { layers: 48, shared: 0, kEqV: true, input: 0, moe: false, caches: 48, kv8: [3, 6, 7, 8, 10, 12] },
+  moe: { layers: 30, shared: 0, kEqV: true, input: 0, moe: true, caches: 30, kv8: [0, 3, 4, 5, 8, 9, 11, 12] },
+} as const;
+const artifactFacts = (repo: string) => repo.includes("e4b") ? ARTIFACT_FACTS.e4b : repo.includes("26B") ? ARTIFACT_FACTS.moe : ARTIFACT_FACTS.twelve;
+function artifactScheme(repo: string): KvStorageScheme & { readonly kind: "affine-layers" } {
+  const facts = artifactFacts(repo), kv8 = new Set<number>(facts.kv8);
+  return { kind: "affine-layers", kernels: "tiled-causal", layers: Array.from({ length: facts.caches }, (_, layer) => ({ layer, bits: kv8.has(layer) ? 8 : 4, groupSize: 64 })) };
+}
 async function fixtureConfig(repo: string): Promise<ModelConfig> {
-  const graph = repo.includes("e4b") ? currentE4b : repo.includes("26B") ? current26b : current12b;
-  const layers = graph.LAYERS;
-  const donors = Math.max(...layers.map(layer => layer.cache)) + 1;
+  const facts = artifactFacts(repo);
   return {
     modelDir: "", hasVisionSidecar: false, raw: {},
     quantization: parseQuantization({ bits: 4, group_size: 64, mode: "affine" }),
     text: {
-      numHiddenLayers: layers.length, numKvSharedLayers: layers.length - donors,
-      layerTypes: layers.map(layer => layer.attention === "sliding" ? "sliding_attention" : "full_attention"),
-      attentionKEqV: layers.some(layer => layer.kEqV), hiddenSizePerLayerInput: repo.includes("e4b") ? PER_LAYER : 0,
-      enableMoeBlock: repo.includes("26B"), tieWordEmbeddings: true,
+      numHiddenLayers: facts.layers, numKvSharedLayers: facts.shared,
+      layerTypes: Array.from({ length: facts.layers }, (_, layer) => layer % 6 === 5 ? "full_attention" : "sliding_attention"),
+      attentionKEqV: facts.kEqV, hiddenSizePerLayerInput: facts.input,
+      enableMoeBlock: facts.moe, tieWordEmbeddings: true,
       rmsNormEps: 1e-6, finalLogitSoftcapping: 30,
       ropeParameters: {
         sliding_attention: { ropeType: "default", ropeTheta: 10000, partialRotaryFactor: 1, factor: 1 },
@@ -234,9 +244,8 @@ for (const c of COMPOSITIONS) {
     const pair = async () => {
       if (graphs) return graphs;
       const { weights, config } = artifact(await fixtureConfig(c.repo), 1);
-      const served = c.module.COMPOSITION.kv![0]!;
-      if (served.kind !== "affine-layers") throw new Error(`${c.stem}: the generated graph serves ${served.kind}`);
-      const kv: KvStorageScheme = { kind: "affine-layers", layers: served.layers, kernels: "tiled-causal" };
+      const kv = artifactScheme(c.repo);
+      expect(c.module.COMPOSITION.kv![0]).toEqual({ kind: "affine-layers", layers: kv.layers });
       const composition = testComposition(kv);
       return graphs = { model: bindGraphCaches(new c.module.GeneratedGemma4(weights, config), composition), generic: bindGraphCaches(new Gemma4Model(weights, config, composition), composition) };
     };
