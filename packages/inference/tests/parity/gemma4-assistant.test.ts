@@ -1,4 +1,3 @@
-import { sequenceLogitsOperation } from "../../src/scoring/full-sequence";
 // Gemma4 assistant drafter against a real target's donor caches, past the
 // sliding window. The target's plain rotating and full caches go through a
 // prefill of N tokens (longer than the window), a 4-token verify block, a
@@ -63,6 +62,7 @@ const inputs = optIn(Bun.env);
 
 test.skipIf(!inputs)("Gemma4 assistant: donor attention and draft chains equal independently selected donors past the window", async () => {
   const { window, vocab, hidden } = inputs!.geometry;
+  const { sequenceLogitsOperation } = await import("../../src/scoring/full-sequence");
   const ops: typeof Ops = await import("@mlx-bun/mlx/ops");
   const { MlxArray } = await import("@mlx-bun/mlx/array");
   const { loadModelConfig, Weights, createModel } = await import("@mlx-bun/inference");
@@ -251,6 +251,7 @@ test.skipIf(!inputs)("Gemma4 assistant: shared generation accepts, rejects and c
   const { loadModelConfig, Weights, createModel, generate } = await import("@mlx-bun/inference");
   const { loadTokenizer, ChatTemplate } = await import("@mlx-bun/inference/input");
   const { AssistantProvider } = await import("@mlx-bun/inference/generation/speculative");
+  const { sequenceLogitsOperation } = await import("../../src/scoring/full-sequence");
   const { observedPhases, phaseHidden } = await import("../models/phase-forward");
   const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
   const ops = await import("@mlx-bun/mlx/ops");

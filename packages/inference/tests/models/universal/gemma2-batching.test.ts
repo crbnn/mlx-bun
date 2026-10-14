@@ -120,6 +120,7 @@ const { unfusedAffineKernels } = await import("../../../src/state/affine-attenti
 const { softcapAttention } = await import("../../../src/state/softcap-attention");
 const { testComposition, testGraph } = await import("../test-composition");
 const { phaseRowLimit } = await import("../../../src/models/graph");
+const { MlxPhaseDispatch } = await import("../../../src/generation/phase-dispatch");
 const { sequenceLogitsOperation } = await import("../../../src/scoring/full-sequence");
 const { observedPhases, phaseHidden, phaseLogits } = await import("../phase-forward");
 const { syntheticDigests } = await import("../synthetic-digest");
@@ -1763,14 +1764,24 @@ describe.skipIf(!native)("dense-read graphs with delayed affine KV", () => {
     const composed = model.makeCache();
     const oracle = types.map((type, layer) => new OracleKv(type === S ? W : null, bits[layer]!, start)) as unknown as Cache[];
     // Offsets 0 → 6 (a chunk) → 7 (the tail) → 10 (decodes) → 13 (a verification window) → 16 (known tokens) → 18 (decodes).
-    const steps: [string, number[]][] = [["prefillChunk", [2, 4, 7, 9, 3, 11]], ["prefillTail", [13]], ["decode", [17]],
+    type Phase = "prefillChunk" | "prefillTail" | "decode" | "verify" | "appendKnown";
+    const steps: [Phase, number[]][] = [["prefillChunk", [2, 4, 7, 9, 3, 11]], ["prefillTail", [13]], ["decode", [17]],
       ["decode", [19]], ["decode", [23]], ["verify", [29, 31, 37]], ["appendKnown", [41, 43, 47]], ["decode", [53]], ["decode", [59]]];
-    type Forward = (ids: MlxArray, caches: Cache[], capture: null) => MlxArray;
-    const forward = (phase: string, width: number): Forward => phase === "prefillChunk" || phase === "prefillTail" ? model.multiSequencePrompt.at(-1)!.operation as Forward
-      : (model as unknown as Record<string, Record<string, Forward>>)[phase]![width]!;
-    const run = (caches: Cache[], phase: string, ids: number[]) => {
+    const dispatch = new MlxPhaseDispatch(model);
+    const forward = (phase: Phase, tokens: number): import("../../../src/contracts/mlx/graph").MlxCapturingForward => {
+      switch (phase) {
+        case "prefillChunk": return dispatch.prompt("chunk", 1, tokens);
+        case "prefillTail": return dispatch.prompt("tail", 1, tokens);
+        case "decode": return dispatch.decode(1);
+        case "verify": return dispatch.verify(1, tokens);
+        case "appendKnown": return dispatch.known(tokens);
+      }
+    };
+    const run = (caches: Cache[], phase: Phase, ids: number[]) => {
       using input = ops.fromInt32(ids, [1, ids.length]);
-      using hidden = forward(phase, (ids.length))(input, caches, null);
+      const result = forward(phase, ids.length)(input, caches, null);
+      if (result instanceof Promise) throw new Error("the requantizing oracle requires synchronous operations");
+      using hidden = result;
       return sequenceLogitsOperation(model, hidden);
     };
     try {

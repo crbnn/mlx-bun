@@ -1,5 +1,3 @@
-import { testGraph } from "../models/test-composition";
-import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
 // Generated Gemma4 graphs against the dedicated graph on real weights. A
 // generated graph (12B, e4b or 26B, selected by config fingerprint) is an entire
 // graph built for the artifact's kv_config composition; it composes that
@@ -74,6 +72,8 @@ export function recordReads(caches: A[], storageOf: (cache: A) => { signature():
 const inputs = optIn(Bun.env);
 
 test.skipIf(!inputs)("generated Gemma4 graph equals the generic graph under kv_config and under plain caches", async () => {
+  const { testGraph } = await import("../models/test-composition");
+  const { phaseRowLimit } = await import("../../src/models/graph");
   const ffi = await import("@mlx-bun/mlx/ffi");
   const ops = await import("@mlx-bun/mlx/ops");
   const { loadModelConfig, Weights, configFingerprint } = await import("@mlx-bun/inference/artifacts");

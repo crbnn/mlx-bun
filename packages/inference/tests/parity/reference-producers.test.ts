@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { originalOraclePython,ORIGINAL_REVISION,ORIGINAL_SCRIPT,externalOutput } from "../../scripts/gemma4-oracle-reference";
 import { observeTargetPhases } from "../../scripts/reference-phases";
+import { rowTableWithDefault } from "../../src/models/row-table";
 
 const original=Bun.spawnSync(["git","show",`${ORIGINAL_REVISION}:${ORIGINAL_SCRIPT}`]);
 test.skipIf(original.exitCode !== 0)("the available historical Gemma producer retains its pinned calculation",()=>{
@@ -72,4 +73,26 @@ test("native head observers borrow the returned object and preserve named/range 
   expect(b.logits[0]!.operation()).toBe(out);
   expect(seen).toEqual([out, out]);
   expect(b.logits[0]!.to).toBe(Infinity);
+});
+
+test("producer observers preserve numeric defaults and explicit chunk operations", () => {
+  const seen: number[][] = [], heads: unknown[] = [], output = { dispose() { throw new Error("borrowed"); } };
+  const forward = (ids: number[]) => ids;
+  const base = {
+    decode: rowTableWithDefault({ 1: forward }, forward),
+    verify: rowTableWithDefault({}, forward),
+    logits: rowTableWithDefault({}, () => output),
+    promptChunk: [{ from: 1, to: Infinity, unit: "gpu", operation: forward }],
+    multiSequencePromptChunk: [{ from: 1, to: Infinity, unit: "gpu", operation: forward }],
+  };
+  const view = observeTargetPhases(base, ids => seen.push(ids), out => heads.push(out));
+  expect(view.decode[65]!([1])).toEqual([1]);
+  expect(view.verify[88]!([2])).toEqual([2]);
+  expect(view.logits[65]!()).toBe(output);
+  expect(view.decode[65]).toBe(view.decode[65]);
+  view.promptChunk[0]!.operation([3]);
+  view.multiSequencePromptChunk[0]!.operation([4]);
+  expect(seen).toEqual([[1], [2], [3], [4]]);
+  expect(heads).toEqual([output]);
+  expect(view.promptChunk[0]!.to).toBe(Infinity);
 });

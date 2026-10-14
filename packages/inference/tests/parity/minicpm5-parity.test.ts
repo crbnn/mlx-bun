@@ -1,5 +1,3 @@
-import { testGraph } from "../models/test-composition";
-import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
 // MiniCPM5 greedy decode parity against an external mlx-lm reference: 100 full
 // f32 logit vectors and greedy IDs through the direct model forward, batch one,
 // plain KV. The model, reference and oracle stay outside this repository; this
@@ -133,6 +131,8 @@ const inputs = optIn(Bun.env);
 test.skipIf(!inputs)("MiniCPM5: 100 greedy steps match the external reference bit for bit", async () => {
   const { manifest, blobs } = await verifyInputs(inputs!);
   expect(manifest.vocab_size).toBe(VOCAB);
+  const { testGraph } = await import("../models/test-composition");
+  const { phaseRowLimit } = await import("../../src/models/graph");
   const ffi = await import("@mlx-bun/mlx/ffi");
   checkRuntime(manifest, { mlxVersion: ffi.MLX_VERSION, architecture: ffi.deviceArchitecture() });
   const { loadModelConfig, loadTokenizer, Weights, resolveComposition } = await import("@mlx-bun/inference");

@@ -1,6 +1,4 @@
 import type { TestGraph } from "../models/test-composition";
-import { testGraph } from "../models/test-composition";
-import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
 // Real-weight gate migrated from main's compiled-decode suite. Native imports
 // stay inside beforeAll: an ordinary CI run skips without weights or MLX.
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
@@ -49,7 +47,8 @@ for (const [family, checkpoint] of [
       // These are different compiled paths: dense segmented vs e4b whole graph.
       expect(config.text.numKvSharedLayers > 0).toBe(family === "e4b");
       weights = await Weights.open(checkpoint!);
-      const { kvOf, testComposition } = await import("../models/test-composition");
+      const { kvOf, testComposition, testGraph } = await import("../models/test-composition");
+      const { phaseRowLimit } = await import("../../src/models/graph");
       const models = new Map<string, TestGraph<InstanceType<typeof Gemma4Model>>>();
       modelFor = kv => {
         const key = JSON.stringify(kv);

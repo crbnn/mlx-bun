@@ -1,6 +1,4 @@
 import type { TestGraph } from "../models/test-composition";
-import { testGraph } from "../models/test-composition";
-import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
 // Gemma4 12B greedy decode against an external mlx-lm reference: batch one,
 // plain KV from the model's own makeCache (the artifact's kv_config.json is not
 // applied), the prompt once and then each selected token on the same live cache.
@@ -183,6 +181,8 @@ async function runEntry(entry: "createModel" | "Gemma4Model", steps: number) {
   const { manifest, vectors } = await verifyInputs(inputs!);
   expect(manifest.vocab_size).toBe(VOCAB);
   await checkTokenizer(inputs!.model, manifest);
+  const { testGraph } = await import("../models/test-composition");
+  const { phaseRowLimit } = await import("../../src/models/graph");
   const ffi = await import("@mlx-bun/mlx/ffi");
   checkRuntime(manifest, { mlxVersion: ffi.MLX_VERSION, architecture: ffi.deviceArchitecture() });
   const { loadModelConfig, Weights, createModel, resolveComposition } = await import("@mlx-bun/inference");
