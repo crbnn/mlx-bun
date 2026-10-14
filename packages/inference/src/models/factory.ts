@@ -13,7 +13,7 @@ import { Gemma4Model } from "./gemma4/model";
 import { configFingerprint } from "../artifacts/fingerprint";
 import { qwen35GraphFingerprint } from "./qwen/checkpoint";
 import {
-  COMPOSITION as QWEN38_TRELLIS_M4PRO_COMPOSITION, QWEN38_TRELLIS_M4PRO_GRAPH, Qwen38TrellisM4Pro,
+  DECODE_ROWS as QWEN38_M4PRO_DECODE_ROWS, VERIFY_ROWS as QWEN38_M4PRO_VERIFY_ROWS, QWEN38_TRELLIS_M4PRO_GRAPH, Qwen38TrellisM4Pro,
   anePrograms as qwen38TrellisM4ProAnePrograms,
 } from "./qwen/qwen38-27b-trellis-m4pro";
 import {
@@ -91,8 +91,11 @@ export const MLX_GRAPH_TABLES: Readonly<Record<ModelGraph, GraphTable<Weights, R
   // Our published Trellis quant has its generated graphs (scripts/gen-qwen38.ts), keyed by its graph
   // fingerprint (architecture plus the complete quantization table) and the GPU each was built for.
   "qwen3.5": new GraphTable([
-    loadedEntry({ id: QWEN38_TRELLIS_M4PRO_GRAPH, serves: QWEN38_TRELLIS_M4PRO_COMPOSITION,
-      create: (weights, config, composition) => new Qwen38TrellisM4Pro(weights, config, composition),
+    loadedEntry({ id: QWEN38_TRELLIS_M4PRO_GRAPH, serves: {
+        fingerprint:"cfa205c8f5af046a",device:"applegpu_g16s",maxRows:QWEN38_M4PRO_DECODE_ROWS,maxVerifyRows:QWEN38_M4PRO_VERIFY_ROWS,
+        kv:[{kind:"bf16"},{kind:"affine",bits:4,groupSize:64}],
+      },
+      create: (weights,config) => new Qwen38TrellisM4Pro(weights,config),
       anePrograms: () => qwen38TrellisM4ProAnePrograms() }),
     // The M1 Max composition builds no Neural Engine operation (its device's table has none): no programs to install.
     loadedEntry({ id: QWEN38_TRELLIS_M1MAX_GRAPH, serves: QWEN38_TRELLIS_M1MAX_COMPOSITION,
