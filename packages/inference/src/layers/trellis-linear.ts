@@ -3,6 +3,7 @@ import { Dtype, deviceArchitecture } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { quantFor, type ModelConfig, type QuantSpec } from "../artifacts/config";
 import type { Weights } from "../artifacts/weights";
+import { LoraDelta, type LoraState, type LoraWeights } from "./lora";
 import { QuantizedLinear } from "./quantized-linear";
 import { wordsPerBlock } from "../kernels/trellis/codebook";
 import {
@@ -86,6 +87,13 @@ export function trellisStoredRows(lin: TrellisLinear, start: number, stop: numbe
 }
 
 export class TrellisLinear {
+  readonly delta: LoraDelta;
+  get adapters(): Map<string, LoraWeights> | null { return this.delta.adapters; }
+  set adapters(value: Map<string, LoraWeights> | null) { this.delta.adapters = value; }
+  get loraState(): LoraState | null { return this.delta.loraState; }
+  set loraState(value: LoraState | null) { this.delta.loraState = value; }
+  get dropoutId(): number { return this.delta.dropoutId; }
+  set dropoutId(value: number) { this.delta.dropoutId = value; }
   readonly geometry: TrellisGeometry;
   readonly spec: QuantSpec;
   /** The decode variant every kernel over these weights runs (kernels/trellis/index.ts): the row-form layers
@@ -104,6 +112,7 @@ export class TrellisLinear {
   ) {
     this.spec = spec;
     this.geometry = trellisGeometry(codes, spec);
+    this.delta = new LoraDelta(this.geometry.inFeatures, this.geometry.outFeatures);
     if (this.geometry.blockInterleave && (scales.ndim !== 1 || scales.size !== this.geometry.rows))
       throw new Error("trellis: interleaved codes require one scale per stored row");
     this.representations = representations;
@@ -171,7 +180,7 @@ export class TrellisLinear {
     // matmul's reference. Direct tiles and packed matvecs stay lazy: they
     // hold activations and bounded partials, without a dense weight matrix.
     if (expandedWeights) out.eval();
-    return out;
+    return this.delta.forward(x, out);
   }
 }
 

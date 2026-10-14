@@ -18,4 +18,4 @@ export * from "./rope";
 export * from "./rope-2d";
 
 export * from "./trellis-prompt";
-export { LoraDelta } from "./lora";
+export { LoraDelta, LoraOperation, LoraState } from "./lora";
