@@ -17,7 +17,7 @@ import {
 import {
   COMPOSITION as QWEN38_TRELLIS_M1MAX_COMPOSITION, QWEN38_TRELLIS_M1MAX_GRAPH, Qwen38TrellisM1Max,
 } from "./qwen/qwen38-27b-trellis-m1max";
-import { GENERATED_GRAPHS, type GeneratedGemma4Graph } from "./gemma4/generated/index";
+import { GENERATED_GRAPHS, type GeneratedGemma4Graph } from "./gemma4/graphs";
 import { MiniCPM5Model } from "./minicpm5/model";
 import { Qwen35Model } from "./qwen/qwen3_5";
 import { Qwen3Model } from "./qwen/qwen3";
