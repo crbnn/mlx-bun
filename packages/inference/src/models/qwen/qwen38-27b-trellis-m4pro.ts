@@ -4,7 +4,7 @@ import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
 import type { Cache } from "../../contracts/mlx/cache";
 import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
-import type { MlxDeclaredGraph, MlxTokenPhases, MlxLayerCapture, MlxHeadForward, MlxRowTable, MlxPromptRange, MlxCacheLayer, MlxPhaseForward, MlxSequenceRange, MlxSeparateMixed } from "../../contracts/mlx/graph";
+import type { MlxDeclaredGraph, MlxTokenPhases, MlxLayerCapture, MlxHeadForward, MlxRowTable, MlxPromptRange, MlxCacheLayer, MlxPhaseForward, MlxSequenceRange, MlxSeparateMixed, MlxKnownRange } from "../../contracts/mlx/graph";
 import type { MediaEncoders, MlxPromptInput, Vision, MlxPositionedForward, MlxPositionedRange, MlxPositionedEmbeddingsRange } from "../../contracts/mlx/media";
 import type { MropeForwardState } from "../../contracts/mlx/positions";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
@@ -23,7 +23,7 @@ import { TrellisFusedMLP, TrellisUnfusedMLP, TrellisReducePrompt as Reduce, Trel
 import { GraphForwardScope, BoundedGraphForwardScope, SubmittedGraphForwardScope } from "../../runtime/graph-forward";
 import { disposeResources } from "../../runtime/resources";
 import { declareGraph } from "../capabilities";
-import { fixedRowBindings, type ReadPhase } from "../graph";
+import type { ReadPhase } from "../graph";
 import { QwenDeltaLayer as Delta, QwenAttentionLayer as Attention } from "./blocks";
 import { bindQwenMediaInput, qwenDraftTarget, qwenMediaEncoders, qwenResidualBasis } from "./media-input";
 import { DeltaWeights, AttentionWeights, GateDownMLP, AneBoundMlp, AneWeightShares, canonicalQwenWeights, type QwenProjectionTarget } from "./written-layers";
@@ -91,7 +91,7 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
   readonly multiSequencePrompt:readonly MlxPromptRange[];
   readonly decode:MlxRowTable<RowsForward>;
   readonly verify:MlxRowTable<RowsForward>;
-  readonly appendKnown:MlxRowTable<MlxPhaseForward>;
+  readonly appendKnown:readonly MlxKnownRange[];
   readonly logits:MlxRowTable<MlxHeadForward>;
   readonly sequence:readonly MlxSequenceRange[];
   readonly mediaPrefill:readonly MlxPositionedEmbeddingsRange[];
@@ -856,17 +856,8 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
     const knownWide:MlxPhaseForward=(ids,state)=>this.#bounded(this.#knownWide,ids,state,"committed",null);
     const knownTiled:MlxPhaseForward=(ids,state)=>this.#bounded(this.#knownTiled,ids,state,"committed",null);
     const knownExpanded:MlxPhaseForward=(ids,state)=>this.#bounded(this.#knownExpanded,ids,state,"committed",null);
-    this.appendKnown={
-      ...fixedRowBindings(65,t.maxPositionEmbeddings,knownExpanded),
-      1:knownNarrow,2:knownNarrow,3:knownNarrow,4:knownNarrow,5:knownFiveToEight,6:knownFiveToEight,7:knownFiveToEight,8:knownFiveToEight,
-      9:knownWide,10:knownWide,11:knownWide,12:knownWide,13:knownWide,14:knownWide,15:knownWide,
-      16:knownTiled,17:knownTiled,18:knownTiled,19:knownTiled,20:knownTiled,21:knownTiled,22:knownTiled,23:knownTiled,
-      24:knownTiled,25:knownTiled,26:knownTiled,27:knownTiled,28:knownTiled,29:knownTiled,30:knownTiled,31:knownTiled,32:knownTiled,
-      33:knownExpanded,34:knownExpanded,35:knownExpanded,36:knownExpanded,37:knownExpanded,38:knownExpanded,39:knownExpanded,40:knownExpanded,
-      41:knownExpanded,42:knownExpanded,43:knownExpanded,44:knownExpanded,45:knownExpanded,46:knownExpanded,47:knownExpanded,48:knownExpanded,
-      49:knownExpanded,50:knownExpanded,51:knownExpanded,52:knownExpanded,53:knownExpanded,54:knownExpanded,55:knownExpanded,56:knownExpanded,
-      57:knownExpanded,58:knownExpanded,59:knownExpanded,60:knownExpanded,61:knownExpanded,62:knownExpanded,63:knownExpanded,64:knownExpanded,
-    };
+    this.appendKnown=[{from:1,to:4,operation:knownNarrow},{from:5,to:8,operation:knownFiveToEight},
+      {from:9,to:15,operation:knownWide},{from:16,to:32,operation:knownTiled},{from:33,to:Infinity,operation:knownExpanded}];
     const headRows=new Affine4Rows(this.lmHead),headMma=new Affine4Mma(this.lmHead);
     const plainHead:MlxHeadForward=hidden=>this.#head.forward(hidden),rowsHead:MlxHeadForward=hidden=>headRows.forward(hidden),mmaHead:MlxHeadForward=hidden=>headMma.forward(hidden);
     this.logits={
