@@ -92,7 +92,7 @@ describe("adaptive speculative draft gate", () => {
     const wide = new Map([[1, 1], [2, 2], [4, 2.5], [8, 3], [16, 3.4], [32, 6]]);
     const gate = new AdaptiveDraftGate(wide, { maxDraftTokens: 7 });
     for (let i = 0; i < 24; i++) gate.observe(3, 1);
-    // One sequence: the same rate as before rows were counted.
+    // One sequence: the rows default to one.
     expect(gate.expectedRate(3, 1)).toBeCloseTo(gate.expectedRate(3), 12);
     // Four sequences drafting 3 verify 16 rows against a 4-row step: (1 + a1 + ...) * 2.5 / 3.4.
     let survive = 1, tokens = 1;
