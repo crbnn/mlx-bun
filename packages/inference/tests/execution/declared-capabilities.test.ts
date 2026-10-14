@@ -74,11 +74,9 @@ describe("placement follows the graph's declarations", () => {
     expect((adapted.graph as unknown as {loraState:{active:string[]}}).loraState.active).toEqual(["first"]);
     restore();
     expect((adapted.graph as unknown as {loraState:{active:string[]}}).loraState.active).toEqual([]);
-    const compiled = bind(replacement({ compiledDecode: true }));
+    const compiled = bind(replacement({}));
     expect(compiled.plan(shape, {}, schedule).compiledDecode).toBe(true);
-    // A composition that turns the compiled step off is planned without it.
-    expect(bind(replacement({ compiledDecode: true }, { composition: testComposition(undefined, { compiledDecode: false }) }))
-      .plan(shape, {}, schedule).compiledDecode).toBe(false);
+
   });
 
   test("prepared media enters through the graph's own operation, declared and provided together", () => {

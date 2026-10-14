@@ -1,3 +1,6 @@
+import type { Composition } from "../../src/contracts/portable/composition";
+import { testGraph } from "./test-composition";
+import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
 // Each generated Gemma 4 graph (src/models/gemma4/generated/*.ts, an entire graph
 // scripts/gen-gemma4.ts emits for one composition) against the generic Gemma 4
 // graph of its family over the same synthetic weights, where both serve the
@@ -189,7 +192,7 @@ function stateDiff(label: string, actual: readonly Cache[], expected: readonly C
 type Graph = MlxTokenPhases & { makeCache(): Cache[] };
 interface Generated {
   readonly COMPOSITION: ServedComposition;
-  readonly GeneratedGemma4: { new (...args: ConstructorParameters<typeof Gemma4Model>): Graph; readonly prototype: object };
+  readonly GeneratedGemma4: { new (weights: Weights, config: ModelConfig, composition: Composition): Graph; readonly prototype: object };
 }
 const COMPOSITIONS: readonly { stem: string; repo: string; module: Generated }[] = [
   { stem: "gemma4-e4b", repo: "gemma-4-e4b-it-OptiQ-4bit", module: currentE4b as unknown as Generated },
@@ -236,7 +239,7 @@ for (const c of COMPOSITIONS) {
       if (served.kind !== "affine-layers") throw new Error(`${c.stem}: the generated graph serves ${served.kind}`);
       const kv: KvStorageScheme = { kind: "affine-layers", layers: served.layers, kernels: "tiled-causal" };
       const composition = testComposition(kv);
-      return graphs = { model: new c.module.GeneratedGemma4(weights, config, composition), generic: new Gemma4Model(weights, config, composition) };
+      return graphs = { model: new c.module.GeneratedGemma4(weights, config, composition), generic: testGraph(new Gemma4Model(weights, config, phaseRowLimit(composition)), composition) };
     };
 
     test(`${c.stem}: prefill 37, decodes, a window across the sliding boundary, verify 4, decodes`, async () => {

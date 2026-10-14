@@ -1,3 +1,6 @@
+import type { TestGraph } from "../models/test-composition";
+import { testGraph } from "../models/test-composition";
+import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
 // The DFlash 2 drafter loaded in its trained basis and given the target's basis
 // when a draft group binds, on small synthetic weights whose 4-bit projections
 // fit the simdgroup matrix unit: every proposal holds its depth's tokens, the
@@ -313,13 +316,13 @@ test("the rotated Trellis graphs' declaration carries the basis its turboquant_f
     // A Trellis graph's declaration: the basis its constructor reads once from the fold record
     // (`qwenResidualBasis`) and the ports every draftTarget call hands out over the graph (`qwenDraftTarget`),
     // here over the Qwen 3.5 graph of the synthetic artifact, whose embedding and head the drafter reads.
-    const trellisTarget = (model: Qwen35Model) => {
+    const trellisTarget = (model: TestGraph<Qwen35Model>) => {
       const residualBasis = qwenResidualBasis(QWEN38_TRELLIS_M1MAX_GRAPH, target);
       return { draftTarget: (_caches: unknown[]): TargetView => qwenDraftTarget(model, residualBasis) };
     };
     // A record without final_gain declares nothing and names the file once, at construction; so does a missing record.
     writeFileSync(foldPath, JSON.stringify(record));
-    const generic = new Qwen35Model(weights, config, testComposition());
+    const generic = testGraph(new Qwen35Model(weights, config, phaseRowLimit(testComposition())), testComposition());
     expect("residualBasis" in trellisTarget(generic).draftTarget([])).toBe(false);
     expect(fileLines()).toEqual([`[graph] ${QWEN38_TRELLIS_M1MAX_GRAPH}: ${foldPath} records no final_gain; DFlash 2 drafts ` +
       "unrotated (output exact, acceptance collapses) until it records the final-norm gain the fold moved into lm_head"]);
@@ -333,7 +336,7 @@ test("the rotated Trellis graphs' declaration carries the basis its turboquant_f
 
     // The record with final_gain: the Trellis declaration carries it; the generic graph on the same artifact declares nothing.
     writeFileSync(foldPath, JSON.stringify({ ...record, final_gain: Array.from(basis.finalGain) }));
-    const model = new Qwen35Model(weights, config, testComposition());
+    const model = testGraph(new Qwen35Model(weights, config, phaseRowLimit(testComposition())), testComposition());
     const graph = trellisTarget(model);
     expect("residualBasis" in model.draftTarget([])).toBe(false);
     expect(fileLines()).toHaveLength(2);

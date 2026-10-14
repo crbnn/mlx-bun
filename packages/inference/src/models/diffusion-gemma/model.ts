@@ -1,4 +1,3 @@
-import { bindGraphCaches } from "../cache-composition";
 import type { MlxCacheLayer, MlxMixedRange } from "../../contracts/mlx/graph";
 import { cleanupFailure, disposeResources } from "../../runtime/resources";
 // DiffusionGemma-26B-A4B-it (model_type "diffusion_gemma") — the first
@@ -40,7 +39,6 @@ import type { TrainableGraph } from "../../contracts/mlx/trainable";
 import { declareGraph } from "../capabilities";
 import type { PixelInput } from "../../contracts/mlx/media";
 import { geglu, GegluMLP } from "../../layers/geglu";
-import type { Composition } from "../../contracts/portable/composition";
 import { logitSoftcap } from "../../kernels/logits";
 import { compiledLogitSoftcap } from "../../kernels/softcap";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
@@ -471,7 +469,7 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
       denoising: {
         vocabSize: this.config.text.vocabSize,
         layerModulePaths: this.layers.map((_, i) => `model.decoder.layers.${i}`),
-        canvasLogits: (promptIds, canvas) => this.forwardCanvasLogitsArr(promptIds, canvas),
+        canvasLogits: (promptIds, canvas) => (this as unknown as DiffusionGemmaModel & { makeCache(): Cache[] }).forwardCanvasLogitsArr(promptIds, canvas),
       },
     };
   }
@@ -488,13 +486,11 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
    * `compiledGeglu` is off: the spelled-out ops. */
   readonly #compiledGeglu: boolean;
   /** The composition this graph was built for: its KV scheme and paging are its caches' (`makeCache`). */
-  readonly composition: Composition;
 
-  constructor(weights: Weights, config: ModelConfig, composition: Composition) {
+  constructor(weights: Weights, config: ModelConfig) {
     const t = config.text;
     this.config = config;
-    this.composition = composition;
-    this.#compiledGeglu = composition.compiledGeglu;
+    this.#compiledGeglu = true;
     this.weightsBytes = [...weights.shards.files.values()].reduce((a, f) => a + f.mmap.size, 0);
     this.embed = QuantizedEmbedding.load(weights, "model.decoder.embed_tokens", config);
     this.embedScale = Math.pow(t.hiddenSize, 0.5);
@@ -514,7 +510,8 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
     this.imageTokenId = (raw.image_token_id as number) ?? 258880;
     this.visionTower = raw.vision_config ? new DiffusionVisionTower(weights, config) : null;
 
-    bindGraphCaches(this, composition);
+
+    this.cacheLayers = this.layers.map(layer=>layer.layerType === "sliding_attention" ? {kind:"sliding" as const,window:this.slidingWindow}:{kind:"full" as const,turboQuant:"deferred" as const});
   }
 
   /** Build the merged prompt embeddings for an image+text turn: embed the text
@@ -573,7 +570,7 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
   }
 
   /** Prefill from a pre-spliced image+text prompt → populated cache. */
-  prefillVision(splicedIds: number[], pixels: MlxArray): Cache[] {
+  prefillVision(this: DiffusionGemmaModel & { makeCache(): Cache[] }, splicedIds: number[], pixels: MlxArray): Cache[] {
     const cache = this.makeCache();
     try { this.encodeVisionPrefill(splicedIds, pixels, cache); return cache; }
     catch (error) { cleanupFailure(error, () => disposeResources(cache)); }
@@ -592,9 +589,8 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
    *  what the scheme names (`maybePageKv`, growing from one block). The encoder
    *  prefill fills them, the decoder canvas pass reads them. */
   readonly cachePaging = true;
-  get cacheLayers(): readonly MlxCacheLayer[] { return this.layers.map(layer=>layer.layerType === "sliding_attention" ? {kind:"sliding" as const,window:this.slidingWindow}:{kind:"full" as const,turboQuant:"deferred" as const}); }
+  readonly cacheLayers: readonly MlxCacheLayer[];
 
-  makeCache!: () => Cache[];
 
   /** Encoder prefill: run all layers over the prompt through the window read,
    *  filling the cache. Discards the hidden. */
@@ -776,7 +772,7 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
 
   /** Encoder prefill over the prompt -> a fresh populated cache (the denoising
    *  loop reuses it across all steps of a canvas block). */
-  prefill(promptIds: number[]): Cache[] {
+  prefill(this: DiffusionGemmaModel & { makeCache(): Cache[] }, promptIds: number[]): Cache[] {
     const cache = this.makeCache();
     try { this.encodePrompt(promptIds, cache); return cache; }
     catch (error) { cleanupFailure(error, () => disposeResources(cache)); }
@@ -837,7 +833,7 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
 
   /** D1 entry point: prompt + canvas ids -> softcapped logits [1, canvas, vocab].
    *  Builds a fresh cache, prefills the encoder, runs one decoder pass. */
-  forwardCanvasLogits(promptIds: number[], canvasIds: number[]): MlxArray {
+  forwardCanvasLogits(this: DiffusionGemmaModel & { makeCache(): Cache[] }, promptIds: number[], canvasIds: number[]): MlxArray {
     const cache = this.makeCache();
     try {
       this.encodePrompt(promptIds, cache);
@@ -852,7 +848,7 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
 
   /** Training forward over an on-device canvas (D5 LoRA): prompt + canvas array
    *  -> softcapped logits [1, L, vocab], differentiable w.r.t. mounted LoRA. */
-  forwardCanvasLogitsArr(promptIds: number[], canvasArr: MlxArray): MlxArray {
+  forwardCanvasLogitsArr(this: DiffusionGemmaModel & { makeCache(): Cache[] }, promptIds: number[], canvasArr: MlxArray): MlxArray {
     const cache = this.makeCache();
     try {
       this.encodePrompt(promptIds, cache);

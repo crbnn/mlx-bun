@@ -23,7 +23,7 @@ import { Qwen35Model } from "./qwen/qwen3_5";
 import { Qwen3Model } from "./qwen/qwen3";
 import { Qwen3MoeModel } from "./qwen/qwen3-moe";
 import { DiffusionGemmaModel } from "./diffusion-gemma/model";
-import { Glm52Model, type Glm52LatentCaches } from "./glm52/model";
+import { Glm52Model, type Glm52LoadedModel, type Glm52LatentCaches } from "./glm52/model";
 import {
   GLM52_G5_DEFAULT_CONTEXT_TOKENS,
   GLM52_G5_DEFAULT_MAX_GENERATION_TOKENS,
@@ -37,6 +37,7 @@ import { genericArgsFor } from "./universal/archs";
 import { familyForGraph } from "./families";
 import { resolveComposition } from "./composition";
 import { bindGraphCaches } from "./cache-composition";
+import { phaseRowLimit } from "./graph";
 import type { Composition } from "../contracts/portable/composition";
 import type { Cache } from "../contracts/mlx/cache";
 import {
@@ -83,8 +84,8 @@ function loadedGraph(graph: WrittenGraph, composition: Composition): RuntimeMode
  * selected. Adding a graph means adding an entry here (or to the list a table
  * spreads in). */
 export const MLX_GRAPH_TABLES: Readonly<Record<ModelGraph, GraphTable<Weights, RuntimeModel>>> = Object.freeze({
-  "diffusion-gemma": new GraphTable([generic("diffusion-gemma", (weights, config, composition) => new DiffusionGemmaModel(weights, config, composition))]),
-  "minicpm5": new GraphTable([generic("minicpm5", (weights, config, composition) => new MiniCPM5Model(weights, config, composition))]),
+  "diffusion-gemma": new GraphTable([generic("diffusion-gemma", (weights, config, composition) => new DiffusionGemmaModel(weights, config))]),
+  "minicpm5": new GraphTable([generic("minicpm5", (weights, config, composition) => new MiniCPM5Model(weights, config, phaseRowLimit(composition)))]),
   // Our published Trellis quant has its generated graphs (scripts/gen-qwen38.ts), keyed by its graph
   // fingerprint (architecture plus the complete quantization table) and the GPU each was built for.
   "qwen3.5": new GraphTable([
@@ -94,14 +95,14 @@ export const MLX_GRAPH_TABLES: Readonly<Record<ModelGraph, GraphTable<Weights, R
     // The M1 Max composition builds no Neural Engine operation (its device's table has none): no programs to install.
     loadedEntry({ id: QWEN38_TRELLIS_M1MAX_GRAPH, serves: QWEN38_TRELLIS_M1MAX_COMPOSITION,
       create: (weights, config, composition) => new Qwen38TrellisM1Max(weights, config, composition) }),
-    generic("qwen3.5", (weights, config, composition) => new Qwen35Model(weights, config, composition)),
+    generic("qwen3.5", (weights, config, composition) => new Qwen35Model(weights, config, phaseRowLimit(composition))),
   ], qwen35GraphFingerprint),
-  "qwen3-moe": new GraphTable([generic("qwen3-moe", (weights, config, composition) => new Qwen3MoeModel(weights, config, composition))]),
-  "qwen3": new GraphTable([generic("qwen3", (weights, config, composition) => new Qwen3Model(weights, config, composition))]),
-  "gemma4": new GraphTable([...GENERATED_GRAPHS.map(loadedEntry), generic("gemma4", (weights, config, composition) => new Gemma4Model(weights, config, composition))],
+  "qwen3-moe": new GraphTable([generic("qwen3-moe", (weights, config, composition) => new Qwen3MoeModel(weights, config, phaseRowLimit(composition)))]),
+  "qwen3": new GraphTable([generic("qwen3", (weights, config, composition) => new Qwen3Model(weights, config, phaseRowLimit(composition)))]),
+  "gemma4": new GraphTable([...GENERATED_GRAPHS.map(loadedEntry), generic("gemma4", (weights, config, composition) => new Gemma4Model(weights, config, phaseRowLimit(composition)))],
     configFingerprint),
   "universal-dense": new GraphTable([generic("universal-dense", (weights, config, composition) =>
-    new UniversalDenseModel(weights, config, composition, genericArgsFor(config)!))]),
+    new UniversalDenseModel(weights, config, genericArgsFor(config)!, phaseRowLimit(composition)))]),
 });
 
 /** A resident family's native construction: its graph table selects the graph for
@@ -169,7 +170,7 @@ export interface Glm52RuntimeOpenOptions {
 export async function openGlm52RuntimeModel(
   modelDir: string,
   options: Glm52RuntimeOpenOptions = {},
-): Promise<{ model: Glm52Model; plan: Glm52MemoryPlan }> {
+): Promise<{ model: Glm52LoadedModel; plan: Glm52MemoryPlan }> {
   const machineBytes = options.machineBytes ?? totalmem();
   const processLimitBytes = options.memoryBudgetBytes ??
     Math.min(GLM52_G5_DEFAULT_PROCESS_LIMIT_BYTES, machineBytes);

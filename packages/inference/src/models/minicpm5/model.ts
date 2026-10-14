@@ -1,5 +1,4 @@
-import { bindGraphCaches } from "../cache-composition";
-import type { MlxCacheLayer, MlxMixedRange } from "../../contracts/mlx/graph";
+import type { MlxCacheLayer, MlxMixedRange, MlxSequenceRange } from "../../contracts/mlx/graph";
 // Concrete model graph for MiniCPM5-1B-OptiQ-4bit.
 // Port target: mlx_lm.models.llama from the oracle venv. Each block is built
 // once and reads its cache through the cache contract for the phase its caller
@@ -16,7 +15,7 @@ import type { MlxRowTable, MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward
 import type { TrainableGraph } from "../../contracts/mlx/trainable";
 import { miniCpmTrainable } from "./trainable";
 import { declareGraph } from "../capabilities";
-import { phaseRowLimit,  rowTable, type ReadPhase  } from "../graph";
+import { DEFAULT_PHASE_ROWS,  rowTable, type ReadPhase   } from "../graph";
 import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
 import type { Cache, TrainingAttentionCache } from "../../contracts/mlx/cache";
@@ -25,7 +24,6 @@ import { RMSNorm } from "../../layers/normalization";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import { QuantizedLinear } from "../../layers/quantized-linear";
 import { composedFullAttentionCache } from "../../state/bf16-first-kv";
-import type { Composition } from "../../contracts/portable/composition";
 import { AttentionMasks } from "../../state/attention-read";
 import { deferredTurboQuantKernels } from "../../state/turboquant-attention";
 import { compiledSwiglu } from "../../layers/swiglu";
@@ -240,7 +238,6 @@ export class LlamaLayer {
 export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
   /** The served configuration this graph was built for: its KV scheme is what `makeCache` composes. */
-  readonly composition: Composition;
   readonly weightsBytes: number;
   readonly prefixBase = "model";
   readonly loraState = new LoraState();
@@ -254,15 +251,14 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly finalNorm: RMSNorm;
   readonly lmHead: QuantizedLinear;
 
-  constructor(weights: Weights, config: ModelConfig, composition: Composition) {
+  constructor(weights: Weights, config: ModelConfig, maxPhaseRows = DEFAULT_PHASE_ROWS) {
     if (config.text.tieWordEmbeddings)
       throw new Error("llama tied embeddings are not supported yet");
     this.config = config;
-    this.composition = composition;
     this.weightsBytes = [...weights.shards.files.values()]
       .reduce((a, f) => a + f.mmap.size, 0);
     this.embed = QuantizedEmbedding.load(weights, "model.embed_tokens", config);
-    const Mlp = composition.compiledSwiglu ? LlamaMLP : LlamaUnfusedMLP;
+    const Mlp = LlamaMLP;
     this.layers = Array.from(
       { length: config.text.numHiddenLayers },
       (_, i) => new LlamaLayer(weights, config, `model.layers.${i}`, Mlp),
@@ -275,14 +271,17 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
     this.prompt = [{ from: 1, to: Infinity, operation: multiSequencePrompt }];
     this.multiSequencePrompt = this.prompt;
     this.appendKnown = rowTable<MlxPhaseForward>((ids, cache) =>
-    this.forwardLayers(this.embed.encode(ids), cache, "window"), phaseRowLimit(composition));
-    this.logits = rowTable<MlxHeadForward>(hidden => this.logitsFromHidden(hidden), phaseRowLimit(composition));
+    this.forwardLayers(this.embed.encode(ids), cache, "window"), maxPhaseRows);
+    this.logits = rowTable<MlxHeadForward>(hidden => this.logitsFromHidden(hidden), maxPhaseRows);
     this.decode = rowTable<MlxPhaseForward>((ids, cache) =>
-    this.forwardLayers(this.embed.encode(ids), cache, "decode"), phaseRowLimit(composition));
+    this.forwardLayers(this.embed.encode(ids), cache, "decode"), maxPhaseRows);
     this.verify = rowTable<MlxVerifyForward>((ids, cache) =>
-    this.forwardLayers(this.embed.encode(ids), cache, "window"), phaseRowLimit(composition));
+    this.forwardLayers(this.embed.encode(ids), cache, "window"), maxPhaseRows);
 
-    bindGraphCaches(this, composition);
+
+    this.sequence = [{from:1,to:Infinity,operation:(ids,cache)=>this.sequenceHidden(ids,cache,1)}];
+
+    this.cacheLayers = this.layers.map(() => ({kind:"full" as const,turboQuant:"deferred" as const}));
   }
 
   loraTargets(): Map<string, QuantizedLinear> {
@@ -307,9 +306,9 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
   /** One cache per layer, sharing one mask memo. Their TurboQuant read is
    * deferred (`deferredTurboQuantKernels`): attention runs on the rotated
    * values and the read un-rotates its output. */
-  get cacheLayers(): readonly MlxCacheLayer[] { return this.layers.map(() => ({kind:"full" as const,turboQuant:"deferred" as const})); }
+  readonly cacheLayers: readonly MlxCacheLayer[];
+  readonly sequence: readonly MlxSequenceRange[];
 
-  makeCache!: () => Cache[];
 
   /** The scoring and training forward (`MlxSequenceForward`, `trainForward`
    *  over the training caches): the window read at every width. The training

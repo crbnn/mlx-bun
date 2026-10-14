@@ -1,3 +1,4 @@
+import { pagedDecodeCompiles } from "../state/paged/cache";
 import { type MlxForwardWork,type MlxPreparationWork } from "../contracts/mlx/forward-work";
 import type { DisposableResource } from "../contracts/portable/resources";
 import type { ExecutionGroup } from "../contracts/portable/scheduling";
@@ -186,7 +187,7 @@ export class MlxBatchExecutionGroup {
     const proto = withRuntimeConfig(this.#runtime, () => model.makeCache()); // fresh caches hold no buffers
     for (const c of proto) c.dispose();
     // The composition decided at load whether its storage has a compiled form.
-    this.#compiled = facts.compiledDecode
+    this.#compiled = (!model.composition?.pagedKv || pagedDecodeCompiles(model.composition.pagedKv, model.composition.kv))
       ? withRuntimeConfig(this.#runtime, () => compiledDecodeStepOf(model))
       : null;
     this.#dispatch = new MlxPhaseDispatch(tokenPhasesOf(model));

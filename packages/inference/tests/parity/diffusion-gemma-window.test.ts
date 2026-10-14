@@ -1,3 +1,4 @@
+import type { TestGraph } from "../models/test-composition";
 // DiffusionGemma decoder over a prompt longer than the sliding window, against
 // an external optiq reference: the encoder prefill over the reference's prompt
 // IDs, then one decoder pass over its canvas IDs (the first denoising pass, no
@@ -122,7 +123,7 @@ test.skipIf(!inputs)("DiffusionGemma past the window: selected encoder K/V and f
   const weights = await Weights.open(inputs!.model);
   let cache: Cache[] = [];
   try {
-    const model = createModel(weights, await loadModelConfig(inputs!.model)) as DiffusionGemmaModel;
+    const model = createModel(weights, await loadModelConfig(inputs!.model)) as TestGraph<DiffusionGemmaModel>;
     cache = model.prefill(manifest.inputs.prompt);
     expect(cache).toHaveLength(geometry.layers);
     cache.forEach((c, i) => {

@@ -229,7 +229,7 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
     this.embed = QuantizedEmbedding.load(weights, `${PREFIX}.embed_tokens`, config);
     // The GeGLU activations and the head's softcap run the compiled closures unless the
     // composition's `compiledGeglu` is off: the spelled-out ops.
-    const compiledGeglu = composition.compiledGeglu;
+    const compiledGeglu = true;
     this.layers = Object.freeze(LAYERS.map((_, i) => new DecoderLayer(weights, config, PREFIX, i, i < CACHES, compiledGeglu)));
     this.finalNorm = new RMSNorm(weights.tensor(`${PREFIX}.norm.weight`), t.rmsNormEps);
     this.embedScale = Math.sqrt(t.hiddenSize);
@@ -246,7 +246,7 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
       return disposing(logits, compiledGeglu && !isCompiledTrace()
         ? compiledLogitSoftcap(logits, FINAL_LOGIT_SOFTCAP) : logitSoftcap(logits, FINAL_LOGIT_SOFTCAP));
     };
-    this.#packMixedMlp = composition.packedMixedMlp;
+    this.#packMixedMlp = true;
     this.graphCapabilities = declareGraph({
       media: { input: "embeddings", video: false }, hiddenLayerTaps: true, compiledDecode: true,
     });

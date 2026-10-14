@@ -13,3 +13,5 @@ export * from "./graph";
 export * from "./cache-composition";
 export * from "./capabilities";
 export * from "./media-input";
+
+export { bindGraphCaches, composeGraphCaches } from "./cache-composition";

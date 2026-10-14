@@ -1,3 +1,6 @@
+import type { TestGraph } from "./test-composition";
+import { testGraph } from "./test-composition";
+import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
 import { MlxPhaseDispatch } from "../../src/generation/phase-dispatch";
 // The generated M1 Max graph (src/models/qwen/qwen38-27b-trellis-m1max.ts, an entire graph built from the
 // composition) on small synthetic weights laid out by the generated quant table: 48 DeltaNet and 16 attention layers
@@ -130,9 +133,8 @@ function artifact(): { weights: Weights; config: ModelConfig } {
 
 const composition = (overrides: Partial<Composition> = {}): Composition => Object.freeze<Composition>({
   device: "applegpu_g13s", kv: { kind: "bf16" }, pagedKv: null, draftDepth: { adaptive: true, max: 7 },
-  prefillChunkTokens: CHUNK, adapters: false, maxRows: 8, packedMixedMlp: true,
-  vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
-  grammarJump: false, greedyDraft: false, compiledGeglu: true, compiledSwiglu: true, ...overrides,
+  prefillChunkTokens: CHUNK, maxRows: 8, vectorGreedySampling: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
+  grammarJump: false, greedyDraft: false, ...overrides,
 });
 
 /** The KV schemes the composition serves, as `--kv-quant` composes them (fused SDPA unset). */
@@ -215,14 +217,14 @@ const disposeAll = (...sets: Cache[][]) => { for (const set of sets) for (const 
 
 let synthetic: { weights: Weights; config: ModelConfig } | null = null;
 const source = () => synthetic ??= artifact();
-const built = new Map<string, { current: Qwen38TrellisM1Max; generic: Qwen35Model }>();
-function graphs(scheme: string, overrides: Partial<Composition> = {}): { current: Qwen38TrellisM1Max; generic: Qwen35Model } {
+const built = new Map<string, { current: Qwen38TrellisM1Max; generic: TestGraph<Qwen35Model> }>();
+function graphs(scheme: string, overrides: Partial<Composition> = {}): { current: Qwen38TrellisM1Max; generic: TestGraph<Qwen35Model> } {
   const key = `${scheme} ${JSON.stringify(overrides)}`;
   let found = built.get(key);
   if (!found) {
     const { weights, config } = source();
     const facts = composition({ kv: SCHEMES[scheme]!, ...overrides });
-    found = { current: new Qwen38TrellisM1Max(weights, config, facts), generic: new Qwen35Model(weights, config, facts) };
+    found = { current: new Qwen38TrellisM1Max(weights, config, facts), generic: testGraph(new Qwen35Model(weights, config, phaseRowLimit(facts)), facts) };
     built.set(key, found);
   }
   return found;
@@ -269,7 +271,7 @@ for (const scheme of Object.keys(SCHEMES)) {
     const { current, generic } = graphs(scheme);
     const mine = current.makeCache(), theirs = generic.makeCache();
     const step = (label: string, width: number, rows: number[][],
-      run: (graph: Qwen38TrellisM1Max | Qwen35Model, input: MlxArray, caches: Cache[]) => MlxArray | Promise<MlxArray>) => {
+      run: (graph: Qwen38TrellisM1Max | TestGraph<Qwen35Model>, input: MlxArray, caches: Cache[]) => MlxArray | Promise<MlxArray>) => {
       using input = ids(rows);
       outputDiff(`${scheme} ${label}`, run(current, input, mine) as MlxArray, run(generic, input, theirs) as MlxArray,
         current.logits[width]!, generic.logits[width]!);

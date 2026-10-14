@@ -349,7 +349,7 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph, MlxTokenPhases {
     const genericStep = (layer: Qwen3Layer): Step => (x, cache, phase, mrope, width) => layer.forward(x, cache, phase, mrope, width);
     this.#generic = generic.map(genericStep);
 
-    if (composition.adapters) {
+    if (false) {
       // Every class runs the generic blocks: their QuantizedLinear projections
       // apply the mounted adapters (the one-kernel layers do not).
       this.#one = this.#twoToThree = this.#four = this.#fiveToEight = this.#generic;
@@ -402,7 +402,7 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph, MlxTokenPhases {
     // programs `anePrograms` lists, loaded from the compile cache the install
     // step filled (nothing compiles here).
     let ane: { readonly minRows: number; readonly rows: number; readonly steps: Step[] }[] | null = null;
-    if (neuralEngine && !composition.adapters) {
+    if (neuralEngine && !false) {
       const started = performance.now();
       const affineShares = new Map<string, AneAffineSplit>();
       let mlpShare: AneMlpSplit | undefined;
@@ -425,7 +425,7 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph, MlxTokenPhases {
     }
 
     const targets = new Map<string, QuantizedLinear>();
-    if (composition.adapters) generic.forEach((layer, i) => {
+    if (false) generic.forEach((layer, i) => {
       const p = `${PREFIX}.layers.${i}`;
       if (layer.selfAttn) for (const name of ATTENTION_PROJECTIONS) targets.set(`${p}.self_attn.${name}`, layer.selfAttn[projectionMember[name]]);
       if (layer.linearAttn) for (const name of DELTANET_PROJECTIONS) targets.set(`${p}.linear_attn.${name}`, layer.linearAttn[projectionMember[name]]);
@@ -491,7 +491,7 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph, MlxTokenPhases {
       ? (ids, state) => this.#bounded(wide, embed.encode(ids), state, "committed", null, null, width)
       : (ids, state) => this.#lazy(wide, embed.encode(ids), state, "committed", null, null, width));
     const head = this.lmHead, plain: MlxHeadForward = hidden => head.forward(hidden);
-    if (composition.adapters) this.logits = rowTable(plain);
+    if (false) this.logits = rowTable(plain);
     else {
       const affine4RowsHead = new Affine4RowsLinear(head), affine4MmaHead = new Affine4MmaLinear(head);
       this.logits = rowTableFrom(rows => ({
@@ -502,7 +502,7 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph, MlxTokenPhases {
         9: plain,
       })[rows === 1 ? 1 : rows <= 3 ? 2 : rows === 4 ? 4 : rows <= 8 ? 5 : 9]!, phaseRowLimit(composition));
     }
-    console.error(`[graph] ${this.graph} ${COMPOSITION.fingerprint} ane-prefill=${ane ? "on" : "off"} adapters=${composition.adapters ? "on" : "off"}`);
+    console.error(`[graph] ${this.graph} ${COMPOSITION.fingerprint} ane-prefill=${ane ? "on" : "off"} adapters=${false ? "on" : "off"}`);
 
     bindGraphCaches(this, composition);
   }

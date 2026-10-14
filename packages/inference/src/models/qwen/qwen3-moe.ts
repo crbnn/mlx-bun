@@ -1,5 +1,4 @@
-import { bindGraphCaches } from "../cache-composition";
-import type { MlxCacheLayer, MlxMixedRange } from "../../contracts/mlx/graph";
+import type { MlxCacheLayer, MlxMixedRange, MlxSequenceRange } from "../../contracts/mlx/graph";
 // Concrete model graph for Qwen3-MoE (model_type `qwen3_moe`,
 // Qwen3MoeForCausalLM). A STRAIGHT op-for-op transcription of the oracle
 // (`mlx_lm/models/qwen3_moe.py` +
@@ -27,14 +26,13 @@ import { disposing } from "../../layers/helpers";
 import { compiledSwiglu } from "../../layers/swiglu";
 import { isCompiledTrace } from "../../runtime/compiled-trace";
 import { composedFullAttentionCache } from "../../state/bf16-first-kv";
-import type { Composition } from "../../contracts/portable/composition";
 import { AttentionMasks } from "../../state/attention-read";
 import { denseTurboQuantKernels } from "../../state/turboquant-attention";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import type { MlxRowTable, MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPromptRange, MlxTokenPhases, MlxVerifyForward } from "../../contracts/mlx/graph";
 import { declareGraph } from "../capabilities";
-import { phaseRowLimit,  rowTable, type ReadPhase  } from "../graph";
+import { DEFAULT_PHASE_ROWS,  rowTable, type ReadPhase   } from "../graph";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import { QuantizedLinear } from "../../layers/quantized-linear";
 import { QuantizedSwitchLinear } from "../../layers/quantized-switch-linear";
@@ -234,7 +232,6 @@ class Qwen3MoeDecoderLayer {
 export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
   /** The served configuration this graph was built for: its KV scheme is what `makeCache` composes. */
-  readonly composition: Composition;
   readonly weightsBytes: number;
   readonly prefixBase = "model";
   readonly loraState = new LoraState();
@@ -246,9 +243,8 @@ export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
   /** Untied lm_head (tie_word_embeddings=false for this family). */
   readonly lmHead: QuantizedLinear | null;
 
-  constructor(weights: Weights, config: ModelConfig, composition: Composition) {
+  constructor(weights: Weights, config: ModelConfig, maxPhaseRows = DEFAULT_PHASE_ROWS) {
     this.config = config;
-    this.composition = composition;
     this.weightsBytes = [...weights.shards.files.values()]
       .reduce((a, f) => a + f.mmap.size, 0);
     this.embed = QuantizedEmbedding.load(weights, "model.embed_tokens", config); // nn.Embedding
@@ -266,14 +262,17 @@ export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
     this.prompt = [{ from: 1, to: Infinity, operation: multiSequencePrompt }];
     this.multiSequencePrompt = this.prompt;
     this.appendKnown = rowTable<MlxPhaseForward>((ids, cache) =>
-    this.forwardLayers(this.embed.encode(ids), cache, "window"), phaseRowLimit(composition));
-    this.logits = rowTable<MlxHeadForward>(hidden => this.logitsFromHidden(hidden), phaseRowLimit(composition));
+    this.forwardLayers(this.embed.encode(ids), cache, "window"), maxPhaseRows);
+    this.logits = rowTable<MlxHeadForward>(hidden => this.logitsFromHidden(hidden), maxPhaseRows);
     this.decode = rowTable<MlxPhaseForward>((ids, cache) =>
-    this.forwardLayers(this.embed.encode(ids), cache, "decode"), phaseRowLimit(composition));
+    this.forwardLayers(this.embed.encode(ids), cache, "decode"), maxPhaseRows);
     this.verify = rowTable<MlxVerifyForward>((ids, cache) =>
-    this.forwardLayers(this.embed.encode(ids), cache, "window"), phaseRowLimit(composition));
+    this.forwardLayers(this.embed.encode(ids), cache, "window"), maxPhaseRows);
 
-    bindGraphCaches(this, composition);
+
+    this.sequence = [{from:1,to:Infinity,operation:(ids,cache)=>this.sequenceHidden(ids,cache,1)}];
+
+    this.cacheLayers = this.layers.map(() => ({kind:"full" as const,turboQuant:"dense" as const}));
   }
 
   loraTargets(): Map<string, QuantizedLinear> {
@@ -303,9 +302,9 @@ export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
    * mask per forward, built by the caches). Their TurboQuant read is dense
    * (`denseTurboQuantKernels`): the read decodes keys and values, then runs the
    * fused SDPA. */
-  get cacheLayers(): readonly MlxCacheLayer[] { return this.layers.map(() => ({kind:"full" as const,turboQuant:"dense" as const})); }
+  readonly cacheLayers: readonly MlxCacheLayer[];
+  readonly sequence: readonly MlxSequenceRange[];
 
-  makeCache!: () => Cache[];
 
   /** The scoring forward (`MlxSequenceForward`): the window read at every width. */
   sequenceHidden(ids: MlxArray, cache: Cache[], _width: number): MlxArray {

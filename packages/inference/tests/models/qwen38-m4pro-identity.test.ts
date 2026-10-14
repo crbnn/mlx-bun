@@ -1,3 +1,6 @@
+import type { TestGraph } from "./test-composition";
+import { testGraph } from "./test-composition";
+import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
 import { MlxPhaseDispatch } from "../../src/generation/phase-dispatch";
 // The generated M4 Pro graph (src/models/qwen/qwen38-27b-trellis-m4pro.ts, an entire graph built from the
 // composition) on small synthetic weights laid out by the generated quant table: 48 DeltaNet and 16 attention layers
@@ -128,9 +131,8 @@ function artifact(): { weights: Weights; config: ModelConfig } {
 
 const composition = (overrides: Partial<Composition> = {}): Composition => Object.freeze<Composition>({
   device: "applegpu_g16s", kv: { kind: "bf16" }, pagedKv: null, draftDepth: { adaptive: true, max: 7 },
-  prefillChunkTokens: CHUNK, adapters: false, maxRows: 8, packedMixedMlp: true,
-  vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
-  grammarJump: false, greedyDraft: false, compiledGeglu: true, compiledSwiglu: true, ...overrides,
+  prefillChunkTokens: CHUNK, maxRows: 8, vectorGreedySampling: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
+  grammarJump: false, greedyDraft: false, ...overrides,
 });
 /** The M4 Pro composition's KV scheme (`--kv-quant 4`, fused SDPA unset). */
 const KV4: KvStorageScheme = Object.freeze({ kind: "affine", bits: 4, groupSize: 64, kernels: "unfused" });
@@ -250,7 +252,7 @@ describe("composition", () => {
 describe("the M4 Pro graph against the generic Qwen 3.5 graph where both run the generic blocks (bf16 KV)", () => {
   test("a whole prompt chunk, a prompt tail and a window wider than eight rows", () => {
     const current = graph(), { weights, config } = source();
-    const generic = new Qwen35Model(weights, config, composition());
+    const generic = testGraph(new Qwen35Model(weights, config, phaseRowLimit(composition())), composition());
     const mine = current.makeCache(), theirs = generic.makeCache();
     try {
       {
@@ -274,27 +276,5 @@ describe("the M4 Pro graph against the generic Qwen 3.5 graph where both run the
     } finally { disposeAll(mine, theirs); }
   }, 180_000);
 
-  test("the adapters composition: every operation runs the generic blocks", () => {
-    const { weights, config } = source();
-    const adapters = composition({ adapters: true });
-    const adapted = new Qwen38TrellisM4Pro(weights, config, adapters, false), generic = new Qwen35Model(weights, config, adapters);
-    expect(adapted.loraTargets().size).toBe(48 * 5 + 16 * 4);
-    expect([...adapted.loraTargets().keys()].sort()).toEqual([...generic.loraTargets().keys()].sort());
-    expect(adapted.prompt.filter(range => range.unit === "ane")).toEqual([]);
-    const mine = adapted.makeCache(), theirs = generic.makeCache();
-    try {
-      const steps: [string, number[][], (graph: Qwen38TrellisM4Pro | Qwen35Model, input: MlxArray, caches: Cache[]) => MlxArray][] = [
-        ["prefillChunk.gpu", [prompt(CHUNK, 90)], (g, input, caches) => g.multiSequencePrompt.at(-1)!.operation(input, caches, null) as MlxArray],
-        ["decode.one", [[7]], (g, input, caches) => g.decode[1]!(input, caches, null) as MlxArray],
-        ["verify.twoToThree 3", [prompt(3, 91)], (g, input, caches) => g.verify[2]!(input, caches, null) as MlxArray],
-        ["verify.four 4", [prompt(4, 93)], (g, input, caches) => g.verify[4]!(input, caches, null) as MlxArray],
-        ["verify.fiveToEight 6", [prompt(6, 92)], (g, input, caches) => g.verify[5]!(input, caches, null) as MlxArray],
-      ];
-      for (const [label, rows, run] of steps) {
-        using input = ids(rows);
-        outputDiff(`adapters ${label}`, run(adapted, input, mine), run(generic, input, theirs), adapted.logits[1]!, generic.logits[1]!);
-        stateDiff(`adapters ${label}`, mine, theirs);
-      }
-    } finally { disposeAll(mine, theirs); }
-  }, 180_000);
+
 });

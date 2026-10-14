@@ -284,7 +284,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
     const genericStep = (layer: Qwen3Layer): Step => (x, cache, phase, mrope, width) => layer.forward(x, cache, phase, mrope, width);
     this.#generic = generic.map(genericStep);
     this.#layers = generic;
-    this.#packMixedMlp = composition.packedMixedMlp;
+    this.#packMixedMlp = true;
 
     // Every class's attention and DeltaNet projections are the generic blocks' QuantizedLinear, which apply
     // mounted adapters: no class changes with them.
@@ -383,7 +383,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
     });
     const head = this.lmHead, plain: MlxHeadForward = hidden => head.forward(hidden);
     this.logits = rowTable(plain);
-    console.error(`[graph] ${this.graph} ${COMPOSITION.fingerprint} adapters=${composition.adapters ? "on" : "off"}`);
+    console.error(`[graph] ${this.graph} ${COMPOSITION.fingerprint} adapters=${false ? "on" : "off"}`);
 
     bindGraphCaches(this, composition);
   }

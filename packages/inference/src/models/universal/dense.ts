@@ -1,5 +1,4 @@
-import { bindGraphCaches } from "../cache-composition";
-import type { MlxCacheLayer, MlxMixedRange } from "../../contracts/mlx/graph";
+import type { MlxCacheLayer, MlxMixedRange, MlxSequenceRange } from "../../contracts/mlx/graph";
 // UniversalDense — the Tier-0 config-driven dense llama-family module
 // (`02d723a:docs/design/generic-model-support.md` §4.1). One module, shaped exactly
 // like qwen3.ts, with every arch delta selected by the UniversalArgs
@@ -21,7 +20,6 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { logitSoftcap } from "../../kernels/logits";
 import { disposing } from "../../layers/helpers";
 import { composedFullAttentionCache, composedSlidingAttentionCache } from "../../state/bf16-first-kv";
-import type { Composition } from "../../contracts/portable/composition";
 import { AttentionMasks } from "../../state/attention-read";
 import { softcapAttentionReads } from "../../state/softcap-attention";
 import { denseTurboQuantKernels } from "../../state/turboquant-attention";
@@ -29,7 +27,7 @@ import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import type { MlxRowTable, MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPromptRange, MlxTokenPhases, MlxVerifyForward } from "../../contracts/mlx/graph";
 import { ORDINARY_VERIFICATION, declareGraph } from "../capabilities";
-import { phaseRowLimit,  rowTable, type ReadPhase  } from "../graph";
+import { DEFAULT_PHASE_ROWS,  rowTable, type ReadPhase   } from "../graph";
 import type { QuantizedLinear } from "../../layers/quantized-linear";
 import { TrellisLinear } from "../../layers/trellis-linear";
 import { RMSNorm } from "../../layers/normalization";
@@ -444,7 +442,6 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
   readonly args: UniversalArgs;
   /** The served configuration this graph was built for: its KV scheme is what `makeCache` composes. */
-  readonly composition: Composition;
   readonly weightsBytes: number;
   readonly prefixBase = "model";
   readonly loraState = new LoraState();
@@ -466,13 +463,12 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
   // bound at construction; later edits to `args` cannot make them disagree.
   readonly #cacheWindows: readonly (number | null)[];
 
-  constructor(weights: Weights, config: ModelConfig, composition: Composition, args?: UniversalArgs) {
+  constructor(weights: Weights, config: ModelConfig, args?: UniversalArgs, maxPhaseRows = DEFAULT_PHASE_ROWS) {
     const a = args ?? genericArgsFor(config);
     if (!a)
       throw new Error(`UniversalDenseModel: no descriptor for model_type ${config.modelType}`);
     this.config = config;
     this.args = a;
-    this.composition = composition;
     this.#cacheWindows = universalCacheWindows(a);
     // Each layer's read: the cache's own read, or the softcapped read over plain
     // KV with the layer group's window (gemma2: create_attention_mask(...,
@@ -519,14 +515,17 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
     this.prompt = [{ from: 1, to: Infinity, operation: multiSequencePrompt }];
     this.multiSequencePrompt = this.prompt;
     this.appendKnown = rowTable<MlxPhaseForward>((ids, cache) =>
-    this.forwardLayers(this.#embed(ids), cache, "window"), phaseRowLimit(composition));
-    this.logits = rowTable<MlxHeadForward>(hidden => this.logitsFromHidden(hidden), phaseRowLimit(composition));
+    this.forwardLayers(this.#embed(ids), cache, "window"), maxPhaseRows);
+    this.logits = rowTable<MlxHeadForward>(hidden => this.logitsFromHidden(hidden), maxPhaseRows);
     this.decode = rowTable<MlxPhaseForward>((ids, cache) =>
-    this.forwardLayers(this.#embed(ids), cache, "decode"), phaseRowLimit(composition));
+    this.forwardLayers(this.#embed(ids), cache, "decode"), maxPhaseRows);
     this.verify = rowTable<MlxVerifyForward>((ids, cache) =>
-    this.forwardLayers(this.#embed(ids), cache, "window"), phaseRowLimit(composition));
+    this.forwardLayers(this.#embed(ids), cache, "window"), maxPhaseRows);
 
-    bindGraphCaches(this, composition);
+
+    this.sequence = [{from:1,to:Infinity,operation:(ids,cache)=>this.sequenceHidden(ids,cache,1)}];
+
+    this.cacheLayers = this.#cacheWindows.map(window=>window ? {kind:"sliding" as const,window}:{kind:"full" as const,turboQuant:"dense" as const});
   }
 
   /** LoRA hot-swap targets — quantized linears only (dense checkpoints
@@ -559,9 +558,9 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
    * one mask memo. The full-attention caches' TurboQuant read is dense
    * (`denseTurboQuantKernels`): the read decodes keys and values first (the
    * softcapped read attends the decoded window). */
-  get cacheLayers(): readonly MlxCacheLayer[] { return this.#cacheWindows.map(window=>window ? {kind:"sliding" as const,window}:{kind:"full" as const,turboQuant:"dense" as const}); }
+  readonly cacheLayers: readonly MlxCacheLayer[];
+  readonly sequence: readonly MlxSequenceRange[];
 
-  makeCache!: () => Cache[];
 
   /** The scoring forward (`MlxSequenceForward`): the window read at every width. */
   sequenceHidden(ids: MlxArray, cache: Cache[], _width: number): MlxArray {

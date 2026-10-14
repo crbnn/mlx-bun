@@ -40,9 +40,8 @@ const on = (device: string, config: ModelConfig, request: CompositionRequest = {
 describe("a graph table", () => {
   const entry = (id: string, serves: ServedComposition): GraphEntry<null, string> => ({ id, serves, create: () => id });
   const composition = (fields: Partial<Composition> = {}): Composition => ({ device: M4_PRO, kv: { kind: "bf16" }, pagedKv: null,
-    draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 8, packedMixedMlp: true,
-    vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
-    grammarJump: false, greedyDraft: false, compiledGeglu: true, compiledSwiglu: true, ...fields });
+    draftDepth: 0, prefillChunkTokens: 2048, maxRows: 8, vectorGreedySampling: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
+    grammarJump: false, greedyDraft: false, ...fields });
 
   test("the most constrained entry the composition meets wins; the generic entry serves the rest", () => {
     const table = new GraphTable([
@@ -84,7 +83,7 @@ describe("a graph table", () => {
     expect(table.match(undefined, composition({ draftDepth: 8, maxRows: 4 })).id).toBe("verify");
     expect(table.match(undefined, composition({ device: M1_MAX, draftDepth: { adaptive: true, max: 7 } })).id).toBe("depth");
     expect(table.match(undefined, composition({ device: M1_MAX, draftDepth: 7 })).id).toBe("generic");
-    expect(table.match(undefined, composition({ device: M1_MAX, prefillChunkTokens: 512, adapters: true })).id).toBe("chunk");
+    expect(table.match(undefined, composition({ device: M1_MAX, prefillChunkTokens: 512 })).id).toBe("chunk");
     expect(table.match(undefined, composition({ device: M1_MAX, prefillChunkTokens: 512 })).id).toBe("chunk");
     // Per-layer schemes compare layer by layer, in any order.
     expect(table.match(undefined, composition({ device: "applegpu_g15s",
@@ -141,7 +140,7 @@ describe("the Qwen 3.5 table", () => {
     expect(select(on(M4_PRO, qwen, { kv: { override: 4, quantizedKvStart: 512 } }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     for (const fusedSdpa of [true, false])
       expect(select(on(M4_PRO, qwen, { kv: { override: 4, fusedSdpa } }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
-    expect(select(on(M4_PRO, qwen, { adapters: true }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
+    expect(select(on(M4_PRO, qwen, {}))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     expect(select(on(M4_PRO, qwen, { maxRows: 1, draft: { numDraftTokens: 3 } }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     expect(select({ ...on(M4_PRO, qwen, { draft: { numDraftTokens: 7, adaptive: true } }), prefillChunkTokens: 512 }))
       .toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
@@ -161,7 +160,7 @@ describe("the Qwen 3.5 table", () => {
     expect(select(on(M1_MAX, qwen))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
     expect(select(on(M1_MAX, qwen, { kv: { override: 8 } }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
     expect(select(on(M1_MAX, qwen, { kv: { override: 4 }, maxRows: 16 }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
-    expect(select(on(M1_MAX, qwen, { kv: { turboQuant: { kBits: 8, vBits: 3 } }, adapters: true }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
+    expect(select(on(M1_MAX, qwen, { kv: { turboQuant: { kBits: 8, vBits: 3 } } }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
     expect(select(on("applegpu_g15s", qwen))).toBe("qwen3.5");
   });
 
@@ -204,7 +203,7 @@ describe("the Gemma 4 table", () => {
       // `--fused-sdpa` names the read kernels its caches compose, not another graph.
       for (const fusedSdpa of [true, false]) expect(pick({ kv: { override: "config", fusedSdpa } })).toBe(stem);
       // Selection does not depend on the device, rows or adapters for these entries.
-      expect(table.select(config, on(M1_MAX, config, { kv: { override: "config" }, maxRows: 32, adapters: true })).id).toBe(stem);
+      expect(table.select(config, on(M1_MAX, config, { kv: { override: "config" }, maxRows: 32 })).id).toBe(stem);
       for (const other of [{}, { kv: { override: "off" as const } }, { kv: { override: 4 } }, { kv: { override: 8 } },
         { kv: { turboQuant: { kBits: 8, vBits: 3 } } }]) expect(pick(other)).toBe("gemma4");
     });

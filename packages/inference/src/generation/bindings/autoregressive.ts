@@ -1,3 +1,4 @@
+import { pagedDecodeCompiles } from "../../state/paged/cache";
 import type { GraphDescriptor } from "../../contracts/portable/graph";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { Cache } from "../../contracts/mlx/cache";
@@ -65,7 +66,7 @@ export interface MlxAutoregressiveBinding {
 export function bindMlxAutoregressiveGraph(model: MlxTokenGraph): MlxAutoregressiveBinding {
   const runtime = runtimeConfig();
   const facts = model.composition ?? COMPOSITION_DEFAULTS;
-  const compiledOn = facts.compiledDecode;
+  const compiledOn = (!model.composition?.pagedKv || pagedDecodeCompiles(model.composition.pagedKv, model.composition.kv));
   return {
     runtime,
     prefillPolicy: resolveMlxPrefillPolicy(model, runtime),

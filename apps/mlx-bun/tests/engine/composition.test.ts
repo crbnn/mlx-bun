@@ -41,9 +41,8 @@ test("a loaded model records the composition resolved before its graph was built
   try {
     expect(context.composition).toEqual({ device: deviceArchitecture(),
       kv: { kind: "affine", bits: 8, groupSize: 64, kernels: "unfused" }, pagedKv: null,
-      draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 3, packedMixedMlp: true,
-      vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
-      grammarJump: false, greedyDraft: false, compiledGeglu: true, compiledSwiglu: true });
+      draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 3, vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
+      grammarJump: false, greedyDraft: false });
     const binding = await modelServingBinding(context);
     expect(binding.diagnostics()).toEqual({ composition: { device: deviceArchitecture(),
       kv: { kind: "affine", bits: 8, group_size: 64, kernels: "unfused" }, paged_kv: null, draft_depth: 0, prefill_chunk_tokens: 2048,

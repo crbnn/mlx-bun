@@ -1,3 +1,5 @@
+import { bindGraphCaches } from "../../../src/models/cache-composition";
+import { GLM52_F32_CACHES } from "../../../src/models/glm52/model";
 import { MlxPhaseDispatch } from "../../../src/generation/phase-dispatch";
 // GLM-5.2's graph over synthetic weights, held to its recorded digest
 // (tests/fixtures/synthetic-digests/glm52.json; tests/models/synthetic-digest.ts):
@@ -197,7 +199,7 @@ for (const dsa of [true, false]) describe(`GLM-5.2 graph (DSA ${dsa ? "on" : "of
   const config = { modelType: "glm_moe_dsa", text: { numHiddenLayers: LAYERS }, eosTokenIds: [1] } as unknown as ModelConfig;
   const weights = new SyntheticWeights(glm);
   const capabilities = { dsa, mtpMetadata: true, mtpEnabled: true, mtpDraftTokens: 3 };
-  const graph = new Glm52Model(weights, config, glm, capabilities);
+  const graph = bindGraphCaches(new Glm52Model(weights, config, glm, capabilities), GLM52_F32_CACHES);
   const scenario = `DSA ${dsa ? "on" : "off"}`;
   afterAll(() => weights.dispose());
 
@@ -310,9 +312,9 @@ for (const dsa of [true, false]) describe(`GLM-5.2 latent legos (DSA ${dsa ? "on
   const config = { modelType: "glm_moe_dsa", text: { numHiddenLayers: LAYERS }, eosTokenIds: [1] } as unknown as ModelConfig;
   const weights = new SyntheticWeights(glm);
   const capabilities = { dsa, mtpMetadata: true, mtpEnabled: true, mtpDraftTokens: 3 };
-  const plain = new Glm52Model(weights, config, glm, capabilities);
-  const composed = (kv: KvStorageScheme, paged: boolean) => new Glm52Model(weights, config, glm, capabilities, null, null,
-    "exact", 0, { kv, pagedKv: paged ? { blockSize: 4 } : null });
+  const plain = bindGraphCaches(new Glm52Model(weights, config, glm, capabilities), GLM52_F32_CACHES);
+  const composed = (kv: KvStorageScheme, paged: boolean) => bindGraphCaches(new Glm52Model(weights, config, glm, capabilities, null, null,
+    "exact", 0), { kv, pagedKv: paged ? { blockSize: 4 } : null });
   const scenario = `latent legos DSA ${dsa ? "on" : "off"}`;
   afterAll(() => weights.dispose());
   /** The phases of one sequence, then two merged rows: [phase, rows of ids]. */

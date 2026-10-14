@@ -1,3 +1,5 @@
+import { testGraph } from "./test-composition";
+import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
 // DiffusionGemma's graph over small synthetic weights, held to its recorded
 // digest (tests/fixtures/synthetic-digests/diffusion-gemma.json;
 // tests/models/synthetic-digest.ts): six layers (sliding, sliding, full,
@@ -153,7 +155,7 @@ function artifact(): { weights: Weights; config: ModelConfig } {
 
 const digests = syntheticDigests("diffusion-gemma");
 const { weights, config } = artifact();
-const current = new DiffusionGemmaModel(weights, config, testComposition());
+const current = testGraph(new DiffusionGemmaModel(weights, config), testComposition());
 
 /** Same shape, dtype and bytes; both owned by the caller and disposed here. */
 function expectSame(label: string, actual: MlxArray, expected: MlxArray): void {
@@ -312,7 +314,7 @@ for (const run of runs) digests.test(`seeded generation, ${run.label}: the denoi
 // continuations. The quantized forms have no oracle: their canvas logits are
 // compared with the bf16 graph's on the same canvases, by KL, and reported.
 const composedGraph = (kv: KvStorageScheme, paged: boolean) =>
-  new DiffusionGemmaModel(weights, config, testComposition(kv, paged ? { pagedKv: { blockSize: 16, direct: false } } : {}));
+  testGraph(new DiffusionGemmaModel(weights, config), testComposition(kv, paged ? { pagedKv: { blockSize: 16, direct: false } } : {}));
 
 test("the composition's paging: paged bf16 canvas passes equal the bf16 lego's", () => {
   const paged = composedGraph({ kind: "bf16" }, true);

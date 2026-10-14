@@ -1,3 +1,5 @@
+import { testGraph } from "../models/test-composition";
+import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
 // Generated Gemma4 graphs against the dedicated graph on real weights. A
 // generated graph (12B, e4b or 26B, selected by config fingerprint) is an entire
 // graph built for the artifact's kv_config composition; it composes that
@@ -124,7 +126,7 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the generic graph under kv_c
     return caches;
   };
   try {
-    mono = new Gemma4Model(weights, config, resolveComposition(config));
+    mono = testGraph(new Gemma4Model(weights, config, phaseRowLimit(resolveComposition(config))), resolveComposition(config));
     gen = createModel(weights, config, resolveComposition(config, { kv: { override: "config" } }));
     expect(gen).toBeInstanceOf(generated.GeneratedGemma4);
     // An entire graph: no class to fall back to.
@@ -160,7 +162,7 @@ test.skipIf(!inputs)("generated Gemma4 graph equals the generic graph under kv_c
     // 2. Greedy trajectories under the kv_config composition, uncompiled and compiled: both
     // graphs composed with the artifact's per-layer scheme, each reading its own caches.
     const configComposition = resolveComposition(config, { kv: { override: "config", quantizedKvStart: 0 } });
-    const configured = { mono: new Gemma4Model(weights, config, configComposition), gen: createModel(weights, config, configComposition) as A };
+    const configured = { mono: testGraph(new Gemma4Model(weights, config, phaseRowLimit(configComposition)), configComposition), gen: createModel(weights, config, configComposition) as A };
     expect(configured.gen).toBeInstanceOf(generated.GeneratedGemma4);
     try {
       for (const compiled of [false, true]) {
