@@ -88,6 +88,17 @@ interface AheadStep {
   readonly rows: readonly Row[];
 }
 
+/** A probe drafted without a verify round: proposals [B, depth] from each row's input to a step without drafts,
+ *  compared with the target's samples as the following steps deliver them. `seen` counts each row's samples compared
+ *  so far; a row leaves it at its first mismatch or after `depth` matches, when the gate observes it. */
+interface ShadowProbe {
+  tokens: MlxArray | null;
+  proposals: Map<Row, readonly number[]> | null;
+  readonly rows: readonly Row[];
+  readonly depth: number;
+  readonly seen: Map<Row, number>;
+}
+
 /** How one delivered sample left its row: still decoding, or ended. */
 type StepOutcome = { readonly kind: "continue" } | { readonly kind: "stop" | "length" } |
   { readonly kind: "cancelled"; readonly reason: unknown } | { readonly kind: "failed"; readonly error: unknown };
@@ -113,6 +124,8 @@ class SpeculativeGroup implements MlxGroupedMethod {
   #steps = 0;
   /** The step without drafts in flight, when the last round was one. */
   #ahead: AheadStep | null = null;
+  /** The probe the steps without drafts are comparing, if any. */
+  #shadow: ShadowProbe | null = null;
   /** Adaptive draft depth: each round's depth comes from the decayed
    *  acceptance rate and the graph's measured verify costs. */
   readonly #gate: AdaptiveDraftGate | null;
@@ -395,7 +408,10 @@ class SpeculativeGroup implements MlxGroupedMethod {
     // A round without drafts verifies the pending token alone (one plain decode step) and still advances the
     // drafter's context through its commit; rows that sample on the device pipeline such rounds as plain decode does.
     let depth = this.#gate && cap > 0 ? this.#gate.next(cap) : cap;
-    if (depth === 0 && this.#pipelinesZero(rows)) return this.#zeroStep(rows, work);
+    // A probe from a drafter that can propose without committing is compared with the samples instead of verified.
+    const shadow = depth > 0 && this.#gate?.probing && this.#draft!.preview && !this.#shadow ? cap : 0;
+    if ((depth === 0 || shadow) && this.#pipelinesZero(rows)) return this.#zeroStep(rows, work, shadow);
+    this.#settleShadow();
     if (this.#ahead) {
       await this.#flushAhead();
       rows = [...this.host.rows];
@@ -561,7 +577,7 @@ class SpeculativeGroup implements MlxGroupedMethod {
    *  commit its taps to the drafter, rows that end drop it (`bindRowStepRollback`), so a finished row's state covers
    *  exactly the tokens it processed, as after an unpipelined round. A graph or state failure throws and discards
    *  the group. */
-  async #zeroStep(rows: readonly Row[], work: MlxForwardWork | undefined): Promise<void> {
+  async #zeroStep(rows: readonly Row[], work: MlxForwardWork | undefined, shadow = 0): Promise<void> {
     // A round for every row, which delivers the sample in flight; the forward runs unless every row has drawn its last.
     const forward = !this.#ahead || rows.some(row => row.sampled < row.req.maxTokens);
     for (const row of rows) {
@@ -608,6 +624,9 @@ class SpeculativeGroup implements MlxGroupedMethod {
           context.dispose(); tokens.dispose();
           context = keptContext; tokens = keptTokens;
         }
+        // A probe drafts from the kept inputs before their taps join the drafter's context, as a round would.
+        if (shadow) this.#previewShadow(keep.map(index => rows[index]!), keep.map(index => inputs[index]!),
+          shadow, keep.map(index => steps[index]!));
         // The drafter takes the kept inputs as a round's pending tokens, then their taps.
         await this.#draft!.draft(keep.map(index => inputs[index]!), 0, keep.map(index => steps[index]!));
         await this.#draft!.commit(keep.map(() => 0), context);
@@ -641,8 +660,43 @@ class SpeculativeGroup implements MlxGroupedMethod {
 
   /** Deliver one verified sample of a step without drafts, as a round delivers its window: an EOS ends the row
    *  unpublished, a consumer may stop it, and its budget ends it. */
+  /** Start a probe: each row's proposals from `pending`, left on the device and submitted behind the step in flight. */
+  #previewShadow(rows: readonly Row[], pending: readonly number[], depth: number, steps: readonly number[]): void {
+    const tokens = this.#draft!.preview!(pending, depth, steps);
+    if (!tokens) return;
+    ops.asyncEvalAll([tokens]);
+    this.#shadow = { tokens, proposals: null, rows, depth: tokens.shape[1]!, seen: new Map(rows.map(row => [row, 0])) };
+  }
+
+  /** Compare one delivered sample with its row's probe; the gate observes the row at its first mismatch or after
+   *  every proposal matched. */
+  #compareShadow(row: Row, token: number): void {
+    const shadow = this.#shadow, seen = shadow?.seen.get(row);
+    if (!shadow || seen === undefined) return;
+    if (!shadow.proposals) {
+      const read = shadow.tokens!.toIntTokens();
+      shadow.tokens!.dispose(); shadow.tokens = null;
+      shadow.proposals = new Map(shadow.rows.map((probed, index) => [probed, read.slice(index * shadow.depth, (index + 1) * shadow.depth)]));
+    }
+    const matched = shadow.proposals.get(row)![seen] === token;
+    if (matched && seen + 1 < shadow.depth) { shadow.seen.set(row, seen + 1); return; }
+    this.#gate?.observe(shadow.depth, matched ? shadow.depth : seen);
+    shadow.seen.delete(row);
+    if (!shadow.seen.size) this.#settleShadow();
+  }
+
+  /** End the probe: rows still matching are observed over the samples they compared. */
+  #settleShadow(): void {
+    const shadow = this.#shadow;
+    if (!shadow) return;
+    this.#shadow = null;
+    shadow.tokens?.dispose();
+    for (const seen of shadow.seen.values()) if (seen > 0) this.#gate?.observe(seen, seen);
+  }
+
   async #deliverSample(row: Row, token: number): Promise<StepOutcome> {
     if (row.req.signal?.aborted) return { kind: "cancelled", reason: row.req.signal.reason };
+    this.#compareShadow(row, token);
     if (row.req.eosTokenIds.includes(token)) {
       if (row.generated < row.req.maxTokens) row.generated++;
       return { kind: "stop" };
@@ -724,6 +778,8 @@ class SpeculativeGroup implements MlxGroupedMethod {
   dispose(): void {
     this.#ahead?.tokens.dispose();
     this.#ahead = null;
+    this.#shadow?.tokens?.dispose();
+    this.#shadow = null;
     for (const request of this.#requests.values()) this.#settleEcho(request);
     const resources = [...(this.#target ? [this.#target] : []), ...(this.#draft ? [this.#draft] : []),
       ...[...this.#requests.values()].flatMap(request => [request.sampling, { dispose: () => request.retain?.() }])];

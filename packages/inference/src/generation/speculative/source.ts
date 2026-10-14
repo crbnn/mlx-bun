@@ -65,6 +65,10 @@ export interface DraftRowGroup extends MlxDraftRows {
    * Context and tokens are borrowed rectangular windows; lengths retain each
    * row's consumed prefix, excluding right padding and the pending output. */
   consume?(tokens: MlxArray, context: MlxArray, lengths: readonly number[]): void | Promise<void>;
+  /** Optional: the proposals `draftDevice` would make from `pending` [B, depth], owned and left on the device,
+   *  without changing the rows' state, so a method can compare them with the target's own next samples instead of
+   *  verifying them. Absent where drafting advances the drafter's own state (a recurrent head). */
+  preview?(pending: readonly number[], depth: number, steps: readonly number[]): MlxArray | null;
   readonly namespace: string;
   readonly tapLayers: readonly number[];
   readonly rowCount: number;

@@ -13,6 +13,8 @@ import { kvOf } from "../models/test-composition";
 import type { RuntimeModel } from "../../src/models/factory";
 import { captureKvAttention } from "../../src/state/kv-attention-view";
 import { NgramProvider } from "../../src/generation/speculative/sources/ngram-source";
+import { projectedDraftGroups } from "../../src/generation/speculative/bindings/projected-draft-rows";
+import type { DraftProvider } from "../../src/generation/speculative/source";
 import { PromptCache } from "../../src/state/prefix-cache";
 import { KvCacheService } from "../../src/state/cache-service";
 import { runtimeConfig } from "../../src/runtime/config";
@@ -22,9 +24,28 @@ import type { MlxArray } from "@mlx-bun/mlx/array";
 import { declareGraph } from "../../src/models/capabilities";
 import { stubPhases } from "../models/phase-forward";
 
-const VOCABULARY = 64;
+const VOCABULARY = 256;
 
-function fixture() {
+/** A block drafter (projected context rows, as DFlash 2 drafts) that proposes `pending + 1 + offset`, ...: right at
+ *  offset 0 for the successor head, wrong otherwise. Its rows draft without committing, so they can preview. */
+function successorDrafter(offset: { value: number }) {
+  return { id: "successor", grouped: projectedDraftGroups("successor-v1", [], () => ({
+    namespace: "successor-v1", schema: "successor-v1", layers: 1,
+    project(hidden: MlxArray) {
+      using rows = ops.reshape(hidden, [hidden.shape[0]!, 1, hidden.shape[1]!, 1]);
+      using values = rows.astype(Dtype.float32);
+      return [{ k: ops.copyOf(values), v: ops.copyOf(values) }];
+    },
+    draft: () => { throw new Error("successor drafts on the device"); },
+    draftDevice(_context: unknown, pending: readonly number[], _positions: unknown, depth: number) {
+      return ops.fromInt32(pending.flatMap(token => Array.from({ length: depth }, (_, i) => token + 1 + i + offset.value)),
+        [pending.length, depth]);
+    },
+  })), dispose() {} };
+}
+
+function fixture(provider: Pick<DraftProvider, "id" | "grouped"> & { dispose(): void } = new NgramProvider(),
+  costs: [number, number][] = [[1, 1], [2, 50], [3, 60]]) {
   /** Each forward's input ids, read after the step ran (reading them earlier would end the pipelining). */
   const inputs: MlxArray[] = [];
   const puts: { tokens: number[]; offset: number }[] = [];
@@ -32,8 +53,8 @@ function fixture() {
   const failures: { row: Row; error: unknown }[] = [], joined: Row[] = [];
   const scheme = kvOf({});
   const model = { config: { modelType: "fixture", eosTokenIds: [] }, graphCapabilities: declareGraph(),
-    // Drafting never pays: a two-position window costs fifty one-position steps.
-    verifyRoundCosts: new Map([[1, 1], [2, 50], [3, 60]]),
+    // By default drafting never pays: a two-position window costs fifty one-position steps.
+    verifyRoundCosts: new Map(costs),
     makeCache: () => [composedFullAttentionCache(scheme, 0, new AttentionMasks(), denseTurboQuantKernels)],
     ...stubPhases((ids: MlxArray, caches: Cache[]) => {
       inputs.push(ops.copyOf(ids));
@@ -57,7 +78,6 @@ function fixture() {
       puts.push({ tokens: [...tokens], offset: caches[0]!.offset });
       cache.put(tokens, caches, namespace, retain, attachments);
     } };
-  const provider = new NgramProvider();
   const host: MlxGroupMethodHost = { rows: joined, runtime: runtimeConfig(), prefillChunkSize: 8, prefillTailSplit: true,
     kvMaintenance: undefined, cache: new KvCacheService(model, { prefixes: prefixes as PromptCache }),
     join(row) { joined.push(row); },
@@ -177,6 +197,31 @@ test("a row that joins while a step is in flight waits for its delivery; both co
     expect(f.published.get(b)).toEqual([33, 34, 35, 36]);
     expect(f.puts.filter(put => put.tokens[0] === 1).at(-1)).toEqual({ tokens: [1, 2, 3, 4, 5, 6, 7, 8, 9], offset: 9 });
     expect(f.puts.filter(put => put.tokens[0] === 30).at(-1)).toEqual({ tokens: [30, 31, 32, 33, 34, 35], offset: 6 });
+    expect(f.failures).toEqual([]);
+  } finally { f.dispose(); }
+});
+
+test("a drafter that previews probes without verify windows, and drafts again once its previews match", async () => {
+  const offset = { value: 5 };
+  // Drafting pays when the drafts are right: three positions cost 1.5 steps.
+  const f = fixture(successorDrafter(offset), [[1, 1], [2, 1.4], [3, 1.5]]);
+  const a = f.row([1, 2, 3, 4], { maxTokens: 160 });
+  try {
+    const first = f.method.prepare(a);
+    try { await drain(first); } finally { first.dispose(); }
+    // Wrong drafts: the optimistic first rounds fail and the gate stops drafting.
+    for (let advance = 0; advance < 30; advance++) await f.method.advance();
+    const settled = f.read().length;
+    expect(f.read().some(ids => ids.length > 1)).toBe(true);
+    for (let advance = 0; advance < 20; advance++) await f.method.advance();
+    // Its probes compare previews with the samples: every forward since is one decode position.
+    expect(f.read().slice(settled).every(ids => ids.length === 1)).toBe(true);
+    // Right drafts: a probe's preview matches and verify windows return.
+    offset.value = 0;
+    while (f.joined.length) await f.method.advance();
+    expect(f.read().slice(settled).some(ids => ids.length > 1)).toBe(true);
+    // Every token is the successor head's, whatever the drafts were.
+    expect(f.published.get(a)).toEqual(Array.from({ length: 160 }, (_, i) => 5 + i));
     expect(f.failures).toEqual([]);
   } finally { f.dispose(); }
 });

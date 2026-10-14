@@ -50,11 +50,13 @@ round costs 2.01 plain decode steps (1.30 on the M4 Pro) and eight rows 2.96 (1.
 factored, matrix-unit and split-K affine kernels, the one-row bit-field reads and the drafter
 kernels the graph declares since 2026-10-13; verify windows above eight rows still take the generic
 blocks (about 0.9 s at 12 to 16 rows); DFlash 2 adaptive on that chip (in-process serve, four
-prompts, 192 tokens) decodes greedy text at 24.0 against 18.3 tok/s plain, 21.5 against 17.9 under
-Qwen's instruct sampling and 18.9 against 17.9 under its thinking sampling; the adaptive gate drafts
-nothing where drafting does not pay (such rounds are the pipelined decode step), and on text it
-drafts poorly (the short-story prompt) still trails plain decode by 2 to 6% (its first rounds draft
-on an optimistic prior and every probe of one draft costs two steps); its
+prompts, 192 tokens) decodes greedy text at 24.1 against 18.3 tok/s plain, 21.7 against 17.9 under
+Qwen's instruct sampling and 19.4 against 17.9 under its thinking sampling, the MTP head (adaptive up
+to four drafts) at 20.3, 18.8 and 17.8; the adaptive gate drafts nothing where drafting does not pay
+(such rounds are the pipelined decode step), yet on text the drafter predicts poorly (the
+short-story prompt) greedy and instruct decoding still trail plain decode by 2 to 3% (the first
+rounds draft on an optimistic prior, instruct rounds sample on the host, and MTP's rounds without
+drafts still advance its head); its
 per-row verify costs ignore how many requests are batched; the M1 Max composition prefills 1k and
 8k-token prompts at about 175 tok/s (2026-10-13, alternated sessions of the graph's own prefill
 operations, against 129 to 130 before its dense-GEMM prompt projections and Neural Engine MLP split;

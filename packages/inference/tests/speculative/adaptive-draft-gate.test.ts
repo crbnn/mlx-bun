@@ -47,7 +47,9 @@ describe("adaptive speculative draft gate", () => {
     const gate = new AdaptiveDraftGate(new Map([[1, 1], [2, 1.9], [3, 2.3]]), { maxDraftTokens: 2, probeInterval: 3,
       maxProbeInterval: 24 });
     for (let i = 0; i < 32; i++) gate.observe(2, 0);
-    expect([gate.next(2), gate.next(2), gate.next(2), gate.next(2), gate.next(2)]).toEqual([0, 0, 0, 1, 0]);
+    const probes: boolean[] = [];
+    expect([0, 1, 2, 3, 4].map(() => { const depth = gate.next(2); probes.push(gate.probing); return depth; })).toEqual([0, 0, 0, 1, 0]);
+    expect(probes).toEqual([false, false, false, true, false]);
     // The probe was rejected: the run before the next one doubles, then doubles again, up to its cap.
     gate.observe(1, 0);
     const runs: number[] = [];

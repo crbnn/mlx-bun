@@ -64,6 +64,7 @@ export class AdaptiveDraftGate {
   /** Rounds in a row `next` has run without drafts, and the rounds before its next probe. */
   #idle = 0;
   #interval: number;
+  #probing = false;
 
   constructor(readonly costs: VerifyCostModel, options: AdaptiveDraftGateOptions) {
     this.#maxDraftTokens = options.maxDraftTokens;
@@ -130,13 +131,19 @@ export class AdaptiveDraftGate {
    *  drafting nothing, up to `maxProbeInterval`: a probe costs more than the plain step it replaces, so text that
    *  stays hard to draft pays for fewer of them. */
   next(budget: number): number {
+    this.#probing = false;
     const depth = this.choose(budget);
     if (depth > 0 || budget < 1) { this.#idle = 0; this.#interval = this.#probeInterval; return depth; }
     if (++this.#idle <= this.#interval) return 0;
     this.#idle = 0;
     this.#interval = Math.min(2 * this.#interval, this.#maxProbeInterval);
+    this.#probing = true;
     return 1;
   }
+
+  /** Whether the depth `next` last returned is a probe: drafts the estimate does not pay for, drafted only to observe
+   *  acceptance. A drafter that can propose without committing may observe them without a verify round. */
+  get probing(): boolean { return this.#probing; }
 
   choose(budget: number): number {
     const limit = Math.min(this.#maxDraftTokens, budget);

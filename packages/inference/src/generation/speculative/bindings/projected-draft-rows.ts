@@ -74,6 +74,9 @@ class ProjectedDraftRows implements DraftPrefillGroup, DraftRowGroup {
       return { tokens, resolve: read => pending.map((_, row) => read.slice(row * width, (row + 1) * width)) };
     } finally { donors.dispose(); }
   }
+  preview(pending: readonly number[], depth: number): MlxArray | null {
+    return this.draftDevice(pending, depth)?.tokens ?? null;
+  }
   commit(accepted: readonly number[], hidden: MlxArray): void {
     this.context.append(hidden, accepted.map(count => count + 1));
   }
