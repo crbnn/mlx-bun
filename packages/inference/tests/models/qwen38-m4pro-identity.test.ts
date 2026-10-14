@@ -256,18 +256,22 @@ describe("composition", () => {
 
 describe("the M4 Pro graph against the generic Qwen 3.5 graph where both run the generic blocks (bf16 KV)", () => {
   test("a known grammar span beyond the verify cap retains one full committed forward",()=>{
-    class CommittedReference extends Qwen35Model {
-      wholeSpan(input:MlxArray,cache:Cache[]):MlxArray {
-        return this.forwardLayers(this.embed.encode(input),cache,"committed",undefined,null,80,false);
-      }
-    }
-    const current=graph(),{weights,config}=source(),generic=new CommittedReference(weights,config,composition());
+    const current=graph(),{weights,config}=source(),generic=new Qwen35Model(weights,config,composition());
+    const committed=(input:MlxArray,cache:Cache[]):MlxArray=>{
+      let hidden=generic.embed.encode(input);
+      try {
+        for (const [layer,block] of generic.layers.entries()) {
+          const next=block.forward(hidden,cache[layer]!,"committed",null,80);hidden.dispose();hidden=next;
+        }
+        return generic.finalNorm.forward(hidden);
+      } finally {hidden.dispose();}
+    };
     const mine=current.makeCache(),theirs=generic.makeCache();
     try {
       using input=ids([prompt(80,71)]);
       expect(new MlxPhaseDispatch(current).known(80)).toBe(new MlxPhaseDispatch(current).known(262144));
       outputDiff("known span 80",new MlxPhaseDispatch(current).known(80)(input,mine) as MlxArray,
-        generic.wholeSpan(input,theirs),
+        committed(input,theirs),
         current.logitsFromHidden.bind(current),generic.logitsFromHidden.bind(generic));
       stateDiff("known span 80",mine,theirs);
     } finally {disposeAll(mine,theirs);generic.dispose();}
