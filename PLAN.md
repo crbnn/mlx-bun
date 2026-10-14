@@ -65,8 +65,8 @@ Binding for every graph file in the tree, held by the architecture gate where me
   bit gate run in the repo (its recorded digests on its artifact), not a script it must match.
 - Routing is the scheduler's: the phase, the row count, the prompt piece's position range, the
   adapter context, the rows-per-forward cap. The file declares facts the scheduler reads once when it
-  binds the graph (the Neural Engine ranges, the verify round costs, the known-span chunk sizes, the
-  adapter-capable operations) and never looks at a request.
+  binds the graph (the Neural Engine ranges, the verify round costs, the known-span chunk sizes)
+  and never looks at a request.
 - Platform facts are not conditions. Every Apple Silicon chip has a Neural Engine; a file for an
   M4 Pro exports its Neural Engine operations the way it exports any layer, the install step compiles
   the programs that file lists, and a program missing at load is an install that did not finish,
@@ -98,9 +98,14 @@ Binding for every graph file in the tree, held by the architecture gate where me
 - There are no hard-coded widths. Profiling chooses what each row count runs, and the file is that
   lookup table: the same operation at every row count, or different operations at certain row
   counts, read the same way.
-- Bit identity with main (3ea6ba5e) on every served composition where main served it: the digests,
-  the parity suites, the captured texts. Performance is unchanged (paired, preflight-gated) and is
-  not the subject of this program.
+- One file, one change. Optimizing one model on one machine is an edit to that model's file for
+  that machine, gated by that file's own gate, and nothing else is touched or re-checked: not
+  another machine's file, not another model, not another family. Only a change to a kernel or a
+  layer reaches every file that imports it, and that is caught by the type checker and those
+  files' own gates, never by regenerating anything.
+- This program changes no numbers: bit identity with main (3ea6ba5e) on every served composition
+  where main served it (the digests, the parity suites, the captured texts), and performance
+  unchanged (paired, preflight-gated). Performance work is not this program.
 
 ### Items
 
@@ -123,12 +128,11 @@ matrix runs once at the end. Agents do the work; Josh reviews the plan, I review
       off for this graph" branch go. Compiled decode under adapters stays the scheduler's routing,
       as today.
       The install step compiles the programs the selected file lists (`anePrograms()` takes no
-      composition). The cache composer moves to the loader: a file declares each layer's cache kind
-      (attention full or sliding, recurrent) as data, and the loader composes the lego from the
-      composition's KV scheme over that declaration (`makeCache` leaves the graphs). The
-      composition record drops `aneBridge`. Exit: typecheck, the dispatch unit tests, the
-      conformance suites unchanged, the generic graphs ported to the row-keyed tables (their
-      loops stay until G7 decides their fate).
+      composition). The loader builds the cache for the composition's KV scheme from the file's
+      layer list (which layers are full attention, sliding attention or recurrent is what the file
+      already states); `makeCache` leaves the graphs. The composition record drops `aneBridge`.
+      Exit: typecheck, the dispatch unit tests, the conformance suites unchanged, the generic
+      graphs ported to the row-keyed tables (their loops stay; G7).
 - [ ] **G2. The M4 Pro file.** `models/qwen/qwen38-27b-trellis-m4pro.ts` rewritten as a file: the
       64 layers listed in order with their attention or DeltaNet block and, per binding, the literal
       MLP and projection classes (rows 1 through 8, every row written; the prompt ranges 1..639 on the
@@ -159,12 +163,13 @@ matrix runs once at the end. Agents do the work; Josh reviews the plan, I review
       KV scheme, rows cap, draft depth (a file declaring verify costs serves adaptive depth), prompt
       chunk size (the file's ranges). The generic Qwen 3.5 graph's device condition for known spans
       goes: the M4 Pro file declares its known spans, the generic graph declares none. The
-      Colibri bypass and the encoder-decoder refusal in `factory.ts` become table facts or typed
-      errors at the table. Exit: `graph-table` tests; every served composition on both machines
-      selects the file this plan names.
+      loader's two special cases outside the table (`factory.ts`: the GLM Colibri path and the
+      encoder-decoder refusal) become table entries or typed errors; no graph is selected by a
+      condition outside the table. Exit: `graph-table` tests; every served composition on both
+      machines selects the file this plan names.
 - [ ] **G7. The generic graphs.** They stay as each family's entry for artifacts without a file:
       the loop over the artifact's layer count stays, and the ownership documentation says so; their
-      branches on composition fields go (G1 moved the cache composer; `packedMixedMlp`,
+      branches on composition fields go (G1 moved cache building to the loader; `packedMixedMlp`,
       `compiledGeglu`, `compiledSwiglu` and `device` become fixed lines). Exit: no composition
       parameter in any generic graph; their digests unchanged.
 - [ ] **G8. Delete and gate.** `scripts/gen-qwen38.ts`, `scripts/gen-gemma4.ts`, `tests/fixtures/
