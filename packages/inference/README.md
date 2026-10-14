@@ -152,21 +152,21 @@ producer-source pins, so it cannot qualify. The reviewed run in
 [#202](https://github.com/joshuarossi/mlx-bun/pull/202) used a fresh, fully pinned
 capture from main `02d723a` and passed both consumer paths at `e7288425` on an
 Apple M1 Max (MLX 0.32.2, mlx-lm 0.31.3), with input pins unchanged. This qualifies
-the plain-KV scope above; the generated graph's unrolled `kv_config` path and
+the plain-KV scope above; the written graph's unrolled `kv_config` path and
 performance remain separate checks.
 
-The [generated Gemma graph test](tests/parity/gemma4-generated.test.ts) is that
+The [written Gemma graph test](tests/parity/gemma4-generated.test.ts) is that
 unrolled-path check, ported from `02d723a:tests/parity/generated-parity.test.ts`
 for each registered fingerprint (12B, e4b, 26B-A4B). With
 `MLX_BUN_TEST_GENERATED_MODEL` naming an artifact that ships `kv_config.json`, it
-requires the `kv_config` composition (`--kv-quant config`) to build the generated
+requires the `kv_config` composition (`--kv-quant config`) to select the written
 graph and the default composition `Gemma4Model`; byte-identical vectors against
 `Gemma4Model` over caches converted to `kv_config` before a prompt past the
 sliding window; identical 24-token greedy trajectories under the `kv_config`
 composition, each graph reading its own composed caches (stop tokens off, so
 every trajectory is full length), uncompiled, where from the second forward on
 every listed cache answers from its quantized storage, and with compiled decode;
-and identical vectors over plain caches. This is identity between the generated
+and identical vectors over plain caches. This is identity between the written
 graph and the family's generic graph within this tree, not an oracle claim. On 2026-09-28 it
 passed on the M1 Max for mlx-community gemma-4-e4b-it-OptiQ-4bit (`98d7dc6a`; 24
 generated forwards uncompiled, 2 compiled) and gemma-4-12B-it-OptiQ-4bit
@@ -337,34 +337,28 @@ Set all of `MLX_BUN_TEST_QWEN_TRELLIS_TARGET`,
 bun --no-env-file test packages/inference/tests/parity/qwen-trellis-parity.test.ts
 ```
 
-On M1 Max 32 GB, MLX 0.32.2 (`applegpu_g13s`), Bun 1.4.2, the candidate
-matched main `02d723a2875153196f8c6c10bce2daf6f0044655`: 96 complete
-last-position float32 logit vectors and greedy tokens across three prompts;
-three 64-token MTP runs with every target input and speculation counter equal,
-where the graph's operations are bit-identical to main's. The M1 Max graph's are
-not everywhere: it verifies the MTP runs' two- and three-row windows on kernels that
-reassociate relative to its one-row decode (the width-class decision, KL-gated:
-the matrix-unit Trellis kernels that read code values from a threadgroup
-codebook, with the affine row kernels), so the test teacher-forces main's MTP
-windows and holds each window row to the one-row decode of its position
-instead: 192 rows, mean KL 3.1e-4, largest 1.2e-2, every window's argmax the
-one-row top or tied with it; the one-row decode still selects all 192 of
-main's emitted tokens. Two runs emit main's tokens (one with main's counters),
-the third differs from main's at token 17. The M1 Max graph also runs prompt
-pieces of nine to 256 positions (these prompts' 23 to 32) on its wider layers,
-which reassociate: the test then holds each prompt's last-position logits by KL
-and argmax to the graph's generic blocks' over the same prompt
-(`prefillEmbeddings` at the caches' positions, then the plain head), which are
-main's bytes, and decodes the trajectory and the teacher-forced windows on that
-prompt state, main's to the bit.
-The MTP runs use the shared gateway with batch capacity one, depth two, plain
-KV, greedy sampling and stopping tokens disabled. The reference SHA-256 is
-`15421eb8c691fab7eabeb6e13c9a5c2a2eeed5caf5832f57e3575ef0119780f9`.
-An earlier comparison against main's single-request MTP loop kept all 192
-output tokens but differed in draft proposals and acceptance; that execution
-shape does not establish equality for the shared path and its reference is
-refused. This evidence covers the named artifact and geometry, not B>1,
-quantized KV, stochastic sampling, intelligence or performance.
+The schema-2 reference independently records 96 complete last-position float32
+vectors and greedy tokens across three prompts, plus three 64-token native MTP
+runs. Each MTP run records emitted tokens, every target input, speculation
+counters and the full logits at its actual native heads. Separate teacher-forced
+controls record one-row and verify-window vectors, CPU first-maximum IDs, exact
+maximum sets and cache positions before, after and after rollback.
+
+The consumer requires equality with those main controls and literal equality
+of native MTP tokens, target inputs, counters and head vectors. Every emitted
+token must belong to the exact maximum set of its actual head. This preserves
+native selection when an exact tie makes the CPU's first maximum a different
+token. Window-versus-one-row KL checks remain separate checks of the existing
+arithmetic; they do not relax equality against main. The producer records its
+source revision and script content hashes, including whether its operational
+checkout was dirty. Produce references from an isolated, pinned main checkout
+on the same device as the candidate and retain the independent capture's hash.
+
+The MTP scope is the shared gateway with batch capacity one, depth two, plain
+KV, greedy sampling and stopping tokens disabled. These checks cover the named
+artifact and geometry, not B>1, quantized KV, stochastic sampling, intelligence
+or performance. Refactor run results and their source and artifact pins belong
+in the PR and external run directory.
 
 The existing runtime-report consumer also matches full logits, all live cache
 planes and continuation in 18 cases (contexts 0/64/512 × append lengths
