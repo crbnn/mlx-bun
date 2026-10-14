@@ -123,7 +123,7 @@ function artifact(): { weights: Weights; config: ModelConfig } {
       linearNumKeyHeads: HK, linearNumValueHeads: HV, linearKeyHeadDim: DK, linearValueHeadDim: DV,
       linearConvKernelDim: KERNEL, fullAttentionInterval: 4, partialRotaryFactor: 0.25,
       ropeParameters: { full_attention: { ropeTheta: 10_000_000, ropeType: "default", partialRotaryFactor: 0.25, factor: 1 } },
-      tieWordEmbeddings: false,
+      tieWordEmbeddings: false,maxPositionEmbeddings:4096,
     },
   } as unknown as ModelConfig;
   return { weights, config };
@@ -255,6 +255,18 @@ describe("composition", () => {
 });
 
 describe("the M4 Pro graph against the generic Qwen 3.5 graph where both run the generic blocks (bf16 KV)", () => {
+  test("a known grammar span beyond the verify cap retains one full committed forward",()=>{
+    const current=graph(),{weights,config}=source(),generic=new Qwen35Model(weights,config,composition());
+    const mine=current.makeCache(),theirs=generic.makeCache();
+    try {
+      using input=ids([prompt(80,71)]);
+      expect(current.appendKnown[80]).toBe(current.appendKnown[4096]);
+      expect(current.appendKnown[4097]).toBeUndefined();
+      outputDiff("known span 80",new MlxPhaseDispatch(current).known(80)(input,mine) as MlxArray,
+        new MlxPhaseDispatch(generic).known(80)(input,theirs) as MlxArray,current.logitsFromHidden.bind(current),generic.logitsFromHidden.bind(generic));
+      stateDiff("known span 80",mine,theirs);
+    } finally {disposeAll(mine,theirs);generic.dispose();}
+  },180_000);
   test("a whole prompt chunk, a prompt tail and a window wider than eight rows", () => {
     const current = graph(), { weights, config } = source();
     const generic = new Qwen35Model(weights, config, composition());

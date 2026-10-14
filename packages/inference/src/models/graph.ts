@@ -34,6 +34,14 @@ export function rowTable<Operation>(operation: Operation, rows: number = DEFAULT
   return Object.freeze(Object.fromEntries(Array.from({ length: rows }, (_, i) => [i + 1, operation])));
 }
 
+/** Repeat one already named operation through a declared context bound. This
+ * does not build or choose operations; long known spans retain one whole call. */
+export function fixedRowBindings<Operation>(from:number,to:number,operation:Operation):MlxRowTable<Operation> {
+  const bindings:Record<number,Operation>={};
+  for (let rows=from;rows<=to;rows++) bindings[rows]=operation;
+  return Object.freeze(bindings);
+}
+
 /** Generic graphs bind their row-specific operations once, before execution. */
 export function rowTableFrom<Operation>(build: (rows: number) => Operation, rows: number = DEFAULT_MAX_ROWS * PREFILL_CHUNK_TOKENS): MlxRowTable<Operation> {
   return Object.freeze(Object.fromEntries(Array.from({ length: rows }, (_, i) => [i + 1, build(i + 1)])));
