@@ -45,39 +45,21 @@ synthetic digests, the real-weight parity suites, `packages/inference/scripts/di
 - [ ] Synthetic digests are recorded for `applegpu_g16s` and `applegpu_g13s`; the cases skip on
       any other host until recorded there (`scripts/synthetic-digests.ts record`).
 
-Facts recorded for the program after the merge, not planned here: on the M1 Max a two-row verify
-round costs 1.77 plain decode steps (1.30 on the M4 Pro) and eight rows 2.05 (1.94), on the
-matrix-unit Trellis kernels reading code values from a threadgroup codebook since 2026-10-14 (2.01
-and 2.96 on the factored and arithmetic-decode matrix-unit kernels before), the split-K affine
-kernels, the one-row bit-field reads and the drafter kernels the graph declares; since 2026-10-13
-operations of nine to 256 rows run the
-graph's wider layers (any-row matrix-unit Trellis kernels and the split-K affine kernel: verify
-windows of 16 rows 0.89 -> 0.19 s, 32 0.89 -> 0.34, 64 0.77 -> 0.63; time to first token of 16-, 64-
-and 200-token prompts 0.97 -> 0.24, 0.87 -> 0.64 and 2.28 -> 1.90 s), and windows and prompt pieces
-above 256 rows still the generic blocks, a one-sequence prompt piece of 224 to 2048 positions on the
-Neural Engine split over programs every 64 positions to 768, every 128 to 1024 and every 256 to 2048
-(time to first token of 300-, 400-, 500-, 639-, 700- and 1100-token prompts 2.74/3.55/4.09/5.00/5.09/7.23
--> 2.43/2.98/3.28/3.94/4.26/6.65 s; since 2026-10-14, with its layers queued, its programs in four reduction
-slices and, from 768 positions, the projections split as well, prompts of 300, 500, 639, 1024, 2048 and 8192
-tokens 2.43/3.26/3.89/5.83/11.18/45.85 -> 2.16/2.92/3.58/4.95/9.36/38.54 s with the weights wired);
-DFlash 2 adaptive on that chip (in-process serve, 192 tokens, 2026-10-14, on the codebook matrix-unit kernels with
-the gate settings the graph declares for them; the four standard prompts and the four a replay of the gate finds
-hardest, the sampled modes over three seeds) decodes greedy text at 30.5 against 19.5 tok/s plain, 28.5 against 19.1
-under Qwen's instruct sampling and 24.5 against 19.1 under its thinking sampling (the standard four alone 33.8, 30.9
-and 24.6), the MTP head (adaptive up to four drafts, the graph's `adaptiveDraftWidths`; five and seven lose) at 26.7,
-24.8 and 22.4; with two and four concurrent requests DFlash 2 decodes 42.6, 42.0 and 33.0 and 47.5-48.3, 50.9 and
-45.0-45.3 tok/s in aggregate against plain's 24.2, 23.6 and 22.6 and 36.2, 34.9 and 34.1-35.3 (the gate weighs a
-group's round by the rows it verifies, 16- and 32-row rounds measured); the adaptive gate drafts nothing where
-drafting does not pay (such rounds are the pipelined decode step, at plain decode's step time), yet on short creative
-text (a limerick or a short poem, 35 to 80 tokens) both drafters still trail plain decode, by up to 16% under
-instruct sampling and 3% greedy (7 of 56 prompt, mode and seed runs for DFlash 2, 9 for the MTP head), the loss in
-drafted rounds the text does not repay (a replay over 96 texts: probes and transitions cost under 0.3%); the M1
-Max composition prefills 1k and 8k-token prompts at 207 and 213 tok/s (2026-10-14, alternated sessions of the graph's
-own prefill operations; 175 on 2026-10-13, 129 to 130 before its dense-GEMM prompt projections and Neural Engine
-MLP split; mean KL of the split against the GPU alone 1.2e-4 to 1.9e-3, 3e-5 to 2.0e-3 before) against 200 on
-the M4 Pro; the paired check's band is narrower than session drift for sub-percent decode differences (the clean
-M1 Max run is the null); the TurboQuant fused decode kernel covers head dimensions 64, 128, 256 and 512 and 96
-decodes on the plain path.
+Facts recorded for the program after the merge, not planned here: on the M1 Max a verify round
+of two rows costs 1.77 plain decode steps and of eight rows 2.05 (1.30 and 1.94 on the M4 Pro);
+that graph runs operations of nine to 256 rows on its wider layers and more on the generic
+blocks, and one-sequence prompt pieces of 224 to 2048 positions on the Neural Engine split (mean
+KL against the GPU alone 1.2e-4 to 1.9e-3), prefilling 1k- and 8k-token prompts at 207 and 213
+tok/s (200 on the M4 Pro). With the gate settings the graph declares, DFlash 2 adaptive decodes
+30.5 tok/s greedy, 28.5 under Qwen's instruct sampling and 24.5 under its thinking sampling
+against plain decode's 19.5, 19.1 and 19.1, the MTP head 26.7, 24.8 and 22.4 (in-process serve,
+192 tokens, eight prompts, sampled modes over three seeds); two and four concurrent greedy
+requests decode 42.6 and 47.5 to 48.3 tok/s in aggregate with DFlash 2 against plain's 24.2 and
+36.2. Open: on short creative text (35 to 80 tokens) both drafters still trail plain decode, by
+up to 16% under instruct sampling and 3% greedy, in drafted rounds the text does not repay. The
+paired check's band is narrower than session drift for sub-percent decode differences (the clean
+M1 Max run is the null); the TurboQuant fused decode kernel covers head dimensions 64, 128, 256
+and 512 and 96 decodes on the plain path.
 
 The measurements of record before the merge. M1 Max (2026-10-12, clean machine, `perf.yml`):
 Trellis default decode 14.1 → 14.0 tok/s (1.000 [0.995, 1.006]), e4b default 64.4 → 64.3 (0.998
@@ -115,8 +97,8 @@ while that machine is in use (swap above 512 MB).
   alone do not close this. Done so far: the
   [generated Gemma4 graph test](packages/inference/tests/parity/gemma4-generated.test.ts)
   passed on e4b and 12B (identity within this tree; 26B-A4B not run). Packed Trellis now matches main in 96 full greedy logit vectors, three shared
-  B1/depth-two MTP runs (since 2026-10-13 held by KL and greedy agreement on the M1 Max, whose verify
-  windows reassociate), and the 18-case plain-KV runtime grid with restored
+  B1/depth-two MTP runs (on the M1 Max, whose verify windows reassociate, by KL and greedy
+  agreement), and the 18-case plain-KV runtime grid with restored
   continuation ([evidence](packages/inference/README.md#packed-qwen-trellis-parity)).
   Open: published references and broader Trellis shapes;
   [runtime-oracle](packages/inference/tests/parity/runtime-oracle.test.ts) references
