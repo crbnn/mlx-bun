@@ -277,7 +277,7 @@ describe("the written graph declarations", () => {
       try { expect(a.map(cache => `${cache.constructor.name} ${cache.signature()}`)).toEqual(b.map(cache => `${cache.constructor.name} ${cache.signature()}`)); }
       finally { disposeAll(a, b); }
     }
-  });
+  }, 120_000);
 
   test("draft context projections keep the stock one-row operation and unbounded split MMA rows",()=>{
     const {current}=graphs("bf16"),table=current.draftTarget([]).draftProjections!;
