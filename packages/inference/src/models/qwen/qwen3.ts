@@ -27,7 +27,7 @@ import type { MlxRowTable, MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward
 import { declareGraph } from "../capabilities";
 import { DEFAULT_PHASE_ROWS,  rowTable, type ReadPhase   } from "../graph";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
-import { QuantizedLinear } from "../../layers/quantized-linear";
+import { QuantizedLinear, QuantizedLinearPlain } from "../../layers/quantized-linear";
 import { RMSNorm } from "../../layers/normalization";
 import { type Cache } from "../../contracts/mlx/cache";
 import { compiledSwiglu } from "../../layers/swiglu";
@@ -49,6 +49,11 @@ export class Qwen3Attention {
   readonly scale: number;
   readonly ropeBase: number;
 
+  readonly #q: QuantizedLinearPlain;
+  readonly #k: QuantizedLinearPlain;
+  readonly #v: QuantizedLinearPlain;
+  readonly #out: QuantizedLinearPlain;
+
   /** `reads` is how the block reads its cache: the cache's own read, fixed when
    * the block is built. */
   constructor(weights: Weights, config: ModelConfig, prefix: string, defaultRopeBase = 1000000,
@@ -65,15 +70,19 @@ export class Qwen3Attention {
     this.oProj = QuantizedLinear.load(weights, `${prefix}.o_proj`, config);
     this.qNorm = new RMSNorm(weights.tensor(`${prefix}.q_norm.weight`), t.rmsNormEps);
     this.kNorm = new RMSNorm(weights.tensor(`${prefix}.k_norm.weight`), t.rmsNormEps);
+    this.#q = new QuantizedLinearPlain(this.qProj);
+    this.#k = new QuantizedLinearPlain(this.kProj);
+    this.#v = new QuantizedLinearPlain(this.vProj);
+    this.#out = new QuantizedLinearPlain(this.oProj);
   }
 
   /** `x` [B, L, hidden] (borrowed) to an owned [B, L, hidden], appending to
    *  `cache` and attending through the read `phase` names. */
   forward(x: MlxArray, cache: Cache, phase: ReadPhase): MlxArray {
     const [B, L] = x.shape as [number, number, number];
-    let q = this.qProj.forward(x);
-    let k = this.kProj.forward(x);
-    let v = this.vProj.forward(x);
+    let q = this.#q.forward(x);
+    let k = this.#k.forward(x);
+    let v = this.#v.forward(x);
 
     // Reshape to heads, then q/k RMSNorm over head_dim BEFORE transpose+RoPE
     // (mlx-lm qwen3 reference order).
@@ -102,7 +111,7 @@ export class Qwen3Attention {
     attn.dispose();
     const merged = ops.reshape(attnT, [B, L, -1]);
     attnT.dispose();
-    const out = this.oProj.forward(merged);
+    const out = this.#out.forward(merged);
     merged.dispose();
     return out;
   }
@@ -113,15 +122,22 @@ export class Qwen3MLP {
   readonly up: QuantizedLinear;
   readonly down: QuantizedLinear;
 
+  readonly #gate: QuantizedLinearPlain;
+  readonly #up: QuantizedLinearPlain;
+  readonly #down: QuantizedLinearPlain;
+
   constructor(weights: Weights, config: ModelConfig, prefix: string) {
     this.gate = QuantizedLinear.load(weights, `${prefix}.gate_proj`, config);
     this.up = QuantizedLinear.load(weights, `${prefix}.up_proj`, config);
     this.down = QuantizedLinear.load(weights, `${prefix}.down_proj`, config);
+    this.#gate = new QuantizedLinearPlain(this.gate);
+    this.#up = new QuantizedLinearPlain(this.up);
+    this.#down = new QuantizedLinearPlain(this.down);
   }
 
   forward(x: MlxArray): MlxArray {
-    const gate = this.gate.forward(x);
-    const up = this.up.forward(x);
+    const gate = this.#gate.forward(x);
+    const up = this.#up.forward(x);
     // Oracle (mlx_lm/models/qwen3.py MLP): down_proj(swiglu(gate_proj(x), up_proj(x)))
     // where swiglu is the `@mx.compile` closure (silu(gate)*up). Compiled = the
     // same libmlx kernel mlx-lm dispatches (L1-faithful) AND fuses the three
@@ -129,7 +145,7 @@ export class Qwen3MLP {
     const hidden = compiledSwiglu(gate, up);
     gate.dispose();
     up.dispose();
-    const out = this.down.forward(hidden);
+    const out = this.#down.forward(hidden);
     hidden.dispose();
     return out;
   }
@@ -166,7 +182,6 @@ export class Qwen3Layer {
 
 export class Qwen3Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
-  /** The served configuration this graph was built for: its KV scheme is what `makeCache` composes. */
   readonly weightsBytes: number;
   readonly prefixBase = "model";
   readonly loraState = new LoraState();
@@ -177,6 +192,7 @@ export class Qwen3Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly finalNorm: RMSNorm;
   /** Separate lm_head when NOT tied; otherwise the tied embedding's asLinear. */
   readonly lmHead: QuantizedLinear | null;
+  readonly #head: (hidden: MlxArray) => MlxArray;
 
   constructor(weights: Weights, config: ModelConfig, maxPhaseRows = DEFAULT_PHASE_ROWS) {
     this.config = config;
@@ -191,6 +207,8 @@ export class Qwen3Model implements MlxDeclaredGraph, MlxTokenPhases {
     this.lmHead = config.text.tieWordEmbeddings
       ? null
       : QuantizedLinear.load(weights, "lm_head", config);
+    const head = this.lmHead && new QuantizedLinearPlain(this.lmHead);
+    this.#head = head ? hidden => head.forward(hidden) : hidden => this.embed.asLinear(hidden);
 
     const multiSequencePrompt: MlxCapturingForward = (ids, cache) =>
     this.forwardLayers(this.embed.encode(ids), cache, "window");
@@ -296,6 +314,6 @@ export class Qwen3Model implements MlxDeclaredGraph, MlxTokenPhases {
   }
 
   logitsFromHidden(h: MlxArray): MlxArray {
-    return this.lmHead ? this.lmHead.forward(h) : this.embed.asLinear(h);
+    return this.#head(h);
   }
 }

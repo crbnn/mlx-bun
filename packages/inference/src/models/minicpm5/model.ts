@@ -22,7 +22,7 @@ import type { Cache, TrainingAttentionCache } from "../../contracts/mlx/cache";
 import { disposing } from "../../layers/helpers";
 import { RMSNorm } from "../../layers/normalization";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
-import { QuantizedLinear } from "../../layers/quantized-linear";
+import { QuantizedLinear, QuantizedLinearPlain } from "../../layers/quantized-linear";
 import { composedFullAttentionCache } from "../../state/bf16-first-kv";
 import { AttentionMasks } from "../../state/attention-read";
 import { deferredTurboQuantKernels } from "../../state/turboquant-attention";
@@ -40,6 +40,11 @@ export class LlamaAttention {
   readonly scale: number;
   readonly ropeBase: number;
 
+  readonly #q: QuantizedLinearPlain;
+  readonly #k: QuantizedLinearPlain;
+  readonly #v: QuantizedLinearPlain;
+  readonly #out: QuantizedLinearPlain;
+
   /** `reads` is how the block reads its cache: the cache's own read, fixed when
    * the block is built. */
   constructor(weights: Weights, config: ModelConfig, prefix: string, readonly reads: AttentionReadStrategy = cacheRead) {
@@ -53,6 +58,10 @@ export class LlamaAttention {
     this.kProj = QuantizedLinear.load(weights, `${prefix}.k_proj`, config);
     this.vProj = QuantizedLinear.load(weights, `${prefix}.v_proj`, config);
     this.oProj = QuantizedLinear.load(weights, `${prefix}.o_proj`, config);
+    this.#q = new QuantizedLinearPlain(this.qProj);
+    this.#k = new QuantizedLinearPlain(this.kProj);
+    this.#v = new QuantizedLinearPlain(this.vProj);
+    this.#out = new QuantizedLinearPlain(this.oProj);
   }
 
   /** `x` [B, L, hidden] (borrowed) to an owned [B, L, hidden], appending to
@@ -102,9 +111,9 @@ export class LlamaAttention {
 
   /** q, k and v heads [B, H, L, D] of `x` (borrowed), before RoPE. */
   #heads(x: MlxArray, B: number, L: number): [MlxArray, MlxArray, MlxArray] {
-    let q = this.qProj.forward(x);
-    let k = this.kProj.forward(x);
-    let v = this.vProj.forward(x);
+    let q = this.#q.forward(x);
+    let k = this.#k.forward(x);
+    let v = this.#v.forward(x);
 
     q = disposing(q, ops.reshape(q, [B, L, this.nHeads, this.headDim]));
     k = disposing(k, ops.reshape(k, [B, L, this.nKvHeads, this.headDim]));
@@ -122,7 +131,7 @@ export class LlamaAttention {
     attn.dispose();
     const merged = ops.reshape(attnT, [B, L, -1]);
     attnT.dispose();
-    const out = this.oProj.forward(merged);
+    const out = this.#out.forward(merged);
     merged.dispose();
     return out;
   }
@@ -137,25 +146,32 @@ export class LlamaMLP {
   readonly up: QuantizedLinear;
   readonly down: QuantizedLinear;
 
+  readonly #gate: QuantizedLinearPlain;
+  readonly #up: QuantizedLinearPlain;
+  readonly #down: QuantizedLinearPlain;
+
   constructor(weights: Weights, config: ModelConfig, prefix: string) {
     this.gate = QuantizedLinear.load(weights, `${prefix}.gate_proj`, config);
     this.up = QuantizedLinear.load(weights, `${prefix}.up_proj`, config);
     this.down = QuantizedLinear.load(weights, `${prefix}.down_proj`, config);
+    this.#gate = new QuantizedLinearPlain(this.gate);
+    this.#up = new QuantizedLinearPlain(this.up);
+    this.#down = new QuantizedLinearPlain(this.down);
   }
 
   /** MLP: returns mlp(x); the caller adds the residual when given. */
   forward(x: MlxArray, residual?: MlxArray): MlxArray {
-    const gate = this.gate.forward(x);
-    const up = this.up.forward(x);
+    const gate = this.#gate.forward(x);
+    const up = this.#up.forward(x);
     const hidden = compiledSwiglu(gate, up);
     gate.dispose();
     up.dispose();
-    return downWithResidual(this.down, hidden, residual);
+    return downWithResidual(this.#down, hidden, residual);
   }
 }
 
 /** The MLP with the swiglu as separate silu and multiply kernels: the explicit
- *  composition with `compiledSwiglu` off, chosen when the graph is built. */
+ *  layer form, available for callers writing their own graph. */
 export class LlamaUnfusedMLP {
   readonly kind = "unfused";
   readonly gate: QuantizedLinear;
@@ -184,7 +200,7 @@ export class LlamaUnfusedMLP {
 }
 
 /** down(hidden) (hidden consumed), plus `residual` when given. */
-function downWithResidual(down: QuantizedLinear, hidden: MlxArray, residual: MlxArray | undefined): MlxArray {
+function downWithResidual(down: { forward(x: MlxArray): MlxArray }, hidden: MlxArray, residual: MlxArray | undefined): MlxArray {
   const m = down.forward(hidden);
   hidden.dispose();
   if (residual == null) return m;
@@ -237,7 +253,6 @@ export class LlamaLayer {
 
 export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
-  /** The served configuration this graph was built for: its KV scheme is what `makeCache` composes. */
   readonly weightsBytes: number;
   readonly prefixBase = "model";
   readonly loraState = new LoraState();
@@ -250,6 +265,7 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly layers: LlamaLayer[];
   readonly finalNorm: RMSNorm;
   readonly lmHead: QuantizedLinear;
+  readonly #head: QuantizedLinearPlain;
 
   constructor(weights: Weights, config: ModelConfig, maxPhaseRows = DEFAULT_PHASE_ROWS) {
     if (config.text.tieWordEmbeddings)
@@ -265,6 +281,7 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
     );
     this.finalNorm = new RMSNorm(weights.tensor("model.norm.weight"), config.text.rmsNormEps);
     this.lmHead = QuantizedLinear.load(weights, "lm_head", config);
+    this.#head = new QuantizedLinearPlain(this.lmHead);
 
     const multiSequencePrompt: MlxCapturingForward = (ids, cache) =>
     this.forwardLayers(this.embed.encode(ids), cache, "window");
@@ -368,6 +385,6 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
   }
 
   logitsFromHidden(h: MlxArray): MlxArray {
-    return this.lmHead.forward(h);
+    return this.#head.forward(h);
   }
 }
