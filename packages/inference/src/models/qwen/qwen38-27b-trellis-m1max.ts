@@ -22,9 +22,9 @@
 //
 //   operation                      MLP gate/up + down (row-major/interleaved)  affine projections (3/4-bit)
 //   decode.one, verify.one         CodebookGateUpRow + CodebookDownRow/K3i     AffineRowLinear/QuantizedLinear
-//   decode/verify.twoToThree       CodebookMmaGateUp + MmaDownWide/K3i         Affine3RowsLinear/Affine4RowsLinear
-//   decode/verify.four             CodebookMmaGateUp + MmaDownWide/K3i         AffineSplitMmaLinear
-//   decode/verify.fiveToEight      CodebookMmaGateUp + MmaDownWide/K3i         AffineSplitMmaLinear
+//   decode/verify.twoToThree       CodebookMmaGateUp + CodebookMmaDown/K3i     Affine3RowsLinear/Affine4RowsLinear
+//   decode/verify.four             CodebookMmaGateUp + CodebookMmaDown/K3i     AffineSplitMmaLinear
+//   decode/verify.fiveToEight      CodebookMmaGateUp + CodebookMmaDown/K3i     AffineSplitMmaLinear
 //   every operation 9..256         MmaGateUpWide + MmaDownWide/K3i             AffineSplitMmaLinear
 //   decode/verify.wider 257+       the generic blocks (TrellisMlp)             QuantizedLinear
 //   prefillChunk.gpu/Tail 257+     the generic blocks (TrellisMlp)             DequantizedLinear
@@ -103,7 +103,7 @@ import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import { QuantizedLinear } from "../../layers/quantized-linear";
 import { mropeInvFreq } from "../../layers/qwen-mrope";
 import { compiledSwiglu } from "../../layers/swiglu";
-import { MmaDownWide, MmaDownWideK3i } from "../../layers/trellis-down";
+import { CodebookMmaDown, CodebookMmaDownK3i, MmaDownWide, MmaDownWideK3i } from "../../layers/trellis-down";
 import { CodebookMmaGateUp, MmaGateUpWide } from "../../layers/trellis-gate-up";
 import { CodebookGateUpRow } from "../../layers/trellis-reduce-gate-up";
 import { CodebookDownK3iRow, CodebookDownRow } from "../../layers/trellis-scatter-down";
@@ -447,7 +447,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
       this.#twoToThree = generic.map((layer, i) => {
         const spec = LAYERS[i]!, { gate, up, down } = mlpOf(i);
         const gateUp = new CodebookMmaGateUp(gate, up);
-        const project = spec.downLayout === "k3Interleaved" ? new MmaDownWideK3i(down) : new MmaDownWide(down);
+        const project = spec.downLayout === "k3Interleaved" ? new CodebookMmaDownK3i(down) : new CodebookMmaDown(down);
         return layerStep(layer, mixerOf(affine4RowsBlocks[i]!, spec.kind), post => {
           using mid = gateUp.forward(post);
           return project.forward(mid);
@@ -456,7 +456,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
       this.#four = generic.map((layer, i) => {
         const spec = LAYERS[i]!, { gate, up, down } = mlpOf(i);
         const gateUp = new CodebookMmaGateUp(gate, up);
-        const project = spec.downLayout === "k3Interleaved" ? new MmaDownWideK3i(down) : new MmaDownWide(down);
+        const project = spec.downLayout === "k3Interleaved" ? new CodebookMmaDownK3i(down) : new CodebookMmaDown(down);
         return layerStep(layer, mixerOf(affineSplitMmaBlocks[i]!, spec.kind), post => {
           using mid = gateUp.forward(post);
           return project.forward(mid);
@@ -465,7 +465,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph, MlxTokenPhases {
       this.#fiveToEight = generic.map((layer, i) => {
         const spec = LAYERS[i]!, { gate, up, down } = mlpOf(i);
         const gateUp = new CodebookMmaGateUp(gate, up);
-        const project = spec.downLayout === "k3Interleaved" ? new MmaDownWideK3i(down) : new MmaDownWide(down);
+        const project = spec.downLayout === "k3Interleaved" ? new CodebookMmaDownK3i(down) : new CodebookMmaDown(down);
         return layerStep(layer, mixerOf(affineSplitMmaBlocks[i]!, spec.kind), post => {
           using mid = gateUp.forward(post);
           return project.forward(mid);

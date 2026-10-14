@@ -19,7 +19,8 @@ import {
   CodebookMmaGateUp, FactoredGateUpRow, FactoredGateUpRows, FactoredMixedGateUp, MmaGateUp, MmaGateUpWide,
 } from "../../src/layers/trellis-gate-up";
 import {
-  FactoredDownK3iRow, FactoredDownK3iRows, FactoredDownRow, FactoredDownRows, MmaDown, MmaDownK3i, MmaDownWide, MmaDownWideK3i,
+  CodebookMmaDown, CodebookMmaDownK3i, FactoredDownK3iRow, FactoredDownK3iRows, FactoredDownRow, FactoredDownRows, MmaDown,
+  MmaDownK3i, MmaDownWide, MmaDownWideK3i,
 } from "../../src/layers/trellis-down";
 import {
   Affine3MmaLinear, Affine3RowsLinear, Affine4MmaLinear, Affine4RowsLinear, AffineRowLinear, AffineSplitMmaLinear,
@@ -92,8 +93,15 @@ describe("Trellis verify layers", () => {
         using actual = layer.forward(x);
         expect(relErr(actual, expected), `${interleave ? "k3i" : "row-major"} m${m}`).toBeLessThan(2e-2);
       }
+      const codebook = interleave ? new CodebookMmaDownK3i(down) : new CodebookMmaDown(down);
+      for (const m of [1, 2, 3, 4, 8]) {
+        using x = rows(m, R);
+        using expected = down.forward(x, true);
+        using actual = codebook.forward(x);
+        expect(relErr(actual, expected), `codebook ${interleave ? "k3i" : "row-major"} m${m}`).toBeLessThan(2e-2);
+      }
       const wide = interleave ? new MmaDownWideK3i(down) : new MmaDownWide(down);
-      for (const m of [1, 2, 4, 8, 9, 16, 40]) {
+      for (const m of [1, 9, 16, 40]) {
         using x = rows(m, R);
         using expected = down.forward(x, true);
         using actual = wide.forward(x);
@@ -113,6 +121,8 @@ describe("Trellis verify layers", () => {
     expect(() => new MmaDownWideK3i(rowMajor)).toThrow();
     expect(() => new MmaGateUpWide(gate, rowMajor)).toThrow();
     expect(() => new CodebookMmaGateUp(gate, rowMajor)).toThrow();
+    expect(() => new CodebookMmaDown(interleaved)).toThrow();
+    expect(() => new CodebookMmaDownK3i(rowMajor)).toThrow();
   });
 });
 

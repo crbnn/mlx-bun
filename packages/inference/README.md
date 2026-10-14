@@ -913,7 +913,7 @@ threadgroup table and keep variant 13's one-row output bits.
 | `downCodebookRow` / `downK3InterleavedCodebookRow(x2, codes, scales, geometry)` | One-row axis-0 projection through a threadgroup codebook, row-major 2/4-bit / 3-bit interleaved codes; the scatter kernels' bits |
 | `downMma` / `downK3InterleavedMma(x2, codes, scales, geometry)` | Axis-0 projection for 1..8 rows, row-major / 3-bit interleaved codes |
 | `gateUpMmaWide(x, gate, up)` | Gate/up/SwiGLU for any number of rows, each decoded fragment feeding several 8-row blocks (threadgroup codebook, activations staged in threadgroup memory); each row the bits `gateUpMma` gives its block of 8 |
-| `downMmaWide` / `downK3InterleavedMmaWide(x2, codes, scales, geometry)` | Axis-0 projection for any number of rows through a threadgroup codebook, each decoded fragment feeding up to three 8-row blocks; each row the bits `downMma` gives its block of 8 |
+| `downMmaWide` / `downK3InterleavedMmaWide(x2, codes, scales, geometry)` | Axis-0 projection for any number of rows through a threadgroup codebook, each decoded fragment feeding up to three 8-row blocks in the pass the rows plan (`downMmaWidePass` / `downK3InterleavedMmaWidePass` take the pass, `DOWN_ONE_BLOCK` for 1..8 rows); each row the bits `downMma` gives its block of 8 |
 | `gateUpCodebookMma(x, gate, up)` | Gate/up/SwiGLU for 1..8 rows, each code value read from a threadgroup codebook (the M1 Max form); `gateUpMma`'s bits |
 
 Outside the Trellis family, `kernels/quantization/affine{3,4}-{rows,mma}` run
@@ -1012,7 +1012,7 @@ the M1 Max: the threadgroup-codebook kernels at one row, with the 3-bit projecti
 and the head on the one-row affine kernel (MLX's quantized matmul bit for bit; the 4-bit
 projections stay on it); at two to eight rows the
 matrix-unit Trellis kernels that read each code value from a threadgroup codebook
-(`gateUpCodebookMma`, `downMmaWide`), with the affine row kernels for the
+(`gateUpCodebookMma`, and `downMmaWidePass` one block of 8 rows per pass), with the affine row kernels for the
 projections and head at two to three rows and the split matrix-unit affine kernel
 at four to eight; every operation of nine to 256 rows (`WIDER_ROWS`: decode and
 verify windows, prompt tails, known-token appends and a mixed forward's packed MLP

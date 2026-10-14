@@ -9,7 +9,8 @@ import { describe, expect, test } from "bun:test";
 import { Dtype, MlxArray, ops } from "@mlx-bun/mlx";
 import {
   downFactoredRow, downFactoredRows, downK3InterleavedFactoredRow, downK3InterleavedFactoredRows,
-  downK3InterleavedMma, downK3InterleavedMmaWide, downMma, downMmaWide,
+  DOWN_ONE_BLOCK, downK3InterleavedMma, downK3InterleavedMmaWide, downK3InterleavedMmaWidePass, downMma, downMmaWide,
+  downMmaWidePass,
   fusedGateUpSwiglu, fusedGateUpSwigluMixed, gateUpCodebookMma, gateUpFactoredRow, gateUpFactoredRows, gateUpMma,
   gateUpMmaWide, mixedGateUpFactoredRows, trellisScatter, type TrellisGeometry,
 } from "@mlx-bun/inference/kernels/trellis";
@@ -204,4 +205,23 @@ describe("threadgroup-codebook simdgroup-matrix gate/up", () => {
     }
   }, 60_000);
 
+});
+
+describe("threadgroup-codebook any-row down projection in a fixed pass", () => {
+  test("one block per pass, and two and three for row-major codes: each block of eight rows the 1..8-row kernel's bits", () => {
+    for (const [k, interleave] of [[2, false], [3, false], [4, false], [3, true]] as const) {
+      using w = weights(k, 0, interleave);
+      const passes = interleave ? [DOWN_ONE_BLOCK] : [DOWN_ONE_BLOCK, { S: 8, MT: 2 }, { S: 8, MT: 3 }];
+      for (const pass of passes) for (const m of [1, 2, 3, 5, 8, 12]) {
+        using x = input(m, w.geometry.inFeatures);
+        using actual = interleave ? downK3InterleavedMmaWidePass(x, w.codes, w.scales, w.geometry, pass)
+          : downMmaWidePass(x, w.codes, w.scales, w.geometry, pass);
+        for (let lo = 0; lo < m; lo += 8) {
+          using block = x.slice([lo, 0], [Math.min(m, lo + 8), x.shape[1]!]);
+          using alone = (interleave ? downK3InterleavedMma : downMma)(block, w.codes, w.scales, w.geometry);
+          expect(sameRows(actual, alone, lo, Math.min(m, lo + 8), 0), `k${k}${interleave ? "i" : ""} S${pass.S} MT${pass.MT} m${m} rows ${lo}+`).toBe(true);
+        }
+      }
+    }
+  }, 60_000);
 });

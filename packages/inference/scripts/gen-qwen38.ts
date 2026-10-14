@@ -278,7 +278,7 @@ const LAYER_MODULES: Readonly<Record<string, string>> = Object.freeze({
   FactoredDownRow: "trellis-down", FactoredDownRows: "trellis-down", FactoredDownK3iRow: "trellis-down",
   FactoredDownK3iRows: "trellis-down", MmaDown: "trellis-down", MmaDownK3i: "trellis-down",
   MmaDownWide: "trellis-down", MmaDownWideK3i: "trellis-down",
-  CodebookMmaGateUp: "trellis-gate-up",
+  CodebookMmaGateUp: "trellis-gate-up", CodebookMmaDown: "trellis-down", CodebookMmaDownK3i: "trellis-down",
   CodebookGateUpRow: "trellis-reduce-gate-up", CodebookDownRow: "trellis-scatter-down", CodebookDownK3iRow: "trellis-scatter-down",
 });
 
@@ -335,9 +335,9 @@ const KERNELS: Readonly<Record<string, DeviceKernels>> = Object.freeze({
     label: "M1 Max GPU",
     mlp: {
       one: { sameGateUp: "CodebookGateUpRow", mixedGateUp: "CodebookGateUpRow", rowMajorDown: "CodebookDownRow", k3InterleavedDown: "CodebookDownK3iRow" },
-      twoToThree: { sameGateUp: "CodebookMmaGateUp", mixedGateUp: "CodebookMmaGateUp", rowMajorDown: "MmaDownWide", k3InterleavedDown: "MmaDownWideK3i" },
-      four: { sameGateUp: "CodebookMmaGateUp", mixedGateUp: "CodebookMmaGateUp", rowMajorDown: "MmaDownWide", k3InterleavedDown: "MmaDownWideK3i" },
-      fiveToEight: { sameGateUp: "CodebookMmaGateUp", mixedGateUp: "CodebookMmaGateUp", rowMajorDown: "MmaDownWide", k3InterleavedDown: "MmaDownWideK3i" },
+      twoToThree: { sameGateUp: "CodebookMmaGateUp", mixedGateUp: "CodebookMmaGateUp", rowMajorDown: "CodebookMmaDown", k3InterleavedDown: "CodebookMmaDownK3i" },
+      four: { sameGateUp: "CodebookMmaGateUp", mixedGateUp: "CodebookMmaGateUp", rowMajorDown: "CodebookMmaDown", k3InterleavedDown: "CodebookMmaDownK3i" },
+      fiveToEight: { sameGateUp: "CodebookMmaGateUp", mixedGateUp: "CodebookMmaGateUp", rowMajorDown: "CodebookMmaDown", k3InterleavedDown: "CodebookMmaDownK3i" },
     },
     // One row: MLX's qmv bit for bit with x's chunks computed once per threadgroup (AffineRowLinear) for the 3-bit
     // projections and the head, measured on each layer's weights back to back: 5120 -> 10240 0.100 -> 0.082 ms,

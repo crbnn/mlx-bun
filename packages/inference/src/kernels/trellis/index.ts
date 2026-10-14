@@ -67,7 +67,8 @@
 //   - gate-up-mma / down-mma: 1..8 rows on the simdgroup matrix unit
 //   - gate-up-mma-wide / down-mma-wide: the same fragments for any number of
 //     rows, each decoded fragment feeding the MMAs of several 8-row blocks,
-//     each code value read from a threadgroup codebook
+//     each code value read from a threadgroup codebook; down-mma-wide in
+//     passes the rows plan or the caller fixes (one block for 1..8 rows)
 //   - gate-up-codebook-mma: gate-up-mma's fragments and bits for 1..8 rows,
 //     each code value read from a threadgroup codebook (the M1 Max form)
 //
@@ -96,5 +97,7 @@ export { downK3InterleavedFactoredRow, downK3InterleavedFactoredRows } from "./d
 export { gateUpMma } from "./gate-up-mma";
 export { downMma, downK3InterleavedMma } from "./down-mma";
 export { gateUpMmaWide } from "./gate-up-mma-wide";
-export { downMmaWide, downK3InterleavedMmaWide } from "./down-mma-wide";
+export {
+  downMmaWide, downK3InterleavedMmaWide, downMmaWidePass, downK3InterleavedMmaWidePass, DOWN_ONE_BLOCK, type DownPass,
+} from "./down-mma-wide";
 export { gateUpCodebookMma } from "./gate-up-codebook-mma";

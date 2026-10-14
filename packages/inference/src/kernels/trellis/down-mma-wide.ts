@@ -27,16 +27,22 @@ import type { TrellisGeometry } from "./geometry";
 // 0.40, 0.58, 0.76, 1.49 (0.62, 0.64, 0.88, 1.08, 2.13; downMma 0.43).
 const SG_TG = 4, SPLITS = 8;
 
-/** Each layout's passes (sub-tiles S, row blocks MT) and their relative cost, measured per pass at 8 to 128 rows: the
- *  3-bit interleave runs one block per pass at every row count; row-major codes take sixteen sub-tiles for one block
- *  and eight for two or three. */
-const PLANS: Readonly<Record<"rowMajor" | "interleaved", readonly { readonly S: number; readonly MT: number; readonly cost: number }[]>> = {
-  interleaved: [{ S: 16, MT: 1, cost: 1 }],
-  rowMajor: [{ S: 16, MT: 1, cost: 0.6 }, { S: 8, MT: 2, cost: 1 }, { S: 8, MT: 3, cost: 1.44 }],
+/** One pass of the kernel: S sub-tiles per simdgroup, MT blocks of 8 rows per decoded fragment. */
+export interface DownPass { readonly S: number; readonly MT: number }
+
+/** One block of 8 rows per pass, sixteen sub-tiles: the cheapest pass for 1..8 rows in either layout. */
+export const DOWN_ONE_BLOCK: DownPass = Object.freeze({ S: 16, MT: 1 });
+
+/** Each layout's passes and their relative cost, measured per pass at 8 to 128 rows: the 3-bit interleave runs one
+ *  block per pass at every row count; row-major codes take sixteen sub-tiles for one block and eight for two or
+ *  three. */
+const PLANS: Readonly<Record<"rowMajor" | "interleaved", readonly (DownPass & { readonly cost: number })[]>> = {
+  interleaved: [{ ...DOWN_ONE_BLOCK, cost: 1 }],
+  rowMajor: [{ ...DOWN_ONE_BLOCK, cost: 0.6 }, { S: 8, MT: 2, cost: 1 }, { S: 8, MT: 3, cost: 1.44 }],
 };
 
-/** The sub-tiles and row blocks for M rows: the pass whose passes cost least in all (the more blocks on a tie). */
-function plan(layout: keyof typeof PLANS, M: number): { S: number; MT: number } {
+/** The pass for M rows: the one whose passes cost least in all (the more blocks on a tie). */
+function plan(layout: keyof typeof PLANS, M: number): DownPass {
   let best = { S: 0, MT: 0, cost: Infinity };
   for (const { S, MT, cost } of PLANS[layout]) {
     const total = Math.ceil(M / (8 * MT)) * cost;
@@ -137,12 +143,12 @@ inline uint block_state(thread const uint* w, thread const uint* v, uint t) {
 }
 `;
 
-function launch(kernel: MetalKernel, x2: MlxArray, codes: MlxArray, scales: MlxArray, g: TrellisGeometry, interleave: 0 | 1): MlxArray {
+function launch(kernel: MetalKernel, x2: MlxArray, codes: MlxArray, scales: MlxArray, g: TrellisGeometry, interleave: 0 | 1,
+  { S, MT }: DownPass): MlxArray {
   const M = x2.shape[0]!;
   if (x2.ndim !== 2 || M < 1) throw new Error("downMmaWide: expects [rows, inputs]");
   if (g.axis !== 0 || g.T !== 256 || g.cols % 256 !== 0 || g.rows % 8 !== 0 || g.L > 12)
     throw new Error("downMmaWide: unsupported geometry");
-  const { S, MT } = plan(interleave ? "interleaved" : "rowMajor", M);
   const nGroups = (g.cols / 256) * (32 / S);
   // Words covering 2S positions plus the L-bit window, after realignment.
   const NW = Math.ceil((2 * S * g.k + g.L - 1) / 32) + 1;
@@ -160,18 +166,29 @@ function launch(kernel: MetalKernel, x2: MlxArray, codes: MlxArray, scales: MlxA
 let rowMajor: MetalKernel | undefined, interleaved: MetalKernel | undefined;
 
 /** x2 [M, inFeatures] · W → [M, outFeatures] in x2's dtype for row-major axis-0 codes (T 256, L at most 12, input
- *  features a multiple of 8), any number of rows. Borrows inputs. */
-export function downMmaWide(x2: MlxArray, codes: MlxArray, scales: MlxArray, g: TrellisGeometry): MlxArray {
+ *  features a multiple of 8), any number of rows, in passes of the given shape. Borrows inputs. */
+export function downMmaWidePass(x2: MlxArray, codes: MlxArray, scales: MlxArray, g: TrellisGeometry, pass: DownPass): MlxArray {
   if (g.blockInterleave || codes.ndim !== 2) throw new Error("downMmaWide: needs row-major codes");
   rowMajor ??= new MetalKernel({ name: "mlx_bun_trellis_down_mma_wide", inputNames: ["x", "codes", "scales"],
     outputNames: ["partial"], source: SOURCE, header: HEADER + STATE_HEADER, ensureRowContiguous: true });
-  return launch(rowMajor, x2, codes, scales, g, 0);
+  return launch(rowMajor, x2, codes, scales, g, 0, pass);
 }
 
-/** downMmaWide for 3-bit block-interleaved codes [cols/512, rows, 48]. */
-export function downK3InterleavedMmaWide(x2: MlxArray, codes: MlxArray, scales: MlxArray, g: TrellisGeometry): MlxArray {
+/** downMmaWidePass for 3-bit block-interleaved codes [cols/512, rows, 48]. */
+export function downK3InterleavedMmaWidePass(x2: MlxArray, codes: MlxArray, scales: MlxArray, g: TrellisGeometry,
+  pass: DownPass): MlxArray {
   if (g.blockInterleave !== 2 || g.k !== 3) throw new Error("downK3InterleavedMmaWide: needs 3-bit block-interleaved codes");
   interleaved ??= new MetalKernel({ name: "mlx_bun_trellis_down_k3i_mma_wide", inputNames: ["x", "codes", "scales"],
     outputNames: ["partial"], source: SOURCE, header: HEADER + STATE_HEADER, ensureRowContiguous: true });
-  return launch(interleaved, x2, codes, scales, g, 1);
+  return launch(interleaved, x2, codes, scales, g, 1, pass);
+}
+
+/** downMmaWidePass in the pass the row count plans. */
+export function downMmaWide(x2: MlxArray, codes: MlxArray, scales: MlxArray, g: TrellisGeometry): MlxArray {
+  return downMmaWidePass(x2, codes, scales, g, plan("rowMajor", x2.shape[0]!));
+}
+
+/** downK3InterleavedMmaWidePass in the pass the row count plans. */
+export function downK3InterleavedMmaWide(x2: MlxArray, codes: MlxArray, scales: MlxArray, g: TrellisGeometry): MlxArray {
+  return downK3InterleavedMmaWidePass(x2, codes, scales, g, plan("interleaved", x2.shape[0]!));
 }
