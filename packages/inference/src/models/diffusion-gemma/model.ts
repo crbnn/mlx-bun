@@ -1,4 +1,4 @@
-import type { MlxCacheLayer, MlxMixedRange } from "../../contracts/mlx/graph";
+import type { MlxCacheLayer, MlxDenoisingPrefillRange, MlxDenoisingDecodeRange, MlxDenoisingAppendRange } from "../../contracts/mlx/graph";
 import { cleanupFailure, disposeResources } from "../../runtime/resources";
 // DiffusionGemma-26B-A4B-it (model_type "diffusion_gemma") — the first
 // NON-autoregressive model in the codebase. Instead of a left-to-right AR loop
@@ -38,8 +38,8 @@ import type { MlxDeclaredGraph, MlxDenoisingOperations } from "../../contracts/m
 import type { TrainableGraph } from "../../contracts/mlx/trainable";
 import { declareGraph } from "../capabilities";
 import type { PixelInput } from "../../contracts/mlx/media";
-import { geglu, GegluMLP } from "../../layers/geglu";
-import { logitSoftcap } from "../../kernels/logits";
+import { geglu, GegluMLP, CompiledGeglu, CompiledGegluMLP } from "../../layers/geglu";
+import { SortedDiffExperts, UnsortedDiffExperts } from "./experts";
 import { compiledLogitSoftcap } from "../../kernels/softcap";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
 import { QuantizedLinear } from "../../layers/quantized-linear";
@@ -201,6 +201,7 @@ class DiffExperts {
 /** SelfConditioning: post_norm(inputs_embeds + down(geglu(gate(pre_norm(signal)),
  *  up(pre_norm(signal))))). pre_norm is RMSNorm, post_norm is RMSNormNoScale. */
 class SelfConditioning {
+  readonly activation = new CompiledGeglu();
   readonly preNorm: RMSNorm;
   readonly postNorm: RMSNorm; // RMSNormNoScale (null weight)
   readonly gate: QuantizedLinear;
@@ -216,7 +217,7 @@ class SelfConditioning {
   }
   forward(inputsEmbeds: MlxArray, signal: MlxArray): MlxArray {
     const normed = this.preNorm.forward(signal);
-    const m = geglu(this.gate.forward(normed), this.up.forward(normed), this.compiledGeglu);
+    const m = this.activation.forward(this.gate.forward(normed), this.up.forward(normed));
     normed.dispose();
     const s = this.down.forward(m);
     m.dispose();
@@ -396,7 +397,10 @@ class DiffDecoderLayer {
     read: PassRead,
     offset: number,
     layerScalar: MlxArray | null,
-  ): MlxArray {
+  ): MlxArray { return this.forwardWith(x,cache,read,offset,layerScalar,this.mlp,this.experts); }
+
+  forwardWith(x: MlxArray, cache: Cache, read: PassRead, offset: number, layerScalar: MlxArray | null,
+    mlp: {forward(x:MlxArray):MlxArray}, experts: {forward(x:MlxArray,indices:MlxArray,weights:MlxArray):MlxArray}): MlxArray {
     // attention
     let residual = x;
     let h = this.inputNorm.forward(x);
@@ -407,7 +411,7 @@ class DiffDecoderLayer {
     // parallel dense-MLP + MoE feedforward
     residual = h;
     const dense = this.preFfNorm.forward(h);
-    let h1 = this.mlp.forward(dense);
+    let h1 = mlp.forward(dense);
     dense.dispose();
     h1 = disposing(h1, this.postFfNorm1.forward(h1));
 
@@ -423,7 +427,7 @@ class DiffDecoderLayer {
     rawIdx.dispose();
     let h2 = this.preFfNorm2.forward(flat);
     flat.dispose();
-    h2 = disposing(h2, this.experts.forward(h2, indices, topw));
+    h2 = disposing(h2, experts.forward(h2, indices, topw));
     indices.dispose();
     topw.dispose();
     h2 = disposing(h2, ops.reshape(h2, shape));
@@ -484,26 +488,53 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
   /** The GeGLU activations and the head's softcap run the compiled closures
    * (the reference's mx.compile'd geglu and softcap), unless the composition's
    * `compiledGeglu` is off: the spelled-out ops. */
-  readonly #compiledGeglu: boolean;
+  readonly makeCache!: () => Cache[];
+  readonly denoisingDecode: readonly MlxDenoisingDecodeRange[];
+  readonly denoisingAppend: readonly MlxDenoisingAppendRange[];
+  readonly denoisingPrefill: readonly MlxDenoisingPrefillRange[];
+  readonly #canvasLayers: readonly {forward: DiffDecoderLayer["forward"]}[];
+  readonly #unsortedLayers: readonly {forward: DiffDecoderLayer["forward"]}[];
+  readonly #sortedLayers: readonly {forward: DiffDecoderLayer["forward"]}[];
   /** The composition this graph was built for: its KV scheme and paging are its caches' (`makeCache`). */
 
   constructor(weights: Weights, config: ModelConfig) {
     const t = config.text;
     this.config = config;
-    this.#compiledGeglu = true;
+
     this.weightsBytes = [...weights.shards.files.values()].reduce((a, f) => a + f.mmap.size, 0);
     this.embed = QuantizedEmbedding.load(weights, "model.decoder.embed_tokens", config);
     this.embedScale = Math.pow(t.hiddenSize, 0.5);
     this.layers = Array.from(
       { length: t.numHiddenLayers },
-      (_, i) => new DiffDecoderLayer(weights, config, i, this.#compiledGeglu),
+      (_, i) => new DiffDecoderLayer(weights, config, i, true),
     );
     this.finalNorm = new RMSNorm(weights.tensor("model.decoder.norm.weight"), t.rmsNormEps);
-    this.selfConditioning = new SelfConditioning(weights, config, "model.decoder.self_conditioning", this.#compiledGeglu);
+    this.selfConditioning = new SelfConditioning(weights, config, "model.decoder.self_conditioning", true);
     this.encoderLayerScalars = this.layers.map((_, i) =>
       weights.tensor(`model.encoder.language_model.layers.${i}.layer_scalar`),
     );
     this.canvasLength = t.canvasLength ?? 256;
+    this.#unsortedLayers = this.layers.map(layer=>{
+      const mlp = new CompiledGegluMLP(layer.mlp), experts = new UnsortedDiffExperts(layer.experts);
+      return {forward:(x:MlxArray,cache:Cache,read:PassRead,offset:number,scalar:MlxArray|null)=>layer.forwardWith(x,cache,read,offset,scalar,mlp,experts)};
+    });
+    this.#sortedLayers = this.layers.map(layer=>{
+      const mlp = new CompiledGegluMLP(layer.mlp), experts = new SortedDiffExperts(layer.experts);
+      return {forward:(x:MlxArray,cache:Cache,read:PassRead,offset:number,scalar:MlxArray|null)=>layer.forwardWith(x,cache,read,offset,scalar,mlp,experts)};
+    });
+    this.#canvasLayers = this.canvasLength * t.topKExperts < 64 ? this.#unsortedLayers : this.#sortedLayers;
+    const boundary = Math.ceil(64/t.topKExperts);
+    const ranges = [{from:1,to:boundary-1,layers:this.#unsortedLayers},{from:boundary,to:Infinity,layers:this.#sortedLayers}].filter(range=>range.from<=range.to);
+    this.denoisingDecode = ranges.map(range=>({from:range.from,to:range.to,operation:(canvas,cache,feedback)=>this.decoderLogits(canvas,cache,feedback,range.layers)}));
+    this.denoisingAppend = ranges.map(range=>({from:range.from,to:range.to,operation:(tokens,cache)=>this.extendPrefill(tokens,cache,range.layers)}));
+    this.denoisingPrefill = ranges.map(range=>({from:range.from,to:range.to,operation:(ids,pixels)=>{
+        const cache = this.makeCache();
+        try {
+          if (pixels) this.encodeVisionPrefill(ids,pixels,cache,range.layers);
+          else this.#encodePrompt(ids,cache,range.layers);
+          return cache;
+        } catch(error) { cleanupFailure(error,()=>disposeResources(cache)); }
+      }}));
     this.softcap = t.finalLogitSoftcapping ?? 30.0;
     this.slidingWindow = t.slidingWindow;
     const raw = (config as unknown as { raw: Record<string, any> }).raw;
@@ -556,12 +587,12 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
    *  sliding window, image positions both ways; reference _make_encoder_masks +
    *  _vision_block_overlay, one mask for every layer), filling `cache`. The
    *  canvas decoder then reads it like the text path. */
-  encodeVisionPrefill(splicedIds: number[], pixels: MlxArray, cache: Cache[]): void {
+  encodeVisionPrefill(splicedIds: number[], pixels: MlxArray, cache: Cache[], layers: readonly {forward:DiffDecoderLayer["forward"]}[] = this.layers): void {
     let h = this.#embedInputsVision(splicedIds, pixels); // [1, L, hidden] (*embed_scale)
     using media = this.#imagePositions(splicedIds);
     const read = encoderRead(media);
     for (let i = 0; i < this.layers.length; i++) {
-      const layer = this.layers[i]!;
+      const layer = layers[i]!;
       const next = layer.forward(h, cache[i]!, read, 0, this.encoderLayerScalars[i]!);
       h.dispose();
       h = next;
@@ -594,13 +625,15 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
 
   /** Encoder prefill: run all layers over the prompt through the window read,
    *  filling the cache. Discards the hidden. */
-  encodePrompt(promptIds: number[], cache: Cache[]): void {
+  encodePrompt(promptIds: number[], cache: Cache[]): void { this.#encodePrompt(promptIds,cache,this.layers); }
+
+  #encodePrompt(promptIds: number[], cache: Cache[], layers: readonly {forward:DiffDecoderLayer["forward"]}[]): void {
     const ids = MlxArray.fromInt32(Int32Array.from(promptIds), [1, promptIds.length]);
     let h = this.embed.encode(ids);
     ids.dispose();
     h = disposing(h, ops.mulScalar(h, this.embedScale));
     for (let i = 0; i < this.layers.length; i++) {
-      const next = this.layers[i]!.forward(h, cache[i]!, windowRead, 0, this.encoderLayerScalars[i]!);
+      const next = layers[i]!.forward(h, cache[i]!, windowRead, 0, this.encoderLayerScalars[i]!);
       h.dispose();
       h = next;
     }
@@ -743,11 +776,12 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
     cache: Cache[],
     scLogits: MlxArray | null = null,
     scEmbeddings: MlxArray | null = null,
+    layers: readonly {forward:DiffDecoderLayer["forward"]}[] = this.layers,
   ): MlxArray {
     let h = this.#embedCanvas(canvasArr, scLogits, scEmbeddings);
     const offset = cache[0]!.offset;
     for (let i = 0; i < this.layers.length; i++) {
-      const next = this.layers[i]!.forward(h, cache[i]!, blockRead, offset, null);
+      const next = layers[i]!.forward(h, cache[i]!, blockRead, offset, null);
       h.dispose();
       h = next;
     }
@@ -779,8 +813,8 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
   }
 
   /** One denoising-step decoder pass -> softcapped logits [1, canvas, vocab]. */
-  decoderLogits(canvasArr: MlxArray, cache: Cache[], scEmbeddings: MlxArray | null): MlxArray {
-    const h = this.decodeCanvasArr(canvasArr, cache, null, scEmbeddings);
+  decoderLogits(canvasArr: MlxArray, cache: Cache[], scEmbeddings: MlxArray | null, layers = this.#canvasLayers): MlxArray {
+    const h = this.decodeCanvasArr(canvasArr, cache, null, scEmbeddings,layers);
     try { return this.logitsFromHidden(h); }
     finally { h.dispose(); }
   }
@@ -808,11 +842,11 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
 
   /** Re-prefill the encoder over an accepted canvas block (continuation), so the
    *  next block's decoder sees it as context. Appends to the existing cache. */
-  extendPrefill(canvasArr: MlxArray, cache: Cache[]): void {
+  extendPrefill(canvasArr: MlxArray, cache: Cache[], layers: readonly {forward:DiffDecoderLayer["forward"]}[] = this.layers): void {
     let h = this.embed.encode(canvasArr);
     h = disposing(h, ops.mulScalar(h, this.embedScale));
     for (let i = 0; i < this.layers.length; i++) {
-      const next = this.layers[i]!.forward(h, cache[i]!, windowRead, 0, this.encoderLayerScalars[i]!);
+      const next = layers[i]!.forward(h, cache[i]!, windowRead, 0, this.encoderLayerScalars[i]!);
       h.dispose();
       h = next;
     }
@@ -826,7 +860,7 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
     // (stays f32; the golden is dumped f32). The flag-off arm spells out the same math.
     const wide = logits.astype(Dtype.float32);
     logits.dispose();
-    const capped = this.#compiledGeglu ? compiledLogitSoftcap(wide, this.softcap) : logitSoftcap(wide, this.softcap);
+    const capped = compiledLogitSoftcap(wide, this.softcap);
     wide.dispose();
     return capped;
   }

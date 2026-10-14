@@ -6,6 +6,7 @@ import type { Weights } from "../../src/artifacts/weights";
 import type { ModelConfig } from "../../src/artifacts/config";
 import { DecoderLayer } from "../../src/models/gemma4/blocks";
 import { GemmaLayerWeights, GemmaInputLayerWeights, GemmaMoeLayerWeights, GemmaDenseLayer, GemmaInputLayer, GemmaMoeLayer, SlidingAttention, FullAttention, FullKEqVAttention, SharedSlidingAttention, CompiledGegluMLP, FixedExperts, CompiledGeglu, SortedSwitchGLU, UnsortedSwitchGLU } from "../../src/models/gemma4/written-blocks";
+import { ServingDenseLayer, ServingMoeLayer } from "../../src/models/gemma4/serving-blocks";
 import { KVCache } from "../../src/state/kv";
 
 const numerical = test.skipIf(!process.env.MLX_BUN_TEST_FIXED_LAYERS);
@@ -62,16 +63,18 @@ numerical("written dense and per-layer-input blocks retain outputs, donor reads 
     const attention = kEqV ? new FullKEqVAttention(data.weights, data.config, `${prefix}.self_attn`) : new SlidingAttention(data.weights, data.config, `${prefix}.self_attn`);
     const parts = inputs ? new GemmaInputLayerWeights(data.weights, data.config, prefix, attention) : new GemmaLayerWeights(data.weights, data.config, prefix, attention);
     const fixed = inputs ? new GemmaInputLayer(parts as GemmaInputLayerWeights, new CompiledGegluMLP(parts.mlp)) : new GemmaDenseLayer(parts, new CompiledGegluMLP(parts.mlp));
-    const a = new KVCache(), b = new KVCache();
+    const serving = new ServingDenseLayer(original,new CompiledGegluMLP(original.mlp));
+    const a = new KVCache(), b = new KVCache(), c = new KVCache();
     try {
       for (const rows of [3, 1, 1]) {
         using x = input(rows, 128), layerInput = input(rows, 64);
         const control = original.forward(x, a, rows === 1 ? "decode" : "window", null, inputs ? layerInput : null);
+        const bound = serving.forward(x,c,rows === 1 ? "decode" : "window",null,inputs ? layerInput : null);
         const actual = fixed.forward(x, b, rows === 1 ? "decode" : "window", null, layerInput);
-        try { equal(actual.h, control.h); equal(a.keys!, b.keys!); equal(a.values!, b.values!); expect(a.offset).toBe(b.offset); }
-        finally { actual.h.dispose(); control.h.dispose(); actual.donor?.dispose(); control.donor?.dispose(); }
+        try { equal(bound.h,control.h); equal(c.keys!,a.keys!); equal(c.values!,a.values!); equal(actual.h, control.h); equal(a.keys!, b.keys!); equal(a.values!, b.values!); expect(a.offset).toBe(b.offset); }
+        finally { bound.h.dispose(); bound.donor?.dispose(); actual.h.dispose(); control.h.dispose(); actual.donor?.dispose(); control.donor?.dispose(); }
       }
-    } finally { a.dispose(); b.dispose(); data.dispose(); }
+    } finally { a.dispose(); b.dispose(); c.dispose(); data.dispose(); }
   }
 });
 
@@ -82,12 +85,15 @@ numerical("written MoE blocks retain unsorted and sorted expert arithmetic at th
   const unsorted = new GemmaMoeLayer(parts, new CompiledGegluMLP(parts.mlp), new FixedExperts(new UnsortedSwitchGLU(parts.experts, new CompiledGeglu())));
   const sorted = new GemmaMoeLayer(parts, new CompiledGegluMLP(parts.mlp), new FixedExperts(new SortedSwitchGLU(parts.experts, new CompiledGeglu())));
   try {
+    const boundUnsorted = new ServingMoeLayer(original,new CompiledGegluMLP(original.mlp),new FixedExperts(new UnsortedSwitchGLU(original.experts!.switchGlu,new CompiledGeglu())));
+    const boundSorted = new ServingMoeLayer(original,new CompiledGegluMLP(original.mlp),new FixedExperts(new SortedSwitchGLU(original.experts!.switchGlu,new CompiledGeglu())));
     for (const rows of [1, 7, 31, 32, 40]) {
       using x = input(rows, 128);
       const expected = original.moeFeedforward(x);
       using actual = (rows >= 32 ? sorted : unsorted).feedforward(x);
       using scaled = original.scaled(expected);
-      equal(actual, scaled);
+      using bound = (rows >= 32 ? boundSorted : boundUnsorted).forwardMlp(x,null);
+      equal(bound,scaled); equal(actual, scaled);
     }
   } finally { parts.router.normWeight.dispose(); original.router!.normWeight.dispose(); data.dispose(); }
 });

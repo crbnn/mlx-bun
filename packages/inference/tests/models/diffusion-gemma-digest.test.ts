@@ -396,3 +396,41 @@ test("the composition's KV scheme: quantized and paged quantized forms serve the
   }
   console.log(`diffusion-gemma composed KV (synthetic weights, canvas KL vs bf16): ${JSON.stringify(report)}`);
 }, 240_000);
+
+test("declared denoising ranges preserve prompt, canvas and continuation arithmetic across the expert threshold", () => {
+  const binding = bindLegacyDenoisingModel(current).graph;
+  for (const length of [1,31,32,37]) {
+    const ids = prompt(length,length);
+    const candidate = binding.prefill(ids), control = current.prefill(ids);
+    const sameState = () => {
+      expect(candidate.length).toBe(control.length);
+      for (let i=0; i<control.length; i++) {
+        expect(candidate[i]!.offset).toBe(control[i]!.offset);
+        const a=candidate[i]!.state(), b=control[i]!.state();
+        try {
+          expect(a.length).toBe(b.length);
+          for (let j=0;j<a.length;j++) {
+            using left=ops.contiguous(a[j]!), right=ops.contiguous(b[j]!);
+            expect(Buffer.from(left.rawBytes()).equals(Buffer.from(right.rawBytes()))).toBe(true);
+          }
+        } finally {
+          if(candidate[i]!.stateNeedsDispose) disposeResources(a);
+          if(control[i]!.stateNeedsDispose) disposeResources(b);
+        }
+      }
+    };
+    try {
+      sameState();
+      for (const rows of [1,7,31,32,37]) {
+        using canvas=ops.fromInt32(prompt(rows,3),[1,rows]);
+        using hidden=current.decodeCanvasArr(canvas,control);
+        expectSame(`range canvas ${rows}`,binding.decoderLogits(canvas,candidate,null),current.logitsFromHidden(hidden));
+        sameState();
+      }
+      for(const rows of [1,31,32]) {
+        using tokens=ops.fromInt32(prompt(rows,4),[1,rows]);
+        binding.extendPrefill(tokens,candidate); current.extendPrefill(tokens,control); sameState();
+      }
+    } finally { disposeResources([...candidate,...control]); }
+  }
+},120_000);

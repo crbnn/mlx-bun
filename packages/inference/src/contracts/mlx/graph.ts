@@ -129,7 +129,27 @@ export interface MlxCompiledDecodeStep {
 
 /** method `denoising`: what the canvas denoiser drives over a graph's weights, with the prefill state
  * an array of caches. A graph that declares the method implements these; binding refuses one that does not. */
+export interface MlxDenoisingPrefillRange {
+  readonly from: number;
+  readonly to: number;
+  readonly operation: (promptIds: number[], pixels: MlxArray | null) => Cache[];
+}
+
+export interface MlxDenoisingDecodeRange {
+  readonly from: number;
+  readonly to: number;
+  readonly operation: (canvas: MlxArray, state: Cache[], feedback: MlxArray | null) => MlxArray;
+}
+export interface MlxDenoisingAppendRange {
+  readonly from: number;
+  readonly to: number;
+  readonly operation: (tokens: MlxArray, state: Cache[]) => void;
+}
+
 export interface MlxDenoisingOperations {
+  readonly denoisingDecode?: readonly MlxDenoisingDecodeRange[];
+  readonly denoisingAppend?: readonly MlxDenoisingAppendRange[];
+  readonly denoisingPrefill?: readonly MlxDenoisingPrefillRange[];
   readonly config: { readonly text: { readonly vocabSize: number } };
   readonly canvasLength: number;
   readonly embedScale: number;

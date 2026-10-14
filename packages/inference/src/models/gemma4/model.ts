@@ -64,6 +64,8 @@ import {
  * applied) and values it appended to its training cache, which its sharers read
  * through that cache and which cross checkpoint and segment boundaries as
  * tensors. */
+type DecoderOperation = Pick<DecoderLayer,"forward"|"forwardAttn"|"forwardMlp">;
+
 type PlainSharedKv = Extract<SharedKv, { kind: "plain" }>;
 
 /** The training forward's attention (`Gemma4Model.forwardTrainingHidden`,
@@ -216,10 +218,6 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly perLayerModelProjection: QuantizedLinear | null;
   readonly perLayerProjectionNorm: RMSNorm | null;
   readonly perLayerWidth: number;
-  /** The served configuration this graph was built for: its KV scheme (what
-   *  `makeCache` composes) and its switches. */
-  /** The composition's `packedMixedMlp`: the groups of a mixed forward share
-   *  one MLP call. */
   readonly #servingLayers: readonly ServingDenseLayer[];
   readonly #sortedLayers: readonly ServingDenseLayer[];
   readonly traceLayers: readonly ServingDenseLayer[];
@@ -228,19 +226,14 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly #traceSlice: PerLayerInputs["traceLayer"] | undefined;
   readonly traceLogits = (hidden: MlxArray) => this.#head(hidden, logitSoftcap);
   readonly mediaPrefill: readonly MlxEmbeddingsRange[];
+  readonly embeddingPrompt: readonly MlxEmbeddingsRange[];
   readonly mixed: readonly MlxMixedRange[];
   readonly mixedSeparate: MlxSeparateMixed;
-  /** The GeGLU activations and the head's softcap run the compiled closures
-   *  (mlx-lm's @mx.compile'd geglu and logit_softcap), unless the
-   *  composition's `compiledGeglu` is off: the spelled-out ops. */
-
-
   constructor(weights: Weights, config: ModelConfig, maxPhaseRows = DEFAULT_PHASE_ROWS) {
     const t = config.text;
     if (t.hiddenSize === 0 || !config.text.tieWordEmbeddings)
       throw new Error("only tied-embedding text configs are supported");
 
-    
     this.config = config;
     this.weightsBytes = [...weights.shards.files.values()]
       .reduce((a, f) => a + f.mmap.size, 0);
@@ -309,6 +302,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
       : this.forwardDecoder(this.embedTokens(ids),cache,"window",ids,null,view.layers)}));
     this.mediaPrefill = views.map(view=>({from:view.from,to:view.to,operation:(embeddings,cache,imageMask,ids,multimodalMask)=>
       this.#prefillEmbeddings(embeddings,cache,imageMask,ids,multimodalMask,view.layers)}));
+    this.embeddingPrompt = this.mediaPrefill;
     this.mixed = views.map(view=>({from:view.from,to:view.to,operation:groups=>this.#mixed(groups,view.layers)}));
     const separate = views.map(view=>({from:view.from,to:view.to,operation:(group:MlxPhaseGroup)=>{
       const hidden = this.forwardDecoder(this.embedTokens(group.ids),group.state,group.phase === "decode" ? "decode" : "window",group.ids,group.capture,view.layers);
@@ -371,12 +365,13 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
     if (constants.length) ops.evalAll(constants);
   }
 
-  /** The scoring and training forward (`MlxSequenceForward`): the window read
+  /** Legacy direct scoring/training API. Serving resolves the fixed `sequence`
+   * ranges above. The window read
    *  at every width, or the checkpointed training forward while the trainer
    *  checkpoints (`gradCkpt`). */
   sequenceHidden(ids: MlxArray, cache: Cache[], _width: number): MlxArray {
     const h0 = this.embedTokens(ids);
-    return this.gradCkpt ? this.#forwardTraining(h0, cache, ids) : this.forwardDecoder(h0, cache, "window", ids);
+    return this.gradCkpt ? this.#forwardTraining(h0, cache, ids) : this.forwardDecoder(h0, cache, "window", ids, null, this.layers);
   }
 
   /** The scaled token embeddings [B, L, hidden] of `ids` (owned). */
@@ -440,14 +435,15 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    *  positions must still be zeroed. When null (the legacy vision call
    *  shape), the zeroing mask falls back to `bidir` — vision passes the same
    *  image mask for both roles, so that path is unchanged. */
+  /** Legacy direct media API. Serving resolves `mediaPrefill` ranges. */
   prefillEmbeddings(embeds: MlxArray, cache: Cache[], bidir: MlxArray | null, ids: MlxArray | null = null, multimodal: MlxArray | null = null): MlxArray {
-    return this.#prefillEmbeddings(embeds,cache,bidir,ids,multimodal,this.#servingLayers);
+    return this.#prefillEmbeddings(embeds,cache,bidir,ids,multimodal,this.layers);
   }
 
   #prefillEmbeddings(
     embeds: MlxArray, cache: Cache[], bidir: MlxArray | null,
     ids: MlxArray | null = null, multimodal: MlxArray | null = null,
-    layers = this.#servingLayers,
+    layers: readonly DecoderOperation[] = this.#servingLayers,
   ): MlxArray {
     const h = ops.mulScalar(embeds, this.embedScale);
     const phase: Gemma4Phase = bidir ? { bidirectional: bidir } : "window";
@@ -476,7 +472,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    *  runs (see `MlxLayerCapture`); the caller hands it the final hidden. */
   protected forwardDecoder(
     h0: MlxArray, cache: Cache[], phase: Gemma4Phase, ids: MlxArray | null,
-    capture: MlxLayerCapture | null = null, layers: readonly ServingDenseLayer[] = this.#servingLayers, slice = this.#ordinarySlice,
+    capture: MlxLayerCapture | null = null, layers: readonly DecoderOperation[] = this.#servingLayers, slice = this.#ordinarySlice,
   ): MlxArray {
     const B = h0.shape[0]!;
     const L = h0.shape[1]!;

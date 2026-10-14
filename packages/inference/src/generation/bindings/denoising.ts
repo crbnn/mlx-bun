@@ -34,9 +34,15 @@ export function bindLegacyDenoisingModel(resident: MlxDenoisingModel): MlxDenois
       descriptor: Object.freeze({ id: "legacy-diffusion-gemma", backend: "mlx",
         graphAbi: "mlx-denoising-v1", stateAbi: "legacy-cache-array-v1", artifact: "legacy-resident-model" }),
       vocabSize: model.config.text.vocabSize, canvasLength: model.canvasLength, embedScale: model.embedScale,
-      prefill: (ids, vision) => vision ? model.prefillVision!(ids, vision) : model.prefill(ids),
-      extendPrefill: model.extendPrefill.bind(model),
-      decoderLogits: model.decoderLogits.bind(model),
+      prefill: (ids, vision) => model.denoisingPrefill
+        ? model.denoisingPrefill.find(range => ids.length >= range.from && ids.length <= range.to)!.operation(ids, vision ?? null)
+        : vision ? model.prefillVision!(ids, vision) : model.prefill(ids),
+      extendPrefill: (tokens,state) => model.denoisingAppend
+        ? model.denoisingAppend.find(range=>tokens.size>=range.from && tokens.size<=range.to)!.operation(tokens,state)
+        : model.extendPrefill(tokens,state),
+      decoderLogits: (canvas,state,feedback) => model.denoisingDecode
+        ? model.denoisingDecode.find(range=>canvas.size>=range.from && canvas.size<=range.to)!.operation(canvas,state,feedback)
+        : model.decoderLogits(canvas,state,feedback),
       dequantEmbedWeight: model.dequantEmbedWeight.bind(model),
       softEmbeddings: model.softEmbeddings.bind(model),
       closeState: disposeResources,
