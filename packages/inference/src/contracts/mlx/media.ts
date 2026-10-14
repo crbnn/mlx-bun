@@ -85,3 +85,29 @@ export interface MediaSidecarProbes {
   /** Whether the sidecar at `path` ships the audio encoder's tensors (header-only read). */
   shipsAudioTower(path: string): boolean;
 }
+
+
+/** Fixed embedding prefill over prepared image/audio embeddings. */
+export type MlxEmbeddingsForward = (embeddings: MlxArray, state: Cache[], imageMask: MlxArray | null,
+  ids: MlxArray, multimodalMask: MlxArray | null) => MlxArray;
+export interface MlxEmbeddingsRange {
+  readonly from: number;
+  readonly to: number;
+  readonly operation: MlxEmbeddingsForward;
+}
+
+/** Fixed token forward at request-owned rotary positions. */
+export type MlxPositionedForward = (ids: MlxArray, state: Cache[], positions: MlxArray) => MlxArray;
+export interface MlxPositionedRange {
+  readonly from: number;
+  readonly to: number;
+  readonly operation: MlxPositionedForward;
+}
+
+/** Fixed embedding prefill at request-owned rotary positions. */
+export type MlxPositionedEmbeddingsForward = (embeddings: MlxArray, state: Cache[], positions: MlxArray) => MlxArray;
+export interface MlxPositionedEmbeddingsRange {
+  readonly from: number;
+  readonly to: number;
+  readonly operation: MlxPositionedEmbeddingsForward;
+}

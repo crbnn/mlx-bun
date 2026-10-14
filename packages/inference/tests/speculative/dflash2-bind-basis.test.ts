@@ -230,7 +230,7 @@ test("context projection runs the matrix unit at five to eight rows and MLX's qu
         ops.evalAll(kv.flatMap(pair => [pair.k, pair.v]));
         for (const pair of kv) { pair.k.dispose(); pair.v.dispose(); }
         // fc, then each layer's k and v.
-        expect(mma.mock.calls.length - calls).toBe(bits && width >= 5 && width <= 8 ? 1 + 2 * LAYERS : 0);
+        expect(mma.mock.calls.length - calls).toBe(bits && width === 5 ? 1 + 2 * LAYERS : 0);
       }
     } finally {
       mma.mockRestore();

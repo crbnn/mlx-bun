@@ -6,7 +6,7 @@ import { mropePositionIds } from "../../layers/qwen-mrope";
 import { type MropeRequestState } from "../../contracts/mlx/positions";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { Cache } from "../../contracts/mlx/cache";
-import type { MediaEncoders, MlxDecodeState, MlxPromptInput, VisionEncoder } from "../../contracts/mlx/media";
+import type { MediaEncoders, MlxDecodeState, MlxPromptInput, VisionEncoder, MlxPositionedEmbeddingsRange, MlxPositionedRange, MlxPositionedForward } from "../../contracts/mlx/media";
 import type { MlxHeadForward, MlxRowTable } from "../../contracts/mlx/graph";
 import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
 import { existsSync } from "node:fs";
@@ -23,11 +23,14 @@ export interface QwenMediaGraph {
   /** The full-attention layer whose cache supplies logical positions. */
   readonly faIdx: number;
   /** The vision prefill phase: a prompt's prepared embeddings (borrowed) at request positions. */
-  prefillEmbeddingsAtPositions(embeddings: MlxArray, caches: Cache[], positions: MlxArray, width: number): MlxArray;
+  prefillEmbeddingsAtPositions?(embeddings: MlxArray, caches: Cache[], positions: MlxArray, width: number): MlxArray;
   /** A prompt's token ids after a reused prefix, at request positions. */
-  prefillAtPositions(ids: MlxArray, caches: Cache[], positions: MlxArray, width: number): MlxArray;
+  prefillAtPositions?(ids: MlxArray, caches: Cache[], positions: MlxArray, width: number): MlxArray;
   /** One new token per row at request positions. */
-  decodeAtPositions(ids: MlxArray, caches: Cache[], positions: MlxArray, width: number): MlxArray;
+  decodeAtPositions?(ids: MlxArray, caches: Cache[], positions: MlxArray, width: number): MlxArray;
+  readonly mediaPrefill?: readonly MlxPositionedEmbeddingsRange[];
+  readonly mediaPrompt?: readonly MlxPositionedRange[];
+  readonly mediaDecode?: MlxRowTable<MlxPositionedForward>;
   readonly logits: MlxRowTable<MlxHeadForward>;
 }
 
@@ -49,7 +52,8 @@ class QwenMediaDecodeState implements MlxDecodeState {
     using positions = ops.add(startRows, indices);
     using axis = ops.reshape(positions, [1, B, L]);
     using grid = ops.concatAxis([axis, axis, axis], 0);
-    return this.model.decodeAtPositions(ids, caches, grid, width);
+    return this.model.mediaDecode ? this.model.mediaDecode[width]!(ids, caches, grid)
+      : this.model.decodeAtPositions!(ids, caches, grid, width);
   }
 }
 
@@ -58,9 +62,14 @@ export function bindQwenMediaInput(model: QwenMediaGraph, embeddings: MlxArray,
   state: MropeRequestState): MlxPromptInput {
   const input = bindEmbeddingsInput((ids, caches, start, phase, width) => {
     using positions = mropePositionIds(state, start, ids.shape[1]!);
-    if (start === 0) return model.prefillEmbeddingsAtPositions(embeddings, caches, positions, width);
-    return phase === "decode" ? model.decodeAtPositions(ids, caches, positions, width)
-      : model.prefillAtPositions(ids, caches, positions, width);
+    if (start === 0) return model.mediaPrefill
+      ? model.mediaPrefill.find(range => width >= range.from && width <= range.to)!.operation(embeddings, caches, positions)
+      : model.prefillEmbeddingsAtPositions!(embeddings, caches, positions, width);
+    if (phase === "decode") return model.mediaDecode ? model.mediaDecode[width]!(ids, caches, positions)
+      : model.decodeAtPositions!(ids, caches, positions, width);
+    return model.mediaPrompt
+      ? model.mediaPrompt.find(range => width >= range.from && width <= range.to)!.operation(ids, caches, positions)
+      : model.prefillAtPositions!(ids, caches, positions, width);
   });
   return { ...input, decodeState: new QwenMediaDecodeState(model, state.delta) };
 }
