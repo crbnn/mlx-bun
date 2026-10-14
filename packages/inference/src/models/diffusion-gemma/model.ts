@@ -600,13 +600,6 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
     h.dispose();
   }
 
-  /** Prefill from a pre-spliced image+text prompt → populated cache. */
-  prefillVision(this: DiffusionGemmaModel & { makeCache(): Cache[] }, splicedIds: number[], pixels: MlxArray): Cache[] {
-    const cache = this.makeCache();
-    try { this.encodeVisionPrefill(splicedIds, pixels, cache); return cache; }
-    catch (error) { cleanupFailure(error, () => disposeResources(cache)); }
-  }
-
   /** Releases the rope frequency tables its layers built; the weights are its owner's. */
   dispose(): void {
     disposeResources(this.layers.flatMap(layer => layer.attn.ropeFreqs ? [layer.attn.ropeFreqs] : []));
@@ -804,14 +797,6 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
 
   // ---- D2 denoising-engine surface ----
 
-  /** Encoder prefill over the prompt -> a fresh populated cache (the denoising
-   *  loop reuses it across all steps of a canvas block). */
-  prefill(this: DiffusionGemmaModel & { makeCache(): Cache[] }, promptIds: number[]): Cache[] {
-    const cache = this.makeCache();
-    try { this.encodePrompt(promptIds, cache); return cache; }
-    catch (error) { cleanupFailure(error, () => disposeResources(cache)); }
-  }
-
   /** One denoising-step decoder pass -> softcapped logits [1, canvas, vocab]. */
   decoderLogits(canvasArr: MlxArray, cache: Cache[], scEmbeddings: MlxArray | null, layers = this.#canvasLayers): MlxArray {
     const h = this.decodeCanvasArr(canvasArr, cache, null, scEmbeddings,layers);
@@ -893,14 +878,6 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
     } finally {
       for (const c of cache) c.dispose();
     }
-  }
-
-  // ---- The scoring surface (never called on a diffusion model) ----
-  // DiffusionGemma is non-autoregressive: generation routes it to the denoising
-  // engine (packages/inference/src/generation/diffusion.ts). This exists so the
-  // model fits the RuntimeModel union scoring takes; calling it is a bug.
-  sequenceHidden(_ids: MlxArray, _cache: Cache[], _width: number): MlxArray {
-    throw new Error("DiffusionGemma is non-autoregressive — use the diffusion engine, not the scoring forward");
   }
 
   readonly prefixBase = "model.decoder";

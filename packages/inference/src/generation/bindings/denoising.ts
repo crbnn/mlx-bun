@@ -24,9 +24,11 @@ export function bindLegacyDenoisingModel(resident: MlxDenoisingModel): MlxDenois
   if (declaredGraph(resident).graphCapabilities.method !== "denoising")
     throw new TypeError("the graph does not declare the denoising method");
   const model = resident as MlxDenoisingOperations;
-  for (const operation of ["prefill", "extendPrefill", "decoderLogits", "dequantEmbedWeight", "softEmbeddings"] as const)
+  for (const operation of ["extendPrefill", "decoderLogits", "dequantEmbedWeight", "softEmbeddings"] as const)
     if (typeof model[operation] !== "function")
       throw new TypeError(`the graph declares the denoising method but provides no ${operation}`);
+  if (!model.denoisingPrefill && typeof model.prefill !== "function")
+    throw new TypeError("the graph declares the denoising method but provides no prefill");
   return {
     runtime: runtimeConfig(),
     memory: resident, adapters: resident.loraState,
@@ -36,7 +38,7 @@ export function bindLegacyDenoisingModel(resident: MlxDenoisingModel): MlxDenois
       vocabSize: model.config.text.vocabSize, canvasLength: model.canvasLength, embedScale: model.embedScale,
       prefill: (ids, vision) => model.denoisingPrefill
         ? model.denoisingPrefill.find(range => ids.length >= range.from && ids.length <= range.to)!.operation(ids, vision ?? null)
-        : vision ? model.prefillVision!(ids, vision) : model.prefill(ids),
+        : vision ? model.prefillVision!(ids, vision) : model.prefill!(ids),
       extendPrefill: (tokens,state) => model.denoisingAppend
         ? model.denoisingAppend.find(range=>tokens.size>=range.from && tokens.size<=range.to)!.operation(tokens,state)
         : model.extendPrefill(tokens,state),

@@ -365,15 +365,6 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
     if (constants.length) ops.evalAll(constants);
   }
 
-  /** Legacy direct scoring/training API. Serving resolves the fixed `sequence`
-   * ranges above. The window read
-   *  at every width, or the checkpointed training forward while the trainer
-   *  checkpoints (`gradCkpt`). */
-  sequenceHidden(ids: MlxArray, cache: Cache[], _width: number): MlxArray {
-    const h0 = this.embedTokens(ids);
-    return this.gradCkpt ? this.#forwardTraining(h0, cache, ids) : this.forwardDecoder(h0, cache, "window", ids, null, this.layers);
-  }
-
   /** The scaled token embeddings [B, L, hidden] of `ids` (owned). */
   protected embedTokens(ids: MlxArray): MlxArray {
     const h = this.embed.encode(ids);
@@ -435,11 +426,6 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    *  positions must still be zeroed. When null (the legacy vision call
    *  shape), the zeroing mask falls back to `bidir` — vision passes the same
    *  image mask for both roles, so that path is unchanged. */
-  /** Legacy direct media API. Serving resolves `mediaPrefill` ranges. */
-  prefillEmbeddings(embeds: MlxArray, cache: Cache[], bidir: MlxArray | null, ids: MlxArray | null = null, multimodal: MlxArray | null = null): MlxArray {
-    return this.#prefillEmbeddings(embeds,cache,bidir,ids,multimodal,this.layers);
-  }
-
   #prefillEmbeddings(
     embeds: MlxArray, cache: Cache[], bidir: MlxArray | null,
     ids: MlxArray | null = null, multimodal: MlxArray | null = null,

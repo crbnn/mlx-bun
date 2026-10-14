@@ -227,7 +227,7 @@ function extend(digest: DigestCase, label: string, caches: Cache[], length: numb
 
 // 5 < window - 1, 15 = window - 1 (no block mask), 16 and 37 past it (block mask and cut).
 for (const length of [2, 5, 15, 16, 37]) digests.test(`text ${length}: prefill, canvas passes and continuations across the window`, digest => {
-  const caches = current.prefill(prompt(length, length));
+  const caches = bindLegacyDenoisingModel(current).graph.prefill(prompt(length, length));
   try {
     digest.caches(`text prefill ${length}`, caches);
     canvasSteps(digest, `text ${length}`, caches, BigInt(length), 4);
@@ -243,7 +243,7 @@ for (const [before, after] of [[0, 1], [2, 3], [8, 13]] as const) {
   digests.test(`vision ${before}+${after}: the encoder window over synthetic pixels, inside and past the sliding window`, digest => {
     const ids = visionPrompt(before, VISION.output, after);
     using image = pixels(before + 1);
-    const caches = current.prefillVision(ids, image);
+    const caches = bindLegacyDenoisingModel(current).graph.prefill(ids,image);
     try {
       digest.caches(`vision prefill ${ids.length}`, caches);
       canvasSteps(digest, `vision ${ids.length}`, caches, BigInt(ids.length), 3);
@@ -320,7 +320,7 @@ test("the composition's paging: paged bf16 canvas passes equal the bf16 lego's",
   const paged = composedGraph({ kind: "bf16" }, true);
   for (const length of [5, 37]) {
     const ids = prompt(length, length);
-    const caches = { paged: paged.prefill(ids), plain: current.prefill(ids) };
+    const caches = { paged: bindLegacyDenoisingModel(paged).graph.prefill(ids), plain: bindLegacyDenoisingModel(current).graph.prefill(ids) };
     try {
       expect(caches.paged.filter(cache => cache.signature() === "kv:paged").length).toBe(2);
       const step = (label: string, salt: number) => {
@@ -336,7 +336,7 @@ test("the composition's paging: paged bf16 canvas passes equal the bf16 lego's",
   }
   const ids = visionPrompt(8, VISION.output, 13);
   using image = pixels(9);
-  const caches = { paged: paged.prefillVision(ids, image), plain: current.prefillVision(ids, image) };
+  const caches = { paged: bindLegacyDenoisingModel(paged).graph.prefill(ids,image), plain: bindLegacyDenoisingModel(current).graph.prefill(ids,image) };
   try {
     using canvas = ops.fromInt32(prompt(CANVAS, 5), [1, CANVAS]);
     expectSame("paged vision", paged.decoderLogits(canvas, caches.paged, null), current.decoderLogits(canvas, caches.plain, null));
@@ -377,7 +377,7 @@ test("the composition's KV scheme: quantized and paged quantized forms serve the
     const totals = { mean: 0, max: 0, agree: 0, passes: 0 };
     for (const length of [5, 37]) {
       const ids = prompt(length, length);
-      const caches = { form: graph.prefill(ids), reference: reference.prefill(ids) };
+      const caches = { form: bindLegacyDenoisingModel(graph).graph.prefill(ids), reference: bindLegacyDenoisingModel(reference).graph.prefill(ids) };
       try {
         for (const salt of [3, 4]) {
           using canvas = ops.fromInt32(prompt(CANVAS, salt), [1, CANVAS]);
@@ -401,7 +401,8 @@ test("declared denoising ranges preserve prompt, canvas and continuation arithme
   const binding = bindLegacyDenoisingModel(current).graph;
   for (const length of [1,31,32,37]) {
     const ids = prompt(length,length);
-    const candidate = binding.prefill(ids), control = current.prefill(ids);
+    const candidate = binding.prefill(ids), control = current.makeCache();
+    current.encodePrompt(ids,control);
     const sameState = () => {
       expect(candidate.length).toBe(control.length);
       for (let i=0; i<control.length; i++) {

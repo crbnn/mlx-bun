@@ -153,7 +153,7 @@ export interface MlxDenoisingOperations {
   readonly config: { readonly text: { readonly vocabSize: number } };
   readonly canvasLength: number;
   readonly embedScale: number;
-  prefill(promptIds: number[]): Cache[];
+  prefill?(promptIds: number[]): Cache[];
   /** Image-conditioned prefill from channel-first pixels. */
   prefillVision?(promptIds: number[], pixels: MlxArray): Cache[];
   extendPrefill(tokens: MlxArray, state: Cache[]): void;

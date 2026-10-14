@@ -124,7 +124,8 @@ test.skipIf(!inputs)("DiffusionGemma past the window: selected encoder K/V and f
   let cache: Cache[] = [];
   try {
     const model = createModel(weights, await loadModelConfig(inputs!.model)) as TestGraph<DiffusionGemmaModel>;
-    cache = model.prefill(manifest.inputs.prompt);
+    const { bindLegacyDenoisingModel } = await import("../../src/generation/bindings/denoising");
+    cache = bindLegacyDenoisingModel(model).graph.prefill(manifest.inputs.prompt);
     expect(cache).toHaveLength(geometry.layers);
     cache.forEach((c, i) => {
       // The decoder's selection: the newest window - 1 encoder positions on sliding

@@ -80,8 +80,11 @@ export function trainForward(
 
 
 /** Select the full-sequence operation from its exact token rows. */
-export function sequenceHiddenOperation(model: { readonly sequence?: readonly MlxSequenceRange[]; readonly sequenceHidden?: MlxSequenceForward },
+type SequenceOperations = { readonly sequence?: readonly MlxSequenceRange[]; readonly sequenceHidden?: MlxSequenceForward };
+export function sequenceHiddenOperation(model: SequenceOperations | object,
   ids: MlxArray, cache: Cache[], rows = ids.shape[0]! * ids.shape[1]!): MlxArray {
-  if (model.sequence) return model.sequence.find(range => rows >= range.from && rows <= range.to)!.operation(ids, cache);
-  return model.sequenceHidden!(ids, cache, rows);
+  const ports = model as SequenceOperations;
+  if (ports.sequence) return ports.sequence.find(range => rows >= range.from && rows <= range.to)!.operation(ids, cache);
+  if (!ports.sequenceHidden) throw new TypeError("the graph declares no full-sequence operation");
+  return ports.sequenceHidden(ids, cache, rows);
 }
