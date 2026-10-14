@@ -129,3 +129,64 @@ numerical("fixed sorted and unsorted expert gathers retain the threshold dispatc
     }
   } finally { q.packed.dispose(); q.scales.dispose(); q.biases?.dispose(); }
 });
+
+numerical("literal fused and unfused Trellis MLP operations retain the old width bindings", () => {
+  const gate = trellis(512, 512, 1), up = trellis(512, 512, 1), down = trellis(512, 512, 0);
+  const old = new TrellisMlp(gate, up, down);
+  try {
+    for (const rows of [1, 2, 3, 4, 8]) {
+      using x = input(rows, 512);
+      using expected = old.forward(x, "window", rows);
+      const operation = rows <= 4 ? new TrellisFusedMLP(gate, up, new TrellisScatterPrompt(down))
+        : new TrellisUnfusedMLP(new TrellisExpandReducePrompt(gate), new TrellisExpandReducePrompt(up), new TrellisExpandScatterPrompt(down));
+      using actual = operation.forward(x);
+      bitsEqual(actual, expected);
+    }
+  } finally { release(gate); release(up); release(down); }
+});
+
+numerical("named Qwen text and media attention retain outputs and KV state across prompt and decode", () => {
+  using normWide = MlxArray.fromFloat32(new Float32Array(64).fill(1), [64]);
+  using norm = normWide.astype(Dtype.bfloat16);
+  const weights = { tensor: () => norm } as unknown as Weights;
+  const config = { text: { numAttentionHeads: 2, numKeyValueHeads: 2, headDim: 64, partialRotaryFactor: 1, rmsNormEps: 1e-6,
+    ropeParameters: { full_attention: { ropeTheta: 10000 } } } } as unknown as ModelConfig;
+  const owned: MlxArray[] = [];
+  const projection = (rows: number) => {
+    using raw = input(rows, 128), flat = ops.reshape(raw, [rows, 128]);
+    const q = ops.quantize(flat, 64, 4);
+    owned.push(q.packed, q.scales); if (q.biases) owned.push(q.biases);
+    return new QuantizedLinear(q.packed, q.scales, q.biases, { bits: 4, groupSize: 64, mode: "affine" });
+  };
+  const ports = { qProj: projection(256), kProj: projection(128), vProj: projection(128), oProj: projection(128) };
+  const old = new Qwen3Attention(weights, config, "attention", undefined, undefined, ports);
+  const fixed = { qProj: new QuantizedLinearPlain(ports.qProj), kProj: new QuantizedLinearPlain(ports.kProj),
+    vProj: new QuantizedLinearPlain(ports.vProj), oProj: new QuantizedLinearPlain(ports.oProj) };
+  const text = new Qwen3TextAttention(weights, config, "attention", fixed), media = new Qwen3MediaAttention(weights, config, "attention", fixed);
+  using invFreq = mropeInvFreq(64, 10000);
+  try {
+    for (const variant of ["text", "media"] as const) {
+      const controlCache = new KVCache(), candidateCache = new KVCache();
+      try {
+        for (const rows of [3, 1, 1]) {
+          using x = input(rows, 128);
+          using positions = ops.fromInt32(Array.from({ length: rows * 3 }, (_, i) => controlCache.offset + i % rows), [3, 1, rows]);
+          const state = { posIds: positions, invFreq, rotaryDims: 64 };
+          const phase = rows === 1 ? "decode" : "window";
+          using expected = old.forward(x, controlCache, phase, variant === "media" ? state : null);
+          using actual = variant === "media" ? media.forward(x, candidateCache, phase, state) : text.forward(x, candidateCache, phase);
+          bitsEqual(actual, expected);
+          expect(candidateCache.offset).toEqual(controlCache.offset);
+          bitsEqual(candidateCache.keys!, controlCache.keys!); bitsEqual(candidateCache.values!, controlCache.values!);
+        }
+      } finally { controlCache.dispose(); candidateCache.dispose(); }
+    }
+  } finally { for (const array of owned) array.dispose(); }
+});
+
+import type { ModelConfig } from "../../src/artifacts/config";
+import type { Weights } from "../../src/artifacts/weights";
+import { Qwen3Attention, Qwen3TextAttention, Qwen3MediaAttention, TrellisMlp } from "../../src/models/qwen/blocks";
+import { TrellisFusedMLP, TrellisUnfusedMLP } from "../../src/layers/trellis-prompt";
+import { mropeInvFreq } from "../../src/layers/qwen-mrope";
+import { KVCache } from "../../src/state/kv";
