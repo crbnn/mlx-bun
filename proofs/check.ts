@@ -30,6 +30,15 @@ const sourcePins = {
   "layers/trellis-codebook-down.ts": "48752c429a3ab558131f95c6d361b15b6795c3bb6ee161f8afdca71609437898",
   "models/qwen/written-layers.ts": "ebf7710ffdf202d3e25ec7721930e5d992df31fb3d7fa5bde9709aa7a608c2c9",
 };
+// Exact upstream source for the reviewed MLX convolution and qmv translations.
+// These pins do not establish correspondence with the bundled native binary.
+const mlxRevision = "1f8e74e3f12f31365464a6867c6579f0e9b29d85";
+const mlxSourcePins = {
+  "mlx/backend/metal/conv.cpp": "ffec76d32b453b232245978ee067fac70a0205981d9ff38311e19db422dc0758",
+  "mlx/backend/metal/kernels/conv.metal": "d0604f69e144ffb65dcfc99e6383880b6d2d61645fa73147f35230034a1cd874",
+  "mlx/backend/metal/quantized.cpp": "44483286a359afb7f35d8a9c1658ffaec6ff6c01a7ab34ac7bb35cf6438804a6",
+  "mlx/backend/metal/kernels/quantized.h": "2a007016da606afe569adb9adcc05e00f14558ad2e094bcb4f8974beb53c316f",
+};
 const proofFiles = [
   "contracts/mlx/M1Max.lean",
   "contracts/mlx/Memory.lean",
@@ -77,6 +86,9 @@ const proofFiles = [
   "kernels/quantization/AffineInput.lean",
   "kernels/quantization/AffineDot.lean",
   "kernels/quantization/AffineTile.lean",
+  "kernels/quantization/AffineLayout.lean",
+  "kernels/quantization/AffineRow.lean",
+  "kernels/quantization/MlxQmv.lean",
   "kernels/delta/Gates.lean",
   "kernels/delta/Softplus.lean",
   "kernels/delta/Decay.lean",
@@ -104,8 +116,8 @@ for (const file of discoveredProofs) {
   if (!proofFiles.includes(file)) throw new Error(`Proof module is missing from the checked build: ${file}`);
 }
 
-function checkSource(name: keyof typeof sourcePins, source: string): void {
-  if (new Bun.CryptoHasher("sha256").update(source).digest("hex") !== sourcePins[name]) {
+function checkSource(name: string, source: string, expected: string): void {
+  if (new Bun.CryptoHasher("sha256").update(source).digest("hex") !== expected) {
     throw new Error(`${name} changed: review its translation and proofs before updating the source pin.`);
   }
 }
@@ -171,11 +183,27 @@ process.stdout.write(await runLake(["build",
   "Mathlib.Analysis.Real.Sqrt",
 ]));
 dependencyPath = (await runLake(["env", "printenv", "LEAN_PATH"])).trim();
-const sources = new Map<keyof typeof sourcePins, string>();
-for (const name of Object.keys(sourcePins) as (keyof typeof sourcePins)[]) {
+const sources = new Map<string, { source: string; expected: string }>();
+for (const [name, expected] of Object.entries(sourcePins)) {
   const source = await Bun.file(new URL(`packages/inference/src/${name}`, root)).text();
-  checkSource(name, source);
-  sources.set(name, source);
+  checkSource(name, source, expected);
+  sources.set(name, { source, expected });
+}
+for (const [name, expected] of Object.entries(mlxSourcePins)) {
+  const cached = new URL(`.lake/sources/mlx/${mlxRevision}/${name}`, import.meta.url);
+  let source: string;
+  if (await Bun.file(cached).exists()) {
+    source = await Bun.file(cached).text();
+  } else {
+    const response = await fetch(`https://raw.githubusercontent.com/ml-explore/mlx/${mlxRevision}/${name}`);
+    if (!response.ok) throw new Error(`Cannot fetch pinned MLX source ${name}: HTTP ${response.status}`);
+    source = await response.text();
+    checkSource(name, source, expected);
+    await mkdir(dirname(cached.pathname), { recursive: true });
+    await Bun.write(cached, source);
+  }
+  checkSource(name, source, expected);
+  sources.set(`mlx@${mlxRevision}/${name}`, { source, expected });
 }
 
 const dir = await mkdtemp(join(tmpdir(), "mlx-bun-proof-"));
@@ -197,9 +225,9 @@ try {
   }
 
   if (process.argv.includes("--self-test")) {
-    for (const [name, source] of sources) {
+    for (const [name, { source, expected }] of sources) {
       let rejected = false;
-      try { checkSource(name, source + "\n// source mutation\n"); } catch { rejected = true; }
+      try { checkSource(name, source + "\n// source mutation\n", expected); } catch { rejected = true; }
       if (!rejected) throw new Error(`Source mutation was accepted: ${name}`);
     }
     // Small prefix retains the arithmetic contract and its dependencies, avoiding
@@ -237,6 +265,6 @@ try {
 } finally {
   await rm(dir, { recursive: true, force: true });
 }
-console.log(`Checked ${proofFiles.length} proof modules: Trellis decoding and affine 16-value numerical kernels, packed windows, conditional M1 loads, initialization and scratch stores, flushed binary32/bfloat16 arithmetic, SwiGLU and stable sigmoid including exponential overflow, single-row Trellis projection error propagation, RMS reduction and in-place ownership, weight preparation, packed bf16 boundaries, the normalized MLP residual block, DeltaNet gates, convolution history and recurrent composition, tensor offsets and cache-write bounds, and fused head/residual/gated normalization.`);
+console.log(`Checked ${proofFiles.length} proof modules: Trellis and affine row numerical bounds, MLX fast-qmv source-model equivalence, packed windows, conditional M1 loads, initialization and scratch stores, flushed binary32/bfloat16 arithmetic, SwiGLU and stable sigmoid including exponential overflow, projection error propagation, RMS reduction and in-place ownership, weight preparation, packed bf16 boundaries, the normalized MLP residual block, DeltaNet gates, convolution history and recurrent composition, tensor offsets and cache-write bounds, and fused head/residual/gated normalization.`);
 console.log("Permitted axioms: propext, Classical.choice, Quot.sound. No native proof evaluation.");
 console.log("Scope: these are conditional numerical bounds for reviewed source models. Hardware/compiler conformance, model-wide range bounds, native memory/dispatch, delta adapters, remaining kernels, and the complete inference graph remain unproved.");
