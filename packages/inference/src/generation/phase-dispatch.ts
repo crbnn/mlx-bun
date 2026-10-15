@@ -5,6 +5,7 @@ import { type MlxCapturingForward, type MlxHeadForward, type MlxLayerCapture, ty
 import type { PrefillPhase } from "../contracts/portable/prefill";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { MlxForwardStep } from "../contracts/mlx/forward-work";
+import { rowOperationFor } from "../runtime/row-operations";
 
 /** Index the declared whole-span operation without changing its geometry. */
 export function knownOperationFor(operations: MlxKnownOperations, rows: number): MlxPhaseForward {
@@ -74,7 +75,7 @@ export class MlxPhaseDispatch {
   /** One prompt step of `sequences` sequences of `tokens` positions each, in
    *  the `phase` its planner named. */
   prompt(phase: PrefillPhase, sequences: number, tokens: number): MlxCapturingForward {
-    if (phase === "decode") return this.#graph.decode[sequences]!;
+    if (phase === "decode") return this.decode(sequences);
     const positions = sequences > 1 ? sequences * tokens : tokens;
     const ranges = sequences > 1
       ? phase === "chunk" ? this.#graph.multiSequencePromptChunk ?? this.#graph.multiSequencePrompt : this.#graph.multiSequencePrompt
@@ -85,16 +86,16 @@ export class MlxPhaseDispatch {
   }
 
   /** One new token for each of `sequences` sequences. */
-  decode(sequences: number): MlxCapturingForward { return this.#graph.decode[sequences]!; }
+  decode(sequences: number): MlxCapturingForward { return rowOperationFor(this.#graph.decode, sequences); }
 
   /** A verify window of `positions` (depth + 1) per sequence. */
   verify(sequences: number, positions: number): MlxCapturingForward {
-    return this.#graph.verify[sequences * positions]!;
+    return rowOperationFor(this.#graph.verify, sequences * positions);
   }
 
   /** `tokens` known tokens appended to one sequence. */
   known(tokens: number): MlxPhaseForward { return knownOperationFor(this.#graph.appendKnown, tokens); }
 
   /** The head over a hidden of `rows` rows. */
-  logits(rows: number): MlxHeadForward { return this.#graph.logits[rows]!; }
+  logits(rows: number): MlxHeadForward { return rowOperationFor(this.#graph.logits, rows); }
 }

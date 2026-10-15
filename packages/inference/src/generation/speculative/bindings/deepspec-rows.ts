@@ -2,6 +2,7 @@ import { projectedDraftGroups } from "./projected-draft-rows";
 import type { GroupedDraftProvider, TargetView } from "../source";
 import { targetLacks } from "../source";
 import type { DeepspecDrafterModel } from "../../../contracts/mlx/drafter";
+import { rowOperationFor } from "../../../runtime/row-operations";
 
 /** Existing pairing requirements are checked once when the provider opens. */
 export function bindDeepspecTarget(target: TargetView, drafter: Pick<DeepspecDrafterModel, "cfg">): void {
@@ -20,9 +21,9 @@ export function deepspecGroups(drafter: DeepspecDrafterModel, namespace: string)
       layers: drafter.cfg.num_hidden_layers,
       // The B × L context rows a prefill or a commit appends index the drafter's context tables.
       project(hidden, positions) {
-        const width = (hidden.shape[0]! * hidden.shape[1]!);
-        using projected = drafter.projectContext[width]!(hidden);
-        return drafter.projectContextKVRows[width]!(projected, positions);
+        const rows = hidden.shape[0]! * hidden.shape[1]!;
+        using projected = rowOperationFor(drafter.projectContext, rows)(hidden);
+        return rowOperationFor(drafter.projectContextKVRows, rows)(projected, positions);
       },
       draft(context, pending, positions, depth) {
         return drafter.draftRows(context, pending, positions).tokens.map(row => row.slice(0, depth));

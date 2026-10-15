@@ -5,7 +5,7 @@ import type { PreparedStateChange } from "../../../contracts/portable/resources"
 import { normalizedArgmax } from "../../../kernels/sampling/normalized-argmax";
 import type { RecurrentMtpModule } from "../../../contracts/mlx/drafter";
 import { type MlxRowTable } from "../../../contracts/mlx/graph";
-import { rowTableFrom } from "../../../models/graph";
+import { mapOperations, rowOperationFor, rowTableWithDefault } from "../../../runtime/row-operations";
 import { applyStateChanges,cleanupFailure,disposeResources } from "../../../runtime/resources";
 import { toLogprobs } from "../../../sampling/index";
 import { BatchedKVCache } from "../../../state/batched-kv";
@@ -21,7 +21,7 @@ export type MtpRowSampling = DraftRowSampling;
  *  each row's step in, owned full-vocabulary ids [B] out. */
 type MtpSelect = (output: MlxArray, steps: readonly number[]) => MlxArray;
 
-/** The selection the draft group bound, per width class of the rows it drafts
+/** The selection the draft group bound, per exact row count of the rows it drafts
  *  for: the listed vocabulary's projection and each row's coupled draw over it,
  *  the full head and its fused normalized argmax, or the full head and each
  *  row's sampler over its log-probabilities. Resolved once when the rows open;
@@ -34,7 +34,7 @@ function bindMtpSelection(target: RecurrentMtpTarget, sampling: MtpRowSampling,
     // The target still verifies over the full vocabulary.
     if (!target.vocabularyHead) throw new Error("a listed draft vocabulary needs the target's quantized vocabulary head");
     const head = owned.vocabulary = new DraftVocabularyHead(target.vocabularyHead, selection.ids);
-    return rowTableFrom(() => (output, steps) => {
+    return rowTableWithDefault({}, (output, steps) => {
       using subsetLogits = head.project(output);
       using subsetFlat = ops.reshape(subsetLogits, [steps.length, head.size]);
       return selection.sample(subsetFlat, head, steps);
@@ -42,21 +42,21 @@ function bindMtpSelection(target: RecurrentMtpTarget, sampling: MtpRowSampling,
   }
   // Greedy drafting: one fused normalized-argmax over [B,V]; no logsumexp
   // pass, no per-row top-p/top-k sort, no categorical draw.
-  if (selection.kind === "greedy") return rowTableFrom(width => (output, steps) => {
-    using logits = target.logits[width]!(output);
+  if (selection.kind === "greedy") return mapOperations(target.logits, head => (output: MlxArray, steps: readonly number[]) => {
+    using logits = head(output);
     using flat = ops.reshape(logits, [steps.length, logits.shape.at(-1)!]);
     return normalizedArgmax(flat);
-  });
-  return rowTableFrom(width => (output, steps) => {
-    using logits = target.logits[width]!(output);
+  }) as MlxRowTable<MtpSelect>;
+  return mapOperations(target.logits, head => (output: MlxArray, steps: readonly number[]) => {
+    using logits = head(output);
     using flat = ops.reshape(logits, [steps.length, logits.shape.at(-1)!]);
     using logprobs = toLogprobs(flat);
     return sampling.sample(logprobs, steps);
-  });
+  }) as MlxRowTable<MtpSelect>;
 }
 
 /** Prefill membership drafts nothing, so its rows bind no selection. */
-const prefillOnly: MlxRowTable<MtpSelect> = rowTableFrom(() => () => {
+const prefillOnly: MlxRowTable<MtpSelect> = rowTableWithDefault({}, () => {
   throw new Error("Qwen MTP prefill rows do not draft");
 });
 
@@ -264,10 +264,10 @@ export class QwenMtpRows {
     let ids: MlxArray | null = ops.fromInt32([...pending], [B, 1]);
     let chained: MlxArray | null = null;
     try {
-      const width = B, select = this.#select[width]!;
+      const select = rowOperationFor(this.#select, B);
       for (let position = 0; position < depth; position++) {
         using embeds = this.target.embed(ids!);
-        const output = this.module.decode[width]!(embeds, chained ?? this.#hidden!, this.#cache);
+        const output = this.module.decode[B]!(embeds, chained ?? this.#hidden!, this.#cache);
         chained?.dispose(); chained = output;
         const token = select(output, steps.map(step => step + position));
         tokens.push(token);
