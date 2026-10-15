@@ -26,7 +26,7 @@ export function isDrafterModelType(modelType: string): boolean {
 }
 
 /** Support tier of a registry record's `model_type` (`02d723a:docs/design/generic-model-support.md`):
- *  "targeted" = dedicated/generated forward + L2/L3 paths;
+ *  "targeted" = dedicated forward + L2/L3 paths;
  *  "generic"  = the Tier-0 universal module (L1 only);
  *  null       = unsupported. Generic never shadows targeted. The type alone cannot
  *  tell a family that shares another's `model_type` (MiniCPM5 is `llama`); read

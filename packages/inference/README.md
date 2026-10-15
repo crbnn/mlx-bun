@@ -136,10 +136,10 @@ float32 vectors. Through `createModel` it checks the 100-token greedy trajectory
 and those four vectors byte for byte; a separate 12-step control does the same
 through `new Gemma4Model`. Every step must be finite and select the reference
 token. This is not 100-step full-vector parity. The loader's Gemma 4 table
-builds the generated 12B graph only for the `kv_config` composition it serves, so
+builds the written 12B graph only for the `kv_config` composition it serves, so
 for plain KV (the default composition) `createModel` builds `Gemma4Model` too,
 and the test asserts that. Opt in with all of
-`MLX_BUN_TEST_GEMMA4_GRAPH_MODEL`, `MLX_BUN_TEST_GEMMA4_REFERENCE` (the directory
+`MLX_BUN_TEST_GEMMA4_MODEL`, `MLX_BUN_TEST_GEMMA4_REFERENCE` (the directory
 holding `gemma4-parity.json`, the producer's unchanged `parity.json` and the four
 step blobs) and `MLX_BUN_TEST_GEMMA4_REFERENCE_SHA256`. Before native libraries
 load it verifies the manifest hash; the producer provenance (script hash, main
@@ -169,7 +169,7 @@ every listed cache answers from its quantized storage, and with compiled decode;
 and identical vectors over plain caches. This is identity between the written
 graph and the family's generic graph within this tree, not an oracle claim. On 2026-09-28 it
 passed on the M1 Max for mlx-community gemma-4-e4b-it-OptiQ-4bit (`98d7dc6a`; 24
-generated forwards uncompiled, 2 compiled) and gemma-4-12B-it-OptiQ-4bit
+unrolled forwards uncompiled, 2 compiled) and gemma-4-12B-it-OptiQ-4bit
 (`5b110106`; 24 uncompiled, 1 compiled). The 26B-A4B cell was not run. A final
 cell runs two different rows through one forward over `kv_config` caches and
 requires bytes equal to the generic graph's; it caught the committed e4b graph slicing
@@ -953,7 +953,7 @@ with token IDs from your checkpoint’s tokenizer. The example forwards the prom
 selects a token, continues with the same cache, and disposes cache before weights.
 
 The direct graph imports currently include `models/gemma4`,
-`models/gemma4/generated`, `models/minicpm5`, `models/qwen3`, `models/qwen3-moe`,
+`models/gemma4/graphs`, `models/minicpm5`, `models/qwen3`, `models/qwen3-moe`,
 `models/qwen3_5`, `models/qwen38-27b-trellis-m4pro`, `models/qwen38-27b-trellis-m1max`,
 and `models/universal`.
 `models/glm52`, `models/diffusion-gemma`, and `models/whisper` provide the other

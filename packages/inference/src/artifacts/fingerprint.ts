@@ -1,9 +1,8 @@
 // Config fingerprint (`02d723a:docs/archive/investigations/optimization_plan.md`
 // Phase C): a stable hash over every config field that changes the decode graph
-// structure, plus the kv_config quant layout. A graph table keys a generated
-// graph's entry on it: the loader selects a generated graph only for the
-// fingerprint (and composition) it was generated from, and the family's
-// generic graph otherwise.
+// structure, plus the kv_config quant layout. The default graph table keys a
+// written graph's entry on its declared fingerprint and composition, and uses
+// the family's generic graph otherwise. Explicit graph choices bypass the table.
 
 import type { ModelConfig } from "./config";
 

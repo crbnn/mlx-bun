@@ -164,7 +164,7 @@ export function qwen35WeightsView(weights: Weights): WeightsView | null {
   };
 }
 
-/** The graph fingerprint the `qwen3.5` graph table keys its generated graphs on: architecture plus the complete
+/** The graph fingerprint the `qwen3.5` graph table keys its written graphs on: architecture plus the complete
  *  language-model quantization table (every layer's projections, the head and the embedding). Two artifacts share
  *  a fingerprint only if every tensor has the same codec. Reads the config only. */
 export function qwen35GraphFingerprint(config: ModelConfig): string {

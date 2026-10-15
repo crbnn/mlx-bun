@@ -1,5 +1,5 @@
 import { testGraph } from "../models/test-composition";
-import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
+import { phaseRowLimit, rowOperationFor } from "@mlx-bun/inference/models/graph";
 // Opt-in real packed Qwen artifact; no timing, oracle startup or downloads.
 // MLX_BUN_TEST_TRELLIS_MODEL selects it; AB_VARIANT/AB_BASELINE retain main defaults.
 // TrellisLinear passes one decode variant, so this test builds the variants it
@@ -139,7 +139,7 @@ test.skipIf(!artifact)("shared-M kernels preserve full Qwen logits, recurrent st
         try { hidden = hiddenForward(variant, ids, caches); }
         finally { ids.dispose(); }
         const last = hidden.slice([0, tokens.length - 1, 0], [1, tokens.length, hidden.shape[2]!]);
-        try { return model.logits[1]!(last); }
+        try { return rowOperationFor(model.logits, 1)(last); }
         finally { last.dispose(); hidden.dispose(); }
       })();
       try {

@@ -229,6 +229,61 @@ beforeAll(() => {
 afterAll(() => { built?.dispose(); });
 const graph = () => built ??= bindGraphCaches(new Qwen38TrellisM4Pro(source().weights,source().config),composition());
 
+test("generic short single and multi-sequence chunks retain main's unfused bounded arithmetic", () => {
+  const { weights, config } = source();
+  for (const device of ["applegpu_g13s", "applegpu_g16s"]) {
+    const model = testGraph(new Qwen35Model(weights, config, 1, device), composition({ device }));
+    const dispatch = new MlxPhaseDispatch(model);
+    // 3743321e prefillChunk.gpu always passes "wider", bounded=true.
+    // In the unchanged carriers, numeric9 reproduces that unfused MLP choice;
+    // actual tensor rows still determine the individual projection launches.
+    const mainChunk = (input: MlxArray, cache: Cache[]): MlxArray => {
+      let hidden = model.embed.encode(input);
+      try {
+        for (const [index, layer] of model.layers.entries()) {
+          const next = layer.forward(hidden, cache[index]!, "window", null, 9);
+          hidden.dispose(); hidden = next;
+          const state = cache[index]!.state();
+          try { ops.evalAll([hidden, ...state]); }
+          finally { if (cache[index]!.stateNeedsDispose) for (const value of state) value.dispose(); }
+        }
+        return model.finalNorm.forward(hidden);
+      } finally { hidden.dispose(); }
+    };
+    try {
+      const layouts = [1, 2, 3, 4].flatMap(rows => [
+        { port: "single", sequences: 1, tokens: rows },
+        { port: "multi", sequences: rows, tokens: 1 },
+      ]);
+      layouts.push({ port: "multi", sequences: 2, tokens: 2 });
+      for (const { port, sequences, tokens } of layouts) {
+        const rows = sequences * tokens, mine = model.makeCache(), reference = model.makeCache();
+        const stateReads = mine.map(() => 0);
+        for (const [index, cache] of mine.entries()) {
+          const state = cache.state.bind(cache);
+          cache.state = () => { stateReads[index] = stateReads[index]! + 1; return state(); };
+        }
+        try {
+          using input = ids(Array.from({ length: sequences }, (_, row) => prompt(tokens, 101 + row)));
+          // Directly exercise the multi-sequence declaration even at one row.
+          const operation = port === "multi" ? rowOperationFor(model.multiSequencePromptChunk, rows)
+            : dispatch.prompt("chunk", sequences, tokens);
+          expect(operation).not.toBe(dispatch.prompt("tail", sequences, tokens));
+          let expected: MlxArray | null = mainChunk(input, reference), actual: MlxArray | null = null;
+          try {
+            actual = operation(input, mine, null) as MlxArray;
+            expect(stateReads).toEqual(model.layers.map(() => 1));
+            const label = `generic ${device} ${port} chunk ${sequences}x${tokens}`;
+            const left = actual, right = expected; actual = null; expected = null;
+            outputDiff(label, left, right, model.logitsFromHidden.bind(model), model.logitsFromHidden.bind(model));
+            stateDiff(label, mine, reference);
+          } finally { actual?.dispose(); expected?.dispose(); }
+        } finally { disposeAll(mine, reference); }
+      }
+    } finally { model.dispose(); }
+  }
+}, 180_000);
+
 describe.skipIf(!ANE)("M4 Pro identity (MLX_BUN_TEST_ANE=1)", () => {
 describe("composition", () => {
   test("makeCache composes the lego the composition's KV scheme names; the graph declares what the composition built", () => {

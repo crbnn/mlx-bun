@@ -18,11 +18,6 @@ Decisions that govern all work:
 
 ## Graph files
 
-- [ ] Complete the architectural corrections: make row defaults and chunk bindings
-      explicit data, consolidate device-qualified generic copies into one generic
-      per family with choices settled at load, simplify loader lookup keys, finish
-      written Gemma naming, and run the full correctness suite. PR #363 is draft
-      until these corrections are reviewed.
 - [ ] Resolve performance acceptance for the final `refactor/graph-files` merge request to
       `main`. Review the saved short paired reports, including slower decode and aggregate
       samples under the accepted current machine conditions. A quiet paired run is required
