@@ -32,10 +32,12 @@ const sourcePins = {
   "layers/trellis-codebook-down.ts": "48752c429a3ab558131f95c6d361b15b6795c3bb6ee161f8afdca71609437898",
   "models/qwen/written-layers.ts": "ebf7710ffdf202d3e25ec7721930e5d992df31fb3d7fa5bde9709aa7a608c2c9",
 };
-// Exact upstream source for the reviewed MLX convolution and qmv translations.
+// Exact upstream source for the reviewed MLX convolution, qmv and RoPE translations.
 // These pins do not establish correspondence with the bundled native binary.
 const mlxRevision = "1f8e74e3f12f31365464a6867c6579f0e9b29d85";
 const mlxSourcePins = {
+  "mlx/backend/metal/rope.cpp": "9ec2d2f298381af6445b1e2281dd90521988861ed170a602944ec0f1fca17ecc",
+  "mlx/backend/metal/kernels/rope.metal": "2b35221ebea033ff43100b85eaaddec5c0e34e3cfd52e7c692573764b2b7d0ab",
   "mlx/backend/metal/conv.cpp": "ffec76d32b453b232245978ee067fac70a0205981d9ff38311e19db422dc0758",
   "mlx/backend/metal/kernels/conv.metal": "d0604f69e144ffb65dcfc99e6383880b6d2d61645fa73147f35230034a1cd874",
   "mlx/backend/metal/quantized.cpp": "44483286a359afb7f35d8a9c1658ffaec6ff6c01a7ab34ac7bb35cf6438804a6",
@@ -101,6 +103,8 @@ const proofFiles = [
   "kernels/delta/Recurrence.lean",
   "kernels/delta/Inputs.lean",
   "kernels/delta/SiluRmsHeads.lean",
+  "kernels/attention/Rope.lean",
+  "kernels/attention/RopeAngles.lean",
   "kernels/ResidualRmsNorm.lean",
   "kernels/GatedRmsNorm.lean",
   "layers/TrellisCodebookGateUp.lean",
@@ -190,6 +194,7 @@ process.stdout.write(await runLake(["build",
   "Mathlib.Analysis.Calculus.MeanValue",
   "Mathlib.Analysis.Calculus.Deriv.Inv",
   "Mathlib.Analysis.Real.Sqrt",
+  "Mathlib.Analysis.SpecialFunctions.Trigonometric.Bounds",
 ]));
 dependencyPath = (await runLake(["env", "printenv", "LEAN_PATH"])).trim();
 const sources = new Map<string, { source: string; expected: string }>();
