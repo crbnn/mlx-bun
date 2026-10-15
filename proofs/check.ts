@@ -55,6 +55,7 @@ const proofFiles = [
   "contracts/mlx/Reduction.lean",
   "contracts/mlx/FlushedReduction.lean",
   "contracts/mlx/ArithmeticFold.lean",
+  "contracts/mlx/ArithmeticDependencies.lean",
   "contracts/mlx/DotProduct.lean",
   "contracts/mlx/FlushedDotProduct.lean",
   "contracts/mlx/SquaredSum.lean",
@@ -111,6 +112,10 @@ const proofFiles = [
   "models/qwen/WrittenLayers.lean",
   "models/qwen/Blocks.lean",
   "models/qwen/DeltaNet.lean",
+  "models/qwen/TrellisMlp.lean",
+  "models/qwen/ResidualBlocks.lean",
+  "models/qwen/DeltaCache.lean",
+  "models/qwen/ResidualDelta.lean",
 ];
 
 const discoveredProofs = await Array.fromAsync(new Bun.Glob("**/*.lean").scan({
