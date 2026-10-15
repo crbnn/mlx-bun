@@ -527,6 +527,67 @@ never deletes checkpoints, and it never waits for a flush in progress).
 Cache policy tests inject storage and allocator ports; real SSD/numerical runs
 remain separate verification.
 
+## Local decisions
+
+`POST /v1/decisions` accepts the OpenAI Decisions request and returns its ordered
+answer array (`predicate`, `choice`, `score`). `POST /v1/systemone` accepts Jev's
+`state` and questions map and returns its keyed answers (`noul`, `choice`, `score`).
+Both endpoints normalize into one handler and one numerical operation. Question
+names identify responses and are excluded from the model input. Jev's structured
+instructions/criteria, gzip/zstd requests and multipart/base64 image assets are
+accepted; OpenAI accepts text and `input_image` parts through the existing media
+preparation. Images require a graph with the corresponding media operations.
+Box questions and denoising/pixel-input decision graphs are unsupported.
+
+Point OpenAI's `baseURL` at `http://localhost:8080/v1`, or TypeSafe's `baseURL` at
+`http://localhost:8080`, and set `model` to the exact local ID from `GET /v1/models`,
+for example `mlx-community/gemma-4-e4b-it-OptiQ-4bit`. The residency host leases
+that model, loading it when needed and sharing its resident weights with generation.
+The existing current-model fallback also accepts cloud names for compatibility;
+the local examples use the actual model ID. Responses identify the model that actually ran. The same loaded
+model serves generation and decisions: each candidate is a scheduler task between
+generation iterations, with private caches and its own adapter scope.
+
+Each supplied answer is encoded as its complete JSON value (score levels use
+their label), followed by the chat template's assistant-turn ending through its
+first stop marker, including a next-role marker for templates that use that
+boundary (the tokenizer's end token when no template ending is available). A teacher-forced forward
+reads the prompt and supplied answer tokens. The response mask counts only
+answer-token predictions, including the terminator. DPO's existing summed log
+likelihood is divided by the answer token count, then normalized as
+`softmax(-NLL / answer_token_count)` across the supplied candidates. No token is
+sampled or generated. Scores use average token log likelihood, so longer answers
+do not receive a multiplicative length penalty from summing token losses.
+Scores come directly from the loaded model's answer likelihoods; there
+is no tuning or calibration stage. Choice/score confidence is a statistic of
+that distribution, computed with Jev's documented formulas.
+Usage counts the tokens processed across candidate forwards and reports zero
+output tokens. These operations currently keep no reusable prompt cache;
+OpenAI cache counters are zero and cache hints do not change scoring.
+Decision requests use bounded engine admission, returning 429 when its wait queue
+is full. Image preparations hold the same media reservation used by chat until
+the question finishes scoring or fails.
+
+With a cached vision model, for example:
+
+```sh
+mlx-bun serve mlx-community/gemma-4-e4b-it-OptiQ-4bit
+bun apps/mlx-bun/scripts/decision-example.ts http://localhost:8080 mlx-community/gemma-4-e4b-it-OptiQ-4bit
+node apps/mlx-bun/scripts/decision-website-examples.mjs http://localhost:8080 mlx-community/gemma-4-e4b-it-OptiQ-4bit /path/to/lane-scene.png
+```
+
+The [HTTP example](scripts/decision-example.ts) covers all three question types
+through both endpoints and generation through the same model. The
+[website examples](scripts/decision-website-examples.mjs) use the upstream OpenAI
+and TypeSafe SDKs with local connection settings (Node 22+); a supplied image runs
+the lane-choice scenario. OpenAI's lane widget is a scripted illustration, so use
+a scene-only capture without the widget's displayed probabilities. The opt-in
+[acceptance test](tests/engine/decisions-native.test.ts) runs these examples with
+`MLX_BUN_TEST_NATIVE=1 MLX_BUN_APP_TEST_MODEL=<cached snapshot>` and optional
+`MLX_BUN_DECISION_IMAGE=<lane capture.png>`; it also compares concurrent generation
+against a solo greedy control. Tests without weights check SDK wire compatibility,
+validation, compression, complete answer preservation, cancellation and disposal.
+
 ## Server seams
 
 `server/routes.ts` composes chat/text completion, Anthropic Messages, Responses, embedding, and discovery
