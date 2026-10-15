@@ -87,7 +87,7 @@ export interface ModelContext<Model = RuntimeModel> {
     kind?: string;
   } | null;
   /** The composition this load resolved before building the graph: device,
-   * Neural Engine bridge, KV scheme, draft depth, prefill chunk, adapters and
+   * KV scheme, draft depth, prefill chunk and
    * rows per forward. Absent for a context an engine-owned implementation or a
    * caller built. */
   readonly composition?: Composition;
@@ -120,11 +120,8 @@ export interface LoadContextOptions<Model extends ServedModelInfo = RuntimeModel
   kv?: CompositionRequest["kv"];
   /** Paged KV (`--paged-kv`, `--paged-kv-block-size`); absent means unpaged. */
   pagedKv?: CompositionRequest["pagedKv"];
-  /** Adapters are mounted at load (`--adapter`). Default false. */
-  adapters?: boolean;
   /** Most rows one forward carries (`--batch`). Default 8. */
   maxRows?: number;
-  /** Compose the Neural Engine bridge where the graph builds a Neural Engine operation. Default true. */
   /** Resource overrides for runtimes that plan memory up front; models
    * without one ignore them. */
   runtime?: RuntimeOpenOptions;

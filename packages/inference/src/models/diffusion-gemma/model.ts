@@ -485,9 +485,8 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
   readonly visionTower: DiffusionVisionTower | null;
   readonly imageTokenId: number;
 
-  /** The GeGLU activations and the head's softcap run the compiled closures
-   * (the reference's mx.compile'd geglu and softcap), unless the composition's
-   * `compiledGeglu` is off: the spelled-out ops. */
+  /** The graph binds compiled GeGLU and softcap closures, matching the
+   * reference's mx.compile'd operations. */
   readonly makeCache!: () => Cache[];
   readonly denoisingDecode: readonly MlxDenoisingDecodeRange[];
   readonly denoisingAppend: readonly MlxDenoisingAppendRange[];

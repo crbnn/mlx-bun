@@ -1,6 +1,6 @@
 import { bindGraphCaches } from "@mlx-bun/inference/models";
 import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
-import { MlxPhaseDispatch } from "../src/generation/phase-dispatch";
+import { MlxPhaseDispatch } from "@mlx-bun/inference/generation";
 import { loadModelConfig, Weights } from "@mlx-bun/inference/artifacts";
 import { resolveComposition } from "@mlx-bun/inference";
 

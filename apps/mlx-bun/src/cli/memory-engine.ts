@@ -29,8 +29,8 @@ export interface MemoryEngine {
 export interface MemoryEngineDependencies {
   /** The task model's snapshot directory; never downloads. */
   locate(repoId: string): Promise<string>;
-  /** `composition`: the batch cap and chunk adapter the loaded composition records. */
-  load(path: string, repoId: string, composition?: Pick<LoadContextOptions, "adapters" | "maxRows">): Promise<LoadedModelContext>;
+  /** `composition`: the batch cap. The chunk adapter mounts through the loaded context. */
+  load(path: string, repoId: string, composition?: Pick<LoadContextOptions, "maxRows">): Promise<LoadedModelContext>;
   /** Takes ownership of the context even if construction rejects. */
   engine(context: LoadedModelContext, capacity: number): Promise<MemoryEngine>;
   adapterDir(stage: string): string | undefined;
@@ -73,7 +73,7 @@ export function createInProcessMemoryClient(deps: MemoryEngineDependencies = def
     const path = snapshot ?? await deps.locate(MEMORY_TASK_MODEL);
     if (closed) throw closedError();
     const dir = deps.adapterDir("chunk");
-    const context = await deps.load(path, MEMORY_TASK_MODEL, { adapters: dir !== undefined, maxRows: memoryBatchSize() });
+    const context = await deps.load(path, MEMORY_TASK_MODEL, { maxRows: memoryBatchSize() });
     if (closed) { context.dispose(); throw closedError(); }
     // Main decoded with a full-precision cache, whatever the artifact's kv_config says: the load names no KV flags.
     const engine = await deps.engine(context, memoryBatchSize());

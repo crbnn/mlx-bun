@@ -116,8 +116,8 @@ export async function startModelHost(state: AppState, model: ModelRecord, option
       const loadStarted = performance.now();
       const context = await loadContext(record.path, record.repoId, {
         ...(options.memoryBudgetBytes !== undefined ? { memoryBudgetBytes: options.memoryBudgetBytes } : {}),
-        // The composition's facts: the KV flags, the startup adapter and the batch cap.
-        kv: kvFlags(options), adapters: startup && options.adapterDir !== undefined, maxRows: options.capacity,
+        // The composition's facts: the KV flags and batch cap. Startup adapters mount below.
+        kv: kvFlags(options), maxRows: options.capacity,
         ...(options.cache.pagedKv ? { pagedKv: options.cache.pagedKv } : {}),
         // Resource plan inputs for runtimes that plan memory up front; other models ignore this block.
         runtime: { batchSize: options.capacity, maxGenerationTokens: options.defaultGeneratedTokens ?? 128,

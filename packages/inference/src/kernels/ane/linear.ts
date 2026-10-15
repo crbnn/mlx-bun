@@ -9,14 +9,14 @@ import { ANE_LIBRARY as LIBRARY } from "../../runtime/native";
 // inputs/outputs the host or the GPU (zero-copy MLX wraps) fill. Compiling is
 // the install step (`AneProgram.compile`, run for every shipped composition by
 // `compileAnePrograms` in models/ane-install); it leaves each program in the
-// system compile cache. A graph whose composition names the bridge
-// (`Composition.aneBridge`) loads its programs from that cache when it is
+// system compile cache. A graph binding Neural Engine layers
+// loads its programs from that cache when it is
 // constructed and never compiles one: a bridge that does not load, or a program
 // the cache lacks, fails that load with `AneBridgeError`.
 
 /** The Neural Engine bridge did not load, a program is not compiled on this Mac,
- *  or the compiler refused one: the load of a graph whose composition names the
- *  bridge fails with it. */
+ *  or the compiler refused one: loading a graph that binds the bridge fails
+ *  with it. */
 export class AneBridgeError extends Error {
   override readonly name = "AneBridgeError";
 }
