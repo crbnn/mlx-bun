@@ -1,4 +1,4 @@
-import contracts.mlx.Arithmetic
+import contracts.mlx.ArithmeticFold
 import contracts.mlx.FlushedReduction
 import contracts.mlx.BFloat16
 import Mathlib.Algebra.BigOperators.Fin
@@ -33,52 +33,8 @@ theorem lanes_complete (f : Fin 128 → ℝ) :
     (∑ lane : Fin 32, ∑ offset : Fin 4, f (laneIndex lane offset)) = ∑ i : Fin 128, f i := by
   simpa only [Fintype.sum_prod_type, laneEquiv, Equiv.coe_fn_mk] using Equiv.sum_comp laneEquiv f
 
-def madd (contracted : Bool) (a b acc : Expr) : Expr :=
-  if contracted then .fma a b acc else .add acc (.mul a b)
-
-def maddFloat (contracted : Bool) (a b acc : Float32) : Float32 :=
-  if contracted then FlushToZero.fma a b acc else FlushToZero.add acc (FlushToZero.mul a b)
-
-theorem evaluate_madd (input : Nat → Float32) (contracted : Bool) (a b acc : Expr) :
-    Arithmetic.evaluate input (madd contracted a b acc) =
-      maddFloat contracted (Arithmetic.evaluate input a) (Arithmetic.evaluate input b) (Arithmetic.evaluate input acc) := by
-  cases contracted <;> rfl
-
-theorem ideal_madd (input : Nat → ℝ) (contracted : Bool) (a b acc : Expr) :
-    Arithmetic.ideal input (madd contracted a b acc) =
-      Arithmetic.ideal input acc + Arithmetic.ideal input a * Arithmetic.ideal input b := by
-  cases contracted <;> simp [madd, Arithmetic.ideal, add_comm]
-
-theorem evaluate_fold (input : Nat → Float32) (contracted : Bool) (a b : α → Expr) (indices : List α) (acc : Expr) :
-    Arithmetic.evaluate input (indices.foldl (fun acc i => madd contracted (a i) (b i) acc) acc) =
-      indices.foldl (fun acc i => maddFloat contracted (Arithmetic.evaluate input (a i)) (Arithmetic.evaluate input (b i)) acc)
-        (Arithmetic.evaluate input acc) := by
-  induction indices generalizing acc with
-  | nil => rfl
-  | cons i rest ih => simp only [List.foldl_cons, ih, evaluate_madd]
-
-theorem ideal_fold (input : Nat → ℝ) (contracted : Bool) (a b : α → Expr) (indices : List α) (acc : Expr) :
-    Arithmetic.ideal input (indices.foldl (fun acc i => madd contracted (a i) (b i) acc) acc) =
-      Arithmetic.ideal input acc + (indices.map (fun i => Arithmetic.ideal input (a i) * Arithmetic.ideal input (b i))).sum := by
-  induction indices generalizing acc with
-  | nil => simp
-  | cons i rest ih => simp only [List.foldl_cons, ih, ideal_madd, List.map_cons, List.sum_cons]; ring
-
-def reduceExpr (lanes : Fin n → Expr) : Reduction.Tree n → Expr
-  | .leaf i => lanes i
-  | .add a b => .add (reduceExpr lanes a) (reduceExpr lanes b)
-
-theorem evaluate_reduce (input : Nat → Float32) (lanes : Fin n → Expr) (tree : Reduction.Tree n) :
-    Arithmetic.evaluate input (reduceExpr lanes tree) = FlushedReduction.evaluate (fun i => Arithmetic.evaluate input (lanes i)) tree := by
-  induction tree with
-  | leaf i => rfl
-  | add a b ia ib => simp only [reduceExpr, Arithmetic.evaluate, FlushedReduction.evaluate, ia, ib]
-
-theorem ideal_reduce (input : Nat → ℝ) (lanes : Fin n → Expr) (tree : Reduction.Tree n) :
-    Arithmetic.ideal input (reduceExpr lanes tree) = Reduction.ideal (fun i => Arithmetic.ideal input (lanes i)) tree := by
-  induction tree with
-  | leaf i => rfl
-  | add a b ia ib => simp only [reduceExpr, Arithmetic.ideal, Reduction.ideal, ia, ib]
+export ArithmeticFold (madd maddFloat evaluate_madd ideal_madd evaluate_fold ideal_fold
+  reduceExpr evaluate_reduce ideal_reduce)
 
 def laneExpr (contracted : Bool) (a b : Fin 128 → Expr) (lane : Fin 32) : Expr :=
   (List.finRange 4).foldl (fun acc offset => madd contracted (a (laneIndex lane offset)) (b (laneIndex lane offset)) acc) .zero

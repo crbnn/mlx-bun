@@ -11,10 +11,7 @@ def added (x update : BF) : Float32 := FlushToZero.add (BFloat16.widen x) (BFloa
 def residual (x update : BF) : BF := BFloat16.narrow (added x update)
 
 theorem widen_finite (x : BF) (hx : Model.isFinite x = true) : (BFloat16.widen x).isFinite = true := by
-  change (Model.toFloat32Model (Model.cast FloatFormat.bfloat16 FloatFormat.binary32 x)).unpack.isFinite = true
-  rw [Model.unpack_toFloat32Model, Model.isFinite_toModel (by decide),
-    Model.cast_eq_widenExact_of_compatibleWidening x (by decide) (by decide) (by decide) (by decide) hx]
-  exact Model.isFinite_widenExact x (by decide) (by decide) (by decide) (by decide) hx
+  exact BFloat16.widen_finite x hx
 
 structure AddFinite (x update : BF) : Prop where
   input : Model.isFinite x = true

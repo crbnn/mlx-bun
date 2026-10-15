@@ -17,6 +17,12 @@ def cast (x : Float32) : Float32 :=
 def widen (x : Model FloatFormat.bfloat16) : Float32 :=
   Float32.ofModel (Model.toFloat32Model (Model.cast FloatFormat.bfloat16 FloatFormat.binary32 x))
 
+theorem widen_finite (x : Model FloatFormat.bfloat16) (hx : Model.isFinite x = true) : (widen x).isFinite = true := by
+  change (Model.toFloat32Model (Model.cast FloatFormat.bfloat16 FloatFormat.binary32 x)).unpack.isFinite = true
+  rw [Model.unpack_toFloat32Model, Model.isFinite_toModel (by decide),
+    Model.cast_eq_widenExact_of_compatibleWidening x (by decide) (by decide) (by decide) (by decide) hx]
+  exact Model.isFinite_widenExact x (by decide) (by decide) (by decide) (by decide) hx
+
 -- The staged kernels widen a stored bf16 word by shifting its bits. Prove
 -- that representation change equals the numerical cast, including subnormals
 -- and signed zero, for every finite bf16 value.

@@ -43,6 +43,7 @@ const proofFiles = [
   "contracts/mlx/ElementwiseAdd.lean",
   "contracts/mlx/Reduction.lean",
   "contracts/mlx/FlushedReduction.lean",
+  "contracts/mlx/ArithmeticFold.lean",
   "contracts/mlx/DotProduct.lean",
   "contracts/mlx/FlushedDotProduct.lean",
   "contracts/mlx/SquaredSum.lean",
@@ -73,6 +74,9 @@ const proofFiles = [
   "kernels/StableSigmoid.lean",
   "kernels/quantization/AffinePacking.lean",
   "kernels/quantization/AffineLift.lean",
+  "kernels/quantization/AffineInput.lean",
+  "kernels/quantization/AffineDot.lean",
+  "kernels/quantization/AffineTile.lean",
   "kernels/delta/Gates.lean",
   "kernels/delta/Softplus.lean",
   "kernels/delta/Decay.lean",
@@ -233,6 +237,6 @@ try {
 } finally {
   await rm(dir, { recursive: true, force: true });
 }
-console.log(`Checked ${proofFiles.length} proof modules: Trellis and affine field decoding, packed windows, conditional M1 loads, initialization and scratch stores, flushed binary32/bfloat16 arithmetic, SwiGLU and stable sigmoid including exponential overflow, single-row Trellis projection error propagation, RMS reduction and in-place ownership, weight preparation, packed bf16 boundaries, the normalized MLP residual block, DeltaNet gates, convolution history and recurrent composition, tensor offsets and cache-write bounds, and fused head/residual/gated normalization.`);
+console.log(`Checked ${proofFiles.length} proof modules: Trellis decoding and affine 16-value numerical kernels, packed windows, conditional M1 loads, initialization and scratch stores, flushed binary32/bfloat16 arithmetic, SwiGLU and stable sigmoid including exponential overflow, single-row Trellis projection error propagation, RMS reduction and in-place ownership, weight preparation, packed bf16 boundaries, the normalized MLP residual block, DeltaNet gates, convolution history and recurrent composition, tensor offsets and cache-write bounds, and fused head/residual/gated normalization.`);
 console.log("Permitted axioms: propext, Classical.choice, Quot.sound. No native proof evaluation.");
 console.log("Scope: these are conditional numerical bounds for reviewed source models. Hardware/compiler conformance, model-wide range bounds, native memory/dispatch, delta adapters, remaining kernels, and the complete inference graph remain unproved.");
