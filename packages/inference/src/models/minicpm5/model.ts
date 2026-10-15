@@ -10,7 +10,7 @@ import type { MlxCacheLayer, MlxMixedRange, MlxSequenceRange } from "../../contr
 import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import { LoraState } from "../../layers/lora";
-import type { GraphCapabilities } from "../../contracts/portable/graph";
+import type { GraphDeclaration } from "../../contracts/portable/graph";
 import type { MlxRowTable, MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPromptRange, MlxTokenPhases, MlxVerifyForward } from "../../contracts/mlx/graph";
 import type { TrainableGraph } from "../../contracts/mlx/trainable";
 import { miniCpmTrainable } from "./trainable";
@@ -257,7 +257,7 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly prefixBase = "model";
   readonly loraState = new LoraState();
   /** An ordinary autoregressive graph: every method over every cache lego. */
-  get graphCapabilities(): GraphCapabilities { return declareGraph(); }
+  get graphCapabilities(): GraphDeclaration { return declareGraph(); }
   #trainable: TrainableGraph | undefined;
   /** The separate quantized head, segmented backward, prefix-shared ORPO and flash training attention. */
   get trainable(): TrainableGraph { return this.#trainable ??= miniCpmTrainable(this); }

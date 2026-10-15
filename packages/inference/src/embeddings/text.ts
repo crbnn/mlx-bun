@@ -14,7 +14,7 @@ export interface EmbeddingGraph { embedPooled(ids: MlxArray): MlxArray }
 
 /** A graph declares the pooled-embedding path. */
 export function isEmbeddingModel(model: object): model is EmbeddingGraph {
-  return declaredGraph(model).graphCapabilities.embeddings;
+  return typeof declaredGraph(model).embedPooled === "function";
 }
 
 /** The token id of the profile's declared pooling terminator in this tokenizer. */

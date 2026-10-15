@@ -22,7 +22,7 @@ import { composedFullAttentionCache } from "../../state/bf16-first-kv";
 import { AttentionMasks } from "../../state/attention-read";
 import { denseTurboQuantKernels } from "../../state/turboquant-attention";
 import { LoraState } from "../../layers/lora";
-import type { GraphCapabilities } from "../../contracts/portable/graph";
+import type { GraphDeclaration } from "../../contracts/portable/graph";
 import type { MlxRowTable, MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPromptRange, MlxTokenPhases, MlxVerifyForward } from "../../contracts/mlx/graph";
 import { declareGraph } from "../capabilities";
 import { DEFAULT_PHASE_ROWS,  rowTable, type ReadPhase   } from "../graph";
@@ -186,7 +186,7 @@ export class Qwen3Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly prefixBase = "model";
   readonly loraState = new LoraState();
   /** An ordinary autoregressive graph that also exposes the pooled embedding path. */
-  get graphCapabilities(): GraphCapabilities { return declareGraph({ embeddings: true }); }
+  get graphCapabilities(): GraphDeclaration { return declareGraph(); }
   readonly embed: QuantizedEmbedding;
   readonly layers: Qwen3Layer[];
   readonly finalNorm: RMSNorm;

@@ -41,7 +41,8 @@ const placement = (plan: { reasons: readonly string[] }) =>
 describe("placement follows the graph's declarations", () => {
   test("the binding reports what the graph declared, once", () => {
     const declared = declareGraph({ hiddenLayerTaps: true });
-    expect(bind(replacement({ hiddenLayerTaps: true })).capabilities).toEqual(declared);
+    expect(bind(replacement({ hiddenLayerTaps: true })).capabilities).toEqual({ ...declared, embeddings: false });
+    expect(bind(replacement({}, { embedPooled: never })).capabilities.embeddings).toBe(true);
   });
 
   test("a model type or class name declares nothing", () => {

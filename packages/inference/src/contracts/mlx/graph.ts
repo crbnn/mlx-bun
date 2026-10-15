@@ -1,6 +1,6 @@
 import type { MlxHeadForward, MlxHeadRange } from "./head";
 export type { MlxHeadForward, MlxHeadRange } from "./head";
-import type { GraphCapabilities } from "../portable/graph";
+import type { GraphDeclaration } from "../portable/graph";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { Cache } from "./cache";
 import type { TargetView } from "./draft-target";
@@ -195,11 +195,12 @@ export interface AdaptiveDraftGateSettings {
   readonly probeDepth?: number;
 }
 
-/** The operations behind a graph's declared capabilities. A graph implements
- * the ones its `graphCapabilities` promise; composition checks the pairing once
- * when it binds (`declaredGraph`), so execution never probes for them. */
+/** The graph's operations and construction facts. Pooled embedding support is
+ * declared by its operation alone. Other operations accompany the promises in
+ * `graphCapabilities`; composition checks their pairing when it binds
+ * (`declaredGraph`). */
 export interface MlxDeclaredGraph {
-  readonly graphCapabilities: GraphCapabilities;
+  readonly graphCapabilities: GraphDeclaration;
   /** Release what the graph built at construction (computed constants, Neural
    *  Engine programs, its own weight source where it opened one) once every
    *  execution and compiled runner has stopped. A graph that built nothing
@@ -211,7 +212,8 @@ export interface MlxDeclaredGraph {
   /** media `embeddings`/`embeddings+positions`: bind one request's prepared
    * embeddings into an input whose prefill is indivisible. */
   bindMediaInput?(input: Vision): MlxPromptInput;
-  /** embeddings: the pooled, L2-normalized sentence vector of one sequence,
+  /** Presence declares pooled embeddings; there is no separate support flag.
+   * The pooled, L2-normalized sentence vector of one sequence,
    * ids [1, L] to [1, hidden]. The caller appends the pooling token the
    * profile declares and owns the result. */
   embedPooled?(ids: MlxArray): MlxArray;

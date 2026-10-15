@@ -479,9 +479,10 @@ async function inspectWorkspaces(root: string): Promise<string[]> {
 //                    are exempt; profiling hooks are exempt by name.
 //   cache-escape     the representation-specific cache reads and conversions, outside `state/` and the cache contract.
 //   phase-by-shape   `forwardHidden`/`forwardHiddenMixed` reached from `execution/` and `generation/`.
+//   embedding-declaration  an independent `embeddings` flag passed to `declareGraph`, or read from a graph's declaration.
 // ---------------------------------------------------------------------------------------------
 type RatchetRule = "model-class" | "family-subpath" | "family-identity" | "cache-class" | "model-env-flag" | "scheduler-core" |
-  "graph-extends" | "hot-path-read" | "cache-escape" | "phase-by-shape" | "graph-composition" | "graph-control-flow";
+  "graph-extends" | "hot-path-read" | "cache-escape" | "phase-by-shape" | "graph-composition" | "graph-control-flow" | "embedding-declaration";
 interface Finding { rule: RatchetRule; file: string; line: number; text: string }
 type RatchetTable = Partial<Record<RatchetRule, Record<string, number>>>;
 
@@ -527,6 +528,7 @@ const pavedRoad: Partial<Record<RatchetRule, string>> = {
   "phase-by-shape": "The scheduler names the phase and exact rows: index the graph's prompt ranges or decode[rows] and verify[rows] tables.",
   "graph-composition": "Write the file: the loader selects it and attaches weights; a graph takes no Composition record.",
   "graph-control-flow": "Write the file: name every layer and kernel binding literally, in execution order; route dynamic work in the scheduler.",
+  "embedding-declaration": "Supply the graph's embedPooled operation; graphCapabilitiesOf(graph) derives the portable embeddings flag from that operation.",
 };
 
 const lineOf = (source: ts.SourceFile, node: ts.Node) => source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1;
@@ -546,6 +548,52 @@ function memberReads(source: ts.SourceFile, names: ReadonlySet<string>): { name:
     } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.InKeyword &&
         ts.isStringLiteralLike(node.left) && names.has(node.left.text))
       found.push({ name: node.left.text, node, receiver: node.right });
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return found;
+}
+
+/** Pooled embeddings have one declaration: the operation. Other capabilities and assertions are unaffected. */
+function embeddingDeclarations(source: ts.SourceFile): { text: string; node: ts.Node }[] {
+  const found: { text: string; node: ts.Node }[] = [];
+  const declarations = new Set(["declareGraph"]);
+  for (const statement of source.statements) {
+    const bindings = ts.isImportDeclaration(statement) ? statement.importClause?.namedBindings : undefined;
+    if (bindings && ts.isNamedImports(bindings))
+      for (const item of bindings.elements)
+        if ((item.propertyName ?? item.name).text === "declareGraph") declarations.add(item.name.text);
+  }
+  const unwrap = (node: ts.Expression): ts.Expression => {
+    while (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isTypeAssertionExpression(node) ||
+        ts.isNonNullExpression(node) || ts.isSatisfiesExpression(node)) node = node.expression;
+    return node;
+  };
+  const key = (name: ts.PropertyName): string | undefined => {
+    if (ts.isIdentifier(name) || ts.isStringLiteralLike(name)) return name.text;
+    const value = ts.isComputedPropertyName(name) ? unwrap(name.expression) : undefined;
+    return value && ts.isStringLiteralLike(value) ? value.text : undefined;
+  };
+  const member = (expression: ts.Expression): { name: string; receiver: ts.Expression } | undefined => {
+    const node = unwrap(expression);
+    if (ts.isPropertyAccessExpression(node)) return { name: node.name.text, receiver: node.expression };
+    if (ts.isElementAccessExpression(node) && ts.isStringLiteralLike(node.argumentExpression))
+      return { name: node.argumentExpression.text, receiver: node.expression };
+  };
+  const visit = (node: ts.Node) => {
+    if (ts.isCallExpression(node)) {
+      const callee = unwrap(node.expression), argument = node.arguments[0] && unwrap(node.arguments[0]);
+      if ((ts.isIdentifier(callee) ? declarations.has(callee.text) : member(callee)?.name === "declareGraph") &&
+          argument && ts.isObjectLiteralExpression(argument))
+        for (const property of argument.properties)
+          if (property.name && key(property.name) === "embeddings")
+            found.push({ text: "declareGraph({ embeddings })", node: property });
+    }
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      const read = member(node);
+      if (read?.name === "embeddings" && member(read.receiver)?.name === "graphCapabilities")
+        found.push({ text: ".graphCapabilities.embeddings", node });
+    }
     ts.forEachChild(node, visit);
   };
   visit(source);
@@ -936,6 +984,7 @@ async function seamFindings(root: string): Promise<Finding[]> {
     const inModels = inInference && name.startsWith("models/");
     const add = (rule: RatchetRule, node: ts.Node | undefined, text: string) =>
       found.push({ rule, file: at, line: node ? source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1 : 0, text });
+    for (const { text, node } of embeddingDeclarations(source)) add("embedding-declaration", node, text);
     const { instances, names, flags } = nameAndClassChecks(source);
     if (!inModels) {
       for (const { name: klass, node } of instances) {
@@ -1019,6 +1068,7 @@ const seamRatchet: RatchetTable = {
   "hot-path-read": {},
   "cache-escape": {},
   "phase-by-shape": {},
+  "embedding-declaration": {},
 };
 
 test("the seam ratchet: no new violation, no file above its allowlisted count", async () => {
@@ -1350,6 +1400,44 @@ test("the composition rules fire, honor their exemptions, stay silent on the pav
     const shaped = findings.filter(item => item.rule === "phase-by-shape");
     expect(checkRatchet(shaped, { "phase-by-shape": { [inference("execution/group.ts")]: 5 } })).toEqual({ failures: [], reminders: [] });
     expect(checkRatchet(shaped, { "phase-by-shape": { [inference("execution/group.ts")]: 4 } }).failures[0]).toContain("5 violations, 4 allowed");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("pooled embedding declarations derive support from the operation", async () => {
+  const root = mkdtempSync(join(tmpdir(), "mlx-embedding-ratchet-"));
+  const write = (path: string, text: string) => {
+    mkdirSync(dirname(resolve(root, path)), { recursive: true }); writeFileSync(resolve(root, path), text);
+  };
+  const file = "packages/inference/src/models/embedding.ts";
+  try {
+    write("packages/inference/package.json", JSON.stringify({ name: "@mlx-bun/inference", type: "module" }));
+    write(file, 'import { declareGraph as declare } from "./capabilities";\n' +
+      "export const declarations = [declareGraph({ embeddings: true }), declare({ embeddings }),\n" +
+      '  graphs.declareGraph({ "embeddings": false }), graphs["declareGraph"]({ ["embeddings"]: true } as const)];\n' +
+      "export const reads = [graph.graphCapabilities.embeddings, graph?.graphCapabilities?.embeddings,\n" +
+      '  graph["graphCapabilities"].embeddings, graph.graphCapabilities["embeddings"],\n' +
+      '  graph["graphCapabilities"]["embeddings"], (graph.graphCapabilities!).embeddings];');
+    const findings = (await seamFindings(root)).filter(item => item.rule === "embedding-declaration");
+    expect(findings.map(item => item.text)).toEqual([
+      ...Array(4).fill("declareGraph({ embeddings })"), ...Array(6).fill(".graphCapabilities.embeddings"),
+    ]);
+    expect(findings.every(item => item.file === file && item.line > 0)).toBe(true);
+    const { failures, reminders } = checkRatchet(findings, seamRatchet);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toContain("10 violations, 0 allowed (a new file)");
+    expect(failures[0]).toEndWith(`. ${pavedRoad["embedding-declaration"]}`);
+    expect(reminders).toEqual([]);
+
+    write(file, "export const declaration = declareGraph({ compiledDecode: true });\n" +
+      "export const capabilities = graphCapabilitiesOf(graph);\n" +
+      "export const supported = capabilities.embeddings && graphCapabilitiesOf(graph).embeddings;\n" +
+      "export function embed(ids: unknown) { if (graph.embedPooled) return graph.embedPooled(ids); }\n" +
+      "export const unrelated = { embeddings: true, callback: optional! };\n" +
+      "export const method = graph.graphCapabilities.method;\n" +
+      "export interface EmbeddingGraph { embedPooled(ids: unknown): unknown }\n" +
+      "export interface Other { embeddings?: boolean; callback?(): void }\n" +
+      "export const asserted = optional! as EmbeddingGraph;");
+    expect(await seamFindings(root)).toEqual([]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

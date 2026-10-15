@@ -25,7 +25,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { disposing } from "../../layers/helpers";
 import { compiledSwiglu } from "../../layers/swiglu";
 import { LoraState } from "../../layers/lora";
-import type { GraphCapabilities } from "../../contracts/portable/graph";
+import type { GraphDeclaration } from "../../contracts/portable/graph";
 import type { MlxRowTable, MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPromptRange, MlxTokenPhases, MlxVerifyForward } from "../../contracts/mlx/graph";
 import { declareGraph } from "../capabilities";
 import { DEFAULT_PHASE_ROWS, rowTableFrom, rowTable, type ReadPhase   } from "../graph";
@@ -236,7 +236,7 @@ export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
   readonly prefixBase = "model";
   readonly loraState = new LoraState();
   /** An ordinary autoregressive graph: every method over every cache lego. */
-  get graphCapabilities(): GraphCapabilities { return declareGraph(); }
+  get graphCapabilities(): GraphDeclaration { return declareGraph(); }
   readonly embed: QuantizedEmbedding;
   readonly layers: Qwen3MoeDecoderLayer[];
   readonly finalNorm: RMSNorm;

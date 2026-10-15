@@ -7,7 +7,7 @@ import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target
 import type { MlxDeclaredGraph, MlxTokenPhases, MlxLayerCapture, MlxHeadForward, MlxRowTable, MlxPromptRange, MlxCacheLayer, MlxPhaseForward, MlxSequenceRange, MlxSeparateMixed, MlxKnownRange } from "../../contracts/mlx/graph";
 import type { MediaEncoders, MlxPromptInput, Vision, MlxPositionedForward, MlxPositionedRange, MlxPositionedEmbeddingsRange, MlxEmbeddingsRange } from "../../contracts/mlx/media";
 import type { MropeForwardState } from "../../contracts/mlx/positions";
-import type { GraphCapabilities } from "../../contracts/portable/graph";
+import type { GraphDeclaration } from "../../contracts/portable/graph";
 import type { AneProgramSpec } from "../../kernels/ane/linear";
 import { Affine3MmaLinear as Affine3Mma, Affine3RowsLinear as Affine3Rows, Affine4MmaLinear as Affine4Mma, Affine4RowsLinear as Affine4Rows } from "../../layers/affine-verify-linear";
 import { AneAffineSplit, AneTrellisExpandedMlpSplit as AneMlp, AneTrellisExpandedMlpSplitK3i as AneMlpK3i, aneAffineSplitProgram, aneMlpSplitProgram } from "../../layers/ane-prefill-split";
@@ -66,7 +66,7 @@ export class Qwen38TrellisM4Pro implements MlxDeclaredGraph,MlxTokenPhases {
   readonly embed:QuantizedEmbedding;
   readonly finalNorm:RMSNorm;
   readonly lmHead:QuantizedLinear;
-  readonly graphCapabilities:GraphCapabilities=declareGraph({media:{input:"embeddings+positions",video:true},hiddenLayerTaps:true,prefill:{boundedWorkspace:true}});
+  readonly graphCapabilities:GraphDeclaration=declareGraph({media:{input:"embeddings+positions",video:true},hiddenLayerTaps:true,prefill:{boundedWorkspace:true}});
   readonly verifyRoundCosts=new Map([[1,1],[2,1.3],[3,1.46],[4,1.68],[5,1.82],[6,1.92],[7,1.93],[8,1.94]]);
   readonly knownSpans={maxChunkSize:(state:readonly Cache[])=>qwenAppendChunkSize(state[0]!.offset)};
   readonly cacheLayers:readonly MlxCacheLayer[]=[

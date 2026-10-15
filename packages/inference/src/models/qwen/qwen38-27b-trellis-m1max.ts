@@ -10,7 +10,7 @@ import type { ResidualBasis, TargetView } from "../../contracts/mlx/draft-target
 import type { MlxDeclaredGraph, MlxTokenPhases, MlxLayerCapture, MlxHeadForward, MlxRowTable, MlxPromptRange, MlxCacheLayer, MlxSequenceRange, MlxMixedRange, MlxPhaseGroup, MlxMixedGroupRange, MlxSeparateMixed, MlxKnownRange } from "../../contracts/mlx/graph";
 import type { MediaEncoders, MlxPromptInput, Vision, MlxPositionedForward, MlxPositionedRange, MlxPositionedEmbeddingsRange, MlxEmbeddingsRange } from "../../contracts/mlx/media";
 import type { MropeForwardState } from "../../contracts/mlx/positions";
-import type { GraphCapabilities } from "../../contracts/portable/graph";
+import type { GraphDeclaration } from "../../contracts/portable/graph";
 import { LoraState } from "../../layers/lora";
 import { RMSNorm } from "../../layers/normalization";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
@@ -91,7 +91,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
   readonly embed:QuantizedEmbedding;
   readonly finalNorm:RMSNorm;
   readonly lmHead:QuantizedLinear;
-  readonly graphCapabilities:GraphCapabilities=declareGraph({media:{input:"embeddings+positions",video:true},hiddenLayerTaps:true,prefill:{boundedWorkspace:true}});
+  readonly graphCapabilities:GraphDeclaration=declareGraph({media:{input:"embeddings+positions",video:true},hiddenLayerTaps:true,prefill:{boundedWorkspace:true}});
   readonly verifyRoundCosts=new Map([[1,1],[2,1.77],[3,1.95],[4,1.98],[5,2],[6,2.03],[7,2.04],[8,2.05],[16,3.46],[32,6.4]]);
   readonly adaptiveDraftWidths=new Map([["mtp",4]]);
   readonly adaptiveDraftGates=new Map([["dflash2",{decay:.95,idleDecay:.93,probeDepth:1}],["mtp",{decay:.95,idleDecay:.93}]]);

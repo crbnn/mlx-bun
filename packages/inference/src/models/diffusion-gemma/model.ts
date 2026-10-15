@@ -33,7 +33,7 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { disposing } from "../../layers/helpers";
 import { LoraState } from "../../layers/lora";
-import type { GraphCapabilities } from "../../contracts/portable/graph";
+import type { GraphDeclaration } from "../../contracts/portable/graph";
 import type { MlxDeclaredGraph, MlxDenoisingOperations } from "../../contracts/mlx/graph";
 import type { TrainableGraph } from "../../contracts/mlx/trainable";
 import { declareGraph } from "../capabilities";
@@ -464,7 +464,7 @@ export class DiffusionGemmaModel implements MlxDeclaredGraph, MlxDenoisingOperat
   readonly loraState = new LoraState();
   /** Denoising rows interleave through their own grouped method; images enter as
    * the method's pixel prefill input. */
-  get graphCapabilities(): GraphCapabilities {
+  get graphCapabilities(): GraphDeclaration {
     return declareGraph({ method: "denoising", media: { input: "pixels", video: false } });
   }
   /** The denoising objective: LoRA on the decoder blocks (the encoder reuses them, weight-tied). */
