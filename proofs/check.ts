@@ -38,7 +38,7 @@ const sourcePins = {
   "models/qwen/checkpoint.ts": "1ec846424a2d4e5a046bcb62b43a5e6b8e1f3d9c2b4b3f5f3d7180276362edd8",
   "kernels/sampling/normalized-argmax.ts": "1578cff1ef678cbff3e2e9a754c6d7ba369e455885127e8d15c8b61f22a87740",
 };
-// Exact upstream source for the reviewed MLX convolution, qmv and RoPE translations.
+// Exact upstream source for the reviewed MLX arithmetic and kernel translations.
 // These pins do not establish correspondence with the bundled native binary.
 const mlxRevision = "1f8e74e3f12f31365464a6867c6579f0e9b29d85";
 const mlxSourcePins = {
@@ -53,6 +53,10 @@ const mlxSourcePins = {
   "mlx/backend/metal/kernels/conv.metal": "d0604f69e144ffb65dcfc99e6383880b6d2d61645fa73147f35230034a1cd874",
   "mlx/backend/metal/quantized.cpp": "44483286a359afb7f35d8a9c1658ffaec6ff6c01a7ab34ac7bb35cf6438804a6",
   "mlx/backend/metal/kernels/quantized.h": "2a007016da606afe569adb9adcc05e00f14558ad2e094bcb4f8974beb53c316f",
+  "mlx/ops.cpp": "6eae219354d0f9be37a064cb327c863fc3a12dba6668fd61d428e8d09d6baaf2",
+  "mlx/backend/metal/logsumexp.cpp": "e629a1fa0b8744c7ee7913ccdb37caf6d22ad76aa6945282aa6adc4afdd316e7",
+  "mlx/backend/metal/kernels/logsumexp.h": "233f9a7072bed21f2b71f522c41aa5e86208e3bcfd18fafc87cf28a7d7f13154",
+  "mlx/backend/metal/kernels/logsumexp.metal": "f9bec5e1e5a23d20bedf9ff8d29a8c03bbb5144bc5d751bbfe906d32ee894817",
 };
 const proofFiles = [
   "contracts/mlx/M1Max.lean",
@@ -245,6 +249,18 @@ const proofFiles = [
   "kernels/sampling/NormalizedScores.lean",
   "kernels/sampling/NormalizedArgmaxLayout.lean",
   "kernels/sampling/NormalizedArgmaxExecution.lean",
+  "contracts/mlx/Maximum.lean",
+  "contracts/mlx/FlushOrder.lean",
+  "contracts/mlx/NonnegativeArithmetic.lean",
+  "kernels/sampling/LogSumExpLayout.lean",
+  "kernels/sampling/LogSumExpExponentRanges.lean",
+  "kernels/sampling/LogSumExpAccumulator.lean",
+  "kernels/sampling/LogSumExpBlockRanges.lean",
+  "kernels/sampling/LogSumExpLoopRanges.lean",
+  "kernels/sampling/LogSumExpMergeRanges.lean",
+  "kernels/sampling/LogSumExpRanges.lean",
+  "kernels/sampling/GreedySampling.lean",
+  "models/qwen/TokenSampledInitialRanges.lean",
 ];
 
 const discoveredProofs = await Array.fromAsync(new Bun.Glob("**/*.lean").scan({
@@ -412,4 +428,4 @@ try {
 }
 console.log(`Checked ${proofFiles.length} proof modules: Trellis and affine numerical bounds, MLX fast-qmv source-model equivalence, packed windows, conditional M1 loads, scratch stores, flushed binary32/bfloat16 arithmetic and range bounds, SwiGLU and sigmoid, RMS normalization, Delta convolution/recurrence/cache, Q/K normalization and partial RoPE, one-pass SDPA arithmetic and scratch transpose, plain KV append, quantized embedding, residual Delta/attention layer composition, initial cache state, and the conditional 64-layer token-to-logits source model with returned-cache bounds.`);
 console.log("Permitted axioms: propext, Classical.choice, Quot.sound. No native proof evaluation.");
-console.log("Scope: first-token source-model ranges and error composition cover embedding, all 64 layers, final normalization, logits and returned caches, conditional on parameter and scalar/platform contracts. Normalization literals have checked range certificates; their host attachment checker is outside Lean. Full checkpoint/loader binding, a useful final accuracy bound, subsequent-token stability, native memory/dispatch and hardware/compiler correspondence remain unproved.");
+console.log("Scope: the first-token source model covers embedding, all 64 layers, final normalization, logits, 1024-thread looped logsumexp, normalized greedy selection and returned-cache error bounds, conditional on parameter and scalar/platform contracts. Selection maximizes the rounded normalized score with lowest-index ties; exact-real winner agreement requires an explicit numerical margin. Normalization literals have checked range certificates; their host attachment checker is outside Lean. Full checkpoint/loader binding, a useful final accuracy bound, subsequent-token stability, native memory/dispatch and hardware/compiler correspondence remain unproved.");
