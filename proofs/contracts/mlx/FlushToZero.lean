@@ -62,6 +62,64 @@ theorem flush_error (x : Float32) : |real (flush x)-real x| ≤ threshold := by
 def mul (x y : Float32) : Float32 := flush (flush x * flush y)
 def add (x y : Float32) : Float32 := flush (flush x + flush y)
 def fma (x y z : Float32) : Float32 := flush (Float32.fma (flush x) (flush y) (flush z))
+def div (x y : Float32) : Float32 := flush (flush x / flush y)
+
+theorem flush_nonnegative (x : Float32) (hx : 0 ≤ real x) : 0 ≤ real (flush x) := by
+  unfold flush
+  split
+  · split
+    · rw [real_signed_zero]
+    · exact hx
+  · exact hx
+
+theorem flush_eq_or_zero (x : Float32) : flush x = x ∨ real (flush x) = 0 := by
+  unfold flush
+  split
+  · split
+    · exact Or.inr (real_signed_zero _)
+    · exact Or.inl rfl
+  · exact Or.inl rfl
+
+theorem flush_eq_of_one_le (x : Float32) (hx : 1 ≤ real x) : flush x = x := by
+  rcases flush_eq_or_zero x with h | h
+  · exact h
+  · have he := flush_error x
+    rw [h, zero_sub, abs_neg, abs_of_nonneg (by linarith)] at he
+    have ht : threshold < 1 := by norm_num [threshold]
+    linarith
+
+theorem flush_one : flush (1 : Float32) = 1 := by
+  apply flush_eq_of_one_le
+  rw [real_one]
+
+-- A sigmoid denominator cannot be subnormal: adding a nonnegative finite
+-- exponential to one and rounding nearest-even still produces at least one.
+theorem add_one_ge_one (x : Float32) (hx : x.isFinite=true) (hn : 0 ≤ real x)
+    (hs : ((1 : Float32) + flush x).isFinite=true) : 1 ≤ real (add 1 x) := by
+  have hi := flush_nonnegative x hn
+  have hm := Model.roundAt_mono FloatFormat.binary32 (show (1 : ℝ) ≤ 1+real (flush x) by linarith)
+  have hr := Model.roundAt_toReal_eq (model (1 : Float32)) (by rw [finite_model]; decide)
+  rw [show Model.toReal (model (1 : Float32))=1 from real_one] at hr
+  rw [hr] at hm
+  have hs' : 1 ≤ real ((1 : Float32)+flush x) := by
+    rw [Numerics.add_real _ _ (by decide) (finite_flush x hx) hs, real_one]
+    exact hm
+  unfold add
+  rw [flush_one, flush_eq_of_one_le _ hs']
+  exact hs'
+
+theorem reciprocal_error (x : Float32) (hx : x.isFinite=true) (hn : 1 ≤ real x)
+    (hq : ((1 : Float32)/x).isFinite=true) :
+    |real (div 1 x)-1/real x| ≤ threshold + epsilon (1/real x) := by
+  have er := Numerics.div_error (1 : Float32) x hx hq
+  rw [real_one] at er
+  have ef := flush_error ((1 : Float32)/x)
+  unfold div
+  rw [flush_one, flush_eq_of_one_le x hn]
+  calc
+    _ = |(real (flush ((1 : Float32)/x))-real ((1 : Float32)/x)) +
+        (real ((1 : Float32)/x)-1/real x)| := by congr 1; ring
+    _ ≤ _ := (abs_add_le _ _).trans (add_le_add ef er)
 
 theorem product_input_error (x y : Float32) :
     |real (flush x)*real (flush y)-real x*real y| ≤ threshold*(|real x|+|real y|) := by

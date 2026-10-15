@@ -14,6 +14,9 @@ def cast (x : Float32) : Float32 :=
   Float32.ofModel (Model.toFloat32Model
     (Model.cast FloatFormat.bfloat16 FloatFormat.binary32 (narrow x)))
 
+def widen (x : Model FloatFormat.bfloat16) : Float32 :=
+  Float32.ofModel (Model.toFloat32Model (Model.cast FloatFormat.bfloat16 FloatFormat.binary32 x))
+
 theorem bridge (x : Model FloatFormat.binary32) :
     real (Float32.ofModel (Model.toFloat32Model x)) = Model.toReal x := by
   rw [real_unpack]
@@ -31,6 +34,21 @@ theorem cast_real (x : Float32) (hx : x.isFinite=true)
     (by rw [finite_model]; exact hx) hy
 
 noncomputable def epsilon (x : ℝ) : ℝ := Model.epsilonAt FloatFormat.bfloat16 x
+
+theorem narrow_error (x : Float32) (hx : x.isFinite=true)
+    (hy : Model.isFinite (narrow x)=true) :
+    |Model.toReal (narrow x)-real x| ≤ epsilon (real x) := by
+  have h := Model.cast_eq_roundAt (by decide) (by decide) (model x)
+    (by rw [finite_model]; exact hx) hy
+  change Model.toReal (narrow x) = Model.roundAt FloatFormat.bfloat16 (real x) at h
+  rw [h]
+  exact Model.abs_roundAt_sub_le _ _
+
+theorem widen_real (x : Model FloatFormat.bfloat16) (hx : Model.isFinite x=true) :
+    real (widen x) = Model.toReal x := by
+  unfold widen
+  rw [bridge]
+  exact Model.cast_exact_of_compatibleWidening x (by decide) (by decide) (by decide) (by decide) hx
 
 theorem cast_error (x : Float32) (hx : x.isFinite=true)
     (hy : Model.isFinite (narrow x)=true) :

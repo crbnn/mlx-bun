@@ -12,10 +12,13 @@ let dependencyPath = "";
 // Reviewed manual translations, not a verified Metal/TypeScript frontend. Pins
 // prevent source drift; changing a hash requires reviewing the affected proofs.
 const sourcePins = {
-  "codebook.ts": "0ba8624952767d077cdecc531fd9f49a159545b95ae4fc4ddd213ed13fa1e276",
-  "down-codebook.ts": "5649124f12f6828241d88bb86f9e9f6bf965af2b3b5a298ddd8a2973277eec55",
-  "gate-up-codebook.ts": "c0aec9b9f951c5fd94270a52f4bf4da43e7fb7d0ecda6ccd65e20571e8931f45",
-  "launch.ts": "da0a19922ccc93935c5cab869de040d4b759271df08496c88c7371c386724052",
+  "kernels/trellis/codebook.ts": "0ba8624952767d077cdecc531fd9f49a159545b95ae4fc4ddd213ed13fa1e276",
+  "kernels/trellis/down-codebook.ts": "5649124f12f6828241d88bb86f9e9f6bf965af2b3b5a298ddd8a2973277eec55",
+  "kernels/trellis/gate-up-codebook.ts": "c0aec9b9f951c5fd94270a52f4bf4da43e7fb7d0ecda6ccd65e20571e8931f45",
+  "kernels/trellis/launch.ts": "da0a19922ccc93935c5cab869de040d4b759271df08496c88c7371c386724052",
+  "layers/trellis-codebook-gate-up.ts": "28d27e84cb669c18a4532723e8dbc66786e386a4390454121640a3e14e5526f5",
+  "layers/trellis-codebook-down.ts": "48752c429a3ab558131f95c6d361b15b6795c3bb6ee161f8afdca71609437898",
+  "models/qwen/written-layers.ts": "fc298c473e61a1e851443ff8263b65c0c15c27172b9db6615f73f486414bfb38",
 };
 const proofFiles = [
   "contracts/mlx/M1Max.lean",
@@ -23,6 +26,7 @@ const proofFiles = [
   "contracts/mlx/Numerics.lean",
   "contracts/mlx/FlushToZero.lean",
   "contracts/mlx/BFloat16.lean",
+  "contracts/mlx/BFloat16Arithmetic.lean",
   "contracts/mlx/Reduction.lean",
   "contracts/mlx/DotProduct.lean",
   "contracts/mlx/FlushedDotProduct.lean",
@@ -40,8 +44,22 @@ const proofFiles = [
   "kernels/trellis/GateUpExecution.lean",
   "kernels/trellis/GateUpAccuracy.lean",
   "kernels/trellis/GateUpFlushToZero.lean",
+  "kernels/trellis/DownFlushToZero.lean",
   "kernels/trellis/GateUpTail.lean",
+  "kernels/trellis/SwiGLUStability.lean",
+  "kernels/trellis/GateUpTailFlushToZero.lean",
+  "kernels/trellis/GateUpSplitTail.lean",
+  "layers/TrellisCodebookGateUp.lean",
+  "layers/TrellisCodebookDown.lean",
+  "models/qwen/WrittenLayers.lean",
 ];
+
+const discoveredProofs = await Array.fromAsync(new Bun.Glob("**/*.lean").scan({
+  cwd: new URL("./", import.meta.url).pathname, onlyFiles: true, dot: false,
+}));
+for (const file of discoveredProofs) {
+  if (!proofFiles.includes(file)) throw new Error(`Proof module is missing from the checked build: ${file}`);
+}
 
 function checkSource(name: keyof typeof sourcePins, source: string): void {
   if (new Bun.CryptoHasher("sha256").update(source).digest("hex") !== sourcePins[name]) {
@@ -98,12 +116,18 @@ process.stdout.write(await runLake(["build",
   "FloatLib.Floats.Formats.BinaryInterchange.Arithmetic.LeanModel.MulDiv",
   "FloatLib.Floats.Formats.IEEE754.Native.Model",
   "FloatLib.Floats.Formats.BinaryInterchange.Conversion.Cast.Proof",
+  "FloatLib.Floats.Formats.BinaryInterchange.Arithmetic.Constants",
+  "FloatLib.Floats.Formats.BinaryInterchange.Operations.Classification.Semantics",
+  "FloatLib.Floats.Formats.BinaryInterchange.Operations.Compare.Proof",
   "Mathlib.Analysis.SpecialFunctions.Exp",
+  "Mathlib.Analysis.SpecialFunctions.ExpDeriv",
+  "Mathlib.Analysis.Calculus.MeanValue",
+  "Mathlib.Analysis.Calculus.Deriv.Inv",
 ]));
 dependencyPath = (await runLake(["env", "printenv", "LEAN_PATH"])).trim();
 const sources = new Map<keyof typeof sourcePins, string>();
 for (const name of Object.keys(sourcePins) as (keyof typeof sourcePins)[]) {
-  const source = await Bun.file(new URL(`packages/inference/src/kernels/trellis/${name}`, root)).text();
+  const source = await Bun.file(new URL(`packages/inference/src/${name}`, root)).text();
   checkSource(name, source);
   sources.set(name, source);
 }
@@ -167,6 +191,6 @@ try {
 } finally {
   await rm(dir, { recursive: true, force: true });
 }
-console.log("Checked decoding, packed windows, binary32/bfloat16 rounding bounds, conditional M1 loads, initialization stores, gate/up and down dot-product error bounds, and the TAIL=0 SwiGLU arithmetic bound.");
+console.log("Checked decoding, packed windows, conditional M1 loads, initialization and scratch stores, flushed binary32/bfloat16 arithmetic, both SwiGLU tails including exponential overflow, and numerical error propagation through the single-row projections.");
 console.log("Permitted axioms: propext, Classical.choice, Quot.sound. No native proof evaluation.");
-console.log("Scope: gate/up also has a flush-to-zero model; down/SwiGLU bounds still use gradual underflow and do not yet describe the observed M1 Max flushing behavior. Hardware/compiler conformance, finite intermediates, TAIL=1 arithmetic, remaining kernels, layers, and graph remain unproved.");
+console.log("Scope: these are conditional numerical bounds for reviewed source models. Hardware/compiler conformance, model-wide range bounds, native memory/dispatch, delta adapters, remaining kernels, and the complete inference graph remain unproved.");
