@@ -9,6 +9,8 @@
 #   1. creates (or updates) the GitHub release v<ver> with the tarball asset
 #   2. rewrites version/url/sha256 in the TAP's Formula/mlx-bun.rb and pushes
 #   3. publishes the workspace npm archives in dependency order
+# Website deployment is a separate manual step after publication; see
+# apps/website/README.md.
 #
 # Releases are inherently local (signing/notarization need the Developer ID
 # cert + Apple creds on this Mac), so this local step is the single source
@@ -41,8 +43,8 @@ SHA="$(shasum -a 256 "$TARPATH" | awk '{print $1}')"
 URL="https://github.com/$REPO/releases/download/v$VERSION/$TARBALL"
 echo "==> version $VERSION  sha $SHA"
 
-# Preflight: the site deploys from origin/main on push, while these binaries
-# are built from the LOCAL tree — releasing unpushed code splits the story.
+# Preflight: the release tag, locally built binaries, and manually deployed
+# website must identify the same reviewed source on origin/main.
 # (Skip with RELEASE_SKIP_GIT_CHECK=1 for a re-run/hotfix of assets only.)
 if [ "${RELEASE_SKIP_GIT_CHECK:-0}" != "1" ]; then
   if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
@@ -52,8 +54,8 @@ if [ "${RELEASE_SKIP_GIT_CHECK:-0}" != "1" ]; then
   fi
   git fetch -q origin main
   if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
-    echo "local HEAD != origin/main — run \`git push\` first (the site deploys" >&2
-    echo "from the push; binaries must match), or RELEASE_SKIP_GIT_CHECK=1" >&2
+    echo "local HEAD != origin/main — push the reviewed release commit first," >&2
+    echo "or RELEASE_SKIP_GIT_CHECK=1 to override" >&2
     exit 1
   fi
   [ "$(git rev-parse HEAD)" = "$PREPARED_HEAD" ] || { echo "prepared source differs from origin/main" >&2; exit 1; }
@@ -124,4 +126,4 @@ echo "==> done — all channels:"
 echo "    GitHub release  https://github.com/$REPO/releases/tag/v$VERSION"
 echo "    Homebrew tap    brew upgrade joshuarossi/tap/mlx-bun"
 echo "    npm             mlx-bun@$VERSION"
-echo "    site            deploys from the git push (GitHub Pages)"
+echo "    site            deploy manually: gh workflow run pages.yml -R $REPO --ref main -f release_tag=v$VERSION"

@@ -1,5 +1,8 @@
 # mlx-bun app
 
+mlx-bun 1.0.0 is beta and actively developed. APIs and behavior may change;
+breaking changes are called out in release notes.
+
 The runnable terminal app, server, and web surfaces live here. Default startup
 loads a local model and serves the browser app, Pi web chat, and OpenAI-compatible
 completions through one continuous scheduler. Model-management commands remain
@@ -400,7 +403,7 @@ loading MLX or accessing audio.
 `gc` previews changes unless `--yes` is supplied; `--dry-run` always prevents
 deletion. Cache location and Hugging Face credentials follow the
 [hub library](../../packages/hub/README.md). The app and public libraries use MIT
-licensing and version 0.6.0 for the first workspace release. The root workspace,
+licensing and version 1.0.0 for the first workspace release. The root workspace,
 website and transcription example app remain private.
 
 ## One-shot inference
@@ -1451,7 +1454,10 @@ instruction; preparation and tests do not access identities or Apple services.
 The release entrypoints are ported from main: `scripts/release-binary.sh` builds,
 signs, notarizes and packages; `scripts/publish-release.sh` publishes GitHub assets,
 updates the tap, then publishes npm. `PUBLISH=1 ./scripts/release-binary.sh` runs
-that single flow. `BUILD_DIR` names the preparation directory, `OUT_DIR` holds
+that publication flow. After it completes, deploy the website and installer through
+the [manual Pages workflow](../website/README.md); its release tag must be GitHub's
+latest release and match the published application version.
+`BUILD_DIR` names the preparation directory, `OUT_DIR` holds
 the distributable archives, and `RELEASE_NOTES` names the reviewed release body.
 The publisher requires a clean checkout at `origin/main` matching the prepared
 source. Its npm step extends main's idempotent publication to all public workspace

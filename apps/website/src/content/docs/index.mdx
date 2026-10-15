@@ -167,7 +167,7 @@ Built to be trusted first, then embedded.
 
 ## Decisions, scored on your Mac
 
-A drop-in for OpenAI's Decisions API and for Jev's System One format, answered by the model that already serves your chat.
+Use Jev or OpenAI Decisions-compatible endpoints with any supported local language model, sharing the same loaded weights as generation.
 
 </div>
 <div class="lp-section-body">
@@ -353,6 +353,11 @@ Download any of them from Hugging Face with `mlx-bun get`. Compatibility claims 
 <dt>Generic dense graph</dt>
 <dd>The architectures mlx-lm's universal path knows: Llama, Mistral, SmolLM 3, Qwen 2, Gemma, Gemma 2, Phi 3, OLMo 2, GLM 4, Granite and StarCoder 2.</dd>
 </dl>
+
+### Our quant on Hugging Face
+
+We publish [Qwen3.8-27B-Trellis-3.2bpw](https://huggingface.co/mlx-bun/Qwen3.8-27B-Trellis-3.2bpw), a 27B Qwen model in mlx-bun's packed Trellis format. The full download is about **12.25 GB**; running it needs additional memory for inference. This is an optional larger model, separate from the first-run starter. See the model card for requirements, evaluations and usage.
+
 </div>
 </section>
 

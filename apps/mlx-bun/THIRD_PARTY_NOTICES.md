@@ -55,13 +55,43 @@ place 58 package versions in those two files. Below, for 57 of them, is the lice
 each installs in that build, grouped where the files are identical and labeled with the
 file's sha256. The 58th, `babel-plugin-parameter-decorator@1.0.16` (npm integrity
 `sha512-yUT2WPTUg1JaPmRGRSF557m1HJ9vdFQInRWOkiOyO5a9HhqlXffJu+fQ2xd5+qU/35ICMrrk9eWKsHCairKA9w==`),
-has no license text to reproduce: its only license statement is its `package.json`,
+ships no license file or copyright notice; its license declaration is its `package.json`,
 `"author": "Warner"` and `"license": "MIT"`. Its npm `gitHead`
 `c3f713c69687b353c703cb0da8502506ec9fedb1` is not in its repository,
 https://github.com/WarnerHooh/babel-plugin-parameter-decorator, whose commit
 `8596985ebd6aacc9860799efdcc59889ad75b08e` ("1.0.16") holds the package's six files byte
 for byte. No commit on any of the repository's branches adds a license, copying or notice
 file, and no revision of its README mentions a license.
+
+### Parameter decorator MIT declaration
+
+Author: `Warner`. License: `MIT`, as declared in the
+[upstream package manifest](https://github.com/WarnerHooh/babel-plugin-parameter-decorator/blob/8596985ebd6aacc9860799efdcc59889ad75b08e/package.json).
+The following permission and disclaimer reproduce the canonical [SPDX MIT text](https://spdx.org/licenses/MIT.html)
+for that declared license, not an upstream LICENSE file. The source is
+[`text/MIT.txt`](https://github.com/spdx/license-list-data/blob/279b7e997a87c09be00dd6bdda189519ade502cf/text/MIT.txt)
+(SHA256 `b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5`).
+Only SPDX's `Copyright (c) <year> <copyright holders>` placeholder and its following blank
+line are omitted: the package supplies no copyright notice, and no holder or year is inferred.
+
+```text
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the "Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
 
 ### `@babel/core@7.29.0`, `@babel/generator@7.29.1`, `@babel/helper-annotate-as-pure@7.27.3`, `@babel/helper-create-class-features-plugin@7.29.3`, `@babel/helper-globals@7.28.0`, `@babel/helper-member-expression-to-functions@7.28.5`, `@babel/helper-module-imports@7.28.6`, `@babel/helper-module-transforms@7.28.6`, `@babel/helper-optimise-call-expression@7.27.1`, `@babel/helper-plugin-utils@7.28.6`, `@babel/helper-replace-supers@7.28.6`, `@babel/helper-simple-access@7.27.1`, `@babel/helper-skip-transparent-expression-wrappers@7.27.1`, `@babel/helper-string-parser@7.27.1`, `@babel/helper-validator-identifier@7.28.5`, `@babel/helper-validator-option@7.27.1`, `@babel/plugin-proposal-decorators@7.29.0`, `@babel/plugin-syntax-class-properties@7.12.13`, `@babel/plugin-syntax-decorators@7.28.6`, `@babel/plugin-syntax-import-assertions@7.28.6`, `@babel/plugin-syntax-jsx@7.28.6`, `@babel/plugin-syntax-typescript@7.28.6`, `@babel/plugin-transform-destructuring@7.28.5`, `@babel/plugin-transform-explicit-resource-management@7.28.6`, `@babel/plugin-transform-export-namespace-from@7.27.1`, `@babel/plugin-transform-modules-commonjs@7.28.6`, `@babel/plugin-transform-react-jsx@7.28.6`, `@babel/plugin-transform-typescript@7.28.6`, `@babel/preset-typescript@7.28.5`, `@babel/template@7.28.6`, `@babel/traverse@7.29.0`, `@babel/types@7.29.0`
 

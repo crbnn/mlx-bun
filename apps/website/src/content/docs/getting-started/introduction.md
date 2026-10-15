@@ -32,18 +32,24 @@ hosted-model API key.
 
 Validated configurations are bit-exact with mlx-lm, and with mlx-optiq for
 mixed-precision KV; the [correctness page](/about/correctness/) states the
-contract, its evidence and what it does not cover. Existing OpenAI and
-Anthropic SDKs, agents and tools work by changing one URL, and
-`POST /v1/decisions` and `POST /v1/systemone` answer OpenAI Decisions and Jev
-System One requests from the model that serves chat. Downloaded models stay in
-the Hugging Face cache on your Mac, and the app's own data lives under
-`~/.mlx-bun`.
+contract, its evidence and what it does not cover. Connect existing OpenAI and
+Anthropic clients through a local base URL for the supported interfaces.
+Downloaded models stay in the Hugging Face cache on your Mac, and the app's
+own data lives under `~/.mlx-bun`.
 
-The repository uses Bun workspaces: applications live in `apps/`, libraries
-in `packages/`. See the [architecture](https://github.com/joshuarossi/mlx-bun/blob/main/ARCHITECTURE.md)
-for ownership and dependency direction.
+Use **Jev or OpenAI Decisions-compatible endpoints with any supported local
+language model**. `POST /v1/decisions` and `POST /v1/systemone` classify and score
+with the same loaded weights as generation; you don't need a separate decision
+model. See [local decisions](/getting-started/quickstart/#local-decisions) for
+the SDK base URLs, supported questions and limits.
 
 ## Where next
+
+The engine requires an Apple Silicon Mac running macOS 14 or later. Models must
+be supported by mlx-bun; a Hugging Face repository alone does not guarantee
+compatibility. Available memory, the model, and context length determine what
+fits. Model downloads require internet access; inference runs locally once the
+model is available. Image questions require a supported vision model.
 
 Start with [installation](/getting-started/installation/) and the
 [quickstart](/getting-started/quickstart/), or go straight to the

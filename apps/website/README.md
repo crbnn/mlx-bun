@@ -6,9 +6,19 @@ and short user explanations. App behavior and library interfaces remain in
 
 From the repository root, run `bun run --cwd apps/website build` or `dev`.
 The Bun workspace lockfile is the only dependency lock. `dist/` is the deployable
-GitHub Pages artifact; CI builds and checks it but does not deploy it.
-Deploy the site and its installer only after a compatible application release
-exists; the installer validates the complete new bundle, including its notices.
+GitHub Pages artifact; CI builds and checks it. After publishing the application
+to GitHub and Homebrew and all public npm packages, deploy the site manually:
+
+```sh
+gh workflow run pages.yml --repo joshuarossi/mlx-bun --ref main -f release_tag=v1.0.0
+```
+
+The [Pages workflow](../../.github/workflows/pages.yml) checks out the selected
+release tag and builds that revision. It requires a published release with both
+versioned and installer archives and their checksums, and a matching app manifest
+version. The tag must also be GitHub's latest release because the installer
+downloads from `releases/latest`. Pushes to `main` do not deploy the site.
+The installer validates the complete bundle, including its notices.
 Source links in the authored pages and CLI generator target `main`; the static
 build check covers only local links.
 

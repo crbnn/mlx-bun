@@ -173,8 +173,16 @@ test("bundle notices carry the package notices, Photon's installed license and P
   const jiti = noticeSection(notice, "## Jiti 2.7.0 prebundle");
   expect(new Set(jiti.split("\n").filter(line => line.startsWith("### `")).flatMap(line => line.match(/`[^`]+@[^`]+`/g)!)).size).toBe(57);
   expect(gitBlobSha1(new TextEncoder().encode(license))).toBe(blob!);
-  // The 58th has no license text; the section records its manifest's statement instead.
+  // The 58th declares MIT but ships no license text or copyright notice. Preserve its
+  // author attribution and reproduce the canonical terms without inventing a copyright.
   expect(jiti.replace(/\s+/g, " ")).toContain('its `package.json`, `"author": "Warner"` and `"license": "MIT"`');
+  const decorator = subsection(jiti, "### Parameter decorator MIT declaration"), terms = fenced(decorator);
+  expect(terms).toHaveLength(1);
+  expect(terms[0]).toStartWith("MIT License\n\nPermission is hereby granted,");
+  expect(terms[0]).not.toMatch(/^Copyright \(c\)/m);
+  const canonicalMit = terms[0]!.replace("MIT License\n\n", "MIT License\n\nCopyright (c) <year> <copyright holders>\n\n");
+  expect(createHash("sha256").update(canonicalMit).digest("hex"))
+    .toBe("b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5");
   // Code Jiti copies: the upstream license blobs named, byte for byte, except TypeScript's two
   // files, whose whole texts are those blobs once the disclosed whitespace is restored.
   for (const heading of ["### import-meta-env plugin code", "### import-meta-paths plugin code"]) {
@@ -352,6 +360,14 @@ test("the reviewed headers, Jiti hashes and XGrammar fallback match the installe
   const emscripten = subsection(whole, "### Emscripten runtime in the XGrammar WASM (3.1.56 release-era match)");
   const [em, ...libraries] = fenced(emscripten);
   expect([blobOf(upstream(em!, { 60: 1 })), ...libraries.map(blobOf)]).toEqual(namedBlobs(emscripten));
+  // Possible compiler runtime code is covered without claiming a recovered toolchain:
+  // all of the pinned compiler-rt license, including its legacy terms, is reproduced.
+  const compilerRt = subsection(whole, "### LLVM compiler-rt license (conservative inclusion)");
+  const compilerRtTexts = fenced(compilerRt);
+  expect(compilerRtTexts).toHaveLength(1);
+  expect(compilerRtTexts.map(blobOf)).toEqual(namedBlobs(compilerRt));
+  expect(createHash("sha256").update(compilerRtTexts[0]!).digest("hex"))
+    .toBe("1a8f1058753f1ba890de984e48f0242a3a5c29a6a8f2ed9fd813f36985387e8d");
 
   // What the notices say of the pinned bytes: Jiti's babel.cjs keeps the copied plugins and
   // the parameter decorator; XGrammar's runtime glue has both fingerprints of the 3.1.56
