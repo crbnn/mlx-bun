@@ -51,12 +51,11 @@ theorem gated (layer : Layer) (cache : Cache) (input : Nat → Fin 5120 → BF) 
     (recurrence : RecurrentFinite layer cache input time)
     (recurrentBound : ∀ h v, |Model.toReal (recurrentOutput layer cache input time h v)| ≤ (2 : ℝ)^(50 : Nat))
     (division : DivisionDirectedBounds.Contract layer.gated.divide) (root : RsqrtBounds.Envelope layer.gated.rsqrt)
-    (exponential : Kernels.StableSigmoidRanges.ExponentialRange layer.gated.expAbs)
-    (reciprocal : Float32UnitInterval.ReciprocalFinite) :
+    (exponential : Kernels.StableSigmoidRanges.ExponentialRange layer.gated.expAbs) :
     GatedFinite layer cache input time ∧ ∀ i, Model.isFinite (merged layer cache input time i) = true ∧
       |Model.toReal (merged layer cache input time i)| ≤ (2 : ℝ)^(30 : Nat) := by
   have h head := Kernels.GatedRmsNormRanges.ranges layer.gated normProfile tailProfile (le_refl _)
-    division root exponential reciprocal (recurrentOutput layer cache input time head) (zHead layer input time head) layer.normWeight
+    division root exponential (recurrentOutput layer cache input time head) (zHead layer input time head) layer.normWeight
     (fun i => ⟨recurrence.cast head i, recurrentBound head i⟩)
     (fun i => by norm_num only [normProfile, (bf 1 (by decide) (by decide)).2, zpow_ofNat]; exact weight i)
     (fun i => ⟨layer.z.forward_finite _ (projection.finite.z time) _, by

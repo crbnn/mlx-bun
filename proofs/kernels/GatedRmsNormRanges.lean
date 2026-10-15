@@ -40,11 +40,11 @@ structure TailProfile where
   storeCapacity : real productCap ≤ Model.toReal storeCap
 
 theorem tail_ranges (p : Platform) (profile : TailProfile)
-    (exponential : StableSigmoidRanges.ExponentialRange p.expAbs) (reciprocal : Float32UnitInterval.ReciprocalFinite)
+    (exponential : StableSigmoidRanges.ExponentialRange p.expAbs)
     (gate up : Float32) (hg : gate.isFinite = true ∧ |real gate| ≤ real profile.gateCap)
     (hu : up.isFinite = true ∧ |real up| ≤ Model.toReal profile.upCap) :
     TailFinite p gate up ∧ |Model.toReal (tail p gate up)| ≤ Model.toReal profile.storeCap := by
-  have hs := StableSigmoidRanges.ranges p.expAbs p.expAbsError p.exponential exponential reciprocal gate hg.1
+  have hs := StableSigmoidRanges.ranges p.expAbs p.expAbsError p.exponential exponential gate hg.1
   have ha := NativeMultiplication.range gate (StableSigmoid.value p.expAbs gate) profile.gateCap hg.1 hs.2.1 profile.gateFinite (by
     rw [abs_of_nonneg hs.2.2.1]
     exact (mul_le_of_le_one_right (abs_nonneg _) hs.2.2.2).trans hg.2)
@@ -57,7 +57,7 @@ theorem tail_ranges (p : Platform) (profile : TailProfile)
 theorem ranges (p : Platform) (norm : NormalizationUniform.Profile 128) (tailProfile : TailProfile)
     (capacity : Model.toReal norm.outputCap ≤ Model.toReal tailProfile.upCap)
     (division : DivisionDirectedBounds.Contract p.divide) (root : RsqrtBounds.Envelope p.rsqrt)
-    (exponential : StableSigmoidRanges.ExponentialRange p.expAbs) (reciprocal : Float32UnitInterval.ReciprocalFinite)
+    (exponential : StableSigmoidRanges.ExponentialRange p.expAbs)
     (x gate weight : Fin 128 → BF)
     (hx : ∀ i, Model.isFinite (x i) = true ∧ |Model.toReal (x i)| ≤ (2 : ℝ)^(50 : Nat))
     (hw : ∀ i, Model.isFinite (weight i) = true ∧ |Model.toReal (weight i)| ≤ Model.toReal norm.weightCap)
@@ -75,7 +75,7 @@ theorem ranges (p : Platform) (norm : NormalizationUniform.Profile 128) (tailPro
       |real (BFloat16.widen (normalized p x weight (Float32.ofInt 128) norm.eps i))| ≤ Model.toReal tailProfile.upCap := by
     exact ⟨BFloat16.widen_finite _ (hn.2 i).1,
       by rw [BFloat16.widen_real _ (hn.2 i).1]; exact (hn.2 i).2.trans capacity⟩
-  have ht := tail_ranges p tailProfile exponential reciprocal _ _ hgate hup
+  have ht := tail_ranges p tailProfile exponential _ _ hgate hup
   exact ⟨ht.1, ht.1.cast, ht.2⟩
 
 end Inference.Kernels.GatedRmsNormRanges

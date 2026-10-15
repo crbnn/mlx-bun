@@ -16,7 +16,7 @@ structure ExponentialRange (expAbs : Float32 → Float32) where
 
 theorem finite_branch (expAbs : Float32 → Float32) (error : Float32 → ℝ)
     (exponential : ExpContract expAbs error) (range : ExponentialRange expAbs)
-    (reciprocal : Float32UnitInterval.ReciprocalFinite) (x : Float32) (hx : x.isFinite = true)
+    (x : Float32) (hx : x.isFinite = true)
     (he : (expAbs x).isFinite = true ∧ |real (expAbs x)| ≤ real range.ceiling) :
     StableSigmoid.Finite expAbs x ∧ (value expAbs x).isFinite = true ∧
       (0 ≤ real (value expAbs x) ∧ real (value expAbs x) ≤ 1) := by
@@ -27,7 +27,7 @@ theorem finite_branch (expAbs : Float32 → Float32) (error : Float32 → ℝ)
   have hden : (denominator expAbs x).isFinite = true := FlushToZero.finite_flush _ hd.1
   have lower : 1 ≤ real (denominator expAbs x) :=
     FlushToZero.add_one_ge_one _ he.1 (exponential.nonnegative x hx he.1) hd'
-  have hq := Float32UnitInterval.reciprocal reciprocal (denominator expAbs x) hden lower
+  have hq := Float32UnitInterval.reciprocal (denominator expAbs x) hden lower
   have hs := Float32UnitInterval.complement (quotient expAbs x) hq.2.1 hq.2.2
   refine ⟨⟨hx, he.1, hd', hq.1, fun _ => hs.1⟩, ?_, ?_⟩
   · unfold value
@@ -41,10 +41,10 @@ theorem finite_branch (expAbs : Float32 → Float32) (error : Float32 → ℝ)
 
 theorem ranges (expAbs : Float32 → Float32) (error : Float32 → ℝ)
     (exponential : ExpContract expAbs error) (range : ExponentialRange expAbs)
-    (reciprocal : Float32UnitInterval.ReciprocalFinite) (x : Float32) (hx : x.isFinite = true) :
+    (x : Float32) (hx : x.isFinite = true) :
     Valid expAbs x ∧ (value expAbs x).isFinite = true ∧ (0 ≤ real (value expAbs x) ∧ real (value expAbs x) ≤ 1) := by
   rcases range.result x hx with he | he
-  · have h := finite_branch expAbs error exponential range reciprocal x hx he
+  · have h := finite_branch expAbs error exponential range x hx he
     exact ⟨Or.inl h.1, h.2⟩
   · refine ⟨Or.inr he, ?_, ?_⟩
     · rw [value_overflow expAbs x he]

@@ -27,7 +27,6 @@ structure Primitives (norm : Blocks.Norm) (layer : Layer) where
   gatedDivision : DivisionDirectedBounds.Contract layer.gated.divide
   gatedRoot : RsqrtBounds.Envelope layer.gated.rsqrt
   gatedExp : Kernels.StableSigmoidRanges.ExponentialRange layer.gated.expAbs
-  reciprocal : Float32UnitInterval.ReciprocalFinite
   output : DeltaOutputRanges.Divisions layer.out
 
 def normalizedInput (norm : Blocks.Norm) (x : Nat → Fin 5120 → BF) : Nat → Fin 5120 → BF :=
@@ -54,7 +53,7 @@ theorem ranges (norm : Blocks.Norm) (layer : Layer) (parameters : Parameters nor
   have hr := DeltaInitialRecurrenceRanges.from_projections layer parameters.heads parameters.gates primitive.headExp
     primitive.headDivision primitive.headRoot primitive.decay primitive.beta cache (normalizedInput norm x) hp.2 history parameters.convolution state
   have hg := DeltaOutputRanges.gated layer cache (normalizedInput norm x) 0 parameters.heads parameters.gated hp.2 hr.1
-    (fun h v => (hr.2.1 h v).trans (by norm_num)) primitive.gatedDivision primitive.gatedRoot primitive.gatedExp primitive.reciprocal
+    (fun h v => (hr.2.1 h v).trans (by norm_num)) primitive.gatedDivision primitive.gatedRoot primitive.gatedExp
   have ho := DeltaOutputRanges.project layer.out parameters.output primitive.output (merged layer cache (normalizedInput norm x) 0) hg.2
   exact ⟨hp.1, ⟨hp.2.finite, hc.1, hr.1, hg.1, ho.1⟩, fun i => (ho.2 i).2, hr.2.2,
     fun i c => DeltaInputRanges.history_after layer cache (normalizedInput norm x) hp.2 history 1 i c⟩

@@ -1,13 +1,8 @@
-import contracts.mlx.Float32Bounds
+import contracts.mlx.NativeDivisionBounds
 
 namespace Inference.Contracts.Mlx.Float32UnitInterval
 open Numerics
 open FloatLib FloatLib.Floats FloatLib.Floats.Formats.BinaryInterchange
-
--- This remaining obligation is for the scalar native division instruction.
--- The packed IEEE reference has a separate proved implementation; equality
--- of native Float32 division with that reference is not asserted here.
-def ReciprocalFinite : Prop := ∀ x : Float32, x.isFinite = true → 1 ≤ real x → ((1 : Float32)/x).isFinite = true
 
 theorem flush_interval (x : Float32) (hx : 0 ≤ real x ∧ real x ≤ 1) :
     0 ≤ real (FlushToZero.flush x) ∧ real (FlushToZero.flush x) ≤ 1 := by
@@ -23,10 +18,10 @@ theorem rounded_interval (x : ℝ) (hx : 0 ≤ x ∧ x ≤ 1) :
   rw [real_one] at he
   rwa [he] at h
 
-theorem reciprocal (finite : ReciprocalFinite) (x : Float32) (hx : x.isFinite = true) (lower : 1 ≤ real x) :
+theorem reciprocal (x : Float32) (hx : x.isFinite = true) (lower : 1 ≤ real x) :
     ((1 : Float32)/x).isFinite = true ∧ (FlushToZero.div 1 x).isFinite = true ∧
       (0 ≤ real (FlushToZero.div 1 x) ∧ real (FlushToZero.div 1 x) ≤ 1) := by
-  have hf := finite x hx lower
+  have hf := NativeDivisionBounds.reciprocal_finite x hx lower
   have hp : 0 < real x := by linarith
   have hi : 0 ≤ (1 : ℝ)/real x ∧ (1 : ℝ)/real x ≤ 1 := ⟨by positivity, (div_le_one hp).mpr lower⟩
   have hr : 0 ≤ real ((1 : Float32)/x) ∧ real ((1 : Float32)/x) ≤ 1 := by

@@ -59,6 +59,7 @@ const proofFiles = [
   "contracts/mlx/FlushToZero.lean",
   "contracts/mlx/Arithmetic.lean",
   "contracts/mlx/Float32Bounds.lean",
+  "contracts/mlx/NativeDivisionBounds.lean",
   "contracts/mlx/Float32UnitInterval.lean",
   "contracts/mlx/NativeMultiplication.lean",
   "contracts/mlx/NativeFma.lean",
@@ -228,6 +229,10 @@ const proofFiles = [
   "models/qwen/AttentionInitialHeadsRanges.lean",
   "models/qwen/AttentionInitialRanges.lean",
   "models/qwen/ResidualAttentionInitialRanges.lean",
+  "models/qwen/DecodeStageInitialRanges.lean",
+  "models/qwen/DecodeChainInitialRanges.lean",
+  "models/qwen/Qwen38TrellisM1MaxInitialRanges.lean",
+  "models/qwen/TokenInitialRanges.lean",
 ];
 
 const discoveredProofs = await Array.fromAsync(new Bun.Glob("**/*.lean").scan({
