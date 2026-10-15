@@ -83,10 +83,9 @@ test("a lone row decodes through the step its graph declares, and other graphs n
   expect(undeclared.forwards.length).toBeGreaterThan(1);
 });
 
-test("the request and the composition keep decoding on the decode operation", async () => {
+test("the request can keep decoding on the decode operation", async () => {
   for (const [name, options, extra] of [
     ["request opt-out", { compiledDecode: false }, {}],
-    ["composition off", {}, { composition: testComposition(undefined, { compiledDecode: false }) }],
   ] as const) {
     const fixture = graph({ compiledDecode: true }, extra);
     const declared = countingStep(fixture);
@@ -138,8 +137,7 @@ test("the autoregressive binding offers the declared step where the composition 
     for (const composition of [testComposition(TURBO), testComposition(DELAYED_AFFINE)])
       expect(bindMlxAutoregressiveGraph({ ...fixture.model, composition, compiledDecodeStep: () => declared.step })
         .createDecode!({ hasAdapters: false })).not.toBeNull();
-    expect(bindMlxAutoregressiveGraph({ ...fixture.model, composition: testComposition(TURBO, { compiledDecode: false }),
-      compiledDecodeStep: () => declared.step }).createDecode!({ hasAdapters: false })).toBeNull();
+
     const decoder = binding.createDecode!({ hasAdapters: false })!;
     try {
       using token = MlxArray.fromFloat32(new Float32Array([0]), [1]);

@@ -10,5 +10,6 @@ export * from "./profile";
 export * from "./implementation";
 export * from "./support";
 export * from "./graph";
+export * from "./cache-composition";
 export * from "./capabilities";
 export * from "./media-input";

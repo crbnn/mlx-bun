@@ -1,7 +1,7 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { AssistantDonors } from "./attention";
 import type { DraftProjection } from "./draft-projection";
-import type { MlxWidthTable } from "./width";
+import type { MlxRowTable } from "./row-table";
 
 /** Read-only target state and embedding, independent of draft scheduling. */
 export interface AssistantRowsTarget {
@@ -20,8 +20,8 @@ export interface RecurrentMtpTarget {
   readonly hiddenSize: number;
   readonly layerCount: number;
   embed(ids: MlxArray): MlxArray;
-  /** The output head per width class, indexed by the rows the drafter projects. */
-  readonly logits: MlxWidthTable<(hidden: MlxArray) => MlxArray>;
+  /** The output head per row count or range, indexed by the rows the drafter projects. */
+  readonly logits: MlxRowTable<(hidden: MlxArray) => MlxArray>;
   /** The untied quantized vocabulary projection, when the drafter may project
    *  onto a row subset of it (frequency-ranked draft vocabulary). Borrowed. */
   readonly vocabularyHead?: {
@@ -53,6 +53,8 @@ export interface ResidualBasis {
  *  projection a drafter quantized itself (its packed weight, scales and biases, borrowed for the kernel's life):
  *  the forward over [.., inputs] activations, caller-owned output. */
 export type DraftProjectionKernel = (w: MlxArray, scales: MlxArray, biases: MlxArray) => (x: MlxArray) => MlxArray;
+export interface DraftProjectionRange { readonly from: number; readonly to: number; readonly operation: DraftProjectionKernel }
+export type DraftProjectionKernels = MlxRowTable<DraftProjectionKernel> | readonly DraftProjectionRange[];
 
 /** Graph-declared ports over the target's live state, named for what they
  * provide. Sources request only the ports they consume and never inspect a
@@ -68,9 +70,9 @@ export interface TargetView {
    *  the stream is in the trained model's basis. The same object on every view. */
   readonly residualBasis?: ResidualBasis;
   /** Declared by a graph whose composition measured the kernels a drafter's own 4-bit projections run on its
-   *  device: one per width class of the rows they project. Absent, the drafter keeps its own rule. The same
+   *  device: one per row count or range of the rows they project. Absent, the drafter keeps its own rule. The same
    *  table on every view. */
-  readonly draftProjections?: MlxWidthTable<DraftProjectionKernel>;
+  readonly draftProjections?: DraftProjectionKernels;
 }
 
 export type TargetPort = "assistantRows" | "hiddenLayerTaps" | "recurrentMtp";

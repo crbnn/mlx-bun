@@ -1,3 +1,5 @@
+import type { Cache } from "../../src/contracts/mlx/cache";
+import { bindGraphCaches } from "../../src/models/cache-composition";
 // The composition record of a graph built directly in a test: bf16 KV unless a
 // scheme is named, and every other field at its default. It never asks the
 // Neural Engine bridge (no program loads); graphs read only the fields their
@@ -9,8 +11,8 @@ import { KvScheme } from "../../src/state/kv-scheme";
 
 export function testComposition(kv: KvStorageScheme = { kind: "bf16" }, fields: Partial<Composition> = {}): Composition {
   return Object.freeze({
-    device: deviceArchitecture(), aneBridge: false, kv, draftDepth: 0, prefillChunkTokens: PREFILL_CHUNK_TOKENS,
-    adapters: false, maxRows: 8, ...COMPOSITION_DEFAULTS, ...fields,
+    device: deviceArchitecture(), kv, draftDepth: 0, prefillChunkTokens: PREFILL_CHUNK_TOKENS,
+    maxRows: 8, ...COMPOSITION_DEFAULTS, ...fields,
   });
 }
 
@@ -39,3 +41,12 @@ export function kvOf(options: KvOptions, kernels?: AffineKernelChoice): KvStorag
       quantizedKvStart: options.quantizedKvStart }, kernels).storage;
   return { kind: "bf16" };
 }
+
+
+/** Load a test's explicit graph with its cache and scheduler facts. */
+export function testGraph<Graph extends { readonly cacheLayers: readonly import("../../src/contracts/mlx/graph").MlxCacheLayer[] }>(
+  graph: Graph, composition: Composition): Graph & { readonly composition: Composition; makeCache(): import("../../src/contracts/mlx/cache").Cache[] } {
+  return Object.assign(bindGraphCaches(graph, composition), { composition });
+}
+
+export type TestGraph<Graph> = Graph & { makeCache(): Cache[]; readonly composition: Composition };

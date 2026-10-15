@@ -24,7 +24,7 @@ describe("the install table", () => {
       [`projection 5120→3392, ${rows} rows`, [QWEN38_TRELLIS_M4PRO_GRAPH]],
       [`projection 6144→2816, ${rows} rows`, [QWEN38_TRELLIS_M4PRO_GRAPH]],
     ]));
-    // The artifact's widths, as its description gives them (the generator fixture).
+    // The artifact's independent projection widths.
     expect(ANE_WIDTHS).toEqual({ hidden: 5120, intermediate: 17408, projections: [[5120, 6144], [6144, 5120]] });
   });
 
@@ -39,17 +39,14 @@ describe("the install table", () => {
       projections: [[5120, 10240], [5120, 6144], [6144, 5120], [5120, 12288]] });
   });
 
-  test("the programs follow the composition: the bridge, mounted adapters and the device, not the chunk size", () => {
+  test("the install list follows the default device and includes its fixed programs regardless of chunk size", () => {
     expect(labels(record({ prefillChunkTokens: 128 }))).toEqual(labels(record()));
-    expect(labels(record({ aneBridge: false }))).toEqual([]);
-    expect(labels(record({ adapters: true }))).toEqual([]);
-    expect(labels(record({ device: M1_MAX, adapters: true }))).toEqual([]);
     expect(labels(record({ device: "applegpu_g15s" }))).toEqual([]);
   });
 
   test("entries constrained to another device are skipped; a program two entries load is one program naming both", () => {
     const shared = streamedMatmulProgram(64, 32, 32), own = mlpSliceProgram(64, 32, 32);
-    const entry = (id: string, device: string | undefined, programs: (c: Composition) => typeof shared[]): GraphEntry<null, string> =>
+    const entry = (id: string, device: string | undefined, programs: () => typeof shared[]): GraphEntry<null, string> =>
       ({ id, serves: device ? { device } : {}, create: () => id, anePrograms: programs });
     const tables = {
       a: new GraphTable([entry("a-m4", M4_PRO, () => [shared, own]), entry("a-generic", undefined, () => [])]),

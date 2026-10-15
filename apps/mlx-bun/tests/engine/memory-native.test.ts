@@ -60,14 +60,14 @@ describe.skipIf(!native)("memory task model on the continuous gateway", () => {
    *  chunk through the phase a scheduler names for it, then one token at a time through the decode phase. */
   const reference = (request: MemoryCompletionRequest, adapters: string[]) => engine!.gateway.runExclusive(async () => {
     const context = engine!.context;
+    const { MlxPhaseDispatch } = await import("@mlx-bun/inference/generation");
+    const { rowOperationFor } = await import("@mlx-bun/inference/models/graph");
     type Forward = (ids: MlxArray, cache: unknown[], capture: null) => MlxArray;
-    type Table<T> = Record<"one" | "twoToThree" | "four" | "fiveToEight" | "wider", T>;
-    const model = context.model as unknown as {
-      loraState: { active: string[] }; makeCache(): { dispose(): void }[];
-      prefillTail: Table<Forward>; decode: Table<Forward>; logits: Table<(hidden: MlxArray) => MlxArray>;
+    type Table<T> = Record<number, T>;
+    const model = context.model as unknown as import("@mlx-bun/inference/contracts/mlx").MlxTokenPhases & {
+      loraState: { active: string[] }; makeCache(): import("@mlx-bun/inference/contracts/mlx").Cache[];
       config: { eosTokenIds: number[] };
     };
-    const width = (rows: number) => rows === 1 ? "one" : rows <= 3 ? "twoToThree" : rows === 4 ? "four" : rows <= 8 ? "fiveToEight" : "wider";
     const ids = promptIds(request);
     model.loraState.active = adapters;
     const cache = model.makeCache();
@@ -76,7 +76,8 @@ describe.skipIf(!native)("memory task model on the continuous gateway", () => {
       for (let start = 0; start < prompt.length; start += 2048) {
         const chunk = prompt.slice(start, start + 2048);
         const input = ops.fromInt32(chunk, [1, chunk.length]);
-        (chunk.length === 1 ? model.decode.one : model.prefillTail[width(chunk.length)])(input, cache, null).dispose();
+        const hidden = (chunk.length === 1 ? rowOperationFor(model.decode,1) : new MlxPhaseDispatch(model).prompt("tail", 1, chunk.length) )(input, cache, null) as MlxArray;
+        hidden.dispose();
         input.dispose();
       }
       const eos = new Set(model.config.eosTokenIds);
@@ -84,9 +85,9 @@ describe.skipIf(!native)("memory task model on the continuous gateway", () => {
       let last = ids.at(-1)!;
       for (let i = 0; i < request.maxTokens; i++) {
         const input = ops.fromInt32([last], [1, 1]);
-        const hidden = model.decode.one(input, cache, null);
+        const hidden = rowOperationFor(model.decode,1)(input, cache, null) as MlxArray;
         input.dispose();
-        const logits = model.logits.one(hidden);
+        const logits = rowOperationFor(model.logits,1)(hidden);
         hidden.dispose();
         const best = ops.argmaxAxis(logits, -1);
         logits.dispose();

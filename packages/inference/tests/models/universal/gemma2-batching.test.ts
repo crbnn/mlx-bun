@@ -1,3 +1,4 @@
+import type { TestGraph } from "../test-composition";
 import { beforeAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -117,11 +118,14 @@ const { resolveKvScheme } = await import("../../../src/state/kv-scheme");
 const { captureKvAttention } = await import("../../../src/state/kv-attention-view");
 const { unfusedAffineKernels } = await import("../../../src/state/affine-attention");
 const { softcapAttention } = await import("../../../src/state/softcap-attention");
-const { testComposition } = await import("../test-composition");
+const { testComposition, testGraph } = await import("../test-composition");
+const { phaseRowLimit } = await import("../../../src/models/graph");
+const { MlxPhaseDispatch } = await import("../../../src/generation/phase-dispatch");
+const { sequenceLogitsOperation } = await import("../../../src/scoring/full-sequence");
 const { observedPhases, phaseHidden, phaseLogits } = await import("../phase-forward");
 const { syntheticDigests } = await import("../synthetic-digest");
 const digests = syntheticDigests("gemma2");
-const { widthClass } = await import("../../../src/contracts/mlx/graph");
+
 /** The storage class a cache holds: a composed lego's storage, else the cache itself. */
 const storageKind = (cache: Cache) => (cache.composed?.storage() ?? cache).constructor.name;
 function fixture() {
@@ -147,9 +151,9 @@ function fixture() {
   })) add(`${prefix}.${name}.weight`, shape);
   const weights = { shards: { files: new Map() }, tensorNames: [...arrays.keys()],
     has: (name: string) => arrays.has(name), tensor: (name: string) => arrays.get(name)! } as unknown as Weights;
-  const models: UniversalDenseModel[] = [];
-  return { make(causalReference = false) { const model = causalReference ? new OffsetCausalMaskModel(weights, config, testComposition())
-    : new UniversalDenseModel(weights, config, testComposition());
+  const models: TestGraph<UniversalDenseModel>[] = [];
+  return { make(causalReference = false) { const model = causalReference ? testGraph(new OffsetCausalMaskModel(weights, config), testComposition())
+    : testGraph(new UniversalDenseModel(weights, config, undefined, phaseRowLimit(testComposition())), testComposition());
     models.push(model); return model; },
     dispose() {
       // Own the synthetic model's transposed views and folded norm weights too.
@@ -343,12 +347,12 @@ function mixedFixture(types: string[], explicitMask: boolean, headDim = 4) {
   // Explicit masks with manual softcap attention, or ordinary masks with fused attention.
   const args = { ...genericArgsFor(config)!, layerTypes: [...types], slidingWindow: W, maskArray: explicitMask,
     ...(explicitMask ? {} : { attnLogitSoftcap: null }) };
-  const models: UniversalDenseModel[] = [];
+  const models: TestGraph<UniversalDenseModel>[] = [];
   return {
     /** A graph of this fixture composed with `composition` (bf16 KV unless it names a scheme). */
-    make<M extends UniversalDenseModel>(Model: new (w: Weights, c: ModelConfig, k: Composition, a: typeof args) => M = UniversalDenseModel as never,
-      composition: Composition = testComposition()): M {
-      const model = new Model(weights, config, composition, args); models.push(model); return model;
+    make<M extends UniversalDenseModel>(Model: new (w: Weights, c: ModelConfig, a: typeof args, maxPhaseRows: number) => M = UniversalDenseModel as never,
+      composition: Composition = testComposition()): M & { makeCache(): Cache[]; composition: Composition } {
+      const model = testGraph(new Model(weights, config, args, phaseRowLimit(composition)), composition); models.push(model); return model;
     },
     dispose() {
       const owned = new Set<MlxArray>(arrays.values()), seen = new Set<object>();
@@ -523,7 +527,7 @@ describe.skipIf(!native)("Universal forward ownership", () => {
   };
   /** Record the hidden states the layers see, optionally failing layer `failAt`, and the mask each read takes
    * from its cache: the caches hand out their causal masks as arrays, so every release can be counted. */
-  const instrument = (model: UniversalDenseModel, caches: Cache[], failAt = -1) => {
+  const instrument = (model: TestGraph<UniversalDenseModel>, caches: Cache[], failAt = -1) => {
     const hidden: MlxArray[] = [], masks: MlxArray[] = [];
     // The forward owns its input (the scaled embedding) and every layer output.
     type Layers = { forwardLayers(h: MlxArray, c: Cache[], p: ReadPhase): MlxArray };
@@ -639,7 +643,7 @@ test.skipIf(!native || !artifact)("cached Gemma2 preserves B1 and serves ragged 
   try {
     const config = await loadModelConfig(artifact!);
     expect(config.modelType).toBe("gemma2");
-    const model = createModel(weights, config) as UniversalDenseModel;
+    const model = createModel(weights, config) as TestGraph<UniversalDenseModel>;
     const binding = bindMlxGateway(model);
     // Main's Gemma2 L1 descriptor deliberately uses full attention, matching
     // the pinned mlx-lm implementation even if HF config lists a window.
@@ -729,7 +733,6 @@ test.skipIf(!native || !artifact)("cached Gemma2 preserves B1 and serves ragged 
   } finally { weights.dispose(); }
 }, 600_000);
 
-
 test.skipIf(!native || !artifact || !referencePath)("real Gemma2 ragged B2/B4 logits and KV match the external same-shaped Python reference", async () => {
   const { Weights, loadModelConfig, createModel } = await import("../../../src/index");
   const reference = await Bun.file(referencePath!).json();
@@ -743,7 +746,7 @@ test.skipIf(!native || !artifact || !referencePath)("real Gemma2 ragged B2/B4 lo
   };
   const weights = await Weights.open(artifact!);
   try {
-    const model = createModel(weights, await loadModelConfig(artifact!)) as UniversalDenseModel;
+    const model = createModel(weights, await loadModelConfig(artifact!)) as TestGraph<UniversalDenseModel>;
     expect(model.config.modelType).toBe("gemma2");
     for (const expected of reference.rows) {
       const batch: number = expected.batch;
@@ -779,7 +782,6 @@ test.skipIf(!native || !artifact || !referencePath)("real Gemma2 ragged B2/B4 lo
   } finally { weights.dispose(); }
 }, 600_000);
 
-
 test.skipIf(!native || !artifact)("cached Gemma2 plain fill matches main's serial fill at B1 and keeps every row through B2/B3/B4 joins and cancellation", async () => {
   const { Weights, loadModelConfig, createModel } = await import("../../../src/index");
   const { bindMlxGateway, createRuntimeConfig } = await import("../../../src/execution");
@@ -788,7 +790,7 @@ test.skipIf(!native || !artifact)("cached Gemma2 plain fill matches main's seria
   type Session = InstanceType<typeof FillSession>;
   const weights = await Weights.open(artifact!);
   try {
-    const model = createModel(weights, await loadModelConfig(artifact!)) as UniversalDenseModel;
+    const model = createModel(weights, await loadModelConfig(artifact!)) as TestGraph<UniversalDenseModel>;
     const tokenizer = await loadTokenizer(artifact!);
     const eos = model.config.eosTokenIds, maxTokens = 32;
     const prompts = ["Write three short sentences about the ocean at night.",
@@ -815,7 +817,7 @@ test.skipIf(!native || !artifact)("cached Gemma2 plain fill matches main's seria
     const serial = (prompt: number[], fill: Session | null) => {
       const caches = model.makeCache(), logits: string[] = [], tokens: number[] = [];
       const forward = (ids: number[]) => { using input = ops.fromInt32(ids, [1, ids.length]); return phaseHidden(model, input, caches); };
-      const project = (hidden: MlxArray) => { const out = model.logitsFromHidden(hidden); logits.push(...hashRows(out)); return out; };
+      const project = (hidden: MlxArray) => { const out = sequenceLogitsOperation(model, hidden); logits.push(...hashRows(out)); return out; };
       try {
         { using head = forward(prompt.slice(0, -1)); head.eval(); }
         let pending: number | null, generated = 0, finish = "length";
@@ -886,7 +888,7 @@ test.skipIf(!native || !artifact)("cached Gemma2 plain fill matches main's seria
     const runtime = createRuntimeConfig({});
     const shape = { hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
       hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
-    const logitsFromHidden = model.logitsFromHidden;
+    const logitsFromHidden = model.logitsFromHidden!;
     // Each row joins after the previous row's first token. The B4 case cancels
     // its third row, which is live when the fourth joins, so four rows share
     // the batch; the observed high water must equal the capacity.
@@ -894,7 +896,7 @@ test.skipIf(!native || !artifact)("cached Gemma2 plain fill matches main's seria
       [3, [2, 0, 1], 0], [4, [2, 0, 1, 3], 1]] as const) {
       const logits: string[] = [];
       // The fill group binds the projection when it opens, after this hook.
-      model.logitsFromHidden = function (this: UniversalDenseModel, hidden: MlxArray) {
+      model.logitsFromHidden = function (this: TestGraph<UniversalDenseModel>, hidden: MlxArray) {
         const out = logitsFromHidden.call(this, hidden);
         if (capacity === 1) logits.push(...hashRows(out));
         return out;
@@ -945,7 +947,6 @@ test.skipIf(!native || !artifact)("cached Gemma2 plain fill matches main's seria
   } finally { weights.dispose(); }
 }, 600_000);
 
-
 test.skipIf(!native || !artifact)("cached Gemma2 two-model speculation keeps B1 deterministic and serves ragged joins, cancellation and a clean follow-on", async () => {
   const { Weights, loadModelConfig, createModel } = await import("../../../src/index");
   const { bindMlxGateway, createRuntimeConfig } = await import("../../../src/execution");
@@ -958,7 +959,7 @@ test.skipIf(!native || !artifact)("cached Gemma2 two-model speculation keeps B1 
   let draft: Awaited<ReturnType<typeof TwoModelProvider.load>> | undefined;
   try {
     draft = await TwoModelProvider.load(artifact!);
-    const model = createModel(weights, await loadModelConfig(artifact!)) as UniversalDenseModel;
+    const model = createModel(weights, await loadModelConfig(artifact!)) as TestGraph<UniversalDenseModel>;
     expect(draft!.model).not.toBe(model);
     const tokenizer = await loadTokenizer(artifact!);
     const eos = model.config.eosTokenIds;
@@ -1069,7 +1070,6 @@ test.skipIf(!native || !artifact)("cached Gemma2 two-model speculation keeps B1 
   } finally { draft?.dispose(); weights.dispose(); }
 }, 900_000);
 
-
 test.skipIf(!native || !artifact)("cached Gemma2 n-gram speculation mixes empty and nonempty proposals, isolates a padded peer, and serves ragged joins, cancellation, grammar and seeded rows", async () => {
   const { Weights, loadModelConfig, createModel } = await import("../../../src/index");
   const { bindMlxGateway, createRuntimeConfig, createRowSampling } = await import("../../../src/execution");
@@ -1078,7 +1078,7 @@ test.skipIf(!native || !artifact)("cached Gemma2 n-gram speculation mixes empty 
   const { compileGrammarRequest, makeStepSampler } = await import("../../../src/sampling");
   const weights = await Weights.open(artifact!);
   try {
-    const model = createModel(weights, await loadModelConfig(artifact!)) as UniversalDenseModel;
+    const model = createModel(weights, await loadModelConfig(artifact!)) as TestGraph<UniversalDenseModel>;
     const tokenizer = await loadTokenizer(artifact!);
     const eos = model.config.eosTokenIds;
     const turn = (user: number[]) => [2, ...tokenizer.encode("<start_of_turn>user\n", false), ...user,
@@ -1304,7 +1304,6 @@ test.skipIf(!native || !artifact)("cached Gemma2 n-gram speculation mixes empty 
   } finally { weights.dispose(); }
 }, 900_000);
 
-
 test.skipIf(!native || !artifact)("a structurally equivalent delegating provider reproduces direct n-gram speculation through joins, cancellation and drain", async () => {
   const { Weights, loadModelConfig, createModel } = await import("../../../src/index");
   const { bindMlxGateway, createRuntimeConfig } = await import("../../../src/execution");
@@ -1312,7 +1311,7 @@ test.skipIf(!native || !artifact)("a structurally equivalent delegating provider
   const { loadTokenizer } = await import("../../../src/input");
   const weights = await Weights.open(artifact!);
   try {
-    const model = createModel(weights, await loadModelConfig(artifact!)) as UniversalDenseModel;
+    const model = createModel(weights, await loadModelConfig(artifact!)) as TestGraph<UniversalDenseModel>;
     const tokenizer = await loadTokenizer(artifact!);
     const eos = model.config.eosTokenIds;
     const prompt = (text: string) => [2, ...tokenizer.encode(`<start_of_turn>user\n${text}<end_of_turn>\n<start_of_turn>model\n`, false)];
@@ -1486,15 +1485,15 @@ describe.skipIf(!native)("dense-read graphs with delayed affine KV", () => {
     /** The graph the scheduler binds: a view whose phases call the hooks (`forwardHooks`). */
     view: object;
     model: SpanGraph & import("../../../src/models/factory").RuntimeModel };
-  type SpanGraph = Pick<import("../../../src/contracts/mlx/graph").MlxTokenPhases, "prefillTail" | "decode" | "logits"> &
-    { logitsFromHidden(hidden: MlxArray): MlxArray };
+  type SpanGraph = Pick<import("../../../src/contracts/mlx/graph").MlxTokenPhases, "prompt" | "multiSequencePrompt" | "decode" | "logits"> &
+    { logitsFromHidden?(hidden: MlxArray): MlxArray };
   /** A view of `model` for the scheduler whose phases call the hooks a test adds before each forward. */
   const hooked = <M extends object>(model: M) => {
     const forwardHooks: ((ids: MlxArray, caches: Cache[]) => void)[] = [];
     return { view: observedPhases(model, { forward(ids, caches) { for (const hook of forwardHooks) hook(ids, caches); } }), forwardHooks };
   };
   const projections = (env: SpanEnv) => {
-    const seen: { shape: number[]; dtype: string; sha256: string }[] = [], project = env.model.logitsFromHidden.bind(env.model);
+    const seen: { shape: number[]; dtype: string; sha256: string }[] = [], project = env.model.logitsFromHidden!.bind(env.model);
     env.model.logitsFromHidden = (hidden: MlxArray) => {
       const logits = project(hidden);
       seen.push({ shape: [...logits.shape], dtype: logits.dtypeName,
@@ -1549,7 +1548,7 @@ describe.skipIf(!native)("dense-read graphs with delayed affine KV", () => {
     const project = (hidden: MlxArray) => {
       const [, length, width] = hidden.shape as [number, number, number];
       using last = hidden.slice([0, length - 1, 0], [1, length, width]);
-      const logits = model.logitsFromHidden(last); seen.push(record(logits)); return logits;
+      const logits = sequenceLogitsOperation(model, last); seen.push(record(logits)); return logits;
     };
     // Sampled tokens stay on device until the step commits them to history.
     const draw = (logits: MlxArray, step: number) => sampler.sample(logits, step).token;
@@ -1636,7 +1635,7 @@ describe.skipIf(!native)("dense-read graphs with delayed affine KV", () => {
    * artifacts ship; affine KV needs a head dimension of the group size.
    * Deterministic: two instances are identical. The graph is composed with
    * `composition` (bf16 KV unless it names a scheme). */
-  const quantizedGraph = <M extends object>(Model: new (weights: Weights, config: ModelConfig, composition: Composition) => M,
+  const quantizedGraph = <M extends { readonly cacheLayers: readonly import("../../../src/contracts/mlx/graph").MlxCacheLayer[] }>(Model: new (weights: Weights, config: ModelConfig, maxPhaseRows: number) => M,
     modelType: string, { layers = 2, qkNorm = false, composition = testComposition() } = {}) => {
     const hidden = 64, heads = 2, kvHeads = 1, intermediate = 128, vocab = 96;
     const spec = { bits: 4, groupSize: 64, mode: "affine" };
@@ -1674,7 +1673,7 @@ describe.skipIf(!native)("dense-read graphs with delayed affine KV", () => {
     }
     const weights = { shards: { files: new Map() }, tensorNames: [...arrays.keys()],
       has: (name: string) => arrays.has(name), tensor: (name: string) => arrays.get(name)! } as unknown as Weights;
-    const model = new Model(weights, config, composition);
+    const model = testGraph(new Model(weights, config, phaseRowLimit(composition)), composition);
     return { model, dispose() {
       // The weights and any array the graph derived from them at construction.
       const owned = new Set<MlxArray>(arrays.values()), seen = new Set<object>();
@@ -1701,7 +1700,7 @@ describe.skipIf(!native)("dense-read graphs with delayed affine KV", () => {
         { checkpoints: false });
       expect(plan).toMatchObject({ method: "autoregressive", mechanism: "continuous", fill: false, compiledDecode: false });
       // Requested (the composition turns it on) and refused by the capability, not disabled.
-      expect(env.model.composition.compiledDecode).toBe(true);
+
       expect(plan.reasons).toContain("compiled-decode-unavailable-for-request");
     } finally { try { await env.close(); } finally { await turboEnv.close(); } }
   });
@@ -1765,15 +1764,25 @@ describe.skipIf(!native)("dense-read graphs with delayed affine KV", () => {
     const composed = model.makeCache();
     const oracle = types.map((type, layer) => new OracleKv(type === S ? W : null, bits[layer]!, start)) as unknown as Cache[];
     // Offsets 0 → 6 (a chunk) → 7 (the tail) → 10 (decodes) → 13 (a verification window) → 16 (known tokens) → 18 (decodes).
-    const steps: [string, number[]][] = [["prefillChunk", [2, 4, 7, 9, 3, 11]], ["prefillTail", [13]], ["decode", [17]],
+    type Phase = "prefillChunk" | "prefillTail" | "decode" | "verify" | "appendKnown";
+    const steps: [Phase, number[]][] = [["prefillChunk", [2, 4, 7, 9, 3, 11]], ["prefillTail", [13]], ["decode", [17]],
       ["decode", [19]], ["decode", [23]], ["verify", [29, 31, 37]], ["appendKnown", [41, 43, 47]], ["decode", [53]], ["decode", [59]]];
-    type Forward = (ids: MlxArray, caches: Cache[], capture: null) => MlxArray;
-    const forward = (phase: string, width: ReturnType<typeof widthClass>): Forward => phase === "prefillChunk" ? model.prefillChunk.gpu as Forward
-      : (model as unknown as Record<string, Record<string, Forward>>)[phase]![width]!;
-    const run = (caches: Cache[], phase: string, ids: number[]) => {
+    const dispatch = new MlxPhaseDispatch(model);
+    const forward = (phase: Phase, tokens: number): import("../../../src/contracts/mlx/graph").MlxCapturingForward => {
+      switch (phase) {
+        case "prefillChunk": return dispatch.prompt("chunk", 1, tokens);
+        case "prefillTail": return dispatch.prompt("tail", 1, tokens);
+        case "decode": return dispatch.decode(1);
+        case "verify": return dispatch.verify(1, tokens);
+        case "appendKnown": return dispatch.known(tokens);
+      }
+    };
+    const run = (caches: Cache[], phase: Phase, ids: number[]) => {
       using input = ops.fromInt32(ids, [1, ids.length]);
-      using hidden = forward(phase, widthClass(ids.length))(input, caches, null);
-      return model.logitsFromHidden(hidden);
+      const result = forward(phase, ids.length)(input, caches, null);
+      if (result instanceof Promise) throw new Error("the requantizing oracle requires synchronous operations");
+      using hidden = result;
+      return sequenceLogitsOperation(model, hidden);
     };
     try {
       for (const [index, [phase, ids]] of steps.entries()) {
@@ -1890,7 +1899,7 @@ describe.skipIf(!native)("dense-read graphs with delayed affine KV", () => {
     const serial = (fill: Session | null) => {
       const caches = model.makeCache(), logits: string[] = [], tokens: number[] = [];
       const forward = (ids: number[]) => { using input = ops.fromInt32(ids, [1, ids.length]); return phaseHidden(model, input, caches); };
-      const project = (hidden: MlxArray) => { const out = model.logitsFromHidden(hidden); logits.push(hash(out)); return out; };
+      const project = (hidden: MlxArray) => { const out = sequenceLogitsOperation(model, hidden); logits.push(hash(out)); return out; };
       try {
         { using head = forward(A.slice(0, -1)); head.eval(); }
         let pending: number | null, generated = 0;
@@ -1926,8 +1935,8 @@ describe.skipIf(!native)("dense-read graphs with delayed affine KV", () => {
       expect(fill.stats.strict).toBeGreaterThan(0);
       expect(expected.kinds).toEqual(types.map(type => type === F ? "QuantizedKVCache" : "RotatingQuantizedKVCache"));
       const binding = bindMlxGateway(model), logits: string[] = [];
-      const logitsFromHidden = model.logitsFromHidden;
-      model.logitsFromHidden = function (this: UniversalDenseModel, hidden: MlxArray) {
+      const logitsFromHidden = model.logitsFromHidden!;
+      model.logitsFromHidden = function (this: TestGraph<UniversalDenseModel>, hidden: MlxArray) {
         const out = logitsFromHidden.call(this, hidden); logits.push(hash(out)); return out;
       };
       const group = binding.createBatchGroup({ maxBatch: 1, prefillChunkSize: 64, runtime: createRuntimeConfig({}) });
@@ -2351,7 +2360,7 @@ describe.skipIf(!native)("dense-read graphs with delayed affine KV", () => {
             await grammar.ready();
             using ids = ops.fromInt32([suffix], [1, 1]);
             using hidden = phaseHidden(env.model, ids, composed);
-            using logits = env.model.logitsFromHidden(hidden);
+            using logits = sequenceLogitsOperation(env.model, hidden);
             expectedProjection = record(logits);
             using sampled = sampler.sample(logits, 0).token;
             expectedToken = sampled.toIntTokens()[0]!;

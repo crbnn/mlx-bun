@@ -1,3 +1,5 @@
+import { rowOperationFor } from "../../src/runtime/row-operations";
+import type { TestGraph } from "../models/test-composition";
 // Real-weight gate migrated from main's compiled-decode suite. Native imports
 // stay inside beforeAll: an ordinary CI run skips without weights or MLX.
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
@@ -20,10 +22,10 @@ for (const [family, checkpoint] of [
     let CompiledDecode: typeof import("@mlx-bun/inference/models/gemma4/compiled-decode").CompiledDecode;
     let generate: typeof import("@mlx-bun/inference/generation").generate;
     let weights: import("@mlx-bun/inference/artifacts").Weights | undefined;
-    let model: import("@mlx-bun/inference/models/gemma4").Gemma4Model;
+    let model: TestGraph<import("@mlx-bun/inference/models/gemma4").Gemma4Model>;
     /** The graph composed with a KV scheme: one per scheme, built on first use.
      * Affine reads take the tiled-causal set (OptiQ's wrapper rule). */
-    let modelFor: (kv: KvOptions) => import("@mlx-bun/inference/models/gemma4").Gemma4Model;
+    let modelFor: (kv: KvOptions) => TestGraph<import("@mlx-bun/inference/models/gemma4").Gemma4Model>;
     let initialRetraces: number;
     let growingPrompt: number[];
     let wrappedPrompt: number[];
@@ -46,12 +48,13 @@ for (const [family, checkpoint] of [
       // These are different compiled paths: dense segmented vs e4b whole graph.
       expect(config.text.numKvSharedLayers > 0).toBe(family === "e4b");
       weights = await Weights.open(checkpoint!);
-      const { kvOf, testComposition } = await import("../models/test-composition");
-      const models = new Map<string, InstanceType<typeof Gemma4Model>>();
+      const { kvOf, testComposition, testGraph } = await import("../models/test-composition");
+      const { phaseRowLimit } = await import("../../src/models/graph");
+      const models = new Map<string, TestGraph<InstanceType<typeof Gemma4Model>>>();
       modelFor = kv => {
         const key = JSON.stringify(kv);
         let built = models.get(key);
-        if (!built) { built = new Gemma4Model(weights!, config, testComposition(kvOf(kv, "tiled-causal"))); models.set(key, built); }
+        if (!built) { built = testGraph(new Gemma4Model(weights!, config, phaseRowLimit(testComposition(kvOf(kv, "tiled-causal")))), testComposition(kvOf(kv, "tiled-causal"))); models.set(key, built); }
         return built;
       };
       model = modelFor({});
@@ -176,7 +179,7 @@ for (const [family, checkpoint] of [
             } else {
               const ids = mlx.ops.reshape(cur, [1, 1]);
               let hidden: MlxArray;
-              try { hidden = graph.decode.one(ids, cache, null); }
+              try { hidden = rowOperationFor(graph.decode, 1)(ids, cache, null) as MlxArray; }
               finally { ids.dispose(); }
               try { logits = graph.logitsFromHidden(hidden); }
               finally { hidden.dispose(); }
@@ -236,16 +239,17 @@ for (const [family, checkpoint] of [
         hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
       const lines: string[] = [];
       for (const [name, request] of legoCells(prompt.length)) {
-        const graphs = [true, false].map(compiledDecode =>
-          createModel(weights!, model.config, resolveComposition(model.config, { ...request, compiledDecode })) as typeof model);
+        const graphs = [true, false].map(() =>
+          createModel(weights!, model.config, resolveComposition(model.config, request)) as typeof model);
         try {
           // generate(): the library loop.
           const library: number[][] = [];
           let compiledSteps = 0;
           for (const graph of graphs) {
             const before = CompiledDecode.stepsExecuted, out: number[] = [];
-            for await (const token of generate(graph, prompt, { maxTokens, temperature: 0 })) out.push(token.token);
+            for await (const token of generate(graph, prompt, { maxTokens, temperature: 0, decodePolicy: { compiledDecode: graph === graphs[0], grammarJump: false } })) out.push(token.token);
             if (graph === graphs[0]) compiledSteps = CompiledDecode.stepsExecuted - before;
+            else expect(CompiledDecode.stepsExecuted - before, `${name}: generate's uncompiled control`).toBe(0);
             library.push(out);
           }
           expect(library[0]!.length, name).toBeGreaterThan(4);
@@ -258,16 +262,20 @@ for (const [family, checkpoint] of [
             const binding = bindMlxGateway(graph);
             const options = { temperature: 0, maxTokens, eosTokenIds: [] as number[] };
             const plan = binding.plan(shape, options, { checkpoints: false });
-            expect(plan.compiledDecode, name).toBe(graph === graphs[0]);
+            // Both graphs declare the same compiled operation. The host applies
+            // the control policy after planning, just as generate receives its
+            // resolved decodePolicy; it does not change the graph's capability.
+            expect(plan.compiledDecode, name).toBe(true);
             const group = binding.createBatchGroup({ maxBatch: 1 });
             const before = CompiledDecode.stepsExecuted, out: number[] = [];
             try {
               await group.submit({
-                compiledDecode: plan.compiledDecode, promptIds: prompt, maxTokens, eosTokenIds: [],
+                compiledDecode: graph === graphs[0] && plan.compiledDecode, promptIds: prompt, maxTokens, eosTokenIds: [],
                 sample: (logits: MlxArray) => mlx.ops.argmaxAxis(logits, -1),
                 onToken(token: number) { out.push(token); } });
             } finally { await group.close(); }
             if (graph === graphs[0]) groupSteps = CompiledDecode.stepsExecuted - before;
+            else expect(CompiledDecode.stepsExecuted - before, `${name}: batch group's uncompiled control`).toBe(0);
             served.push(out);
           }
           expect(served[0], `${name}: batch group`).toEqual(served[1]);

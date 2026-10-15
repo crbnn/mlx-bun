@@ -3,8 +3,7 @@ import type { MlxCompiledDecodeStep, MlxDeclaredGraph, MlxTokenPhases } from "..
 import type { Composition } from "../contracts/portable/composition";
 import type { CacheCodecProvider } from "../state/persistence-types";
 
-type Declaration = Partial<Omit<GraphCapabilities, "adapters" | "prefill" | "speculation">> & {
-  readonly adapters?: Partial<GraphCapabilities["adapters"]>;
+type Declaration = Partial<Omit<GraphCapabilities, "prefill" | "speculation">> & {
   readonly prefill?: Partial<GraphCapabilities["prefill"]>;
   readonly speculation?: Partial<GraphCapabilities["speculation"]>;
 };
@@ -18,7 +17,6 @@ export function declareGraph(declared: Declaration = {}): GraphCapabilities {
     method: "autoregressive", media: null, compiledDecode: false,
     sparseAttention: false, embeddings: false, hiddenLayerTaps: false, nativeDraft: null,
     ...declared,
-    adapters: Object.freeze({ batched: true, mountable: true, ...declared.adapters }),
     prefill: Object.freeze({ boundedWorkspace: false, ...declared.prefill }),
     speculation: Object.freeze({ adapters: true, logprobs: true, externalTokens: true, grammarProposals: true,
       ...declared.speculation }),
@@ -56,7 +54,7 @@ export function tokenPhasesOf(model: object): MlxTokenPhases & { readonly compos
   const graph = declaredGraph(model);
   if (graph.graphCapabilities.method !== "autoregressive") return null;
   const phases = model as Partial<MlxTokenPhases>;
-  for (const name of ["prefillChunk", "prefillTail", "decode", "verify", "appendKnown", "logits"] as const)
+  for (const name of ["prompt", "multiSequencePrompt", "decode", "verify", "appendKnown", "logits"] as const)
     if (!phases[name]) throw new TypeError(`the graph declares the autoregressive method but provides no ${name} phase`);
   return model as MlxTokenPhases & { readonly composition?: Composition };
 }

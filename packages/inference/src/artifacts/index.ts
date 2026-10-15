@@ -11,3 +11,5 @@ export * from "./weight-audit";
 export * from "./safetensors-writer";
 export * from "./auxiliary-files";
 export * from "./turboquant-fold";
+
+export * from "./draft-vocabulary";

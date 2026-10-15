@@ -31,7 +31,7 @@ function harness(options: { adapterDir?: string; run?: RunImpl; locate?: () => P
   load?: () => Promise<LoadedModelContext> } = {}) {
   const events: string[] = [];
   const calls: Call[] = [];
-  let loadedWith: Pick<LoadContextOptions, "adapters" | "maxRows" | "kv"> | undefined, capacity = 0;
+  let loadedWith: Pick<LoadContextOptions, "maxRows" | "kv"> | undefined, capacity = 0;
   const context = () => ({
     tokenizer, template, kvConfig: null, memoryPlan: null,
     adapters: { async mount(id: string, dir: string) { events.push(`mount ${id} ${dir}`); } },

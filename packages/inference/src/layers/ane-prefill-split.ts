@@ -3,7 +3,8 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { AneProgram, AneStreamedMatmul, mlpSliceProgram, streamedMatmulProgram, type AneProgramSpec } from "../kernels/ane/linear";
 import { trellisFillHalf, trellisFillHalfK3Interleaved, writeHalf } from "../kernels/ane/fill";
 import type { TrellisGeometry } from "../kernels/trellis/geometry";
-import { QuantizedLinear } from "./quantized-linear";
+import { expandTrellis } from "../kernels/trellis/index";
+import { QuantizedLinear, QuantizedLinearPlain } from "./quantized-linear";
 import { TrellisLinear, trellisRows, trellisStoredRows } from "./trellis-linear";
 
 // Prompt-piece channel splits between the Apple Neural Engine and the GPU. The
@@ -52,9 +53,48 @@ type Fill = (codes: MlxArray, scales: MlxArray, g: TrellisGeometry, rows: number
 type Swiglu = (g: MlxArray, u: MlxArray) => MlxArray;
 type Rest = { gate: TrellisLinear; up: TrellisLinear; down: TrellisLinear };
 
+/** Dense axis-1 expansion queued with the ANE's GPU share, without an
+ * intermediate evaluation that would serialize gate, up and down. */
+export class AneTrellisExpandReduce {
+  constructor(readonly linear: TrellisLinear) {}
+  forward(x: MlxArray): MlxArray {
+    const lead = x.shape.slice(0, -1), M = lead.reduce((a, b) => a * b, 1);
+    using input = ops.reshape(x, [M, this.linear.inFeatures]);
+    using stored = expandTrellis(this.linear.codes, this.linear.scales, this.linear.geometry, x.dtype, this.linear.variant);
+    using transposed = ops.transposeAxes(stored, [1, 0]);
+    using product = ops.matmul(input, transposed);
+    return this.linear.delta.forward(x, ops.reshape(product, [...lead, this.linear.outFeatures]));
+  }
+}
+/** Dense axis-0 expansion with the same submission boundary. */
+export class AneTrellisExpandScatter {
+  constructor(readonly linear: TrellisLinear) {}
+  forward(x: MlxArray): MlxArray {
+    const lead = x.shape.slice(0, -1), M = lead.reduce((a, b) => a * b, 1);
+    using input = ops.reshape(x, [M, this.linear.inFeatures]);
+    using stored = expandTrellis(this.linear.codes, this.linear.scales, this.linear.geometry, x.dtype, this.linear.variant);
+    using product = ops.matmul(input, stored);
+    return this.linear.delta.forward(x, ops.reshape(product, [...lead, this.linear.outFeatures]));
+  }
+}
+type GpuRest = { gate: { forward(x: MlxArray): MlxArray }; up: { forward(x: MlxArray): MlxArray }; down: { forward(x: MlxArray): MlxArray } };
+/** The GPU projections attached to the split's stored row slices. */
+export type AneGpuMlpRows = (rest: Rest) => GpuRest;
+const expandedGpuRows: AneGpuMlpRows = rest => ({ gate: new AneTrellisExpandReduce(rest.gate),
+  up: new AneTrellisExpandReduce(rest.up), down: new AneTrellisExpandScatter(rest.down) });
+
+// The public builder also supports standalone small inputs. Its compatibility
+// projections preserve their original row-dependent kernels; written graph
+// bindings use the fixed expanded builders below.
+const legacyGpuRows: AneGpuMlpRows = rest => ({
+  gate: { forward: x => rest.gate.forward(x, true, false) },
+  up: { forward: x => rest.up.forward(x, true, false) },
+  down: { forward: x => rest.down.forward(x, true, false) },
+});
+
 /** Whole Trellis MLP: the ANE computes the first n intermediate channels end
  *  to end (gate and up rows, SwiGLU, and the down projection's partial sum over
- *  those channels); the GPU computes channels [n, R) through TrellisLinear; the
+ *  those channels); the GPU computes channels [n, R) through its attached projections; the
  *  two [M, D] partials add. Measured on M4 Pro: one fused slice program at
  *  10.2 TFLOPS (D 5120, n 9600, S 2048). `hidden` holds M <= `rows` rows.
  *  The ANE starts as soon as the GPU has filled its buffers; the GPU's share is
@@ -63,7 +103,7 @@ type Rest = { gate: TrellisLinear; up: TrellisLinear; down: TrellisLinear };
  *  ANE output, which the program evaluates before its buffers' next run
  *  (`AneProgram.deferOutput`), unless the caller has by then. */
 function mlpSplit(program: AneProgram, rows: number, n: number, gate: TrellisLinear, up: TrellisLinear, down: TrellisLinear,
-  rest: Rest, fillDown: Fill, hidden: MlxArray, swiglu: Swiglu): MlxArray {
+  rest: GpuRest, fillDown: Fill, hidden: MlxArray, swiglu: Swiglu): MlxArray {
   const D = gate.geometry.inFeatures;
   const lead = hidden.shape.slice(0, -1), M = lead.reduce((a, b) => a * b, 1);
   if (M > rows) throw new Error(`ANE MLP split: ${M} rows exceed its program's ${rows}`);
@@ -80,10 +120,10 @@ function mlpSplit(program: AneProgram, rows: number, n: number, gate: TrellisLin
   program.evalAsync();
   let gpuOut: MlxArray;
   try {
-    using g = rest.gate.forward(hidden, true, false);
-    using u = rest.up.forward(hidden, true, false);
+    using g = rest.gate.forward(hidden);
+    using u = rest.up.forward(hidden);
     using mid = swiglu(g, u);
-    gpuOut = rest.down.forward(mid, true, false);
+    gpuOut = rest.down.forward(mid);
     ops.asyncEvalAll([gpuOut]);
   } finally { program.wait(); }
   try {
@@ -112,7 +152,7 @@ export type AneMlpSplit = AneTrellisMlpSplit | AneTrellisMlpSplitK3i;
 /** Whole-MLP split for a down projection with row-major codes. */
 export class AneTrellisMlpSplit implements Disposable {
   private constructor(readonly program: AneProgram, readonly rows: number, readonly channels: number, readonly gate: TrellisLinear,
-    readonly up: TrellisLinear, readonly down: TrellisLinear, readonly rest: Rest) {}
+    readonly up: TrellisLinear, readonly down: TrellisLinear, readonly rest: Rest, readonly gpu: GpuRest) {}
 
   /** Loads `aneMlpSplitProgram(D, R, fraction, rows, slices)` for pieces of up
    *  to `rows` rows now, from the compile cache the install step filled (a
@@ -121,16 +161,16 @@ export class AneTrellisMlpSplit implements Disposable {
    *  when the two are identical, otherwise loads one on its buffers (each at
    *  least as large). */
   static build(gate: TrellisLinear, up: TrellisLinear, down: TrellisLinear, fraction: number, rows: number,
-    share?: AneMlpSplit, slices?: number): AneTrellisMlpSplit {
+    share?: AneMlpSplit, slices?: number, gpuRows: AneGpuMlpRows = legacyGpuRows): AneTrellisMlpSplit {
     checkMlp("AneTrellisMlpSplit", gate, up, down, false);
     const R = gate.geometry.rows, n = aneChannels(R, fraction);
     const program = AneProgram.create(aneMlpSplitProgram(gate.geometry.inFeatures, R, fraction, rows, slices), share?.program);
-    return new AneTrellisMlpSplit(program, rows, n, gate, up, down,
-      { gate: trellisRows(gate, n, R), up: trellisRows(up, n, R), down: trellisStoredRows(down, n, R) });
+    const rest = { gate: trellisRows(gate, n, R), up: trellisRows(up, n, R), down: trellisStoredRows(down, n, R) };
+    return new AneTrellisMlpSplit(program, rows, n, gate, up, down, rest, gpuRows(rest));
   }
   /** hidden [.., M, D], M <= rows → MLP(hidden) [.., M, D], unevaluated (mlpSplit). */
   forward(hidden: MlxArray, swiglu: Swiglu): MlxArray {
-    return mlpSplit(this.program, this.rows, this.channels, this.gate, this.up, this.down, this.rest, trellisFillHalf, hidden, swiglu);
+    return mlpSplit(this.program, this.rows, this.channels, this.gate, this.up, this.down, this.gpu, trellisFillHalf, hidden, swiglu);
   }
   [Symbol.dispose](): void { this.dispose(); }
   /** Releases this layer's program and frees its GPU rows; a shared program or buffers outlive it while another layer holds them. */
@@ -140,20 +180,20 @@ export class AneTrellisMlpSplit implements Disposable {
 /** Whole-MLP split for a 3-bit block-interleaved down projection. */
 export class AneTrellisMlpSplitK3i implements Disposable {
   private constructor(readonly program: AneProgram, readonly rows: number, readonly channels: number, readonly gate: TrellisLinear,
-    readonly up: TrellisLinear, readonly down: TrellisLinear, readonly rest: Rest) {}
+    readonly up: TrellisLinear, readonly down: TrellisLinear, readonly rest: Rest, readonly gpu: GpuRest) {}
 
   /** As AneTrellisMlpSplit.build. */
   static build(gate: TrellisLinear, up: TrellisLinear, down: TrellisLinear, fraction: number, rows: number,
-    share?: AneMlpSplit, slices?: number): AneTrellisMlpSplitK3i {
+    share?: AneMlpSplit, slices?: number, gpuRows: AneGpuMlpRows = legacyGpuRows): AneTrellisMlpSplitK3i {
     checkMlp("AneTrellisMlpSplitK3i", gate, up, down, true);
     const R = gate.geometry.rows, n = aneChannels(R, fraction);
     const program = AneProgram.create(aneMlpSplitProgram(gate.geometry.inFeatures, R, fraction, rows, slices), share?.program);
-    return new AneTrellisMlpSplitK3i(program, rows, n, gate, up, down,
-      { gate: trellisRows(gate, n, R), up: trellisRows(up, n, R), down: trellisStoredRows(down, n, R) });
+    const rest = { gate: trellisRows(gate, n, R), up: trellisRows(up, n, R), down: trellisStoredRows(down, n, R) };
+    return new AneTrellisMlpSplitK3i(program, rows, n, gate, up, down, rest, gpuRows(rest));
   }
   /** hidden [.., M, D], M <= rows → MLP(hidden) [.., M, D], unevaluated (mlpSplit). */
   forward(hidden: MlxArray, swiglu: Swiglu): MlxArray {
-    return mlpSplit(this.program, this.rows, this.channels, this.gate, this.up, this.down, this.rest, trellisFillHalfK3Interleaved,
+    return mlpSplit(this.program, this.rows, this.channels, this.gate, this.up, this.down, this.gpu, trellisFillHalfK3Interleaved,
       hidden, swiglu);
   }
   [Symbol.dispose](): void { this.dispose(); }
@@ -161,8 +201,23 @@ export class AneTrellisMlpSplitK3i implements Disposable {
   dispose(): void { this.program.dispose(); for (const lin of Object.values(this.rest)) disposeLinear(lin); }
 }
 
+/** Fixed dense GPU share for written row-major ANE graph bindings. */
+export class AneTrellisExpandedMlpSplit {
+  static build(gate: TrellisLinear, up: TrellisLinear, down: TrellisLinear, fraction: number, rows: number,
+    share?: AneMlpSplit, slices?: number): AneTrellisMlpSplit {
+    return AneTrellisMlpSplit.build(gate, up, down, fraction, rows, share, slices, expandedGpuRows);
+  }
+}
+/** Fixed dense GPU share for written block-interleaved ANE graph bindings. */
+export class AneTrellisExpandedMlpSplitK3i {
+  static build(gate: TrellisLinear, up: TrellisLinear, down: TrellisLinear, fraction: number, rows: number,
+    share?: AneMlpSplit, slices?: number): AneTrellisMlpSplitK3i {
+    return AneTrellisMlpSplitK3i.build(gate, up, down, fraction, rows, share, slices, expandedGpuRows);
+  }
+}
+
 /** The layer that computes an affine split's GPU rows from the projection's
- *  remaining rows (default: the QuantizedLinear itself). */
+ *  remaining rows (default: QuantizedLinearPlain). */
 export type AneGpuRows = (rest: QuantizedLinear) => { forward(x: MlxArray): MlxArray };
 
 /** Affine projection split: the first n output rows of an MLX affine
@@ -171,7 +226,8 @@ export type AneGpuRows = (rest: QuantizedLinear) => { forward(x: MlxArray): MlxA
  *  outputs concatenate in row order. */
 export class AneAffineSplit implements Disposable {
   private constructor(readonly program: AneStreamedMatmul, readonly head: { w: MlxArray; scales: MlxArray; biases: MlxArray },
-    readonly rest: QuantizedLinear, readonly gpu: { forward(x: MlxArray): MlxArray }, readonly spec: ops.QuantSpec) {}
+    readonly rest: QuantizedLinear, readonly gpu: { forward(x: MlxArray): MlxArray }, readonly spec: ops.QuantSpec,
+    readonly linear: QuantizedLinear) {}
 
   /** Loads `aneAffineSplitProgram(K, N, fraction, rows, slices)` for pieces of
    *  up to `rows` rows now, as AneTrellisMlpSplit.build loads its program.
@@ -186,7 +242,7 @@ export class AneAffineSplit implements Disposable {
     const rowsOf = (a: MlxArray, start: number, stop: number) => a.slice([start, 0], [stop, a.shape[1]!]);
     const head = { w: rowsOf(lin.w, 0, n), scales: rowsOf(lin.scales, 0, n), biases: rowsOf(lin.biases, 0, n) };
     const rest = new QuantizedLinear(rowsOf(lin.w, n, N), rowsOf(lin.scales, n, N), rowsOf(lin.biases, n, N), lin.spec);
-    return new AneAffineSplit(program, head, rest, gpuRows ? gpuRows(rest) : rest, lin.spec);
+    return new AneAffineSplit(program, head, rest, gpuRows ? gpuRows(rest) : new QuantizedLinearPlain(rest), lin.spec, lin);
   }
 
   /** x [.., M, K], M <= rows → [.., M, N], unevaluated as the MLP split's
@@ -214,7 +270,7 @@ export class AneAffineSplit implements Disposable {
       using g2 = ops.reshape(gpu, [M, this.rest.outFeatures]);
       const both = ops.concatAxis([b, g2], -1);
       ane.program.deferOutput(both);                          // evaluated (free once the result is) and freed by the program
-      return ops.reshape(both, [...lead, n + this.rest.outFeatures]);
+      return this.linear.delta.forward(x, ops.reshape(both, [...lead, n + this.rest.outFeatures]));
     } finally { gpu.dispose(); }
   }
 

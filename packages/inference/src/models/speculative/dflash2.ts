@@ -1,3 +1,4 @@
+import type { MlxRowTable } from "../../contracts/mlx/row-table";
 // DFlash 2 drafter for Qwen3.8-27B (incoai/Qwen3.8-27B-DFlash2, Apache-2.0).
 // Port of z-lab/dflash@07ebd93 `dflash/model_mlx.py` (DFlash2DraftModel),
 // cross-checked against Splash `runtime/model/DFlashDraft.cpp`, SGLang PR
@@ -30,14 +31,14 @@
 // folded head as ((v/γ)⊙s)·M. For n = 5120 = 20·256, M is orthogonal but NOT
 // symmetric, so x·Mᵀ needs the dense transpose, not a second transform.
 //
-// Kernels: each 4-bit projection runs, per width class of its rows, the kernel
+// Kernels: each 4-bit projection runs, per row count or range of its rows, the kernel
 // the target's composition declares for its device (`TargetView.draftProjections`)
 // or, without a declaration, the drafter's own rule: five to eight rows (the
-// fiveToEight class, one block of 8) on the simdgroup matrix unit, every other
+// 5..8 rows, one block of 8) on the simdgroup matrix unit, every other
 // width on MLX's quantized matmul. The rule's kernels are built at load (fc when
 // the first draft group binds) and the declared ones when it binds. The context
 // projection (fc, then each layer's k and v, over the B × L rows a prefill or a
-// commit appends) and the draft block (B anchors × G columns) are width tables;
+// commit appends) and the draft block (B anchors × G columns) are row declarations;
 // the caller indexes them by the rows it projects or drafts.
 
 import { MlxArray } from "@mlx-bun/mlx/array";
@@ -45,14 +46,14 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { Weights } from "../../artifacts/weights";
 import type { DraftProjection } from "../../contracts/mlx/draft-projection";
-import type { DraftProjectionKernel, ResidualBasis } from "../../contracts/mlx/draft-target";
+import type { DraftProjectionKernels, ResidualBasis } from "../../contracts/mlx/draft-target";
 import type {
-  ContextKV, Dflash2ContextAttention, Dflash2DraftBlock, Dflash2DrafterModel, DrafterContextKV, DrafterContextProjection,
+  ContextKV, Dflash2ContextAttention, Dflash2DraftBlock, Dflash2DrafterModel, DrafterContextKV, DrafterContextProjection, DrafterOperations,
 } from "../../contracts/mlx/drafter";
-import { widthClass, type MlxWidthClass, type MlxWidthTable } from "../../contracts/mlx/graph";
-import { atEveryWidth, byWidth } from "../graph";
+import { rowOperationFor } from "../graph";
+import { mapOperations } from "./dflash2-operations";
 import { isDflash2Architecture } from "./dflash2-artifact";
-import { QuantizedLinear } from "../../layers/quantized-linear";
+import { QuantizedLinear, QuantizedLinearPlain } from "../../layers/quantized-linear";
 import { Affine4MmaLinear } from "../../layers/affine-verify-linear";
 
 export interface Dflash2Config {
@@ -86,26 +87,33 @@ class Bf16Projection implements Projection {
  *  at every other class. A target that declares its composition's kernels rebuilds `at` over `affine4` when it
  *  binds. */
 interface Weight {
-  at: MlxWidthTable<Projection>;
+  at: DrafterOperations<Projection>;
+  /** The fixed default of the checkpoint's original range-backed projection. */
+  readonly defaultProjection?: Projection;
   /** The 4-bit, group-64 weight a declared kernel builds over; null for any other width. */
   readonly affine4: { readonly w: MlxArray; readonly scales: MlxArray; readonly biases: MlxArray } | null;
   dispose(): void;
 }
 
 function bf16Weight(projection: Bf16Projection): Weight {
-  return { at: atEveryWidth<Projection>(projection), affine4: null, dispose: () => projection.t.dispose() };
+  return { at: [{from:1,to:Infinity,operation:projection}], defaultProjection: projection, affine4: null, dispose: () => projection.t.dispose() };
 }
 function quantizedWeight(source: MlxArray, bits: number): Weight {
   const q = ops.quantize(source, 64, bits);
   ops.evalAll([q.packed, q.scales, q.biases]);
   const linear = new QuantizedLinear(q.packed, q.scales, q.biases, { bits, groupSize: 64, mode: "affine" });
+  const plain = new QuantizedLinearPlain(linear);
   const mma = bits === 4 && q.scales.shape[0]! % 8 === 0 && (q.scales.shape[1]! * 64) % 256 === 0 ? new Affine4MmaLinear(linear) : null;
   return {
-    at: byWidth<Projection>(width => width === "fiveToEight" ? mma ?? linear : linear),
+    at: [{from:1,to:4,operation:plain},{from:5,to:8,operation:mma ?? plain},{from:9,to:Infinity,operation:plain}],
+    defaultProjection: plain,
     affine4: bits === 4 ? { w: q.packed, scales: q.scales, biases: q.biases } : null,
     dispose() { linear.w.dispose(); linear.scales.dispose(); linear.biases!.dispose(); },
   };
 }
+
+const DEFAULT_PROJECTION_ROWS=[{from:1,to:4,operation:true},{from:5,to:8,operation:true},{from:9,to:Infinity,operation:true}];
+type LayerProjections=Record<"q"|"k"|"v"|"o"|"gate"|"up"|"down",Projection>;
 
 /** R1 sign lane 0 of the rotation fold (packages/quantize/src/rotate.ts signVector). */
 function r1Signs(seed: number, n: number): Float32Array {
@@ -161,7 +169,7 @@ export class Dflash2Drafter implements Dflash2DrafterModel {
   #succ: MlxArray;
   #layers: Layer[] = [];
   /** The target declarations bound by the first draft group: undefined until then. */
-  #bound: { basis: ResidualBasis | null; projections: MlxWidthTable<DraftProjectionKernel> | null } | undefined = undefined;
+  #bound: { basis: ResidualBasis | null; projections: DraftProjectionKernels | null } | undefined = undefined;
   /** R1's signs, the folded gain and dense Mᵀ [H, H] (bf16; every entry is ±1/√H) of a bound fold. */
   #rotation: { signs: MlxArray; finalGain: MlxArray; hadamardT: MlxArray } | null = null;
   /** Target-basis rows → drafter basis; identity until a fold binds. */
@@ -264,10 +272,10 @@ export class Dflash2Drafter implements Dflash2DrafterModel {
 
   /** Build fc for the target's basis and, for a fold, the rotations at the
    *  embedding and the head; then, where the target declares its composition's
-   *  kernels, every 4-bit projection's kernel per width class from them. The
+   *  kernels, every 4-bit projection's kernel per row count or range from them. The
    *  first call applies; later calls (every draft group binds) must pass the
    *  same declarations. */
-  bindTarget(basis: ResidualBasis | null, projections: MlxWidthTable<DraftProjectionKernel> | null): void {
+  bindTarget(basis: ResidualBasis | null, projections: DraftProjectionKernels | null): void {
     if (this.#bound !== undefined) {
       if (this.#bound.basis !== basis) throw new Error("this DFlash 2 drafter is bound to a target with a different residual basis");
       if (this.#bound.projections !== projections) throw new Error("this DFlash 2 drafter is bound to a target with different projection kernels");
@@ -277,8 +285,9 @@ export class Dflash2Drafter implements Dflash2DrafterModel {
     if (projections) for (const weight of [this.#fc!, ...this.#layers.flatMap(l => [l.q, l.k, l.v, l.o, l.gate, l.up, l.down])]) {
       if (!weight.affine4) continue;
       const { w, scales, biases } = weight.affine4;
-      weight.at = byWidth<Projection>(width => ({ forward: projections[width](w, scales, biases) }));
+      weight.at = mapOperations(projections, kernel=>({forward:kernel(w,scales,biases)}));
     }
+    this.#bindOperations(projections ?? DEFAULT_PROJECTION_ROWS);
     this.#bound = { basis, projections };
   }
 
@@ -368,26 +377,60 @@ export class Dflash2Drafter implements Dflash2DrafterModel {
       : ops.ropeDynamic(x, this.cfg.headDim, this.cfg.ropeTheta, position, null);
   }
 
-  /** Target taps [B,L,m·H] (target basis; fc carries the bound fold) → context rows [B,L,H], per width class of
-   *  the B·L rows: fc on its kernel for the class (see `Weight`). */
-  readonly projectContext: MlxWidthTable<DrafterContextProjection> = byWidth(width => taps => {
-    using projected = this.#fc!.at[width].forward(taps);
-    return this.#rms(projected, this.#hiddenNorm);
-  });
+  /** Each context operation is fixed when the target's declarations bind. */
+  projectContext!: DrafterOperations<DrafterContextProjection>;
+  projectContextKVRows!: DrafterOperations<DrafterContextKV>;
+  draft!: DrafterOperations<Dflash2DraftBlock>;
 
-  /** Context rows [B,L,H] → per-layer K/V [B,kv,L,D] at absolute positions from `position`, per width class of
-   *  the B·L rows: each layer's k and v on the kernel `projectContext` runs for that class. */
-  readonly projectContextKVRows: MlxWidthTable<DrafterContextKV> = byWidth(width =>
-    (context, position) => this.#contextKV(context, position, width));
+  #bindOperations(rows: DrafterOperations<unknown>): void {
+    type Binding = { fc: Projection; layers: LayerProjections[] };
+    const bind = (projection: (weight: Weight) => Projection): Binding => ({
+      fc: projection(this.#fc!),
+      layers: this.#layers.map(layer => ({
+        q: projection(layer.q), k: projection(layer.k), v: projection(layer.v), o: projection(layer.o),
+        gate: projection(layer.gate), up: projection(layer.up), down: projection(layer.down),
+      })),
+    });
+    const at = (row: number) => bind(weight => rowOperationFor(weight.at, row));
+    const defaults = () => bind(weight => {
+      const operation = Array.isArray(weight.at) ? Object.hasOwn(weight, "defaultProjection") ? weight.defaultProjection : undefined
+        : Object.hasOwn(weight.at, "default") ? (weight.at as MlxRowTable<Projection>).default : undefined;
+      if (operation === undefined) throw new Error("DFlash2 projection has no declared default operation");
+      return operation;
+    });
+    let bindings: DrafterOperations<Binding>;
+    if (Array.isArray(rows)) {
+      bindings = Object.freeze(rows.map(range => Object.freeze({
+        from: range.from, to: range.to, operation: at(range.from),
+      })));
+    } else {
+      const source = rows as MlxRowTable<unknown>, exact: Partial<Record<number, Binding>> & { default?: Binding } = {};
+      for (const [key, operation] of Object.entries(source)) {
+        const row = Number(key);
+        if (operation !== undefined && Number.isSafeInteger(row) && row > 0 && String(row) === key) exact[row] = at(row);
+      }
+      if (Object.hasOwn(source, "default") && source.default !== undefined) exact.default = defaults();
+      bindings = Object.freeze(exact);
+    }
+    this.projectContext = mapOperations(bindings, fixed => (taps: MlxArray) => {
+      using projected = fixed.fc.forward(taps);
+      return this.#rms(projected, this.#hiddenNorm);
+    });
+    this.projectContextKVRows = mapOperations(bindings, fixed =>
+      (context: MlxArray, position: number | MlxArray) => this.#contextKV(context, position, fixed.layers));
+    this.draft = mapOperations(bindings, fixed =>
+      (context: Dflash2ContextAttention, projection: DraftProjection, anchors: readonly number[], position: number | MlxArray, columns: number) =>
+        this.#block(context, projection, anchors, position, columns, fixed.layers));
+  }
 
-  #contextKV(context: MlxArray, position: number | MlxArray, width: MlxWidthClass): ContextKV[] {
+  #contextKV(context: MlxArray, position: number | MlxArray, fixed: readonly LayerProjections[]): ContextKV[] {
     const B = context.shape[0]!, L = context.shape[1]!, { kvHeads, headDim } = this.cfg;
-    return this.#layers.map(layer => {
-      using kFlat = layer.k.at[width].forward(context);
+    return this.#layers.map((layer,index) => {
+      using kFlat = fixed[index]!.k.forward(context);
       using k4 = ops.reshape(kFlat, [B, L, kvHeads, headDim]);
       using kn = this.#rms(k4, layer.kNorm);
       using kT = ops.transposeAxes(kn, [0, 2, 1, 3]);
-      using vFlat = layer.v.at[width].forward(context);
+      using vFlat = fixed[index]!.v.forward(context);
       using v4 = ops.reshape(vFlat, [B, L, kvHeads, headDim]);
       return { k: this.#rope(kT, position), v: ops.transposeAxes(v4, [0, 2, 1, 3]) };
     });
@@ -396,15 +439,10 @@ export class Dflash2Drafter implements Dflash2DrafterModel {
   /** The columns of a block drafting `depth` tokens: the anchor and up to `depth` (≤ gamma) mask positions. */
   blockColumns(depth: number): number { return Math.min(this.cfg.blockSize, Math.max(1, depth) + 1); }
 
-  /** The draft block per width class of its rows (anchors × columns): every projection on its kernel for the
-   *  class (see `Weight`). */
-  readonly draft: MlxWidthTable<Dflash2DraftBlock> = byWidth(width =>
-    (context, projection, anchors, position, columns) => this.#block(context, projection, anchors, position, columns, width));
-
   /** One block per anchor over `columns` positions, every projection on its kernel for `width`: the proposals left on the
    *  device, [B, columns - 1] uint32, row-major. */
   #block(context: Dflash2ContextAttention, projection: DraftProjection, anchors: readonly number[],
-    position: number | MlxArray, columns: number, width: MlxWidthClass): MlxArray {
+    position: number | MlxArray, columns: number, fixed: readonly LayerProjections[]): MlxArray {
     const B = anchors.length, G = columns;
     const { hidden: H, heads, kvHeads, headDim } = this.cfg;
     using ids = ops.fromInt32(anchors.flatMap(anchor => [anchor, ...Array(G - 1).fill(this.cfg.maskTokenId)]), [B, G]);
@@ -417,23 +455,23 @@ export class Dflash2Drafter implements Dflash2DrafterModel {
           using coef = this.#coefficients(n, layer.attnProj, layer.attnBase);
           using a32 = this.#conv(n, coef, 0);
           using a = a32.astype(x.dtype);
-          using qFlat = layer.q.at[width].forward(a);
+          using qFlat = fixed[li]!.q.forward(a);
           using q4 = ops.reshape(qFlat, [B, G, heads, headDim]);
           using qn = this.#rms(q4, layer.qNorm);
           using qT = ops.transposeAxes(qn, [0, 2, 1, 3]);
           using q = this.#rope(qT, position);
-          using kFlat = layer.k.at[width].forward(a);
+          using kFlat = fixed[li]!.k.forward(a);
           using k4 = ops.reshape(kFlat, [B, G, kvHeads, headDim]);
           using kn = this.#rms(k4, layer.kNorm);
           using kT = ops.transposeAxes(kn, [0, 2, 1, 3]);
           using k = this.#rope(kT, position);
-          using vFlat = layer.v.at[width].forward(a);
+          using vFlat = fixed[li]!.v.forward(a);
           using v4 = ops.reshape(vFlat, [B, G, kvHeads, headDim]);
           using v = ops.transposeAxes(v4, [0, 2, 1, 3]);
           using attn = context.attend(li, q, k, v, 1 / Math.sqrt(headDim));
           using attnT = ops.transposeAxes(attn, [0, 2, 1, 3]);
           using attnFlat = ops.reshape(attnT, [B, G, heads * headDim]);
-          using out = layer.o.at[width].forward(attnFlat);
+          using out = fixed[li]!.o.forward(attnFlat);
           using finished = this.#conv(out, coef, 1);
           using x32 = x.astype(Dtype.float32);
           using sum = ops.add(x32, finished);
@@ -445,11 +483,11 @@ export class Dflash2Drafter implements Dflash2DrafterModel {
           using coef = this.#coefficients(m, layer.mlpProj, layer.mlpBase);
           using inner32 = this.#conv(m, coef, 0);
           using inner = inner32.astype(x.dtype);
-          using g = layer.gate.at[width].forward(inner);
-          using u = layer.up.at[width].forward(inner);
+          using g = fixed[li]!.gate.forward(inner);
+          using u = fixed[li]!.up.forward(inner);
           using act = ops.silu(g);
           using prod = ops.mul(act, u);
-          using mlp = layer.down.at[width].forward(prod);
+          using mlp = fixed[li]!.down.forward(prod);
           using finished = this.#conv(mlp, coef, 1);
           using x32 = x.astype(Dtype.float32);
           using sum = ops.add(x32, finished);
@@ -462,7 +500,7 @@ export class Dflash2Drafter implements Dflash2DrafterModel {
       using headInput = this.#toTargetHead(h);
       // A target that declares its draft vocabulary is projected onto those rows only (its candidates their ids).
       const listed = projection.vocabulary;
-      using logits = (listed?.logits ?? projection.logits)[widthClass(B * (G - 1))](headInput);
+      using logits = rowOperationFor(listed?.logits ?? projection.logits,B * (G - 1))(headInput);
       using z = this.#selProj.forward(h);
       using columns = this.#select(logits, z, anchors, G - 1, listed?.ids ?? null); // [steps, B]
       using rowsMajor = ops.transposeAxes(columns, [1, 0]);

@@ -48,7 +48,7 @@ test("an explicit seed composes with ordinary logprobs and grammar in continuous
 });
 
 test("with grammar coordination and no optional features, grammar never changes placement", () => {
-  const variants: Partial<ExecutionCapabilities>[] = [{}, { mediaBatch: true }, { adapterBatch: true }, { method: "denoising" },
+  const variants: Partial<ExecutionCapabilities>[] = [{}, { mediaBatch: true }, { method: "denoising" },
     { groupedMethods: ["autoregressive", "speculative"], speculativeLogprobs: true }];
   for (const variant of variants) for (const extra of [{}, { hasVision: true },
     { hasAdapters: true }, { wantsLogprobs: true }, { userSeed: true }, { hasDraft: true }]) {
@@ -62,7 +62,7 @@ test.each(["hasVision", "hasAdapters", "wantsLogprobs"] as const)(
   "%s uses AR and retains an explicit draft fallback reason", (key) => {
     const plan = resolveExecution({ ...request, hasDraft: true, [key]: true }, capabilities);
     expect(plan.method).toBe("autoregressive");
-    expect(plan.mechanism).toBe(key === "wantsLogprobs" ? "continuous" : "unsupported");
+    expect(plan.mechanism).toBe(key === "hasVision" ? "unsupported" : "continuous");
     expect(plan.reasons).toContain("draft-incompatible-with-request");
   },
 );
@@ -87,7 +87,7 @@ test("a draft without a grouped verifier is refused, never ignored; media, adapt
 test("fill requires a qualified shared binding and cannot run in another method or resumable checkpoint", () => {
   const features = { fill: true };
   expect(resolveExecution(request, capabilities, features).fill).toBe(false);
-  const unbound = resolveExecution(request, { ...capabilities, adapterBatch: false }, features);
+  const unbound = resolveExecution(request, { ...capabilities }, features);
   expect(unbound).toMatchObject({ mechanism: "continuous", fill: false, checkpoint: false });
   expect(unbound.reasons).toContain("fill-incompatible-with-request");
   expect(resolveExecution({ ...request, hasDraft: true }, capabilities, features).fill).toBe(false);
@@ -140,7 +140,7 @@ test("grammar jump requires a qualified shared method, never an unsupported plan
 
 test("adapter-capable groups retain ordinary sampling features", () => {
   const plan = resolveExecution({ ...request, hasAdapters: true, wantsLogprobs: true,
-    userSeed: true }, { ...capabilities, adapterBatch: true }, { fill: false, compiledDecode: true });
+    userSeed: true }, { ...capabilities }, { fill: false, compiledDecode: true });
   expect(plan).toMatchObject({ method: "autoregressive", mechanism: "continuous", compiledDecode: false });
 });
 
@@ -155,11 +155,11 @@ test("registered grouped methods compose speculation with sampling", () => {
 
 test("qualified target-adapter speculation stays in the shared adapter context", () => {
   const adapted = { ...request, hasDraft: true, hasAdapters: true, wantsLogprobs: true, userSeed: true, hasGrammar: true };
-  const supported = { ...capabilities, adapterBatch: true, sharedSpeculativeAdapters: true,
+  const supported = { ...capabilities, sharedSpeculativeAdapters: true,
     speculativeLogprobs: true, groupedMethods: ["autoregressive", "speculative"] };
   expect(resolveExecution(adapted, supported)).toMatchObject({ method: "speculative", mechanism: "continuous" });
   expect(resolveExecution(adapted, { ...supported, sharedSpeculativeAdapters: false }).method).toBe("autoregressive");
-  for (const disabled of [{ adapterBatch: false }, { grammarBatch: false }])
+  for (const disabled of [{ grammarBatch: false }])
     expect(resolveExecution(adapted, { ...supported, ...disabled })).toMatchObject({ method: "autoregressive", mechanism: "unsupported" });
   expect(resolveExecution({ ...adapted, hasVision: true }, supported).method).toBe("autoregressive");
 });
@@ -209,7 +209,7 @@ test("a provider consuming external tokens composes echo with shared speculation
 
 describe("interleaved denoising placement", () => {
   const denoising: ExecutionCapabilities = { method: "denoising",
-    grammarBatch: false, checkpoints: true, adapterBatch: true, sharedCheckpoints: true,
+    grammarBatch: false, checkpoints: true, sharedCheckpoints: true,
     groupedMethods: ["denoising"] };
   const features = { fill: false, compiledDecode: true, grammarJump: false };
 
@@ -261,7 +261,6 @@ test("accepted plans keep their selected features", () => {
 
 test.each([
   [{ hasVision: true }, {}, "media-batch-unsupported"],
-  [{ hasAdapters: true }, {}, "adapter-batch-unsupported"],
   [{ hasGrammar: true }, { grammarBatch: false }, "grammar-batch-unsupported"],
   [{}, { method: "denoising" }, "method-batch-unsupported"],
 ] as const)("an unsupported plan names its rejection reason: %#", (shape, capability, reason) => {
@@ -274,7 +273,7 @@ test.each([
 test("committed grammar spans stay AR and do not replace verified grammar proposals", () => {
   const features = { fill: true, grammarJump: true };
   const grammar = { ...request, hasGrammar: true };
-  const spans = { ...capabilities, adapterBatch: true, sharedGrammarJump: true };
+  const spans = { ...capabilities, sharedGrammarJump: true };
   expect(resolveExecution(grammar, spans, features)).toMatchObject({
     method: "autoregressive", mechanism: "continuous", grammarJump: true,
     checkpoint: false, promptCache: true, fill: false,

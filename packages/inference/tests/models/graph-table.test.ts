@@ -1,15 +1,14 @@
 // The loader's selection tables (E1): every resident family's graphs are data,
 // selected once at load from the artifact fingerprint and the composition. No
-// model loads here: configs are synthetic or the committed generator fixtures,
+// model loads here: configs and composition records are synthetic,
 // compositions come from resolveComposition with the device overridden, and the
 // selected entry is read, never built. Real-weight selection is
 // graph-table-real-weights.test.ts.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadModelConfig, type ModelConfig } from "../../src/artifacts/config";
-import { configFingerprint } from "../../src/artifacts/fingerprint";
 import type { Composition } from "../../src/contracts/portable/composition";
 import { resolveComposition, type CompositionRequest } from "../../src/models/composition";
 import { MLX_GRAPH_TABLES } from "../../src/models/factory";
@@ -39,10 +38,9 @@ const on = (device: string, config: ModelConfig, request: CompositionRequest = {
 
 describe("a graph table", () => {
   const entry = (id: string, serves: ServedComposition): GraphEntry<null, string> => ({ id, serves, create: () => id });
-  const composition = (fields: Partial<Composition> = {}): Composition => ({ device: M4_PRO, aneBridge: true, kv: { kind: "bf16" }, pagedKv: null,
-    draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 8, packedMixedMlp: true,
-    vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
-    grammarJump: false, greedyDraft: false, compiledGeglu: true, compiledSwiglu: true, ...fields });
+  const composition = (fields: Partial<Composition> = {}): Composition => ({ device: M4_PRO, kv: { kind: "bf16" }, pagedKv: null,
+    draftDepth: 0, prefillChunkTokens: 2048, maxRows: 8, vectorGreedySampling: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
+    grammarJump: false, greedyDraft: false, ...fields });
 
   test("the most constrained entry the composition meets wins; the generic entry serves the rest", () => {
     const table = new GraphTable([
@@ -68,21 +66,24 @@ describe("a graph table", () => {
     expect(table.select({ modelDir: "g" } as ModelConfig, composition({ maxRows: 2 })).id).toBe("device");
   });
 
-  test("every field constrains when present: ANE bridge, draft depth, chunk, adapters, per-layer and TurboQuant KV", () => {
+  test("default keys cover draft depth, prompt chunk, verification rows, per-layer and TurboQuant KV", () => {
     const layered = { kind: "affine-layers", layers: [{ layer: 1, bits: 8, groupSize: 64 }, { layer: 0, bits: 4, groupSize: 64 }] } as const;
     const table = new GraphTable([
-      entry("ane", { aneBridge: false }),
-      entry("depth", { draftDepth: { adaptive: true, max: 7 }, device: M1_MAX }),
-      entry("chunk", { prefillChunkTokens: 512, device: M1_MAX, adapters: true }),
+      entry("depth", { draftDepth: { adaptive: true, max: 7 }, device: M1_MAX, maxRows: 8 }),
+      entry("chunk", { prefillChunkTokens: 512, device: M1_MAX }),
+      entry("verify", { device: M4_PRO, maxRows: 8, maxVerifyRows: 64 }),
       entry("layers", { kv: [layered], device: "applegpu_g15s" }),
       entry("turbo", { kv: [{ kind: "turbo", kBits: 8, vBits: 3 }], device: "applegpu_g14s" }),
       entry("generic", {}),
     ]);
-    expect(table.match(undefined, composition({ aneBridge: false })).id).toBe("ane");
+    expect(table.match(undefined, composition({ draftDepth: 7 })).id).toBe("verify");
+    expect(table.match(undefined, composition({ draftDepth: { adaptive: true, max: 7 } })).id).toBe("verify");
+    expect(table.match(undefined, composition({ draftDepth: 8 })).id).toBe("generic");
+    expect(table.match(undefined, composition({ draftDepth: 8, maxRows: 4 })).id).toBe("verify");
     expect(table.match(undefined, composition({ device: M1_MAX, draftDepth: { adaptive: true, max: 7 } })).id).toBe("depth");
     expect(table.match(undefined, composition({ device: M1_MAX, draftDepth: 7 })).id).toBe("generic");
-    expect(table.match(undefined, composition({ device: M1_MAX, prefillChunkTokens: 512, adapters: true })).id).toBe("chunk");
-    expect(table.match(undefined, composition({ device: M1_MAX, prefillChunkTokens: 512 })).id).toBe("generic");
+    expect(table.match(undefined, composition({ device: M1_MAX, prefillChunkTokens: 512 })).id).toBe("chunk");
+    expect(table.match(undefined, composition({ device: M1_MAX, prefillChunkTokens: 512 })).id).toBe("chunk");
     // Per-layer schemes compare layer by layer, in any order.
     expect(table.match(undefined, composition({ device: "applegpu_g15s",
       kv: { kind: "affine-layers", layers: [{ layer: 0, bits: 4, groupSize: 64 }, { layer: 1, bits: 8, groupSize: 64 }], kernels: "tiled-causal" } })).id).toBe("layers");
@@ -90,6 +91,23 @@ describe("a graph table", () => {
       kv: { kind: "affine-layers", layers: [{ layer: 0, bits: 4, groupSize: 64 }, { layer: 1, bits: 4, groupSize: 64 }], kernels: "tiled-causal" } })).id).toBe("generic");
     expect(table.match(undefined, composition({ device: "applegpu_g14s", kv: { kind: "turbo", kBits: 8, vBits: 3 } })).id).toBe("turbo");
     expect(table.match(undefined, composition({ device: "applegpu_g14s", kv: { kind: "turbo", kBits: 4, vBits: 4 } })).id).toBe("generic");
+  });
+
+  test("an explicit graph bypasses default matching and custom graphs need no registration", () => {
+    let fingerprints = 0;
+    const specialized = entry("m4", { fingerprint: "f", device: M4_PRO, maxRows: 8 });
+    const generic = entry("generic", {});
+    const table = new GraphTable([specialized, generic], () => { fingerprints++; return "different"; });
+    const config = { modelDir: "other-artifact" } as ModelConfig;
+    const otherMachine = composition({ device: M1_MAX, maxRows: 16 });
+    expect(table.select(config, otherMachine).id).toBe("generic");
+    fingerprints = 0;
+    expect(table.select(config, otherMachine, "m4")).toBe(specialized);
+    expect(table.select(config, composition(), "generic")).toBe(generic);
+    const custom = entry("mine", { device: "another-device" });
+    expect(table.select(config, otherMachine, custom)).toBe(custom);
+    expect(fingerprints).toBe(0);
+    expect(() => table.explicit("missing")).toThrow("no graph named missing");
   });
 
   test("construction rejects tables whose selection would refuse or depend on order", () => {
@@ -115,16 +133,36 @@ describe("the Qwen 3.5 table", () => {
   const table = MLX_GRAPH_TABLES["qwen3.5"]!;
   const select = (composition: Composition, fingerprint = TRELLIS) => table.match(fingerprint, composition).id;
 
-  test("the M4 Pro graph serves the Trellis artifact on applegpu_g16s with bf16 or affine 4/64, adapters or not, up to 8 rows", () => {
+  test("the M4 Pro graph serves the Trellis artifact on applegpu_g16s with bf16 or affine 4/64 and up to 8 decode rows", () => {
     expect(select(on(M4_PRO, qwen))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     expect(select(on(M4_PRO, qwen, { kv: { override: 4 } }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     expect(select(on(M4_PRO, qwen, { kv: { override: 4, quantizedKvStart: 512 } }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     for (const fusedSdpa of [true, false])
       expect(select(on(M4_PRO, qwen, { kv: { override: 4, fusedSdpa } }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
-    expect(select(on(M4_PRO, qwen, { adapters: true }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
+    expect(select(on(M4_PRO, qwen, {}))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
+
     expect(select(on(M4_PRO, qwen, { maxRows: 1, draft: { numDraftTokens: 3 } }))).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
-    expect(select({ ...on(M4_PRO, qwen, { draft: { numDraftTokens: 7, adaptive: true } }), aneBridge: false, prefillChunkTokens: 512 }))
+    expect(select({ ...on(M4_PRO, qwen, { draft: { numDraftTokens: 7, adaptive: true } }), prefillChunkTokens: 512 }))
       .toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
+  });
+
+  test("M4 recommendations preserve MTP depth 8, default ngram depth 10 and larger verification rounds", () => {
+    const shapes = [
+      { numDraftTokens: 8, verificationRows: 72 },
+      { numDraftTokens: 10, verificationRows: 88 },
+      { numDraftTokens: 512, verificationRows: 4104 },
+    ];
+    for (const shape of shapes) {
+      for (const adaptive of [false, true]) {
+        for (const kv of [undefined, { override: 4 as const }]) {
+          const composition = on(M4_PRO, qwen, { maxRows: 8, kv,
+            draft: { numDraftTokens: shape.numDraftTokens, adaptive } });
+          const depth = typeof composition.draftDepth === "number" ? composition.draftDepth : composition.draftDepth.max;
+          expect(composition.maxRows * (depth + 1)).toBe(shape.verificationRows);
+          expect(select(composition)).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
+        }
+      }
+    }
   });
 
   test("the same artifact on applegpu_g16s with another KV scheme or more rows gets the generic graph", () => {
@@ -137,12 +175,28 @@ describe("the Qwen 3.5 table", () => {
     expect(select(on(M4_PRO, qwen, { maxRows: 16 }))).toBe("qwen3.5");
   });
 
-  test("on applegpu_g13s the generated M1 Max graph serves the artifact whatever its KV scheme or rows; other GPUs get the generic graph", () => {
-    expect(select(on(M1_MAX, qwen))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
-    expect(select(on(M1_MAX, qwen, { kv: { override: 8 } }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
-    expect(select(on(M1_MAX, qwen, { kv: { override: 4 }, maxRows: 16 }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
-    expect(select(on(M1_MAX, qwen, { kv: { turboQuant: { kBits: 8, vBits: 3 } }, adapters: true }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
+  test("the M1 Max graph is recommended for the Trellis artifact across KV schemes, row counts and draft depths", () => {
+    const requests: CompositionRequest[] = [
+      {}, { kv: { override: 4 } }, { kv: { override: 8 } },
+      { kv: { turboQuant: { kBits: 8, vBits: 3 } } },
+    ];
+    for (const request of requests) {
+      for (const maxRows of [1, 8, 16, 256, 257, 4096]) {
+        expect(select(on(M1_MAX, qwen, { ...request, maxRows }))).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
+        for (const adaptive of [false, true])
+          expect(select(on(M1_MAX, qwen, { ...request, maxRows, draft: { numDraftTokens: 512, adaptive } })))
+            .toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
+      }
+    }
+    const layered = { ...qwen, kvQuant: [{ layerIdx: 1, bits: 4, groupSize: 64 }] };
+    expect(select(on(M1_MAX, layered, { kv: { override: "config" }, maxRows: 4096 })))
+      .toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
+  });
+
+  test("the M1 recommendation still requires its device and artifact fingerprint", () => {
     expect(select(on("applegpu_g15s", qwen))).toBe("qwen3.5");
+    expect(select(on("unlisted-gpu", qwen, { maxRows: 4096 }))).toBe("qwen3.5");
+    expect(select(on(M1_MAX, qwen, { maxRows: 4096 }), "another-artifact")).toBe("qwen3.5");
   });
 
   test("another Qwen 3.5 artifact gets the generic graph on every device; the table fingerprints with the Trellis graph fingerprint", () => {
@@ -152,6 +206,15 @@ describe("the Qwen 3.5 table", () => {
       expect(table.select(qwen, on(device, qwen)).id).toBe("qwen3.5");
       expect(select(on(device, qwen), fingerprint)).toBe("qwen3.5");
     }
+  });
+
+  test("one generic graph serves every unmatched device and explicit choices bypass recommendation keys", () => {
+    const config = qwen;
+    expect(table.select(config, on("unlisted-gpu", config)).id).toBe("qwen3.5");
+    expect(table.select(config, on(M4_PRO, config), "qwen3.5").id).toBe("qwen3.5");
+    expect(table.select(config, on(M1_MAX, config), QWEN38_TRELLIS_M4PRO_GRAPH).id).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
+    for (const device of ["applegpu_g15x", "applegpu_g16x", "applegpu_g17s"])
+      expect(table.select(config, on(device, config)).id).toBe("qwen3.5");
   });
 
   test("the published Trellis config selects by its own fingerprint (config only; skips when the snapshot is not downloaded)", async () => {
@@ -167,36 +230,53 @@ describe("the Qwen 3.5 table", () => {
 
 describe("the Gemma 4 table", () => {
   const table = MLX_GRAPH_TABLES["gemma4"]!;
-  const fixtures = join(import.meta.dir, "../fixtures/gemma4-graphs");
-  const stems = { "gemma4-12b": "gemma-4-12B-it-OptiQ-4bit", "gemma4-e4b": "gemma-4-e4b-it-OptiQ-4bit", "gemma4-26b": "gemma-4-26B-A4B-it-OptiQ-4bit" };
-  const fixture = async (repo: string) => {
-    const snapshots = join(fixtures, `models--mlx-community--${repo}`, "snapshots");
-    return loadModelConfig(join(snapshots, readdirSync(snapshots)[0]!));
+  const graphs = [gemmaE4b, gemma12b, gemma26b] as const;
+  const configFor = (graph: typeof graphs[number]): ModelConfig => {
+    const scheme = table.entries.find(entry => entry.serves.fingerprint === graph.FINGERPRINT)!.serves.kv![0]!;
+    if (scheme.kind !== "affine-layers") throw new Error("expected declared per-cache affine scheme");
+    return { ...qwen, modelType: "gemma4", kvQuant: scheme.layers.map(layer => ({ layerIdx: layer.layer, bits: layer.bits, groupSize: layer.groupSize })),
+      text: { ...qwen.text, numHiddenLayers: graph.LAYERS.length, layerTypes: graph.LAYERS.map(layer => layer.attention === "sliding" ? "sliding_attention" : "full_attention") } };
   };
-
-  for (const [stem, repo] of Object.entries(stems)) {
-    test(`${stem}: its fingerprint with its kv_config scheme selects the generated graph; any other scheme the generic graph`, async () => {
-      const config = await fixture(repo);
-      const pick = (request: CompositionRequest) => table.select(config, on(M4_PRO, config, request)).id;
+  for (const [index, stem] of ["gemma4-e4b", "gemma4-12b", "gemma4-26b"].entries()) {
+    test(`${stem}: declared fingerprint and cache scheme select the file across devices and row counts`, () => {
+      const graph = graphs[index]!, config = configFor(graph);
+      const pick = (request: CompositionRequest) => table.match(graph.FINGERPRINT, on(M4_PRO, config, request)).id;
       expect(on(M4_PRO, config, { kv: { override: "config" } }).kv.kind).toBe("affine-layers");
       expect(pick({ kv: { override: "config" } })).toBe(stem);
       expect(pick({ kv: { override: "config", quantizedKvStart: 100 } })).toBe(stem);
-      // `--fused-sdpa` names the read kernels its caches compose, not another graph.
       for (const fusedSdpa of [true, false]) expect(pick({ kv: { override: "config", fusedSdpa } })).toBe(stem);
-      // Selection does not depend on the device, rows or adapters for these entries.
-      expect(table.select(config, on(M1_MAX, config, { kv: { override: "config" }, maxRows: 32, adapters: true })).id).toBe(stem);
+      const otherMachine = on(M1_MAX, config, { kv: { override: "config" }, maxRows: 32 });
+      expect(table.match(graph.FINGERPRINT, otherMachine).id).toBe(stem);
+      expect(table.select(config, otherMachine, stem).id).toBe(stem);
+      expect(pick({ kv: { override: "config" }, maxRows: 8, draft: { numDraftTokens: 7 } })).toBe(stem);
+      for (const device of [M4_PRO, M1_MAX, "unlisted-gpu"]) {
+        for (const maxRows of [8, 16, 257, 4096]) {
+          expect(table.match(graph.FINGERPRINT, on(device, config, { kv: { override: "config" }, maxRows })).id).toBe(stem);
+          // Depth 10 is the default model-free ngram round; 8 also covers MTP.
+          for (const numDraftTokens of [8, 10, 512]) {
+            for (const adaptive of [false, true]) {
+              const composition = on(device, config, { kv: { override: "config" }, maxRows,
+                draft: { numDraftTokens, adaptive } });
+              expect(table.match(graph.FINGERPRINT, composition).id).toBe(stem);
+            }
+          }
+        }
+      }
+
       for (const other of [{}, { kv: { override: "off" as const } }, { kv: { override: 4 } }, { kv: { override: 8 } },
         { kv: { turboQuant: { kBits: 8, vBits: 3 } } }]) expect(pick(other)).toBe("gemma4");
     });
   }
-
-  test("a generated file's scheme on another fingerprint, or a non-generated Gemma 4 artifact, gets the generic graph", async () => {
-    const e4b = await fixture(stems["gemma4-e4b"]), twelve = await fixture(stems["gemma4-12b"]);
-    const e4bScheme = on(M4_PRO, e4b, { kv: { override: "config" } });
-    expect(table.match(configFingerprint(twelve), e4bScheme).id).toBe("gemma4");
-    expect(table.match("0000000000000000", e4bScheme).id).toBe("gemma4");
+  test("another fingerprint or another file's cache scheme gets the generic default", () => {
+    const config = configFor(gemmaE4b), scheme = on(M4_PRO, config, { kv: { override: "config" } });
+    expect(table.match(gemma12b.FINGERPRINT, scheme).id).toBe("gemma4");
+    expect(table.match("0000000000000000", scheme).id).toBe("gemma4");
   });
 });
+
+import * as gemmaE4b from "../../src/models/gemma4/gemma4-e4b";
+import * as gemma12b from "../../src/models/gemma4/gemma4-12b";
+import * as gemma26b from "../../src/models/gemma4/gemma4-26b";
 
 test("every resident family's table has its generic graph, named for the family", () => {
   for (const [graph, table] of Object.entries(MLX_GRAPH_TABLES)) expect([graph, table.generic.id]).toEqual([graph, graph]);

@@ -1,3 +1,4 @@
+import type { TestGraph } from "../models/test-composition";
 import { describe, expect, test } from "bun:test";
 import { dirname, isAbsolute, join } from "node:path";
 import { DenoisingKeys, denoiseAsync, denoiseSync, type DiffusionGenOptions } from "../../src/generation/diffusion";
@@ -536,7 +537,7 @@ describe("interleaved shared denoising", () => {
       },
       extendPrefill: f.graph.extendPrefill, decoderLogits: f.graph.decoderLogits,
       dequantEmbedWeight: f.graph.dequantEmbedWeight, softEmbeddings: f.graph.softEmbeddings,
-    }) as DiffusionGemmaModel;
+    }) as TestGraph<DiffusionGemmaModel>;
     const binding = bindMlxGateway(model);
     const shape = { hasVision: false, hasAdapters: true, hasRepetitionPenalty: false, userSeed: true,
       hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: false };
@@ -575,7 +576,7 @@ test.skipIf(!diffusionModel)("real DiffusionGemma rows reproduce solo runs and m
   const weights = await Weights.open(diffusionModel!);
   try {
     const config = await loadModelConfig(diffusionModel!);
-    const model = createModel(weights, config) as DiffusionGemmaModel;
+    const model = createModel(weights, config) as TestGraph<DiffusionGemmaModel>;
     const binding = bindLegacyDenoisingModel(model);
     const run = async (rows: { prompt: number[]; options: DiffusionGenOptions; cancelAtStep?: number; joinAfter?: number }[]) => {
       const states = new Map<unknown, number>(), stepsByRow = new Map<number, number>();

@@ -3,6 +3,7 @@ import { Dtype, deviceArchitecture } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { quantFor, type ModelConfig, type QuantSpec } from "../artifacts/config";
 import type { Weights } from "../artifacts/weights";
+import { LoraDelta, type LoraState, type LoraWeights } from "./lora";
 import { QuantizedLinear } from "./quantized-linear";
 import { wordsPerBlock } from "../kernels/trellis/codebook";
 import {
@@ -68,7 +69,7 @@ export function trellisRows(lin: TrellisLinear, start: number, stop: number): Tr
   const codes = lin.codes.slice([start, 0], [stop, lin.codes.shape[1]!]);
   const scales = lin.scales.slice([start], [stop]);
   ops.evalAll([codes, scales]);
-  return new TrellisLinear(codes, scales, lin.spec);
+  return new TrellisLinear(codes, scales, lin.spec, false, lin.representations);
 }
 
 /** Stored rows [start, stop) of an axis-0 Trellis projection (input features of
@@ -82,10 +83,17 @@ export function trellisStoredRows(lin: TrellisLinear, start: number, stop: numbe
     : lin.codes.slice([start, 0], [stop, lin.codes.shape[1]!]);
   const scales = lin.scales.slice([start], [stop]);
   ops.evalAll([codes, scales]);
-  return new TrellisLinear(codes, scales, lin.spec);
+  return new TrellisLinear(codes, scales, lin.spec, false, lin.representations);
 }
 
 export class TrellisLinear {
+  readonly delta: LoraDelta;
+  get adapters(): Map<string, LoraWeights> | null { return this.delta.adapters; }
+  set adapters(value: Map<string, LoraWeights> | null) { this.delta.adapters = value; }
+  get loraState(): LoraState | null { return this.delta.loraState; }
+  set loraState(value: LoraState | null) { this.delta.loraState = value; }
+  get dropoutId(): number { return this.delta.dropoutId; }
+  set dropoutId(value: number) { this.delta.dropoutId = value; }
   readonly geometry: TrellisGeometry;
   readonly spec: QuantSpec;
   /** The decode variant every kernel over these weights runs (kernels/trellis/index.ts): the row-form layers
@@ -100,20 +108,22 @@ export class TrellisLinear {
     readonly scales: MlxArray,
     spec: QuantSpec,
     readonly useSharedScatterCodebook = false,
+    representations: TrellisRepresentations = qualifiedRepresentations(deviceArchitecture()),
   ) {
     this.spec = spec;
     this.geometry = trellisGeometry(codes, spec);
+    this.delta = new LoraDelta(this.geometry.inFeatures, this.geometry.outFeatures);
     if (this.geometry.blockInterleave && (scales.ndim !== 1 || scales.size !== this.geometry.rows))
       throw new Error("trellis: interleaved codes require one scale per stored row");
-    this.representations = qualifiedRepresentations(deviceArchitecture());
+    this.representations = representations;
   }
 
-  static load(weights: Weights, path: string, config: ModelConfig, useSharedScatterCodebook = false): TrellisLinear {
+  static load(weights: Weights, path: string, config: ModelConfig, useSharedScatterCodebook = false, representations?: TrellisRepresentations): TrellisLinear {
     const spec = quantFor(config.quantization, path);
     if (!spec || spec.mode !== "trellis")
       throw new Error(`${path}: expected a trellis quant spec`);
     if (!weights.has(`${path}.scales`)) throw new Error(`${path}: trellis tensor has no .scales`);
-    return new TrellisLinear(weights.tensor(`${path}.weight`), weights.tensor(`${path}.scales`), spec, useSharedScatterCodebook);
+    return new TrellisLinear(weights.tensor(`${path}.weight`), weights.tensor(`${path}.scales`), spec, useSharedScatterCodebook, representations);
   }
 
   static isTrellis(config: ModelConfig, path: string): boolean {
@@ -175,7 +185,7 @@ export class TrellisLinear {
     // matmul's reference. Direct tiles and packed matvecs stay lazy: they
     // hold activations and bounded partials, without a dense weight matrix.
     if (expandedWeights && boundExpansion) out.eval();
-    return out;
+    return this.delta.forward(x, out);
   }
 }
 

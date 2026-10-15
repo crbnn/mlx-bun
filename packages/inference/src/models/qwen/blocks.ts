@@ -21,7 +21,6 @@ import type { AttentionRead, Cache, CommittedAttentionCache, GatedDeltaCache, Ga
 import { applyInterleavedRope } from "../../layers/qwen-mrope";
 import type { MropeForwardState } from "../../contracts/mlx/positions";
 import type { ReadPhase } from "../graph";
-import type { MlxWidthClass } from "../../contracts/mlx/graph";
 
 const PREFIX = "language_model";
 
@@ -102,6 +101,12 @@ export function compiledSilu(x: MlxArray): MlxArray {
 /** A projection the blocks can run: affine-quantized here, dense or quantized
  *  in the MTP companion. Only QuantizedLinear reads `independentRows`. */
 export interface AttentionLinear { forward(x: MlxArray, independentRows?: boolean): MlxArray }
+export interface QwenAttentionProjections<L extends AttentionLinear> {
+  readonly qProj: L; readonly kProj: L; readonly vProj: L; readonly oProj: L;
+}
+export interface QwenDeltaProjections<L extends AttentionLinear> {
+  readonly inProjQkv: L; readonly inProjZ: L; readonly inProjB: L; readonly inProjA: L; readonly outProj: L;
+}
 export type AttentionLinearLoader<L extends AttentionLinear> = (weights: Weights, path: string, config: ModelConfig) => L;
 
 /** Gated-DeltaNet linear-attention block (mlx-lm GatedDeltaNet): projections,
@@ -135,7 +140,8 @@ export class GatedDeltaNet<L extends AttentionLinear = QuantizedLinear> {
   readonly recurrence: GatedDeltaParameters;
 
   constructor(weights: Weights, config: ModelConfig, prefix: string,
-    loadLinear: AttentionLinearLoader<L> = QuantizedLinear.load as unknown as AttentionLinearLoader<L>) {
+    loadLinear: AttentionLinearLoader<L> = QuantizedLinear.load as unknown as AttentionLinearLoader<L>,
+    projections?: QwenDeltaProjections<L>) {
     const t = config.text;
     this.numKHeads = t.linearNumKeyHeads;
     this.numVHeads = t.linearNumValueHeads;
@@ -145,11 +151,11 @@ export class GatedDeltaNet<L extends AttentionLinear = QuantizedLinear> {
     this.valueDim = this.headVDim * this.numVHeads;
     this.convKernel = t.linearConvKernelDim;
     this.eps = t.rmsNormEps;
-    this.inProjQkv = loadLinear(weights, `${prefix}.in_proj_qkv`, config);
-    this.inProjZ = loadLinear(weights, `${prefix}.in_proj_z`, config);
-    this.inProjB = loadLinear(weights, `${prefix}.in_proj_b`, config);
-    this.inProjA = loadLinear(weights, `${prefix}.in_proj_a`, config);
-    this.outProj = loadLinear(weights, `${prefix}.out_proj`, config);
+    this.inProjQkv = projections?.inProjQkv ?? loadLinear(weights, `${prefix}.in_proj_qkv`, config);
+    this.inProjZ = projections?.inProjZ ?? loadLinear(weights, `${prefix}.in_proj_z`, config);
+    this.inProjB = projections?.inProjB ?? loadLinear(weights, `${prefix}.in_proj_b`, config);
+    this.inProjA = projections?.inProjA ?? loadLinear(weights, `${prefix}.in_proj_a`, config);
+    this.outProj = projections?.outProj ?? loadLinear(weights, `${prefix}.out_proj`, config);
     this.convWeight = weights.tensor(`${prefix}.conv1d.weight`);
     this.aLog = weights.tensor(`${prefix}.A_log`);
     this.dtBias = weights.tensor(`${prefix}.dt_bias`);
@@ -263,7 +269,8 @@ export class Qwen3Attention<L extends AttentionLinear = QuantizedLinear> {
   constructor(weights: Weights, config: ModelConfig, prefix: string,
     // The default projection type L is QuantizedLinear (the loader's own type).
     loadLinear: AttentionLinearLoader<L> = QuantizedLinear.load as unknown as AttentionLinearLoader<L>,
-    readonly reads: AttentionReadStrategy = cacheRead) {
+    readonly reads: AttentionReadStrategy = cacheRead,
+    projections?: QwenAttentionProjections<L>) {
     const t = config.text;
     this.nHeads = t.numAttentionHeads;
     this.nKvHeads = t.numKeyValueHeads;
@@ -271,10 +278,10 @@ export class Qwen3Attention<L extends AttentionLinear = QuantizedLinear> {
     this.scale = Math.pow(this.headDim, -0.5);
     this.ropeDims = Math.trunc(this.headDim * t.partialRotaryFactor);
     this.ropeBase = t.ropeParameters.full_attention?.ropeTheta ?? 10000;
-    this.qProj = loadLinear(weights, `${prefix}.q_proj`, config);
-    this.kProj = loadLinear(weights, `${prefix}.k_proj`, config);
-    this.vProj = loadLinear(weights, `${prefix}.v_proj`, config);
-    this.oProj = loadLinear(weights, `${prefix}.o_proj`, config);
+    this.qProj = projections?.qProj ?? loadLinear(weights, `${prefix}.q_proj`, config);
+    this.kProj = projections?.kProj ?? loadLinear(weights, `${prefix}.k_proj`, config);
+    this.vProj = projections?.vProj ?? loadLinear(weights, `${prefix}.v_proj`, config);
+    this.oProj = projections?.oProj ?? loadLinear(weights, `${prefix}.o_proj`, config);
     this.qNorm = new RMSNorm(weights.tensor(`${prefix}.q_norm.weight`), t.rmsNormEps);
     this.kNorm = new RMSNorm(weights.tensor(`${prefix}.k_norm.weight`), t.rmsNormEps);
   }
@@ -283,6 +290,22 @@ export class Qwen3Attention<L extends AttentionLinear = QuantizedLinear> {
    *  `cache` and attending through the read `phase` names. Media forwards
    *  supply their own positions in `mrope`. */
   forward(x: MlxArray, cache: Cache, phase: ReadPhase, mrope: MropeForwardState | null = null): MlxArray {
+    return mrope ? this.forwardMedia(x, cache, phase, mrope) : this.forwardText(x, cache, phase);
+  }
+
+  forwardText(x: MlxArray, cache: Cache, phase: ReadPhase): MlxArray {
+    const offArr = cache.ropeOffsetArr;
+    const position = offArr
+      ? (value: MlxArray) => ops.ropeDynamic(value, this.ropeDims, this.ropeBase, offArr, null)
+      : (value: MlxArray) => ops.rope(value, this.ropeDims, this.ropeBase, cache.offset, null);
+    return this.forwardPositioned(x, cache, phase, position);
+  }
+
+  forwardMedia(x: MlxArray, cache: Cache, phase: ReadPhase, mrope: MropeForwardState): MlxArray {
+    return this.forwardPositioned(x, cache, phase, value => applyInterleavedRope(value, mrope));
+  }
+
+  protected forwardPositioned(x: MlxArray, cache: Cache, phase: ReadPhase, position: (value: MlxArray) => MlxArray): MlxArray {
     const [B, L] = x.shape as [number, number, number];
     const rowsApart = projectRowsApart[phase];
     // Diagnostic sub-phase timing (same switch as GatedDeltaNet): projections
@@ -324,18 +347,8 @@ export class Qwen3Attention<L extends AttentionLinear = QuantizedLinear> {
     // Media forwards supply their own 3D interleaved positions. The reference
     // never uses the fused fast-rope kernel when position_ids are supplied,
     // so this IS the oracle's own arithmetic. Text-only stays on ops.rope.
-    const offArr = cache.ropeOffsetArr;
-    if (mrope) {
-      q = disposing(q, applyInterleavedRope(q, mrope));
-      k = disposing(k, applyInterleavedRope(k, mrope));
-    } else {
-      q = disposing(q, offArr
-        ? ops.ropeDynamic(q, this.ropeDims, this.ropeBase, offArr, null)
-        : ops.rope(q, this.ropeDims, this.ropeBase, cache.offset, null));
-      k = disposing(k, offArr
-        ? ops.ropeDynamic(k, this.ropeDims, this.ropeBase, offArr, null)
-        : ops.rope(k, this.ropeDims, this.ropeBase, cache.offset, null));
-    }
+    q = disposing(q, position(q));
+    k = disposing(k, position(k));
 
     lap("attnProj", [q, k, v, gate]);
     const read = this.reads.read(cache, phase, k, v);
@@ -364,8 +377,35 @@ export class Qwen3Attention<L extends AttentionLinear = QuantizedLinear> {
   }
 }
 
+/** Text positions are selected by the text phase, never by media state. */
+export class Qwen3TextAttention<L extends AttentionLinear = QuantizedLinear> extends Qwen3Attention<L> {
+  constructor(weights: Weights, config: ModelConfig, prefix: string, projections: QwenAttentionProjections<L>, reads: AttentionReadStrategy = cacheRead) {
+    super(weights, config, prefix, undefined, reads, projections);
+  }
+  override forward(x: MlxArray, cache: Cache, phase: ReadPhase): MlxArray {
+    return this.forwardText(x, cache, phase);
+  }
+}
+
+/** Media phases bind the interleaved positions variant explicitly. */
+export class Qwen3MediaAttention<L extends AttentionLinear = QuantizedLinear> extends Qwen3Attention<L> {
+  constructor(weights: Weights, config: ModelConfig, prefix: string, projections: QwenAttentionProjections<L>, reads: AttentionReadStrategy = cacheRead) {
+    super(weights, config, prefix, undefined, reads, projections);
+  }
+  override forward(x: MlxArray, cache: Cache, phase: ReadPhase, mrope: MropeForwardState | null = null): MlxArray {
+    return this.forwardMedia(x, cache, phase, mrope!);
+  }
+}
+
+/** Recurrence block with every projection named at its call site. */
+export class QwenGatedDeltaNet<L extends AttentionLinear = QuantizedLinear> extends GatedDeltaNet<L> {
+  constructor(weights: Weights, config: ModelConfig, prefix: string, projections: QwenDeltaProjections<L>) {
+    super(weights, config, prefix, undefined, projections);
+  }
+}
+
 /** The width classes whose rows the fused Trellis gate/up kernel takes (up to `TRELLIS_MATVEC_MAX_M` rows). */
-const FUSED_GATE_UP_WIDTHS: ReadonlySet<MlxWidthClass> = new Set<MlxWidthClass>(["one", "twoToThree", "four"]);
+const FUSED_GATE_UP_WIDTHS: ReadonlySet<number> = new Set<number>([1, 2, 3, 4]);
 
 /** The MLP over Trellis-coded projections (a packed-Trellis artifact's
  *  `mode: "trellis"` entries). Its input is the post-attention norm's output,
@@ -384,7 +424,7 @@ export class TrellisMlp {
   /** `x` [.., hidden] (borrowed, row-contiguous) to an owned [.., hidden].
    *  Every phase computes the same rows; `width` is the class of `x`'s rows,
    *  named by the caller. */
-  forward(x: MlxArray, _phase: ReadPhase, width: MlxWidthClass): MlxArray {
+  forward(x: MlxArray, _phase: ReadPhase, width: number): MlxArray {
     // Packed-trellis decode (up to four rows): gate, up and the swiglu in ONE
     // kernel — x read once, no gate/up vectors materialized. This Lab path
     // retains the packed activation arithmetic documented in
@@ -416,7 +456,7 @@ export class AffineMlp {
 
   /** `x` [.., hidden] (borrowed) to an owned [.., hidden], with the projection
    *  arithmetic `phase` names; every width class takes the same kernels. */
-  forward(x: MlxArray, phase: ReadPhase, _width: MlxWidthClass): MlxArray {
+  forward(x: MlxArray, phase: ReadPhase, _width: number): MlxArray {
     const rowsApart = projectRowsApart[phase];
     const g = this.gate.forward(x, rowsApart);
     const u = this.up.forward(x, rowsApart);
@@ -435,15 +475,15 @@ export type QwenMlp = TrellisMlp | AffineMlp;
 /** The MLP block the written-down quant table names for `prefix`: Trellis when
  *  its gate, up and down entries are `mode: "trellis"`, affine when none is.
  *  A table that mixes the two in one MLP has no block here and is refused. */
-export function loadQwenMlp(weights: Weights, config: ModelConfig, prefix: string): QwenMlp {
+export function loadQwenMlp(weights: Weights, config: ModelConfig, prefix: string, representations?: import("../../kernels/trellis/index").TrellisRepresentations): QwenMlp {
   const paths = [`${prefix}.gate_proj`, `${prefix}.up_proj`, `${prefix}.down_proj`] as const;
   const trellis = paths.map(path => TrellisLinear.isTrellis(config, path));
   if (trellis.every(Boolean)) {
     // M4 Pro measurements support the 27B down projection at M3/4. The
     // operation also checks variant, dtype and packed-code layout eligibility.
     const sharedScatterCodebook = config.text.hiddenSize === 5120 && config.text.intermediateSize === 17408;
-    return new TrellisMlp(TrellisLinear.load(weights, paths[0], config), TrellisLinear.load(weights, paths[1], config),
-      TrellisLinear.load(weights, paths[2], config, sharedScatterCodebook));
+    return new TrellisMlp(TrellisLinear.load(weights, paths[0], config, false, representations), TrellisLinear.load(weights, paths[1], config, false, representations),
+      TrellisLinear.load(weights, paths[2], config, sharedScatterCodebook, representations));
   }
   if (!trellis.some(Boolean))
     return new AffineMlp(QuantizedLinear.load(weights, paths[0], config), QuantizedLinear.load(weights, paths[1], config),
@@ -460,20 +500,20 @@ export class Qwen3Layer {
   readonly inputNorm: RMSNorm;
   readonly postAttnNorm: RMSNorm;
 
-  constructor(weights: Weights, config: ModelConfig, layerIdx: number) {
+  constructor(weights: Weights, config: ModelConfig, layerIdx: number, representations?: import("../../kernels/trellis/index").TrellisRepresentations) {
     const prefix = `${PREFIX}.model.layers.${layerIdx}`;
     this.isLinear = (layerIdx + 1) % config.text.fullAttentionInterval !== 0;
     if (this.isLinear)
       this.linearAttn = new GatedDeltaNet(weights, config, `${prefix}.linear_attn`);
     else this.selfAttn = new Qwen3Attention(weights, config, `${prefix}.self_attn`);
-    this.mlp = loadQwenMlp(weights, config, `${prefix}.mlp`);
+    this.mlp = loadQwenMlp(weights, config, `${prefix}.mlp`, representations);
     this.inputNorm = new RMSNorm(weights.tensor(`${prefix}.input_layernorm.weight`), config.text.rmsNormEps);
     this.postAttnNorm = new RMSNorm(weights.tensor(`${prefix}.post_attention_layernorm.weight`), config.text.rmsNormEps);
   }
 
   /** One layer over `x` [.., hidden] (borrowed) for `phase`; `width` is the class of `x`'s rows, which picks the
    *  MLP's kernels. */
-  forward(x: MlxArray, cache: Cache, phase: ReadPhase, mrope: MropeForwardState | null, width: MlxWidthClass): MlxArray {
+  forward(x: MlxArray, cache: Cache, phase: ReadPhase, mrope: MropeForwardState | null, width: number): MlxArray {
     using h = this.forwardAttn(x, cache, phase, mrope);
     return this.forwardMlp(h, phase, width);
   }
@@ -486,7 +526,7 @@ export class Qwen3Layer {
     return ops.add(x, r);
   }
 
-  forwardMlp(h: MlxArray, phase: ReadPhase, width: MlxWidthClass): MlxArray {
+  forwardMlp(h: MlxArray, phase: ReadPhase, width: number): MlxArray {
     using hn = this.postAttnNorm.forward(h);
     // Diagnostic (same switch as the attention/DeltaNet sub-phases): settle the
     // pending attention block first so the MLP is timed alone.
@@ -498,5 +538,57 @@ export class Qwen3Layer {
     using m = this.mlp.forward(hn, phase, width);
     if (prof) { ops.evalAll([m]); prof.mlp = (prof.mlp ?? 0) + performance.now() - t0; }
     return ops.add(h, m);
+  }
+}
+
+/** A recurrent decoder layer whose mixer and MLP are named by its graph. */
+export class QwenDeltaLayer {
+  readonly inputNorm: RMSNorm;
+  readonly postAttnNorm: RMSNorm;
+  constructor(weights: Weights, config: ModelConfig, prefix: string,
+    readonly mixer: { forward(x: MlxArray, cache: GatedDeltaCache, phase: ReadPhase): MlxArray },
+    readonly mlp: { forward(x: MlxArray): MlxArray }) {
+    this.inputNorm = new RMSNorm(weights.tensor(`${prefix}.input_layernorm.weight`), config.text.rmsNormEps);
+    this.postAttnNorm = new RMSNorm(weights.tensor(`${prefix}.post_attention_layernorm.weight`), config.text.rmsNormEps);
+  }
+  forwardAttn(x: MlxArray, cache: Cache, phase: ReadPhase): MlxArray {
+    using normed = this.inputNorm.forward(x);
+    using mixed = this.mixer.forward(normed, cache as GatedDeltaCache, phase);
+    return ops.add(x, mixed);
+  }
+  forwardMlp(x: MlxArray): MlxArray {
+    using normed = this.postAttnNorm.forward(x);
+    using hidden = this.mlp.forward(normed);
+    return ops.add(x, hidden);
+  }
+  forward(x: MlxArray, cache: Cache, phase: ReadPhase): MlxArray {
+    using hidden = this.forwardAttn(x, cache, phase);
+    return this.forwardMlp(hidden);
+  }
+}
+
+/** Full-attention decoder layer; text and media mixers are separate bindings. */
+export class QwenAttentionLayer {
+  readonly inputNorm: RMSNorm;
+  readonly postAttnNorm: RMSNorm;
+  constructor(weights: Weights, config: ModelConfig, prefix: string,
+    readonly mixer: { forward(x: MlxArray, cache: Cache, phase: ReadPhase, positions?: MropeForwardState | null): MlxArray },
+    readonly mlp: { forward(x: MlxArray): MlxArray }) {
+    this.inputNorm = new RMSNorm(weights.tensor(`${prefix}.input_layernorm.weight`), config.text.rmsNormEps);
+    this.postAttnNorm = new RMSNorm(weights.tensor(`${prefix}.post_attention_layernorm.weight`), config.text.rmsNormEps);
+  }
+  forwardAttn(x: MlxArray, cache: Cache, phase: ReadPhase, positions: MropeForwardState | null = null): MlxArray {
+    using normed = this.inputNorm.forward(x);
+    using mixed = this.mixer.forward(normed, cache, phase, positions);
+    return ops.add(x, mixed);
+  }
+  forwardMlp(x: MlxArray): MlxArray {
+    using normed = this.postAttnNorm.forward(x);
+    using hidden = this.mlp.forward(normed);
+    return ops.add(x, hidden);
+  }
+  forward(x: MlxArray, cache: Cache, phase: ReadPhase, positions: MropeForwardState | null = null): MlxArray {
+    using hidden = this.forwardAttn(x, cache, phase, positions);
+    return this.forwardMlp(hidden);
   }
 }

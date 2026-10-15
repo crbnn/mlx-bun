@@ -1,3 +1,5 @@
+import type { TestGraph } from "../models/test-composition";
+import type { Composition } from "../../src/contracts/portable/composition";
 import { expect, test } from "bun:test";
 import { bindMlxGateway } from "../../src/execution/gateway-binding";
 import { Gemma4Model } from "../../src/models/gemma4/model";
@@ -23,7 +25,7 @@ test(`ordinary shared continuation binds ${name} through its loaded backend`, ()
     config: { modelType: name, text: { enableMoeBlock: false }, eosTokenIds: [] },
     makeCache: () => [new KVCache()], composition: testComposition(kvOf(kv)),
     loraState: { active: [] },
-  }) as Gemma4Model;
+  }) as TestGraph<Gemma4Model>;
   const model = make();
   const binding = bindMlxGateway(model);
   expect(binding.plan(shape, {}, unscheduled).checkpoint).toBe(false);
@@ -59,7 +61,7 @@ test("Gemma2 softcap plans shared continuation for plain, affine and TurboQuant 
     config: { modelType: "gemma2", text: { enableMoeBlock: false }, eosTokenIds: [] },
     makeCache: () => [new KVCache()], loraState: { active: [] },
     composition: testComposition(kvOf(kv)),
-  }) as UniversalDenseModel;
+  }) as TestGraph<UniversalDenseModel>;
   const model = make();
   const binding = bindMlxGateway(model);
   expect(binding.plan(shape, {}, unscheduled)).toMatchObject({ mechanism: "continuous", checkpoint: false });
@@ -104,7 +106,7 @@ test("a paged composition pages plain, adapter and media requests alike and keys
     config: { modelType, text: { enableMoeBlock: false }, eosTokenIds: [] },
     makeCache: () => [new KVCache()], loraState: { active: [] },
     composition: testComposition(undefined, { pagedKv }),
-  }) as M;
+  }) as TestGraph<M>;
   const lookups: unknown[][] = [];
   const store = { findGenerationCheckpoint: (...args: unknown[]) => { lookups.push(args); return null; } } as unknown as ContinuationStore;
   const continuations = { store, persistence: new ContinuationPersistence(store, { maxBytes: 1024 }), everyTokens: 4 };
@@ -134,7 +136,7 @@ test("a paged composition pages plain, adapter and media requests alike and keys
   // The method's namespace is the composition's alike; the cache service adds its paging.
   expect(binding.prefixNamespace!(plan, adapters, "upper@a")).toBe("upper@a");
   expect(unpaged.prefixNamespace!(plan, adapters, "upper@a")).toBe("upper@a");
-  const namespace = pagedPrefixNamespace(pagedGraph.composition!.kv, { blockSize: 16, direct: false }, "upper@a");
+  const namespace = pagedPrefixNamespace((pagedGraph as TestGraph<Gemma4Model> & { composition: Composition }).composition.kv, { blockSize: 16, direct: false }, "upper@a");
   expect(JSON.parse(namespace)[0]).toBe("paged-v1");
   expect(binding.reusesPrefix(plan)).toBe(true);
   const requests = [binding.continuationRequest!(plan, adapters, prompt, () => {}, 4)!,

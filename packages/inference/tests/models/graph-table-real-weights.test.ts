@@ -1,8 +1,8 @@
-// The loader's selection on real artifacts, through openModel: a generated Gemma 4
+// The loader's selection on real artifacts, through openModel: a written Gemma 4
 // artifact gets the generic graph for the default composition (bf16 KV) and its
-// generated graph for the kv_config composition (`--kv-quant config`); the
+// written graph for the kv_config composition (`--kv-quant config`); the
 // published Qwen3.8 Trellis artifact gets the M4 Pro graph on applegpu_g16s and
-// the generated M1 Max graph on applegpu_g13s for the default composition. The graphs are
+// the written M1 Max graph on applegpu_g13s for the default composition. The graphs are
 // constructed (weights open, nothing runs a forward). Opt in with
 //   MLX_BUN_TEST_GRAPH_TABLE_MODEL=/snapshot
 // naming one such artifact. Unset skips; a blank value, a missing config.json or
@@ -33,8 +33,8 @@ test.skipIf(!inputs)("openModel builds the graph the table selects for the compo
   const { Qwen38TrellisM4Pro } = await import("../../src/models/qwen/qwen38-27b-trellis-m4pro");
   const { Qwen38TrellisM1Max } = await import("../../src/models/qwen/qwen38-27b-trellis-m1max");
   const { qwen35GraphFingerprint } = await import("../../src/models/qwen/checkpoint");
-  const generated = await Promise.all([import("../../src/models/gemma4/generated/gemma4-12b"),
-    import("../../src/models/gemma4/generated/gemma4-e4b"), import("../../src/models/gemma4/generated/gemma4-26b")]);
+  const [twelve, e4b, moe] = await Promise.all([import("../../src/models/gemma4/gemma4-12b"),
+    import("../../src/models/gemma4/gemma4-e4b"), import("../../src/models/gemma4/gemma4-26b")]);
   const dir = inputs!.model;
   const config = await loadModelConfig(dir);
   const device = deviceArchitecture();
@@ -44,16 +44,19 @@ test.skipIf(!inputs)("openModel builds the graph the table selects for the compo
     try { return model.constructor; } finally { (model as { dispose?: () => void }).dispose?.(); }
   };
 
-  const gemma = generated.find(module => module.FINGERPRINT === configFingerprint(config));
+  const written = [{ fingerprint: twelve.FINGERPRINT, Graph: twelve.Gemma4TwelveB },
+    { fingerprint: e4b.FINGERPRINT, Graph: e4b.Gemma4E4b },
+    { fingerprint: moe.FINGERPRINT, Graph: moe.Gemma4Moe }];
+  const gemma = written.find(entry => entry.fingerprint === configFingerprint(config));
   if (gemma) {
-    assert(config.kvQuant?.length, `${MODEL}: a generated Gemma 4 artifact ships kv_config.json`);
+    assert(config.kvQuant?.length, `${MODEL}: a written Gemma 4 artifact ships kv_config.json`);
     expect(await built()).toBe(Gemma4Model);
-    expect(await built(resolveComposition(config, { kv: { override: "config" } }))).toBe(gemma.GeneratedGemma4);
-    console.log(`[graph-table] ${dir}: default composition -> Gemma4Model; kv_config composition -> generated ${gemma.FINGERPRINT}`);
+    expect(await built(resolveComposition(config, { kv: { override: "config" } }))).toBe(gemma.Graph);
+    console.log(`[graph-table] ${dir}: default composition -> Gemma4Model; kv_config composition -> written ${gemma.fingerprint}`);
     return;
   }
   assert(qwen35GraphFingerprint(config) === "cfa205c8f5af046a", `${MODEL}: no selection expectation for ${dir}`);
-  assert(device === "applegpu_g16s" || device === "applegpu_g13s", `${MODEL}: the Trellis artifact has a generated graph for g16s and g13s, not ${device}`);
+  assert(device === "applegpu_g16s" || device === "applegpu_g13s", `${MODEL}: the Trellis artifact has a written graph for g16s and g13s, not ${device}`);
   const expected = device === "applegpu_g16s" ? Qwen38TrellisM4Pro : Qwen38TrellisM1Max;
   expect(await built()).toBe(expected);
   console.log(`[graph-table] ${dir} on ${device}: default composition -> ${expected.name}`);

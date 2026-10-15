@@ -1,10 +1,11 @@
+import { pagedDecodeCompiles } from "../state/layout";
 import { type MlxForwardWork,type MlxPreparationWork } from "../contracts/mlx/forward-work";
 import type { DisposableResource } from "../contracts/portable/resources";
 import type { ExecutionGroup } from "../contracts/portable/scheduling";
 import { cleanupFailure,disposeResources,withResource } from "../runtime/resources";
 import { KvCacheService, type RequestStateCache } from "../state/cache-service";
 import { AdmissionRejected } from "./admission";
-import { runMixedTokenIteration } from "./mixed-iteration";
+import { runMixedTokenIteration, dispatchMixedGroups } from "./mixed-iteration";
 import { MlxPrefillCohort,type PrefillState } from "./prefill-cohort";
 import type { MlxPrefillForward } from "./prefill-rows";
 import { MlxPhaseDispatch } from "../generation/phase-dispatch";
@@ -63,7 +64,7 @@ import { activeMemory,cacheMemory,clearCache,Dtype,peakMemory } from "@mlx-bun/m
 import * as ops from "@mlx-bun/mlx/ops";
 import { type Cache } from "../contracts/mlx/cache";
 import type { PrefillPolicy } from "../contracts/portable/prefill";
-import { widthClass, type MlxCompiledDecodeStep, type MlxMixedForward } from "../contracts/mlx/graph";
+import { type MlxCompiledDecodeStep, type MlxMixedRange, type MlxSeparateMixed } from "../contracts/mlx/graph";
 import { BF16_KV,COMPOSITION_DEFAULTS } from "../contracts/portable/composition";
 import { resolveMlxPrefillPolicy } from "../generation/bindings/prefill-policy";
 import { acquireModelWiredLimit } from "../generation/index";
@@ -160,7 +161,8 @@ export class MlxBatchExecutionGroup {
   readonly #vectorGreedy: boolean;
   /** The mixed iteration: the graph's mixed-rows forward when it declares one and the composition's
    *  `mixedPrefill` is on (default off), bound once; null otherwise. */
-  readonly #mixed: MlxMixedForward | null;
+  readonly #mixed: readonly MlxMixedRange[] | null;
+  readonly #mixedSeparate: MlxSeparateMixed | undefined;
   /** The composition's `mixedTokenBudget`: prompt tokens one mixed forward carries. */
   readonly #mixedTokenBudget: number;
 
@@ -185,12 +187,13 @@ export class MlxBatchExecutionGroup {
     const proto = withRuntimeConfig(this.#runtime, () => model.makeCache()); // fresh caches hold no buffers
     for (const c of proto) c.dispose();
     // The composition decided at load whether its storage has a compiled form.
-    this.#compiled = facts.compiledDecode
+    this.#compiled = (!model.composition?.pagedKv || pagedDecodeCompiles(model.composition.pagedKv, model.composition.kv))
       ? withRuntimeConfig(this.#runtime, () => compiledDecodeStepOf(model))
       : null;
     this.#dispatch = new MlxPhaseDispatch(tokenPhasesOf(model));
     this.#vectorGreedy = facts.vectorGreedySampling;
-    this.#mixed = facts.mixedPrefill && model.mixed ? model.mixed : null;
+    this.#mixed = facts.mixedPrefill && (model.mixed || model.mixedSeparate) ? model.mixed ?? [] : null;
+    this.#mixedSeparate = model.mixedSeparate;
     this.#mixedTokenBudget = facts.mixedTokenBudget;
   }
 
@@ -331,7 +334,7 @@ export class MlxBatchExecutionGroup {
             const closes = [...this.#running, ...(this.#prefill?.rows ?? [])].map(row =>
               row.req.trace?.begin("engine.mixed_forward", { workId,
                 decodeTokens: tokens[0]!, prefillTokens: tokens[1]!, packedTokens: tokens[0]! + tokens[1]! }));
-            try { return mixed(groups, widthClass(rows)); }
+            try { return dispatchMixedGroups(groups, rows, mixed, this.#mixedSeparate); }
             finally { for (const close of closes) close?.(); }
           },
         });
@@ -480,7 +483,6 @@ export class MlxBatchExecutionGroup {
     for (const row of rows) row.reject(error);
     disposeResources(resources);
   }
-
 
   /** The target owns projection geometry; samplers receive individual rows. */
   #projectPrefill(hidden: MlxArray, caches: Cache[], completed: readonly PrefillState[], step: MlxPrefillForward): MlxArray {
@@ -669,10 +671,10 @@ export class MlxBatchExecutionGroup {
   /** One decode forward of the `B` running rows: the media rows' positioned decode or the graph's decode for
    *  their width, through the mixed iteration's hook when it runs one. */
   #decodeForward(ids: MlxArray, caches: Cache[], B: number, work?: MlxForwardWork): Promise<MlxArray> {
-    const width = widthClass(B), decodeState = this.#running[0]?.req.promptInput?.decodeState;
+    const width = (B), decodeState = this.#running[0]?.req.promptInput?.decodeState;
     const states = decodeState ? this.#running.map(row => row.req.promptInput!.decodeState!) : null;
     const own = async () => decodeState ? decodeState.decode(ids, caches, states!, width) : this.#dispatch.decode(B)(ids, caches, null);
-    return work ? work(ids, caches, { phase: "decode", rows: B, width, capture: null, own }) : own();
+    return work ? work(ids, caches, { phase: "decode", rows: B, capture: null, own }) : own();
   }
 
   async #step(forward?: MlxForwardWork): Promise<void> {

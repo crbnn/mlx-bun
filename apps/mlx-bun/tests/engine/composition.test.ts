@@ -39,19 +39,16 @@ test("a loaded model records the composition resolved before its graph was built
   const { modelServingBinding } = await import("../../src/engine/model-serving");
   const context = await loadContext(dir, "tiny", { kv: { override: 8 }, maxRows: 3 });
   try {
-    const aneBridge = context.composition!.aneBridge;
-    expect(context.composition).toEqual({ device: deviceArchitecture(), aneBridge,
+    expect(context.composition).toEqual({ device: deviceArchitecture(),
       kv: { kind: "affine", bits: 8, groupSize: 64, kernels: "unfused" }, pagedKv: null,
-      draftDepth: 0, prefillChunkTokens: 2048, adapters: false, maxRows: 3, packedMixedMlp: true,
-      vectorGreedySampling: true, compiledDecode: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
-      grammarJump: false, greedyDraft: false, compiledGeglu: true, compiledSwiglu: true });
-    expect(typeof aneBridge).toBe("boolean");
+      draftDepth: 0, prefillChunkTokens: 2048, maxRows: 3, vectorGreedySampling: true, mixedPrefill: false, mixedTokenBudget: 256, prefillTailSplit: true,
+      grammarJump: false, greedyDraft: false });
     const binding = await modelServingBinding(context);
-    expect(binding.diagnostics()).toEqual({ composition: { device: deviceArchitecture(), ane_bridge: aneBridge,
+    expect(binding.diagnostics()).toEqual({ composition: { device: deviceArchitecture(),
       kv: { kind: "affine", bits: 8, group_size: 64, kernels: "unfused" }, paged_kv: null, draft_depth: 0, prefill_chunk_tokens: 2048,
-      adapters: false, max_rows: 3, packed_mixed_mlp: true, vector_greedy_sampling: true,
-      compiled_decode: true, mixed_prefill: false, mixed_token_budget: 256, prefill_tail_split: true, grammar_jump: false,
-      greedy_draft: false, compiled_geglu: true, compiled_swiglu: true } });
+      max_rows: 3, vector_greedy_sampling: true,
+      mixed_prefill: false, mixed_token_budget: 256, prefill_tail_split: true, grammar_jump: false,
+      greedy_draft: false } });
     // The graph's caches are the composition's: the KV8 legos it names.
     const caches = (context.model as { makeCache(): { signature(): string; dispose(): void }[] }).makeCache();
     try { expect(caches.every(cache => cache.signature() === "kv:bf16-first:kv:plain")).toBe(true); }
@@ -63,10 +60,10 @@ test("the loaded drafter settles the draft depth before the graph is built: its 
   const { loadContext } = await import("../../src/engine/model-host");
   for (const [numDraftTokens, depth] of [[undefined, 10], [4, 4]] as const) {
     const context = await loadContext(dir, "tiny", { draftKind: "ngram", ...(numDraftTokens ? { numDraftTokens } : {}),
-      kv: { override: 4, quantizedKvStart: 256 }, adapters: true });
+      kv: { override: 4, quantizedKvStart: 256 } });
     try {
       expect(context.draft?.numDraftTokens).toBe(depth);
-      expect(context.composition).toMatchObject({ draftDepth: depth, adapters: true, maxRows: 8,
+      expect(context.composition).toMatchObject({ draftDepth: depth, maxRows: 8,
         kv: { kind: "affine", bits: 4, groupSize: 64, quantizedKvStart: 256 } });
     } finally { context.dispose(); }
   }
@@ -82,7 +79,7 @@ test("paging and its read are composition fields, and /stats prints them; direct
       const binding = await modelServingBinding(context);
       const printed = (binding.diagnostics() as { composition: { paged_kv: unknown; compiled_decode: boolean } }).composition;
       expect(printed.paged_kv).toEqual(wire);
-      expect([context.composition!.compiledDecode, printed.compiled_decode]).toEqual([!wire.direct, !wire.direct]);
+      expect(printed).not.toHaveProperty("compiled_decode");
     } finally { context.dispose(); }
   }
 });

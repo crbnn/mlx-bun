@@ -1,7 +1,8 @@
+import { pagedDecodeCompiles } from "../../state/paged/cache";
 import type { GraphDescriptor } from "../../contracts/portable/graph";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { Cache } from "../../contracts/mlx/cache";
-import type { MlxCompiledDecodeStep, MlxKnownSpans, MlxModelMemory, MlxWidthClass } from "../../contracts/mlx/graph";
+import type { MlxCompiledDecodeStep, MlxKnownSpans, MlxModelMemory } from "../../contracts/mlx/graph";
 import { compiledDecodeStepOf, tokenPhasesOf } from "../../models/capabilities";
 import { runtimeConfig, type RuntimeConfig } from "../../runtime/config";
 import type { MlxTokenGraph } from "../../models/graph";
@@ -49,7 +50,7 @@ export interface MlxAutoregressiveBinding {
   /** The vision prefill phase over prepared embeddings (borrowed). */
   prefillEmbeddings?(
     embeddings: MlxArray, state: Cache[], imageMask: MlxArray | null,
-    ids: MlxArray, multimodalMask: MlxArray | null, width: MlxWidthClass,
+    ids: MlxArray, multimodalMask: MlxArray | null, width: number,
   ): MlxArray;
   /** The graph's compiled decode step for this run, chosen once after
    * prefill: present when the graph declares one, the run allows replay and
@@ -65,7 +66,7 @@ export interface MlxAutoregressiveBinding {
 export function bindMlxAutoregressiveGraph(model: MlxTokenGraph): MlxAutoregressiveBinding {
   const runtime = runtimeConfig();
   const facts = model.composition ?? COMPOSITION_DEFAULTS;
-  const compiledOn = facts.compiledDecode;
+  const compiledOn = (!model.composition?.pagedKv || pagedDecodeCompiles(model.composition.pagedKv, model.composition.kv));
   return {
     runtime,
     prefillPolicy: resolveMlxPrefillPolicy(model, runtime),
@@ -79,7 +80,9 @@ export function bindMlxAutoregressiveGraph(model: MlxTokenGraph): MlxAutoregress
     pagedKv: facts.pagedKv ?? null, prefillTailSplit: facts.prefillTailSplit, grammarJump: facts.grammarJump,
     ...(model.knownSpans ? { knownSpans: model.knownSpans } : {}),
     makeCache: model.makeCache.bind(model),
-    prefillEmbeddings: model.prefillEmbeddings?.bind(model),
+    prefillEmbeddings: model.embeddingPrompt ? (embeddings, caches, imageMask, ids, multimodalMask, rows) =>
+      model.embeddingPrompt!.find(range => rows >= range.from && rows <= range.to)!.operation(embeddings, caches, imageMask, ids, multimodalMask)
+      : model.prefillEmbeddings?.bind(model),
     createDecode(policy) {
       // Only a graph that declares a compiled step has one, and only a
       // composition whose storage the step drives keeps it on. Adapters would

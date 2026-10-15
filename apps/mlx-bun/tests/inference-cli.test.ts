@@ -312,7 +312,7 @@ test("production CLI composition requests optional templates and a continuous en
     mock.module(app + "src/engine/model-host.ts", () => ({ loadContext: async (path, id, options) => {
       loaded++; assert.equal(path, "/unused"); assert.equal(id, "test");
       assert.deepEqual(options, { requireChatTemplate: false, runtime: { nativeDraft: false, maxGenerationTokens: loaded === 1 ? 256 : undefined },
-        kv: loaded === 1 ? { override: "off", fusedSdpa: false } : { override: "off" }, adapters: false, maxRows: 1 });
+        kv: loaded === 1 ? { override: "off", fusedSdpa: false } : { override: "off" }, maxRows: 1 });
       return context;
     } }));
     mock.module(app + "src/engine/index.ts", () => ({ createAppEngine: async (supplied, options) => {

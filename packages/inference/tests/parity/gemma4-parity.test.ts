@@ -1,3 +1,4 @@
+import type { TestGraph } from "../models/test-composition";
 // Gemma4 12B greedy decode against an external mlx-lm reference: batch one,
 // plain KV from the model's own makeCache (the artifact's kv_config.json is not
 // applied), the prompt once and then each selected token on the same live cache.
@@ -9,7 +10,7 @@
 // At every step the whole vector must be finite and its argmax must be the
 // reference token, which is then fed. This is a 100-token trajectory plus four
 // vectors and a separate 12-step control, not 100-step full-vector parity. The
-// generated 12B graph serves only the kv_config composition, so for plain KV (the
+// written 12B graph serves only the kv_config composition, so for plain KV (the
 // default composition) the loader's table selects the generic graph for this
 // artifact, and both entry points build Gemma4Model.
 // The model and reference stay outside this repository; Python never runs.
@@ -180,6 +181,8 @@ async function runEntry(entry: "createModel" | "Gemma4Model", steps: number) {
   const { manifest, vectors } = await verifyInputs(inputs!);
   expect(manifest.vocab_size).toBe(VOCAB);
   await checkTokenizer(inputs!.model, manifest);
+  const { testGraph } = await import("../models/test-composition");
+  const { phaseRowLimit } = await import("../../src/models/graph");
   const ffi = await import("@mlx-bun/mlx/ffi");
   checkRuntime(manifest, { mlxVersion: ffi.MLX_VERSION, architecture: ffi.deviceArchitecture() });
   const { loadModelConfig, Weights, createModel, resolveComposition } = await import("@mlx-bun/inference");
@@ -193,11 +196,11 @@ async function runEntry(entry: "createModel" | "Gemma4Model", steps: number) {
   expect([config.text.numHiddenLayers, config.text.numKvSharedLayers, config.text.slidingWindow, config.text.vocabSize])
     .toEqual([LAYERS, 0, WINDOW, VOCAB]);
   const weights = await Weights.open(inputs!.model);
-  let model: InstanceType<typeof Gemma4Model> | null = null, caches: Array<{ dispose(): void }> = [];
+  let model: TestGraph<InstanceType<typeof Gemma4Model>> | null = null, caches: Array<{ dispose(): void }> = [];
   const greedy: number[] = [];
   let vectorsCompared = 0;
   try {
-    model = entry === "createModel" ? createModel(weights, config) as InstanceType<typeof Gemma4Model> : new Gemma4Model(weights, config, resolveComposition(config));
+    model = entry === "createModel" ? createModel(weights, config) as TestGraph<InstanceType<typeof Gemma4Model>> : testGraph(new Gemma4Model(weights, config, phaseRowLimit(resolveComposition(config))), resolveComposition(config));
     expect(model.constructor).toBe(Gemma4Model);
     const layers = model.makeCache();
     caches = layers;

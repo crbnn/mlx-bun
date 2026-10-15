@@ -1,3 +1,6 @@
+import type { TestGraph } from "../models/test-composition";
+import { testGraph } from "../models/test-composition";
+import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
 // The DFlash 2 drafter loaded in its trained basis and given the target's basis
 // when a draft group binds, on small synthetic weights whose 4-bit projections
 // fit the simdgroup matrix unit: every proposal holds its depth's tokens, the
@@ -29,10 +32,10 @@ import { QWEN38_TRELLIS_M1MAX_GRAPH } from "../../src/models/qwen/qwen38-27b-tre
 import { qwenDraftTarget, qwenDraftVocabulary, qwenResidualBasis } from "../../src/models/qwen/media-input";
 import { Affine4MmaLinear, Affine4RowsLinear, AffineSplitMmaLinear } from "../../src/layers/affine-verify-linear";
 import type { DraftProjection } from "../../src/contracts/mlx/draft-projection";
-import { atEveryWidth, byWidth } from "../../src/models/graph";
-import { widthClass, type MlxWidthClass } from "../../src/contracts/mlx/graph";
+import { rowTable, rowOperationFor } from "../../src/models/graph";
 import type { DraftProjectionKernel, ResidualBasis, TargetView } from "../../src/contracts/mlx/draft-target";
 import { QuantizedLinear } from "../../src/layers/quantized-linear";
+
 import type { DraftPrefillGroup, GroupedDraftProvider } from "../../src/generation/speculative/source";
 import { Dflash2Provider } from "../../src/generation/speculative/sources/dflash2-source";
 import { Dflash2Drafter } from "../../src/models/speculative/dflash2";
@@ -114,7 +117,7 @@ beforeAll(() => {
   projection = {
     embed: { encode: ids => ops.takeAxis(table, ids, 0), scales: { dtype: Dtype.bfloat16 } },
     // One head at every width.
-    logits: atEveryWidth((hidden: MlxArray) => {
+    logits: rowTable((hidden: MlxArray) => {
       const logits = ops.matmul(hidden, headT);
       captured.push(logits.toFloat32());
       return logits;
@@ -218,16 +221,18 @@ test("a drafter keeps the basis and kernels it was first bound to and refuses ot
   } finally { drafter.dispose(); }
 });
 
-/** A target's declared drafter kernels: one per width class, each MLX's quantized matmul over the drafter's weight,
+/** A target's declared drafter kernels: one per row range, each MLX's quantized matmul over the drafter's weight,
  *  counting the projections built and the forwards run per class. */
 function declared() {
-  const built = new Map<MlxWidthClass, number>(), runs = new Map<MlxWidthClass, number>();
-  const table = byWidth<DraftProjectionKernel>(width => (w, scales, biases) => {
-    built.set(width, (built.get(width) ?? 0) + 1);
-    const linear = new QuantizedLinear(w, scales, biases, { bits: 4, groupSize: 64, mode: "affine" });
-    return x => { runs.set(width, (runs.get(width) ?? 0) + 1); return linear.forward(x); };
-  });
-  return { table, built, runs };
+  const built = new Map<number,number>(),runs = new Map<number,number>();
+  const bind=(row:number):DraftProjectionKernel=>(w,scales,biases)=>{
+    built.set(row,(built.get(row)??0)+1);
+    const linear=new QuantizedLinear(w,scales,biases,{bits:4,groupSize:64,mode:"affine"});
+    return x=>{runs.set(row,(runs.get(row)??0)+1);return linear.forward(x);};
+  };
+  const table=[{from:1,to:1,operation:bind(1)},{from:2,to:3,operation:bind(2)},
+    {from:4,to:4,operation:bind(4)},{from:5,to:8,operation:bind(5)},{from:9,to:Infinity,operation:bind(9)}];
+  return {table,built,runs};
 }
 
 test("a target that declares its composition's kernels runs every 4-bit projection on the one its class names, the drafter's own rule nowhere", async () => {
@@ -241,12 +246,12 @@ test("a target that declares its composition's kernels runs every 4-bit projecti
     using commit = bf16([1, 6, TAPS.length * H], 1);
     const runs = drafts(provider.grouped, target, taps, commit, [5], [5], DEPTHS);
     for (const [i, depth] of DEPTHS.entries()) expect(runs[i]!.tokens[0]!.length).toBe(depth);
-    for (const width of ["one", "twoToThree", "four", "fiveToEight", "wider"] as const) expect(kernels.built.get(width)).toBe(1 + 7 * LAYERS);
+    for (const width of [1,2,4,5,9] as const) expect(kernels.built.get(width)).toBe(1 + 7 * LAYERS);
     // Prefill (12 rows) and the commit (6) project the context; blocks of 2, 4 and 8 rows draft.
-    expect(kernels.runs.get("wider")).toBe(1 + 2 * LAYERS);
-    expect(kernels.runs.get("fiveToEight")).toBe(1 + 2 * LAYERS + 7 * LAYERS);
-    expect(kernels.runs.get("twoToThree")).toBe(7 * LAYERS);
-    expect(kernels.runs.get("four")).toBe(7 * LAYERS);
+    expect(kernels.runs.get(9)).toBe(1 + 2 * LAYERS);
+    expect(kernels.runs.get(5)).toBe(1 + 2 * LAYERS + 7 * LAYERS);
+    expect(kernels.runs.get(2)).toBe(7 * LAYERS);
+    expect(kernels.runs.get(4)).toBe(7 * LAYERS);
     expect(mma.mock.calls.length).toBe(0);
   } finally {
     mma.mockRestore();
@@ -262,14 +267,14 @@ test("context projection runs the matrix unit at five to eight rows and MLX's qu
     try {
       // B × L context rows in every class: 1, 2, 4, 6 (one row of six and two of three), 8, 9 and 12.
       for (const [B, L] of [[1, 1], [1, 2], [1, 4], [1, 6], [2, 3], [1, 8], [1, 9], [2, 6]] as const) {
-        const width = widthClass(B * L), calls = mma.mock.calls.length;
+        const width = (B * L), calls = mma.mock.calls.length;
         using taps = bf16([B, L, TAPS.length * H], 1);
-        using context = drafter.projectContext[width](taps);
-        const kv = drafter.projectContextKVRows[width](context, 0);
+        using context = rowOperationFor(drafter.projectContext,width)(taps);
+        const kv = rowOperationFor(drafter.projectContextKVRows,width)(context, 0);
         ops.evalAll(kv.flatMap(pair => [pair.k, pair.v]));
         for (const pair of kv) { pair.k.dispose(); pair.v.dispose(); }
         // fc, then each layer's k and v.
-        expect(mma.mock.calls.length - calls).toBe(bits && width === "fiveToEight" ? 1 + 2 * LAYERS : 0);
+        expect(mma.mock.calls.length - calls).toBe(bits && width >= 5 && width <= 8 ? 1 + 2 * LAYERS : 0);
       }
     } finally {
       mma.mockRestore();
@@ -352,13 +357,13 @@ test("the rotated Trellis graphs' declaration carries the basis its turboquant_f
     // A Trellis graph's declaration: the basis its constructor reads once from the fold record
     // (`qwenResidualBasis`) and the ports every draftTarget call hands out over the graph (`qwenDraftTarget`),
     // here over the Qwen 3.5 graph of the synthetic artifact, whose embedding and head the drafter reads.
-    const trellisTarget = (model: Qwen35Model) => {
+    const trellisTarget = (model: TestGraph<Qwen35Model>) => {
       const residualBasis = qwenResidualBasis(QWEN38_TRELLIS_M1MAX_GRAPH, target);
       return { draftTarget: (_caches: unknown[]): TargetView => qwenDraftTarget(model, residualBasis) };
     };
     // A record without final_gain declares nothing and names the file once, at construction; so does a missing record.
     writeFileSync(foldPath, JSON.stringify(record));
-    const generic = new Qwen35Model(weights, config, testComposition());
+    const generic = testGraph(new Qwen35Model(weights, config, phaseRowLimit(testComposition())), testComposition());
     expect("residualBasis" in trellisTarget(generic).draftTarget([])).toBe(false);
     expect(fileLines()).toEqual([`[graph] ${QWEN38_TRELLIS_M1MAX_GRAPH}: ${foldPath} records no final_gain; DFlash 2 drafts ` +
       "unrotated (output exact, acceptance collapses) until it records the final-norm gain the fold moved into lm_head"]);
@@ -372,7 +377,7 @@ test("the rotated Trellis graphs' declaration carries the basis its turboquant_f
 
     // The record with final_gain: the Trellis declaration carries it; the generic graph on the same artifact declares nothing.
     writeFileSync(foldPath, JSON.stringify({ ...record, final_gain: Array.from(basis.finalGain) }));
-    const model = new Qwen35Model(weights, config, testComposition());
+    const model = testGraph(new Qwen35Model(weights, config, phaseRowLimit(testComposition())), testComposition());
     const graph = trellisTarget(model);
     expect("residualBasis" in model.draftTarget([])).toBe(false);
     expect(fileLines()).toHaveLength(2);
@@ -439,8 +444,8 @@ test("a target that declares a draft vocabulary drafts among its rows: a list ho
       using index = ops.fromInt32([...list], [list.length]);
       const ids = index.astype(Dtype.uint32), columns = ops.fromInt32([...list], [list.length]);
       resident.push(ids, columns);
-      const vocabulary = { ids, logits: atEveryWidth((hidden: MlxArray) => {
-        using logits = projection.logits.one(hidden);
+      const vocabulary = { ids, logits: rowTable((hidden: MlxArray) => {
+        using logits = rowOperationFor(projection.logits,1)(hidden);
         return ops.takeAxis(logits, columns, -1);
       }) };
       return Object.freeze({ identity: {}, residualBasis: basis,
@@ -471,11 +476,11 @@ test("the Qwen graphs' draft vocabulary is the head's listed rows on the head's 
     const q = ops.quantize(weight, 64, 4);
     const head = new QuantizedLinear(q.packed, q.scales, q.biases, { bits: 4, groupSize: 64, mode: "affine" });
     owned.push(q.packed, q.scales, q.biases);
-    // The M1 Max head's layers per width class.
+    // The M1 Max head's layers per row range.
     const kernels = (linear: QuantizedLinear) => {
       const rows = new Affine4RowsLinear(linear), split = new AffineSplitMmaLinear(linear);
-      return Object.freeze({ one: (x: MlxArray) => linear.forward(x), twoToThree: (x: MlxArray) => rows.forward(x),
-        four: (x: MlxArray) => split.forward(x), fiveToEight: (x: MlxArray) => split.forward(x), wider: (x: MlxArray) => split.forward(x) });
+      return [{from:1,to:1,operation:(x:MlxArray)=>linear.forward(x)},
+        {from:2,to:3,operation:(x:MlxArray)=>rows.forward(x)},{from:4,to:Infinity,operation:(x:MlxArray)=>split.forward(x)}];
     };
     expect(() => qwenDraftVocabulary(head, artifact, "mtp/draft_vocab.json", 200, kernels, owned)).toThrow(/outside the target vocabulary 200/);
     const vocabulary = qwenDraftVocabulary(head, artifact, "mtp/draft_vocab.json", OUT, kernels, owned);
@@ -485,12 +490,12 @@ test("the Qwen graphs' draft vocabulary is the head's listed rows on the head's 
     const fullHead = kernels(head);
     using columns = ops.fromInt32(sorted, [sorted.length]);
     for (const rows of [1, 2, 3, 4, 7, 12]) {
-      const width = widthClass(rows);
+      const width = rows;
       using hidden = bf16([rows, H], 1);
-      using all = fullHead[width](hidden);
+      using all = rowOperationFor(fullHead,width)(hidden);
       using taken = ops.takeAxis(all, columns, -1);
       using expected = ops.contiguous(taken);
-      using actual = vocabulary.logits[width](hidden);
+      using actual = rowOperationFor(vocabulary.logits,width)(hidden);
       expect(actual.shape).toEqual([rows, sorted.length]);
       expect(maxDiff(actual.toFloat32(), expected.toFloat32())).toBe(0);
     }

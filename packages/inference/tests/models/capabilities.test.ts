@@ -26,7 +26,7 @@ describe("every graph declares its capabilities", () => {
   });
 
   test("Qwen3.5: prepared embeddings with positions, video, bounded prefill workspace", () => {
-    // The generated M1 Max Trellis graph declares the same (tests/models/qwen38-m1max-identity.test.ts).
+    // The written M1 Max Trellis graph declares the same (tests/models/qwen38-m1max-identity.test.ts).
     expect(graph(Qwen35Model.prototype, { composition: testComposition() }).graphCapabilities).toEqual(declareGraph({
       media: { input: "embeddings+positions", video: true }, hiddenLayerTaps: true, prefill: { boundedWorkspace: true } }));
   });
@@ -49,7 +49,7 @@ describe("every graph declares its capabilities", () => {
     expect(graph(DiffusionGemmaModel.prototype).graphCapabilities)
       .toEqual(declareGraph({ method: "denoising", media: { input: "pixels", video: false } }));
     expect(graph(Glm52Model.prototype, { capabilities: { dsa: true } }).graphCapabilities)
-      .toEqual(declareGraph({ adapters: { mountable: false }, sparseAttention: true }));
+      .toEqual(declareGraph({ sparseAttention: true }));
     expect(graph(Glm52Model.prototype, { capabilities: { dsa: false } }).graphCapabilities.sparseAttention).toBe(false);
   });
 });

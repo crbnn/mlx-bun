@@ -1,3 +1,4 @@
+import type { MlxCacheLayer, MlxMixedRange, MlxSequenceRange } from "../../contracts/mlx/graph";
 // Gemma 4 text model — line-for-line port of mlx-lm's gemma4_text.py
 // (oracle venv site-packages), covering the paths our target models
 // exercise: 12B (dense), e4b (per-layer-input embeddings + KV-shared
@@ -20,7 +21,7 @@
 // forward (gradient checkpointing, prefix-shared and segmented training)
 // included: it reads its stateless training caches the same way. The blocks
 // (attention, feed-forward, per-layer inputs, KV sharing, decoder layer) live in
-// blocks.ts, which the generated graphs (generated/*.ts) compose too.
+// blocks.ts, which the written graph files compose too.
 
 import { disposeResources } from "../../runtime/resources";
 import type { MlxArray } from "@mlx-bun/mlx/array";
@@ -30,20 +31,21 @@ import type { Weights } from "../../artifacts/weights";
 import { Checkpoint } from "@mlx-bun/mlx/checkpoint";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
-import type {
-  MlxCompiledDecodeStep, MlxDeclaredGraph, MlxHeadForward, MlxLayerCapture, MlxMixedForward, MlxPhaseForward,
-  MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward, MlxWidthClass,
-} from "../../contracts/mlx/graph";
+import type { MlxCapturingForward, MlxRowTable, MlxCompiledDecodeStep, MlxDeclaredGraph, MlxHeadForward, MlxLayerCapture, MlxMixedForward, MlxPhaseForward, MlxKnownOperations, MlxPromptRange, MlxTokenPhases, MlxVerifyForward } from "../../contracts/mlx/graph";
 import { CompiledDecode } from "./compiled-decode";
 import type { TargetView } from "../../contracts/mlx/draft-target";
 import type { TrainableGraph } from "../../contracts/mlx/trainable";
 import { gemma4Trainable, type GradCheckpointCtx, type LayerLoras } from "./trainable";
 import type { MediaEncoders, MediaSidecarProbes, MlxPromptInput, Vision } from "../../contracts/mlx/media";
 import { declareGraph } from "../capabilities";
-import { atEveryWidth } from "../graph";
+import { DEFAULT_PHASE_ROWS,  rowTable   } from "../graph";
 import { bindGemma4MediaInput, gemma4DraftTarget, gemma4MediaEncoders } from "./media";
 import type { AttentionRead, Cache, SharedKv, TrainingAttentionCache } from "../../contracts/mlx/cache";
-import { isCompiledTrace } from "../../runtime/compiled-trace";
+import { CompiledGegluMLP, PlainGegluMLP, CompiledGeglu } from "../../layers/geglu";
+import { ServingDenseLayer, ServingMoeLayer } from "./serving-blocks";
+import { FixedExperts, SortedSwitchGLU, UnsortedSwitchGLU } from "./blocks";
+import type { MlxEmbeddingsRange } from "../../contracts/mlx/media";
+import type { MlxSeparateMixed, MlxPhaseGroup } from "../../contracts/mlx/graph";
 import { mapPackedTokens } from "../../input/token-groups";
 import { disposing } from "../../layers/helpers";
 import { RMSNorm } from "../../layers/normalization";
@@ -53,7 +55,6 @@ import { logitSoftcap } from "../../kernels/logits";
 import { compiledLogitSoftcap } from "../../kernels/softcap";
 import { AttentionMasks } from "../../state/attention-read";
 import { composedFullAttentionCache, composedSlidingAttentionCache } from "../../state/bf16-first-kv";
-import type { Composition } from "../../contracts/portable/composition";
 import { deferredTurboQuantKernels } from "../../state/turboquant-attention";
 import {
   DecoderLayer, kvDonors, PerLayerInputs, type Attention, type DonorRead, type Gemma4Phase,
@@ -63,6 +64,8 @@ import {
  * applied) and values it appended to its training cache, which its sharers read
  * through that cache and which cross checkpoint and segment boundaries as
  * tensors. */
+type DecoderOperation = Pick<DecoderLayer,"forward"|"forwardAttn"|"forwardMlp">;
+
 type PlainSharedKv = Extract<SharedKv, { kind: "plain" }>;
 
 /** The training forward's attention (`Gemma4Model.forwardTrainingHidden`,
@@ -215,25 +218,23 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly perLayerModelProjection: QuantizedLinear | null;
   readonly perLayerProjectionNorm: RMSNorm | null;
   readonly perLayerWidth: number;
-  /** The served configuration this graph was built for: its KV scheme (what
-   *  `makeCache` composes) and its switches. */
-  readonly composition: Composition;
-  /** The composition's `packedMixedMlp`: the groups of a mixed forward share
-   *  one MLP call. */
-  readonly #packMixedMlp: boolean;
-  /** The GeGLU activations and the head's softcap run the compiled closures
-   *  (mlx-lm's @mx.compile'd geglu and logit_softcap), unless the
-   *  composition's `compiledGeglu` is off: the spelled-out ops. */
-  readonly #compiledGeglu: boolean;
-
-  constructor(weights: Weights, config: ModelConfig, composition: Composition) {
+  readonly #servingLayers: readonly ServingDenseLayer[];
+  readonly #sortedLayers: readonly ServingDenseLayer[];
+  readonly traceLayers: readonly ServingDenseLayer[];
+  readonly traceDecode: MlxCapturingForward;
+  readonly #ordinarySlice: PerLayerInputs["ordinaryLayer"] | undefined;
+  readonly #traceSlice: PerLayerInputs["traceLayer"] | undefined;
+  readonly traceLogits = (hidden: MlxArray) => this.#head(hidden, logitSoftcap);
+  readonly mediaPrefill: readonly MlxEmbeddingsRange[];
+  readonly embeddingPrompt: readonly MlxEmbeddingsRange[];
+  readonly mixed: readonly MlxMixedRange[];
+  readonly mixedSeparate: MlxSeparateMixed;
+  constructor(weights: Weights, config: ModelConfig, maxPhaseRows = DEFAULT_PHASE_ROWS) {
     const t = config.text;
     if (t.hiddenSize === 0 || !config.text.tieWordEmbeddings)
       throw new Error("only tied-embedding text configs are supported");
 
-    this.#compiledGeglu = composition.compiledGeglu;
     this.config = config;
-    this.composition = composition;
     this.weightsBytes = [...weights.shards.files.values()]
       .reduce((a, f) => a + f.mmap.size, 0);
     // gemma4_unified prefixes weights with language_model.; gemma4_text doesn't
@@ -245,7 +246,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
     this.numDonors = t.numHiddenLayers - t.numKvSharedLayers;
     this.layers = Array.from(
       { length: t.numHiddenLayers },
-      (_, i) => new DecoderLayer(weights, config, prefixBase, i, i < this.numDonors, this.#compiledGeglu),
+      (_, i) => new DecoderLayer(weights, config, prefixBase, i, i < this.numDonors, true),
     );
     // previous_kvs (reference Gemma4TextModel): sharer j uses the LAST
     // donor of its own layer type
@@ -264,7 +265,53 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
     this.perLayerModelProjection = this.perLayerInputs?.modelProjection ?? null;
     this.perLayerProjectionNorm = this.perLayerInputs?.projectionNorm ?? null;
     this.perLayerWidth = this.perLayerInputs?.width ?? 0;
-    this.#packMixedMlp = composition.packedMixedMlp;
+    this.#servingLayers = this.layers.map(layer => layer.experts
+      ? new ServingMoeLayer(layer, new CompiledGegluMLP(layer.mlp), new FixedExperts(new UnsortedSwitchGLU(layer.experts.switchGlu, new CompiledGeglu())))
+      : new ServingDenseLayer(layer, new CompiledGegluMLP(layer.mlp)));
+    this.#sortedLayers = this.layers.map(layer => layer.experts
+      ? new ServingMoeLayer(layer, new CompiledGegluMLP(layer.mlp), new FixedExperts(new SortedSwitchGLU(layer.experts.switchGlu, new CompiledGeglu())))
+      : new ServingDenseLayer(layer, new CompiledGegluMLP(layer.mlp)));
+    this.#ordinarySlice = this.perLayerInputs?.ordinaryLayer.bind(this.perLayerInputs);
+    this.#traceSlice = this.perLayerInputs?.traceLayer.bind(this.perLayerInputs);
+    this.traceLayers = this.layers.map(layer => new ServingDenseLayer(layer, new PlainGegluMLP(layer.mlp)));
+    this.traceDecode = (ids,cache,capture) => {
+      const h = this.forwardDecoder(this.embedTokens(ids),cache,"decode",ids,capture,this.traceLayers,this.#traceSlice);
+      capture?.(this.layers.length,h); return h;
+    };
+
+    // Artifact top-k determines the reference gather-sort boundary. Each
+    // declared operation already owns its concrete expert and activation form.
+    const boundary = t.enableMoeBlock ? Math.ceil(64 / t.topKExperts) : Infinity;
+    const views = [{from:1,to:boundary-1,layers:this.#servingLayers}, {from:boundary,to:Infinity,layers:this.#sortedLayers}].filter(view=>Number.isFinite(view.from) && view.from<=view.to);
+    this.prompt = views.map(view => ({from:view.from,to:view.to,operation:(ids,cache,capture)=>this.#window(ids,cache,capture,view.layers)}));
+    this.promptChunk = this.prompt;
+    this.multiSequencePrompt = this.prompt;
+    this.multiSequencePromptChunk = this.multiSequencePrompt;
+    const decode: Record<number,MlxCapturingForward> = {}, verify: Record<number,MlxCapturingForward> = {};
+    for (let rows=1; rows<=maxPhaseRows; rows++) {
+      const layers = rows < boundary ? this.#servingLayers : this.#sortedLayers;
+      decode[rows] = (ids,cache,capture) => {
+        const hidden = this.forwardDecoder(this.embedTokens(ids),cache,"decode",ids,capture,layers);
+        capture?.(this.layers.length,hidden); return hidden;
+      };
+      verify[rows] = (ids,cache,capture) => this.#window(ids,cache,capture,layers);
+    }
+    this.decode = decode; this.verify = verify; this.appendKnown = views.map(view=>({from:view.from,to:view.to,operation:(ids,cache)=>this.#window(ids,cache,null,view.layers)}));
+    this.logits = rowTable<MlxHeadForward>(hidden=>this.logitsFromHidden(hidden),maxPhaseRows);
+    this.sequence = views.map(view=>({from:view.from,to:view.to,operation:(ids,cache)=>this.gradCkpt
+      ? this.#forwardTraining(this.embedTokens(ids),cache,ids)
+      : this.forwardDecoder(this.embedTokens(ids),cache,"window",ids,null,view.layers)}));
+    this.mediaPrefill = views.map(view=>({from:view.from,to:view.to,operation:(embeddings,cache,imageMask,ids,multimodalMask)=>
+      this.#prefillEmbeddings(embeddings,cache,imageMask,ids,multimodalMask,view.layers)}));
+    this.embeddingPrompt = this.mediaPrefill;
+    this.mixed = views.map(view=>({from:view.from,to:view.to,operation:groups=>this.#mixed(groups,view.layers)}));
+    const separate = views.map(view=>({from:view.from,to:view.to,operation:(group:MlxPhaseGroup)=>{
+      const hidden = this.forwardDecoder(this.embedTokens(group.ids),group.state,group.phase === "decode" ? "decode" : "window",group.ids,group.capture,view.layers);
+      group.capture?.(this.layers.length,hidden); return hidden;
+    }}));
+    this.mixedSeparate = {decode:separate,window:separate,verify:separate};
+
+    this.cacheLayers = this.layers.slice(0,this.numDonors).map(layer=>layer.layerType === "sliding_attention" ? {kind:"sliding" as const,window:this.windowSize}:{kind:"full" as const,turboQuant:"deferred" as const});
   }
 
   /** LoRA-mountable linears, keyed by weight-file module path: optiq
@@ -300,14 +347,9 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    * mask, and stay bf16 under TurboQuant. The full-attention caches' TurboQuant
    * read is deferred (`deferredTurboQuantKernels`): values stay rotated through
    * the fused SDPA and the read un-rotates the output. */
-  makeCache(): Cache[] {
-    const masks = new AttentionMasks(), kv = this.composition.kv;
-    return this.layers.slice(0, this.numDonors).map((l, layer) =>
-      l.layerType === "sliding_attention"
-        ? composedSlidingAttentionCache(kv, layer, this.windowSize, masks)
-        : composedFullAttentionCache(kv, layer, masks, deferredTurboQuantKernels),
-    );
-  }
+  readonly cacheLayers: readonly MlxCacheLayer[];
+  readonly sequence: readonly MlxSequenceRange[];
+
 
   /** Release model-owned graph constants after all executions and compiled
    * runners have stopped. Weight tensors and hidden taps are borrowed. */
@@ -324,14 +366,6 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
     if (constants.length) ops.evalAll(constants);
   }
 
-  /** The scoring and training forward (`MlxSequenceForward`): the window read
-   *  at every width, or the checkpointed training forward while the trainer
-   *  checkpoints (`gradCkpt`). */
-  sequenceHidden(ids: MlxArray, cache: Cache[], _width: MlxWidthClass): MlxArray {
-    const h0 = this.embedTokens(ids);
-    return this.gradCkpt ? this.#forwardTraining(h0, cache, ids) : this.forwardDecoder(h0, cache, "window", ids);
-  }
-
   /** The scaled token embeddings [B, L, hidden] of `ids` (owned). */
   protected embedTokens(ids: MlxArray): MlxArray {
     const h = this.embed.encode(ids);
@@ -342,42 +376,35 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    * prefill chunk size; rows are sequences times that size. Token ids only: a
    * prompt with prepared media enters through the `MlxPromptInput` that
    * `bindMediaInput` returns. The GPU is this graph's one unit. */
-  readonly prefillChunk: MlxPrefillChunk = { gpu: (ids, cache, capture) => this.#window(ids, cache, capture) };
+  readonly prompt: readonly MlxPromptRange[];
+  readonly promptChunk: typeof this.prompt;
+  readonly multiSequencePromptChunk: typeof this.multiSequencePrompt;
+  readonly multiSequencePrompt: readonly MlxPromptRange[];
 
   /** A prompt's positions that are not a whole chunk: the window read at every width. */
-  readonly prefillTail = atEveryWidth<(ids: MlxArray, cache: Cache[], capture: MlxLayerCapture | null) => MlxArray>(
-    (ids, cache, capture) => this.#window(ids, cache, capture));
 
   /** Known tokens: this graph declares no committed spans, so they read as a window. */
-  readonly appendKnown = atEveryWidth<MlxPhaseForward>((ids, cache) => this.#window(ids, cache, null));
+  readonly appendKnown: MlxKnownOperations;
 
   /** A causal window of token ids over every layer, `capture` seeing every layer and then the final hidden. */
-  #window(ids: MlxArray, cache: Cache[], capture: MlxLayerCapture | null): MlxArray {
-    const hidden = this.forwardDecoder(this.embedTokens(ids), cache, "window", ids, capture);
+  #window(ids: MlxArray, cache: Cache[], capture: MlxLayerCapture | null, layers = this.#servingLayers): MlxArray {
+    const hidden = this.forwardDecoder(this.embedTokens(ids), cache, "window", ids, capture, layers);
     capture?.(this.layers.length, hidden);
     return hidden;
   }
 
   /** The one output head at every width. */
-  readonly logits = atEveryWidth<MlxHeadForward>(hidden => this.logitsFromHidden(hidden));
+  readonly logits: MlxRowTable<MlxHeadForward>;
 
   /** One new token per sequence: `ids` [sequences, 1], so rows are sequences. */
-  readonly decode = atEveryWidth<(ids: MlxArray, cache: Cache[], capture: MlxLayerCapture | null) => MlxArray>((ids, cache, capture) => {
-    const hidden = this.forwardDecoder(this.embedTokens(ids), cache, "decode", ids, capture);
-    capture?.(this.layers.length, hidden);
-    return hidden;
-  });
+  readonly decode: MlxRowTable<MlxCapturingForward>;
 
   /** A speculative window: each sequence's last accepted token and its drafted
    * tokens, right-padded by the caller to the round's depth, `ids`
    * [sequences, depth + 1], so rows are sequences times (depth + 1). The graph
    * appends all depth + 1 positions; dropping the rejected suffix is the
    * caller's speculative transaction, begun before this call. */
-  readonly verify = atEveryWidth<MlxVerifyForward>((ids, cache, capture) => {
-    const hidden = this.forwardDecoder(this.embedTokens(ids), cache, "window", ids, capture);
-    capture?.(this.layers.length, hidden);
-    return hidden;
-  });
+  readonly verify: MlxRowTable<MlxCapturingForward>;
 
   /** Per-layer inputs (reference _get_per_layer_inputs +
    *  _project_per_layer_inputs): [B, L, nLayers, perLayerWidth] (`PerLayerInputs.compute`). */
@@ -402,13 +429,14 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    *  positions must still be zeroed. When null (the legacy vision call
    *  shape), the zeroing mask falls back to `bidir` — vision passes the same
    *  image mask for both roles, so that path is unchanged. */
-  prefillEmbeddings(
+  #prefillEmbeddings(
     embeds: MlxArray, cache: Cache[], bidir: MlxArray | null,
     ids: MlxArray | null = null, multimodal: MlxArray | null = null,
+    layers: readonly DecoderOperation[] = this.#servingLayers,
   ): MlxArray {
     const h = ops.mulScalar(embeds, this.embedScale);
     const phase: Gemma4Phase = bidir ? { bidirectional: bidir } : "window";
-    if (this.perLayerWidth === 0) return this.forwardDecoder(h, cache, phase, null);
+    if (this.perLayerWidth === 0) return this.forwardDecoder(h, cache, phase, null, null, layers);
 
     if (!ids)
       throw new Error("per-layer-input multimodal models require token ids");
@@ -421,7 +449,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
       cond.dispose();
       zero.dispose();
     }
-    const out = this.forwardDecoder(h, cache, phase, plIds);
+    const out = this.forwardDecoder(h, cache, phase, plIds, null, layers);
     if (plIds !== ids) plIds.dispose();
     return out;
   }
@@ -433,7 +461,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    *  runs (see `MlxLayerCapture`); the caller hands it the final hidden. */
   protected forwardDecoder(
     h0: MlxArray, cache: Cache[], phase: Gemma4Phase, ids: MlxArray | null,
-    capture: MlxLayerCapture | null = null,
+    capture: MlxLayerCapture | null = null, layers: readonly DecoderOperation[] = this.#servingLayers, slice = this.#ordinarySlice,
   ): MlxArray {
     const B = h0.shape[0]!;
     const L = h0.shape[1]!;
@@ -445,10 +473,10 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
       if (this.perLayerWidth > 0) perLayer = this.computePerLayerInputs(ids!, h);
       for (let i = 0; i < this.layers.length; i++) {
         const ci = this.cacheIndex[i]!;
-        const pls = perLayer ? this.#perLayerInput(perLayer, i, B, L) : null;
+        const pls = perLayer ? slice!(perLayer,i,B,L) : null;
         let next: { h: MlxArray; donor: DonorRead | null };
         try {
-          next = this.layers[i]!.forward(h, ci === -1 ? null : cache[ci]!, phase,
+          next = layers[i]!.forward(h, ci === -1 ? null : cache[ci]!, phase,
             ci === -1 ? donors[this.previousKvs[i]!]! : null, pls);
         } finally { pls?.dispose(); }
         h.dispose();
@@ -538,10 +566,10 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    * MLP and no group is a verify window. Kernel selection for packed matmuls
    * can differ from a solo GEMV, so this is an explicit Lab port until its
    * matching packed oracle and serving comparison are accepted. */
-  readonly mixed: MlxMixedForward = groups => {
+  #mixed(groups: Parameters<MlxMixedForward>[0], layers: readonly ServingDenseLayer[]): MlxArray[] {
     const runs: Array<{ h: MlxArray; perLayer: MlxArray | null; donors: (DonorRead | null)[] }> = [];
     const results: MlxArray[] = [];
-    const packedMlp = this.#packMixedMlp && !groups.some(group => group.phase === "verify");
+
     try {
       for (const group of groups) {
         const run = { h: this.embedTokens(group.ids), perLayer: null as MlxArray | null,
@@ -550,7 +578,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
         if (this.perLayerWidth > 0) run.perLayer = this.computePerLayerInputs(group.ids, run.h);
       }
       for (let i = 0; i < this.layers.length; i++) {
-        const layer = this.layers[i]!, ci = this.cacheIndex[i]!;
+        const layer = layers[i]!, ci = this.cacheIndex[i]!;
         const mids: MlxArray[] = [], inputs: MlxArray[] = [];
         try {
           for (const [row, group] of groups.entries()) {
@@ -567,7 +595,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
           }
           // Per-layer inputs use the same token order as the hidden states.
           let packedInput: MlxArray | null = null;
-          if (packedMlp && inputs.length) {
+          if (inputs.length) {
             const flat = inputs.map(input => ops.reshape(input, [1, -1, this.perLayerWidth]));
             try { packedInput = ops.concatAxis(flat, 1); }
             finally { for (const input of flat) input.dispose(); }
@@ -575,8 +603,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
           using pli = packedInput;
           const outputs: MlxArray[] = [];
           try {
-            if (packedMlp) outputs.push(...mapPackedTokens(mids, packed => layer.forwardMlp(packed, pli)));
-            else for (const [row, mid] of mids.entries()) outputs.push(layer.forwardMlp(mid, inputs[row] ?? null));
+            outputs.push(...mapPackedTokens(mids, packed => layer.forwardMlp(packed, pli)));
           } catch (error) { for (const output of outputs) output.dispose(); throw error; }
           for (const [row, run] of runs.entries()) {
             run.h.dispose(); run.h = outputs[row]!;
@@ -599,8 +626,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
         for (const donor of run.donors) donor?.dispose();
       }
     }
-  };
-
+  }
 
   // --- Segmented-backward support (`02d723a:docs/design/orpo-training.md`
   // §5.3). These run the training forward's layers (`layerTraining`). The
@@ -823,13 +849,12 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
   }
 
   /** hidden [1, L, hidden] → softcapped logits [1, L, vocab]. */
-  logitsFromHidden(h: MlxArray): MlxArray {
+  logitsFromHidden(h: MlxArray): MlxArray { return this.#head(h, compiledLogitSoftcap); }
+
+  #head(h: MlxArray, softcapOperation: typeof logitSoftcap): MlxArray {
     let logits = this.embed.asLinear(h);
     const softcap = this.config.text.finalLogitSoftcapping;
-    if (softcap !== null)
-      logits = disposing(logits, this.#compiledGeglu && !isCompiledTrace()
-        ? compiledLogitSoftcap(logits, softcap)   // fused, matches @mx.compile logit_softcap
-        : logitSoftcap(logits, softcap));
+    if (softcap !== null) logits = disposing(logits, softcapOperation(logits, softcap));
     return logits;
   }
 }

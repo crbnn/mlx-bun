@@ -1,3 +1,4 @@
+import { rowOperationFor } from "../../runtime/row-operations";
 // Compiled decode step (Phase A of `02d723a:docs/archive/investigations/optimization_plan.md`).
 //
 // The single-token decode graph is identical token-to-token except for
@@ -42,7 +43,7 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { decodeStepInputs } from "../../state/decode-step-inputs";
 import { setCompiledTrace } from "../../runtime/compiled-trace";
 import type { Cache, CompiledDecodeCache, DecodeSlot, DecodeTrace } from "../../contracts/mlx/cache";
-import type { MlxCompiledDecodeStep } from "../../contracts/mlx/graph";
+import type { MlxCompiledDecodeStep, MlxRowTable, MlxCapturingForward } from "../../contracts/mlx/graph";
 
 /** What the runner reads of the Gemma graph it compiles (the graph passes
  * itself; a structural type keeps the graph file and this one acyclic). */
@@ -60,8 +61,12 @@ export interface CompiledGemmaTarget {
   }[];
   materializeGraphConstants(): void;
   /** The one-row decode operation the trace records. */
-  readonly decode: { readonly one: (ids: MlxArray, cache: Cache[], capture: null) => MlxArray };
+  readonly decode: MlxRowTable<MlxCapturingForward>;
   logitsFromHidden(hidden: MlxArray): MlxArray;
+  /** Written graphs name their plain operations for the enclosing trace. */
+  readonly traceDecode?: MlxCapturingForward;
+  readonly traceLogits?: (hidden: MlxArray) => MlxArray;
+  readonly traceLayers?: CompiledGemmaTarget["layers"];
 }
 
 /** Graph-shape signature: anything that changes the traced op sequence
@@ -85,14 +90,16 @@ function traceCaches(slots: readonly DecodeSlot[], inputs: readonly MlxArray[], 
 }
 
 function makeTraceFn(model: CompiledGemmaTarget, slots: DecodeSlot[]) {
+  const decode = model.traceDecode ?? rowOperationFor(model.decode, 1);
+  const head = model.traceLogits ?? model.logitsFromHidden.bind(model);
   return (inputs: MlxArray[]): MlxArray[] => {
     const adapters = traceCaches(slots, inputs, inputs[1]!);
     setCompiledTrace(true);
     try {
       const ids = ops.reshape(inputs[0]!, [1, 1]);
-      const h = model.decode.one(ids, adapters, null);
+      const h = decode(ids, adapters, null) as MlxArray;
       ids.dispose();
-      const logits = model.logitsFromHidden(h);
+      const logits = head(h);
       h.dispose();
       return [logits, ...adapters.flatMap((a) => a.outs)];
     } finally {
@@ -121,6 +128,8 @@ function makeSegmentTraceFn(
   model: CompiledGemmaTarget, slots: DecodeSlot[], from: number, to: number,
   first: boolean, last: boolean,
 ) {
+  const layers = model.traceLayers ?? model.layers;
+  const head = model.traceLogits ?? model.logitsFromHidden.bind(model);
   return (inputs: MlxArray[]): MlxArray[] => {
     setCompiledTrace(true);
     try {
@@ -139,7 +148,7 @@ function makeSegmentTraceFn(
       }
 
       for (let i = from; i < to; i++) {
-        const { h: next, donor } = model.layers[i]!.forward(h, adapters[i - from]!, "decode", null, null);
+        const { h: next, donor } = layers[i]!.forward(h, adapters[i - from]!, "decode", null, null);
         h.dispose();
         h = next;
         donor?.dispose();
@@ -149,7 +158,7 @@ function makeSegmentTraceFn(
       if (last) {
         const normed = model.finalNorm.forward(h);
         h.dispose();
-        out = model.logitsFromHidden(normed);
+        out = head(normed);
         normed.dispose();
       }
       return [out, ...adapters.flatMap((a) => a.outs)];

@@ -1,3 +1,4 @@
+import type { MlxHeadForward, MlxHeadRange, MlxSequenceRange, MlxSequenceForward } from "@mlx-bun/inference/contracts/mlx";
 import type { Composition } from "@mlx-bun/inference/contracts/portable";
 import type { ModelContext, LoadedModelContext } from "./model-host";
 import type { ModelBinding } from "./model-binding";
@@ -15,15 +16,20 @@ function compositionWire(composition: Composition): unknown {
  * supply a binding explicitly and need no forward/makeCache methods. */
 export async function modelServingBinding(context: LoadedModelContext, supplied?: ModelBinding): Promise<ModelBinding> {
   if (supplied) return supplied;
-  const [{ declaredGraph, embeddingDeclarationFor }, { embedMany, embeddingTerminatorId, isEmbeddingModel }, { bindMlxGateway }, { MLX_VERSION, deviceArchitecture }, ops, { widthClass }] = await Promise.all([
+  const [{ declaredGraph, embeddingDeclarationFor }, { embedMany, embeddingTerminatorId, isEmbeddingModel }, { bindMlxGateway }, { MLX_VERSION, deviceArchitecture }, ops, { sequenceHiddenOperation, sequenceLogitsOperation }] = await Promise.all([
     import("@mlx-bun/inference/models"), import("@mlx-bun/inference/embeddings"),
-    import("@mlx-bun/inference/execution"), import("@mlx-bun/mlx/ffi"), import("@mlx-bun/mlx/ops"), import("@mlx-bun/inference/contracts/mlx"),
+    import("@mlx-bun/inference/execution"), import("@mlx-bun/mlx/ffi"), import("@mlx-bun/mlx/ops"), import("@mlx-bun/inference/scoring"),
   ]);
   const ctx = context as ModelContext;
   const model = ctx.model;
-  if (typeof model.makeCache !== "function" || typeof model.sequenceHidden !== "function")
+  const scoring = model as { readonly sequence?: readonly MlxSequenceRange[]; readonly sequenceHidden?: MlxSequenceForward;
+    readonly sequenceLogits?: readonly MlxHeadRange[]; readonly logitsFromHidden?: MlxHeadForward };
+  if (typeof model.makeCache !== "function")
     throw new Error("model implementation must supply its serving binding");
-  declaredGraph(model);
+  const graph = declaredGraph(model);
+  const hasSequence = !!scoring.sequence?.some(range => typeof range.operation === "function") || typeof scoring.sequenceHidden === "function";
+  const hasHead = !!scoring.sequenceLogits?.some(range => typeof range.operation === "function") || typeof scoring.logitsFromHidden === "function";
+  const adapters = typeof model.loraTargets === "function" && model.loraTargets().size > 0;
   const gateway = bindMlxGateway(model, ctx.draft ?? undefined);
   const capabilities = gateway.capabilities;
   const embedding = isEmbeddingModel(model);
@@ -34,14 +40,15 @@ export async function modelServingBinding(context: LoadedModelContext, supplied?
     stateCompatibility: `mlx-${MLX_VERSION}-${deviceArchitecture()}`,
     gateway,
     async signal(ids, count, minimum) {
+      if (!hasSequence || !hasHead) throw new TypeError("model declares no full-sequence scoring operation for signal");
       const caches = model.makeCache();
       try {
         // The whole prompt as one window (the scoring forward), the head over every position.
         const input = ops.fromInt32(ids, [1, ids.length]);
         let hidden;
-        try { hidden = model.sequenceHidden(input, caches, widthClass(ids.length)); } finally { input.dispose(); }
+        try { hidden = sequenceHiddenOperation(scoring, input, caches, ids.length); } finally { input.dispose(); }
         let logits;
-        try { logits = model.logitsFromHidden(hidden); } finally { hidden.dispose(); }
+        try { logits = sequenceLogitsOperation(model, hidden); } finally { hidden.dispose(); }
         let f: Float32Array;
         let vocab: number;
         try {
@@ -64,7 +71,7 @@ export async function modelServingBinding(context: LoadedModelContext, supplied?
         return { bins, vocab };
       } finally { for (const cache of caches) cache.dispose(); }
     },
-    discovery: { adapters: capabilities.adapters.mountable, training: capabilities.adapters.mountable,
+    discovery: { adapters, training: adapters && ((hasSequence && hasHead) || typeof graph.trainable?.denoising?.canvasLogits === "function"),
       dsa: capabilities.sparseAttention, embeddings: embedding },
     ...(embedding ? { embed: (inputs: string[], instruction?: string) => embedMany(model, ctx.tokenizer, terminator, inputs, instruction) } : {}),
     diagnostics() {

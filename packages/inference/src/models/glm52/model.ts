@@ -1,3 +1,5 @@
+import { bindGraphCaches } from "../cache-composition";
+import type { MlxCacheLayer } from "../../contracts/mlx/graph";
 // Dedicated GLM-5.2 correctness graph over the direct Colibri artifact.
 //
 // G2 deliberately favors an auditable dequantize->f32 path. Routed experts are
@@ -19,13 +21,9 @@ import { ColibriGlm52Weights } from "../../artifacts/glm52/weights";
 import { type Cache, type LatentAttentionCache } from "../../contracts/mlx/cache";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
-import type {
-  MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward, MlxWidthClass,
-} from "../../contracts/mlx/graph";
+import type { MlxRowTable, MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxKnownOperations, MlxPromptRange, MlxTokenPhases } from "../../contracts/mlx/graph";
 import { declareGraph } from "../capabilities";
-import { atEveryWidth, byWidth } from "../graph";
 import { type QuantizedLinear } from "../../layers/quantized-linear";
-import { composedLatentCache, latentLegoCodecs } from "../../state/latent-legos";
 import type { CacheCodecProvider } from "../../state/persistence-types";
 import { BF16_KV, type KvStorageScheme } from "../../contracts/portable/composition";
 import {
@@ -694,7 +692,7 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
    * are not offered on streamed experts. */
   get graphCapabilities(): GraphCapabilities {
     return declareGraph({
-      adapters: { mountable: false }, sparseAttention: this.capabilities?.dsa === true,
+      sparseAttention: this.capabilities?.dsa === true,
       nativeDraft: this.capabilities?.mtpEnabled === true
         ? { kind: NATIVE_MTP_DRAFT, numDraftTokens: this.capabilities.mtpDraftTokens ?? 3 } : null,
     });
@@ -749,8 +747,6 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
     expertRuntime: Glm52ExpertRuntime | null = null,
     dsaPrefillMode: "exact" | "dense-benchmark" = "exact",
     dsaBenchmarkPrefillTokens = 0,
-    /** The composition's KV scheme and paging, which `makeCache` composes. */
-    readonly caches: Glm52LatentCaches = GLM52_F32_CACHES,
   ) {
     if (config.modelType !== "glm_moe_dsa" ||
         glmConfig.modelType !== "glm_moe_dsa") {
@@ -802,9 +798,34 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
       ),
     );
     this.finalNorm = weights.tensor("model.norm.weight");
+
+    const multiSequencePrompt: MlxCapturingForward = (ids, cache) => this.#forward(ids, cache, GLM52_PHASE_READS.window);
+    this.prompt = [{ from: 1, to: Infinity, operation: multiSequencePrompt }];
+    this.promptChunk = this.prompt;
+    this.multiSequencePrompt = this.prompt;
+    this.multiSequencePromptChunk = this.multiSequencePrompt;
+    this.appendKnown = [
+      { from: 1, to: 1, operation: (ids, cache) => this.#forward(ids, cache, GLM52_PHASE_READS.oneToken) },
+      { from: 2, to: Infinity, operation: (ids, cache) => this.#forward(ids, cache, GLM52_PHASE_READS.window) },
+    ];
+    this.logits = Object.freeze({
+      default: (hidden: MlxArray) => this.logitsFromHidden(hidden),
+    });
+    this.decode = Object.freeze({
+      default: (ids: MlxArray, cache: Cache[]) => this.#forward(ids, cache, GLM52_PHASE_READS.oneToken),
+    });
+    this.verify = Object.freeze({
+      default: async (ids: MlxArray, cache: Cache[]) => {
+      const executor = this.expertRuntime?.executor;
+      executor?.setFixedKernelFamily(true);
+      try { return await this.#forward(ids, cache, GLM52_PHASE_READS.window); }
+      finally { executor?.setFixedKernelFamily(false); }
+    },
+    });
+
   }
 
-  static async open(modelDir: string, caches: Glm52LatentCaches = GLM52_F32_CACHES): Promise<Glm52Model> {
+  static async open(modelDir: string, caches: Glm52LatentCaches = GLM52_F32_CACHES): Promise<Glm52LoadedModel> {
     const glmConfig = await loadGlm52Config(modelDir);
     const config = await loadModelConfig(modelDir);
     const weights = ColibriGlm52Weights.open(modelDir);
@@ -813,10 +834,10 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
         weights.container,
         glmConfig,
       );
-      return new Glm52Model(weights, config, glmConfig, {
+      return bindGraphCaches(new Glm52Model(weights, config, glmConfig, {
         dsa: detected.hasDsa,
         mtpMetadata: detected.hasMtp,
-      }, null, null, "exact", 0, caches);
+      }, null, null, "exact", 0), caches);
     } catch (error) {
       weights.dispose();
       throw error;
@@ -826,7 +847,7 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
   static async openStreamed(
     modelDir: string,
     options: Glm52StreamedOpenOptions,
-  ): Promise<Glm52Model> {
+  ): Promise<Glm52LoadedModel> {
     const glmConfig = await loadGlm52Config(modelDir);
     const config = await loadModelConfig(modelDir);
     const weights = ColibriGlm52ResidentWeights.open(modelDir, {
@@ -849,7 +870,7 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
         ...runtimeOptions,
         fixedBytes: weights.weightsBytes + options.reserveBytes,
       });
-      return new Glm52Model(
+      return bindGraphCaches(new Glm52Model(
         weights,
         config,
         glmConfig,
@@ -863,8 +884,7 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
         runtime,
         dsaPrefillMode ?? "exact",
         dsaBenchmarkPrefillTokens ?? 0,
-        caches ?? GLM52_F32_CACHES,
-      );
+      ), caches ?? GLM52_F32_CACHES);
     } catch (error) {
       runtime?.close();
       weights.dispose();
@@ -880,21 +900,8 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
    *  scheme and paging name for it (`composedLatentCache`): f32 by default, the
    *  latent, RoPE key and (on a DSA layer) index key encoded f32-first under a
    *  quantized scheme, in pages under paging. */
-  makeCache(): Cache[] {
-    const { kv, pagedKv } = this.caches;
-    return this.layers.map((layer, index) => composedLatentCache(kv, pagedKv, index, {
-      kvLoraRank: this.glmConfig.kvLoraRank,
-      ropeHeadDim: this.glmConfig.qkRopeHeadDim,
-      maxTokens: this.glmConfig.maxPositionEmbeddings,
-      ...(this.capabilities.dsa && layer.dsa ? { indexHeadDim: this.glmConfig.indexHeadDim } : {}),
-    }));
-  }
+  get cacheLayers(): readonly MlxCacheLayer[] { return this.layers.map(layer=>({kind:"latent" as const,geometry:{kvLoraRank:this.glmConfig.kvLoraRank,ropeHeadDim:this.glmConfig.qkRopeHeadDim,maxTokens:this.glmConfig.maxPositionEmbeddings,...(this.capabilities.dsa && layer.dsa ? {indexHeadDim:this.glmConfig.indexHeadDim}:{})}})); }
 
-  /** The persistence codecs of the caches `makeCache` composes: the latent
-   *  legos' beside the default set, where the scheme or paging composes them. */
-  get stateCodecs(): CacheCodecProvider | undefined {
-    return this.caches.kv.kind === "bf16" && !this.caches.pagedKv ? undefined : latentLegoCodecs;
-  }
 
   /** Attach probe-only telemetry for selections computed by FULL DSA layers. */
   setDsaSelectionObserver(observer: Glm52DsaSelectionObserver | null): void {
@@ -903,11 +910,11 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
 
   /** The scoring forward (`MlxSequenceForward`) of a resident graph; a streamed
    *  graph's forward is asynchronous, and it refuses this. */
-  sequenceHidden(ids: MlxArray, cache: Cache[], width: MlxWidthClass): MlxArray {
+  sequenceHidden(ids: MlxArray, cache: Cache[], width: number): MlxArray {
     if (this.expertBackend)
       throw new Error("a streamed GLM graph has no synchronous scoring forward");
     // One row of one token is a one-query read; every wider scoring forward is a window.
-    return this.#sequence(ids, cache, width === "one" ? GLM52_PHASE_READS.oneToken : GLM52_PHASE_READS.window);
+    return this.#sequence(ids, cache, width === 1 ? GLM52_PHASE_READS.oneToken : GLM52_PHASE_READS.window);
   }
 
   #sequence(ids: MlxArray, cache: Cache[], reads: Glm52PhaseReads): MlxArray {
@@ -1000,23 +1007,20 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
   }
 
   // Each phase names its MLA reads (`GLM52_PHASE_READS`): windows reconstruct, one token per sequence absorbs.
-  readonly prefillChunk: MlxPrefillChunk = { gpu: (ids, cache) => this.#forward(ids, cache, GLM52_PHASE_READS.window) };
-  readonly prefillTail = atEveryWidth<MlxCapturingForward>((ids, cache) => this.#forward(ids, cache, GLM52_PHASE_READS.window));
-  /** Known tokens: one sequence's tokens are its rows, so the one-row class is one token. */
-  readonly appendKnown = byWidth<MlxPhaseForward>(width => (ids, cache) =>
-    this.#forward(ids, cache, width === "one" ? GLM52_PHASE_READS.oneToken : GLM52_PHASE_READS.window));
-  readonly logits = atEveryWidth<MlxHeadForward>(hidden => this.logitsFromHidden(hidden));
-  readonly decode = atEveryWidth<MlxPhaseForward>((ids, cache) => this.#forward(ids, cache, GLM52_PHASE_READS.oneToken));
+  readonly prompt: readonly MlxPromptRange[];
+  readonly promptChunk: typeof this.prompt;
+  readonly multiSequencePromptChunk: typeof this.multiSequencePrompt;
+  readonly multiSequencePrompt: readonly MlxPromptRange[];
+
+  /** Known tokens: one sequence's tokens are its rows, so the one-row operation is one token. */
+  readonly appendKnown: MlxKnownOperations;
+  readonly logits: MlxRowTable<MlxHeadForward>;
+  readonly decode: MlxRowTable<MlxCapturingForward>;
   /** A verify window on the row-independent M=1 streamed-expert kernel family
    *  (`setFixedKernelFamily`), so a token's experts take the same kernels
    *  whatever rows verify beside it. Composed into the operation: the scheduler
    *  never pins or unpins it. */
-  readonly verify = atEveryWidth<MlxVerifyForward>(async (ids, cache) => {
-    const executor = this.expertRuntime?.executor;
-    executor?.setFixedKernelFamily(true);
-    try { return await this.#forward(ids, cache, GLM52_PHASE_READS.window); }
-    finally { executor?.setFixedKernelFamily(false); }
-  });
+  readonly verify: MlxRowTable<MlxCapturingForward>;
 
   /** The decoder over `embeddings` (borrowed). `cache` holds one latent
    * attention cache per layer (`makeCache`), which each layer's MLA block reads
@@ -1119,3 +1123,5 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
 
 import { Glm52WeightSource } from "../../contracts/mlx/glm52-weights";
 export { type Glm52WeightSource } from "../../contracts/mlx/glm52-weights";
+
+export type Glm52LoadedModel = Glm52Model & { makeCache(): Cache[]; readonly stateCodecs?: CacheCodecProvider };

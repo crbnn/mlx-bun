@@ -13,18 +13,27 @@ Decisions that govern all work:
   performance regressions. Knowledge benchmark scores characterize the candidate
   quant for its Hugging Face model card; that publication work has its own criteria.
 - Legos compose at load. A graph never contains a fallback to another graph, the cache owns its read, and the
-  scheduler calls named phases. The composition refactor below is the current structural work.
+  scheduler calls named phases. The remaining graph-files acceptance and composition work are
+  listed below.
+
+## Graph files
+
+- [ ] Resolve performance acceptance for the final `refactor/graph-files` merge request to
+      `main`. Review the saved short paired reports, including slower decode and aggregate
+      samples under the accepted current machine conditions. A quiet paired run is required
+      before making performance claims; current-condition results cannot establish that gate.
+      Josh decides when the merge request merges.
 
 ## Composition refactor
 
 Landed on `refactor/composition` (PR #323 to `main`), 2026-10-10 to 2026-10-12. Every served
-configuration is one composition built at load; the loader selects the graph from a table keyed
-on the composition; the scheduler names the phase and the width; the cache owns storage, the
+configuration is one composition resolved at load; the loader selects the graph from a table keyed
+on the composition; the scheduler names the phase and the row count; the cache owns storage, the
 read, prefix reuse, paging, SSD offload and eviction; drafters bind one selection operation;
-every graph is an entire graph built for a composition and extends nothing; the architecture
+every graph is a written arrangement selected at load and extends nothing; the architecture
 gate holds the rules with an empty ratchet. The rules and the ownership live in
 [ARCHITECTURE.md](ARCHITECTURE.md); the evidence per step is in the PR description, the merged
-PRs' descriptions and this file's history; the gates are the generator drift tests, the
+PRs' descriptions and this file's history; the gates are the written-file architecture rules, the
 conformance suites, the identity tests against each family's generic graph, the recorded
 synthetic digests, the real-weight parity suites, `packages/inference/scripts/digest.ts` and
 `teacher-forced-kl.ts`, and the paired check in `.github/workflows/perf.yml`.
@@ -95,7 +104,7 @@ while that machine is in use (swap above 512 MB).
   Exit: opt-in comparisons meet the numerical contracts against pinned published
   golden revisions recording source revisions and oracle versions; synthetic tests
   alone do not close this. Done so far: the
-  [generated Gemma4 graph test](packages/inference/tests/parity/gemma4-generated.test.ts)
+  [written Gemma4 graph test](packages/inference/tests/parity/gemma4-written.test.ts)
   passed on e4b and 12B (identity within this tree; 26B-A4B not run). Packed Trellis now matches main in 96 full greedy logit vectors, three shared
   B1/depth-two MTP runs (on the M1 Max, whose verify windows reassociate, by KL and greedy
   agreement), and the 18-case plain-KV runtime grid with restored
@@ -263,19 +272,6 @@ on main and the refactor is only useful when investigating a behavior difference
 One line per idea: the question and the domains it touches. Picking one up makes it an item
 above with an exit; an answered one moves its finding to the owning documentation and is deleted.
 
-- **Width tables as a LUT keyed by exact row count** (graphs, scheduler; Josh, 2026-10-11). Row
-  count is a property of the work; the class boundaries (`one`, `twoToThree`, `four`,
-  `fiveToEight`, `wider`) are properties of one composition: that model, those kernels, that
-  hardware, measured once (D1, including the separate four-row path that preserved the bits).
-  Exposing them in the shared contract makes every implementation adopt vocabulary derived from
-  that experiment: local optimization results promoted into shared API structure. The durable
-  contract is "perform this named phase for work of this width"; the composition supplies the
-  prepared mapping, binding each width to the operation its kernels were measured best at, with
-  several widths aliasing one bound operation. The scheduler describes the work as N rows wide
-  and indexes, choosing nothing; new kernels change the bindings a generator emits, never what
-  the scheduler understands. The general rule behind it: a measured boundary belongs to the
-  composition, never to a contract. Pick up when a measurement first needs a boundary the named
-  classes cannot express, or when the generated graphs are the only width tables left.
 - **Formal proofs composed along the contracts** (kernels, layers, graphs, cache, scheduler; Josh,
   2026-10-11): because every piece implements a contract defined between layers and nothing crosses
   one any other way, correctness can be proven per lego (a kernel against its reference op over the

@@ -40,7 +40,7 @@ const vectorOf = (base64: string) => float32Of(new Uint8Array(Buffer.from(base64
 
 describe.skipIf(!opted)("qwen3-embedding vs mlx-lm and main", () => {
   setDefaultTimeout(600_000);
-  let model: import("@mlx-bun/inference/embeddings").EmbeddingGraph & { sequenceHidden(ids: import("@mlx-bun/mlx/array").MlxArray, cache: unknown[], width: import("@mlx-bun/inference/contracts/mlx").MlxWidthClass): import("@mlx-bun/mlx/array").MlxArray; makeCache(): { dispose?(): void }[] };
+  let model: import("@mlx-bun/inference/embeddings").EmbeddingGraph & { sequenceHidden(ids: import("@mlx-bun/mlx/array").MlxArray, cache: unknown[], width: number): import("@mlx-bun/mlx/array").MlxArray; makeCache(): { dispose?(): void }[] };
   let tokenizer: Awaited<ReturnType<typeof import("@mlx-bun/inference").loadTokenizer>>;
   let terminator: number;
   let embeddings: typeof import("@mlx-bun/inference/embeddings");
@@ -80,8 +80,8 @@ describe.skipIf(!opted)("qwen3-embedding vs mlx-lm and main", () => {
     let ourHidden: Float32Array;
     try {
       // The whole sequence as one window: the scoring forward at the class of its rows.
-      const { widthClass } = await import("@mlx-bun/inference/contracts/mlx");
-      using hidden = model.sequenceHidden(ids, cache, widthClass(meta!.ids.length));
+
+      using hidden = model.sequenceHidden(ids, cache, (meta!.ids.length));
       expect(hidden.shape).toEqual([1, L, H]);
       ourHidden = hidden.toFloat32();
     } finally { for (const c of cache) c.dispose?.(); }

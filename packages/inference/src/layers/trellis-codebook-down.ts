@@ -37,7 +37,7 @@ export class CodebookDownRow {
 
   forward(x: MlxArray): MlxArray {
     const { codes, scales, geometry } = this.down;
-    return project(this.down, x, x2 => downCodebookRow(x2, codes, scales, geometry));
+    return this.down.delta.forward(x, project(this.down, x, x2 => downCodebookRow(x2, codes, scales, geometry)));
   }
 }
 
@@ -47,6 +47,6 @@ export class CodebookDownK3iRow {
 
   forward(x: MlxArray): MlxArray {
     const { codes, scales, geometry } = this.down;
-    return project(this.down, x, x2 => downK3InterleavedCodebookRow(x2, codes, scales, geometry));
+    return this.down.delta.forward(x, project(this.down, x, x2 => downK3InterleavedCodebookRow(x2, codes, scales, geometry)));
   }
 }

@@ -1,3 +1,4 @@
+import { rowOperationFor } from "../../runtime/row-operations";
 // Gemma-4 "-assistant" drafter — port of optiq's
 // runtime/spec/drafters/gemma_assistant.py (itself a port of Ollama's
 // x/models/gemma4/assistant.go, MIT).
@@ -28,9 +29,9 @@ import { Dtype } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import { Weights } from "../../artifacts/weights";
 import type { AssistantDrafterModel, AssistantDraftStep, DrafterRowsStep } from "../../contracts/mlx/drafter";
-import type { MlxWidthTable } from "../../contracts/mlx/width";
+import type { MlxRowTable } from "../../contracts/mlx/graph";
 import { disposeResources } from "../../runtime/resources";
-import { atEveryWidth, byWidth } from "../graph";
+import { rowTable, rowTableFrom } from "../graph";
 
 /** Legacy plain donor adapter. The common graph never reads cache geometry. */
 export function plainAssistantDonors(shared: { sliding: [MlxArray, MlxArray]; full: [MlxArray, MlxArray] },
@@ -95,7 +96,7 @@ export class GemmaAssistantDrafter implements AssistantDrafterModel {
   #ordering: MlxArray | null = null;   // [numCentroids, vocabPerCentroid] int32
   #embed: MlxArray;      // drafter token embeddings [vocab, hidden]
   #norm: MlxArray;
-  readonly forwardRows: MlxWidthTable<AssistantDraftStep>;
+  readonly forwardRows: MlxRowTable<AssistantDraftStep>;
 
   private constructor(w: Weights, cfg: Record<string, any>) {
     const t = cfg.text_config ?? cfg;
@@ -174,11 +175,11 @@ export class GemmaAssistantDrafter implements AssistantDrafterModel {
     // The head's token selection, bound once: the centroid candidates at every
     // width, or the tied embedding's full-vocabulary argmax, whose one-row form
     // multiplies by the hidden column and whose wider form by the rows' transpose.
-    const select: MlxWidthTable<RowSelect> = this.useCentroids
-      ? atEveryWidth((h, rows) => this.#centroidTokens(h, rows))
-      : byWidth(width => width === "one" ? h => this.#embeddingTokensOne(h) : (h, rows) => this.#embeddingTokens(h, rows));
-    this.forwardRows = byWidth(width => (lastTokenEmb, targetHidden, donors, position) =>
-      this.#forwardRows(lastTokenEmb, targetHidden, donors, position, select[width]));
+    const select: MlxRowTable<RowSelect> = this.useCentroids
+      ? rowTable((h, rows) => this.#centroidTokens(h, rows))
+      : rowTableFrom(width => width === 1 ? h => this.#embeddingTokensOne(h) : (h, rows) => this.#embeddingTokens(h, rows));
+    this.forwardRows = rowTableFrom(width => (lastTokenEmb, targetHidden, donors, position) =>
+      this.#forwardRows(lastTokenEmb, targetHidden, donors, position, select[width]!));
   }
 
   static async load(modelDir: string): Promise<GemmaAssistantDrafter> {
@@ -204,7 +205,7 @@ export class GemmaAssistantDrafter implements AssistantDrafterModel {
    * Donors are chronological; position is the target's last position. */
   forward(lastTokenEmb: MlxArray, targetHidden: MlxArray,
     sharedKv: { sliding: [MlxArray, MlxArray]; full: [MlxArray, MlxArray] }, position: number): DrafterStep {
-    const result = this.forwardRows.one(lastTokenEmb, targetHidden, plainAssistantDonors(sharedKv, position), position);
+    const result = rowOperationFor(this.forwardRows, 1)(lastTokenEmb, targetHidden, plainAssistantDonors(sharedKv, position), position);
     try { return { token: ops.itemUint32(result.tokens), nextHidden: result.nextHidden }; }
     catch (error) { result.nextHidden.dispose(); throw error; }
     finally { result.tokens.dispose(); }

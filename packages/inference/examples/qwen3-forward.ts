@@ -1,6 +1,9 @@
+import { bindGraphCaches } from "@mlx-bun/inference/models";
+import { phaseRowLimit, rowOperationFor } from "@mlx-bun/inference/models/graph";
+import { MlxPhaseDispatch } from "@mlx-bun/inference/generation";
 import { loadModelConfig, Weights } from "@mlx-bun/inference/artifacts";
 import { resolveComposition } from "@mlx-bun/inference";
-import { widthClass } from "@mlx-bun/inference/contracts/mlx";
+
 import { Qwen3Model } from "@mlx-bun/inference/models/qwen3";
 import { argmaxLastPosition, lastPositionLogits } from "@mlx-bun/inference/scoring";
 import * as ops from "@mlx-bun/mlx/ops";
@@ -12,16 +15,16 @@ export async function forwardTokens(directory: string, promptTokens: number[]) {
   const config = await loadModelConfig(directory);
   const weights = await Weights.open(directory);
   try {
-    const graph = new Qwen3Model(weights, config, resolveComposition(config));
+    const graph = bindGraphCaches(new Qwen3Model(weights, config, phaseRowLimit(resolveComposition(config))), resolveComposition(config));
     const state = graph.makeCache();
     try {
       using prompt = ops.fromInt32(promptTokens, [1, promptTokens.length]);
-      using promptHidden = await graph.prefillTail[widthClass(promptTokens.length)](prompt, state, null);
-      using prefill = graph.logits[widthClass(promptTokens.length)](promptHidden);
+      using promptHidden = await new MlxPhaseDispatch(graph).prompt("tail", 1, (promptTokens.length))(prompt, state, null);
+      using prefill = rowOperationFor(graph.logits,promptTokens.length)(promptHidden);
       const token = argmaxLastPosition(prefill);
       using next = ops.fromInt32([token], [1, 1]);
-      using nextHidden = await graph.decode.one(next, state);
-      using continuation = graph.logits.one(nextHidden);
+      using nextHidden = await rowOperationFor(graph.decode,1)(next, state, null);
+      using continuation = rowOperationFor(graph.logits,1)(nextHidden);
       return { token, nextToken: argmaxLastPosition(continuation),
         logits: lastPositionLogits(continuation), offset: state[0]!.offset };
     } finally {

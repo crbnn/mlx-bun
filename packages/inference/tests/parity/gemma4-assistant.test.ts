@@ -62,6 +62,7 @@ const inputs = optIn(Bun.env);
 
 test.skipIf(!inputs)("Gemma4 assistant: donor attention and draft chains equal independently selected donors past the window", async () => {
   const { window, vocab, hidden } = inputs!.geometry;
+  const { sequenceLogitsOperation } = await import("../../src/scoring/full-sequence");
   const ops: typeof Ops = await import("@mlx-bun/mlx/ops");
   const { MlxArray } = await import("@mlx-bun/mlx/array");
   const { loadModelConfig, Weights, createModel } = await import("@mlx-bun/inference");
@@ -103,7 +104,7 @@ test.skipIf(!inputs)("Gemma4 assistant: donor attention and draft chains equal i
     caches = model.makeCache();
     assert(caches[slidingAt] instanceof RotatingKVCache && caches[fullAt] instanceof KVCacheClass, "unexpected donor cache kinds");
     const embed = (token: number) => { using ids = ops.fromInt32([token], [1, 1]); using e = model.embed.encode(ids); return ops.mulScalar(e, model.embedScale); };
-    const greedy = (h: MlxArray) => { using logits = model.logitsFromHidden(h); using arg = ops.argmaxAxis(logits, -1); return arg.toIntTokens()[0]!; };
+    const greedy = (h: MlxArray) => { using logits = sequenceLogitsOperation(model, h); using arg = ops.argmaxAxis(logits, -1); return arg.toIntTokens()[0]!; };
     const forward = (ids: number[]) => { using x = ops.fromInt32(ids, [1, ids.length]); return phaseHidden(model as never, x, caches); };
     const at = (h: MlxArray, i: number) => h.slice([0, i, 0], [1, i + 1, h.shape[2]!]);
     /** Donor rows chosen independently of temporalView, each registered as it is made. */
@@ -135,13 +136,13 @@ test.skipIf(!inputs)("Gemma4 assistant: donor attention and draft chains equal i
       return f.astype(dtype);
     };
     /** One deterministic draft chain. Partial output is released if a step throws. */
-    const chain = (shared: Parameters<GemmaAssistantDrafter["forwardRows"]["one"]>[2], anchor: MlxArray, pending: number, position: number) => {
+    const chain = (shared: Parameters<NonNullable<GemmaAssistantDrafter["forwardRows"][1]>>[2], anchor: MlxArray, pending: number, position: number) => {
       const steps: { token: number; hidden: MlxArray }[] = [];
       let token = pending, hidden = anchor;
       try {
         for (let k = 0; k < STEPS; k++) {
           using e = embed(token);
-          const step = drafter!.forwardRows.one(e, hidden, shared, position + k);
+          const step = drafter!.forwardRows[1]!(e, hidden, shared, position + k);
           const entry = { token: -1, hidden: step.nextHidden };
           steps.push(entry); // owned before the tokens are read or released
           try { entry.token = step.tokens.toIntTokens()[0]!; } finally { step.tokens.dispose(); }
@@ -250,6 +251,7 @@ test.skipIf(!inputs)("Gemma4 assistant: shared generation accepts, rejects and c
   const { loadModelConfig, Weights, createModel, generate } = await import("@mlx-bun/inference");
   const { loadTokenizer, ChatTemplate } = await import("@mlx-bun/inference/input");
   const { AssistantProvider } = await import("@mlx-bun/inference/generation/speculative");
+  const { sequenceLogitsOperation } = await import("../../src/scoring/full-sequence");
   const { observedPhases, phaseHidden } = await import("../models/phase-forward");
   const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
   const ops = await import("@mlx-bun/mlx/ops");
@@ -342,7 +344,7 @@ test.skipIf(!inputs)("Gemma4 assistant: shared generation accepts, rejects and c
       forwarded(ids, caches, hidden) {
         const values = ids.toIntTokens();
         using reference = phaseHidden(replay as never, ids, replayCaches);
-        using actualLogits = model.logitsFromHidden(hidden), wantedLogits = replay.logitsFromHidden(reference);
+        using actualLogits = sequenceLogitsOperation(model, hidden), wantedLogits = sequenceLogitsOperation(replay, reference);
         const logits = same(actualLogits, wantedLogits, [1, values.length, vocab], "full target logits");
         processed.push(...values);
         forwards.push({ ids: [...values], offset: processed.length, logits, state: state(caches, processed.length) });
@@ -451,7 +453,6 @@ test("donors must hold the scripted positions: a missing or wrong rollback fails
   expect(() => assertDonorOffsets(rollback[0], { ...at(rollback[1]), full: rollback[1] + 1 }, rollback[1], window)).toThrow("685/686");
   expect(() => assertDonorOffsets(rollback[0], { ...at(rollback[1]), slidingWidth: 513 }, rollback[1], window)).toThrow("donor views 513/685 wide");
 });
-
 
 test("assistant acceptance checks complete verification, EOS, final budget and retained rollback (CPU only)", () => {
   expect(assistantRound([4, 5], [4, 5, 6], 8, [9], 10)).toEqual({ accepted: 2, emitted: [4, 5, 6], retained: 2, disagreed: false });

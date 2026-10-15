@@ -5,6 +5,7 @@
 // regen/train/calibrate runs are separate verification.
 
 import { afterAll, describe, expect, test } from "bun:test";
+import type { DraftProjection } from "@mlx-bun/inference/contracts/mlx";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -45,10 +46,10 @@ function syntheticTarget() {
     if (f !== h) f.dispose();
     return out;
   };
-  const projection = {
+  const projection: DraftProjection = {
     embed: { scales, encode: (ids: MlxArray) => ops.takeAxis(table, ids, 0) },
-    // The output head per width class (`DraftProjection.logits`): one head at every width.
-    logits: { one: logits, twoToThree: logits, four: logits, fiveToEight: logits, wider: logits },
+    // This fixed head accepts every positive row count, including training batches.
+    logits: [{ from: 1, to: Infinity, operation: logits }],
   };
   const model = {
     graphCapabilities: declareGraph({ hiddenLayerTaps: true }),
@@ -252,10 +253,10 @@ describe.skipIf(!native)("calibration rows", () => {
     };
     const rounds: { pos: number; conf: number; accepted: boolean }[][] = [];
     const provider = new CalibrationProvider(fake as never, round => rounds.push(round), "fake");
-    // The target's projection, declared per width class (`DraftProjection.logits`); the fake drafter never reads it.
+    // The target's fixed projection; the fake drafter never reads it.
     const unused = () => { throw new Error("unused"); };
-    const projection = { embed: { encode: unused, scales: { dtype: Dtype.bfloat16 } },
-      logits: { one: unused, twoToThree: unused, four: unused, fiveToEight: unused, wider: unused } };
+    const projection: DraftProjection = { embed: { encode: unused, scales: { dtype: Dtype.bfloat16 } },
+      logits: [{ from: 1, to: Infinity, operation: unused }] };
     const target = { identity: {}, hiddenLayerTaps: { layerCount: 3, projection } } as never;
     // The prompt's tapped context seeds a row, which joins the draft rows as the group joins it.
     const prefill = provider.grouped.openPrefill({ target, checkpoints: [null] });

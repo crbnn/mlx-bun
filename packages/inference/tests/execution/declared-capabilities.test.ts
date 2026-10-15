@@ -5,7 +5,7 @@ import { declareGraph, ORDINARY_VERIFICATION } from "../../src/models/capabiliti
 import type { RuntimeModel } from "../../src/models/factory";
 import { createRuntimeConfig, withRuntimeConfig } from "../../src/runtime/config";
 import { KVCache } from "../../src/state/kv";
-import { atEveryWidth } from "../../src/models/graph";
+import { rowTable } from "../../src/models/graph";
 import { NgramProvider } from "../../src/generation/speculative/sources/ngram-source";
 import type { GenerateOptions } from "../../src/generation/index";
 import type { GraphCapabilities } from "../../src/contracts/portable/graph";
@@ -21,8 +21,8 @@ const schedule = { checkpoints: false };
 
 /** Placement never forwards: every phase a stand-in declares throws. */
 const never = () => { throw new Error("placement never forwards"); };
-const phases = { prefillChunk: { gpu: never }, prefillTail: atEveryWidth(never), decode: atEveryWidth(never),
-  verify: atEveryWidth(never), appendKnown: atEveryWidth(never), logits: atEveryWidth(never) };
+const phases = { prompt: [{from:1,to:Infinity,operation:never}], multiSequencePrompt: [{from:1,to:Infinity,operation:never}], decode: rowTable(never),
+  verify: rowTable(never), appendKnown: rowTable(never), logits: rowTable(never) };
 function replacement(declared: Parameters<typeof declareGraph>[0] = {}, extra: object = {}, modelType = "replacement"): RuntimeModel {
   return {
     config: { modelType, text: { enableMoeBlock: false, numHiddenLayers: 1, layerTypes: ["full_attention"] }, eosTokenIds: [] },
@@ -67,15 +67,16 @@ describe("placement follows the graph's declarations", () => {
       expect(fresh(paged, paged.reusesPrefix(plan))).toEqual(["kv:paged"]);
     }
     expect(fresh(bind(replacement()), true)).toEqual(["kv:plain"]);
-    const unadapted = bind(replacement({ adapters: { batched: false } }));
-    expect(refusals(unadapted.plan({ ...shape, hasAdapters: true }, {}, schedule))).toEqual(["adapter-batch-unsupported"]);
-    expect(unadapted.bindAdapterContext).toBeUndefined();
-    expect(bind(replacement({ adapters: { batched: true } })).plan({ ...shape, hasAdapters: true }, {}, schedule).mechanism).toBe("continuous");
+    const adapted = bind(replacement());
+    expect(refusals(adapted.plan({ ...shape, hasAdapters: true }, {}, schedule))).toEqual([]);
+    const selected = adapted.bindAdapterContext!(["first"], "first");
+    const restore = selected.enter();
+    expect((adapted.graph as unknown as {loraState:{active:string[]}}).loraState.active).toEqual(["first"]);
+    restore();
+    expect((adapted.graph as unknown as {loraState:{active:string[]}}).loraState.active).toEqual([]);
     const compiled = bind(replacement({ compiledDecode: true }));
     expect(compiled.plan(shape, {}, schedule).compiledDecode).toBe(true);
-    // A composition that turns the compiled step off is planned without it.
-    expect(bind(replacement({ compiledDecode: true }, { composition: testComposition(undefined, { compiledDecode: false }) }))
-      .plan(shape, {}, schedule).compiledDecode).toBe(false);
+
   });
 
   test("prepared media enters through the graph's own operation, declared and provided together", () => {

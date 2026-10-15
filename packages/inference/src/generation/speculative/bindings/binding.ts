@@ -1,7 +1,7 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { Cache } from "../../../contracts/mlx/cache";
-import { widthClass, type MlxLayerCapture } from "../../../contracts/mlx/graph";
+import { type MlxLayerCapture } from "../../../contracts/mlx/graph";
 import type { MlxTokenGraph } from "../../../models/graph";
 import { declaredGraph, tokenPhasesOf } from "../../../models/capabilities";
 import type { MlxForwardWork } from "../../../contracts/mlx/forward-work";
@@ -57,7 +57,7 @@ export function bindSpeculativeTargetModel(model: MlxTokenGraph): MlxSpeculative
     decode: (ids, caches, tapLayers, work) => withCapture(tapLayers, layerCount, capture => {
       const sequences = ids.shape[0]!;
       const own = async () => dispatch.decode(sequences)(ids, caches, capture);
-      return work ? work(ids, caches, { phase: "decode", rows: sequences, width: widthClass(sequences), capture, own }) : own();
+      return work ? work(ids, caches, { phase: "decode", rows: sequences, capture, own }) : own();
     }),
     verify: (ids, caches, window, tapLayers, work) => withCapture(tapLayers, layerCount, capture => {
       const own = async () => dispatch.verify(window.sequences, window.positions)(ids, caches, capture);

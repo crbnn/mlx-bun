@@ -20,8 +20,8 @@ import type { MlxArray } from "@mlx-bun/mlx/array";
 import { type Cache } from "../contracts/mlx/cache";
 import { AttentionMasks } from "../state/attention-read";
 import { selectedTrainingAttention, TrainingCache, TrainingSSMCache, trainingStandIn } from "../state/training-cache";
+import type { MlxSequenceForward, MlxSequenceRange } from "../contracts/mlx/graph";
 import type { RuntimeModel } from "../models/factory";
-import { widthClass } from "../contracts/mlx/width";
 
 export { TrainingCache, TrainingSSMCache };
 /** The padded-batch training mask (`paddedTrainingMask`): [B, 1, L, L] bool,
@@ -43,7 +43,7 @@ export function trainForwardHidden(
   validLengths?: number[],
 ): MlxArray {
   const [B, L] = ids.shape as [number, number];
-  const width = widthClass(B * L);
+  const width = (B * L);
   const rowLengths = validLengths !== undefined && validLengths.some((v) => v < L) ? validLengths : null;
   // Stateless offset-0 caches (one per cache the graph composes), so the
   // forward is pure and safe to recompute under gradient checkpointing. Each
@@ -56,7 +56,7 @@ export function trainForwardHidden(
     trainingStandIn(c, window => new TrainingCache(window, masks, attention, rowLengths)));
   for (const c of probe) c.dispose();
   try {
-    return model.sequenceHidden(ids, cache, width); // [B, L, hidden]
+    return sequenceHiddenOperation(model, ids, cache, width); // [B, L, hidden]
   } finally {
     for (const c of cache) c.dispose();
   }
@@ -73,7 +73,31 @@ export function trainForward(
   validLengths?: number[],
 ): MlxArray {
   const h = trainForwardHidden(model, ids, validLengths);
-  const logits = model.logitsFromHidden(h);
+  const logits = sequenceLogitsOperation(model,h);
   h.dispose();
   return logits;
+}
+
+
+/** Select the full-sequence operation from its exact token rows. */
+type SequenceOperations = { readonly sequence?: readonly MlxSequenceRange[]; readonly sequenceHidden?: MlxSequenceForward };
+export function sequenceHiddenOperation(model: SequenceOperations | object,
+  ids: MlxArray, cache: Cache[], rows = ids.shape[0]! * ids.shape[1]!): MlxArray {
+  const ports = model as SequenceOperations;
+  if (ports.sequence) return ports.sequence.find(range => rows >= range.from && rows <= range.to)!.operation(ids, cache);
+  if (!ports.sequenceHidden) throw new TypeError("the graph declares no full-sequence operation");
+  return ports.sequenceHidden(ids, cache, rows);
+}
+
+/** Full-sequence heads may cover more rows than the serving scheduler's table. */
+export function sequenceLogitsOperation(model: object, hidden: MlxArray): MlxArray {
+  const ports=model as {readonly sequenceLogits?: readonly import("../contracts/mlx/graph").MlxHeadRange[]; logitsFromHidden?(hidden:MlxArray):MlxArray};
+  const rows=hidden.shape.slice(0,-1).reduce((a,b)=>a*b,1);
+  if (ports.sequenceLogits) {
+    const range=ports.sequenceLogits.find(range=>rows>=range.from && rows<=range.to);
+    if (!range) throw new Error(`graph has no sequence head for ${rows} rows`);
+    return range.operation(hidden);
+  }
+  if (ports.logitsFromHidden) return ports.logitsFromHidden(hidden);
+  throw new TypeError("graph declares no full-sequence head");
 }

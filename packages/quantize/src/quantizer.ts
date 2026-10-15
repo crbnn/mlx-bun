@@ -1,3 +1,4 @@
+import type { QuantizedLinear } from "@mlx-bun/inference/layers";
 // Native model quantizer: walk a model directory's weights, quantize every
 // eligible Linear / embedding / lm_head weight to uniform affine N-bit, pass
 // everything else through unchanged, and write a loadable quantized snapshot.
@@ -633,7 +634,8 @@ async function computeMixedAllocation(
 
         // Quantizable linears to probe: the model's LoRA-target linears
         // (attention + MLP projections), keyed by full module path.
-        const layers = model.loraTargets();
+        const layers = new Map([...model.loraTargets()].filter((entry): entry is [string, QuantizedLinear] =>
+          "exchangeQuantizedState" in entry[1]));
 
         progress(
           "sensitivity",

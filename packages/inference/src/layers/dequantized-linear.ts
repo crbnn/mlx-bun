@@ -18,8 +18,7 @@ import type { QuantizedLinear } from "./quantized-linear";
 // choice at those shapes, not a property of every shape (at 512 inputs the two
 // round differently): a graph selects this layer for the artifact it was
 // measured on. The dense weight is a transient of one call (outputs x inputs x
-// 2 bytes). Applies no mounted adapters: a graph builds it only where the
-// composition mounts none.
+// 2 bytes). Applies the request's external adapter delta after the projection.
 
 /** The fewest rows the dense GEMM takes at any projection: below this the dequantization costs about what the
  *  GEMM saves over MLX's quantized matmul. */
@@ -51,9 +50,23 @@ export class DequantizedLinear {
   /** `x` [.., inputs] (borrowed) to an owned [.., outputs], lazy. */
   forward(x: MlxArray): MlxArray {
     const { w, scales, biases } = this.linear;
-    if (x.size / x.shape.at(-1)! < this.#minRows) return ops.quantizedMatmul(x, w, scales, biases, this.#spec, true);
+    if (x.size / x.shape.at(-1)! < this.#minRows) return this.linear.delta.forward(x, ops.quantizedMatmul(x, w, scales, biases, this.#spec, true));
     using dense = ops.dequantize(w, scales, biases, this.#spec);
     using weightT = ops.transposeAxes(dense, [1, 0]);
-    return ops.matmul(x, weightT);
+    return this.linear.delta.forward(x, ops.matmul(x, weightT));
+  }
+}
+
+/** One fixed dequantize-and-GEMM operation. The graph declares its measured row range. */
+export class DequantizedMatmulLinear {
+  constructor(readonly linear: QuantizedLinear) {
+    if (!linear.biases || linear.bias || linear.w.ndim !== 2 || linear.spec.mode !== "affine")
+      throw new Error("DequantizedMatmulLinear: unsupported projection (affine, two-dimensional, no additive bias)");
+  }
+  forward(x: MlxArray): MlxArray {
+    const {w,scales,biases,spec}=this.linear;
+    using dense=ops.dequantize(w,scales,biases,spec);
+    using weightT=ops.transposeAxes(dense,[1,0]);
+    return this.linear.delta.forward(x,ops.matmul(x,weightT));
   }
 }

@@ -1,6 +1,5 @@
 import type { MlxArray } from '@mlx-bun/mlx/array';
 import type { Cache } from './cache';
-import type { MlxWidthClass } from './width';
 
 /** Prepared embeddings for vision/audio prompts. Qualified models consume
  * this through the media prompt input the graph binds (`bindMediaInput`).
@@ -42,7 +41,7 @@ export interface MlxPromptInput {
    * planner's name for the piece (one position after a reused prefix appends
    * as a decode, more as a tail) and the class of its rows. Returns the hidden
    * of the prompt's last position. */
-  prefill(ids: MlxArray, caches: Cache[], start: number, phase: "tail" | "decode", width: MlxWidthClass): MlxArray;
+  prefill(ids: MlxArray, caches: Cache[], start: number, phase: "tail" | "decode", width: number): MlxArray;
   readonly decodeState?: MlxDecodeState;
 }
 
@@ -52,7 +51,7 @@ export interface MlxDecodeState {
   readonly key: string;
   /** One new token per row at the positions each row's state names; `width`
    * is the class of the rows, named by the scheduler. */
-  decode(ids: MlxArray, caches: Cache[], rows: readonly MlxDecodeState[], width: MlxWidthClass): MlxArray;
+  decode(ids: MlxArray, caches: Cache[], rows: readonly MlxDecodeState[], width: number): MlxArray;
 }
 
 /** Common contract for image encoders: preprocess image bytes into an
@@ -85,4 +84,30 @@ export interface MediaEncoders {
 export interface MediaSidecarProbes {
   /** Whether the sidecar at `path` ships the audio encoder's tensors (header-only read). */
   shipsAudioTower(path: string): boolean;
+}
+
+
+/** Fixed embedding prefill over prepared image/audio embeddings. */
+export type MlxEmbeddingsForward = (embeddings: MlxArray, state: Cache[], imageMask: MlxArray | null,
+  ids: MlxArray, multimodalMask: MlxArray | null) => MlxArray;
+export interface MlxEmbeddingsRange {
+  readonly from: number;
+  readonly to: number;
+  readonly operation: MlxEmbeddingsForward;
+}
+
+/** Fixed token forward at request-owned rotary positions. */
+export type MlxPositionedForward = (ids: MlxArray, state: Cache[], positions: MlxArray) => MlxArray;
+export interface MlxPositionedRange {
+  readonly from: number;
+  readonly to: number;
+  readonly operation: MlxPositionedForward;
+}
+
+/** Fixed embedding prefill at request-owned rotary positions. */
+export type MlxPositionedEmbeddingsForward = (embeddings: MlxArray, state: Cache[], positions: MlxArray) => MlxArray;
+export interface MlxPositionedEmbeddingsRange {
+  readonly from: number;
+  readonly to: number;
+  readonly operation: MlxPositionedEmbeddingsForward;
 }

@@ -1,3 +1,4 @@
+import type { TestGraph } from "../models/test-composition";
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -14,7 +15,7 @@ import { KVCache } from "../../src/state/kv";
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
 import { testComposition } from "../models/test-composition";
 import { bindSpeculativeGroupRequests } from "../../src/execution/speculative-group";
-import { atEveryWidth } from "../../src/models/graph";
+import { rowTable } from "../../src/models/graph";
 import { stubPhases } from "../models/phase-forward";
 
 let directory: string;
@@ -137,7 +138,7 @@ test("group membership borrows committed checkpoints and survives reorder, drain
   const provider = await QwenMtpProvider.load(directory);
   const unused = () => { throw new Error("membership must not execute the model"); };
   const target = { identity: {}, recurrentMtp: {
-    hiddenSize: 8, layerCount: 1, embed: unused, logits: atEveryWidth(unused),
+    hiddenSize: 8, layerCount: 1, embed: unused, logits: rowTable(unused),
   } };
   const checkpoint = (tokens: number, value: number): DraftRowCheckpoint => ({
     processedTokens: tokens,
@@ -194,7 +195,7 @@ test("target and draft admission publish together after every state owner prepar
   const provider = await QwenMtpProvider.load(directory);
   const unused = () => { throw new Error("admission must not execute the model"); };
   const draft = provider.grouped.open({ target: { identity: {}, recurrentMtp: {
-    hiddenSize: 8, layerCount: 1, embed: unused, logits: atEveryWidth(unused),
+    hiddenSize: 8, layerCount: 1, embed: unused, logits: rowTable(unused),
   } }, sampling: { selection: { kind: "sampled" }, sample: unused }, checkpoints: [] });
   const target = new MlxStateRows([new BatchedKVCache()]);
   const pending = MlxArray.fromFloat32(new Float32Array(8).fill(17), [1, 1, 8]);
@@ -233,7 +234,7 @@ test("prefill membership borrows the same checkpoints without constructing a sam
   const provider = await QwenMtpProvider.load(directory);
   const unused = () => { throw new Error("prefill membership must not execute the model"); };
   const target = { identity: {}, recurrentMtp: { hiddenSize: 8, layerCount: 1,
-    embed: unused, logits: atEveryWidth(unused) } };
+    embed: unused, logits: rowTable(unused) } };
   const hidden = MlxArray.fromFloat32(new Float32Array(8).fill(7), [1, 1, 8]);
   const checkpoint: DraftRowCheckpoint = { processedTokens: 1,
     attachment: { schema: "qwen-mtp-v1", metadata: { draftOffset: 0 }, tensors: [hidden] } };
@@ -269,7 +270,7 @@ test("Qwen MTP declares the target tap its grouped rows consume, resolved from t
   const provider = await QwenMtpProvider.load(directory);
   const unused = () => { throw new Error("declaration must not execute the model"); };
   try {
-    const target = { identity: {}, recurrentMtp: { hiddenSize: 8, layerCount: 3, embed: unused, logits: atEveryWidth(unused) } };
+    const target = { identity: {}, recurrentMtp: { hiddenSize: 8, layerCount: 3, embed: unused, logits: rowTable(unused) } };
     const declared = provider.grouped.targetTapLayers!(target);
     expect(declared).toEqual([2]);
     for (const open of [() => provider.grouped.open({ target, sampling: { selection: { kind: "sampled" }, sample: unused }, checkpoints: [] }),
@@ -285,7 +286,7 @@ test("Qwen MTP declares the target tap its grouped rows consume, resolved from t
         embed: { encode: unused }, lmHead: null, makeCache: () => [], composition: testComposition(), ...stubPhases(unused, unused) });
       const declared = Object.getOwnPropertyDescriptor(Qwen35Model.prototype, "graphCapabilities")!.get!.call(graph);
       Object.defineProperty(graph, "graphCapabilities", { value: { ...declared, hiddenLayerTaps: tap } });
-      return graph as Qwen35Model;
+      return graph as TestGraph<Qwen35Model>;
     };
     expect(bindSpeculativeGroupRequests(qwen(true), provider, 2)).toBeDefined();
     expect(bindSpeculativeGroupRequests(qwen(false), provider, 2)).toBeUndefined();

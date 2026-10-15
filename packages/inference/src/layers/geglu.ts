@@ -10,7 +10,7 @@ import { CompiledFunction } from "@mlx-bun/mlx/compile";
 import type { ModelConfig } from "../artifacts/config";
 import type { Weights } from "../artifacts/weights";
 import { isCompiledTrace } from "../runtime/compiled-trace";
-import { QuantizedLinear } from "./quantized-linear";
+import { QuantizedLinear, QuantizedLinearPlain } from "./quantized-linear";
 
 /** Verbatim port of mlx_lm/models/gemma4_text.py:
  *    `@partial(mx.compile, shapeless=True) def geglu(gate, x): return nn.gelu_approx(gate) * x`
@@ -41,7 +41,7 @@ export function compiledGeglu(gate: MlxArray, up: MlxArray): MlxArray {
 /** gelu_approx(gate) * up, consuming both inputs. `compiled` is the owner's
  *  construction-time choice: the compiled closure (the oracle's @mx.compile'd
  *  geglu, one kernel set; the default the Gemma graphs compose), or the
- *  spelled-out composition (the composition's `compiledGeglu` off, same L1
+ *  spelled-out operation (same L1
  *  parity, slower). Inside a compiled-decode trace the closure records the
  *  spelled-out ops. */
 export function geglu(gate: MlxArray, up: MlxArray, compiled: boolean): MlxArray {
@@ -76,5 +76,55 @@ export class GegluMLP {
     const out = this.down.forward(m);
     m.dispose();
     return out;
+  }
+}
+
+/** Plain GeGLU consumes both activation inputs. */
+export class PlainGeglu {
+  forward(gate: MlxArray, up: MlxArray): MlxArray {
+    using act = ops.geluApprox(gate);
+    const out = ops.mul(act, up);
+    gate.dispose(); up.dispose();
+    return out;
+  }
+}
+
+/** Compiled GeGLU consumes both activation inputs. */
+export class CompiledGeglu {
+  forward(gate: MlxArray, up: MlxArray): MlxArray {
+    const out = compiledGeglu(gate, up);
+    gate.dispose(); up.dispose();
+    return out;
+  }
+}
+
+export class PlainGegluMLP {
+  readonly #activation = new PlainGeglu();
+  readonly #gate: QuantizedLinearPlain;
+  readonly #up: QuantizedLinearPlain;
+  readonly #down: QuantizedLinearPlain;
+  constructor(readonly base: GegluMLP) {
+    this.#gate = new QuantizedLinearPlain(base.gate);
+    this.#up = new QuantizedLinearPlain(base.up);
+    this.#down = new QuantizedLinearPlain(base.down);
+  }
+  forward(x: MlxArray): MlxArray {
+    using hidden = this.#activation.forward(this.#gate.forward(x), this.#up.forward(x));
+    return this.#down.forward(hidden);
+  }
+}
+export class CompiledGegluMLP {
+  readonly #activation = new CompiledGeglu();
+  readonly #gate: QuantizedLinearPlain;
+  readonly #up: QuantizedLinearPlain;
+  readonly #down: QuantizedLinearPlain;
+  constructor(readonly base: GegluMLP) {
+    this.#gate = new QuantizedLinearPlain(base.gate);
+    this.#up = new QuantizedLinearPlain(base.up);
+    this.#down = new QuantizedLinearPlain(base.down);
+  }
+  forward(x: MlxArray): MlxArray {
+    using hidden = this.#activation.forward(this.#gate.forward(x), this.#up.forward(x));
+    return this.#down.forward(hidden);
   }
 }

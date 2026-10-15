@@ -1,6 +1,9 @@
+import type { MlxArray } from "@mlx-bun/mlx/array";
+import type { MlxCapturingForward, MlxHeadForward } from "../../src/contracts/mlx/graph";
+import { rowOperationFor } from "../../src/runtime/row-operations";
 // Qwen3.8-27B packed-Trellis graph and its native MTP draft head against main's
 // own outputs. The packed-Trellis artifact has no external oracle (mlx-lm cannot
-// load it), so the reference is what main at 02d723a computes for the same
+// load it), so the reference is what the independently pinned main revision computes for the same
 // artifacts, produced outside this repository by
 // packages/inference/scripts/main-qwen-trellis-reference.ts. This test never
 // starts main or Python. Opt in with all four of
@@ -22,38 +25,16 @@
 //    to its generic blocks' over the same prompt (`prefillEmbeddings` at the
 //    caches' positions, then the plain head), which hash to main's, and the
 //    trajectory then decodes on that prompt state, main's to the bit;
-//  - verify windows against one-row decode on this tree, main's MTP run
-//    teacher-forced: after the prompt, each recorded round's window [pending,
-//    ...proposals] runs through `verify` at its width class, the caches'
-//    speculative rollback drops it again, and the round's accepted tokens are
-//    decoded one row at a time on the same state. The one-row decode selects
-//    every token main emitted (main's speculative output was its plain greedy
-//    output, and plain decode here is main's to the bit). Each window row whose
-//    context was accepted (the pending token's and each accepted proposal's) is
-//    compared with the one-row logits of its position: KL(one row || window)
-//    within KL_ROW per row and KL_MEAN on average, and the same argmax unless the
-//    one-row top is a near-tie (NEAR_TIE), where the window may pick a tied
-//    token. Rows after a rejected proposal read a context no output depends on
-//    and are not compared; the fully accepted rounds compare every window row
-//    (on main's prompt state, as the trajectory builds it);
-//  - MTP speculation, depth 2, greedy, stop tokens off, through the public gateway
-//    binding. Where every compared window row is bit-identical to its one-row
-//    decode, as main's M1 graph's were, the run equals main's shared batch-one
-//    gateway: the emitted tokens, every target forward's input IDs (so every
-//    verify row, accepted or rejected) and the round and draft counters. Where
-//    they are not, a run's last bits depend on its window widths, which Josh's
-//    2026-10-11 width-class decision accepts, KL-gated, as the M4 Pro graph
-//    serves: this tree's M1 Max graph verifies two to eight rows on the codebook
-//    matrix-unit Trellis kernels and the affine row and split matrix-unit
-//    kernels, which reassociate relative to its one-row codebook kernels (main's
-//    ran the reduce and scatter row kernels there). Then the emitted tokens
-//    equal plain greedy (main's) up to their first difference, which must fall
-//    on a near-tie of the one-row logits, and the counters are those the run's
-//    own target forwards and tokens give. The check keys on that measured
-//    identity, not on the graph's name.
+//  - verify windows and one-row decode teacher-forced with main's native emitted
+//    prefix: full vectors, CPU first-maximum IDs and phase/cache positions equal
+//    independently captured main controls. Window-vs-one-row KL checks remain;
+//  - native MTP tokens, target inputs and counters equal main literally. Each
+//    emitted token is an exact maximum of its actual native target head. CPU
+//    first-maximum selection can differ from device argmax on an exact tie.
 // Continuation state and append geometry are the runtime-oracle plan's job
 // (README, "Repeatable runtime comparison"). This is not a claim about other
 // artifacts, batching above one, quantized KV, sampling, or speed.
+import { logitsEvidence, cachePositions, validateTeacherforce, validateNativeHeads, type LogitsEvidence, type TeacherforceEvidence } from "../../scripts/reference-logits";
 import { expect, test } from "bun:test";
 import { strict as assert } from "node:assert";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -79,12 +60,12 @@ type A = any;
 interface Inputs { target: string; draft: string; reference: string; referenceSha256: string }
 interface Pins { files: Record<string, string>; weights: Record<string, string> }
 interface Reference {
-  producer: string; schema: 1; mainRevision: string; graph: string;
+  producer: string; schema: 2; provenance: {producerSha256: string; phaseObserverSha256: string; teacherforceSha256: string; producerRevision: string}; mainRevision: string; graph: string;
   runtime: { mlx: string; architecture: string };
   artifacts: { target: Pins; draft: Pins };
   prompts: { text: string; ids: number[] }[];
   trajectories: { prompt: string; promptIds: number[]; greedy: number[]; logitsSha256: string[]; finite: boolean; vocab: number }[];
-  mtp: { execution: "shared-b1"; depth: number; maxTokens: number; runs: { prompt: string; tokens: number[]; forwards: number[][]; spec: Record<string, unknown> }[] };
+  mtp: { execution: "shared-b1"; depth: number; maxTokens: number; runs: { prompt: string; tokens: number[]; forwards: number[][]; heads: LogitsEvidence[][]; teacherforce: TeacherforceEvidence; spec: Record<string, unknown> }[] };
 }
 
 function optIn(env: Record<string, string | undefined>): Inputs | null {
@@ -133,7 +114,11 @@ async function verifyInputs(inputs: Inputs): Promise<Reference> {
   assert.equal(sha256(bytes), inputs.referenceSha256, "reference SHA-256 differs from the supplied pin");
   const reference = JSON.parse(bytes.toString("utf8")) as Reference;
   assert.equal(reference.producer, "main-qwen-trellis-reference", "not a main-qwen-trellis-reference file");
-  assert.equal(reference.schema, 1, "unsupported reference schema");
+  assert.equal(reference.schema, 2, "unsupported reference schema");
+  assert(/^[a-f0-9]{40}$/.test(reference.mainRevision), "reference main revision missing");
+  assert(/^[a-f0-9]{40}$/.test(reference.provenance?.producerRevision), "producer revision missing");
+  for (const key of ["producerSha256", "phaseObserverSha256", "teacherforceSha256"] as const)
+    assert(isSha256(reference.provenance?.[key]), `producer provenance ${key} missing`);
   assert(typeof reference.runtime?.mlx === "string" && reference.runtime.mlx && typeof reference.runtime?.architecture === "string" && reference.runtime.architecture,
     "reference runtime identity missing");
   const ids = (value: unknown, what: string) => assert(Array.isArray(value) && value.length > 0 && value.every(n => Number.isSafeInteger(n) && n >= 0), `${what}: expected token IDs`);
@@ -160,6 +145,8 @@ async function verifyInputs(inputs: Inputs): Promise<Reference> {
     // Its windows are teacher-forced below with the acceptances its tokens give.
     assert.deepEqual(speculationOf(run.forwards, run.tokens, reference.mtp.depth, `mtp run ${i}`).spec,
       Object.fromEntries(SPEC_KEYS.map(key => [key, run.spec[key]])), `mtp run ${i}: counters disagree with its forwards and tokens`);
+    validateTeacherforce(run.teacherforce, run.forwards, run.tokens, reference.trajectories[i]!.vocab);
+    validateNativeHeads(run.heads, run.forwards, run.tokens, reference.trajectories[i]!.vocab);
   });
   await verifyArtifact(inputs.target, reference.artifacts?.target, TARGET_METADATA);
   await verifyArtifact(inputs.draft, reference.artifacts?.draft, ["config.json"]);
@@ -179,9 +166,10 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis against main: logits, greedy tokens
   const { bindMlxGateway } = await import("@mlx-bun/inference/execution");
   const { argmaxLastPosition, klPerToken, lastPositionLogits } = await import("@mlx-bun/inference/scoring");
   const { rollbackVerifyBlock } = await import("@mlx-bun/inference/state");
-  const { widthClass } = await import("@mlx-bun/inference/contracts");
+  const { bindMlxAutoregressiveGraph } = await import("../../src/generation/bindings/autoregressive");
   const ops = await import("@mlx-bun/mlx/ops");
   const { Qwen38TrellisM1Max } = await import("@mlx-bun/inference/models/qwen38-27b-trellis-m1max");
+  const { Qwen38TrellisM4Pro } = await import("@mlx-bun/inference/models/qwen38-27b-trellis-m4pro");
   const { clearCache } = await import("@mlx-bun/mlx/ffi");
   const { observedPhases, phaseLogits } = await import("../models/phase-forward");
 
@@ -197,10 +185,12 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis against main: logits, greedy tokens
   const report: Record<string, unknown> = {};
   try {
     const model = createModel(weights, config) as A;
-    // Main selected its hand-written graph for this artifact on the M1 Max; this tree selects the graph generated
-    // for that composition (the reference runtime's GPU family is checked above).
-    expect(model).toBeInstanceOf(Qwen38TrellisM1Max);
+    // The pinned capture names the graph main selected on the matching runtime.
+    assert.equal(model.constructor.name, reference.graph, "loaded graph differs from the reference's pinned graph");
+    assert.equal(model instanceof Qwen38TrellisM1Max || model instanceof Qwen38TrellisM4Pro, true,
+      "the reference requires a known written Qwen Trellis graph");
     report.graph = model.constructor.name;
+    const controlBinding = bindMlxAutoregressiveGraph(model);
 
     const promptRows = { prompts: 0, identical: 0, klMax: 0 };
     const promptExact: boolean[] = [];
@@ -209,18 +199,18 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis against main: logits, greedy tokens
      *  logits are not main's bytes, its generic blocks' (the graph's `prefillEmbeddings` above eight rows: the
      *  prompt's embeddings at the caches' own positions) and its plain head, main's arithmetic, this graph's prompt
      *  held to them by KL and argmax. */
-    const mainPrompt = (i: number, ids: readonly number[], hash: string): { cache: A[]; out: A } => {
-      const cache = model.makeCache(), out = phaseLogits(model, ids, cache), last: Float32Array = lastPositionLogits(out);
+    const mainPrompt = (i: number, ids: readonly number[], hash: string): { cache: A[]; out: A; before: (number | null)[] } => {
+      const cache = model.makeCache(), before = cachePositions(cache), out = phaseLogits(model, ids, cache), last: Float32Array = lastPositionLogits(out);
       promptRows.prompts++;
       promptExact[i] = sha256(new Uint8Array(last.buffer, last.byteOffset, last.byteLength)) === hash;
-      if (promptExact[i]) { promptRows.identical++; return { cache, out }; }
-      expect(widthClass(ids.length), `prompt ${i}: the generic blocks take prompts above eight rows`).toBe("wider");
-      const mains = model.makeCache();
+      if (promptExact[i]) { promptRows.identical++; return { cache, out, before }; }
+      expect(ids.length, `prompt ${i}: the stock control takes prompts above eight rows`).toBeGreaterThan(8);
+      const mains = model.makeCache(), mainBefore = cachePositions(mains);
       let main: A;
       {
         using tokens = ops.fromInt32([...ids], [1, ids.length]);
         using embeds = model.embed.encode(tokens);
-        using hidden = model.prefillEmbeddings(embeds, mains, null, null, null, "wider");
+        using hidden = controlBinding.prefillEmbeddings!(embeds, mains, null, tokens, null, ids.length);
         main = model.logitsFromHidden(hidden);
       }
       try {
@@ -234,7 +224,7 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis against main: logits, greedy tokens
         expect(nearTop(expected), `prompt ${i}: this graph's argmax is not main's top or tied with it`).toContain(nearTop(last)[0]!);
       } catch (error) { main.dispose(); releaseAll(mains.map((c: A) => () => c.dispose())); throw error; }
       finally { out.dispose(); releaseAll(cache.map((c: A) => () => c.dispose())); }
-      return { cache: mains, out: main };
+      return { cache: mains, out: main, before: mainBefore };
     };
 
     // Greedy trajectories, full logits by hash.
@@ -267,35 +257,41 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis against main: logits, greedy tokens
     // Main's MTP windows teacher-forced: each verified on the state its accepted predecessors built one row at a time,
     // dropped, then its accepted tokens decoded one row at a time and their logits compared.
     const windows = { rows: 0, identical: 0, klSum: 0, klMax: 0, tieFlips: 0 };
-    const plainTies: number[][][] = []; // per run, per emitted token: the one-row near-top tokens at its position
+
     for (const [i, run] of reference.mtp.runs.entries()) {
       const prompt = mainPrompt(i, reference.prompts[i]!.ids, reference.trajectories[i]!.logitsSha256[0]!);
       const cache = prompt.cache;
-      const ties: number[][] = [];
-      plainTies.push(ties);
+      const measured: TeacherforceEvidence = {plain: [], windows: [], phases: []};
+      measured.phases.push({phase: "prompt", ids: [...reference.prompts[i]!.ids],
+        before: prompt.before, after: cachePositions(cache)});
       try {
         // The one-row logits [1, 1, V] after `tokens`, at the position of emitted token `ties.length`.
         const plain = (tokens: readonly number[]) => {
+          const before = cachePositions(cache);
           using out = phaseLogits(model, tokens, cache);
           const [, L, V] = out.shape as number[];
           const last = out.slice([0, L! - 1, 0], [1, L!, V!]);
-          ties.push(nearTop(last.toFloat32()));
+          measured.plain.push(logitsEvidence(last.toFloat32()));
+          measured.phases.push({phase: "decode", ids: [...tokens], before, after: cachePositions(cache)});
           return last;
         };
         {
           using out = prompt.out;
           using last = lastRow(out);
-          ties.push(nearTop(last.toFloat32()));
+          measured.plain.push(logitsEvidence(last.toFloat32()));
         }
         const { rounds } = speculationOf(run.forwards, run.tokens, reference.mtp.depth, `mtp run ${i}`);
         for (const [r, round] of rounds.entries()) {
-          const window = run.forwards[r + 1]!, width = widthClass(window.length), kept = round.accepted + 1;
+          const window = run.forwards[r + 1]!, width = window.length, kept = round.accepted + 1;
+          const before = cachePositions(cache);
           for (const c of cache) c.specRoundBegin?.();
           using ids = ops.fromInt32([...window], [1, window.length]);
-          using hidden = await model.verify[width](ids, cache, null);
-          using verified = model.logits[width](hidden);
+          using hidden = await rowOperationFor<MlxCapturingForward>(model.verify, width)(ids, cache, null);
+          using verified = rowOperationFor<MlxHeadForward>(model.logits, width)(hidden);
           ops.evalAll([verified]);
+          const after = cachePositions(cache);
           rollbackVerifyBlock(cache, 0, window.length);
+          measured.phases.push({phase: "verify", ids: [...window], before, after, afterRollback: cachePositions(cache)});
           const V = verified.shape[2]!;
           using rows = verified.slice([0, 0, 0], [1, kept, V]);
           const decoded = Array.from({ length: kept }, (_, j) => plain([run.tokens[round.start + j]!]));
@@ -305,6 +301,7 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis against main: logits, greedy tokens
           for (let j = 0; j < kept; j++) {
             const where = `mtp run ${i} round ${r}: window row ${j} (emitted token ${round.start + j + 1})`;
             const a = oneRows.subarray(j * V, (j + 1) * V), b = windowRows.subarray(j * V, (j + 1) * V);
+            measured.windows.push(logitsEvidence(b));
             windows.rows++;
             if (Buffer.from(a.buffer, a.byteOffset, a.byteLength).equals(Buffer.from(b.buffer, b.byteOffset, b.byteLength))) {
               windows.identical++;
@@ -317,12 +314,13 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis against main: logits, greedy tokens
             if (picked !== near[0]) windows.tieFlips++;
           }
         }
-        // The last accepted window's last row may predict one past the run.
-        expect(ties.slice(0, run.tokens.length).map(near => near[0]), `mtp run ${i}: one-row decode selects main's emitted tokens`)
-          .toEqual(run.tokens);
+        validateTeacherforce(measured, run.forwards, run.tokens, reference.trajectories[i]!.vocab);
+        expect(measured, `mtp run ${i}: independently captured main teacherforce vectors, CPU argmax and phase inputs`).toEqual(run.teacherforce);
+        // Where main's CPU first-maximum agrees with native, retain literal equality.
+        for (let p = 0; p < run.tokens.length; p++) if (run.teacherforce.plain[p]!.argmax === run.tokens[p])
+          expect(measured.plain[p]!.argmax, `mtp run ${i}: CPU first maximum ${p}`).toBe(run.tokens[p]!);
       } finally { releaseAll(cache.map((c: A) => () => c.dispose())); clearCache(); }
     }
-    const exact = windows.identical === windows.rows && promptExact.every(Boolean);
     expect(windows.klSum / windows.rows, "mean KL(one row || window) over the compared rows").toBeLessThanOrEqual(KL_MEAN);
     report.windows = { rows: windows.rows, identical: windows.identical, meanKl: windows.klSum / windows.rows,
       maxKl: windows.klMax, tieFlips: windows.tieFlips };
@@ -332,12 +330,20 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis against main: logits, greedy tokens
     releases.push(() => provider.dispose());
     let forwards: number[][] = [];
     // The scheduler binds to a view whose phases record each target forward's tokens.
-    const view = observedPhases(model, { forward(input: A) { forwards.push(input.toIntTokens() as number[]); } });
+    let heads: LogitsEvidence[][] = [];
+    const view = observedPhases(model, {
+      forward(input: A) { forwards.push(input.toIntTokens() as number[]); },
+      head(_hidden: A, out: A) {
+        const all: Float32Array = out.toFloat32(), V: number = out.shape.at(-1), L = all.length / V;
+        const rows = forwards.length === 1 ? [L - 1] : Array.from({length: L}, (_, i) => i);
+        heads.push(rows.map(j => logitsEvidence(all.subarray(j * V, (j + 1) * V))));
+      },
+    });
     const binding = bindMlxGateway(view, { provider, numDraftTokens: reference.mtp.depth });
     const options = { temperature: 0, maxTokens: reference.mtp.maxTokens };
     const rounds: unknown[] = [];
     for (const [i, run] of reference.mtp.runs.entries()) {
-      forwards = [];
+      forwards = []; heads = [];
       const plan = binding.plan({ hasVision: false, hasAdapters: false, hasRepetitionPenalty: false, userSeed: false,
         hasLogitsExtras: false, hasGrammar: false, wantsLogprobs: false, hasDraft: true }, options,
       { checkpoints: false });
@@ -354,21 +360,11 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis against main: logits, greedy tokens
       const spec = Object.fromEntries(SPEC_KEYS.map(key => [key, result.spec?.[key] ?? null]));
       const mains = Object.fromEntries(SPEC_KEYS.map(key => [key, run.spec[key]]));
       const summary: Record<string, unknown> = { accepted: spec.accepted, drafted: spec.drafted, rounds: spec.rounds };
-      if (exact) {
-        expect(tokens, `mtp run ${i}: emitted tokens`).toEqual(run.tokens);
-        expect(forwards, `mtp run ${i}: target forwards (prefill, then [pending, ...proposals] per round)`).toEqual(run.forwards);
-        expect(spec, `mtp run ${i}: speculation counters`).toEqual(mains);
-      } else {
-        expect(tokens.length, `mtp run ${i}: emitted tokens`).toBe(reference.mtp.maxTokens);
-        expect(forwards[0], `mtp run ${i}: prefill forward`).toEqual(reference.prompts[i]!.ids);
-        expect(spec, `mtp run ${i}: speculation counters`).toEqual(speculationOf(forwards, tokens, reference.mtp.depth, `mtp run ${i}`).spec);
-        // Plain greedy is main's emitted tokens (the one-row decode above selected each of them).
-        const differs = tokens.findIndex((token, m) => token !== run.tokens[m]);
-        if (differs >= 0) expect(plainTies[i]![differs], `mtp run ${i}: emitted token ${differs} differs from plain greedy's ` +
-          `${run.tokens[differs]} beyond a near-tie`).toContain(tokens[differs]!);
-        Object.assign(summary, { differsAt: differs < 0 ? null : differs, forwardsEqualMain: Bun.deepEquals(forwards, run.forwards),
-          countersEqualMain: Bun.deepEquals(spec, mains) });
-      }
+      expect(tokens, `mtp run ${i}: emitted tokens`).toEqual(run.tokens);
+      expect(forwards, `mtp run ${i}: target forwards (prefill, then [pending, ...proposals] per round)`).toEqual(run.forwards);
+      expect(spec, `mtp run ${i}: speculation counters`).toEqual(mains);
+      validateNativeHeads(heads, forwards, tokens, reference.trajectories[i]!.vocab);
+      expect(heads, `mtp run ${i}: actual native head vectors and exact maximum membership`).toEqual(run.heads);
       rounds.push(summary);
       clearCache();
     }
@@ -398,7 +394,8 @@ function synthetic() {
   writeFileSync(join(draft, "model.safetensors"), "draft weights");
   const h = "a".repeat(64);
   const reference: Reference = {
-    producer: "main-qwen-trellis-reference", schema: 1, mainRevision: "rev", graph: "Qwen38TrellisTQ", runtime: { mlx: "0.32.2", architecture: "applegpu_g13s" },
+    producer: "main-qwen-trellis-reference", schema: 2, mainRevision: "b".repeat(40),
+    provenance: {producerSha256: h, phaseObserverSha256: h, teacherforceSha256: h, producerRevision: "c".repeat(40)}, graph: "Qwen38TrellisTQ", runtime: { mlx: "0.32.2", architecture: "applegpu_g13s" },
     artifacts: {
       target: { files: Object.fromEntries(Object.entries(files).map(([name, text]) => [name, sha256(text)])),
         weights: { "model-00001-of-00002.safetensors": sha256("shard-one"), "model-00002-of-00002.safetensors": sha256("shard-two") } },
@@ -407,6 +404,15 @@ function synthetic() {
     prompts: [{ text: "p", ids: [1, 2, 3] }],
     trajectories: [{ prompt: "p", promptIds: [1, 2, 3], greedy: [4, 5], logitsSha256: [h, h], finite: true, vocab: 8 }],
     mtp: { execution: "shared-b1", depth: 2, maxTokens: 3, runs: [{ prompt: "p", tokens: [4, 5, 6], forwards: [[1, 2, 3], [4, 5, 6]],
+      heads: [[{sha256: h, vocab: 8, finite: true, argmax: 4, maxima: [4]}],
+        [5, 6, 7].map(argmax => ({sha256: h, vocab: 8, finite: true as const, argmax, maxima: [argmax]}))],
+      teacherforce: {plain: [4,5,6,7].map(argmax => ({sha256: h, vocab: 8, finite: true as const, argmax, maxima: [argmax]})),
+        windows: [5,6,7].map(argmax => ({sha256: h, vocab: 8, finite: true as const, argmax, maxima: [argmax]})),
+        phases: [{phase: "prompt", ids: [1,2,3], before: [0], after: [3]},
+          {phase: "verify", ids: [4,5,6], before: [3], after: [6], afterRollback: [3]},
+          {phase: "decode", ids: [4], before: [3], after: [4]},
+          {phase: "decode", ids: [5], before: [4], after: [5]},
+          {phase: "decode", ids: [6], before: [5], after: [6]}]},
       spec: { drafted: 2, accepted: 2, rejected: 0, targetCalls: 2, rounds: 1, acceptanceLengths: [2], draftedByPos: [1, 1], acceptedByPos: [1, 1] } }] },
   };
   const pin = () => { const text = JSON.stringify(reference); writeFileSync(join(root, "reference.json"), text); return sha256(text); };
@@ -443,7 +449,7 @@ test("a relocated identical reference and artifacts verify (CPU only)", async ()
 
 test("altered, incomplete or mismatched inputs fail before any native load (CPU only)", async () => {
   await rejects(s => ({ ...s.inputs(), referenceSha256: "0".repeat(64) }), "reference SHA-256 differs");
-  await rejects(s => { s.reference.schema = 2 as 1; }, "unsupported reference schema");
+  await rejects(s => { s.reference.schema = 3 as 2; }, "unsupported reference schema");
   await rejects(s => { s.reference.producer = "other"; }, "not a main-qwen-trellis-reference file");
   await rejects(s => { s.reference.trajectories[0]!.logitsSha256.pop(); }, "a logits hash per step");
   await rejects(s => { s.reference.trajectories[0]!.logitsSha256[1] = "xyz"; }, "invalid logits SHA-256");
@@ -464,4 +470,34 @@ test("altered, incomplete or mismatched inputs fail before any native load (CPU 
   await rejects(s => { writeFileSync(join(s.draft, "model.safetensors"), "other"); }, "weights model.safetensors differ");
   await rejects(s => { rmSync(join(s.draft, "model.safetensors")); }, "model.safetensors");
   await rejects(s => { delete s.reference.artifacts.target.files["chat_template.jinja"]; }, "artifact pins do not include chat_template.jinja");
+});
+
+test("teacherforce and native-head corruption fail without native libraries", async () => {
+  await rejects(s => { s.reference.mainRevision = "unknown"; }, "main revision missing");
+  await rejects(s => { s.reference.provenance.teacherforceSha256 = "unknown"; }, "producer provenance teacherforceSha256");
+  await rejects(s => { s.reference.provenance.producerRevision = "unknown"; }, "producer revision missing");
+  await rejects(s => { s.reference.mtp.runs[0]!.teacherforce.plain.pop(); }, "plain vector count");
+  await rejects(s => { s.reference.mtp.runs[0]!.teacherforce.windows.pop(); }, "window vector count");
+  await rejects(s => { s.reference.mtp.runs[0]!.teacherforce.plain[0]!.sha256 = "unknown"; }, "invalid logits SHA-256");
+  await rejects(s => { s.reference.mtp.runs[0]!.teacherforce.plain[0]!.finite = false as true; }, "not all finite");
+  await rejects(s => { s.reference.mtp.runs[0]!.teacherforce.plain[0]!.argmax = 0; }, "first maximum");
+  await rejects(s => { s.reference.mtp.runs[0]!.teacherforce.plain[0]!.maxima = [4,4]; }, "exact maxima");
+  await rejects(s => { s.reference.mtp.runs[0]!.teacherforce.plain[0]!.vocab = 9; }, "vocabulary");
+  await rejects(s => { s.reference.mtp.runs[0]!.teacherforce.phases.pop(); }, "phase count");
+  await rejects(s => { s.reference.mtp.runs[0]!.teacherforce.phases[1]!.ids = [4,5,7]; }, "inputs");
+  await rejects(s => { s.reference.mtp.runs[0]!.teacherforce.phases[1]!.afterRollback = [4]; }, "rollback positions");
+  await rejects(s => { s.reference.mtp.runs[0]!.teacherforce.phases[2]!.before = [4]; }, "predecessor positions");
+  await rejects(s => { s.reference.mtp.runs[0]!.teacherforce.phases[2]!.after = [5]; }, "appended positions");
+  await rejects(s => { s.reference.mtp.runs[0]!.heads.pop(); }, "native head call count");
+  await rejects(s => { s.reference.mtp.runs[0]!.heads[1]!.pop(); }, "row count");
+  await rejects(s => { s.reference.mtp.runs[0]!.heads[1]![0]!.sha256 = "unknown"; }, "invalid logits SHA-256");
+  await rejects(s => { s.reference.mtp.runs[0]!.heads[1]![0]!.maxima = [4]; s.reference.mtp.runs[0]!.heads[1]![0]!.argmax = 4; }, "native token 1 is not an exact maximum");
+});
+
+test("exact ties preserve native maximum membership without a tolerance", () => {
+  const row = logitsEvidence(new Float32Array([23.375, 23.375, 23.374]));
+  expect(row.argmax).toBe(0); expect(row.maxima).toEqual([0,1]);
+  expect(() => validateNativeHeads([[row],[row]], [[9],[1]], [1,0], 3)).not.toThrow();
+  expect(() => validateNativeHeads([[row],[row]], [[9],[1]], [1,2], 3)).toThrow("not an exact maximum");
+  expect(() => logitsEvidence(new Float32Array([NaN]))).toThrow("finite");
 });

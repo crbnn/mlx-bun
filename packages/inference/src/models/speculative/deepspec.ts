@@ -28,8 +28,7 @@ import { Weights } from "../../artifacts/weights";
 import type {
   ContextKV, DeepspecContextAttention, DeepspecDraftRows, DeepspecDrafterModel, DrafterContextKV, DrafterContextProjection,
 } from "../../contracts/mlx/drafter";
-import type { MlxWidthTable } from "../../contracts/mlx/graph";
-import { atEveryWidth } from "../graph";
+import type { MlxRowTable } from "../../contracts/mlx/graph";
 import { isDeepspecArchitecture } from "./deepspec-artifact";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
@@ -412,14 +411,18 @@ export class DeepspecDrafter implements DeepspecDrafterModel {
     return disposing(proj, this.#rms(proj, this.#hiddenNorm));
   }
 
-  /** The context projection per width class of the B·L rows projected: one kernel at every class (`matmulW`:
+  /** The context projection for every positive B·L row count (`matmulW`:
    *  MLX's quantized matmul, matmul for a BF16 checkpoint). */
-  readonly projectContext: MlxWidthTable<DrafterContextProjection> =
-    atEveryWidth((targetHiddens: MlxArray) => this.#projectContext(targetHiddens));
+  readonly projectContext: MlxRowTable<DrafterContextProjection> =
+    Object.freeze({
+      default: (targetHiddens: MlxArray) => this.#projectContext(targetHiddens),
+    });
 
-  /** Each layer's context K/V per width class of the B·L context rows: the same kernel at every class. */
-  readonly projectContextKVRows: MlxWidthTable<DrafterContextKV> =
-    atEveryWidth((contextHidden: MlxArray, position: number | MlxArray) => this.#projectContextKVRows(contextHidden, position));
+  /** Each layer's context K/V: the same operation for every positive B·L row count. */
+  readonly projectContextKVRows: MlxRowTable<DrafterContextKV> =
+    Object.freeze({
+      default: (contextHidden: MlxArray, position: number | MlxArray) => this.#projectContextKVRows(contextHidden, position),
+    });
 
   /**
    * Per-layer context K/V rows, projected + normed + ROPE'd, ready to cache

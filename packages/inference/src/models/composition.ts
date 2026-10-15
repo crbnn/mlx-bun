@@ -6,7 +6,7 @@ import type { ModelConfig, TurboQuantScheme } from "../artifacts/config";
 import { COMPOSITION_DEFAULTS, type Composition } from "../contracts/portable/composition";
 import { runtimeConfig, type RuntimeConfig } from "../runtime/config";
 import { resolveKvScheme, type KvQuantOverride } from "../state/kv-scheme";
-import { PagedKVCache, pagedDecodeCompiles } from "../state/paged/cache";
+import { PagedKVCache } from "../state/paged/cache";
 
 /** Rows per forward when the caller states no cap (the app's `--batch` default). */
 export const DEFAULT_MAX_ROWS = 8;
@@ -44,17 +44,10 @@ export interface CompositionRequest {
   /** The loaded drafter's tokens per round, and whether the scheduler adapts
    * each round's count up to it. Absent or null: no drafter. */
   readonly draft?: { readonly numDraftTokens: number; readonly adaptive?: boolean } | null;
-  /** Adapters are mounted at load. Default false. */
-  readonly adapters?: boolean;
   /** The most rows one forward carries. Default {@link DEFAULT_MAX_ROWS}. */
   readonly maxRows?: number;
-  /** The groups of a mixed forward share one MLP pass. Default true. */
-  readonly packedMixedMlp?: boolean;
   /** One argmax over a decode step whose live rows are all plain greedy. Default true. */
   readonly vectorGreedySampling?: boolean;
-  /** A lone ordinary row decodes through the graph's compiled step. Default true;
-   * off whatever the request says where the caches have no compiled form (direct pages). */
-  readonly compiledDecode?: boolean;
   /** One forward carries a decode group and a prefill group. Default false. */
   readonly mixedPrefill?: boolean;
   /** Prompt tokens a mixed forward carries beside its decode rows. Default 256. */
@@ -65,13 +58,6 @@ export interface CompositionRequest {
   readonly grammarJump?: boolean;
   /** Speculative rows draft by argmax. Default false. */
   readonly greedyDraft?: boolean;
-  /** The GeGLU activations run the compiled closures. Default true. */
-  readonly compiledGeglu?: boolean;
-  /** The SwiGLU activations run the compiled closure. Default true. */
-  readonly compiledSwiglu?: boolean;
-  /** Compose the Neural Engine bridge where a graph builds a Neural Engine
-   * operation. Default true: every Apple-silicon Mac has the unit. */
-  readonly aneBridge?: boolean;
 }
 
 /** Resolve the record for `config` on this machine. Reads the GPU architecture
@@ -105,23 +91,17 @@ function compose(request: Omit<CompositionRequest, "kv">, kv: Composition["kv"])
   const runtime = runtimeConfig();
   return Object.freeze({
     device: deviceArchitecture(),
-    aneBridge: request.aneBridge ?? true,
     kv,
     pagedKv,
     draftDepth: !draft ? 0 : draft.adaptive ? Object.freeze({ adaptive: true as const, max: draft.numDraftTokens }) : draft.numDraftTokens,
     prefillChunkTokens: resolveChunkTokens(runtime),
-    adapters: request.adapters ?? false,
     maxRows,
-    packedMixedMlp: request.packedMixedMlp ?? COMPOSITION_DEFAULTS.packedMixedMlp,
     vectorGreedySampling: request.vectorGreedySampling ?? COMPOSITION_DEFAULTS.vectorGreedySampling,
     // The caches' declaration: direct pages have no compiled form.
-    compiledDecode: (request.compiledDecode ?? COMPOSITION_DEFAULTS.compiledDecode) && (!pagedKv || pagedDecodeCompiles(pagedKv, kv)),
     mixedPrefill: request.mixedPrefill ?? COMPOSITION_DEFAULTS.mixedPrefill,
     mixedTokenBudget,
     prefillTailSplit: request.prefillTailSplit ?? COMPOSITION_DEFAULTS.prefillTailSplit,
     grammarJump: request.grammarJump ?? COMPOSITION_DEFAULTS.grammarJump,
     greedyDraft: request.greedyDraft ?? COMPOSITION_DEFAULTS.greedyDraft,
-    compiledGeglu: request.compiledGeglu ?? COMPOSITION_DEFAULTS.compiledGeglu,
-    compiledSwiglu: request.compiledSwiglu ?? COMPOSITION_DEFAULTS.compiledSwiglu,
   });
 }

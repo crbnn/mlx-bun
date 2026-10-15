@@ -48,8 +48,8 @@ export interface OneShotEngine {
 }
 export interface InferenceDependencies {
   resolve: typeof resolveInferenceModel;
-  /** `composition`: the command's KV flags and adapter, which the loaded composition records. */
-  load(model: SelectedModel, maxTokens?: number, composition?: Pick<LoadContextOptions, "kv" | "adapters">): Promise<LoadedModelContext>;
+  /** `composition`: the command's KV flags. Adapters mount through the loaded context. */
+  load(model: SelectedModel, maxTokens?: number, composition?: Pick<LoadContextOptions, "kv">): Promise<LoadedModelContext>;
   /** Takes ownership of the context even if construction rejects. */
   engine(context: LoadedModelContext): Promise<OneShotEngine>;
   write(text: string): void;
@@ -157,7 +157,7 @@ export async function runInference(command: InferenceCommand, args: CommandArgs,
     ...(generation?.quantizedKvStart !== undefined ? { quantizedKvStart: generation.quantizedKvStart }
       : generation?.kvQuant === undefined && runtimeValue("MLX_BUN_EVAL_KV_QUANT") === "1" ? { quantizedKvStart: 0 } : {}),
     ...(generation ? { fusedSdpa: generation.fusedSdpa } : {}) };
-  const context = await deps.load(model, generation?.options.maxTokens, { kv, adapters: generation?.adapter !== undefined });
+  const context = await deps.load(model, generation?.options.maxTokens, { kv });
   let close: (() => void | Promise<void>) | undefined = () => context.dispose();
   let failure: unknown, failed = false;
   try {

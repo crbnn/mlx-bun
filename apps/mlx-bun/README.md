@@ -876,8 +876,8 @@ headers. The packed consumer check verifies the same assets after installation.
 Adapters are the models module's (`/v1/adapters*`, [module README](../../packages/module-models/README.md)): the routes
 reach the served model through its `adapters` operation, which `engine/adapter-operation.ts` builds over the loaded context
 (mount, unmount and merge run under the engine execution lock in the process that holds the model); no HTTP handler owns
-tensors. Serving with an adapter uses the shared scheduler; an adapter request to a graph whose declared capabilities
-serve no adapter rows gets the typed 501 (`adapter-batch-unsupported`).
+tensors. Serving with an adapter uses the shared scheduler. Adapter discovery reports the graph's actual mount
+targets; the loader binds each request's projection deltas before its forward runs.
 
 ## Memory vault
 

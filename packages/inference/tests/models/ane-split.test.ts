@@ -14,7 +14,7 @@ import { DequantizedLinear } from "../../src/layers/dequantized-linear";
 import { QuantizedLinear } from "../../src/layers/quantized-linear";
 import { TrellisLinear } from "../../src/layers/trellis-linear";
 import {
-  AneAffineSplit, AneTrellisMlpSplit, AneTrellisMlpSplitK3i, aneAffineSplitProgram, aneMlpSplitProgram,
+  AneAffineSplit, AneTrellisMlpSplit, AneTrellisMlpSplitK3i, AneTrellisExpandedMlpSplit, AneTrellisExpandedMlpSplitK3i, aneAffineSplitProgram, aneMlpSplitProgram,
 } from "../../src/layers/ane-prefill-split";
 import { compiledSwiglu } from "../../src/layers/swiglu";
 
@@ -203,3 +203,44 @@ test.skipIf(!process.env.MLX_BUN_TEST_ANE)("a split of fewer rows built on a lon
   expect(maxDiff(again, out)).toBe(0);
   expected.dispose();
 }, 120_000);
+
+
+for (const interleave of [false, true])
+  for (const slices of [undefined, 4])
+    test.skipIf(!process.env.MLX_BUN_TEST_ANE)(`the fixed expanded ANE builder preserves the public large-row output (${interleave ? "interleaved" : "row-major"}, ${slices ?? 8} slices)`, () => {
+      using x = hidden();
+      const weights = mlp(D, R, interleave, 71, x);
+      const Public = interleave ? AneTrellisMlpSplitK3i : AneTrellisMlpSplit;
+      const Fixed = interleave ? AneTrellisExpandedMlpSplitK3i : AneTrellisExpandedMlpSplit;
+      using legacy = Public.build(weights.gate, weights.up, weights.down, 0.5, M, undefined, slices);
+      using fixed = Fixed.build(weights.gate, weights.up, weights.down, 0.5, M, legacy, slices);
+      using control = legacy.forward(x, compiledSwiglu);
+      // The shared buffers must consume the first deferred output before the
+      // fixed operation writes its output, as in consecutive graph layers.
+      using result = fixed.forward(x, compiledSwiglu);
+      expect(maxDiff(result, control)).toBe(0);
+      expect(relErr(result, weights.expected)).toBeLessThan(2e-2);
+      weights.expected.dispose();
+    }, 120_000);
+
+for (const rows of [1, 2, 3, 4])
+  test.skipIf(!process.env.MLX_BUN_TEST_ANE)(`the public ANE builder retains its legacy GPU projection kernels at ${rows} rows`, () => {
+    using x = hidden(rows);
+    const weights = mlp(D, R, false, 93, x);
+    using split = AneTrellisMlpSplit.build(weights.gate, weights.up, weights.down, 0.5, M);
+    using actual = split.forward(x, compiledSwiglu);
+    // Keep the actual ANE partial and independently compose the GPU share
+    // through the original projection API. This isolates a change of GPU
+    // kernel from the ANE's permitted fp16 rounding.
+    using partial = split.program.output([rows, D]);
+    using typedPartial = partial.astype(x.dtype);
+    using gate = split.rest.gate.forward(x, true, false);
+    using up = split.rest.up.forward(x, true, false);
+    using mid = compiledSwiglu(gate, up);
+    using down = split.rest.down.forward(mid, true, false);
+    using downRows = ops.reshape(down, [rows, D]);
+    using sum = ops.add(typedPartial, downRows);
+    using control = ops.reshape(sum, [1, rows, D]);
+    expect(maxDiff(actual, control)).toBe(0);
+    weights.expected.dispose();
+  }, 120_000);

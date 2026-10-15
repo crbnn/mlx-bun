@@ -1,10 +1,9 @@
 import type { SentinelTokenTexts, MediaTokenTexts } from "../../input/special-tokens";
 import { L1, type TrainingDefaults, configuredMoe, defineFamily } from "../family";
 
-/** The config fingerprints the generated Gemma 4 graphs were generated from
- * (`scripts/gen-gemma4.ts`): each generated file's table entry serves its own
- * (`generated/index.ts`). Metadata only. */
-export const GENERATED_GEMMA_FINGERPRINTS = Object.freeze({
+/** Artifact fingerprints used by the written Gemma 4 graph entries
+ * (`graphs.ts`). Metadata only. */
+export const GEMMA_GRAPH_FINGERPRINTS = Object.freeze({
   "12b": "9f812d2eb461fcbe",
   "e4b": "418e9adc386ea67c",
   "26b": "c9dd67ed5a525231",

@@ -1,5 +1,5 @@
 import type { MlxArray } from "@mlx-bun/mlx/array";
-import type { MlxPhaseGroup } from "../contracts/mlx/graph";
+import type { MlxPhaseGroup, MlxMixedRange, MlxSeparateMixed } from "../contracts/mlx/graph";
 import type { MlxForwardStep, MlxForwardWork } from "../contracts/mlx/forward-work";
 
 /** Join two method-owned work producers at their forward boundary: the first
@@ -21,7 +21,7 @@ export async function runMixedTokenIteration(options: {
   let preparationError: unknown;
   let preparationFailed = false;
   const groupOf = (ids: MlxArray, state: MlxPhaseGroup["state"], step: MlxForwardStep): MlxPhaseGroup =>
-    ({ phase: step.phase, width: step.width, ids, state, capture: step.capture });
+    ({ phase: step.phase, rows: step.rows, ids, state, capture: step.capture });
   const preparing = options.prepare(async (ids, cache, step) => {
     if (captured) return step.own();
     captured = true;
@@ -59,3 +59,38 @@ export async function runMixedTokenIteration(options: {
 }
 
 export { type MlxForwardWork, type MlxPreparationWork } from "../contracts/mlx/forward-work";
+
+
+/** The scheduler routes declared packed work and preserves each separate group's geometry. */
+export function dispatchMixedGroups(groups: readonly MlxPhaseGroup[], rows: number,
+  packed: readonly MlxMixedRange[], separate?: MlxSeparateMixed): MlxArray[] {
+  const packedOperation = (ranges: readonly MlxMixedRange[], packedRows: number) => {
+    const operation = ranges.find(range => packedRows >= range.from && packedRows <= range.to
+      && rows >= (range.totalFrom ?? 1) && rows <= (range.totalTo ?? Infinity))?.operation;
+    if (!operation) throw new Error(`graph has no mixed operation for ${packedRows} packed rows (${rows} total rows)`);
+    return operation;
+  };
+  if (!separate || (packed.length > 0 && !groups.some(group => group.phase === "verify")))
+    return packedOperation(packed, rows)(groups, rows);
+  const outputs: Array<MlxArray | undefined> = Array(groups.length);
+  try {
+    const candidates = separate.packed?.length
+      ? groups.flatMap((group, index) => group.phase !== "verify" ? [index] : []) : [];
+    if (candidates.length > 1) {
+      const joined = candidates.map(index => groups[index]!);
+      const packedRows = joined.reduce((sum, group) => sum + group.rows, 0);
+      const returned = packedOperation(separate.packed!, packedRows)(joined, rows);
+      for (const [position, index] of candidates.entries()) outputs[index] = returned[position]!;
+    }
+    for (const [index, group] of groups.entries()) {
+      if (outputs[index]) continue;
+      const operation = separate[group.phase].find(range => group.rows >= range.from && group.rows <= range.to)?.operation;
+      if (!operation) throw new Error(`graph has no separate ${group.phase} operation for ${group.rows} rows`);
+      outputs[index] = operation(group);
+    }
+    return outputs as MlxArray[];
+  } catch (error) {
+    for (const output of outputs) output?.dispose();
+    throw error;
+  }
+}

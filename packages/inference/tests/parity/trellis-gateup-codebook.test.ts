@@ -1,3 +1,5 @@
+import { testGraph } from "../models/test-composition";
+import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { Weights, loadModelConfig } from "@mlx-bun/inference/artifacts";
@@ -11,13 +13,12 @@ import {
 import { gateUpCodebookEligible } from "../../src/kernels/trellis/gate-up";
 import { scatterBitsEligible, scatterFloatCodebookEligible } from "../../src/kernels/trellis/scatter";
 import type { ReadPhase } from "../../src/models/graph";
-import type { MlxWidthClass } from "../../src/contracts/mlx/graph";
+
 import { Dtype } from "@mlx-bun/mlx/ffi";
 import { createRuntimeConfig, runtimeConfig, withRuntimeConfig } from "../../src/runtime/config";
 import { deviceArchitecture, clearCache } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { MlxArray } from "@mlx-bun/mlx/array";
-import { phaseLogits } from "../models/phase-forward";
 
 const artifact = process.env.MLX_BUN_TEST_TRELLIS_MODEL;
 const digest = (a: MlxArray) => createHash("sha256").update(a.rawBytesView()).digest("hex");
@@ -35,13 +36,17 @@ const representation = (mode: Mode): Representation => {
  *  (same-width gate/up fuse, different widths take the mixed kernel's split
  *  tail, down runs the packed matvec) with each single-row representation
  *  explicit; wider inputs run the loaded MLP. */
-function representedMlp(mlp: { gate: unknown; up: unknown; down: unknown; forward(x: MlxArray, phase: ReadPhase, width: MlxWidthClass): MlxArray },
+function representedMlp(mlp: { gate: unknown; up: unknown; down: unknown; forward(x: MlxArray, phase: ReadPhase, width: number): MlxArray },
   r: Representation) {
   const gate = mlp.gate as TrellisLinear, up = mlp.up as TrellisLinear, down = mlp.down as TrellisLinear;
   return {
-    forward(x: MlxArray, phase: ReadPhase, width: MlxWidthClass): MlxArray {
+    calls: 0,
+    narrowCalls: 0,
+    forward(x: MlxArray, phase: ReadPhase, width: number): MlxArray {
+      this.calls++;
       const lead = x.shape.slice(0, -1), M = lead.reduce((a, b) => a * b, 1);
       if (M > TRELLIS_MATVEC_MAX_M) return mlp.forward(x, phase, width);
+      this.narrowCalls++;
       const row = r.rowKernels && M === 1;
       using mid = row ? gateUpCodebookRow(x, gate, up, "split") : gate.geometry.k === up.geometry.k
         ? fusedGateUpSwiglu(x, gate, up, 13, r.codebook) : fusedGateUpSwigluMixed(x, gate, up, 13, "split", r.mixedBits);
@@ -57,9 +62,10 @@ test.skipIf(!artifact || deviceArchitecture() !== "applegpu_g13s")(
   "Trellis codebook and bit representation preserve complete Qwen logits, live state and greedy continuation",
   async () => {
     const weights = await Weights.open(artifact!);
-    // The generic graph reads each layer's MLP per forward, so the representations below reach it.
+    // The explicit test forward below invokes each represented MLP directly;
+    // the generic graph's phase views are already bound at construction.
     const config = await loadModelConfig(artifact!);
-    const model = new Qwen35Model(weights, config, resolveComposition(config));
+    const model = testGraph(new Qwen35Model(weights, config, phaseRowLimit(resolveComposition(config))), resolveComposition(config));
     expect(model.layers.length).toBe(64);
     expect(model.layers.filter(layer => layer.mlp.gate instanceof TrellisLinear &&
       gateUpCodebookEligible(layer.mlp.gate.geometry, 1, Dtype.bfloat16, 13, deviceArchitecture())).length).toBeGreaterThan(0);
@@ -70,20 +76,41 @@ test.skipIf(!artifact || deviceArchitecture() !== "applegpu_g13s")(
     expect(model.layers.filter(layer => layer.mlp.down instanceof TrellisLinear &&
       scatterFloatCodebookEligible(layer.mlp.down.geometry, 1, Dtype.bfloat16, 13, deviceArchitecture())).length).toBe(64);
     const loaded = model.layers.map(layer => layer.mlp);
-    const install = (mode: Mode) => model.layers.forEach((layer, i) => {
-      (layer as unknown as { mlp: unknown }).mlp = representedMlp(loaded[i]!, representation(mode));
-    });
     // Plain KV: no affine read is composed, so no kernel choice applies.
     const run = (mode: Mode, prompt: number[]) => withRuntimeConfig(createRuntimeConfig({
       ...runtimeConfig().values,
     }), () => {
-      install(mode);
+      const mlps = loaded.map(mlp => representedMlp(mlp, representation(mode)));
       const caches = model.makeCache();
+      const logitsForward = (tokens: number[]): MlxArray => {
+        using ids = ops.fromInt32(tokens, [1, tokens.length]);
+        const before = mlps.map(mlp => mlp.calls), phase = tokens.length === 1 ? "decode" : "window";
+        let hidden: MlxArray | null = model.embed.encode(ids);
+        try {
+          for (const [i, layer] of model.layers.entries()) {
+            using attended = layer.forwardAttn(hidden, caches[i]!, phase);
+            using normed = layer.postAttnNorm.forward(attended);
+            using projected = mlps[i]!.forward(normed, phase, tokens.length);
+            const next = ops.add(attended, projected);
+            hidden.dispose(); hidden = next;
+            if (tokens.length > 4) {
+              const state = caches[i]!.state();
+              try { ops.evalAll([hidden, ...state]); }
+              finally { if (caches[i]!.stateNeedsDispose) for (const value of state) value.dispose(); }
+            }
+          }
+          using normed = model.finalNorm.forward(hidden);
+          const logits = model.logitsFromHidden(normed);
+          try { mlps.forEach((mlp, i) => expect(mlp.calls).toBe(before[i]! + 1)); }
+          catch (error) { logits.dispose(); throw error; }
+          return logits;
+        } finally { hidden?.dispose(); }
+      };
       const output: { logits: string; tokens: number[]; state: unknown[] }[] = [];
       let input = prompt;
       try {
         for (let step = 0; step < 17; step++) {
-          using logits = phaseLogits(model, input, caches);
+          using logits = logitsForward(input);
           ops.evalAll([logits, ...caches.flatMap(c => c.state())]);
           expect([Dtype.bfloat16, Dtype.float32]).toContain(logits.dtype);
           const bytes = logits.rawBytesView(), view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -107,6 +134,7 @@ test.skipIf(!artifact || deviceArchitecture() !== "applegpu_g13s")(
           output.push({ logits: digest(logits), tokens, state });
           input = tokens;
         }
+        mlps.forEach(mlp => expect(mlp.narrowCalls).toBe(prompt.length === 1 ? 17 : 16));
         return output;
       } finally { caches.forEach(c => c.dispose()); clearCache(); }
     });
@@ -126,7 +154,7 @@ test.skipIf(!artifact || deviceArchitecture() !== "applegpu_g13s")(
         console.log(`[trellis-codebook+bits] prefix=${length}: 17 full logit tensors, all live state and tokens match across six modes`);
       }
     } finally {
-      model.layers.forEach((layer, i) => { (layer as unknown as { mlp: unknown }).mlp = loaded[i]; });
+      model.dispose();
       weights.dispose(); clearCache();
     }
   }, 180_000);

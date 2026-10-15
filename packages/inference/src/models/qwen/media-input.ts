@@ -1,3 +1,4 @@
+import { rowOperationFor } from "../../runtime/row-operations";
 import type { ModelConfig } from "../../artifacts/config";
 import { TURBOQUANT_FOLD_FILE, readTurboQuantFold } from "../../artifacts/turboquant-fold";
 import type { QuantizedEmbedding } from "../../layers/quantized-embedding";
@@ -8,9 +9,10 @@ import { mropePositionIds } from "../../layers/qwen-mrope";
 import { type MropeRequestState } from "../../contracts/mlx/positions";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { Cache } from "../../contracts/mlx/cache";
-import type { MediaEncoders, MlxDecodeState, MlxPromptInput, VisionEncoder } from "../../contracts/mlx/media";
-import type { MlxHeadForward, MlxWidthClass, MlxWidthTable } from "../../contracts/mlx/graph";
-import type { DraftProjectionKernel, ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
+import type { MediaEncoders, MlxDecodeState, MlxPromptInput, VisionEncoder, MlxPositionedEmbeddingsRange, MlxPositionedRange, MlxPositionedForward } from "../../contracts/mlx/media";
+import type { MlxHeadForward, MlxRowTable } from "../../contracts/mlx/graph";
+import type { DraftProjectionKernels, ResidualBasis, TargetView } from "../../contracts/mlx/draft-target";
+import type { DraftHeadOperations } from "../../contracts/mlx/draft-projection";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import * as ops from "@mlx-bun/mlx/ops";
@@ -25,19 +27,22 @@ export interface QwenMediaGraph {
   /** The full-attention layer whose cache supplies logical positions. */
   readonly faIdx: number;
   /** The vision prefill phase: a prompt's prepared embeddings (borrowed) at request positions. */
-  prefillEmbeddingsAtPositions(embeddings: MlxArray, caches: Cache[], positions: MlxArray, width: MlxWidthClass): MlxArray;
+  prefillEmbeddingsAtPositions?(embeddings: MlxArray, caches: Cache[], positions: MlxArray, width: number): MlxArray;
   /** A prompt's token ids after a reused prefix, at request positions. */
-  prefillAtPositions(ids: MlxArray, caches: Cache[], positions: MlxArray, width: MlxWidthClass): MlxArray;
+  prefillAtPositions?(ids: MlxArray, caches: Cache[], positions: MlxArray, width: number): MlxArray;
   /** One new token per row at request positions. */
-  decodeAtPositions(ids: MlxArray, caches: Cache[], positions: MlxArray, width: MlxWidthClass): MlxArray;
-  readonly logits: MlxWidthTable<MlxHeadForward>;
+  decodeAtPositions?(ids: MlxArray, caches: Cache[], positions: MlxArray, width: number): MlxArray;
+  readonly mediaPrefill?: readonly MlxPositionedEmbeddingsRange[];
+  readonly mediaPrompt?: readonly MlxPositionedRange[];
+  readonly mediaDecode?: MlxRowTable<MlxPositionedForward>;
+  readonly logits: MlxRowTable<MlxHeadForward>;
 }
 
 class QwenMediaDecodeState implements MlxDecodeState {
   readonly key = "qwen-interleaved-mrope";
   constructor(readonly model: QwenMediaGraph, readonly delta: number) {}
 
-  decode(ids: MlxArray, caches: Cache[], rows: readonly MlxDecodeState[], width: MlxWidthClass): MlxArray {
+  decode(ids: MlxArray, caches: Cache[], rows: readonly MlxDecodeState[], width: number): MlxArray {
     const B = rows.length, L = ids.shape[1]!;
     const cache = caches[this.model.faIdx]!;
     // The cache supplies logical positions, including left padding, on device.
@@ -51,7 +56,8 @@ class QwenMediaDecodeState implements MlxDecodeState {
     using positions = ops.add(startRows, indices);
     using axis = ops.reshape(positions, [1, B, L]);
     using grid = ops.concatAxis([axis, axis, axis], 0);
-    return this.model.decodeAtPositions(ids, caches, grid, width);
+    return this.model.mediaDecode ? rowOperationFor(this.model.mediaDecode, width)(ids, caches, grid)
+      : this.model.decodeAtPositions!(ids, caches, grid, width);
   }
 }
 
@@ -60,9 +66,14 @@ export function bindQwenMediaInput(model: QwenMediaGraph, embeddings: MlxArray,
   state: MropeRequestState): MlxPromptInput {
   const input = bindEmbeddingsInput((ids, caches, start, phase, width) => {
     using positions = mropePositionIds(state, start, ids.shape[1]!);
-    if (start === 0) return model.prefillEmbeddingsAtPositions(embeddings, caches, positions, width);
-    return phase === "decode" ? model.decodeAtPositions(ids, caches, positions, width)
-      : model.prefillAtPositions(ids, caches, positions, width);
+    if (start === 0) return model.mediaPrefill
+      ? model.mediaPrefill.find(range => width >= range.from && width <= range.to)!.operation(embeddings, caches, positions)
+      : model.prefillEmbeddingsAtPositions!(embeddings, caches, positions, width);
+    if (phase === "decode") return model.mediaDecode ? rowOperationFor(model.mediaDecode, width)(ids, caches, positions)
+      : model.decodeAtPositions!(ids, caches, positions, width);
+    return model.mediaPrompt
+      ? model.mediaPrompt.find(range => width >= range.from && width <= range.to)!.operation(ids, caches, positions)
+      : model.prefillAtPositions!(ids, caches, positions, width);
   });
   return { ...input, decodeState: new QwenMediaDecodeState(model, state.delta) };
 }
@@ -100,7 +111,7 @@ export function qwenResidualBasis(graph: string, modelDir: string): ResidualBasi
  * same object on every view) and the head over its draft vocabulary (`vocabulary`,
  * read when a drafter first reads the projection's). */
 export function qwenDraftTarget(model: QwenMediaGraph, residualBasis?: ResidualBasis,
-  draftProjections?: MlxWidthTable<DraftProjectionKernel>, vocabulary?: () => DraftProjection["vocabulary"]): TargetView {
+  draftProjections?: DraftProjectionKernels, vocabulary?: () => DraftProjection["vocabulary"]): TargetView {
   const projection: DraftProjection = { embed: model.embed, logits: model.logits };
   // The vocabulary's rows are gathered when a drafter first reads them, not for drafters that never do.
   if (vocabulary) Object.defineProperty(projection, "vocabulary", { get: vocabulary, enumerable: true });
@@ -117,11 +128,11 @@ export function qwenDraftTarget(model: QwenMediaGraph, residualBasis?: ResidualB
 }
 
 /** The head's rows of the artifact's frequency-ranked draft vocabulary (`file`, a path inside the artifact) and their
- *  projection per width class on `kernels` (the head's own layers over those rows), for a graph whose composition
+ *  projection operations on `kernels` (the head's own layers over those rows), for a graph whose composition
  *  measured a drafter selecting over them. A row gather of an affine head is exact: the rows' logits are the full
  *  head's arithmetic per row. The gathered arrays go to `owned`, which the graph frees. */
 export function qwenDraftVocabulary(head: QuantizedLinear, modelDir: string, file: string, vocabSize: number,
-  kernels: (rows: QuantizedLinear) => MlxWidthTable<(hidden: MlxArray) => MlxArray>,
+  kernels: (rows: QuantizedLinear) => DraftHeadOperations,
   owned: { dispose(): void }[]): NonNullable<DraftProjection["vocabulary"]> {
   const listed = readDraftVocabulary(join(modelDir, file), vocabSize);
   using index = ops.fromInt32([...listed], [listed.length]);
@@ -136,4 +147,15 @@ export function qwenDraftVocabulary(head: QuantizedLinear, modelDir: string, fil
   const rows = new QuantizedLinear(gather(head.w), gather(head.scales), head.biases ? gather(head.biases) : null, head.spec);
   ops.evalAll([ids, rows.w, rows.scales, ...(rows.biases ? [rows.biases] : [])]);
   return Object.freeze({ ids, logits: kernels(rows) });
+}
+
+
+/** Gather a draft vocabulary only when a source first reads it, then retain
+ * the same port and owned weights for every target view. The graph supplies
+ * the concrete projection operations over the gathered rows. */
+export function qwenDraftVocabularyMemo(head: QuantizedLinear, modelDir: string, file: string, vocabSize: number,
+  kernels: (rows: QuantizedLinear) => DraftHeadOperations,
+  owned: { dispose(): void }[]): () => NonNullable<DraftProjection["vocabulary"]> {
+  let vocabulary: NonNullable<DraftProjection["vocabulary"]> | undefined;
+  return () => vocabulary ??= qwenDraftVocabulary(head, modelDir, file, vocabSize, kernels, owned);
 }

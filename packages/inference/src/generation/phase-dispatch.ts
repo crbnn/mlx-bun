@@ -1,13 +1,17 @@
 // The scheduler's side of the graph contract: it names the phase it is in and
 // the rows it is loading, and this resolves the operation the graph built for
 // them. Bound once per graph; nothing here inspects a tensor.
-import {
-  widthClass, type MlxCapturingForward, type MlxHeadForward, type MlxLayerCapture, type MlxNeuralEngineChunk, type MlxPhaseForward,
-  type MlxTokenPhases,
-} from "../contracts/mlx/graph";
+import { type MlxCapturingForward, type MlxHeadForward, type MlxLayerCapture, type MlxPromptRange, type MlxPhaseForward, type MlxTokenPhases, type MlxKnownOperations } from "../contracts/mlx/graph";
 import type { PrefillPhase } from "../contracts/portable/prefill";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { MlxForwardStep } from "../contracts/mlx/forward-work";
+import { rowOperationFor } from "../runtime/row-operations";
+
+/** Index the declared whole-span operation without changing its geometry. */
+export function knownOperationFor(operations: MlxKnownOperations, rows: number): MlxPhaseForward {
+  try { return rowOperationFor(operations, rows); }
+  catch { throw new Error(`graph has no known-span operation for ${rows} rows`); }
+}
 
 /** One prompt step the scheduler runs: the phase its planner named and its
  *  rows, `sequences` sequences of `tokens` positions each. */
@@ -28,14 +32,14 @@ export interface MlxVerifyWindow {
 export function promptWorkStep(step: MlxPromptStep, capture: MlxLayerCapture | null,
   own: () => Promise<MlxArray>): MlxForwardStep {
   const rows = step.sequences * step.tokens;
-  return { phase: step.phase === "decode" ? "decode" : "window", rows, width: widthClass(rows), capture, own };
+  return { phase: step.phase === "decode" ? "decode" : "window", rows, capture, own };
 }
 
 /** A verify window as the mixed iteration's hook takes it. */
 export function verifyWorkStep(window: MlxVerifyWindow, capture: MlxLayerCapture | null,
   own: () => Promise<MlxArray>): MlxForwardStep {
   const rows = window.sequences * window.positions;
-  return { phase: "verify", rows, width: widthClass(rows), capture, own };
+  return { phase: "verify", rows, capture, own };
 }
 
 /** The phase operations of one graph, indexed by what the scheduler decides.
@@ -47,44 +51,65 @@ export function verifyWorkStep(window: MlxVerifyWindow, capture: MlxLayerCapture
  *  scheduler drives one dispatch at a time, so the unit serves one piece at a
  *  time. */
 export class MlxPhaseDispatch {
-  readonly #phases: MlxTokenPhases | null;
-  readonly #ane: readonly MlxNeuralEngineChunk[];
+  readonly #phases: Partial<MlxTokenPhases> | null;
 
   /** `graph`: the phases `tokenPhasesOf` resolved, or null for a graph whose
    *  method runs none (denoising), which then refuses every token phase. */
-  constructor(graph: MlxTokenPhases | null) {
+  constructor(graph: Partial<MlxTokenPhases> | null) {
     this.#phases = graph;
-    this.#ane = graph?.prefillChunk.ane ?? [];
   }
 
-  get #graph(): MlxTokenPhases {
+  get #graph(): Partial<MlxTokenPhases> {
     if (!this.#phases) throw new Error("this graph's method runs no token phases");
     return this.#phases;
   }
 
   /** Whether the composition built a Neural Engine operation. */
-  get neuralEngine(): boolean { return this.#ane.length > 0; }
+  get neuralEngine(): boolean {
+    const graph = this.#phases;
+    return [graph?.prompt, graph?.promptChunk, graph?.multiSequencePrompt, graph?.multiSequencePromptChunk]
+      .some(ranges => ranges?.some(range => range.unit === "ane"));
+  }
 
   /** One prompt step of `sequences` sequences of `tokens` positions each, in
    *  the `phase` its planner named. */
   prompt(phase: PrefillPhase, sequences: number, tokens: number): MlxCapturingForward {
-    if (phase === "decode") return this.#graph.decode[widthClass(sequences)];
-    const unit = sequences === 1 ? this.#ane.find(ane => tokens >= ane.minRows && tokens <= ane.rows) : undefined;
-    if (unit) return unit.forward;
-    return phase === "tail" ? this.#graph.prefillTail[widthClass(sequences * tokens)] : this.#graph.prefillChunk.gpu;
+    if (phase === "decode") return this.decode(sequences);
+    const positions = sequences > 1 ? sequences * tokens : tokens;
+    const ranges = sequences > 1
+      ? phase === "chunk" ? this.#graph.multiSequencePromptChunk : this.#graph.multiSequencePrompt
+      : phase === "chunk" ? this.#graph.promptChunk : this.#graph.prompt;
+    if (!ranges) throw new Error(`graph has no ${sequences > 1 ? "multi-sequence " : ""}${phase} operation table`);
+    const range = ranges.find(range => positions >= range.from && positions <= range.to);
+    if (!range) throw new Error(`graph has no prompt operation for ${tokens} positions`);
+    return range.operation;
   }
 
   /** One new token for each of `sequences` sequences. */
-  decode(sequences: number): MlxCapturingForward { return this.#graph.decode[widthClass(sequences)]; }
+  decode(sequences: number): MlxCapturingForward {
+    const operations = this.#graph.decode;
+    if (!operations) throw new Error("graph has no decode operation table");
+    return rowOperationFor(operations, sequences);
+  }
 
   /** A verify window of `positions` (depth + 1) per sequence. */
   verify(sequences: number, positions: number): MlxCapturingForward {
-    return this.#graph.verify[widthClass(sequences * positions)];
+    const operations = this.#graph.verify;
+    if (!operations) throw new Error("graph has no verify operation table");
+    return rowOperationFor(operations, sequences * positions);
   }
 
   /** `tokens` known tokens appended to one sequence. */
-  known(tokens: number): MlxPhaseForward { return this.#graph.appendKnown[widthClass(tokens)]; }
+  known(tokens: number): MlxPhaseForward {
+    const operations = this.#graph.appendKnown;
+    if (!operations) throw new Error("graph has no known-span operation table");
+    return knownOperationFor(operations, tokens);
+  }
 
   /** The head over a hidden of `rows` rows. */
-  logits(rows: number): MlxHeadForward { return this.#graph.logits[widthClass(rows)]; }
+  logits(rows: number): MlxHeadForward {
+    const operations = this.#graph.logits;
+    if (!operations) throw new Error("graph has no logits operation table");
+    return rowOperationFor(operations, rows);
+  }
 }

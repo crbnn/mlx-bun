@@ -1,3 +1,5 @@
+import { rowOperationFor } from "../src/runtime/row-operations";
+import { MlxPhaseDispatch } from "../src/generation/phase-dispatch";
 /** Full-grid and live-state parity against an externally generated report.
  * No native imports on the compare/help paths; references never run here. */
 import { strict as assert } from "node:assert";
@@ -8,7 +10,7 @@ import { cpus, hostname, release, totalmem, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import type { MlxArray } from "@mlx-bun/mlx/array";
-import { widthClass, type Cache } from "@mlx-bun/inference/contracts/mlx";
+import { type Cache } from "@mlx-bun/inference/contracts/mlx";
 
 export interface Plan {
   model: string;
@@ -206,16 +208,16 @@ export async function emit(plan: Plan, planBytes: Uint8Array, hashWeights: boole
       const input = ops.fromInt32(ids, [1, ids.length]);
       let hidden: MlxArray | null = null;
       try {
-        hidden = await (ids.length === 1 ? graph.decode.one(input, caches, null)
-          : graph.prefillTail[widthClass(ids.length)](input, caches, null));
-        return graph.logits[widthClass(ids.length)](hidden);
+        hidden = await (ids.length === 1 ? rowOperationFor(graph.decode,1)(input, caches, null)
+          : new MlxPhaseDispatch(graph).prompt("tail", 1, (ids.length))(input, caches, null));
+        return rowOperationFor(graph.logits,ids.length)(hidden);
       } finally { input.dispose(); hidden?.dispose(); }
     }
     async function forward(ids: number[], caches: Cache[]) {
       const input = ops.fromInt32(ids, [1, ids.length]);
       try {
-        return await (ids.length === 1 ? graph.decode.one(input, caches, null)
-          : graph.prefillTail[widthClass(ids.length)](input, caches, null));
+        return await (ids.length === 1 ? rowOperationFor(graph.decode,1)(input, caches, null)
+          : new MlxPhaseDispatch(graph).prompt("tail", 1, (ids.length))(input, caches, null));
       } finally { input.dispose(); }
     }
     for (const context of plan.contexts) for (const m of plan.lengths) {

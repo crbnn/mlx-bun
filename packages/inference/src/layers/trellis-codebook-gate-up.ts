@@ -31,3 +31,12 @@ export class CodebookGateUpRow {
   /** `x` [.., in] (borrowed, one row) to an owned [.., rows]. */
   forward(x: MlxArray): MlxArray { return gateUpCodebookRow(x, this.gate, this.up, this.mixedTail); }
 }
+
+/** The mixed-width split activation tail, fixed for written two-argument bindings. */
+export class CodebookSplitGateUpRow {
+  constructor(readonly gate:TrellisLinear,readonly up:TrellisLinear) {
+    sameAxis1("CodebookSplitGateUpRow",gate,up,null);
+    if (gate.geometry.L>12) throw new Error("CodebookSplitGateUpRow: the codebook holds at most 2^12 states");
+  }
+  forward(x:MlxArray):MlxArray {return gateUpCodebookRow(x,this.gate,this.up,"split");}
+}

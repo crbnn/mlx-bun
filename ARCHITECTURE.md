@@ -55,29 +55,39 @@ Interfaces describe required capabilities and ownership, not a selected model
 or service. A caller may provide a different implementation satisfying the
 same contract. Concrete model loading remains available as a convenience.
 
-### Construct the implementation before executing it
+### Write the graph before loading it
 
-The model description is an input to constructing an implementation. Every
-served configuration is one composition, resolved once at load from the user's
-model choice, their flags and the machine (`contracts/portable/composition.ts`):
-the loader builds the graph, its cache and its drafter for exactly that
-configuration and hands them to the scheduler. Resolve known architecture,
-weight layout, quantization, layer roles, and configured capabilities there.
-Compose the selected layers and kernels into that implementation so execution
-does not repeatedly interpret the descriptor or rediscover what a particular
-layer does. Nothing below the scheduler decides anything at run time: no flag,
-environment variable, device query or `instanceof` of a layer or cache class
-inside a forward, a read or a kernel dispatch. Constructors, `build`, `load` and
-the loader read those facts. Every graph is an entire graph built for a
-composition and extends nothing. A family's generic graph is one of them: the
-table entry the loader selects when no more constrained entry matches, never a
-path another graph falls back to.
+A graph is a file written before anyone runs it. It imports layers, each binding
+its kernel, arranges them in execution order and exports that arrangement.
+Profiling determines the bindings for the model and hardware; the file states
+them literally. A specialized graph takes weights and artifact configuration,
+attaches those weights to the layers it already names and decides nothing.
+It takes no composition record and contains no branches or layer loops. Every
+graph is an entire graph and extends nothing. One generic graph per family may
+inspect the artifact and device at load and loop over the artifact's layer count
+to bind its operations. Those choices settle at construction; its forwards do
+not reread the device or module configuration.
 
-Here, "compile" means resolving those facts into a concrete implementation;
-it does not require generated source or MLX graph compilation. Layers own MLX
-compilation choices, whose performance must be measured. State can be omitted
-or kept unmaterialized only when its uses and lifetime establish that this is
-correct, with numerical and lifecycle evidence.
+When the caller supplies no graph, the loader recommends one from the model,
+device and module configuration (`contracts/portable/composition.ts`), choosing
+the most specific table entry or the family's generic graph. Callers can choose
+the generic graph, a file tuned for another machine, or their own arrangement
+of exported layers. The matching keys guide default selection; the authoring
+rules govern repository code. The loader attaches weights and composes cache
+and drafter components, and the scheduler routes work through their contracts.
+
+Known kernel choices belong in the written bindings. Nothing below the scheduler
+reads a flag, environment variable or device to select another kernel during
+execution. Each module exposes its own configuration: cache storage and paging,
+scheduler row caps, draft method and depth, sampling. An adapter is a trained
+file named by a request; its delta adds to that request's projection outputs.
+Graphs expose projection targets and have no adapter support switch. Compound
+fused layers bind the corresponding unfused projection-delta operation when an
+active request names an adapter, before the forward runs.
+
+Layers expose their MLX compilation forms as separate bindings, whose performance
+must be measured. State can be omitted or kept unmaterialized only when its uses
+and lifetime establish that this is correct, with numerical and lifecycle evidence.
 
 Sampling, caches, scheduling, and speculative methods compose through their
 contracts. Bind required operations and reject genuinely missing capabilities
@@ -109,9 +119,14 @@ a layer appends through `AttentionCache` and reads through `AttentionRead.attend
 and no caller reaches a representation-specific escape hatch; the cache also
 owns prefix reuse, paging, SSD offload and eviction behind that interface and
 answers hit or miss. The graph names its phases (`MlxTokenPhases`:
-`prefillChunk` per execution unit, and `prefillTail`, `decode`, `verify`,
-`appendKnown` and `logits` as width tables); the scheduler calls the phase it is in for the rows
-it batched and dispatches prompt chunks to the GPU or the Neural Engine as a
+`decode`, `verify` and serving `logits` indexed by exact positive row count;
+prompt operations, known appends and full-sequence heads listed over contiguous
+row or position ranges). A table may state an explicit `default` operation for
+other positive row counts, as ordinary inspectable data. No Proxy fills missing
+entries. A missing entry without a declared default is an error. Each graph
+declares its chunk and tail tables, including an explicit shared table when both
+use the same operations; dispatch never supplies an undeclared phase alias.
+The scheduler indexes the rows it batched and dispatches prompt pieces to the GPU or Neural Engine as a
 resource it manages. Row-wise layers take M rows and do not know whether they
 are one sequence or M; only `attend` and the recurrence see the row layout.
 
@@ -134,7 +149,7 @@ Inside `packages/inference/src/`:
 | `input/` | Tokenizers, templates, media preprocessing, and prompt assembly through encoder interfaces. |
 | `sampling/` | Sampling policy, processors, constraints, and draft sampling. |
 | `adapters/` | Loading and mounting adapter weights through named target interfaces. |
-| `models/` | Family records and profiles; entire graphs, generated per model, quantization and machine, or a family's generic graph; the composition resolver (`composition`) and the selection tables the loader picks a graph from (`factory`); drafter loaders; the Neural Engine programs the shipped compositions load (`ane-install`). |
+| `models/` | Family records and profiles; written graph files for models and hardware, and each family's generic graph; the composition resolver (`composition`) and the selection tables the loader picks a graph from (`factory`); drafter loaders; the Neural Engine programs the shipped compositions load (`ane-install`). |
 | `generation/` | Autoregressive, denoising, fill, and speculative methods, and the phase dispatch (`phase-dispatch`) that resolves the operation a graph built for the phase and rows its caller names. `bindings/` connects concrete graphs to those methods. |
 | `scoring/`, `embeddings/`, `transcription/` | Operations consuming graphs and caller-supplied inputs. |
 | `execution/` | Admission, the plan from declared capabilities, the batch groups that call the graph's phases for the rows they batched, sessions, coordination, and fit estimates: the one component that decides at run time. |
@@ -386,8 +401,9 @@ Prefer the smallest existing interface that expresses the requirement.
 
 One supported way per pattern; a second way is a gate failure, not a style note:
 
-- Add a model by generating its graph from the family's blocks with the
-  generator script; a hand-written graph for one composition is not a pattern.
+- Add a model by writing its graph file: import layers, arrange them and export
+  the arrangement. Write the selected bindings for each model and machine;
+  a model may have several files, and the loader recommends a default.
 - Add a kernel as one file in `kernels/` bound by exactly one layer.
 - Read a cache through `attend`; add a representation as a cache lego, never as
   a read path inside a layer.
@@ -400,19 +416,13 @@ The architecture gate holds these rules where they are mechanical, with a
 ratchet of violators (empty) whose counts only fall; every failure message
 names the paved road.
 
-For every newly supported model, the target is to compile its description into
-a concrete implementation. Here, compilation means resolving known facts during
-graph construction or startup; it is distinct from the layers' MLX compilation
-policy and can use ordinary functions and explicit graph construction. Resolve
-model, artifact, layer, and selected option facts into specific kernels, layers,
-state layouts, and bound operations. The generated graphs demonstrate the
-pattern for model support generally: `packages/inference/scripts/gen-gemma4.ts`
-emits `models/gemma4/generated/*` from `models/gemma4/blocks.ts`, and
-`gen-qwen38.ts` emits the M4 Pro and M1 Max Qwen3.8 graphs from
-`models/qwen/blocks.ts`; drift tests keep the committed
-graphs equal to what the generators emit. Adding support means generating the
-graph from reusable blocks and implementing any missing operation in its owning
-layer.
+Every specialized graph states each layer and its kernel choices directly.
+Changing the M1 Max file changes that file; the M4 Pro file is untouched. A change
+to a shared layer or kernel reaches the files that import it and runs those
+files' gates. No generator, description format or generator drift test is part
+of graph authoring. Bit gates, numerical parity suites and paired measurements
+verify the actual files. Users compose their own graphs from the same public
+components, with no registration requirement.
 
 Known data flow is part of that construction: which operations produce and consume
 a tensor, its layout, and its ownership and lifetime obligations. Use these facts

@@ -26,7 +26,7 @@ export type ModelLoader = "safetensors" | "colibri";
 export type GenerationLoop = "autoregressive" | "diffusion" | "encoder-decoder";
 /** What a profile was declared for: an exact artifact, a family's own graphs, or
  * the universal graph. Which of a family's graphs a load builds (its generic
- * graph, or a generated or hand-written one built for the composition) is the
+ * graph, or a written one built for the composition) is the
  * family's graph table's choice (`models/implementation.ts`), not a profile's. */
 export type ModelSpecialization = "artifact" | "dedicated" | "generic";
 

@@ -1,3 +1,4 @@
+import { pagedDecodeCompiles } from "../state/layout";
 import { speculativePrefixNamespace, captureSpeculativeOptions } from "../generation/speculative/cache-identity";
 import { createOrdinaryContinuationRequest } from "./continuation-request";
 import type { ExecutionContext } from "../contracts/portable/scheduling";
@@ -99,7 +100,7 @@ export function bindMlxGateway(model: MlxTokenGraph,
     Math.max(1, Math.trunc(runtime.number("MLX_BUN_GRAMMAR_DRAFT_TOKENS", 3)))) : undefined;
   const grammarSpans = caps.method === "autoregressive" && !verification.grammarProposals
     ? bindGrammarGroupRequests(model) : undefined;
-  const adapterState = caps.adapters.batched ? model.loraState : undefined;
+  const adapterState = model.loraState;
   const fillRequests = !denoising ? bindFillGroupRequests(model) : undefined;
   const mediaInput = caps.media && caps.media.input !== "pixels"
     ? (input: Vision): MlxPromptInput => graph.bindMediaInput!(input) : undefined;
@@ -145,7 +146,7 @@ export function bindMlxGateway(model: MlxTokenGraph,
       // cannot serve the target's adapters, serves adapter requests ordinarily
       // even when a draft is configured.
       const sharedSpeculativeAdapters = verification.adapters && !!sharedMethod &&
-        caps.adapters.batched && provider?.grouped?.supportsTargetAdapters === true;
+        provider?.grouped?.supportsTargetAdapters === true;
       // Such a drafted request opens no draft provider and keeps the ordinary checkpoint rules.
       const ignoredDraft = request.hasDraft && request.hasAdapters && !sharedSpeculativeAdapters;
       return resolveExecution(request, {
@@ -153,7 +154,6 @@ export function bindMlxGateway(model: MlxTokenGraph,
         sharedCheckpoints: scheduling.checkpoints &&
           (!request.hasDraft || ignoredDraft) && !request.hasVision && !request.hasGrammar &&
           !request.wantsLogprobs && !options.fill,
-        adapterBatch: caps.adapters.batched,
         mediaBatch: !!mediaInput,
         mediaPrefixCache: runtime.flag("MLX_BUN_MEDIA_PREFIX_CACHE", true),
         groupedMethods: denoising ? ["denoising"] : sharedMethod ? ["autoregressive", "speculative"] : ["autoregressive"],
@@ -171,7 +171,7 @@ export function bindMlxGateway(model: MlxTokenGraph,
         // masks come from the shared sampler, so no graph qualifies or declines
         // them. Denoising samples canvases, which an AR token mask cannot apply to.
         grammarBatch: !denoising,
-      }, { fill: !!options.fill, compiledDecode: facts.compiledDecode, grammarJump: facts.grammarJump });
+      }, { fill: !!options.fill, compiledDecode: (!model.composition?.pagedKv || pagedDecodeCompiles(model.composition.pagedKv, model.composition.kv)), grammarJump: facts.grammarJump });
     },
     createBatchGroup: (options) => new MlxBatchExecutionGroup(model, options),
   };

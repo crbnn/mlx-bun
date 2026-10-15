@@ -3,8 +3,8 @@
 // built with, the dense and mixture-of-experts feed-forward pieces, the
 // per-layer-input pieces (e2b/e4b), the KV-sharing pieces (a donor layer's read
 // and the donor each sharer attends) and the decoder layer composing them. The
-// generic graph (`Gemma4Model`, model.ts) and the generated graphs
-// (generated/*.ts, from scripts/gen-gemma4.ts) build their layers from these.
+// generic graph (`Gemma4Model`, model.ts) and the written graphs
+// (gemma4-e4b.ts, gemma4-12b.ts, gemma4-26b.ts) compose these blocks.
 // Each block is built once from the weights and the config and reads its cache
 // through the read its caller's phase names: no block inspects its input to
 // choose a phase, builds a mask or chooses an attention kernel. The training
@@ -21,7 +21,7 @@ import { geglu, GegluMLP } from "../../layers/geglu";
 import { disposing } from "../../layers/helpers";
 import { RMSNorm } from "../../layers/normalization";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
-import { QuantizedLinear } from "../../layers/quantized-linear";
+import { QuantizedLinear, QuantizedLinearPlain } from "../../layers/quantized-linear";
 import { QuantizedSwitchLinear } from "../../layers/quantized-switch-linear";
 import { isCompiledTrace } from "../../runtime/compiled-trace";
 import { isExpertTracing, recordRouting } from "../../runtime/expert-trace";
@@ -105,6 +105,10 @@ export class Attention {
   readonly kProj: QuantizedLinear | null;
   readonly vProj: QuantizedLinear | null;
   readonly oProj: QuantizedLinear;
+  readonly #qPlain: QuantizedLinearPlain;
+  readonly #kPlain: QuantizedLinearPlain | null;
+  readonly #vPlain: QuantizedLinearPlain | null;
+  readonly #oPlain: QuantizedLinearPlain;
   readonly qNorm: RMSNorm;
   readonly kNorm: RMSNorm | null;
   readonly vNorm: RMSNorm | null;
@@ -114,6 +118,7 @@ export class Attention {
     hasKv = true,
     /** How a donor layer reads its cache (the cache's own read). */
     readonly reads: Gemma4ReadStrategy = gemma4CacheRead,
+    kEqV?: boolean,
   ) {
     const t = config.text;
     this.hasKv = hasKv;
@@ -121,7 +126,7 @@ export class Attention {
     this.windowSize = t.slidingWindow;
     this.headDim = this.isSliding ? t.headDim : t.globalHeadDim;
     this.nHeads = t.numAttentionHeads;
-    this.useKEqV = t.attentionKEqV && !this.isSliding;
+    this.useKEqV = kEqV ?? (t.attentionKEqV && !this.isSliding);
     this.nKvHeads = this.useKEqV ? t.numGlobalKeyValueHeads : t.numKeyValueHeads;
 
     const rp = t.ropeParameters[this.isSliding ? "sliding_attention" : "full_attention"]!;
@@ -171,6 +176,10 @@ export class Attention {
     this.vProj = hasKv && !this.useKEqV
       ? QuantizedLinear.load(weights, `${prefix}.v_proj`, config) : null;
     this.oProj = QuantizedLinear.load(weights, `${prefix}.o_proj`, config);
+    this.#qPlain = new QuantizedLinearPlain(this.qProj);
+    this.#kPlain = this.kProj ? new QuantizedLinearPlain(this.kProj) : null;
+    this.#vPlain = this.vProj ? new QuantizedLinearPlain(this.vProj) : null;
+    this.#oPlain = new QuantizedLinearPlain(this.oProj);
     this.qNorm = new RMSNorm(weights.tensor(`${prefix}.q_norm.weight`), t.rmsNormEps);
     this.kNorm = hasKv
       ? new RMSNorm(weights.tensor(`${prefix}.k_norm.weight`), t.rmsNormEps) : null;
@@ -195,14 +204,43 @@ export class Attention {
   forward(
     x: MlxArray, cache: Cache | null, phase: Gemma4Phase, donor: DonorRead | null,
   ): { out: MlxArray; donor: DonorRead | null } {
-    const [B, L] = x.shape as [number, number, number];
-
-    let q = this.qProj.forward(x);
-    q = disposing(q, ops.reshape(q, [B, L, this.nHeads, this.headDim]));
-    q = disposing(q, this.qNorm.forward(q));
-
+    const q = this.queries(x);
     const own = this.hasKv ? this.#append(x, cache!, phase) : null;
-    const source = own ?? donor!;
+    return this.attendQueries(q, own ?? donor!, own, x.shape[0]!, x.shape[1]!);
+  }
+
+  forwardSeparate(x: MlxArray, cache: Cache, phase: Gemma4Phase): { out: MlxArray; donor: DonorRead } {
+    const q = this.queries(x);
+    const [B, L] = x.shape;
+    let k = this.#kPlain!.forward(x);
+    k = disposing(k, ops.reshape(k, [B!, L!, this.nKvHeads, this.headDim]));
+    let v = this.#vPlain!.forward(x);
+    v = disposing(v, ops.reshape(v, [B!, L!, this.nKvHeads, this.headDim]));
+    const source = this.appendValues(k, v, cache, phase);
+    return this.attendQueries(q, source, source, B!, L!) as { out: MlxArray; donor: DonorRead };
+  }
+
+  forwardKEqV(x: MlxArray, cache: Cache, phase: Gemma4Phase): { out: MlxArray; donor: DonorRead } {
+    const q = this.queries(x);
+    const [B, L] = x.shape;
+    let k = this.#kPlain!.forward(x);
+    k = disposing(k, ops.reshape(k, [B!, L!, this.nKvHeads, this.headDim]));
+    const source = this.appendValues(k, k, cache, phase);
+    return this.attendQueries(q, source, source, B!, L!) as { out: MlxArray; donor: DonorRead };
+  }
+
+  forwardShared(x: MlxArray, donor: DonorRead): { out: MlxArray; donor: null } {
+    return this.attendQueries(this.queries(x), donor, null, x.shape[0]!, x.shape[1]!) as { out: MlxArray; donor: null };
+  }
+
+  private queries(x: MlxArray): MlxArray {
+    const [B, L] = x.shape;
+    let q = this.#qPlain.forward(x);
+    q = disposing(q, ops.reshape(q, [B!, L!, this.nHeads, this.headDim]));
+    return disposing(q, this.qNorm.forward(q));
+  }
+
+  private attendQueries(q: MlxArray, source: DonorRead, own: DonorRead | null, B: number, L: number): { out: MlxArray; donor: DonorRead | null } {
     let attn: MlxArray;
     try {
       q = disposing(q, ops.transposeAxes(q, [0, 2, 1, 3]));
@@ -216,7 +254,7 @@ export class Attention {
     attn.dispose();
     const merged = ops.reshape(attnT, [B, L, -1]);
     attnT.dispose();
-    const out = this.oProj.forward(merged);
+    const out = this.#oPlain.forward(merged);
     merged.dispose();
     return { out, donor: own };
   }
@@ -236,6 +274,10 @@ export class Attention {
       v = k; // attention_k_eq_v: shared projection; norms differ below
     }
 
+    return this.appendValues(k, v, cache, phase);
+  }
+
+  private appendValues(k: MlxArray, v: MlxArray, cache: Cache, phase: Gemma4Phase): DonorRead {
     const offset = cache.offset;
     // Own the pre-write positions through every query that attends this read.
     // Advancing a row cache may replace and release its borrowed offset array
@@ -421,7 +463,7 @@ export class Experts {
 /** One decoder layer: the attention sub-block (`forwardAttn`) and the row-wise
  * pieces after it (`denseFeedforward` or `moeFeedforward`, `perLayerGated`,
  * `scaled`), which the generic graph composes through `forwardMlp` and a
- * generated graph composes as its layer table names them. */
+ * written graph composes as its layer table names them. */
 export class DecoderLayer {
   readonly attn: Attention;
   readonly mlp: GegluMLP;
@@ -515,7 +557,7 @@ export class DecoderLayer {
    *  e4b per-layer-input gate and layer scalar. `hMid` (the attn sub-block's
    *  output) is BORROWED — the caller owns/disposes it (it is the checkpoint
    *  boundary leaf), so this never disposes it. The generic graph's composition
-   *  of the pieces below; a generated graph composes the ones its layer has. */
+   *  of the pieces below; a written graph composes the ones its layer has. */
   forwardMlp(hMid: MlxArray, perLayerInput: MlxArray | null): MlxArray {
     let h = this.router && this.experts ? this.moeFeedforward(hMid) : this.denseFeedforward(hMid);
     if (this.perLayerGate && this.perLayerProjection && this.postPerLayerNorm && perLayerInput)
@@ -628,6 +670,17 @@ export class PerLayerInputs {
   /** Layer `i`'s input [B, L, width] (owned) from the [B, L, nLayers, width]
    *  tensor `compute` returned (borrowed). A compiled-decode trace slices at an
    *  array start, which replays at every step. */
+  ordinaryLayer(perLayer: MlxArray, i: number, B: number, L: number): MlxArray {
+    using slice = perLayer.slice([0, 0, i, 0], [B, L, i + 1, this.width]);
+    return ops.reshape(slice, [B, L, this.width]);
+  }
+
+  traceLayer(perLayer: MlxArray, i: number, B: number, L: number): MlxArray {
+    using start = ops.fromInt32([i], [1]);
+    using slice = ops.sliceDynamic(perLayer, start, [2], [B, L, 1, this.width]);
+    return ops.reshape(slice, [B, L, this.width]);
+  }
+
   layer(perLayer: MlxArray, i: number, B: number, L: number): MlxArray {
     let pls: MlxArray;
     if (isCompiledTrace()) {
@@ -643,3 +696,60 @@ export class PerLayerInputs {
   }
 }
 
+
+/** Unsorted expert gather. The graph binds this below the reference threshold. */
+export class UnsortedSwitchGLU {
+  constructor(readonly base: SwitchGLU,
+    readonly activation: { forward(gate: MlxArray, up: MlxArray): MlxArray }) {}
+  forward(x: MlxArray, indices: MlxArray): MlxArray {
+    using expanded = ops.expandDims(x, -2);
+    using h = ops.expandDims(expanded, -3);
+    const up = this.base.up.forward(h, indices, false);
+    const gate = this.base.gate.forward(h, indices, false);
+    using mid = this.activation.forward(gate, up);
+    using y = this.base.down.forward(mid, indices, false);
+    const shape = y.shape;
+    shape.splice(shape.length - 2, 1);
+    return ops.reshape(y, shape);
+  }
+}
+
+/** Sorted expert gather and inverse permutation. No token-count selector. */
+export class SortedSwitchGLU {
+  constructor(readonly base: SwitchGLU,
+    readonly activation: { forward(gate: MlxArray, up: MlxArray): MlxArray }) {}
+  forward(x: MlxArray, indices: MlxArray): MlxArray {
+    using expanded = ops.expandDims(x, -2);
+    using h = ops.expandDims(expanded, -3);
+    const k = indices.shape[indices.ndim - 1]!;
+    using idxFlat = ops.reshape(indices, [indices.size]);
+    using order = ops.argsortAxis(idxFlat, 0);
+    using invOrder = ops.argsortAxis(order, 0);
+    using kScalar = ops.scalarLike(k, order);
+    using rowIdx = ops.floorDivide(order, kScalar);
+    using flat = ops.reshape(h, [-1, 1, h.shape[4]!]);
+    using sorted = ops.takeAxis(flat, rowIdx, 0);
+    using idx = ops.takeAxis(idxFlat, order, 0);
+    const up = this.base.up.forward(sorted, idx, true);
+    const gate = this.base.gate.forward(sorted, idx, true);
+    using mid = this.activation.forward(gate, up);
+    using projected = this.base.down.forward(mid, idx, true);
+    using unsorted = ops.takeAxis(projected, invOrder, 0);
+    const [B, L, topK] = indices.shape as number[];
+    using y = ops.reshape(unsorted, [B!, L!, topK!, 1, unsorted.shape.at(-1)!]);
+    const shape = y.shape;
+    shape.splice(shape.length - 2, 1);
+    return ops.reshape(y, shape);
+  }
+}
+
+/** The explicit expert operation, with top-k weighted sum in reference order. */
+export class FixedExperts {
+  constructor(readonly switchGlu: { forward(x: MlxArray, indices: MlxArray): MlxArray }) {}
+  forward(x: MlxArray, indices: MlxArray, weights: MlxArray): MlxArray {
+    using w = ops.expandDims(weights, -1);
+    using y = this.switchGlu.forward(x, indices);
+    using wy = ops.mul(w, y);
+    return ops.sumAxis(wy, -2, false);
+  }
+}

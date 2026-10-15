@@ -1,3 +1,4 @@
+import type { MlxCacheLayer, MlxMixedRange, MlxSequenceRange } from "../../contracts/mlx/graph";
 // Concrete model graph for plain Qwen3 (Qwen3ForCausalLM).
 // Port target: mlx_lm.models.qwen3. A standard dense decoder — GQA softmax
 // attention with per-head q/k RMSNorm (applied over head_dim BEFORE RoPE),
@@ -18,18 +19,15 @@ import { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import { disposing } from "../../layers/helpers";
 import { composedFullAttentionCache } from "../../state/bf16-first-kv";
-import type { Composition } from "../../contracts/portable/composition";
 import { AttentionMasks } from "../../state/attention-read";
 import { denseTurboQuantKernels } from "../../state/turboquant-attention";
 import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
-import type {
-  MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPrefillChunk, MlxTokenPhases, MlxVerifyForward, MlxWidthClass,
-} from "../../contracts/mlx/graph";
+import type { MlxRowTable, MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPhaseForward, MlxPromptRange, MlxTokenPhases, MlxVerifyForward } from "../../contracts/mlx/graph";
 import { declareGraph } from "../capabilities";
-import { atEveryWidth, type ReadPhase } from "../graph";
+import { DEFAULT_PHASE_ROWS,  rowTable, type ReadPhase   } from "../graph";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
-import { QuantizedLinear } from "../../layers/quantized-linear";
+import { QuantizedLinear, QuantizedLinearPlain } from "../../layers/quantized-linear";
 import { RMSNorm } from "../../layers/normalization";
 import { type Cache } from "../../contracts/mlx/cache";
 import { compiledSwiglu } from "../../layers/swiglu";
@@ -51,6 +49,11 @@ export class Qwen3Attention {
   readonly scale: number;
   readonly ropeBase: number;
 
+  readonly #q: QuantizedLinearPlain;
+  readonly #k: QuantizedLinearPlain;
+  readonly #v: QuantizedLinearPlain;
+  readonly #out: QuantizedLinearPlain;
+
   /** `reads` is how the block reads its cache: the cache's own read, fixed when
    * the block is built. */
   constructor(weights: Weights, config: ModelConfig, prefix: string, defaultRopeBase = 1000000,
@@ -67,15 +70,19 @@ export class Qwen3Attention {
     this.oProj = QuantizedLinear.load(weights, `${prefix}.o_proj`, config);
     this.qNorm = new RMSNorm(weights.tensor(`${prefix}.q_norm.weight`), t.rmsNormEps);
     this.kNorm = new RMSNorm(weights.tensor(`${prefix}.k_norm.weight`), t.rmsNormEps);
+    this.#q = new QuantizedLinearPlain(this.qProj);
+    this.#k = new QuantizedLinearPlain(this.kProj);
+    this.#v = new QuantizedLinearPlain(this.vProj);
+    this.#out = new QuantizedLinearPlain(this.oProj);
   }
 
   /** `x` [B, L, hidden] (borrowed) to an owned [B, L, hidden], appending to
    *  `cache` and attending through the read `phase` names. */
   forward(x: MlxArray, cache: Cache, phase: ReadPhase): MlxArray {
     const [B, L] = x.shape as [number, number, number];
-    let q = this.qProj.forward(x);
-    let k = this.kProj.forward(x);
-    let v = this.vProj.forward(x);
+    let q = this.#q.forward(x);
+    let k = this.#k.forward(x);
+    let v = this.#v.forward(x);
 
     // Reshape to heads, then q/k RMSNorm over head_dim BEFORE transpose+RoPE
     // (mlx-lm qwen3 reference order).
@@ -104,7 +111,7 @@ export class Qwen3Attention {
     attn.dispose();
     const merged = ops.reshape(attnT, [B, L, -1]);
     attnT.dispose();
-    const out = this.oProj.forward(merged);
+    const out = this.#out.forward(merged);
     merged.dispose();
     return out;
   }
@@ -115,15 +122,22 @@ export class Qwen3MLP {
   readonly up: QuantizedLinear;
   readonly down: QuantizedLinear;
 
+  readonly #gate: QuantizedLinearPlain;
+  readonly #up: QuantizedLinearPlain;
+  readonly #down: QuantizedLinearPlain;
+
   constructor(weights: Weights, config: ModelConfig, prefix: string) {
     this.gate = QuantizedLinear.load(weights, `${prefix}.gate_proj`, config);
     this.up = QuantizedLinear.load(weights, `${prefix}.up_proj`, config);
     this.down = QuantizedLinear.load(weights, `${prefix}.down_proj`, config);
+    this.#gate = new QuantizedLinearPlain(this.gate);
+    this.#up = new QuantizedLinearPlain(this.up);
+    this.#down = new QuantizedLinearPlain(this.down);
   }
 
   forward(x: MlxArray): MlxArray {
-    const gate = this.gate.forward(x);
-    const up = this.up.forward(x);
+    const gate = this.#gate.forward(x);
+    const up = this.#up.forward(x);
     // Oracle (mlx_lm/models/qwen3.py MLP): down_proj(swiglu(gate_proj(x), up_proj(x)))
     // where swiglu is the `@mx.compile` closure (silu(gate)*up). Compiled = the
     // same libmlx kernel mlx-lm dispatches (L1-faithful) AND fuses the three
@@ -131,7 +145,7 @@ export class Qwen3MLP {
     const hidden = compiledSwiglu(gate, up);
     gate.dispose();
     up.dispose();
-    const out = this.down.forward(hidden);
+    const out = this.#down.forward(hidden);
     hidden.dispose();
     return out;
   }
@@ -168,8 +182,6 @@ export class Qwen3Layer {
 
 export class Qwen3Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
-  /** The served configuration this graph was built for: its KV scheme is what `makeCache` composes. */
-  readonly composition: Composition;
   readonly weightsBytes: number;
   readonly prefixBase = "model";
   readonly loraState = new LoraState();
@@ -180,10 +192,10 @@ export class Qwen3Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly finalNorm: RMSNorm;
   /** Separate lm_head when NOT tied; otherwise the tied embedding's asLinear. */
   readonly lmHead: QuantizedLinear | null;
+  readonly #head: (hidden: MlxArray) => MlxArray;
 
-  constructor(weights: Weights, config: ModelConfig, composition: Composition) {
+  constructor(weights: Weights, config: ModelConfig, maxPhaseRows = DEFAULT_PHASE_ROWS) {
     this.config = config;
-    this.composition = composition;
     this.weightsBytes = [...weights.shards.files.values()]
       .reduce((a, f) => a + f.mmap.size, 0);
     this.embed = QuantizedEmbedding.load(weights, "model.embed_tokens", config);
@@ -195,6 +207,27 @@ export class Qwen3Model implements MlxDeclaredGraph, MlxTokenPhases {
     this.lmHead = config.text.tieWordEmbeddings
       ? null
       : QuantizedLinear.load(weights, "lm_head", config);
+    const head = this.lmHead && new QuantizedLinearPlain(this.lmHead);
+    this.#head = head ? hidden => head.forward(hidden) : hidden => this.embed.asLinear(hidden);
+
+    const multiSequencePrompt: MlxCapturingForward = (ids, cache) =>
+    this.forwardLayers(this.embed.encode(ids), cache, "window");
+    this.prompt = [{ from: 1, to: Infinity, operation: multiSequencePrompt }];
+    this.promptChunk = this.prompt;
+    this.multiSequencePrompt = this.prompt;
+    this.multiSequencePromptChunk = this.multiSequencePrompt;
+    this.appendKnown = [{from:1,to:Infinity,operation:(ids, cache) =>
+    this.forwardLayers(this.embed.encode(ids), cache, "window")}];
+    this.logits = rowTable<MlxHeadForward>(hidden => this.logitsFromHidden(hidden), maxPhaseRows);
+    this.decode = rowTable<MlxPhaseForward>((ids, cache) =>
+    this.forwardLayers(this.embed.encode(ids), cache, "decode"), maxPhaseRows);
+    this.verify = rowTable<MlxVerifyForward>((ids, cache) =>
+    this.forwardLayers(this.embed.encode(ids), cache, "window"), maxPhaseRows);
+
+
+    this.sequence = [{from:1,to:Infinity,operation:(ids,cache)=>this.sequenceHidden(ids,cache,1)}];
+
+    this.cacheLayers = this.layers.map(() => ({kind:"full" as const,turboQuant:"dense" as const}));
   }
 
   loraTargets(): Map<string, QuantizedLinear> {
@@ -219,40 +252,35 @@ export class Qwen3Model implements MlxDeclaredGraph, MlxTokenPhases {
   /** One cache per layer, sharing one mask memo. Their TurboQuant read is dense
    * (`denseTurboQuantKernels`): the read decodes keys and values, then runs the
    * fused SDPA. */
-  makeCache(): Cache[] {
-    const masks = new AttentionMasks();
-    return this.layers.map((_, layer) => composedFullAttentionCache(this.composition.kv, layer, masks, denseTurboQuantKernels));
-  }
+  readonly cacheLayers: readonly MlxCacheLayer[];
+  readonly sequence: readonly MlxSequenceRange[];
+
 
   /** The scoring forward (`MlxSequenceForward`): the window read at every width. */
-  sequenceHidden(ids: MlxArray, cache: Cache[], _width: MlxWidthClass): MlxArray {
+  sequenceHidden(ids: MlxArray, cache: Cache[], _width: number): MlxArray {
     return this.forwardLayers(this.embed.encode(ids), cache, "window");
   }
 
   /** One whole chunk of a prompt; rows are sequences times the chunk size. The GPU is this graph's one unit. */
-  readonly prefillChunk: MlxPrefillChunk = {
-    gpu: (ids, cache) => this.forwardLayers(this.embed.encode(ids), cache, "window"),
-  };
+  readonly prompt: readonly MlxPromptRange[];
+  readonly promptChunk: typeof this.prompt;
+  readonly multiSequencePromptChunk: typeof this.multiSequencePrompt;
+  readonly multiSequencePrompt: readonly MlxPromptRange[];
 
   /** A prompt's positions that are not a whole chunk: the window read at every width. */
-  readonly prefillTail = atEveryWidth<MlxCapturingForward>((ids, cache) =>
-    this.forwardLayers(this.embed.encode(ids), cache, "window"));
 
   /** Known tokens: this graph declares no committed spans, so they read as a window. */
-  readonly appendKnown = atEveryWidth<MlxPhaseForward>((ids, cache) =>
-    this.forwardLayers(this.embed.encode(ids), cache, "window"));
+  readonly appendKnown: import("../../contracts/mlx/graph").MlxKnownOperations;
 
   /** The one output head at every width. */
-  readonly logits = atEveryWidth<MlxHeadForward>(hidden => this.logitsFromHidden(hidden));
+  readonly logits: MlxRowTable<MlxHeadForward>;
 
   /** One new token per sequence: `ids` [sequences, 1]. */
-  readonly decode = atEveryWidth<MlxPhaseForward>((ids, cache) =>
-    this.forwardLayers(this.embed.encode(ids), cache, "decode"));
+  readonly decode: MlxRowTable<MlxCapturingForward>;
 
   /** A speculative window of depth + 1 positions per sequence. This graph
    * declares no hidden-layer taps, so `capture` is always null. */
-  readonly verify = atEveryWidth<MlxVerifyForward>((ids, cache) =>
-    this.forwardLayers(this.embed.encode(ids), cache, "window"));
+  readonly verify: MlxRowTable<MlxCapturingForward>;
 
   /** The decoder over `h0` (consumed), every block reading its cache for `phase`. */
   protected forwardLayers(h0: MlxArray, cache: Cache[], phase: ReadPhase): MlxArray {
@@ -268,7 +296,7 @@ export class Qwen3Model implements MlxDeclaredGraph, MlxTokenPhases {
   /** Last-token pooled, L2-normalized sentence embedding for one sequence.
    *  ids [1, L] → vector [1, hidden]. The caller appends the EOS/eod token
    *  (Qwen3-Embedding's pooling token) to `ids`. */
-  embedPooled(ids: MlxArray): MlxArray {
+  embedPooled(this: Qwen3Model & { makeCache(): Cache[] }, ids: MlxArray): MlxArray {
     const cache = this.makeCache();
     try {
       const h = this.forwardLayers(this.embed.encode(ids), cache, "window"); // [1, L, hidden]
@@ -290,6 +318,6 @@ export class Qwen3Model implements MlxDeclaredGraph, MlxTokenPhases {
   }
 
   logitsFromHidden(h: MlxArray): MlxArray {
-    return this.lmHead ? this.lmHead.forward(h) : this.embed.asLinear(h);
+    return this.#head(h);
   }
 }
