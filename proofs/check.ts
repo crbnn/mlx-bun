@@ -51,14 +51,34 @@ if (process.argv.includes("--self-test")) {
   try {
     const proof = await Bun.file(proofPath).text();
     const wrongClaim = proof.replace("implementation s = specification s :=", "implementation s = specification s + 1 :=");
-    if (proof === wrongClaim) throw new Error("Negative proof test did not alter its target.");
-    const path = join(dir, "Incorrect.lean");
-    await Bun.write(path, wrongClaim);
-    if ((await run([path])).code === 0) throw new Error("Lean accepted the deliberately false contract.");
+    const assumedClaim = proof.replace(
+      /theorem correct[\s\S]*?(?=\ntheorem range)/,
+      "axiom injected : ∀ s, implementation s = specification s\n" +
+      "theorem correct (s : BitVec 32) : implementation s = specification s := injected s\n",
+    );
+    const nativeProof = proof.replace("import Std\n", "import Std.Tactic.BVDecide\n").replace(
+      /theorem packedSum_bound[\s\S]*?(?=\ntheorem correct)/,
+      "theorem packedSum_bound (x : BitVec 32) : packedSum x ≤ 1020 := by\n  unfold packedSum\n  bv_decide\n",
+    );
+    for (const [name, text, axiomCheck] of [
+      ["FalseContract", wrongClaim, false],
+      ["AssumedContract", assumedClaim, true],
+      ["NativeComputation", nativeProof, true],
+    ] as const) {
+      if (proof === text) throw new Error(`Negative proof test did not alter its target: ${name}`);
+      const path = join(dir, `${name}.lean`);
+      await Bun.write(path, text);
+      const rejected = await run([path]);
+      if (rejected.code === 0) throw new Error(`Lean accepted ${name}.`);
+      if (axiomCheck && !rejected.output.includes("Docstring on `#guard_msgs` does not match")) {
+        throw new Error(`${name} failed before the axiom guard:\n${rejected.output}`);
+      }
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
-  console.log("Negative checks passed: changed arithmetic and a false theorem were rejected.");
+  console.log("Negative checks passed: changed arithmetic, a false theorem, a custom axiom, and native computation were rejected.");
 }
 console.log("Proved trellis_y byte-sum equality and [-510, 510] bounds for all 32-bit states.");
-console.log("Scope: source-pinned manual translation; native LRAT checking trusts Lean's compiler. Floating-point decoding and the M1 Max graph remain unproved.");
+console.log("Lean kernel checked both contracts; permitted axioms: propext, Classical.choice, Quot.sound.");
+console.log("Scope: source-pinned manual translation. Floating-point decoding and the M1 Max graph remain unproved.");
