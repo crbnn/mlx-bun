@@ -36,6 +36,7 @@ const sourcePins = {
   "layers/trellis-codebook-down.ts": "48752c429a3ab558131f95c6d361b15b6795c3bb6ee161f8afdca71609437898",
   "models/qwen/written-layers.ts": "ebf7710ffdf202d3e25ec7721930e5d992df31fb3d7fa5bde9709aa7a608c2c9",
   "models/qwen/checkpoint.ts": "1ec846424a2d4e5a046bcb62b43a5e6b8e1f3d9c2b4b3f5f3d7180276362edd8",
+  "kernels/sampling/normalized-argmax.ts": "1578cff1ef678cbff3e2e9a754c6d7ba369e455885127e8d15c8b61f22a87740",
 };
 // Exact upstream source for the reviewed MLX convolution, qmv and RoPE translations.
 // These pins do not establish correspondence with the bundled native binary.
@@ -238,6 +239,12 @@ const proofFiles = [
   "models/qwen/CheckpointTransforms.lean",
   "models/qwen/CheckpointRanges.lean",
   "models/qwen/CheckpointNormalizationData.lean",
+  "models/qwen/CheckpointNormalizationBinding.lean",
+  "contracts/mlx/Argmax.lean",
+  "kernels/sampling/ArgmaxPairs.lean",
+  "kernels/sampling/NormalizedScores.lean",
+  "kernels/sampling/NormalizedArgmaxLayout.lean",
+  "kernels/sampling/NormalizedArgmaxExecution.lean",
 ];
 
 const discoveredProofs = await Array.fromAsync(new Bun.Glob("**/*.lean").scan({
