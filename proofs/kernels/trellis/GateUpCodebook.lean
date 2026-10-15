@@ -1,4 +1,4 @@
-import kernels.trellis.Codebook
+import kernels.trellis.CodebookLoad
 
 namespace Inference.Kernels.Trellis.GateUpCodebook
 /- Qwen single-row gate/up geometry: C=5120, R=17408, T=256, L=12,
@@ -65,6 +65,26 @@ theorem window_state_bits (w : Nat → BitVec 32) (run k j b : Nat)
   have hbit : ((31-j)*k+b)%32 = ((255-(run%8*32+j))*k+b)%32 := by
     rcases hk with hk | hk | hk <;> subst k <;> omega
   exact congr (congrArg BitVec.getLsbD (congrArg w hw)) hbit
+
+theorem window_state (w : Nat → BitVec 32) (run k j : Nat)
+    (hk : k=2 ∨ k=3 ∨ k=4) (hj : j<32) :
+    Codebook.CodebookWindow.byteOffset (runWords w run k) ((31-j)*k) >>> 2 =
+      Codebook.PackedState.read w k (run%8*32+j) := by
+  apply CodebookLoad.eq_of_low_bits _ _
+    (Codebook.CodebookWindow.index_bound _ _) (CodebookLoad.packedState_bound _ _ _)
+  exact fun b hb => window_state_bits w run k j b hk hj hb
+
+theorem load_correct (load : Contracts.Mlx.M1Max.ThreadgroupLoad)
+    (hardware : Contracts.Mlx.M1Max.LoadContract load)
+    (memory : Contracts.Mlx.M1Max.WordMemory) (base : Nat)
+    (ha : base%4=0) (hn : base+16384 ≤ 2^64)
+    (initialized : CodebookLoad.Initialized memory base)
+    (w : Nat → BitVec 32) (run k j : Nat)
+    (hk : k=2 ∨ k=3 ∨ k=4) (hj : j<32) :
+    CodebookLoad.read load memory base (runWords w run k) ((31-j)*k) =
+      CodebookLoad.mathematicalCode (Codebook.PackedState.read w k (run%8*32+j)) := by
+  rw [CodebookLoad.read_correct load hardware memory base ha hn initialized]
+  rw [window_state w run k j hk hj]
 
 theorem code_address_bounds (r run k i : Nat)
     (hr : r<17408) (hRun : run<160) (hk : k=2 ∨ k=3 ∨ k=4) (hi : i<8*k) :

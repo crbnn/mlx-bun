@@ -1,10 +1,14 @@
-/** CPU-only: LEAN=/path/to/lean bun proofs/check.ts [--self-test]. No MLX import. */
+/** CPU-only: LEAN=/path/to/lean bun proofs/check.ts [--self-test].
+ * Lake resolves the pinned FloatLib/mathlib proof dependencies in proofs/.
+ * No MLX import. */
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 
 const root = new URL("../", import.meta.url);
 const lean = process.env.LEAN ?? "lean";
+const lake = process.env.LAKE ?? join(dirname(lean), "lake");
+let dependencyPath = "";
 // Reviewed manual translations, not a verified Metal/TypeScript frontend. Pins
 // prevent source drift; changing a hash requires reviewing the affected proofs.
 const sourcePins = {
@@ -14,9 +18,20 @@ const sourcePins = {
   "launch.ts": "da0a19922ccc93935c5cab869de040d4b759271df08496c88c7371c386724052",
 };
 const proofFiles = [
+  "contracts/mlx/M1Max.lean",
+  "contracts/mlx/Memory.lean",
+  "contracts/mlx/Numerics.lean",
+  "contracts/mlx/Reduction.lean",
   "kernels/trellis/Codebook.lean",
+  "kernels/trellis/CodebookLoad.lean",
+  "kernels/trellis/CodebookAccuracy.lean",
+  "kernels/trellis/CodebookInitialization.lean",
   "kernels/trellis/DownCodebook.lean",
   "kernels/trellis/GateUpCodebook.lean",
+  "kernels/trellis/DownExecution.lean",
+  "kernels/trellis/DownMemory.lean",
+  "kernels/trellis/DownAccuracy.lean",
+  "kernels/trellis/GateUpExecution.lean",
 ];
 
 function checkSource(name: keyof typeof sourcePins, source: string): void {
@@ -45,7 +60,7 @@ run_cmd do
 async function run(args: string[], leanPath?: string) {
   const child = Bun.spawn([lean, ...args], {
     cwd: root.pathname, stdout: "pipe", stderr: "pipe",
-    env: { ...process.env, ...(leanPath ? { LEAN_PATH: leanPath } : {}) },
+    env: { ...process.env, ...(leanPath ? { LEAN_PATH: [leanPath, dependencyPath].filter(Boolean).join(delimiter) } : {}) },
   });
   const [stdout, stderr, code] = await Promise.all([
     new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
@@ -57,6 +72,24 @@ const version = await run(["--version"]);
 if (version.code !== 0 || !version.output.includes("version 4.35.0,")) {
   throw new Error(`Expected Lean 4.35.0; got ${version.output}`);
 }
+async function runLake(args: string[]) {
+  const child = Bun.spawn([lake, ...args], {
+    cwd: new URL("./", import.meta.url).pathname, stdout: "pipe", stderr: "pipe",
+    env: { ...process.env, MATHLIB_NO_CACHE_ON_UPDATE: "1" },
+  });
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+  ]);
+  if (code !== 0) throw new Error(`Lake failed: ${stdout}${stderr}`);
+  return stdout;
+}
+console.log("Building pinned numerical proof dependencies...");
+process.stdout.write(await runLake(["build",
+  "FloatLib.Floats.Formats.BinaryInterchange.Analysis.StandardModel",
+  "FloatLib.Floats.Formats.BinaryInterchange.Arithmetic.LeanModel.MulDiv",
+  "FloatLib.Floats.Formats.IEEE754.Native.Model",
+]));
+dependencyPath = (await runLake(["env", "printenv", "LEAN_PATH"])).trim();
 const sources = new Map<keyof typeof sourcePins, string>();
 for (const name of Object.keys(sourcePins) as (keyof typeof sourcePins)[]) {
   const source = await Bun.file(new URL(`packages/inference/src/kernels/trellis/${name}`, root)).text();
@@ -90,7 +123,7 @@ try {
     }
     // Small prefix retains the arithmetic contract and its dependencies, avoiding
     // repeated exhaustive floating-point checking for deliberately broken proofs.
-    const source = await Bun.file(new URL(proofFiles[0]!, import.meta.url)).text();
+    const source = await Bun.file(new URL("kernels/trellis/Codebook.lean", import.meta.url)).text();
     const proof = source.split("namespace PackedState")[0]! + "\nend Inference.Kernels.Trellis.Codebook\n";
     const wrongClaim = proof.replace("implementation s = specification s :=", "implementation s = specification s + 1 :=");
     const assumedClaim = proof.replace(
@@ -123,6 +156,6 @@ try {
 } finally {
   await rm(dir, { recursive: true, force: true });
 }
-console.log("Checked integer decoding, packed windows, binary32 contracts, gate/up indexing, and down indexing/row order.");
+console.log("Checked decoding, packed windows, binary32 rounding/error bounds, conditional M1 loads, initialization stores, gate/up accumulators, down scratch reduction, and down split error bounds including decoder error.");
 console.log("Permitted axioms: propext, Classical.choice, Quot.sound. No native proof evaluation.");
-console.log("Scope: source-pinned manual translations. M1 load semantics, complete projection arithmetic, layers, and graph remain unproved.");
+console.log("Scope: source-pinned manual translations. M1 loads require a hardware hypothesis; SIMD reduction/casts remain parameters. Finite intermediate values remain caller obligations. Whole-projection bounds, SwiGLU, machine-code correspondence, layers, and graph remain unproved.");

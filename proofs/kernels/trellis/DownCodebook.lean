@@ -1,11 +1,12 @@
-import kernels.trellis.Codebook
+import kernels.trellis.CodebookLoad
 
 namespace Inference.Kernels.Trellis.DownCodebook
 /- Indexing obligations for down-codebook.ts with the pinned Qwen dimensions:
    R = 17408, C = 5120, SPLITS = 128, P = 16, U = 2, THREADS = 256.
    These theorems establish indexing, packed-window alignment, and preservation
    of per-row multiply/FMA order. They do not establish the final reduction,
-   synchronization, or hardware semantics of codebook loads and simd_sum. -/
+   synchronization, or simd_sum semantics. The numerical load theorem uses
+   the explicit M1Max.LoadContract hypothesis. -/
 
 def scratch (sg lane i : Nat) : Nat := sg*512 + ((lane/16)*256+255-lane%16*16)-i
 def column (ty c : Nat) : Nat := (2*(ty/32)+c/512)*512+c%512
@@ -167,6 +168,26 @@ theorem window_state_bits (w : Nat → BitVec 32) (k li i j : Nat)
   rw [he]
 
 end Lane
+
+theorem window_state (w : Nat → BitVec 32) (k li i : Nat)
+    (hk : k=2 ∨ k=3 ∨ k=4) (hl : li<16) (hi : i<16) :
+    Codebook.CodebookWindow.byteOffset (Lane.alignedWord w k li) (i*k) >>> 2 =
+      Codebook.PackedState.read w k (255-(li*16+i)) := by
+  apply CodebookLoad.eq_of_low_bits _ _
+    (Codebook.CodebookWindow.index_bound _ _) (CodebookLoad.packedState_bound _ _ _)
+  exact fun j hj => Lane.window_state_bits w k li i j hk hl hi hj
+
+theorem load_correct (load : Contracts.Mlx.M1Max.ThreadgroupLoad)
+    (hardware : Contracts.Mlx.M1Max.LoadContract load)
+    (memory : Contracts.Mlx.M1Max.WordMemory) (base : Nat)
+    (ha : base%4=0) (hn : base+16384 ≤ 2^64)
+    (initialized : CodebookLoad.Initialized memory base)
+    (w : Nat → BitVec 32) (k li i : Nat)
+    (hk : k=2 ∨ k=3 ∨ k=4) (hl : li<16) (hi : i<16) :
+    CodebookLoad.read load memory base (Lane.alignedWord w k li) (i*k) =
+      CodebookLoad.mathematicalCode (Codebook.PackedState.read w k (255-(li*16+i))) := by
+  rw [CodebookLoad.read_correct load hardware memory base ha hn initialized]
+  rw [window_state w k li i hk hl hi]
 
 theorem all_lanes_active (ty sg lane : Nat) (ht : ty<160) (hs : sg<8) (hl : lane<32) :
     2*(ty/32)+sg/4 < 10 ∧ (2*(ty/32)+sg/4)*2+lane/16 < 20 := by omega
