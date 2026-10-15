@@ -12,6 +12,8 @@ let dependencyPath = "";
 // Reviewed manual translations, not a verified Metal/TypeScript frontend. Pins
 // prevent source drift; changing a hash requires reviewing the affected proofs.
 const sourcePins = {
+  "state/kv.ts": "526a42d976c7dd0a8e908dcf8b515b94d43269042dc3fc3023e1a5baf0d8a579",
+  "state/attention-read.ts": "8081b76f6bd7676825511476c2275601c0c34cb5b68ef30637c7a1c8f9f1c50c",
   "layers/affine-verify-linear.ts": "ee519b24ad34a0322dee6f35d9a0ed9e3c37a367b78a6b09bd4d0353c81a3870",
   "layers/quantized-linear.ts": "bf1c24c17d04951c5ea296bcd2bf34f818ffd7aefc684793e7792a8e5c25e798",
   "kernels/quantization/affine-row.ts": "cb5bd05e24a13547f5672cbe661c0262bc18969eea62266b185fcc3e68a1d20b",
@@ -36,6 +38,8 @@ const sourcePins = {
 // These pins do not establish correspondence with the bundled native binary.
 const mlxRevision = "1f8e74e3f12f31365464a6867c6579f0e9b29d85";
 const mlxSourcePins = {
+  "mlx/backend/metal/kernels/unary_ops.h": "0a5492b65ae39ecb6d8b04e64ea5007e0a4ff60d8d9428559bfbfd03387ece2a",
+  "mlx/backend/metal/kernels/bf16.h": "abd87446a310b77ac530ef52a324feae5cb285d03ec9613e3a88ebb71410fdcb",
   "mlx/backend/metal/scaled_dot_product_attention.cpp": "215ebac6495706cf01a2635c4dcec29802e130165ed8704f212d789679d2e673",
   "mlx/backend/metal/kernels/scaled_dot_product_attention.metal": "f6fefad1d91b01f05c12095e69f248e255f880d65b5ae9e9d8bc2714da56fb41",
   "mlx/backend/metal/kernels/sdpa_vector.h": "de098d50a67a865e2e64fb1700fc4819307861f009a65642679777a9a9cec7cd",
@@ -113,6 +117,10 @@ const proofFiles = [
   "kernels/attention/SdpaLoop.lean",
   "kernels/attention/SdpaNormalize.lean",
   "kernels/attention/SdpaScore.lean",
+  "kernels/attention/SdpaMerge.lean",
+  "kernels/attention/SdpaLayout.lean",
+  "kernels/attention/SdpaVector.lean",
+  "kernels/attention/OutputGate.lean",
   "kernels/ResidualRmsNorm.lean",
   "kernels/GatedRmsNorm.lean",
   "layers/TrellisCodebookGateUp.lean",
@@ -121,8 +129,10 @@ const proofFiles = [
   "layers/DeltaHeads.lean",
   "layers/AffineVerifyLinear.lean",
   "state/Ssm.lean",
+  "state/Kv.lean",
   "models/qwen/WrittenLayers.lean",
   "models/qwen/Blocks.lean",
+  "models/qwen/AttentionHeads.lean",
   "models/qwen/DeltaNet.lean",
   "models/qwen/TrellisMlp.lean",
   "models/qwen/ResidualBlocks.lean",
@@ -203,6 +213,8 @@ process.stdout.write(await runLake(["build",
   "Mathlib.Analysis.Calculus.Deriv.Inv",
   "Mathlib.Analysis.Real.Sqrt",
   "Mathlib.Analysis.SpecialFunctions.Trigonometric.Bounds",
+  "Mathlib.Data.List.FinRange",
+  "Mathlib.Data.List.Nodup",
 ]));
 dependencyPath = (await runLake(["env", "printenv", "LEAN_PATH"])).trim();
 const sources = new Map<string, { source: string; expected: string }>();
