@@ -136,6 +136,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
   readonly #one:Layers;
   readonly #rows:Layers;
   readonly #mma:Layers;
+  readonly #mmaFive:Layers;
   readonly #wide:Layers;
   readonly #draftProjections:DraftProjectionKernels;
   readonly #vocabulary:()=>NonNullable<DraftProjection["vocabulary"]>;
@@ -314,70 +315,70 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
       a63.stage(w,c,Attention,GateDownMLP,GateRow,Reduce,DownK3iRow,Plain,Plain,Plain,Plain),
     ];
     this.#rows=[
-      d0.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,Affine4,Affine4,Affine4,Affine4,Affine4,qk),
-      d1.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine4,qk),
-      d2.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine4,qk),
-      a3.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
-      d4.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine4,Affine4,Affine4,Affine4,qk),
-      d5.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine4,Affine4,Affine4,Affine4,qk),
-      d6.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      a7.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
-      d8.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      d9.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      d10.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      a11.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownRows,Affine4,Affine4,Affine4,Affine4),
-      d12.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      d13.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      d14.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      a15.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownRows,Affine4,Affine4,Affine4,Affine4),
-      d16.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      d17.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      d18.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      a19.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
-      d20.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      d21.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      d22.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      a23.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
-      d24.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      d25.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine4,Affine4,Affine4,Affine3,qk),
-      d26.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      a27.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
-      d28.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      d29.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      d30.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      a31.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownRows,Affine4,Affine4,Affine4,Affine4),
-      d32.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      d33.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      d34.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      a35.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
-      d36.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      d37.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      d38.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      a39.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
-      d40.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      d41.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      d42.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      a43.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
-      d44.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      d45.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      d46.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      a47.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownRows,Affine4,Affine4,Affine4,Affine4),
-      d48.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      d49.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      d50.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      a51.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
-      d52.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
-      d53.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine3,Affine4,Affine4,Affine4,Affine3,qk),
-      d54.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,Affine4,Affine4,Affine4,Affine4,Affine4,qk),
-      a55.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownRows,Affine4,Affine4,Affine4,Affine4),
-      d56.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,Affine4,Affine4,Affine4,Affine4,Affine4,qk),
-      d57.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,Affine4,Affine4,Affine4,Affine4,Affine4,qk),
-      d58.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,Affine4,Affine3,Affine4,Affine4,Affine3,qk),
-      a59.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownRows,Affine4,Affine4,Affine4,Affine4),
-      d60.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,Affine4,Affine4,Affine4,Affine4,Affine3,qk),
-      d61.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,Affine4,Affine4,Affine4,Affine4,Affine4,qk),
-      d62.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine4,Affine4,Affine4,Affine4,Affine3,qk),
-      a63.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
+      d0.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownRows,Affine4,Affine4,Affine4,Affine4,Affine4,qk),
+      d1.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine4,qk),
+      d2.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine4,qk),
+      a3.stage(w,c,Attention,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
+      d4.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine4,Affine4,Affine4,Affine4,qk),
+      d5.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine4,Affine4,Affine4,Affine4,qk),
+      d6.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      a7.stage(w,c,Attention,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
+      d8.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d9.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d10.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      a11.stage(w,c,Attention,GateDownMLP,GateRows,Reduce,DownRows,Affine4,Affine4,Affine4,Affine4),
+      d12.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d13.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d14.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      a15.stage(w,c,Attention,GateDownMLP,GateRows,Reduce,DownRows,Affine4,Affine4,Affine4,Affine4),
+      d16.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d17.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d18.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      a19.stage(w,c,Attention,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
+      d20.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d21.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d22.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      a23.stage(w,c,Attention,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
+      d24.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d25.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine4,Affine4,Affine4,Affine3,qk),
+      d26.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      a27.stage(w,c,Attention,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
+      d28.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d29.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d30.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      a31.stage(w,c,Attention,GateDownMLP,GateRows,Reduce,DownRows,Affine4,Affine4,Affine4,Affine4),
+      d32.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d33.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d34.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      a35.stage(w,c,Attention,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
+      d36.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d37.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d38.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      a39.stage(w,c,Attention,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
+      d40.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d41.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d42.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      a43.stage(w,c,Attention,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
+      d44.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d45.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d46.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      a47.stage(w,c,Attention,GateDownMLP,GateRows,Reduce,DownRows,Affine4,Affine4,Affine4,Affine4),
+      d48.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d49.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d50.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      a51.stage(w,c,Attention,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
+      d52.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine3,Affine4,Affine4,Affine3,qk),
+      d53.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine3,Affine4,Affine4,Affine4,Affine3,qk),
+      d54.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownRows,Affine4,Affine4,Affine4,Affine4,Affine4,qk),
+      a55.stage(w,c,Attention,GateDownMLP,GateRows,Reduce,DownRows,Affine4,Affine4,Affine4,Affine4),
+      d56.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownRows,Affine4,Affine4,Affine4,Affine4,Affine4,qk),
+      d57.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownRows,Affine4,Affine4,Affine4,Affine4,Affine4,qk),
+      d58.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownRows,Affine4,Affine3,Affine4,Affine4,Affine3,qk),
+      a59.stage(w,c,Attention,GateDownMLP,GateRows,Reduce,DownRows,Affine4,Affine4,Affine4,Affine4),
+      d60.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownRows,Affine4,Affine4,Affine4,Affine4,Affine3,qk),
+      d61.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownRows,Affine4,Affine4,Affine4,Affine4,Affine4,qk),
+      d62.stage(w,c,Delta,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine4,Affine4,Affine4,Affine4,Affine3,qk),
+      a63.stage(w,c,Attention,GateDownMLP,GateRows,Reduce,DownK3iRows,Affine4,Affine4,Affine4,Affine4),
     ];
     const rowLayers=this.#rows;
     this.#mma=[
@@ -445,6 +446,72 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
       d61.withProjections(w,c,Delta,rowLayers[61].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
       d62.withProjections(w,c,Delta,rowLayers[62].mlp,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
       a63.withProjections(w,c,Attention,rowLayers[63].mlp,AffineMma,AffineMma,AffineMma,AffineMma),
+    ];
+    this.#mmaFive=[
+      d0.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d1.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d2.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a3.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma),
+      d4.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d5.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d6.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a7.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma),
+      d8.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d9.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d10.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a11.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownRows,AffineMma,AffineMma,AffineMma,AffineMma),
+      d12.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d13.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d14.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a15.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownRows,AffineMma,AffineMma,AffineMma,AffineMma),
+      d16.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d17.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d18.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a19.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma),
+      d20.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d21.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d22.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a23.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma),
+      d24.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d25.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d26.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a27.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma),
+      d28.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d29.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d30.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a31.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownRows,AffineMma,AffineMma,AffineMma,AffineMma),
+      d32.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d33.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d34.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a35.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma),
+      d36.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d37.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d38.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a39.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma),
+      d40.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d41.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d42.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a43.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma),
+      d44.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d45.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d46.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a47.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownRows,AffineMma,AffineMma,AffineMma,AffineMma),
+      d48.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d49.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d50.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a51.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma),
+      d52.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d53.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d54.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a55.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownRows,AffineMma,AffineMma,AffineMma,AffineMma),
+      d56.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d57.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d58.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a59.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownRows,AffineMma,AffineMma,AffineMma,AffineMma),
+      d60.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d61.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      d62.stage(w,c,Delta,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
+      a63.stage(w,c,Attention,GateDownMLP,GateRows,Tiled,DownK3iRows,AffineMma,AffineMma,AffineMma,AffineMma),
     ];
     this.#wide=[
       d0.stage(w,c,Delta,GateDownMLP,WideGate,ExpandGate,WideDown,AffineMma,AffineMma,AffineMma,AffineMma,AffineMma,qk),
@@ -922,6 +989,79 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
       expanded[56],expanded[57],expanded[58],a59.mediaLayer(w,c,Attention,expanded[59].mlp,Plain),
       expanded[60],expanded[61],expanded[62],a63.mediaLayer(w,c,Attention,expanded[63].mlp,Plain),
     ];
+    const mmaFive=this.#mmaFive;
+    const mixedWideNarrow:Layers=[
+      d0.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d1.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d2.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),a3.stage(w,c,Attention,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain),
+      d4.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d5.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d6.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),a7.stage(w,c,Attention,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain),
+      d8.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d9.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d10.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),a11.stage(w,c,Attention,GateDownMLP,WideGate,Reduce,WideDown,Plain,Plain,Plain,Plain),
+      d12.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d13.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d14.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),a15.stage(w,c,Attention,GateDownMLP,WideGate,Reduce,WideDown,Plain,Plain,Plain,Plain),
+      d16.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d17.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d18.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDown,Plain,Plain,Plain,Plain,Plain,qk),a19.stage(w,c,Attention,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain),
+      d20.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d21.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d22.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),a23.stage(w,c,Attention,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain),
+      d24.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d25.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d26.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),a27.stage(w,c,Attention,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain),
+      d28.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d29.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d30.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),a31.stage(w,c,Attention,GateDownMLP,WideGate,Reduce,WideDown,Plain,Plain,Plain,Plain),
+      d32.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d33.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d34.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),a35.stage(w,c,Attention,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain),
+      d36.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d37.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d38.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),a39.stage(w,c,Attention,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain),
+      d40.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d41.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d42.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),a43.stage(w,c,Attention,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain),
+      d44.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d45.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d46.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDown,Plain,Plain,Plain,Plain,Plain,qk),a47.stage(w,c,Attention,GateDownMLP,WideGate,Reduce,WideDown,Plain,Plain,Plain,Plain),
+      d48.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d49.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d50.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),a51.stage(w,c,Attention,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain),
+      d52.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d53.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d54.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDown,Plain,Plain,Plain,Plain,Plain,qk),a55.stage(w,c,Attention,GateDownMLP,WideGate,Reduce,WideDown,Plain,Plain,Plain,Plain),
+      d56.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d57.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d58.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDown,Plain,Plain,Plain,Plain,Plain,qk),a59.stage(w,c,Attention,GateDownMLP,WideGate,Reduce,WideDown,Plain,Plain,Plain,Plain),
+      d60.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d61.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d62.stage(w,c,Delta,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),a63.stage(w,c,Attention,GateDownMLP,WideGate,Reduce,WideDownK3i,Plain,Plain,Plain,Plain),
+    ];
+    const mixedWideFive:Layers=[
+      d0.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d1.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d2.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),a3.stage(w,c,Attention,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain),
+      d4.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d5.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d6.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),a7.stage(w,c,Attention,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain),
+      d8.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d9.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d10.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),a11.stage(w,c,Attention,GateDownMLP,WideGate,Tiled,WideDown,Plain,Plain,Plain,Plain),
+      d12.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d13.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d14.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),a15.stage(w,c,Attention,GateDownMLP,WideGate,Tiled,WideDown,Plain,Plain,Plain,Plain),
+      d16.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d17.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d18.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDown,Plain,Plain,Plain,Plain,Plain,qk),a19.stage(w,c,Attention,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain),
+      d20.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d21.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d22.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),a23.stage(w,c,Attention,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain),
+      d24.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d25.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d26.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),a27.stage(w,c,Attention,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain),
+      d28.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d29.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d30.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),a31.stage(w,c,Attention,GateDownMLP,WideGate,Tiled,WideDown,Plain,Plain,Plain,Plain),
+      d32.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d33.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d34.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),a35.stage(w,c,Attention,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain),
+      d36.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d37.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d38.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),a39.stage(w,c,Attention,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain),
+      d40.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d41.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d42.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),a43.stage(w,c,Attention,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain),
+      d44.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d45.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d46.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDown,Plain,Plain,Plain,Plain,Plain,qk),a47.stage(w,c,Attention,GateDownMLP,WideGate,Tiled,WideDown,Plain,Plain,Plain,Plain),
+      d48.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d49.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d50.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),a51.stage(w,c,Attention,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain),
+      d52.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d53.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),d54.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDown,Plain,Plain,Plain,Plain,Plain,qk),a55.stage(w,c,Attention,GateDownMLP,WideGate,Tiled,WideDown,Plain,Plain,Plain,Plain),
+      d56.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d57.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d58.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDown,Plain,Plain,Plain,Plain,Plain,qk),a59.stage(w,c,Attention,GateDownMLP,WideGate,Tiled,WideDown,Plain,Plain,Plain,Plain),
+      d60.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d61.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDown,Plain,Plain,Plain,Plain,Plain,qk),d62.stage(w,c,Delta,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain,Plain,qk),a63.stage(w,c,Attention,GateDownMLP,WideGate,Tiled,WideDownK3i,Plain,Plain,Plain,Plain),
+    ];
+    const chunkNarrow:Layers=[
+      new Delta(w,c,`${PREFIX}.layers.0`,wide[0].mixer,mixedWideNarrow[0].mlp),new Delta(w,c,`${PREFIX}.layers.1`,wide[1].mixer,mixedWideNarrow[1].mlp),new Delta(w,c,`${PREFIX}.layers.2`,wide[2].mixer,mixedWideNarrow[2].mlp),new Attention(w,c,`${PREFIX}.layers.3`,wide[3].mixer,mixedWideNarrow[3].mlp),
+      new Delta(w,c,`${PREFIX}.layers.4`,wide[4].mixer,mixedWideNarrow[4].mlp),new Delta(w,c,`${PREFIX}.layers.5`,wide[5].mixer,mixedWideNarrow[5].mlp),new Delta(w,c,`${PREFIX}.layers.6`,wide[6].mixer,mixedWideNarrow[6].mlp),new Attention(w,c,`${PREFIX}.layers.7`,wide[7].mixer,mixedWideNarrow[7].mlp),
+      new Delta(w,c,`${PREFIX}.layers.8`,wide[8].mixer,mixedWideNarrow[8].mlp),new Delta(w,c,`${PREFIX}.layers.9`,wide[9].mixer,mixedWideNarrow[9].mlp),new Delta(w,c,`${PREFIX}.layers.10`,wide[10].mixer,mixedWideNarrow[10].mlp),new Attention(w,c,`${PREFIX}.layers.11`,wide[11].mixer,mixedWideNarrow[11].mlp),
+      new Delta(w,c,`${PREFIX}.layers.12`,wide[12].mixer,mixedWideNarrow[12].mlp),new Delta(w,c,`${PREFIX}.layers.13`,wide[13].mixer,mixedWideNarrow[13].mlp),new Delta(w,c,`${PREFIX}.layers.14`,wide[14].mixer,mixedWideNarrow[14].mlp),new Attention(w,c,`${PREFIX}.layers.15`,wide[15].mixer,mixedWideNarrow[15].mlp),
+      new Delta(w,c,`${PREFIX}.layers.16`,wide[16].mixer,mixedWideNarrow[16].mlp),new Delta(w,c,`${PREFIX}.layers.17`,wide[17].mixer,mixedWideNarrow[17].mlp),new Delta(w,c,`${PREFIX}.layers.18`,wide[18].mixer,mixedWideNarrow[18].mlp),new Attention(w,c,`${PREFIX}.layers.19`,wide[19].mixer,mixedWideNarrow[19].mlp),
+      new Delta(w,c,`${PREFIX}.layers.20`,wide[20].mixer,mixedWideNarrow[20].mlp),new Delta(w,c,`${PREFIX}.layers.21`,wide[21].mixer,mixedWideNarrow[21].mlp),new Delta(w,c,`${PREFIX}.layers.22`,wide[22].mixer,mixedWideNarrow[22].mlp),new Attention(w,c,`${PREFIX}.layers.23`,wide[23].mixer,mixedWideNarrow[23].mlp),
+      new Delta(w,c,`${PREFIX}.layers.24`,wide[24].mixer,mixedWideNarrow[24].mlp),new Delta(w,c,`${PREFIX}.layers.25`,wide[25].mixer,mixedWideNarrow[25].mlp),new Delta(w,c,`${PREFIX}.layers.26`,wide[26].mixer,mixedWideNarrow[26].mlp),new Attention(w,c,`${PREFIX}.layers.27`,wide[27].mixer,mixedWideNarrow[27].mlp),
+      new Delta(w,c,`${PREFIX}.layers.28`,wide[28].mixer,mixedWideNarrow[28].mlp),new Delta(w,c,`${PREFIX}.layers.29`,wide[29].mixer,mixedWideNarrow[29].mlp),new Delta(w,c,`${PREFIX}.layers.30`,wide[30].mixer,mixedWideNarrow[30].mlp),new Attention(w,c,`${PREFIX}.layers.31`,wide[31].mixer,mixedWideNarrow[31].mlp),
+      new Delta(w,c,`${PREFIX}.layers.32`,wide[32].mixer,mixedWideNarrow[32].mlp),new Delta(w,c,`${PREFIX}.layers.33`,wide[33].mixer,mixedWideNarrow[33].mlp),new Delta(w,c,`${PREFIX}.layers.34`,wide[34].mixer,mixedWideNarrow[34].mlp),new Attention(w,c,`${PREFIX}.layers.35`,wide[35].mixer,mixedWideNarrow[35].mlp),
+      new Delta(w,c,`${PREFIX}.layers.36`,wide[36].mixer,mixedWideNarrow[36].mlp),new Delta(w,c,`${PREFIX}.layers.37`,wide[37].mixer,mixedWideNarrow[37].mlp),new Delta(w,c,`${PREFIX}.layers.38`,wide[38].mixer,mixedWideNarrow[38].mlp),new Attention(w,c,`${PREFIX}.layers.39`,wide[39].mixer,mixedWideNarrow[39].mlp),
+      new Delta(w,c,`${PREFIX}.layers.40`,wide[40].mixer,mixedWideNarrow[40].mlp),new Delta(w,c,`${PREFIX}.layers.41`,wide[41].mixer,mixedWideNarrow[41].mlp),new Delta(w,c,`${PREFIX}.layers.42`,wide[42].mixer,mixedWideNarrow[42].mlp),new Attention(w,c,`${PREFIX}.layers.43`,wide[43].mixer,mixedWideNarrow[43].mlp),
+      new Delta(w,c,`${PREFIX}.layers.44`,wide[44].mixer,mixedWideNarrow[44].mlp),new Delta(w,c,`${PREFIX}.layers.45`,wide[45].mixer,mixedWideNarrow[45].mlp),new Delta(w,c,`${PREFIX}.layers.46`,wide[46].mixer,mixedWideNarrow[46].mlp),new Attention(w,c,`${PREFIX}.layers.47`,wide[47].mixer,mixedWideNarrow[47].mlp),
+      new Delta(w,c,`${PREFIX}.layers.48`,wide[48].mixer,mixedWideNarrow[48].mlp),new Delta(w,c,`${PREFIX}.layers.49`,wide[49].mixer,mixedWideNarrow[49].mlp),new Delta(w,c,`${PREFIX}.layers.50`,wide[50].mixer,mixedWideNarrow[50].mlp),new Attention(w,c,`${PREFIX}.layers.51`,wide[51].mixer,mixedWideNarrow[51].mlp),
+      new Delta(w,c,`${PREFIX}.layers.52`,wide[52].mixer,mixedWideNarrow[52].mlp),new Delta(w,c,`${PREFIX}.layers.53`,wide[53].mixer,mixedWideNarrow[53].mlp),new Delta(w,c,`${PREFIX}.layers.54`,wide[54].mixer,mixedWideNarrow[54].mlp),new Attention(w,c,`${PREFIX}.layers.55`,wide[55].mixer,mixedWideNarrow[55].mlp),
+      new Delta(w,c,`${PREFIX}.layers.56`,wide[56].mixer,mixedWideNarrow[56].mlp),new Delta(w,c,`${PREFIX}.layers.57`,wide[57].mixer,mixedWideNarrow[57].mlp),new Delta(w,c,`${PREFIX}.layers.58`,wide[58].mixer,mixedWideNarrow[58].mlp),new Attention(w,c,`${PREFIX}.layers.59`,wide[59].mixer,mixedWideNarrow[59].mlp),
+      new Delta(w,c,`${PREFIX}.layers.60`,wide[60].mixer,mixedWideNarrow[60].mlp),new Delta(w,c,`${PREFIX}.layers.61`,wide[61].mixer,mixedWideNarrow[61].mlp),new Delta(w,c,`${PREFIX}.layers.62`,wide[62].mixer,mixedWideNarrow[62].mlp),new Attention(w,c,`${PREFIX}.layers.63`,wide[63].mixer,mixedWideNarrow[63].mlp),
+    ];
+    const chunkFive:Layers=[
+      new Delta(w,c,`${PREFIX}.layers.0`,wide[0].mixer,mixedWideFive[0].mlp),new Delta(w,c,`${PREFIX}.layers.1`,wide[1].mixer,mixedWideFive[1].mlp),new Delta(w,c,`${PREFIX}.layers.2`,wide[2].mixer,mixedWideFive[2].mlp),new Attention(w,c,`${PREFIX}.layers.3`,wide[3].mixer,mixedWideFive[3].mlp),
+      new Delta(w,c,`${PREFIX}.layers.4`,wide[4].mixer,mixedWideFive[4].mlp),new Delta(w,c,`${PREFIX}.layers.5`,wide[5].mixer,mixedWideFive[5].mlp),new Delta(w,c,`${PREFIX}.layers.6`,wide[6].mixer,mixedWideFive[6].mlp),new Attention(w,c,`${PREFIX}.layers.7`,wide[7].mixer,mixedWideFive[7].mlp),
+      new Delta(w,c,`${PREFIX}.layers.8`,wide[8].mixer,mixedWideFive[8].mlp),new Delta(w,c,`${PREFIX}.layers.9`,wide[9].mixer,mixedWideFive[9].mlp),new Delta(w,c,`${PREFIX}.layers.10`,wide[10].mixer,mixedWideFive[10].mlp),new Attention(w,c,`${PREFIX}.layers.11`,wide[11].mixer,mixedWideFive[11].mlp),
+      new Delta(w,c,`${PREFIX}.layers.12`,wide[12].mixer,mixedWideFive[12].mlp),new Delta(w,c,`${PREFIX}.layers.13`,wide[13].mixer,mixedWideFive[13].mlp),new Delta(w,c,`${PREFIX}.layers.14`,wide[14].mixer,mixedWideFive[14].mlp),new Attention(w,c,`${PREFIX}.layers.15`,wide[15].mixer,mixedWideFive[15].mlp),
+      new Delta(w,c,`${PREFIX}.layers.16`,wide[16].mixer,mixedWideFive[16].mlp),new Delta(w,c,`${PREFIX}.layers.17`,wide[17].mixer,mixedWideFive[17].mlp),new Delta(w,c,`${PREFIX}.layers.18`,wide[18].mixer,mixedWideFive[18].mlp),new Attention(w,c,`${PREFIX}.layers.19`,wide[19].mixer,mixedWideFive[19].mlp),
+      new Delta(w,c,`${PREFIX}.layers.20`,wide[20].mixer,mixedWideFive[20].mlp),new Delta(w,c,`${PREFIX}.layers.21`,wide[21].mixer,mixedWideFive[21].mlp),new Delta(w,c,`${PREFIX}.layers.22`,wide[22].mixer,mixedWideFive[22].mlp),new Attention(w,c,`${PREFIX}.layers.23`,wide[23].mixer,mixedWideFive[23].mlp),
+      new Delta(w,c,`${PREFIX}.layers.24`,wide[24].mixer,mixedWideFive[24].mlp),new Delta(w,c,`${PREFIX}.layers.25`,wide[25].mixer,mixedWideFive[25].mlp),new Delta(w,c,`${PREFIX}.layers.26`,wide[26].mixer,mixedWideFive[26].mlp),new Attention(w,c,`${PREFIX}.layers.27`,wide[27].mixer,mixedWideFive[27].mlp),
+      new Delta(w,c,`${PREFIX}.layers.28`,wide[28].mixer,mixedWideFive[28].mlp),new Delta(w,c,`${PREFIX}.layers.29`,wide[29].mixer,mixedWideFive[29].mlp),new Delta(w,c,`${PREFIX}.layers.30`,wide[30].mixer,mixedWideFive[30].mlp),new Attention(w,c,`${PREFIX}.layers.31`,wide[31].mixer,mixedWideFive[31].mlp),
+      new Delta(w,c,`${PREFIX}.layers.32`,wide[32].mixer,mixedWideFive[32].mlp),new Delta(w,c,`${PREFIX}.layers.33`,wide[33].mixer,mixedWideFive[33].mlp),new Delta(w,c,`${PREFIX}.layers.34`,wide[34].mixer,mixedWideFive[34].mlp),new Attention(w,c,`${PREFIX}.layers.35`,wide[35].mixer,mixedWideFive[35].mlp),
+      new Delta(w,c,`${PREFIX}.layers.36`,wide[36].mixer,mixedWideFive[36].mlp),new Delta(w,c,`${PREFIX}.layers.37`,wide[37].mixer,mixedWideFive[37].mlp),new Delta(w,c,`${PREFIX}.layers.38`,wide[38].mixer,mixedWideFive[38].mlp),new Attention(w,c,`${PREFIX}.layers.39`,wide[39].mixer,mixedWideFive[39].mlp),
+      new Delta(w,c,`${PREFIX}.layers.40`,wide[40].mixer,mixedWideFive[40].mlp),new Delta(w,c,`${PREFIX}.layers.41`,wide[41].mixer,mixedWideFive[41].mlp),new Delta(w,c,`${PREFIX}.layers.42`,wide[42].mixer,mixedWideFive[42].mlp),new Attention(w,c,`${PREFIX}.layers.43`,wide[43].mixer,mixedWideFive[43].mlp),
+      new Delta(w,c,`${PREFIX}.layers.44`,wide[44].mixer,mixedWideFive[44].mlp),new Delta(w,c,`${PREFIX}.layers.45`,wide[45].mixer,mixedWideFive[45].mlp),new Delta(w,c,`${PREFIX}.layers.46`,wide[46].mixer,mixedWideFive[46].mlp),new Attention(w,c,`${PREFIX}.layers.47`,wide[47].mixer,mixedWideFive[47].mlp),
+      new Delta(w,c,`${PREFIX}.layers.48`,wide[48].mixer,mixedWideFive[48].mlp),new Delta(w,c,`${PREFIX}.layers.49`,wide[49].mixer,mixedWideFive[49].mlp),new Delta(w,c,`${PREFIX}.layers.50`,wide[50].mixer,mixedWideFive[50].mlp),new Attention(w,c,`${PREFIX}.layers.51`,wide[51].mixer,mixedWideFive[51].mlp),
+      new Delta(w,c,`${PREFIX}.layers.52`,wide[52].mixer,mixedWideFive[52].mlp),new Delta(w,c,`${PREFIX}.layers.53`,wide[53].mixer,mixedWideFive[53].mlp),new Delta(w,c,`${PREFIX}.layers.54`,wide[54].mixer,mixedWideFive[54].mlp),new Attention(w,c,`${PREFIX}.layers.55`,wide[55].mixer,mixedWideFive[55].mlp),
+      new Delta(w,c,`${PREFIX}.layers.56`,wide[56].mixer,mixedWideFive[56].mlp),new Delta(w,c,`${PREFIX}.layers.57`,wide[57].mixer,mixedWideFive[57].mlp),new Delta(w,c,`${PREFIX}.layers.58`,wide[58].mixer,mixedWideFive[58].mlp),new Attention(w,c,`${PREFIX}.layers.59`,wide[59].mixer,mixedWideFive[59].mlp),
+      new Delta(w,c,`${PREFIX}.layers.60`,wide[60].mixer,mixedWideFive[60].mlp),new Delta(w,c,`${PREFIX}.layers.61`,wide[61].mixer,mixedWideFive[61].mlp),new Delta(w,c,`${PREFIX}.layers.62`,wide[62].mixer,mixedWideFive[62].mlp),new Attention(w,c,`${PREFIX}.layers.63`,wide[63].mixer,mixedWideFive[63].mlp),
+    ];
     const one=this.#one,rows=this.#rows;
     const bindings:LayerWeights=[d0,d1,d2,a3,d4,d5,d6,a7,d8,d9,d10,a11,d12,d13,d14,a15,d16,d17,d18,a19,d20,d21,d22,a23,d24,d25,d26,a27,d28,d29,d30,a31,d32,d33,d34,a35,d36,d37,d38,a39,d40,d41,d42,a43,d44,d45,d46,a47,d48,d49,d50,a51,d52,d53,d54,a55,d56,d57,d58,a59,d60,d61,d62,a63];
     const shares=new AneWeightShares();
@@ -949,11 +1089,12 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
     ];
     const D1:RowsForward=(ids,cache,capture)=>this.#submitted(one,ids,cache,"decode",capture);
     const D23:RowsForward=(ids,cache,capture)=>this.#submitted(rows,ids,cache,"decode",capture);
-    const D48:RowsForward=(ids,cache,capture)=>this.#submitted(mma,ids,cache,"decode",capture);
+    const D4:RowsForward=(ids,cache,capture)=>this.#submitted(mma,ids,cache,"decode",capture);
+    const D58:RowsForward=(ids,cache,capture)=>this.#submitted(mmaFive,ids,cache,"decode",capture);
     const DW:RowsForward=(ids,cache,capture)=>this.#submitted(wide,ids,cache,"decode",capture);
     const decodeExpanded:RowsForward=(ids,cache,capture)=>this.#lazy(expanded,ids,cache,"decode",capture);
     this.decode=rowTableWithDefault({
-      1:D1,2:D23,3:D23,4:D48,5:D48,6:D48,7:D48,8:D48,9:DW,10:DW,11:DW,12:DW,13:DW,14:DW,15:DW,16:DW,
+      1:D1,2:D23,3:D23,4:D4,5:D58,6:D58,7:D58,8:D58,9:DW,10:DW,11:DW,12:DW,13:DW,14:DW,15:DW,16:DW,
       17:DW,18:DW,19:DW,20:DW,21:DW,22:DW,23:DW,24:DW,25:DW,26:DW,27:DW,28:DW,29:DW,30:DW,31:DW,32:DW,
       33:DW,34:DW,35:DW,36:DW,37:DW,38:DW,39:DW,40:DW,41:DW,42:DW,43:DW,44:DW,45:DW,46:DW,47:DW,48:DW,
       49:DW,50:DW,51:DW,52:DW,53:DW,54:DW,55:DW,56:DW,57:DW,58:DW,59:DW,60:DW,61:DW,62:DW,63:DW,64:DW,
@@ -972,11 +1113,14 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
     },decodeExpanded);
     const V1:RowsForward=(ids,cache,capture)=>this.#submitted(one,ids,cache,"window",capture);
     const V23:RowsForward=(ids,cache,capture)=>this.#submitted(rows,ids,cache,"window",capture);
-    const V48:RowsForward=(ids,cache,capture)=>this.#submitted(mma,ids,cache,"window",capture);
+    const V4:RowsForward=(ids,cache,capture)=>this.#submitted(mma,ids,cache,"window",capture);
+    const V58:RowsForward=(ids,cache,capture)=>this.#submitted(mmaFive,ids,cache,"window",capture);
+    const chunkNarrowWindow:RowsForward=(ids,cache,capture)=>this.#submitted(chunkNarrow,ids,cache,"window",capture);
+    const chunkFiveWindow:RowsForward=(ids,cache,capture)=>this.#submitted(chunkFive,ids,cache,"window",capture);
     const VW:RowsForward=(ids,cache,capture)=>this.#submitted(wide,ids,cache,"window",capture);
     const windowExpanded:RowsForward=(ids,cache,capture)=>this.#lazy(expanded,ids,cache,"window",capture);
     this.verify=rowTableWithDefault({
-      1:V1,2:V23,3:V23,4:V48,5:V48,6:V48,7:V48,8:V48,9:VW,10:VW,11:VW,12:VW,13:VW,14:VW,15:VW,16:VW,
+      1:V1,2:V23,3:V23,4:V4,5:V58,6:V58,7:V58,8:V58,9:VW,10:VW,11:VW,12:VW,13:VW,14:VW,15:VW,16:VW,
       17:VW,18:VW,19:VW,20:VW,21:VW,22:VW,23:VW,24:VW,25:VW,26:VW,27:VW,28:VW,29:VW,30:VW,31:VW,32:VW,
       33:VW,34:VW,35:VW,36:VW,37:VW,38:VW,39:VW,40:VW,41:VW,42:VW,43:VW,44:VW,45:VW,46:VW,47:VW,48:VW,
       49:VW,50:VW,51:VW,52:VW,53:VW,54:VW,55:VW,56:VW,57:VW,58:VW,59:VW,60:VW,61:VW,62:VW,63:VW,64:VW,
@@ -996,7 +1140,8 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
     this.appendKnown=[
       {from:1,to:1,operation:(ids,cache)=>this.#lazy(one,ids,cache,"window",null)},
       {from:2,to:3,operation:(ids,cache)=>this.#lazy(rows,ids,cache,"window",null)},
-      {from:4,to:8,operation:(ids,cache)=>this.#lazy(mma,ids,cache,"window",null)},
+      {from:4,to:4,operation:(ids,cache)=>this.#lazy(mma,ids,cache,"window",null)},
+      {from:5,to:8,operation:(ids,cache)=>this.#lazy(mmaFive,ids,cache,"window",null)},
       {from:9,to:256,operation:(ids,cache)=>this.#lazy(wide,ids,cache,"window",null)},
       {from:257,to:Infinity,operation:(ids,cache)=>this.#lazy(expanded,ids,cache,"window",null)},
     ];
@@ -1023,13 +1168,13 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
     },head);
     const promptSmall:RowsForward=(ids,cache,capture)=>this.#bounded(prompt512,ids,cache,"window",capture);
     const promptLarge:RowsForward=(ids,cache,capture)=>this.#bounded(promptDense,ids,cache,"window",capture);
-    const gpuTail:readonly MlxPromptRange[]=[{from:1,to:1,operation:V1},{from:2,to:3,operation:V23},{from:4,to:8,operation:V48},{from:9,to:256,operation:VW},{from:257,to:512,operation:promptSmall},{from:513,to:Infinity,operation:promptLarge}];
+    const gpuTail:readonly MlxPromptRange[]=[{from:1,to:1,operation:V1},{from:2,to:3,operation:V23},{from:4,to:4,operation:V4},{from:5,to:8,operation:V58},{from:9,to:256,operation:VW},{from:257,to:512,operation:promptSmall},{from:513,to:Infinity,operation:promptLarge}];
     this.multiSequencePrompt=gpuTail;
-    this.multiSequencePromptChunk=[{from:1,to:256,operation:VW},{from:257,to:512,operation:promptSmall},{from:513,to:Infinity,operation:promptLarge}];
-    this.prompt=[{from:1,to:1,operation:V1,unit:"gpu"},{from:2,to:3,operation:V23,unit:"gpu"},{from:4,to:8,operation:V48,unit:"gpu"},{from:9,to:223,operation:VW,unit:"gpu"},...aneRanges,{from:2049,to:Infinity,operation:promptLarge,unit:"gpu"}];
-    this.promptChunk=[{from:1,to:223,operation:VW,unit:"gpu"},...aneRanges,{from:2049,to:Infinity,operation:promptLarge,unit:"gpu"}];
+    this.multiSequencePromptChunk=[{from:1,to:4,operation:chunkNarrowWindow},{from:5,to:8,operation:chunkFiveWindow},{from:9,to:256,operation:VW},{from:257,to:512,operation:promptSmall},{from:513,to:Infinity,operation:promptLarge}];
+    this.prompt=[{from:1,to:1,operation:V1,unit:"gpu"},{from:2,to:3,operation:V23,unit:"gpu"},{from:4,to:4,operation:V4,unit:"gpu"},{from:5,to:8,operation:V58,unit:"gpu"},{from:9,to:223,operation:VW,unit:"gpu"},...aneRanges,{from:2049,to:Infinity,operation:promptLarge,unit:"gpu"}];
+    this.promptChunk=[{from:1,to:4,operation:chunkNarrowWindow,unit:"gpu"},{from:5,to:8,operation:chunkFiveWindow,unit:"gpu"},{from:9,to:223,operation:VW,unit:"gpu"},...aneRanges,{from:2049,to:Infinity,operation:promptLarge,unit:"gpu"}];
     this.sequence=[{from:1,to:1,operation:(ids,cache)=>V1(ids,cache,null)},{from:2,to:3,operation:(ids,cache)=>V23(ids,cache,null)},
-      {from:4,to:8,operation:(ids,cache)=>V48(ids,cache,null)},{from:9,to:256,operation:(ids,cache)=>VW(ids,cache,null)},
+      {from:4,to:4,operation:(ids,cache)=>V4(ids,cache,null)},{from:5,to:8,operation:(ids,cache)=>V58(ids,cache,null)},{from:9,to:256,operation:(ids,cache)=>VW(ids,cache,null)},
       {from:257,to:512,operation:(ids,cache)=>promptSmall(ids,cache,null)},{from:513,to:Infinity,operation:(ids,cache)=>promptLarge(ids,cache,null)}];
     this.mediaPrefill=[
       {from:1,to:4,operation:(hidden,cache,positions)=>this.#positioned(mediaStock,ops.contiguous(hidden),cache,"window",positions)},
@@ -1056,7 +1201,8 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
     this.embeddingPrompt=[
       {from:1,to:1,operation:(hidden,cache)=>this.#embeddingSubmitted(one,hidden,cache)},
       {from:2,to:3,operation:(hidden,cache)=>this.#embeddingSubmitted(rows,hidden,cache)},
-      {from:4,to:8,operation:(hidden,cache)=>this.#embeddingSubmitted(mma,hidden,cache)},
+      {from:4,to:4,operation:(hidden,cache)=>this.#embeddingSubmitted(mma,hidden,cache)},
+      {from:5,to:8,operation:(hidden,cache)=>this.#embeddingSubmitted(mmaFive,hidden,cache)},
       {from:9,to:32,operation:(hidden,cache)=>this.#embeddingBounded(tiled,hidden,cache)},
       {from:33,to:Infinity,operation:(hidden,cache)=>this.#embeddingBounded(expanded,hidden,cache)},
     ];
@@ -1084,7 +1230,9 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
       {from:1,to:4,totalTo:4,operation:groups=>this.#packed(stock,groups)},
       {from:1,to:4,totalFrom:5,totalTo:8,operation:groups=>this.#packed(mixedUnfused,groups)},
       {from:5,to:8,totalTo:8,operation:groups=>this.#packed(five,groups)},
-      {from:1,to:256,totalFrom:9,operation:groups=>this.#packed(mixedWide,groups)},
+      {from:1,to:4,totalFrom:9,operation:groups=>this.#packed(mixedWideNarrow,groups)},
+      {from:5,to:8,totalFrom:9,operation:groups=>this.#packed(mixedWideFive,groups)},
+      {from:9,to:256,totalFrom:9,operation:groups=>this.#packed(mixedWide,groups)},
       {from:257,to:Infinity,operation:groups=>this.#packed(expanded,groups)},
     ]};
     console.error(`[graph] ${this.graph}`);

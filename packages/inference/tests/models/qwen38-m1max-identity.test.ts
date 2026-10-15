@@ -1,6 +1,9 @@
 import { testGraph, type TestGraph } from "./test-composition";
 import { phaseRowLimit } from "../../src/models/graph";
 import { MlxPhaseDispatch } from "../../src/generation/phase-dispatch";
+import { dispatchMixedGroups } from "../../src/execution/mixed-iteration";
+import { rowOperationFor } from "../../src/models/row-table";
+import type { MlxPhaseGroup } from "../../src/contracts/mlx/graph";
 import { bindMlxAutoregressiveGraph } from "../../src/generation/bindings/autoregressive";
 // Written M1 operations on a small synthetic artifact with all 64 quantization
 // layouts. Expanded GPU windows preserve exact hidden, head, and cache tensors
@@ -30,7 +33,9 @@ import { bindGraphCaches, composeGraphCaches } from "../../src/models/cache-comp
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
 import type { TrellisMlp } from "../../src/models/qwen/blocks";
 
-const HIDDEN = 512, INTER = 256, VOCAB = 256, HEADS = 4, KV_HEADS = 2, HEAD_DIM = 256;
+// Split-K media projections require down input >= output. Keep this compact
+// fixture within that kernel's geometry instead of omitting its 5–8-row path.
+const HIDDEN = 512, INTER = 512, VOCAB = 256, HEADS = 4, KV_HEADS = 2, HEAD_DIM = 256;
 const HK = 4, HV = 16, DK = 64, DV = 64, KERNEL = 4;
 const KEY_DIM = HK * DK, VALUE_DIM = HV * DV, CONV_DIM = 2 * KEY_DIM + VALUE_DIM;
 const PREFIX = "language_model.model";
@@ -271,7 +276,11 @@ describe("the written graph declarations", () => {
         [769,896],[897,1024],[1025,1280],[1281,1536],[1537,1792],[1793,2048],
       ]);
       expect(anePrograms()).toHaveLength(43);
-      expect(current.sequence.map(({from,to})=>[from,to])).toEqual([[1,1],[2,3],[4,8],[9,256],[257,512],[513,Infinity]]);
+      expect(current.sequence.map(({from,to})=>[from,to])).toEqual([[1,1],[2,3],[4,4],[5,8],[9,256],[257,512],[513,Infinity]]);
+      expect(current.decode[4]).not.toBe(current.decode[5]!);
+      expect(current.verify[4]).not.toBe(current.verify[5]!);
+      expect(current.decode[5]).toBe(current.decode[8]!);
+      expect(current.verify[5]).toBe(current.verify[8]!);
       expect(current.decode[9]).toBe(current.decode[256]);
       expect(current.decode[257]).toBe(current.decode[262144]);
       expect(current.verify[9]).toBe(current.verify[256]);
@@ -422,6 +431,131 @@ test("request adapters on gate, up and down overlay the fixed MLP without changi
     disposeAll(mine,theirs);
   }
 },180_000);
+
+test("small-row gate/up adapters keep valid fixed operations and recover inactive outputs and caches", () => {
+  const { current } = graphs("bf16"), dispatch = new MlxPhaseDispatch(current);
+  const targets = ["gate_proj", "up_proj"].map(role => current.loraTargets().get(`${PREFIX}.layers.0.mlp.${role}`)!);
+  for (const [index, projection] of targets.entries()) {
+    projection.adapters = new Map([["small-rows", {
+      a: tensor(noise(projection.inFeatures * 2, 120 + index, 0.05), [projection.inFeatures, 2], Dtype.float32),
+      b: tensor(noise(2 * projection.outFeatures, 123 + index, 0.05), [2, projection.outFeatures], Dtype.float32), rank: 2, scale: 2,
+    }]]);
+    projection.loraState = current.loraState;
+  }
+  const recover = (label: string, run: (cache: Cache[]) => MlxArray, reference = run) => {
+    const base = current.makeCache(), adapted = current.makeCache(), restored = current.makeCache();
+    current.loraState.active = [];
+    const expected = reference(base);
+    let transferred = false;
+    try {
+      const before = Buffer.from(expected.rawBytes());
+      current.loraState.active = ["small-rows"];
+      const active = run(adapted);
+      try {
+        expect(active.toFloat32().every(Number.isFinite), `${label} active finite`).toBe(true);
+        expect(Buffer.from(active.rawBytes()).equals(before), `${label} applies gate/up adapters`).toBe(false);
+      } finally { active.dispose(); }
+      current.loraState.active = [];
+      const recovered = run(restored);
+      transferred = true;
+      outputDiff(`${label} inactive recovery`, recovered, expected,
+        current.logitsFromHidden.bind(current), current.logitsFromHidden.bind(current));
+      stateDiff(`${label} inactive recovery`, restored, base);
+    } finally { if (!transferred) expected.dispose(); current.loraState.active = []; disposeAll(base, adapted, restored); }
+  };
+  try {
+    for (const rows of [2, 3, 4, 5, 6, 8]) {
+      using decodeIds = ids(Array.from({ length: rows }, (_, row) => prompt(1, 120 + row)));
+      using windowIds = ids([prompt(rows, 121)]);
+      const decode = current.decode[rows]!, verify = current.verify[rows]!;
+      recover(`decode ${rows}`, cache => decode(decodeIds, cache, null),
+        rows > 4 ? cache => current.decode[4]!(decodeIds, cache, null) : undefined);
+      recover(`verify ${rows}`, cache => verify(windowIds, cache, null),
+        rows > 4 ? cache => current.verify[4]!(windowIds, cache, null) : undefined);
+      recover(`known ${rows}`, cache => dispatch.known(rows)(windowIds, cache) as MlxArray,
+        rows > 4 ? cache => dispatch.known(4)(windowIds, cache) as MlxArray : undefined);
+      recover(`prompt tail ${rows}`, cache => dispatch.prompt("tail", 1, rows)(windowIds, cache, null) as MlxArray,
+        rows > 4 ? cache => current.verify[4]!(windowIds, cache, null) : undefined);
+      // The unchanged Wide binding is main's inactive chunk operation even
+      // when the actual tensor has fewer than nine positions.
+      recover(`prompt chunk ${rows}`, cache => dispatch.prompt("chunk", 1, rows)(windowIds, cache, null) as MlxArray,
+        cache => current.verify[9]!(windowIds, cache, null));
+      if (rows === 2 || rows === 4 || rows === 6) {
+        using multiIds = ids([prompt(rows / 2, 123), prompt(rows / 2, 124)]);
+        recover(`multi chunk 2x${rows / 2}`, cache => dispatch.prompt("chunk", 2, rows / 2)(multiIds, cache, null) as MlxArray,
+          cache => current.verify[9]!(multiIds, cache, null));
+      }
+      expect(current.decode[rows]).toBe(decode); expect(current.verify[rows]).toBe(verify);
+    }
+    for (const rows of [2, 4, 8]) {
+      using input = ids([prompt(rows, 122)]), embedding = current.embed.encode(input);
+      using positions = ops.fromInt32(Array(3 * rows).fill(0), [3, 1, rows]);
+      recover(`embedding ${rows}`, cache => rowOperationFor(current.embeddingPrompt, rows)(embedding, cache, null, input, null),
+        rows > 4 ? cache => rowOperationFor(current.embeddingPrompt, 4)(embedding, cache, null, input, null) : undefined);
+      recover(`media ${rows}`, cache => rowOperationFor(current.mediaPrompt, rows)(input, cache, positions));
+    }
+  } finally {
+    current.loraState.active = [];
+    for (const target of targets) { target.adapters = null; target.loraState = null; }
+  }
+}, 180_000);
+
+test("mixed adapter overlays follow packed rows independently of the full round's row count", () => {
+  const { current } = graphs("bf16");
+  const targets = ["gate_proj", "up_proj"].map(role => current.loraTargets().get(`${PREFIX}.layers.0.mlp.${role}`)!);
+  for (const [index, projection] of targets.entries()) {
+    projection.adapters = new Map([["mixed-rows", {
+      a: tensor(noise(projection.inFeatures * 2, 130 + index, 0.05), [projection.inFeatures, 2], Dtype.float32),
+      b: tensor(noise(2 * projection.outFeatures, 133 + index, 0.05), [2, projection.outFeatures], Dtype.float32), rank: 2, scale: 2,
+    }]]);
+    projection.loraState = current.loraState;
+  }
+  try {
+    for (const [decodeRows, promptRows, verifyRows] of [[1, 1, 8], [3, 3, 3]] as const) {
+      using decodeIds = ids(Array.from({ length: decodeRows }, (_, row) => prompt(1, 130 + row)));
+      using promptIds = ids([prompt(promptRows, 131)]), verifyIds = ids([prompt(verifyRows, 132)]);
+      const total = decodeRows + promptRows + verifyRows, packed = decodeRows + promptRows;
+      const caches = () => [current.makeCache(), current.makeCache(), current.makeCache()];
+      const base = caches(), adapted = caches(), restored = caches();
+      const groupsOf = (state: Cache[][]): MlxPhaseGroup[] => [
+        { phase: "decode", rows: decodeRows, ids: decodeIds, state: state[0]!, capture: null },
+        { phase: "window", rows: promptRows, ids: promptIds, state: state[1]!, capture: null },
+        { phase: "verify", rows: verifyRows, ids: verifyIds, state: state[2]!, capture: null },
+      ];
+      const run = (state: Cache[][]): MlxArray[] => {
+        return dispatchMixedGroups(groupsOf(state), total, current.mixed, current.mixedSeparate);
+      };
+      current.loraState.active = [];
+      const originalWide = current.mixedSeparate.packed!.find(range => range.from === 9)!.operation;
+      const baseGroups = groupsOf(base);
+      const expected = originalWide(baseGroups.slice(0, 2), total);
+      expected.push(rowOperationFor(current.mixedSeparate.verify, verifyRows)(baseGroups[2]!));
+      const before = expected.map(output => Buffer.from(output.rawBytes()));
+      try {
+        current.loraState.active = ["mixed-rows"];
+        const active = run(adapted);
+        try {
+          expect(active.every(output => output.toFloat32().every(Number.isFinite))).toBe(true);
+          expect(active.some((output, index) => !Buffer.from(output.rawBytes()).equals(before[index]!))).toBe(true);
+        } finally { for (const output of active) output.dispose(); }
+        current.loraState.active = [];
+        const recovery = run(restored);
+        try {
+          for (let index = 0; index < recovery.length; index++)
+            expect(maxDiff(recovery[index]!, expected[index]!, `mixed packed ${packed} total ${total} recovery`)).toBe(0);
+          stateDiff(`mixed packed ${packed} total ${total} inactive recovery`, restored.flat(), base.flat());
+        } finally { for (const output of recovery) output.dispose(); }
+      } finally {
+        current.loraState.active = [];
+        for (const output of expected) output.dispose();
+        disposeAll(...base, ...adapted, ...restored);
+      }
+    }
+  } finally {
+    current.loraState.active = [];
+    for (const target of targets) { target.adapters = null; target.loraState = null; }
+  }
+}, 180_000);
 
 test("packed prompt and decode groups preserve hidden, capture order and independent cache states",()=>{
   const {current,generic}=graphs("bf16");
