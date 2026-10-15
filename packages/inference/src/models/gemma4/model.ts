@@ -21,7 +21,7 @@ import type { MlxCacheLayer, MlxMixedRange, MlxSequenceRange } from "../../contr
 // forward (gradient checkpointing, prefix-shared and segmented training)
 // included: it reads its stateless training caches the same way. The blocks
 // (attention, feed-forward, per-layer inputs, KV sharing, decoder layer) live in
-// blocks.ts, which the generated graphs (generated/*.ts) compose too.
+// blocks.ts, which the written graph files compose too.
 
 import { disposeResources } from "../../runtime/resources";
 import type { MlxArray } from "@mlx-bun/mlx/array";
@@ -284,7 +284,9 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
     const boundary = t.enableMoeBlock ? Math.ceil(64 / t.topKExperts) : Infinity;
     const views = [{from:1,to:boundary-1,layers:this.#servingLayers}, {from:boundary,to:Infinity,layers:this.#sortedLayers}].filter(view=>Number.isFinite(view.from) && view.from<=view.to);
     this.prompt = views.map(view => ({from:view.from,to:view.to,operation:(ids,cache,capture)=>this.#window(ids,cache,capture,view.layers)}));
+    this.promptChunk = this.prompt;
     this.multiSequencePrompt = this.prompt;
+    this.multiSequencePromptChunk = this.multiSequencePrompt;
     const decode: Record<number,MlxCapturingForward> = {}, verify: Record<number,MlxCapturingForward> = {};
     for (let rows=1; rows<=maxPhaseRows; rows++) {
       const layers = rows < boundary ? this.#servingLayers : this.#sortedLayers;
@@ -375,6 +377,8 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
    * prompt with prepared media enters through the `MlxPromptInput` that
    * `bindMediaInput` returns. The GPU is this graph's one unit. */
   readonly prompt: readonly MlxPromptRange[];
+  readonly promptChunk: typeof this.prompt;
+  readonly multiSequencePromptChunk: typeof this.multiSequencePrompt;
   readonly multiSequencePrompt: readonly MlxPromptRange[];
 
   /** A prompt's positions that are not a whole chunk: the window read at every width. */

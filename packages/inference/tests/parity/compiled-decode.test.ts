@@ -1,3 +1,4 @@
+import { rowOperationFor } from "../../src/runtime/row-operations";
 import type { TestGraph } from "../models/test-composition";
 // Real-weight gate migrated from main's compiled-decode suite. Native imports
 // stay inside beforeAll: an ordinary CI run skips without weights or MLX.
@@ -178,7 +179,7 @@ for (const [family, checkpoint] of [
             } else {
               const ids = mlx.ops.reshape(cur, [1, 1]);
               let hidden: MlxArray;
-              try { hidden = graph.decode[1]!(ids, cache, null) as MlxArray; }
+              try { hidden = rowOperationFor(graph.decode, 1)(ids, cache, null) as MlxArray; }
               finally { ids.dispose(); }
               try { logits = graph.logitsFromHidden(hidden); }
               finally { hidden.dispose(); }

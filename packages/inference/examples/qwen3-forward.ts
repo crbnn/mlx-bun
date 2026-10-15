@@ -1,5 +1,5 @@
 import { bindGraphCaches } from "@mlx-bun/inference/models";
-import { phaseRowLimit } from "@mlx-bun/inference/models/graph";
+import { phaseRowLimit, rowOperationFor } from "@mlx-bun/inference/models/graph";
 import { MlxPhaseDispatch } from "@mlx-bun/inference/generation";
 import { loadModelConfig, Weights } from "@mlx-bun/inference/artifacts";
 import { resolveComposition } from "@mlx-bun/inference";
@@ -20,11 +20,11 @@ export async function forwardTokens(directory: string, promptTokens: number[]) {
     try {
       using prompt = ops.fromInt32(promptTokens, [1, promptTokens.length]);
       using promptHidden = await new MlxPhaseDispatch(graph).prompt("tail", 1, (promptTokens.length))(prompt, state, null);
-      using prefill = graph.logits[(promptTokens.length)]!(promptHidden);
+      using prefill = rowOperationFor(graph.logits,promptTokens.length)(promptHidden);
       const token = argmaxLastPosition(prefill);
       using next = ops.fromInt32([token], [1, 1]);
-      using nextHidden = await graph.decode[1]!(next, state, null);
-      using continuation = graph.logits[1]!(nextHidden);
+      using nextHidden = await rowOperationFor(graph.decode,1)(next, state, null);
+      using continuation = rowOperationFor(graph.logits,1)(nextHidden);
       return { token, nextToken: argmaxLastPosition(continuation),
         logits: lastPositionLogits(continuation), offset: state[0]!.offset };
     } finally {

@@ -44,15 +44,15 @@ test("GLM phase declarations stay compact for a billion-position context and pre
   expect(Array.isArray(f.model.appendKnown)).toBe(true);
   expect(f.model.appendKnown).toHaveLength(2);
   for (const table of [f.model.decode, f.model.verify, f.model.logits]) {
-    expect(Object.keys(table)).toHaveLength(0);
-    expect(table[2 * f.context]).toBe(table[1]);
+    expect(Object.keys(table)).toEqual(["default"]);
+    expect(rowOperationFor<Function>(table,2 * f.context)).toBe(table.default!);
     expect(table[0]).toBeUndefined();
   }
-  expect(await f.model.decode[2 * f.context]!(f.ids(2 * f.context, 1), [], null)).toBe(f.output);
+  expect(await rowOperationFor(f.model.decode,2 * f.context)(f.ids(2 * f.context, 1), [], null)).toBe(f.output);
   expect(await rowOperationFor(f.model.appendKnown, 1)(f.ids(1, 1), [])).toBe(f.output);
   expect(await rowOperationFor(f.model.appendKnown, f.context)(f.ids(1, f.context), [])).toBe(f.output);
-  expect(await f.model.verify[2 * f.context]!(f.ids(2, f.context), [], null)).toBe(f.output);
-  expect(f.model.logits[2 * f.context]!(f.output)).toBe(f.output);
+  expect(await rowOperationFor(f.model.verify,2 * f.context)(f.ids(2, f.context), [], null)).toBe(f.output);
+  expect(rowOperationFor(f.model.logits,2 * f.context)(f.output)).toBe(f.output);
   expect(f.reads).toEqual([
     GLM52_PHASE_READS.oneToken, GLM52_PHASE_READS.oneToken,
     GLM52_PHASE_READS.window, GLM52_PHASE_READS.window,
@@ -64,7 +64,7 @@ test("GLM phase declarations stay compact for a billion-position context and pre
 test("GLM's unbounded verify operation restores the expert kernel family when forwarding fails", async () => {
   const f = fixture();
   f.model.forwardEmbeddingsAsync = async () => { throw new Error("forward failed"); };
-  await expect(f.model.verify[2 * f.context]!(f.ids(2, 8), [], null)).rejects.toThrow("forward failed");
+  await expect(rowOperationFor(f.model.verify,2 * f.context)(f.ids(2, 8), [], null)).rejects.toThrow("forward failed");
   expect(f.fixed).toEqual([true, false]);
   expect(f.releases()).toBe(1);
 });

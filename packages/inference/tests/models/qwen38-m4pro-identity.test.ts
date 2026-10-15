@@ -1,3 +1,4 @@
+import { rowOperationFor } from "../../src/models/graph";
 import { testGraph } from "./test-composition";
 import type { TestGraph } from "./test-composition";
 import { phaseRowLimit } from "../../src/models/graph";
@@ -25,8 +26,6 @@ import { LAYERS } from "./qwen38-layout";
 import { AneProgram } from "../../src/kernels/ane/linear";
 import { bindGraphCaches, composeGraphCaches } from "../../src/models/cache-composition";
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
-import { Qwen35WideModel } from "../../src/models/qwen/qwen3_5-wide";
-import { Qwen35WideKnownModel } from "../../src/models/qwen/qwen3_5-wide-known";
 import { unfusedAffineKernels } from "../../src/state/affine-attention";
 import { Bf16FirstKv4Head256Cache, Bf16FirstQuantizedKVCache, Bf16FirstTurboQuantKVCache } from "../../src/state/bf16-first-kv";
 import { KVCache } from "../../src/state/kv";
@@ -266,10 +265,10 @@ describe("composition", () => {
     expect(current.prompt.filter(range => range.unit === "ane").map(({from,to})=>[from,to])).toEqual([[640,1024],[1025,1536],[1537,2048]]);
     expect(LAYERS.filter(layer => layer.downLayout === "k3Interleaved").length).toBe(40);
     expect(LAYERS.filter(layer => layer.kind === "deltanet").length).toBe(48);
-    expect(current.verify[65]).toBe(current.verify[4104]);
-    expect(current.logits[65]).toBe(current.logits[4104]);
-    expect(current.decode[33]).toBe(current.decode[262144]);
-    expect(current.mediaDecode[33]).toBe(current.mediaDecode[262144]);
+    expect(rowOperationFor(current.verify, 65)).toBe(rowOperationFor(current.verify, 4104));
+    expect(rowOperationFor(current.logits, 65)).toBe(rowOperationFor(current.logits, 4104));
+    expect(rowOperationFor(current.decode, 33)).toBe(rowOperationFor(current.decode, 262144));
+    expect(rowOperationFor(current.mediaDecode, 33)).toBe(rowOperationFor(current.mediaDecode, 262144));
   },120_000);
 });
 
@@ -278,20 +277,20 @@ describe("the M4 Pro graph against the generic Qwen 3.5 graph where both run the
     const current = graph(), dispatch = new MlxPhaseDispatch(current);
     for (const [sequences, tokens] of [[2, 1], [3, 1], [2, 2], [2, 3], [4, 2]]) {
       const rows = sequences! * tokens!;
-      expect(dispatch.prompt("tail", sequences!, tokens!)).toBe(current.verify[rows]!);
-      expect(dispatch.prompt("chunk", sequences!, tokens!)).not.toBe(current.verify[rows]!);
+      expect(dispatch.prompt("tail", sequences!, tokens!)).toBe(rowOperationFor(current.verify, rows));
+      expect(dispatch.prompt("chunk", sequences!, tokens!)).not.toBe(rowOperationFor(current.verify, rows));
       const tail = current.makeCache(), window = current.makeCache();
       try {
         using input = ids(Array.from({ length: sequences! }, (_, row) => prompt(tokens!, 81 + row)));
         outputDiff(`cohort tail ${sequences}x${tokens}`, dispatch.prompt("tail", sequences!, tokens!)(input, tail, null) as MlxArray,
-          current.verify[rows]!(input, window, null), current.logits[rows]!, current.logits[rows]!);
+          rowOperationFor(current.verify, rows)(input, window, null), rowOperationFor(current.logits, rows), rowOperationFor(current.logits, rows));
         stateDiff(`cohort tail ${sequences}x${tokens}`, tail, window);
       } finally { disposeAll(tail, window); }
     }
   }, 180_000);
   test("short multi-sequence chunks retain main's unfused generic arithmetic", () => {
     const current = graph(), dispatch = new MlxPhaseDispatch(current), { weights, config } = source();
-    const legacy = testGraph(new Qwen35WideModel(weights, config, 8), composition());
+    const legacy = testGraph(new Qwen35Model(weights, config, 8, "applegpu_g16s"), composition());
     try {
       for (const tokens of [1, 2]) {
         expect(dispatch.prompt("chunk", 1, 2 * tokens)).toBe(dispatch.prompt("chunk", 2, tokens));
@@ -314,16 +313,16 @@ describe("the M4 Pro graph against the generic Qwen 3.5 graph where both run the
       }
     } finally { legacy.dispose(); }
   }, 180_000);
-  test("generic committed graph retains main's committed projections and whole-span geometry", () => {
+  test("generic constructor leaves unqualified geometry on whole-span window operations", () => {
     for (const [kind, { weights, config }] of [["trellis", source()], ["affine", artifact("affine")]] as const) {
       const facts = composition();
-      const current = testGraph(new Qwen35WideKnownModel(weights, config, 64), facts);
-      const legacy = testGraph(new Qwen35WideModel(weights, config, 64), facts);
-      const committed = (input: MlxArray, cache: Cache[], rows: number): MlxArray => {
+      const current = testGraph(new Qwen35Model(weights, config, 64, "applegpu_g16s"), facts);
+      const legacy = testGraph(new Qwen35Model(weights, config, 64, "applegpu_g16s"), facts);
+      const window = (input: MlxArray, cache: Cache[], rows: number): MlxArray => {
         let hidden = legacy.embed.encode(input);
         try {
           for (const [index, layer] of legacy.layers.entries()) {
-            const next = layer.forward(hidden, cache[index]!, "committed", null, rows);
+            const next = layer.forward(hidden, cache[index]!, "window", null, rows);
             hidden.dispose(); hidden = next;
           }
           return legacy.finalNorm.forward(hidden);
@@ -334,13 +333,12 @@ describe("the M4 Pro graph against the generic Qwen 3.5 graph where both run the
           const mine = current.makeCache(), theirs = legacy.makeCache();
           try {
             using input = ids([prompt(rows, 83)]);
-            outputDiff(`generic ${kind} committed ${rows}`, new MlxPhaseDispatch(current).known(rows)(input, mine) as MlxArray,
-              committed(input, theirs, rows), current.logitsFromHidden.bind(current), legacy.logitsFromHidden.bind(legacy));
-            stateDiff(`generic ${kind} committed ${rows}`, mine, theirs);
+            outputDiff(`generic ${kind} window ${rows}`, new MlxPhaseDispatch(current).known(rows)(input, mine) as MlxArray,
+              window(input, theirs, rows), current.logitsFromHidden.bind(current), legacy.logitsFromHidden.bind(legacy));
+            stateDiff(`generic ${kind} window ${rows}`, mine, theirs);
           } finally { disposeAll(mine, theirs); }
         }
-        for (const [offset, chunk] of [[0, 4], [1022, 1], [1023, 1], [1024, 4], [8191, 1]])
-          expect(current.knownSpans.maxChunkSize([{ offset } as Cache])).toBe(chunk!);
+        expect(current.knownSpans).toBeUndefined();
         expect(legacy.knownSpans).toBeUndefined();
       } finally { current.dispose(); legacy.dispose(); }
     }
@@ -352,8 +350,8 @@ describe("the M4 Pro graph against the generic Qwen 3.5 graph where both run the
       const mine=current.makeCache(),theirs=generic.makeCache();
       try {
         using input=ids([prompt(513,73)]);
-        outputDiff("verify513",current.verify[513]!(input,mine,null),generic.verify[513]!(input,theirs,null) as MlxArray,
-          current.logits[513]!,generic.logits[513]!);
+        outputDiff("verify513",rowOperationFor(current.verify, 513)(input,mine,null),rowOperationFor(generic.verify, 513)(input,theirs,null) as MlxArray,
+          rowOperationFor(current.logits, 513),rowOperationFor(generic.logits, 513));
         stateDiff("verify513",mine,theirs);
       } finally {disposeAll(mine,theirs);}
       for (const positioned of [false,true]) {
@@ -361,9 +359,9 @@ describe("the M4 Pro graph against the generic Qwen 3.5 graph where both run the
         try {
           using input=ids(Array.from({length:33},(_,row)=>prompt(1,74+row)));
           using positions=ops.fromInt32(Array(3*33).fill(0),[3,33,1]);
-          const actual=positioned?current.mediaDecode[33]!(input,mine,positions):current.decode[33]!(input,mine,null);
-          const expected=positioned?generic.mediaDecode[33]!(input,theirs,positions):generic.decode[33]!(input,theirs,null);
-          outputDiff(positioned?"positioned decode33":"decode33",actual,expected as MlxArray,current.logits[33]!,generic.logits[33]!);
+          const actual=positioned?rowOperationFor(current.mediaDecode, 33)(input,mine,positions):rowOperationFor(current.decode, 33)(input,mine,null);
+          const expected=positioned?rowOperationFor(generic.mediaDecode, 33)(input,theirs,positions):rowOperationFor(generic.decode, 33)(input,theirs,null);
+          outputDiff(positioned?"positioned decode33":"decode33",actual,expected as MlxArray,rowOperationFor(current.logits, 33),rowOperationFor(generic.logits, 33));
           stateDiff(positioned?"positioned decode33":"decode33",mine,theirs);
         } finally {disposeAll(mine,theirs);}
       }
@@ -410,19 +408,19 @@ describe("the M4 Pro graph against the generic Qwen 3.5 graph where both run the
       {
         using input = ids([prompt(CHUNK, 1)]);
         outputDiff(`prefillChunk.gpu ${CHUNK}`, current.multiSequencePrompt.at(-1)!.operation(input, mine, null) as MlxArray,
-          generic.multiSequencePrompt.at(-1)!.operation(input, theirs, null) as MlxArray, current.logits[9]!, generic.logits[9]!);
+          generic.multiSequencePrompt.at(-1)!.operation(input, theirs, null) as MlxArray, rowOperationFor(current.logits, 9), rowOperationFor(generic.logits, 9));
         stateDiff(`prefillChunk.gpu ${CHUNK}`, mine, theirs);
       }
       {
         using input = ids([prompt(CHUNK, 2)]);
         outputDiff("prompt tail expanded", new MlxPhaseDispatch(current).prompt("tail",1,CHUNK)(input,mine,null) as MlxArray,
-          new MlxPhaseDispatch(generic).prompt("tail",1,CHUNK)(input,theirs,null) as MlxArray,current.logits[CHUNK]!,generic.logits[CHUNK]!);
+          new MlxPhaseDispatch(generic).prompt("tail",1,CHUNK)(input,theirs,null) as MlxArray,rowOperationFor(current.logits, CHUNK),rowOperationFor(generic.logits, CHUNK));
         stateDiff("prompt tail expanded",mine,theirs);
       }
       {
         using input=ids([prompt(CHUNK,3)]);
-        outputDiff("verify expanded",current.verify[CHUNK]!(input,mine,null) as MlxArray,
-          generic.verify[CHUNK]!(input,theirs,null) as MlxArray,current.logits[CHUNK]!,generic.logits[CHUNK]!);
+        outputDiff("verify expanded",rowOperationFor(current.verify, CHUNK)(input,mine,null) as MlxArray,
+          rowOperationFor(generic.verify, CHUNK)(input,theirs,null) as MlxArray,rowOperationFor(current.logits, CHUNK),rowOperationFor(generic.logits, CHUNK));
         stateDiff("verify expanded",mine,theirs);
       }
     } finally { disposeAll(mine, theirs); }
@@ -433,16 +431,16 @@ describe("the M4 Pro graph against the generic Qwen 3.5 graph where both run the
     const path=`${PREFIX}.layers.0.linear_attn.in_proj_z`;
     const left=current.loraTargets().get(path)!,right=generic.loraTargets().get(path)!;
     const adapter={a:tensor(noise(HIDDEN*2,99,0.02),[HIDDEN,2],Dtype.float32),b:tensor(noise(2*VALUE_DIM,101,0.02),[2,VALUE_DIM],Dtype.float32),rank:2,scale:0.5};
-    const operation=current.verify[CHUNK];
+    const operation=rowOperationFor(current.verify, CHUNK);
     left.adapters=new Map([["synthetic",adapter]]);left.loraState=current.loraState;
     right.adapters=new Map([["synthetic",adapter]]);right.loraState=generic.loraState;
     current.loraState.active=["synthetic"];generic.loraState.active=["synthetic"];
     const mine=current.makeCache(),theirs=generic.makeCache();
     try {
       using input=ids([prompt(CHUNK,90)]);
-      outputDiff("request adapter expanded",current.verify[CHUNK]!(input,mine,null) as MlxArray,generic.verify[CHUNK]!(input,theirs,null) as MlxArray,current.logits[CHUNK]!,generic.logits[CHUNK]!);
+      outputDiff("request adapter expanded",rowOperationFor(current.verify, CHUNK)(input,mine,null) as MlxArray,rowOperationFor(generic.verify, CHUNK)(input,theirs,null) as MlxArray,rowOperationFor(current.logits, CHUNK),rowOperationFor(generic.logits, CHUNK));
       stateDiff("request adapter expanded",mine,theirs);
-      expect(current.verify[CHUNK]).toBe(operation);
+      expect(rowOperationFor(current.verify, CHUNK)).toBe(operation);
     } finally {
       current.loraState.active=[];generic.loraState.active=[];
       left.adapters=null;left.loraState=null;right.adapters=null;right.loraState=null;

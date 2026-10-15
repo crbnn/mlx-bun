@@ -61,6 +61,7 @@ describe.skipIf(!native)("memory task model on the continuous gateway", () => {
   const reference = (request: MemoryCompletionRequest, adapters: string[]) => engine!.gateway.runExclusive(async () => {
     const context = engine!.context;
     const { MlxPhaseDispatch } = await import("@mlx-bun/inference/generation");
+    const { rowOperationFor } = await import("@mlx-bun/inference/models/graph");
     type Forward = (ids: MlxArray, cache: unknown[], capture: null) => MlxArray;
     type Table<T> = Record<number, T>;
     const model = context.model as unknown as import("@mlx-bun/inference/contracts/mlx").MlxTokenPhases & {
@@ -75,7 +76,7 @@ describe.skipIf(!native)("memory task model on the continuous gateway", () => {
       for (let start = 0; start < prompt.length; start += 2048) {
         const chunk = prompt.slice(start, start + 2048);
         const input = ops.fromInt32(chunk, [1, chunk.length]);
-        const hidden = (chunk.length === 1 ? model.decode[1]! : new MlxPhaseDispatch(model).prompt("tail", 1, chunk.length) )(input, cache, null) as MlxArray;
+        const hidden = (chunk.length === 1 ? rowOperationFor(model.decode,1) : new MlxPhaseDispatch(model).prompt("tail", 1, chunk.length) )(input, cache, null) as MlxArray;
         hidden.dispose();
         input.dispose();
       }
@@ -84,9 +85,9 @@ describe.skipIf(!native)("memory task model on the continuous gateway", () => {
       let last = ids.at(-1)!;
       for (let i = 0; i < request.maxTokens; i++) {
         const input = ops.fromInt32([last], [1, 1]);
-        const hidden = model.decode[1]!(input, cache, null) as MlxArray;
+        const hidden = rowOperationFor(model.decode,1)(input, cache, null) as MlxArray;
         input.dispose();
-        const logits = model.logits[1]!(hidden);
+        const logits = rowOperationFor(model.logits,1)(hidden);
         hidden.dispose();
         const best = ops.argmaxAxis(logits, -1);
         logits.dispose();

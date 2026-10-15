@@ -23,7 +23,6 @@ import { LoraState } from "../../layers/lora";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import type { MlxRowTable, MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxKnownOperations, MlxPromptRange, MlxTokenPhases } from "../../contracts/mlx/graph";
 import { declareGraph } from "../capabilities";
-import { rowTableWithDefault } from "../row-table";
 import { type QuantizedLinear } from "../../layers/quantized-linear";
 import type { CacheCodecProvider } from "../../state/persistence-types";
 import { BF16_KV, type KvStorageScheme } from "../../contracts/portable/composition";
@@ -802,18 +801,26 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
 
     const multiSequencePrompt: MlxCapturingForward = (ids, cache) => this.#forward(ids, cache, GLM52_PHASE_READS.window);
     this.prompt = [{ from: 1, to: Infinity, operation: multiSequencePrompt }];
+    this.promptChunk = this.prompt;
     this.multiSequencePrompt = this.prompt;
+    this.multiSequencePromptChunk = this.multiSequencePrompt;
     this.appendKnown = [
       { from: 1, to: 1, operation: (ids, cache) => this.#forward(ids, cache, GLM52_PHASE_READS.oneToken) },
       { from: 2, to: Infinity, operation: (ids, cache) => this.#forward(ids, cache, GLM52_PHASE_READS.window) },
     ];
-    this.logits = rowTableWithDefault<MlxHeadForward>({}, hidden => this.logitsFromHidden(hidden));
-    this.decode = rowTableWithDefault<MlxCapturingForward>({}, (ids, cache) => this.#forward(ids, cache, GLM52_PHASE_READS.oneToken));
-    this.verify = rowTableWithDefault<MlxCapturingForward>({}, async (ids, cache) => {
+    this.logits = Object.freeze({
+      default: (hidden: MlxArray) => this.logitsFromHidden(hidden),
+    });
+    this.decode = Object.freeze({
+      default: (ids: MlxArray, cache: Cache[]) => this.#forward(ids, cache, GLM52_PHASE_READS.oneToken),
+    });
+    this.verify = Object.freeze({
+      default: async (ids: MlxArray, cache: Cache[]) => {
       const executor = this.expertRuntime?.executor;
       executor?.setFixedKernelFamily(true);
       try { return await this.#forward(ids, cache, GLM52_PHASE_READS.window); }
       finally { executor?.setFixedKernelFamily(false); }
+    },
     });
 
   }
@@ -1001,6 +1008,8 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
 
   // Each phase names its MLA reads (`GLM52_PHASE_READS`): windows reconstruct, one token per sequence absorbs.
   readonly prompt: readonly MlxPromptRange[];
+  readonly promptChunk: typeof this.prompt;
+  readonly multiSequencePromptChunk: typeof this.multiSequencePrompt;
   readonly multiSequencePrompt: readonly MlxPromptRange[];
 
   /** Known tokens: one sequence's tokens are its rows, so the one-row operation is one token. */

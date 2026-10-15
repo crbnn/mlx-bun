@@ -5,7 +5,7 @@ import type { PreparedStateChange } from "../../../contracts/portable/resources"
 import { normalizedArgmax } from "../../../kernels/sampling/normalized-argmax";
 import type { RecurrentMtpModule } from "../../../contracts/mlx/drafter";
 import { type MlxRowTable } from "../../../contracts/mlx/graph";
-import { mapOperations, rowOperationFor, rowTableWithDefault } from "../../../runtime/row-operations";
+import { mapOperations, rowOperationFor } from "../../../runtime/row-operations";
 import { applyStateChanges,cleanupFailure,disposeResources } from "../../../runtime/resources";
 import { toLogprobs } from "../../../sampling/index";
 import { BatchedKVCache } from "../../../state/batched-kv";
@@ -34,10 +34,12 @@ function bindMtpSelection(target: RecurrentMtpTarget, sampling: MtpRowSampling,
     // The target still verifies over the full vocabulary.
     if (!target.vocabularyHead) throw new Error("a listed draft vocabulary needs the target's quantized vocabulary head");
     const head = owned.vocabulary = new DraftVocabularyHead(target.vocabularyHead, selection.ids);
-    return rowTableWithDefault({}, (output, steps) => {
+    return Object.freeze({
+      default: (output: MlxArray, steps: readonly number[]) => {
       using subsetLogits = head.project(output);
       using subsetFlat = ops.reshape(subsetLogits, [steps.length, head.size]);
       return selection.sample(subsetFlat, head, steps);
+    },
     });
   }
   // Greedy drafting: one fused normalized-argmax over [B,V]; no logsumexp
@@ -56,9 +58,11 @@ function bindMtpSelection(target: RecurrentMtpTarget, sampling: MtpRowSampling,
 }
 
 /** Prefill membership drafts nothing, so its rows bind no selection. */
-const prefillOnly: MlxRowTable<MtpSelect> = rowTableWithDefault({}, () => {
+const prefillOnly: MlxRowTable<MtpSelect> = Object.freeze({
+      default: () => {
   throw new Error("Qwen MTP prefill rows do not draft");
-});
+},
+    });
 
 /** The same draft graph and state lifecycle for one or several requests.
  * Admission, target verification, output publication and persistence belong to
@@ -158,7 +162,7 @@ export class QwenMtpRows {
       using embeds = this.target.embed(first);
       const mixed = this.#prefilled.some(value => !value);
       if (mixed) this.#cache.specRoundBegin();
-      this.module.decode[(B)]!(embeds, this.#hidden!, this.#cache).dispose();
+      rowOperationFor(this.module.decode, B)(embeds, this.#hidden!, this.#cache).dispose();
       if (mixed) this.#cache.specRoundRollback(this.#prefilled.map(Number));
     }
     for (let pos = 0; pos + 1 < length; pos += 2048) {
@@ -167,7 +171,7 @@ export class QwenMtpRows {
       using embeds = this.target.embed(ids);
       using hidden = context.slice([0, pos, 0], [B, end, H]);
       // A single position per row appends through the one-position read.
-      (end - pos === 1 ? this.module.decode[(B)]! : this.module.window)(embeds, hidden, this.#cache).dispose();
+      (end - pos === 1 ? rowOperationFor(this.module.decode, B) : this.module.window)(embeds, hidden, this.#cache).dispose();
       ops.evalAll(this.#cache.state());
     }
     using tail = context.slice([0, length - 1, 0], [B, length, H]);
@@ -244,7 +248,7 @@ export class QwenMtpRows {
     if (depth === 0) {
       using ids = ops.fromInt32([...pending], [B, 1]);
       using embeds = this.target.embed(ids);
-      this.module.decode[B]!(embeds, this.#hidden!, this.#cache).dispose();
+      rowOperationFor(this.module.decode, B)(embeds, this.#hidden!, this.#cache).dispose();
       this.#drafts = Array.from({ length: B }, () => []);
       this.#depth = 0;
       this.#hidden!.dispose(); this.#hidden = null;
@@ -267,7 +271,7 @@ export class QwenMtpRows {
       const select = rowOperationFor(this.#select, B);
       for (let position = 0; position < depth; position++) {
         using embeds = this.target.embed(ids!);
-        const output = this.module.decode[B]!(embeds, chained ?? this.#hidden!, this.#cache);
+        const output = rowOperationFor(this.module.decode, B)(embeds, chained ?? this.#hidden!, this.#cache);
         chained?.dispose(); chained = output;
         const token = select(output, steps.map(step => step + position));
         tokens.push(token);
@@ -298,7 +302,7 @@ export class QwenMtpRows {
       using embeds = this.target.embed(ids);
       using hidden = context.slice([0, depth - 1, 0], [B, depth, context.shape[2]!]);
       this.#cache.specRoundBegin();
-      this.module.decode[(B)]!(embeds, hidden, this.#cache).dispose();
+      rowOperationFor(this.module.decode, B)(embeds, hidden, this.#cache).dispose();
       this.#cache.specRoundRollback(extra);
     }
     using positions = ops.fromInt32([...accepted], [B, 1, 1]);

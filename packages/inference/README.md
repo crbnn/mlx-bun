@@ -139,7 +139,7 @@ token. This is not 100-step full-vector parity. The loader's Gemma 4 table
 builds the generated 12B graph only for the `kv_config` composition it serves, so
 for plain KV (the default composition) `createModel` builds `Gemma4Model` too,
 and the test asserts that. Opt in with all of
-`MLX_BUN_TEST_GEMMA4_MODEL`, `MLX_BUN_TEST_GEMMA4_REFERENCE` (the directory
+`MLX_BUN_TEST_GEMMA4_GRAPH_MODEL`, `MLX_BUN_TEST_GEMMA4_REFERENCE` (the directory
 holding `gemma4-parity.json`, the producer's unchanged `parity.json` and the four
 step blobs) and `MLX_BUN_TEST_GEMMA4_REFERENCE_SHA256`. Before native libraries
 load it verifies the manifest hash; the producer provenance (script hash, main
@@ -155,10 +155,10 @@ Apple M1 Max (MLX 0.32.2, mlx-lm 0.31.3), with input pins unchanged. This qualif
 the plain-KV scope above; the written graph's unrolled `kv_config` path and
 performance remain separate checks.
 
-The [written Gemma graph test](tests/parity/gemma4-generated.test.ts) is that
+The [written Gemma graph test](tests/parity/gemma4-written.test.ts) is that
 unrolled-path check, ported from `02d723a:tests/parity/generated-parity.test.ts`
 for each registered fingerprint (12B, e4b, 26B-A4B). With
-`MLX_BUN_TEST_GENERATED_MODEL` naming an artifact that ships `kv_config.json`, it
+`MLX_BUN_TEST_GEMMA4_GRAPH_MODEL` naming an artifact that ships `kv_config.json`, it
 requires the `kv_config` composition (`--kv-quant config`) to select the written
 graph and the default composition `Gemma4Model`; byte-identical vectors against
 `Gemma4Model` over caches converted to `kv_config` before a prompt past the

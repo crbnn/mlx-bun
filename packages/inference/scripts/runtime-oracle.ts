@@ -1,3 +1,4 @@
+import { rowOperationFor } from "../src/runtime/row-operations";
 import { MlxPhaseDispatch } from "../src/generation/phase-dispatch";
 /** Full-grid and live-state parity against an externally generated report.
  * No native imports on the compare/help paths; references never run here. */
@@ -207,15 +208,15 @@ export async function emit(plan: Plan, planBytes: Uint8Array, hashWeights: boole
       const input = ops.fromInt32(ids, [1, ids.length]);
       let hidden: MlxArray | null = null;
       try {
-        hidden = await (ids.length === 1 ? graph.decode[1]!(input, caches, null)
+        hidden = await (ids.length === 1 ? rowOperationFor(graph.decode,1)(input, caches, null)
           : new MlxPhaseDispatch(graph).prompt("tail", 1, (ids.length))(input, caches, null));
-        return graph.logits[(ids.length)]!(hidden);
+        return rowOperationFor(graph.logits,ids.length)(hidden);
       } finally { input.dispose(); hidden?.dispose(); }
     }
     async function forward(ids: number[], caches: Cache[]) {
       const input = ops.fromInt32(ids, [1, ids.length]);
       try {
-        return await (ids.length === 1 ? graph.decode[1]!(input, caches, null)
+        return await (ids.length === 1 ? rowOperationFor(graph.decode,1)(input, caches, null)
           : new MlxPhaseDispatch(graph).prompt("tail", 1, (ids.length))(input, caches, null));
       } finally { input.dispose(); }
     }

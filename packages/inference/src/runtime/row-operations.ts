@@ -1,61 +1,42 @@
-type RowTable<Operation> = Readonly<Record<number, Operation>>;
+type RowTable<Operation> = Readonly<Partial<Record<number, Operation>> & { readonly default?: Operation }>;
 type RowOperations<Operation> = RowTable<Operation> |
   readonly { readonly from: number; readonly to: number; readonly operation: Operation }[];
 
-/** Index the file's declared rows or contiguous ranges; it never chooses a class. */
-export function rowOperationFor<Operation>(operations: readonly {readonly from:number;readonly to:number;readonly operation:Operation}[],rows:number):Operation;
-export function rowOperationFor<Operation>(operations: Readonly<Record<number,Operation>>,rows:number):Operation;
-export function rowOperationFor<Operation>(operations: Readonly<Record<number,Operation>> | readonly {readonly from:number;readonly to:number;readonly operation:Operation}[],rows:number):Operation;
-export function rowOperationFor<Operation>(operations: Readonly<Record<number, Operation>> | readonly {readonly from:number;readonly to:number;readonly operation:Operation}[], rows: number): Operation {
-  const operation = Array.isArray(operations)
-    ? operations.find(range => rows >= range.from && rows <= range.to)?.operation
-    : (operations as Readonly<Record<number,Operation>>)[rows];
-  if (!operation) throw new Error(`no declared operation for ${rows} rows`);
+/** Index authored exact rows, an explicit default, or authored contiguous ranges. */
+export function rowOperationFor<Operation>(operations: readonly {readonly from:number;readonly to:number;readonly operation:Operation}[], rows:number):Operation;
+export function rowOperationFor<Operation>(operations: RowTable<Operation>, rows:number):Operation;
+export function rowOperationFor<Operation>(operations: RowOperations<Operation>, rows:number):Operation;
+export function rowOperationFor<Operation>(operations: RowOperations<Operation>, rows: number): Operation {
+  let operation: Operation | undefined;
+  if (Number.isSafeInteger(rows) && rows > 0) {
+    operation = Array.isArray(operations)
+      ? operations.find(range => rows >= range.from && rows <= range.to)?.operation
+      : (Object.hasOwn(operations, rows) ? (operations as RowTable<Operation>)[rows] : undefined)
+        ?? (Object.hasOwn(operations, "default") ? (operations as RowTable<Operation>).default : undefined);
+  }
+  if (operation === undefined) throw new Error(`no declared operation for ${rows} rows`);
   return operation;
 }
 
-/** Literal exact-row entries plus one fixed operation for every other positive row count. */
-export function rowTableWithDefault<Operation>(entries:RowTable<Operation>,defaultOperation:Operation):RowTable<Operation> {
-  const table=Object.freeze({...entries});
-  return new Proxy(table,{
-    get(target,key) {
-      if (typeof key!=="string") return undefined;
-      const rows=Number(key);
-      if (!Number.isSafeInteger(rows) || rows<1 || String(rows)!==key) return undefined;
-      return target[rows] ?? defaultOperation;
-    },
-  });
+/** Compatibility data helper. Its default is an ordinary inspectable own property. */
+export function rowTableWithDefault<Operation>(entries: RowTable<Operation>, defaultOperation: Operation): RowTable<Operation> {
+  return Object.freeze({ ...entries, default: defaultOperation });
 }
 
-/** Bind the declared operations while retaining a numeric table's positive-row lookups. */
+/** Map only authored entries, ranges and an explicitly present default. */
+export function mapOperations<Input,Output>(operations: readonly {readonly from:number;readonly to:number;readonly operation:Input}[], bind:(operation:Input)=>Output): readonly {readonly from:number;readonly to:number;readonly operation:Output}[];
+export function mapOperations<Input,Output>(operations: RowTable<Input>, bind:(operation:Input)=>Output):RowTable<Output>;
+export function mapOperations<Input,Output>(operations: RowOperations<Input>, bind:(operation:Input)=>Output):RowOperations<Output>;
 export function mapOperations<Input, Output>(operations: RowOperations<Input>,
-  bind: (operation: Input, rows: number) => Output): RowOperations<Output> {
+  bind: (operation: Input) => Output): RowOperations<Output> {
   if (Array.isArray(operations))
-    return operations.map(range => ({ from: range.from, to: range.to, operation: bind(range.operation, range.from) }));
-  const source = operations as RowTable<Input>;
-  const entries: Record<number, Output> = {};
+    return Object.freeze(operations.map(range => Object.freeze({ from: range.from, to: range.to, operation: bind(range.operation) })));
+  const source = operations as RowTable<Input>, entries: Partial<Record<number, Output>> & { default?: Output } = {};
   for (const [key, operation] of Object.entries(source)) {
-    const rows = positiveRow(key);
-    if (rows !== undefined && operation !== undefined) entries[rows] = bind(operation, rows);
+    if (operation === undefined) continue;
+    const rows = Number(key);
+    if (key === "default") entries.default = bind(operation);
+    else if (Number.isSafeInteger(rows) && rows > 0 && String(rows) === key) entries[rows] = bind(operation);
   }
-  const table = Object.freeze(entries), bound = new Map<number, Output>();
-  return new Proxy(table, {
-    get(target, key) {
-      const rows = positiveRow(key);
-      if (rows === undefined) return undefined;
-      if (Object.hasOwn(target, key)) return target[rows];
-      if (bound.has(rows)) return bound.get(rows);
-      const operation = source[rows];
-      if (operation === undefined) return undefined;
-      const result = bind(operation, rows);
-      bound.set(rows, result);
-      return result;
-    },
-  });
-}
-
-function positiveRow(key: string | symbol): number | undefined {
-  if (typeof key !== "string") return undefined;
-  const rows = Number(key);
-  return Number.isSafeInteger(rows) && rows > 0 && String(rows) === key ? rows : undefined;
+  return Object.freeze(entries);
 }

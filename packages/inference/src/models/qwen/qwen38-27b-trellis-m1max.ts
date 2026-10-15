@@ -28,7 +28,7 @@ import { TrellisFusedMLP, TrellisUnfusedMLP, TrellisReducePrompt as Reduce, Trel
 import { GraphForwardScope, BoundedGraphForwardScope, SubmittedGraphForwardScope, QueuedGraphForwardScope } from "../../runtime/graph-forward";
 import { disposeResources } from "../../runtime/resources";
 import { declareGraph } from "../capabilities";
-import { rowTableWithDefault, type ReadPhase } from "../graph";
+import { type ReadPhase } from "../graph";
 import { QwenDeltaLayer as Delta, QwenAttentionLayer as Attention } from "./blocks";
 import { bindQwenMediaInput, qwenDraftTarget, qwenDraftVocabularyMemo, qwenMediaEncoders, qwenResidualBasis } from "./media-input";
 import { DeltaWeights, AttentionWeights, GateDownMLP, AneWeightShares, AneBoundMlp, canonicalQwenWeights, type QwenProjectionTarget } from "./written-layers";
@@ -1093,7 +1093,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
     const D58:RowsForward=(ids,cache,capture)=>this.#submitted(mmaFive,ids,cache,"decode",capture);
     const DW:RowsForward=(ids,cache,capture)=>this.#submitted(wide,ids,cache,"decode",capture);
     const decodeExpanded:RowsForward=(ids,cache,capture)=>this.#lazy(expanded,ids,cache,"decode",capture);
-    this.decode=rowTableWithDefault({
+    this.decode=Object.freeze({
       1:D1,2:D23,3:D23,4:D4,5:D58,6:D58,7:D58,8:D58,9:DW,10:DW,11:DW,12:DW,13:DW,14:DW,15:DW,16:DW,
       17:DW,18:DW,19:DW,20:DW,21:DW,22:DW,23:DW,24:DW,25:DW,26:DW,27:DW,28:DW,29:DW,30:DW,31:DW,32:DW,
       33:DW,34:DW,35:DW,36:DW,37:DW,38:DW,39:DW,40:DW,41:DW,42:DW,43:DW,44:DW,45:DW,46:DW,47:DW,48:DW,
@@ -1110,7 +1110,9 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
       209:DW,210:DW,211:DW,212:DW,213:DW,214:DW,215:DW,216:DW,217:DW,218:DW,219:DW,220:DW,221:DW,222:DW,223:DW,224:DW,
       225:DW,226:DW,227:DW,228:DW,229:DW,230:DW,231:DW,232:DW,233:DW,234:DW,235:DW,236:DW,237:DW,238:DW,239:DW,240:DW,
       241:DW,242:DW,243:DW,244:DW,245:DW,246:DW,247:DW,248:DW,249:DW,250:DW,251:DW,252:DW,253:DW,254:DW,255:DW,256:DW,
-    },decodeExpanded);
+
+      default: decodeExpanded,
+    });
     const V1:RowsForward=(ids,cache,capture)=>this.#submitted(one,ids,cache,"window",capture);
     const V23:RowsForward=(ids,cache,capture)=>this.#submitted(rows,ids,cache,"window",capture);
     const V4:RowsForward=(ids,cache,capture)=>this.#submitted(mma,ids,cache,"window",capture);
@@ -1119,7 +1121,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
     const chunkFiveWindow:RowsForward=(ids,cache,capture)=>this.#submitted(chunkFive,ids,cache,"window",capture);
     const VW:RowsForward=(ids,cache,capture)=>this.#submitted(wide,ids,cache,"window",capture);
     const windowExpanded:RowsForward=(ids,cache,capture)=>this.#lazy(expanded,ids,cache,"window",capture);
-    this.verify=rowTableWithDefault({
+    this.verify=Object.freeze({
       1:V1,2:V23,3:V23,4:V4,5:V58,6:V58,7:V58,8:V58,9:VW,10:VW,11:VW,12:VW,13:VW,14:VW,15:VW,16:VW,
       17:VW,18:VW,19:VW,20:VW,21:VW,22:VW,23:VW,24:VW,25:VW,26:VW,27:VW,28:VW,29:VW,30:VW,31:VW,32:VW,
       33:VW,34:VW,35:VW,36:VW,37:VW,38:VW,39:VW,40:VW,41:VW,42:VW,43:VW,44:VW,45:VW,46:VW,47:VW,48:VW,
@@ -1136,7 +1138,9 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
       209:VW,210:VW,211:VW,212:VW,213:VW,214:VW,215:VW,216:VW,217:VW,218:VW,219:VW,220:VW,221:VW,222:VW,223:VW,224:VW,
       225:VW,226:VW,227:VW,228:VW,229:VW,230:VW,231:VW,232:VW,233:VW,234:VW,235:VW,236:VW,237:VW,238:VW,239:VW,240:VW,
       241:VW,242:VW,243:VW,244:VW,245:VW,246:VW,247:VW,248:VW,249:VW,250:VW,251:VW,252:VW,253:VW,254:VW,255:VW,256:VW,
-    },windowExpanded);
+
+      default: windowExpanded,
+    });
     this.appendKnown=[
       {from:1,to:1,operation:(ids,cache)=>this.#lazy(one,ids,cache,"window",null)},
       {from:2,to:3,operation:(ids,cache)=>this.#lazy(rows,ids,cache,"window",null)},
@@ -1148,7 +1152,7 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
     const rowHead=new AffineRow(this.lmHead),rowsHead=new Affine4(this.lmHead),mmaHead=new AffineMma(this.lmHead);
     const H1:MlxHeadForward=hidden=>rowHead.forward(hidden),H23:MlxHeadForward=hidden=>rowsHead.forward(hidden),HW:MlxHeadForward=hidden=>mmaHead.forward(hidden);
     const head:MlxHeadForward=hidden=>this.#head.forward(hidden);
-    this.logits=rowTableWithDefault({
+    this.logits=Object.freeze({
       1:H1,2:H23,3:H23,4:HW,5:HW,6:HW,7:HW,8:HW,9:HW,10:HW,11:HW,12:HW,13:HW,14:HW,15:HW,16:HW,
       17:HW,18:HW,19:HW,20:HW,21:HW,22:HW,23:HW,24:HW,25:HW,26:HW,27:HW,28:HW,29:HW,30:HW,31:HW,32:HW,
       33:HW,34:HW,35:HW,36:HW,37:HW,38:HW,39:HW,40:HW,41:HW,42:HW,43:HW,44:HW,45:HW,46:HW,47:HW,48:HW,
@@ -1165,7 +1169,9 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
       209:HW,210:HW,211:HW,212:HW,213:HW,214:HW,215:HW,216:HW,217:HW,218:HW,219:HW,220:HW,221:HW,222:HW,223:HW,224:HW,
       225:HW,226:HW,227:HW,228:HW,229:HW,230:HW,231:HW,232:HW,233:HW,234:HW,235:HW,236:HW,237:HW,238:HW,239:HW,240:HW,
       241:HW,242:HW,243:HW,244:HW,245:HW,246:HW,247:HW,248:HW,249:HW,250:HW,251:HW,252:HW,253:HW,254:HW,255:HW,256:HW,
-    },head);
+
+      default: head,
+    });
     const promptSmall:RowsForward=(ids,cache,capture)=>this.#bounded(prompt512,ids,cache,"window",capture);
     const promptLarge:RowsForward=(ids,cache,capture)=>this.#bounded(promptDense,ids,cache,"window",capture);
     const gpuTail:readonly MlxPromptRange[]=[{from:1,to:1,operation:V1},{from:2,to:3,operation:V23},{from:4,to:4,operation:V4},{from:5,to:8,operation:V58},{from:9,to:256,operation:VW},{from:257,to:512,operation:promptSmall},{from:513,to:Infinity,operation:promptLarge}];
@@ -1192,12 +1198,14 @@ export class Qwen38TrellisM1Max implements MlxDeclaredGraph,MlxTokenPhases {
     const mediaDecodeFive:MlxPositionedForward=(ids,cache,positions)=>this.#positioned(mediaFive,this.embed.encode(ids),cache,"decode",positions);
     const mediaDecodeTiled:MlxPositionedForward=(ids,cache,positions)=>this.#positioned(mediaTiled,this.embed.encode(ids),cache,"decode",positions);
     const mediaDecodeExpanded:MlxPositionedForward=(ids,cache,positions)=>this.#positioned(mediaExpanded,this.embed.encode(ids),cache,"decode",positions);
-    this.mediaDecode=rowTableWithDefault({
+    this.mediaDecode=Object.freeze({
       1:mediaDecodeNarrow,2:mediaDecodeNarrow,3:mediaDecodeNarrow,4:mediaDecodeNarrow,5:mediaDecodeFive,6:mediaDecodeFive,7:mediaDecodeFive,8:mediaDecodeFive,
       9:mediaDecodeTiled,10:mediaDecodeTiled,11:mediaDecodeTiled,12:mediaDecodeTiled,13:mediaDecodeTiled,14:mediaDecodeTiled,15:mediaDecodeTiled,16:mediaDecodeTiled,
       17:mediaDecodeTiled,18:mediaDecodeTiled,19:mediaDecodeTiled,20:mediaDecodeTiled,21:mediaDecodeTiled,22:mediaDecodeTiled,23:mediaDecodeTiled,24:mediaDecodeTiled,
       25:mediaDecodeTiled,26:mediaDecodeTiled,27:mediaDecodeTiled,28:mediaDecodeTiled,29:mediaDecodeTiled,30:mediaDecodeTiled,31:mediaDecodeTiled,32:mediaDecodeTiled,
-    },mediaDecodeExpanded);
+
+      default: mediaDecodeExpanded,
+    });
     this.embeddingPrompt=[
       {from:1,to:1,operation:(hidden,cache)=>this.#embeddingSubmitted(one,hidden,cache)},
       {from:2,to:3,operation:(hidden,cache)=>this.#embeddingSubmitted(rows,hidden,cache)},

@@ -1,4 +1,4 @@
-import { rowTable } from "../../src/models/graph";
+import { rowOperationFor, rowTable } from "../../src/models/graph";
 import { MlxPhaseDispatch } from "../../src/generation/phase-dispatch";
 // A test's forwards through a graph's named phases. The test is the scheduler
 // here: it names the phase of each call from the tokens it hands over, as the
@@ -17,33 +17,35 @@ function settled(result: MlxArray | Promise<MlxArray>): MlxArray {
 }
 
 /** `ids` [sequences, tokens] appended to `caches`: one token per sequence through
- *  `decode`, more through `prefillTail`, each at the class of its rows. */
+ *  `decode`, more through the declared prompt tail, indexed by its actual rows. */
 export function phaseHidden(model: Pick<MlxTokenPhases, "decode" | "prompt" | "multiSequencePrompt">, ids: MlxArray, caches: Cache[],
   capture: MlxLayerCapture | null = null): MlxArray {
   const [sequences, tokens] = ids.shape as [number, number];
-  return settled(tokens === 1 ? model.decode[(sequences)]!(ids, caches, capture)
+  return settled(tokens === 1 ? rowOperationFor(model.decode,sequences)(ids, caches, capture)
     : new MlxPhaseDispatch(model as MlxTokenPhases).prompt("tail", sequences, tokens)(ids, caches, capture));
 }
 
 /** Logits [1, L, vocabulary] for `tokens` appended to `caches` (`phaseHidden`, then
- *  the head for every position at the class of those rows). */
+ *  the head for every position at that row count). */
 export function phaseLogits(model: Pick<MlxTokenPhases, "decode" | "prompt" | "multiSequencePrompt" | "logits">,
   tokens: readonly number[] | MlxArray, caches: Cache[]): MlxArray {
   const ids = Array.isArray(tokens) ? ops.fromInt32([...tokens], [1, tokens.length]) : tokens as MlxArray;
   try {
     using hidden = phaseHidden(model, ids, caches);
     const [sequences, length] = ids.shape as [number, number];
-    return model.logits[(sequences * length)]!(hidden);
+    return rowOperationFor(model.logits,sequences * length)(hidden);
   } finally { if (Array.isArray(tokens)) ids.dispose(); }
 }
 
 /** A stand-in graph's phase tables over its one forward and head: a fixture whose forward serves every phase
- *  and every width (the forward takes the capture a phase hands it, which a fixture may ignore). */
+ *  and every declared row (the forward takes the capture a phase hands it, which a fixture may ignore). */
 export function stubPhases(forward: (ids: MlxArray, caches: Cache[], capture: MlxLayerCapture | null) => MlxArray | Promise<MlxArray>,
   head: (hidden: MlxArray) => MlxArray): MlxTokenPhases {
   const every = rowTable;
   const run = (ids: MlxArray, caches: Cache[], capture: MlxLayerCapture | null = null) => forward(ids, caches, capture);
-  return { prompt: [{from:1,to:Infinity,operation:run}], multiSequencePrompt: [{from:1,to:Infinity,operation:run}], decode: every(run), verify: every(run),
+  const prompt = [{from:1,to:Infinity,operation:run}];
+  return { prompt, promptChunk: prompt, multiSequencePrompt: prompt, multiSequencePromptChunk: prompt,
+    decode: every(run), verify: every(run),
     appendKnown: every((ids: MlxArray, caches: Cache[]) => run(ids, caches)), logits: every(head) };
 }
 

@@ -33,12 +33,12 @@ test("DeepSpec context declarations preserve unbounded B×L rows with one immuta
   for (const rows of [1, 16_384, 16_385, 16 * 2048, 262_144]) {
     expect(rowOperationFor(f.model.projectContext, rows)(input)).toBe(f.projected);
     expect(rowOperationFor(f.model.projectContextKVRows, rows)(f.projected, positions)).toBe(f.kv);
-    expect(f.model.projectContext[rows]).toBe(f.model.projectContext[1]);
-    expect(f.model.projectContextKVRows[rows]).toBe(f.model.projectContextKVRows[1]);
+    expect(rowOperationFor(f.model.projectContext, rows)).toBe(f.model.projectContext.default!);
+    expect(rowOperationFor(f.model.projectContextKVRows, rows)).toBe(f.model.projectContextKVRows.default!);
   }
   expect(f.calls).toEqual(Array.from({ length: 5 }, () => [["project", input], ["kv", f.projected, positions]]).flat());
   for (const table of [f.model.projectContext, f.model.projectContextKVRows]) {
-    expect(Object.keys(table)).toEqual([]);
+    expect(Object.keys(table)).toEqual(["default"]);
     expect(Object.isFrozen(table)).toBe(true);
     expect(Reflect.set(table, "16385", () => null)).toBe(false);
     for (const key of ["0", "-1", "1.5", "then", "Infinity", Symbol.iterator])
@@ -78,7 +78,7 @@ for (const kind of ["greedy", "sampled"] as const) {
     const f = selectionFixture(), owned = { vocabulary: null };
     const sampling = { selection: { kind }, sample() { f.calls.push("sample"); return f.ids; } };
     const table = f.select.bindMtpSelection(f.target, sampling, owned);
-    expect(Object.keys(table)).toEqual(["1", "3"]);
+    expect(Object.keys(table)).toEqual(["1", "3", "default"]);
     expect(Object.isFrozen(table)).toBe(true);
     expect(Reflect.set(table, "16385", () => null)).toBe(false);
     for (const [rows, expected] of [[1, "one"], [3, "three"], [65, "default"], [16_385, "default"]] as const) {
@@ -102,12 +102,73 @@ test("listed and prefill-only MTP selection use compact constant positive-row de
   const f = selectionFixture(), owned = { vocabulary: null };
   const table = f.select.bindMtpSelection(f.target, { selection: { kind: "listed", ids: [1, 3, 7],
     sample() { f.calls.push("sample listed"); return f.ids; } } }, owned);
-  expect(Object.keys(table)).toEqual([]);
-  expect(table[16_385]).toBe(table[1]);
+  expect(Object.keys(table)).toEqual(["default"]);
+  expect(rowOperationFor(table,16_385)).toBe(table.default!);
   expect(owned.vocabulary).not.toBeNull();
-  expect(table[16_385]!(f.tensor("output"), { length: 16_385 })).toBe(f.ids);
+  expect(rowOperationFor(table,16_385)(f.tensor("output"), { length: 16_385 })).toBe(f.ids);
   expect(f.calls).toEqual(["bind listed", "listed", "reshape subset", "sample listed", "dispose flat", "dispose subset"]);
-  expect(Object.keys(f.select.prefillOnly)).toEqual([]);
-  expect(f.select.prefillOnly[16_385]).toBe(f.select.prefillOnly[1]);
-  expect(() => f.select.prefillOnly[16_385]!()).toThrow("Qwen MTP prefill rows do not draft");
+  expect(Object.keys(f.select.prefillOnly)).toEqual(["default"]);
+  expect(rowOperationFor(f.select.prefillOnly,16_385)).toBe(f.select.prefillOnly.default!);
+  expect(() => rowOperationFor(f.select.prefillOnly,16_385)()).toThrow("Qwen MTP prefill rows do not draft");
+});
+
+function dflashBindingFixture(missingDefault = false) {
+  const text = source("../../src/models/speculative/dflash2.ts");
+  const declaration = text.slice(text.indexOf("  #bindOperations("), text.indexOf("\n  #contextKV("));
+  const calls: string[] = [];
+  const projection = (name: string) => ({ name, forward(input: unknown) {
+    calls.push(name);
+    return { input, [Symbol.dispose]() { calls.push(`dispose ${name}`); } };
+  } });
+  const one = projection("one"), fallback = projection("default"), checkpoint = projection("checkpoint");
+  const affine = { at: Object.freeze(missingDefault ? {1:one} : {1:one,default:fallback}) };
+  const original = { at: [{from:1,to:Infinity,operation:checkpoint}], defaultProjection: checkpoint };
+  const fc = affine, layers = [{q:affine,k:original,v:affine,o:affine,gate:affine,up:affine,down:affine}];
+  const output = {}, context = [{}];
+  const code = `class Bindings {
+    #fc; #layers; #hiddenNorm={};
+    constructor(fc,layers) {this.#fc=fc;this.#layers=layers;}
+    #rms() {return output;}
+    #contextKV(_input,_position,fixed) {calls.push(fixed[0].q.name+" "+fixed[0].k.name);return context;}
+    #block(_context,_projection,_anchors,_position,_columns,fixed) {calls.push(fixed[0].gate.name);return output;}
+    bind(rows) {this.#bindOperations(rows);}
+    ${declaration}
+  }
+  return new Bindings(fc,layers);`;
+  const model = new Function("rowOperationFor","mapOperations","fc","layers","calls","output","context",
+    transpiler.transformSync(code))(rowOperationFor,mapOperations,fc,layers,calls,output,context) as {
+      bind(rows: MlxRowTable<unknown> | readonly {from:number;to:number;operation:unknown}[]):void;
+      projectContext: MlxRowTable<(input:unknown)=>unknown>;
+      projectContextKVRows: MlxRowTable<(input:unknown,position:unknown)=>unknown>;
+      draft: MlxRowTable<(...args:unknown[])=>unknown>;
+    };
+  return {model,calls,output,context};
+}
+
+test("DFlash binds authored exact and default component forms without inventing a row count",()=>{
+  const f=dflashBindingFixture();
+  f.model.bind({1:true,default:true});
+  expect(Object.keys(f.model.projectContext)).toEqual(["1","default"]);
+  expect(Object.isFrozen(f.model.projectContext)).toBe(true);
+  const input={},position={};
+  for(const rows of [1,65,262144]) {
+    expect(rowOperationFor(f.model.projectContext,rows)(input)).toBe(f.output);
+    expect(rowOperationFor(f.model.projectContextKVRows,rows)(input,position)).toBe(f.context);
+    expect(rowOperationFor(f.model.draft,rows)(null,null,[],position,4)).toBe(f.output);
+  }
+  expect(f.calls).toEqual(["one","dispose one","one checkpoint","one",
+    "default","dispose default","default checkpoint","default",
+    "default","dispose default","default checkpoint","default"]);
+  expect(rowOperationFor(f.model.projectContext,65)).toBe(f.model.projectContext.default!);
+  expect(f.model.projectContext[65]).toBeUndefined();
+});
+
+test("DFlash refuses a missing component default at binding and never adds a default to exact-only declarations",()=>{
+  const incomplete=dflashBindingFixture(true);
+  expect(()=>incomplete.model.bind({1:true,default:true})).toThrow("DFlash2 projection has no declared default operation");
+  const exact=dflashBindingFixture(true);
+  exact.model.bind({1:true});
+  expect(Object.keys(exact.model.projectContext)).toEqual(["1"]);
+  expect(rowOperationFor(exact.model.projectContext,1)({})).toBe(exact.output);
+  expect(()=>rowOperationFor(exact.model.projectContext,65)).toThrow("no declared operation for 65 rows");
 });

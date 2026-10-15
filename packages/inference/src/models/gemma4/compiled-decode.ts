@@ -1,3 +1,4 @@
+import { rowOperationFor } from "../../runtime/row-operations";
 // Compiled decode step (Phase A of `02d723a:docs/archive/investigations/optimization_plan.md`).
 //
 // The single-token decode graph is identical token-to-token except for
@@ -89,7 +90,7 @@ function traceCaches(slots: readonly DecodeSlot[], inputs: readonly MlxArray[], 
 }
 
 function makeTraceFn(model: CompiledGemmaTarget, slots: DecodeSlot[]) {
-  const decode = model.traceDecode ?? model.decode[1]!;
+  const decode = model.traceDecode ?? rowOperationFor(model.decode, 1);
   const head = model.traceLogits ?? model.logitsFromHidden.bind(model);
   return (inputs: MlxArray[]): MlxArray[] => {
     const adapters = traceCaches(slots, inputs, inputs[1]!);

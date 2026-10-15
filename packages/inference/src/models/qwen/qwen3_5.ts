@@ -20,37 +20,31 @@ import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import { qwenAppendChunkSize } from "../../layers/qwen-append";
 import { disposing } from "../../layers/helpers";
-import { composedFullAttentionCache } from "../../state/bf16-first-kv";
-import { AttentionMasks } from "../../state/attention-read";
-import { denseTurboQuantKernels } from "../../state/turboquant-attention";
 import { LoraState } from "../../layers/lora";
 import { QuantizedEmbedding } from "../../layers/quantized-embedding";
-import { QuantizedLinear, QuantizedLinearPlain } from "../../layers/quantized-linear";
+import { QuantizedLinear, QuantizedLinearPlain, QuantizedLinearRows } from "../../layers/quantized-linear";
 import { RMSNorm } from "../../layers/normalization";
 import { type Cache } from "../../contracts/mlx/cache";
 import { qwen35WeightsView } from "./checkpoint";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
-import type { MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxKnownSpans, MlxLayerCapture, MlxMixedForward, MlxPhaseForward, MlxPromptRange, MlxTokenPhases, MlxVerifyForward, MlxRowTable } from "../../contracts/mlx/graph";
+import type { MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxKnownSpans, MlxLayerCapture, MlxPromptRange, MlxTokenPhases, MlxVerifyForward, MlxRowTable } from "../../contracts/mlx/graph";
 import type { TargetView } from "../../contracts/mlx/draft-target";
 import type { MediaEncoders, MlxPromptInput, Vision } from "../../contracts/mlx/media";
 import { declareGraph } from "../capabilities";
-import { DEFAULT_PHASE_ROWS,  rowTable, rowTableFrom, type ReadPhase   } from "../graph";
+import { DEFAULT_PHASE_ROWS, rowTableFrom, type ReadPhase   } from "../graph";
 import { bindQwenMediaInput, qwenDraftTarget, qwenMediaEncoders } from "./media-input";
-import { SSMCache } from "../../state/ssm";
 import { mropeInvFreq } from "../../layers/qwen-mrope";
 import type { MropeForwardState } from "../../contracts/mlx/positions";
 import { Qwen3Layer, QwenAttentionLayer, QwenDeltaLayer, QwenGatedDeltaNet, Qwen3TextAttention, Qwen3MediaAttention, type QwenMlp } from "./blocks";
-import { Dtype } from "@mlx-bun/mlx/ffi";
+import { Dtype, deviceArchitecture } from "@mlx-bun/mlx/ffi";
 import { fusedGateUpEligible, type TrellisLinear } from "../../layers/trellis-linear";
 import { TrellisFusedMLP, TrellisUnfusedMLP, TrellisReducePrompt, TrellisScatterPrompt, TrellisWidePrompt, TrellisTiledPrompt, TrellisSplitKPrompt, TrellisExpandReducePrompt, TrellisExpandScatterPrompt, type RowProjection } from "../../layers/trellis-prompt";
-import { wideTrellisPrefillEligible, tiledTrellisPrefillEligible, splitKTrellisPrefillEligible } from "../../kernels/trellis/index";
+import { qualifiedRepresentations, wideTrellisPrefillEligible, tiledTrellisPrefillEligible, splitKTrellisPrefillEligible } from "../../kernels/trellis/index";
 
 const PREFIX = "language_model";
 
-// Fixed generic projection forms. The loader may use artifact geometry to bind
-// a compatible layer; forward calls never choose a projection kernel.
-const GENERIC_TRELLIS = { gateUpCodebook: false, mixedExactBits: false,
-  scatter: { bits: false, genericBits: false, floatCodebook: false }, widePrefill: false };
+// The generic graph binds device and artifact choices once at construction.
+// Its forwards call the resulting operations without inspecting the device.
 type FixedLayer = QwenDeltaLayer | QwenAttentionLayer;
 interface FixedRange { readonly from: number; readonly to: number; readonly layers: readonly FixedLayer[]; readonly media: readonly FixedLayer[] }
 function packedProjection(base: TrellisLinear): RowProjection {
@@ -62,6 +56,23 @@ function expandedProjection(base: TrellisLinear): RowProjection {
 function affineMlp(base: Extract<QwenMlp, {kind: "affine"}>): RowProjection {
   return new TrellisUnfusedMLP(new QuantizedLinearPlain(base.gate), new QuantizedLinearPlain(base.up), new QuantizedLinearPlain(base.down));
 }
+/** Main's committed-span qualification, evaluated from loaded projections at construction. */
+export function qwen35KnownSpansEligible(config: ModelConfig, layers: readonly Qwen3Layer[], device: string): boolean {
+  const t = config.text;
+  if (t.hiddenSize !== 5120 || t.intermediateSize !== 17408 || layers.length !== 64 ||
+      t.headDim !== 256 || t.numAttentionHeads !== 24 || t.numKeyValueHeads !== 4 || device !== "applegpu_g16s")
+    return false;
+  const qualified = (linear: QuantizedLinear) => linear.spec.mode === "affine" &&
+    [2, 3, 4, 6, 8].includes(linear.spec.bits) && [32, 64, 128].includes(linear.spec.groupSize);
+  return layers.every(layer => {
+    const a = layer.linearAttn, s = layer.selfAttn;
+    const attention = a ? [a.inProjQkv, a.inProjZ, a.inProjB, a.inProjA, a.outProj]
+      : [s!.qProj, s!.kProj, s!.vProj, s!.oProj];
+    const mlp = layer.mlp.kind === "affine" ? [layer.mlp.gate, layer.mlp.up, layer.mlp.down] : [];
+    return attention.every(qualified) && mlp.every(qualified);
+  });
+}
+
 export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
   readonly weightsBytes: number;
@@ -91,7 +102,8 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly #adapterOperations: TrellisFusedMLP[] = [];
   readonly #head: (hidden: MlxArray) => MlxArray;
 
-  constructor(weights: Weights, config: ModelConfig, maxPhaseRows = DEFAULT_PHASE_ROWS) {
+  constructor(weights: Weights, config: ModelConfig, maxPhaseRows = DEFAULT_PHASE_ROWS, device = deviceArchitecture()) {
+    const representations = qualifiedRepresentations(device);
     // Checkpoint-generation normalization BEFORE the first tensor() call: the
     // 5.8-family export names the trunk `model.language_model.*` with a
     // top-level `lm_head`, ships `mtp.*` in-repo, and stores RMSNorm gains as
@@ -107,7 +119,7 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
     this.embed = QuantizedEmbedding.load(weights, `${PREFIX}.model.embed_tokens`, config);
     this.layers = Array.from(
       { length: config.text.numHiddenLayers },
-      (_, i) => new Qwen3Layer(weights, config, i, GENERIC_TRELLIS),
+      (_, i) => new Qwen3Layer(weights, config, i, representations),
     );
     this.finalNorm = new RMSNorm(weights.tensor(`${PREFIX}.model.norm.weight`), config.text.rmsNormEps);
     // Tied models (e.g. Qwen3.5-4B) ship no lm_head; the reference uses
@@ -126,9 +138,10 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
       return new TrellisUnfusedMLP(packedProjection(base.gate), packedProjection(base.up), down);
     };
     const windowGate = (base: TrellisLinear): RowProjection =>
-      tiledTrellisPrefillEligible(base.geometry, 5, Dtype.bfloat16, false) ? new TrellisTiledPrompt(base) : expandedProjection(base);
+      wideTrellisPrefillEligible(base.geometry, 5, Dtype.bfloat16, representations.widePrefill) ? new TrellisWidePrompt(base)
+        : tiledTrellisPrefillEligible(base.geometry, 5, Dtype.bfloat16, representations.widePrefill) ? new TrellisTiledPrompt(base) : expandedProjection(base);
     const tiledGate = (base: TrellisLinear): RowProjection =>
-      tiledTrellisPrefillEligible(base.geometry, 16, Dtype.bfloat16, false) ? new TrellisTiledPrompt(base) : expandedProjection(base);
+      tiledTrellisPrefillEligible(base.geometry, 16, Dtype.bfloat16, representations.widePrefill) ? new TrellisTiledPrompt(base) : expandedProjection(base);
     const splitDown = (base: TrellisLinear): RowProjection =>
       splitKTrellisPrefillEligible(base.geometry, 5, Dtype.bfloat16) ? new TrellisSplitKPrompt(base) : expandedProjection(base);
     const five = (base: QwenMlp) => base.kind === "affine" ? affineMlp(base)
@@ -147,20 +160,30 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
     const unfusedNarrow=bind(1,4,base=>base.kind==="affine" ? affineMlp(base)
       : new TrellisUnfusedMLP(packedProjection(base.gate),packedProjection(base.up),packedProjection(base.down)));
     this.#ranges = [bind(1, 4, narrow), bind(5, 8, five), bind(9, 15, nine), bind(16, 32, sixteen), bind(33, Infinity, expanded)];
-    this.knownSpans = undefined;
+    this.knownSpans = qwen35KnownSpansEligible(config, this.layers, device)
+      ? Object.freeze({ maxChunkSize: (state: readonly Cache[]) => qwenAppendChunkSize(state[0]!.offset) }) : undefined;
     const forward = (range: FixedRange, phase: ReadPhase, bounded: boolean): MlxCapturingForward => (ids, state, capture) =>
       this.#captured(this.forwardLayers(this.embed.encode(ids), state, phase, undefined, capture, range.layers, bounded), capture);
     const exact = <Op>(build: (range: FixedRange) => Op): MlxRowTable<Op> => {
       const ranges = this.#ranges.map(range => ({ ...range, operation: build(range) }));
-      return rowTableFrom(rows => ranges.find(range => rows >= range.from && rows <= range.to)!.operation, maxPhaseRows);
+      const defaultOperation = ranges.at(-1)!.operation;
+      // Admission caps do not remove the component's distinct 1–32 row forms.
+      return Object.freeze({ ...rowTableFrom(rows => ranges.find(range => rows >= range.from && rows <= range.to)!.operation, Math.max(32, maxPhaseRows)),
+        default: defaultOperation });
     };
     this.decode = exact(range => forward(range, "decode", false));
     this.verify = exact(range => forward(range, "window", false));
-    this.appendKnown = this.#ranges.map(range => ({ from: range.from, to: range.to, operation: (ids, state) =>
-      this.forwardLayers(this.embed.encode(ids), state, "window", undefined, null, range.layers, false) }));
+    this.appendKnown = this.knownSpans ? this.#committedKnownOperations(weights, config)
+      : this.#ranges.map(range => ({ from: range.from, to: range.to, operation: (ids, state) =>
+        this.forwardLayers(this.embed.encode(ids), state, "window", undefined, null, range.layers, false) }));
     this.prompt = this.#ranges.map(range => ({ from: range.from, to: range.to, operation: forward(range, "window", range.from > 4) }));
     this.multiSequencePrompt = this.prompt;
-    this.logits = rowTable(hidden => this.logitsFromHidden(hidden), maxPhaseRows);
+    // Main's whole chunks use independent projections even at 1–4 actual
+    // rows and materialize each layer and its recurrent state.
+    this.promptChunk = [unfusedNarrow, ...this.#ranges.slice(1)].map(range => ({
+      from: range.from, to: range.to, operation: forward(range, "window", true) }));
+    this.multiSequencePromptChunk = this.promptChunk;
+    this.logits = Object.freeze({ default: (hidden: MlxArray) => this.logitsFromHidden(hidden) });
     this.sequence = this.#ranges.map(range => ({ from: range.from, to: range.to,
       operation: (ids, cache) => this.forwardLayers(this.embed.encode(ids), cache, "window", undefined, null, range.layers, range.from > 4) }));
     this.mediaPrefill = this.#ranges.map(range => ({ from: range.from, to: range.to,
@@ -175,7 +198,7 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
     const packedWithVerification: import("../../contracts/mlx/graph").MlxMixedRange[] = this.#ranges.map(range => ({ from: range.from, to: range.to,
       totalTo: range.from === 1 ? 4 : undefined,
       operation: (groups: readonly import("../../contracts/mlx/graph").MlxPhaseGroup[]) => this.#mixedForward(groups, range.layers) }));
-    packedWithVerification.push({ from: 1, to: 4, totalTo: undefined, totalFrom: 5,
+    packedWithVerification.push({ from: 1, to: 4, totalFrom: 5,
       operation: groups => this.#mixedForward(groups, unfusedNarrow.layers) });
     const separated = (phase: ReadPhase) => this.#ranges.map(range => ({ from: range.from, to: range.to,
       operation: (group: import("../../contracts/mlx/graph").MlxPhaseGroup) => this.#captured(this.forwardLayers(this.embed.encode(group.ids), group.state, phase,
@@ -199,6 +222,33 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
     const mixer = media ? new Qwen3MediaAttention(weights, config, `${prefix}.self_attn`, projections)
       : new Qwen3TextAttention(weights, config, `${prefix}.self_attn`, projections);
     return new QwenAttentionLayer(weights, config, prefix, mixer, mlp);
+  }
+
+  /** The committed graph binds independent affine rows before any forward.
+   * Trellis projections retain the same fixed prompt ranges as this graph. */
+  #committedKnownOperations(weights: Weights, config: ModelConfig): import("../../contracts/mlx/graph").MlxKnownOperations {
+    const affine = (base: Extract<QwenMlp, {kind:"affine"}>): RowProjection => new TrellisUnfusedMLP(
+      new QuantizedLinearRows(base.gate), new QuantizedLinearRows(base.up), new QuantizedLinearRows(base.down));
+    return this.#ranges.map(range => {
+      const layers = this.layers.map((base, index): FixedLayer => {
+        const prefix = `${PREFIX}.model.layers.${index}`;
+        const mlp = base.mlp.kind === "affine" ? affine(base.mlp) : range.layers[index]!.mlp;
+        if (base.linearAttn) {
+          const b = base.linearAttn;
+          return new QwenDeltaLayer(weights, config, prefix, new QwenGatedDeltaNet(weights, config, `${prefix}.linear_attn`, {
+            inProjQkv: new QuantizedLinearRows(b.inProjQkv), inProjZ: new QuantizedLinearRows(b.inProjZ),
+            inProjB: new QuantizedLinearRows(b.inProjB), inProjA: new QuantizedLinearRows(b.inProjA), outProj: new QuantizedLinearRows(b.outProj),
+          }), mlp);
+        }
+        const b = base.selfAttn!;
+        return new QwenAttentionLayer(weights, config, prefix, new Qwen3TextAttention(weights, config, `${prefix}.self_attn`, {
+          qProj: new QuantizedLinearRows(b.qProj), kProj: new QuantizedLinearRows(b.kProj),
+          vProj: new QuantizedLinearRows(b.vProj), oProj: new QuantizedLinearRows(b.oProj),
+        }), mlp);
+      });
+      return { from: range.from, to: range.to, operation: (ids, state) =>
+        this.forwardLayers(this.embed.encode(ids), state, "committed", undefined, null, layers, false) };
+    });
   }
 
   loraTargets(): Map<string, QuantizedLinear | TrellisLinear> {
@@ -249,6 +299,8 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
    * GPU is this graph's one unit. */
   readonly prompt: readonly MlxPromptRange[];
   readonly multiSequencePrompt: readonly MlxPromptRange[];
+  readonly promptChunk: readonly MlxPromptRange[];
+  readonly multiSequencePromptChunk: readonly MlxPromptRange[];
 
   /** One new token per sequence: `ids` [sequences, 1], so rows are sequences. */
   readonly decode: MlxRowTable<MlxCapturingForward>;
@@ -260,7 +312,7 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
    * caller's speculative transaction, begun before this call. */
   readonly verify: MlxRowTable<MlxVerifyForward>;
 
-  /** This generic graph does not declare specialized known-span cache behavior. */
+  /** Main's qualified committed spans, bound once when the generic graph loads. */
   readonly knownSpans: MlxKnownSpans | undefined;
   /** Known tokens: the committed read under `knownSpans`, the window read otherwise. */
   readonly appendKnown: import("../../contracts/mlx/graph").MlxKnownOperations;
@@ -320,8 +372,8 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly embeddingPrompt: readonly import("../../contracts/mlx/media").MlxEmbeddingsRange[];
 
   /** The decoder over `h0` (consumed), every block reading its cache for
-   *  `phase` and every MLP on the kernels of `width`, the class of `h0`'s rows
-   *  the calling operation names. `bounded` evaluates each layer's output and
+   *  `phase`, on the fixed layer view the calling operation names.
+   *  `bounded` evaluates each layer's output and
    *  recurrent state before the next. `capture` receives each layer's residual
    *  output after the layer runs; the caller hands it the final hidden. */
   protected forwardLayers(h0: MlxArray, cache: Cache[], phase: ReadPhase,

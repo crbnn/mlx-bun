@@ -5,10 +5,10 @@ import * as ops from "@mlx-bun/mlx/ops";
 import { parseQuantization, type ModelConfig } from "../../../src/artifacts/config";
 import type { Weights } from "../../../src/artifacts/weights";
 import { UniversalDenseModel } from "../../../src/models/universal/dense";
-import { UniversalDenseWideModel } from "../../../src/models/universal/dense-wide";
 import { TrellisLinear } from "../../../src/layers/trellis-linear";
 import { sequenceHiddenOperation, sequenceLogitsOperation } from "../../../src/scoring/full-sequence";
 import { composeGraphCaches } from "../../../src/models/cache-composition";
+import { rowOperationFor } from "../../../src/models/graph";
 
 function fixture(attentionType: Dtype) {
   const width=512, tensors=new Map<string,MlxArray>(), owned:MlxArray[]=[];
@@ -41,19 +41,19 @@ function fixture(attentionType: Dtype) {
   return {config,weights,dispose(){for(const array of owned)array.dispose();}};
 }
 
-for(const Model of [UniversalDenseModel,UniversalDenseWideModel]) for(const attentionType of [Dtype.bfloat16,Dtype.float32]) {
-  test(`${Model.name} fixes Trellis projections and unbounded heads after ${attentionType===Dtype.float32?"promoted":"bf16"} attention`,()=>{
-    const source=fixture(attentionType), model=new Model(source.weights,source.config,undefined,8);
+for(const device of ["applegpu_g13s","applegpu_g16s","unknown-gpu"]) for(const attentionType of [Dtype.bfloat16,Dtype.float32]) for(const cap of [1,8]) {
+  test(`${device} generic cap${cap} fixes numeric phases and unbounded heads after ${attentionType===Dtype.float32?"promoted":"bf16"} attention`,()=>{
+    const source=fixture(attentionType), model=new UniversalDenseModel(source.weights,source.config,undefined,cap,device);
     const cache=()=>composeGraphCaches(model,{kv:{kind:"bf16"},pagedKv:null});
     try {
       expect([...model.loraTargets().keys()].sort()).toEqual(["model.layers.0.mlp.down_proj","model.layers.0.mlp.gate_proj","model.layers.0.mlp.up_proj"]);
       expect(model.logitsFromHidden).toBeUndefined();
-      for(const rows of [1,4,5,8,9,16,32,33,129]) {
-        using ids=ops.fromInt32(Array.from({length:rows},(_,i)=>(i*19+7)%512),[1,rows]);
+      for(const rows of [1,2,3,4,5,8,9,16,32,33,129]) for(const phase of ["sequence","decode","verify"] as const) {
+        using ids=ops.fromInt32(Array.from({length:rows},(_,i)=>(i*19+7)%512),phase==="decode"?[rows,1]:[1,rows]);
         const oldCache=cache(),fixedCache=cache();
         try {
           let hidden=model.embed.encode(ids);
-          for(const [index,layer] of model.layers.entries()){const next=layer.forward(hidden,oldCache[index]!,"window");hidden.dispose();hidden=next;}
+          for(const [index,layer] of model.layers.entries()){const next=layer.forward(hidden,oldCache[index]!,phase==="decode"?"decode":"window");hidden.dispose();hidden=next;}
           using oldHidden=hidden, expected=model.finalNorm.forward(oldHidden), oldLogits=model.lmHead!.forward(expected);
           // Owning carriers remain available to tools; serving must use their fixed borrowed ports.
           const carriers=[model.layers[0]!.mlp.gate!,model.layers[0]!.mlp.up!,model.layers[0]!.mlp.down,model.lmHead!]
@@ -61,13 +61,26 @@ for(const Model of [UniversalDenseModel,UniversalDenseWideModel]) for(const atte
           const forwards=carriers.map(carrier=>carrier.forward);
           try {
             for(const carrier of carriers)carrier.forward=()=>{throw new Error("dynamic projection called");};
-            using actual=sequenceHiddenOperation(model,ids,fixedCache), actualLogits=sequenceLogitsOperation(model,actual);
+            using actual=phase==="sequence"?sequenceHiddenOperation(model,ids,fixedCache):rowOperationFor(model[phase],rows)(ids,fixedCache,null) as MlxArray;
+            using actualLogits=phase==="sequence"?sequenceLogitsOperation(model,actual):rowOperationFor(model.logits,rows)(actual);
             expect(actual.dtype).toBe(expected.dtype);
             expect(Buffer.from(actual.rawBytesView())).toEqual(Buffer.from(expected.rawBytesView()));
             expect(Buffer.from(actualLogits.rawBytesView())).toEqual(Buffer.from(oldLogits.rawBytesView()));
+            for(const [index,expectedCache] of oldCache.entries()) {
+              const expectedState=expectedCache.state(), actualState=fixedCache[index]!.state();
+              try {
+                expect(fixedCache[index]!.offset).toBe(expectedCache.offset);
+                expect(actualState.length).toBe(expectedState.length);
+                for(const [slot,value] of expectedState.entries())
+                  expect(Buffer.from(actualState[slot]!.rawBytesView())).toEqual(Buffer.from(value.rawBytesView()));
+              } finally {
+                if(expectedCache.stateNeedsDispose) for(const value of expectedState)value.dispose();
+                if(fixedCache[index]!.stateNeedsDispose) for(const value of actualState)value.dispose();
+              }
+            }
           } finally {carriers.forEach((carrier,index)=>{carrier.forward=forwards[index]!;});}
         } finally {for(const state of [...oldCache,...fixedCache])state.dispose();}
       }
     } finally {model.dispose();source.dispose();}
-  });
+  },120_000);
 }

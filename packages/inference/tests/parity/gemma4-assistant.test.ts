@@ -136,7 +136,7 @@ test.skipIf(!inputs)("Gemma4 assistant: donor attention and draft chains equal i
       return f.astype(dtype);
     };
     /** One deterministic draft chain. Partial output is released if a step throws. */
-    const chain = (shared: Parameters<GemmaAssistantDrafter["forwardRows"][1]>[2], anchor: MlxArray, pending: number, position: number) => {
+    const chain = (shared: Parameters<NonNullable<GemmaAssistantDrafter["forwardRows"][1]>>[2], anchor: MlxArray, pending: number, position: number) => {
       const steps: { token: number; hidden: MlxArray }[] = [];
       let token = pending, hidden = anchor;
       try {

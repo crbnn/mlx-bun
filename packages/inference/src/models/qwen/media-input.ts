@@ -1,3 +1,4 @@
+import { rowOperationFor } from "../../runtime/row-operations";
 import type { ModelConfig } from "../../artifacts/config";
 import { TURBOQUANT_FOLD_FILE, readTurboQuantFold } from "../../artifacts/turboquant-fold";
 import type { QuantizedEmbedding } from "../../layers/quantized-embedding";
@@ -55,7 +56,7 @@ class QwenMediaDecodeState implements MlxDecodeState {
     using positions = ops.add(startRows, indices);
     using axis = ops.reshape(positions, [1, B, L]);
     using grid = ops.concatAxis([axis, axis, axis], 0);
-    return this.model.mediaDecode ? this.model.mediaDecode[width]!(ids, caches, grid)
+    return this.model.mediaDecode ? rowOperationFor(this.model.mediaDecode, width)(ids, caches, grid)
       : this.model.decodeAtPositions!(ids, caches, grid, width);
   }
 }
@@ -68,7 +69,7 @@ export function bindQwenMediaInput(model: QwenMediaGraph, embeddings: MlxArray,
     if (start === 0) return model.mediaPrefill
       ? model.mediaPrefill.find(range => width >= range.from && width <= range.to)!.operation(embeddings, caches, positions)
       : model.prefillEmbeddingsAtPositions!(embeddings, caches, positions, width);
-    if (phase === "decode") return model.mediaDecode ? model.mediaDecode[width]!(ids, caches, positions)
+    if (phase === "decode") return model.mediaDecode ? rowOperationFor(model.mediaDecode, width)(ids, caches, positions)
       : model.decodeAtPositions!(ids, caches, positions, width);
     return model.mediaPrompt
       ? model.mediaPrompt.find(range => width >= range.from && width <= range.to)!.operation(ids, caches, positions)

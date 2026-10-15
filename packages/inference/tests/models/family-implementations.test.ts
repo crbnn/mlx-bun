@@ -6,7 +6,7 @@ import { loadModelConfig } from "../../src/artifacts/config";
 import { resolveComposition } from "../../src/models/composition";
 import { MLX_GRAPH_TABLES, MLX_MODEL_IMPLEMENTATIONS } from "../../src/models/factory";
 import { MODEL_FAMILIES } from "../../src/models/families";
-import { GENERATED_GRAPHS } from "../../src/models/gemma4/graphs";
+import { GEMMA_GRAPHS } from "../../src/models/gemma4/graphs";
 import { Gemma4Model } from "../../src/models/gemma4/model";
 import { implementationIdFor } from "../../src/models/implementation";
 import { resolveModelProfile } from "../../src/models/profile";
@@ -61,8 +61,9 @@ describe("family implementations", () => {
   });
 
   test("written Gemma graphs retain the family profile and expose direct constructors", async () => {
-    for (const entry of GENERATED_GRAPHS) {
+    for (const entry of GEMMA_GRAPHS) {
       const module = await import(`../../src/models/gemma4/${entry.id}`);
+      const Graph = module.Gemma4E4b ?? module.Gemma4TwelveB ?? module.Gemma4Moe;
       const raw = { model_type: "gemma4", ...text, num_hidden_layers: module.LAYERS.length,
         layer_types: module.LAYERS.map((layer: { attention: string }) => layer.attention === "sliding" ? "sliding_attention" : "full_attention"), sliding_window: 16 };
       const { config, resolved: profile } = await resolved(entry.id, raw);
@@ -75,8 +76,8 @@ describe("family implementations", () => {
       expect(table.explicit(entry.id).serves).toBe(entry.serves);
       expect(table.select(config, resolveComposition(config))).toBe(table.generic);
       expect(Object.getOwnPropertyDescriptor(Gemma4Model.prototype, "trainable")?.get).toBeDefined();
-      expect("trainable" in module.GeneratedGemma4.prototype).toBe(false);
-      expect(module.GeneratedGemma4.length).toBe(2);
+      expect("trainable" in Graph.prototype).toBe(false);
+      expect(Graph.length).toBe(2);
     }
   });
 });

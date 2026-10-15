@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { originalOraclePython,ORIGINAL_REVISION,ORIGINAL_SCRIPT,externalOutput } from "../../scripts/gemma4-oracle-reference";
 import { observeTargetPhases } from "../../scripts/reference-phases";
-import { rowTableWithDefault } from "../../src/models/row-table";
+import { rowOperationFor, rowTableWithDefault } from "../../src/models/row-table";
 
 const original=Bun.spawnSync(["git","show",`${ORIGINAL_REVISION}:${ORIGINAL_SCRIPT}`]);
 test.skipIf(original.exitCode !== 0)("the available historical Gemma producer retains its pinned calculation",()=>{
@@ -86,10 +86,10 @@ test("producer observers preserve numeric defaults and explicit chunk operations
     multiSequencePromptChunk: [{ from: 1, to: Infinity, unit: "gpu", operation: forward }],
   };
   const view = observeTargetPhases(base, ids => seen.push(ids), out => heads.push(out));
-  expect(view.decode[65]!([1])).toEqual([1]);
-  expect(view.verify[88]!([2])).toEqual([2]);
-  expect(view.logits[65]!()).toBe(output);
-  expect(view.decode[65]).toBe(view.decode[65]);
+  expect(rowOperationFor(view.decode,65)([1])).toEqual([1]);
+  expect(rowOperationFor(view.verify,88)([2])).toEqual([2]);
+  expect(rowOperationFor(view.logits,65)()).toBe(output);
+  expect(rowOperationFor(view.decode,65)).toBe(view.decode.default!);
   view.promptChunk[0]!.operation([3]);
   view.multiSequencePromptChunk[0]!.operation([4]);
   expect(seen).toEqual([[1], [2], [3], [4]]);

@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import type { MlxTokenPhases } from "../../src/contracts/mlx/graph";
 import { MlxPhaseDispatch } from "../../src/generation/phase-dispatch";
-import { rowTableWithDefault } from "../../src/models/row-table";
+import { rowOperationFor, rowTableWithDefault } from "../../src/models/row-table";
 import { observedPhases } from "./phase-observer";
 
 const tensor = (name: string, disposed: string[] = []): MlxArray =>
@@ -31,7 +31,7 @@ test("phase observers retain numeric defaults and return the graph's owned outpu
   expect(dispatch.known(262144)(f.input, [])).toBe(f.hidden);
   expect(dispatch.logits(65)(f.hidden)).toBe(f.logits);
   expect(dispatch.decode(65)).toBe(dispatch.decode(65));
-  expect(Object.keys(view.decode)).toEqual(["1"]);
+  expect(Object.keys(view.decode)).toEqual(["1", "default"]);
   expect(Reflect.get(view.decode, "then")).toBeUndefined();
   expect(seen).toEqual(["decode", "verify", "appendKnown", "head"]);
 });
@@ -60,15 +60,15 @@ test("an observer failure releases only its returned output, including asynchron
   const f = fixture();
   const failure = () => { throw new Error("observer failed"); };
   const sync = observedPhases<MlxTokenPhases>({ ...f.phases, decode: rowTableWithDefault({}, () => hidden) }, { forwarded: failure });
-  expect(() => sync.decode[65]!(input, [], null)).toThrow("observer failed");
+  expect(() => rowOperationFor(sync.decode,65)(input, [], null)).toThrow("observer failed");
   expect(disposed).toEqual(["hidden"]);
   const output = tensor("logits", disposed);
   const head = observedPhases<MlxTokenPhases>({ ...f.phases, logits: rowTableWithDefault({}, () => output) }, { head: failure });
-  expect(() => head.logits[65]!(input)).toThrow("observer failed");
+  expect(() => rowOperationFor(head.logits,65)(input)).toThrow("observer failed");
   expect(disposed).toEqual(["hidden", "logits"]);
   const asynchronous = observedPhases<MlxTokenPhases>({ ...f.phases,
     verify: rowTableWithDefault({}, () => Promise.resolve(tensor("async hidden", disposed))),
   }, { forwarded: failure });
-  await expect(asynchronous.verify[65]!(input, [], null)).rejects.toThrow("observer failed");
+  await expect(rowOperationFor(asynchronous.verify,65)(input, [], null)).rejects.toThrow("observer failed");
   expect(disposed).toEqual(["hidden", "logits", "async hidden"]);
 });

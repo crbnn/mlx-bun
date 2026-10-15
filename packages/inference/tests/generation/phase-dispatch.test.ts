@@ -21,8 +21,9 @@ function graph(ane = true): MlxTokenPhases {
     {from:1025,to:1536,operation:op("ane.1536"),unit:"ane" as const},
     {from:1537,to:2048,operation:op("ane.2048"),unit:"ane" as const},
     {from:2049,to:Infinity,operation:gpu}] : [{from:1,to:Infinity,operation:gpu}];
-  return {prompt, multiSequencePrompt:[{from:1,to:4,operation:op("multi.small")},
-    {from:5,to:Infinity,operation:op("multi.large")}], decode:table("decode"),verify:table("verify"),
+  const multiSequencePrompt: MlxTokenPhases["multiSequencePrompt"] =[{from:1,to:4,operation:op("multi.small")},
+    {from:5,to:Infinity,operation:op("multi.large")}];
+  return {prompt, promptChunk:prompt,multiSequencePrompt,multiSequencePromptChunk:multiSequencePrompt,decode:table("decode"),verify:table("verify"),
     appendKnown:table("known") as unknown as MlxTokenPhases["appendKnown"], logits:Object.fromEntries(Array.from({length:64},(_,i)=>{
       const head = (_hidden:MlxArray):MlxArray => {throw new Error("stand-in");};
       labels.set(head,`logits.${i+1}`);return [i+1,head];
@@ -135,8 +136,8 @@ test("exact-row defaults keep one declared operation for unbounded positive rows
   const one=op("one"),last=op("last"),expanded=op("expanded");
   const table=rowTableWithDefault({1:one,256:last},expanded);
   expect(table[1]).toBe(one);expect(table[256]).toBe(last);
-  expect(table[257]).toBe(expanded);expect(table[1_000_000]).toBe(expanded);
-  expect(Object.keys(table)).toEqual(["1","256"]);
+  expect(rowOperationFor(table,257)).toBe(expanded);expect(rowOperationFor(table,1_000_000)).toBe(expanded);
+  expect(Object.keys(table)).toEqual(["1","256","default"]);
   for(const key of ["0","-1","1.5","01","then","missing"]) expect(Reflect.get(table,key)).toBeUndefined();
   expect(Reflect.get(table,Symbol.iterator)).toBeUndefined();
   expect(rowOperationFor([{from:1,to:8,operation:one},{from:9,to:Infinity,operation:expanded}],1_000_000)).toBe(expanded);

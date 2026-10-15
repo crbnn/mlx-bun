@@ -463,7 +463,7 @@ export class Experts {
 /** One decoder layer: the attention sub-block (`forwardAttn`) and the row-wise
  * pieces after it (`denseFeedforward` or `moeFeedforward`, `perLayerGated`,
  * `scaled`), which the generic graph composes through `forwardMlp` and a
- * generated graph composes as its layer table names them. */
+ * written graph composes as its layer table names them. */
 export class DecoderLayer {
   readonly attn: Attention;
   readonly mlp: GegluMLP;
@@ -557,7 +557,7 @@ export class DecoderLayer {
    *  e4b per-layer-input gate and layer scalar. `hMid` (the attn sub-block's
    *  output) is BORROWED — the caller owns/disposes it (it is the checkpoint
    *  boundary leaf), so this never disposes it. The generic graph's composition
-   *  of the pieces below; a generated graph composes the ones its layer has. */
+   *  of the pieces below; a written graph composes the ones its layer has. */
   forwardMlp(hMid: MlxArray, perLayerInput: MlxArray | null): MlxArray {
     let h = this.router && this.experts ? this.moeFeedforward(hMid) : this.denseFeedforward(hMid);
     if (this.perLayerGate && this.perLayerProjection && this.postPerLayerNorm && perLayerInput)

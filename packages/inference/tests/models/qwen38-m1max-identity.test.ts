@@ -277,16 +277,16 @@ describe("the written graph declarations", () => {
       ]);
       expect(anePrograms()).toHaveLength(43);
       expect(current.sequence.map(({from,to})=>[from,to])).toEqual([[1,1],[2,3],[4,4],[5,8],[9,256],[257,512],[513,Infinity]]);
-      expect(current.decode[4]).not.toBe(current.decode[5]!);
-      expect(current.verify[4]).not.toBe(current.verify[5]!);
-      expect(current.decode[5]).toBe(current.decode[8]!);
-      expect(current.verify[5]).toBe(current.verify[8]!);
-      expect(current.decode[9]).toBe(current.decode[256]);
-      expect(current.decode[257]).toBe(current.decode[262144]);
-      expect(current.verify[9]).toBe(current.verify[256]);
-      expect(current.verify[257]).toBe(current.verify[262144]);
-      expect(current.logits[256]).not.toBe(current.logits[257]);
-      expect(current.logits[257]).toBe(current.logits[262144]);
+      expect(rowOperationFor(current.decode, 4)).not.toBe(rowOperationFor(current.decode, 5));
+      expect(rowOperationFor(current.verify, 4)).not.toBe(rowOperationFor(current.verify, 5));
+      expect(rowOperationFor(current.decode, 5)).toBe(rowOperationFor(current.decode, 8));
+      expect(rowOperationFor(current.verify, 5)).toBe(rowOperationFor(current.verify, 8));
+      expect(rowOperationFor(current.decode, 9)).toBe(rowOperationFor(current.decode, 256));
+      expect(rowOperationFor(current.decode, 257)).toBe(rowOperationFor(current.decode, 262144));
+      expect(rowOperationFor(current.verify, 9)).toBe(rowOperationFor(current.verify, 256));
+      expect(rowOperationFor(current.verify, 257)).toBe(rowOperationFor(current.verify, 262144));
+      expect(rowOperationFor(current.logits, 256)).not.toBe(rowOperationFor(current.logits, 257));
+      expect(rowOperationFor(current.logits, 257)).toBe(rowOperationFor(current.logits, 262144));
       const a = current.makeCache(), b = generic.makeCache();
       try { expect(a.map(cache => `${cache.constructor.name} ${cache.signature()}`)).toEqual(b.map(cache => `${cache.constructor.name} ${cache.signature()}`)); }
       finally { disposeAll(a, b); }
@@ -340,15 +340,15 @@ for (const scheme of Object.keys(SCHEMES)) {
       run: (graph: Qwen38TrellisM1Max | Qwen35Model, input: MlxArray, caches: Cache[]) => MlxArray | Promise<MlxArray>) => {
       using input = ids(rows);
       outputDiff(`${scheme} ${label}`, run(current, input, mine) as MlxArray, run(generic, input, theirs) as MlxArray,
-        current.logits[totalRows]!, generic.logits[totalRows]!);
+        rowOperationFor(current.logits, totalRows), rowOperationFor(generic.logits, totalRows));
       stateDiff(`${scheme} ${label}`, mine, theirs);
     };
     try {
       // The artifact fixes dense prompt projections at257+rows. At512 inputs
       // those GEMMs still split K, so this compact fixture cannot use generic
       // quantized projections as a bit-exact oracle for those prompt bindings.
-      step("verify257",257,[prompt(257,1)],(g,input,caches)=>g.verify[257]!(input,caches,null));
-      step("verify258 after append",258,[prompt(258,5)],(g,input,caches)=>g.verify[258]!(input,caches,null));
+      step("verify257",257,[prompt(257,1)],(g,input,caches)=>rowOperationFor(g.verify, 257)(input,caches,null));
+      step("verify258 after append",258,[prompt(258,5)],(g,input,caches)=>rowOperationFor(g.verify, 258)(input,caches,null));
     } finally { disposeAll(mine, theirs); }
   }, 180_000);
 }
@@ -372,11 +372,11 @@ test("tuned9..256 rows retain the current-main first-layer reassociation gate",(
     try {
       using input=ids([prompt(rows,rows)]);
       const run=(graph:Qwen38TrellisM1Max|Qwen35Model,cache:Cache[],tap:MlxLayerCapture)=>
-        phase==="verify"?graph.verify[rows]!(input,cache,tap):graph.multiSequencePrompt.find(range=>range.from<=rows&&range.to>=rows)!.operation(input,cache,tap);
+        phase==="verify"?rowOperationFor(graph.verify, rows)(input,cache,tap):graph.multiSequencePrompt.find(range=>range.from<=rows&&range.to>=rows)!.operation(input,cache,tap);
       using actual=run(current,mine,capture(captures[0])) as MlxArray,expected=run(generic,theirs,capture(captures[1])) as MlxArray;
       const worst=Math.max(...captures[0].slice(0,4).map((hidden,layer)=>relativeDiff(hidden,captures[1][layer]!)));
       expect(worst,`${phase} rows${rows}: first4layers`).toBeLessThan(5e-2);
-      using logits=current.logits[rows]!(actual),wide=logits.astype(Dtype.float32);
+      using logits=rowOperationFor(current.logits, rows)(actual),wide=logits.astype(Dtype.float32);
       expect(wide.toFloat32().every(Number.isFinite)).toBe(true);
     } finally {disposeAll(mine,theirs);for (const hidden of captures.flat()) hidden.dispose();}
   }
@@ -411,7 +411,7 @@ test("request adapters on gate, up and down overlay the fixed MLP without changi
   const right=[mlp.gate,mlp.up,mlp.down];
   const left=[current.loraTargets().get(`${PREFIX}.layers.0.mlp.gate_proj`)!,
     current.loraTargets().get(`${PREFIX}.layers.0.mlp.up_proj`)!,current.loraTargets().get(`${PREFIX}.layers.0.mlp.down_proj`)!];
-  const operation=current.verify[257];
+  const operation=rowOperationFor(current.verify, 257);
   for (let i=0;i<3;i++) {
     const projection=left[i]!;
     const adapter={a:tensor(noise(projection.inFeatures*2,91+i,0.02),[projection.inFeatures,2],Dtype.float32),
@@ -422,9 +422,9 @@ test("request adapters on gate, up and down overlay the fixed MLP without changi
   current.loraState.active=["synthetic"];generic.loraState.active=["synthetic"];
   try {
     using input=ids([prompt(257,91)]);
-    outputDiff("request MLP adapters",current.verify[257]!(input,mine,null),generic.verify[257]!(input,theirs,null) as MlxArray,
+    outputDiff("request MLP adapters",rowOperationFor(current.verify, 257)(input,mine,null),rowOperationFor(generic.verify, 257)(input,theirs,null) as MlxArray,
       current.logitsFromHidden.bind(current),generic.logitsFromHidden.bind(generic));
-    stateDiff("request MLP adapters",mine,theirs);expect(current.verify[257]).toBe(operation);
+    stateDiff("request MLP adapters",mine,theirs);expect(rowOperationFor(current.verify, 257)).toBe(operation);
   } finally {
     current.loraState.active=[];generic.loraState.active=[];
     for (const projection of [...left,...right]) {projection.adapters=null;projection.loraState=null;}
@@ -467,25 +467,25 @@ test("small-row gate/up adapters keep valid fixed operations and recover inactiv
     for (const rows of [2, 3, 4, 5, 6, 8]) {
       using decodeIds = ids(Array.from({ length: rows }, (_, row) => prompt(1, 120 + row)));
       using windowIds = ids([prompt(rows, 121)]);
-      const decode = current.decode[rows]!, verify = current.verify[rows]!;
+      const decode = rowOperationFor(current.decode, rows), verify = rowOperationFor(current.verify, rows);
       recover(`decode ${rows}`, cache => decode(decodeIds, cache, null),
-        rows > 4 ? cache => current.decode[4]!(decodeIds, cache, null) : undefined);
+        rows > 4 ? cache => rowOperationFor(current.decode, 4)(decodeIds, cache, null) : undefined);
       recover(`verify ${rows}`, cache => verify(windowIds, cache, null),
-        rows > 4 ? cache => current.verify[4]!(windowIds, cache, null) : undefined);
+        rows > 4 ? cache => rowOperationFor(current.verify, 4)(windowIds, cache, null) : undefined);
       recover(`known ${rows}`, cache => dispatch.known(rows)(windowIds, cache) as MlxArray,
         rows > 4 ? cache => dispatch.known(4)(windowIds, cache) as MlxArray : undefined);
       recover(`prompt tail ${rows}`, cache => dispatch.prompt("tail", 1, rows)(windowIds, cache, null) as MlxArray,
-        rows > 4 ? cache => current.verify[4]!(windowIds, cache, null) : undefined);
+        rows > 4 ? cache => rowOperationFor(current.verify, 4)(windowIds, cache, null) : undefined);
       // The unchanged Wide binding is main's inactive chunk operation even
       // when the actual tensor has fewer than nine positions.
       recover(`prompt chunk ${rows}`, cache => dispatch.prompt("chunk", 1, rows)(windowIds, cache, null) as MlxArray,
-        cache => current.verify[9]!(windowIds, cache, null));
+        cache => rowOperationFor(current.verify, 9)(windowIds, cache, null));
       if (rows === 2 || rows === 4 || rows === 6) {
         using multiIds = ids([prompt(rows / 2, 123), prompt(rows / 2, 124)]);
         recover(`multi chunk 2x${rows / 2}`, cache => dispatch.prompt("chunk", 2, rows / 2)(multiIds, cache, null) as MlxArray,
-          cache => current.verify[9]!(multiIds, cache, null));
+          cache => rowOperationFor(current.verify, 9)(multiIds, cache, null));
       }
-      expect(current.decode[rows]).toBe(decode); expect(current.verify[rows]).toBe(verify);
+      expect(rowOperationFor(current.decode, rows)).toBe(decode); expect(rowOperationFor(current.verify, rows)).toBe(verify);
     }
     for (const rows of [2, 4, 8]) {
       using input = ids([prompt(rows, 122)]), embedding = current.embed.encode(input);

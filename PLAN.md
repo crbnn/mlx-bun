@@ -18,6 +18,11 @@ Decisions that govern all work:
 
 ## Graph files
 
+- [ ] Complete the architectural corrections: make row defaults and chunk bindings
+      explicit data, consolidate device-qualified generic copies into one generic
+      per family with choices settled at load, simplify loader lookup keys, finish
+      written Gemma naming, and run the full correctness suite. PR #363 is draft
+      until these corrections are reviewed.
 - [ ] Resolve performance acceptance for the final `refactor/graph-files` merge request to
       `main`. Review the saved short paired reports, including slower decode and aggregate
       samples under the accepted current machine conditions. A quiet paired run is required
@@ -104,7 +109,7 @@ while that machine is in use (swap above 512 MB).
   Exit: opt-in comparisons meet the numerical contracts against pinned published
   golden revisions recording source revisions and oracle versions; synthetic tests
   alone do not close this. Done so far: the
-  [generated Gemma4 graph test](packages/inference/tests/parity/gemma4-generated.test.ts)
+  [written Gemma4 graph test](packages/inference/tests/parity/gemma4-written.test.ts)
   passed on e4b and 12B (identity within this tree; 26B-A4B not run). Packed Trellis now matches main in 96 full greedy logit vectors, three shared
   B1/depth-two MTP runs (on the M1 Max, whose verify windows reassociate, by KL and greedy
   agreement), and the 18-case plain-KV runtime grid with restored

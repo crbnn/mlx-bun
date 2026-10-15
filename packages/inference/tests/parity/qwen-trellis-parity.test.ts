@@ -1,3 +1,6 @@
+import type { MlxArray } from "@mlx-bun/mlx/array";
+import type { MlxCapturingForward, MlxHeadForward } from "../../src/contracts/mlx/graph";
+import { rowOperationFor } from "../../src/runtime/row-operations";
 // Qwen3.8-27B packed-Trellis graph and its native MTP draft head against main's
 // own outputs. The packed-Trellis artifact has no external oracle (mlx-lm cannot
 // load it), so the reference is what the independently pinned main revision computes for the same
@@ -283,8 +286,8 @@ test.skipIf(!inputs)("Qwen3.8 packed-Trellis against main: logits, greedy tokens
           const before = cachePositions(cache);
           for (const c of cache) c.specRoundBegin?.();
           using ids = ops.fromInt32([...window], [1, window.length]);
-          using hidden = await model.verify[width](ids, cache, null);
-          using verified = model.logits[width](hidden);
+          using hidden = await rowOperationFor<MlxCapturingForward>(model.verify, width)(ids, cache, null);
+          using verified = rowOperationFor<MlxHeadForward>(model.logits, width)(hidden);
           ops.evalAll([verified]);
           const after = cachePositions(cache);
           rollbackVerifyBlock(cache, 0, window.length);

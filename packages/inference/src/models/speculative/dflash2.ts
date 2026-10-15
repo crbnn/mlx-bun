@@ -1,3 +1,4 @@
+import type { MlxRowTable } from "../../contracts/mlx/row-table";
 // DFlash 2 drafter for Qwen3.8-27B (incoai/Qwen3.8-27B-DFlash2, Apache-2.0).
 // Port of z-lab/dflash@07ebd93 `dflash/model_mlx.py` (DFlash2DraftModel),
 // cross-checked against Splash `runtime/model/DFlashDraft.cpp`, SGLang PR
@@ -87,13 +88,15 @@ class Bf16Projection implements Projection {
  *  binds. */
 interface Weight {
   at: DrafterOperations<Projection>;
+  /** The fixed default of the checkpoint's original range-backed projection. */
+  readonly defaultProjection?: Projection;
   /** The 4-bit, group-64 weight a declared kernel builds over; null for any other width. */
   readonly affine4: { readonly w: MlxArray; readonly scales: MlxArray; readonly biases: MlxArray } | null;
   dispose(): void;
 }
 
 function bf16Weight(projection: Bf16Projection): Weight {
-  return { at: [{from:1,to:Infinity,operation:projection}], affine4: null, dispose: () => projection.t.dispose() };
+  return { at: [{from:1,to:Infinity,operation:projection}], defaultProjection: projection, affine4: null, dispose: () => projection.t.dispose() };
 }
 function quantizedWeight(source: MlxArray, bits: number): Weight {
   const q = ops.quantize(source, 64, bits);
@@ -103,6 +106,7 @@ function quantizedWeight(source: MlxArray, bits: number): Weight {
   const mma = bits === 4 && q.scales.shape[0]! % 8 === 0 && (q.scales.shape[1]! * 64) % 256 === 0 ? new Affine4MmaLinear(linear) : null;
   return {
     at: [{from:1,to:4,operation:plain},{from:5,to:8,operation:mma ?? plain},{from:9,to:Infinity,operation:plain}],
+    defaultProjection: plain,
     affine4: bits === 4 ? { w: q.packed, scales: q.scales, biases: q.biases } : null,
     dispose() { linear.w.dispose(); linear.scales.dispose(); linear.biases!.dispose(); },
   };
@@ -379,22 +383,44 @@ export class Dflash2Drafter implements Dflash2DrafterModel {
   draft!: DrafterOperations<Dflash2DraftBlock>;
 
   #bindOperations(rows: DrafterOperations<unknown>): void {
-    const forms=(row:number):LayerProjections[]=>this.#layers.map(layer=>({
-      q:rowOperationFor(layer.q.at,row),k:rowOperationFor(layer.k.at,row),v:rowOperationFor(layer.v.at,row),o:rowOperationFor(layer.o.at,row),
-      gate:rowOperationFor(layer.gate.at,row),up:rowOperationFor(layer.up.at,row),down:rowOperationFor(layer.down.at,row),
-    }));
-    this.projectContext=mapOperations(rows,(_op,row)=>{
-      const fc=rowOperationFor(this.#fc!.at,row);
-      return (taps:MlxArray)=>{using projected=fc.forward(taps);return this.#rms(projected,this.#hiddenNorm);};
+    type Binding = { fc: Projection; layers: LayerProjections[] };
+    const bind = (projection: (weight: Weight) => Projection): Binding => ({
+      fc: projection(this.#fc!),
+      layers: this.#layers.map(layer => ({
+        q: projection(layer.q), k: projection(layer.k), v: projection(layer.v), o: projection(layer.o),
+        gate: projection(layer.gate), up: projection(layer.up), down: projection(layer.down),
+      })),
     });
-    this.projectContextKVRows=mapOperations(rows,(_op,row)=>{
-      const fixed=forms(row);
-      return (context:MlxArray,position:number|MlxArray)=>this.#contextKV(context,position,fixed);
+    const at = (row: number) => bind(weight => rowOperationFor(weight.at, row));
+    const defaults = () => bind(weight => {
+      const operation = Array.isArray(weight.at) ? Object.hasOwn(weight, "defaultProjection") ? weight.defaultProjection : undefined
+        : Object.hasOwn(weight.at, "default") ? (weight.at as MlxRowTable<Projection>).default : undefined;
+      if (operation === undefined) throw new Error("DFlash2 projection has no declared default operation");
+      return operation;
     });
-    this.draft=mapOperations(rows,(_op,row)=>{
-      const fixed=forms(row);
-      return (context:Dflash2ContextAttention,projection:DraftProjection,anchors:readonly number[],position:number|MlxArray,columns:number)=>this.#block(context,projection,anchors,position,columns,fixed);
+    let bindings: DrafterOperations<Binding>;
+    if (Array.isArray(rows)) {
+      bindings = Object.freeze(rows.map(range => Object.freeze({
+        from: range.from, to: range.to, operation: at(range.from),
+      })));
+    } else {
+      const source = rows as MlxRowTable<unknown>, exact: Partial<Record<number, Binding>> & { default?: Binding } = {};
+      for (const [key, operation] of Object.entries(source)) {
+        const row = Number(key);
+        if (operation !== undefined && Number.isSafeInteger(row) && row > 0 && String(row) === key) exact[row] = at(row);
+      }
+      if (Object.hasOwn(source, "default") && source.default !== undefined) exact.default = defaults();
+      bindings = Object.freeze(exact);
+    }
+    this.projectContext = mapOperations(bindings, fixed => (taps: MlxArray) => {
+      using projected = fixed.fc.forward(taps);
+      return this.#rms(projected, this.#hiddenNorm);
     });
+    this.projectContextKVRows = mapOperations(bindings, fixed =>
+      (context: MlxArray, position: number | MlxArray) => this.#contextKV(context, position, fixed.layers));
+    this.draft = mapOperations(bindings, fixed =>
+      (context: Dflash2ContextAttention, projection: DraftProjection, anchors: readonly number[], position: number | MlxArray, columns: number) =>
+        this.#block(context, projection, anchors, position, columns, fixed.layers));
   }
 
   #contextKV(context: MlxArray, position: number | MlxArray, fixed: readonly LayerProjections[]): ContextKV[] {

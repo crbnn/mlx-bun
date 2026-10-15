@@ -96,10 +96,6 @@ export interface ServedComposition {
   readonly fingerprint?: string;
   /** The GPU architecture (`Composition.device`). */
   readonly device?: string;
-  /** Minimum Apple GPU family for the default recommendation. */
-  readonly minGpuFamily?: number;
-  /** Artifact facts used only when recommending a default. */
-  readonly artifact?: (config: ModelConfig) => boolean;
   /** The KV schemes served. A composition matches one with the same kind and
    * widths (every layer's, for a per-layer scheme). */
   readonly kv?: readonly ServedKv[];
@@ -137,25 +133,14 @@ const kvKey = (scheme: ServedKv): string => {
 };
 const depthKey = (depth: DraftDepth): string => typeof depth === "number" ? `${depth}` : `adaptive ${depth.max}`;
 const SERVED_FIELDS: readonly (keyof ServedComposition)[] =
-  ["fingerprint", "device", "minGpuFamily", "artifact", "kv", "draftDepth", "prefillChunkTokens", "maxRows", "maxVerifyRows"];
+  ["fingerprint", "device", "kv", "draftDepth", "prefillChunkTokens", "maxRows", "maxVerifyRows"];
 const constraintCount = (serves: ServedComposition): number =>
   SERVED_FIELDS.filter(field => serves[field] !== undefined).length;
 
 /** Whether `composition`, on an artifact with `fingerprint`, meets every constraint of `serves`. */
-const gpuFamily = (device: string): number => Number(/^applegpu_[a-z](\d{2})/.exec(device)?.[1] ?? 0);
-function deviceMatches(serves: ServedComposition, device: string): boolean {
-  return (serves.device === undefined || serves.device === device) &&
-    (serves.minGpuFamily === undefined || gpuFamily(device) >= serves.minGpuFamily);
-}
-/** A device-only recommendation refines the one GPU-family-only recommendation it belongs to. */
-function deviceRefines(a: ServedComposition, b: ServedComposition): boolean {
-  return constraintCount(a) === 1 && constraintCount(b) === 1 && a.device !== undefined &&
-    b.minGpuFamily !== undefined && gpuFamily(a.device) >= b.minGpuFamily;
-}
-function meets(serves: ServedComposition, fingerprint: string | undefined, composition: Composition, config?: ModelConfig): boolean {
+function meets(serves: ServedComposition, fingerprint: string | undefined, composition: Composition): boolean {
   return (serves.fingerprint === undefined || serves.fingerprint === fingerprint) &&
-    deviceMatches(serves, composition.device) &&
-    (serves.artifact === undefined || (config !== undefined && serves.artifact(config))) &&
+    (serves.device === undefined || serves.device === composition.device) &&
     (serves.kv === undefined || serves.kv.some(scheme => kvKey(scheme) === kvKey(composition.kv))) &&
     (serves.draftDepth === undefined || depthKey(serves.draftDepth) === depthKey(composition.draftDepth)) &&
     (serves.prefillChunkTokens === undefined || serves.prefillChunkTokens === composition.prefillChunkTokens) &&
@@ -168,8 +153,7 @@ function meets(serves: ServedComposition, fingerprint: string | undefined, compo
 function overlap(a: ServedComposition, b: ServedComposition): boolean {
   const both = <T>(x: T | undefined, y: T | undefined, joint: (x: T, y: T) => boolean) =>
     x === undefined || y === undefined || joint(x, y);
-  return (a.device === undefined || deviceMatches(b, a.device)) &&
-    (b.device === undefined || deviceMatches(a, b.device)) &&
+  return both(a.device, b.device, (x, y) => x === y) &&
     both(a.fingerprint, b.fingerprint, (x, y) => x === y) &&
     both(a.kv, b.kv, (x, y) => x.some(scheme => y.some(other => kvKey(scheme) === kvKey(other)))) &&
     both(a.draftDepth, b.draftDepth, (x, y) => depthKey(x) === depthKey(y)) &&
@@ -183,7 +167,7 @@ function overlap(a: ServedComposition, b: ServedComposition): boolean {
  *
  * Default selection runs once, when the loader loads the graph: among the entries
  * whose every constraint the composition meets, the one
- * constraining the most fields wins; an exact device breaks a tie with a family range.
+ * constraining the most fields wins.
  * The generic entry meets every composition,
  * so the table never refuses; a request the built graph cannot serve is refused
  * before it runs, by the gateway's planning from the graph's declared
@@ -208,11 +192,8 @@ export class GraphTable<Source, Model> {
       if (entry.serves.fingerprint !== undefined && !fingerprint)
         throw new Error(`graph table: ${entry.id} names a fingerprint, and the table computes none`);
       if (entry.serves.kv?.length === 0) throw new Error(`graph table: ${entry.id} serves no KV scheme`);
-      if (entry.serves.minGpuFamily !== undefined && (!Number.isSafeInteger(entry.serves.minGpuFamily) || entry.serves.minGpuFamily <= 0))
-        throw new Error(`graph table: ${entry.id} needs a positive integer GPU family`);
       for (const other of entries.slice(index + 1))
-        if (constraintCount(entry.serves) === constraintCount(other.serves) && overlap(entry.serves, other.serves) &&
-            !deviceRefines(entry.serves, other.serves) && !deviceRefines(other.serves, entry.serves))
+        if (constraintCount(entry.serves) === constraintCount(other.serves) && overlap(entry.serves, other.serves))
           throw new Error(`graph table: ${entry.id} and ${other.id} constrain as many fields and one composition ` +
             "could meet both; constrain one of them further");
     }
@@ -226,7 +207,7 @@ export class GraphTable<Source, Model> {
    * recommendation's device, artifact or configuration keys. */
   select(config: ModelConfig, composition: Composition, graph?: string | GraphEntry<Source, Model>): GraphEntry<Source, Model> {
     if (graph !== undefined) return this.explicit(graph);
-    return this.match(this.#fingerprint?.(config), composition, config);
+    return this.match(this.#fingerprint?.(config), composition);
   }
 
   /** Resolve a named shipped graph or accept the caller's own graph entry. */
@@ -238,12 +219,11 @@ export class GraphTable<Source, Model> {
   }
 
   /** The entry serving `composition` on an artifact with `fingerprint` (as the table computes it). */
-  match(fingerprint: string | undefined, composition: Composition, config?: ModelConfig): GraphEntry<Source, Model> {
+  match(fingerprint: string | undefined, composition: Composition): GraphEntry<Source, Model> {
     let chosen = this.generic, count = 0;
     for (const entry of this.entries) {
       const constrained = constraintCount(entry.serves);
-      if ((constrained > count || (constrained === count && deviceRefines(entry.serves, chosen.serves))) &&
-          meets(entry.serves, fingerprint, composition, config)) { chosen = entry; count = constrained; }
+      if (constrained > count && meets(entry.serves, fingerprint, composition)) { chosen = entry; count = constrained; }
     }
     return chosen;
   }

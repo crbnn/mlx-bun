@@ -14,9 +14,7 @@ import { compiledLogitSoftcap } from "../../kernels/softcap";
 import { logitSoftcap } from "../../kernels/logits";
 import { ownResource, disposeResources } from "../../runtime/resources";
 import { declareGraph } from "../capabilities";
-import { rowTableWithDefault } from "../graph";
-import type { ServedComposition } from "../implementation";
-import { GENERATED_GEMMA_FINGERPRINTS as GEMMA_GRAPH_FINGERPRINTS } from "./family";
+import { GEMMA_GRAPH_FINGERPRINTS } from "./family";
 import { CompiledDecode } from "./compiled-decode";
 import { bindGemma4MediaInput, gemma4DraftTarget, gemma4MediaEncoders } from "./media";
 import { type Gemma4Phase } from "./blocks";
@@ -76,55 +74,10 @@ const CACHES = 30;
 const PREFIX = "language_model.model";
 const FINAL_LOGIT_SOFTCAP = 30;
 
-/** The composition this file was generated for, its entry in the loader's table:
- *  the artifact's config fingerprint and the KV scheme of the caches it serves (the
- *  artifact's kv_config, `--kv-quant config`). The scheme's read kernels and
- *  conversion start constrain nothing: `makeCache` composes them from the record
- *  the constructor is handed. */
-export const COMPOSITION: ServedComposition = Object.freeze({
-  fingerprint: FINGERPRINT,
-  kv: Object.freeze([Object.freeze({
-    kind: "affine-layers" as const,
-    layers: Object.freeze([
-      { layer: 0, bits: 8, groupSize: 64 },
-      { layer: 1, bits: 4, groupSize: 64 },
-      { layer: 2, bits: 4, groupSize: 64 },
-      { layer: 3, bits: 8, groupSize: 64 },
-      { layer: 4, bits: 8, groupSize: 64 },
-      { layer: 5, bits: 8, groupSize: 64 },
-      { layer: 6, bits: 4, groupSize: 64 },
-      { layer: 7, bits: 4, groupSize: 64 },
-      { layer: 8, bits: 8, groupSize: 64 },
-      { layer: 9, bits: 8, groupSize: 64 },
-      { layer: 10, bits: 4, groupSize: 64 },
-      { layer: 11, bits: 8, groupSize: 64 },
-      { layer: 12, bits: 8, groupSize: 64 },
-      { layer: 13, bits: 4, groupSize: 64 },
-      { layer: 14, bits: 4, groupSize: 64 },
-      { layer: 15, bits: 4, groupSize: 64 },
-      { layer: 16, bits: 4, groupSize: 64 },
-      { layer: 17, bits: 4, groupSize: 64 },
-      { layer: 18, bits: 4, groupSize: 64 },
-      { layer: 19, bits: 4, groupSize: 64 },
-      { layer: 20, bits: 4, groupSize: 64 },
-      { layer: 21, bits: 4, groupSize: 64 },
-      { layer: 22, bits: 4, groupSize: 64 },
-      { layer: 23, bits: 4, groupSize: 64 },
-      { layer: 24, bits: 4, groupSize: 64 },
-      { layer: 25, bits: 4, groupSize: 64 },
-      { layer: 26, bits: 4, groupSize: 64 },
-      { layer: 27, bits: 4, groupSize: 64 },
-      { layer: 28, bits: 4, groupSize: 64 },
-      { layer: 29, bits: 4, groupSize: 64 },
-    ]),
-  })]),
-});
-
-
 export const DECODE_ROWS = 8;
 export const VERIFY_ROWS = 64;
 
-export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
+export class Gemma4Moe implements MlxDeclaredGraph, MlxTokenPhases {
   readonly prefixBase = PREFIX;
   readonly loraState = new LoraState();
   readonly weightsBytes: number;
@@ -142,6 +95,8 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
   readonly #constants: ReturnType<typeof ownResource<MlxArray[]>>;
   readonly #parts: readonly GemmaMoeLayerWeights[];
   readonly prompt: readonly MlxPromptRange[];
+  readonly promptChunk: typeof this.prompt;
+  readonly multiSequencePromptChunk: typeof this.multiSequencePrompt;
   readonly multiSequencePrompt: readonly MlxPromptRange[];
   readonly decode: MlxRowTable<MlxCapturingForward>;
   readonly verify: MlxRowTable<MlxCapturingForward>;
@@ -342,11 +297,19 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
       { kind: "full", turboQuant: "deferred" },
     ]);
     this.prompt = Object.freeze([{ from: 1, to: 7, operation: this.#window }, { from: 8, to: Infinity, operation: this.#sortedWindow }]);
+    this.promptChunk = this.prompt;
     this.multiSequencePrompt = this.prompt;
-    this.decode = rowTableWithDefault({ 1: this.#decode, 2: this.#decode, 3: this.#decode, 4: this.#decode, 5: this.#decode, 6: this.#decode, 7: this.#decode, 8: this.#sortedDecode }, this.#sortedDecode);
-    this.verify = rowTableWithDefault({ 1: this.#window, 2: this.#window, 3: this.#window, 4: this.#window, 5: this.#window, 6: this.#window, 7: this.#window, 8: this.#sortedWindow, 9: this.#sortedWindow, 10: this.#sortedWindow, 11: this.#sortedWindow, 12: this.#sortedWindow, 13: this.#sortedWindow, 14: this.#sortedWindow, 15: this.#sortedWindow, 16: this.#sortedWindow, 17: this.#sortedWindow, 18: this.#sortedWindow, 19: this.#sortedWindow, 20: this.#sortedWindow, 21: this.#sortedWindow, 22: this.#sortedWindow, 23: this.#sortedWindow, 24: this.#sortedWindow, 25: this.#sortedWindow, 26: this.#sortedWindow, 27: this.#sortedWindow, 28: this.#sortedWindow, 29: this.#sortedWindow, 30: this.#sortedWindow, 31: this.#sortedWindow, 32: this.#sortedWindow, 33: this.#sortedWindow, 34: this.#sortedWindow, 35: this.#sortedWindow, 36: this.#sortedWindow, 37: this.#sortedWindow, 38: this.#sortedWindow, 39: this.#sortedWindow, 40: this.#sortedWindow, 41: this.#sortedWindow, 42: this.#sortedWindow, 43: this.#sortedWindow, 44: this.#sortedWindow, 45: this.#sortedWindow, 46: this.#sortedWindow, 47: this.#sortedWindow, 48: this.#sortedWindow, 49: this.#sortedWindow, 50: this.#sortedWindow, 51: this.#sortedWindow, 52: this.#sortedWindow, 53: this.#sortedWindow, 54: this.#sortedWindow, 55: this.#sortedWindow, 56: this.#sortedWindow, 57: this.#sortedWindow, 58: this.#sortedWindow, 59: this.#sortedWindow, 60: this.#sortedWindow, 61: this.#sortedWindow, 62: this.#sortedWindow, 63: this.#sortedWindow, 64: this.#sortedWindow }, this.#sortedWindow);
+    this.multiSequencePromptChunk = this.multiSequencePrompt;
+    this.decode = Object.freeze({ 1: this.#decode, 2: this.#decode, 3: this.#decode, 4: this.#decode, 5: this.#decode, 6: this.#decode, 7: this.#decode, 8: this.#sortedDecode ,
+      default: this.#sortedDecode,
+    });
+    this.verify = Object.freeze({ 1: this.#window, 2: this.#window, 3: this.#window, 4: this.#window, 5: this.#window, 6: this.#window, 7: this.#window, 8: this.#sortedWindow, 9: this.#sortedWindow, 10: this.#sortedWindow, 11: this.#sortedWindow, 12: this.#sortedWindow, 13: this.#sortedWindow, 14: this.#sortedWindow, 15: this.#sortedWindow, 16: this.#sortedWindow, 17: this.#sortedWindow, 18: this.#sortedWindow, 19: this.#sortedWindow, 20: this.#sortedWindow, 21: this.#sortedWindow, 22: this.#sortedWindow, 23: this.#sortedWindow, 24: this.#sortedWindow, 25: this.#sortedWindow, 26: this.#sortedWindow, 27: this.#sortedWindow, 28: this.#sortedWindow, 29: this.#sortedWindow, 30: this.#sortedWindow, 31: this.#sortedWindow, 32: this.#sortedWindow, 33: this.#sortedWindow, 34: this.#sortedWindow, 35: this.#sortedWindow, 36: this.#sortedWindow, 37: this.#sortedWindow, 38: this.#sortedWindow, 39: this.#sortedWindow, 40: this.#sortedWindow, 41: this.#sortedWindow, 42: this.#sortedWindow, 43: this.#sortedWindow, 44: this.#sortedWindow, 45: this.#sortedWindow, 46: this.#sortedWindow, 47: this.#sortedWindow, 48: this.#sortedWindow, 49: this.#sortedWindow, 50: this.#sortedWindow, 51: this.#sortedWindow, 52: this.#sortedWindow, 53: this.#sortedWindow, 54: this.#sortedWindow, 55: this.#sortedWindow, 56: this.#sortedWindow, 57: this.#sortedWindow, 58: this.#sortedWindow, 59: this.#sortedWindow, 60: this.#sortedWindow, 61: this.#sortedWindow, 62: this.#sortedWindow, 63: this.#sortedWindow, 64: this.#sortedWindow ,
+      default: this.#sortedWindow,
+    });
     this.appendKnown = [{ from: 1, to: 7, operation: this.#known }, { from: 8, to: Infinity, operation: this.#sortedKnown }];
-    this.logits = rowTableWithDefault({ 1: this.#head, 2: this.#head, 3: this.#head, 4: this.#head, 5: this.#head, 6: this.#head, 7: this.#head, 8: this.#head, 9: this.#head, 10: this.#head, 11: this.#head, 12: this.#head, 13: this.#head, 14: this.#head, 15: this.#head, 16: this.#head, 17: this.#head, 18: this.#head, 19: this.#head, 20: this.#head, 21: this.#head, 22: this.#head, 23: this.#head, 24: this.#head, 25: this.#head, 26: this.#head, 27: this.#head, 28: this.#head, 29: this.#head, 30: this.#head, 31: this.#head, 32: this.#head, 33: this.#head, 34: this.#head, 35: this.#head, 36: this.#head, 37: this.#head, 38: this.#head, 39: this.#head, 40: this.#head, 41: this.#head, 42: this.#head, 43: this.#head, 44: this.#head, 45: this.#head, 46: this.#head, 47: this.#head, 48: this.#head, 49: this.#head, 50: this.#head, 51: this.#head, 52: this.#head, 53: this.#head, 54: this.#head, 55: this.#head, 56: this.#head, 57: this.#head, 58: this.#head, 59: this.#head, 60: this.#head, 61: this.#head, 62: this.#head, 63: this.#head, 64: this.#head }, this.#head);
+    this.logits = Object.freeze({ 1: this.#head, 2: this.#head, 3: this.#head, 4: this.#head, 5: this.#head, 6: this.#head, 7: this.#head, 8: this.#head, 9: this.#head, 10: this.#head, 11: this.#head, 12: this.#head, 13: this.#head, 14: this.#head, 15: this.#head, 16: this.#head, 17: this.#head, 18: this.#head, 19: this.#head, 20: this.#head, 21: this.#head, 22: this.#head, 23: this.#head, 24: this.#head, 25: this.#head, 26: this.#head, 27: this.#head, 28: this.#head, 29: this.#head, 30: this.#head, 31: this.#head, 32: this.#head, 33: this.#head, 34: this.#head, 35: this.#head, 36: this.#head, 37: this.#head, 38: this.#head, 39: this.#head, 40: this.#head, 41: this.#head, 42: this.#head, 43: this.#head, 44: this.#head, 45: this.#head, 46: this.#head, 47: this.#head, 48: this.#head, 49: this.#head, 50: this.#head, 51: this.#head, 52: this.#head, 53: this.#head, 54: this.#head, 55: this.#head, 56: this.#head, 57: this.#head, 58: this.#head, 59: this.#head, 60: this.#head, 61: this.#head, 62: this.#head, 63: this.#head, 64: this.#head ,
+      default: this.#head,
+    });
     this.mixed = Object.freeze([{ from: 1, to: 7, operation: this.#mixed }, { from: 8, to: Infinity, operation: this.#sortedMixed }]);
   }
   readonly #window = (ids: MlxArray, caches: Cache[], capture: MlxLayerCapture | null): MlxArray => this.#windowHidden(this.#embedTokens(ids), caches, "window", ids, capture);

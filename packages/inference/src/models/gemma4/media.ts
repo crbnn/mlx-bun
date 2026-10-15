@@ -1,3 +1,4 @@
+import { rowOperationFor } from "../../runtime/row-operations";
 import type { MlxArray } from "@mlx-bun/mlx/array";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { Cache } from "../../contracts/mlx/cache";
@@ -34,7 +35,7 @@ export function bindGemma4MediaInput(model: Gemma4MediaGraph, input: Vision): Ml
     ? model.mediaPrefill
       ? model.mediaPrefill.find(range => width >= range.from && width <= range.to)!.operation(input.embeddings, caches, input.imageMask ?? null, ids, input.multimodalMask ?? null)
       : model.prefillEmbeddings!(input.embeddings, caches, input.imageMask ?? null, ids, input.multimodalMask ?? null)
-    : (phase === "decode" ? model.decode[width]! : model.prompt.find(range => width >= range.from && width <= range.to)!.operation)(ids, caches, null) as MlxArray);
+    : (phase === "decode" ? rowOperationFor(model.decode, width) : model.prompt.find(range => width >= range.from && width <= range.to)!.operation)(ids, caches, null) as MlxArray);
 }
 
 /** The graph's ports for draft sources over its live caches: donor KV for the

@@ -35,3 +35,28 @@ test("phase dispatch retains explicit heads and unbounded positive defaults",()=
     expect(()=>dispatch.logits(rows)).toThrow("no declared operation");
   }
 });
+
+test("missing phase tables fail instead of borrowing an unrelated operation",()=>{
+  const forward=op("tail"),prompt=[{from:1,to:Infinity,operation:forward}];
+  const dispatch=new MlxPhaseDispatch({prompt,multiSequencePrompt:prompt});
+  expect(dispatch.prompt("tail",1,8)).toBe(forward);
+  expect(dispatch.prompt("tail",2,4)).toBe(forward);
+  expect(()=>dispatch.prompt("chunk",1,8)).toThrow("graph has no chunk operation table");
+  expect(()=>dispatch.prompt("chunk",2,4)).toThrow("graph has no multi-sequence chunk operation table");
+  expect(()=>dispatch.decode(1)).toThrow("graph has no decode operation table");
+  expect(()=>dispatch.verify(1,8)).toThrow("graph has no verify operation table");
+  expect(()=>dispatch.logits(1)).toThrow("graph has no logits operation table");
+  expect(()=>dispatch.known(1)).toThrow("graph has no known-span operation table");
+});
+
+test("shared chunk behavior and its execution unit are explicitly declared data",()=>{
+  const forward=op("shared"),prompt=[{from:1,to:Infinity,operation:forward}];
+  const dispatch=new MlxPhaseDispatch({prompt,multiSequencePrompt:prompt,promptChunk:prompt,multiSequencePromptChunk:prompt});
+  expect(dispatch.prompt("chunk",1,8)).toBe(forward);
+  expect(dispatch.prompt("chunk",2,4)).toBe(forward);
+  expect(dispatch.neuralEngine).toBe(false);
+  const chunkOnly=new MlxPhaseDispatch({promptChunk:[{from:1,to:Infinity,operation:forward,unit:"ane"}]});
+  expect(chunkOnly.neuralEngine).toBe(true);
+  expect(chunkOnly.prompt("chunk",1,8)).toBe(forward);
+  expect(()=>chunkOnly.prompt("tail",1,8)).toThrow("graph has no tail operation table");
+});

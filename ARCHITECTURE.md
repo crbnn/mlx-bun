@@ -63,8 +63,10 @@ Profiling determines the bindings for the model and hardware; the file states
 them literally. A specialized graph takes weights and artifact configuration,
 attaches those weights to the layers it already names and decides nothing.
 It takes no composition record and contains no branches or layer loops. Every
-graph is an entire graph and extends nothing. Generic family graphs retain
-their loops over the artifact's layer count.
+graph is an entire graph and extends nothing. One generic graph per family may
+inspect the artifact and device at load and loop over the artifact's layer count
+to bind its operations. Those choices settle at construction; its forwards do
+not reread the device or module configuration.
 
 When the caller supplies no graph, the loader recommends one from the model,
 device and module configuration (`contracts/portable/composition.ts`), choosing
@@ -119,8 +121,11 @@ owns prefix reuse, paging, SSD offload and eviction behind that interface and
 answers hit or miss. The graph names its phases (`MlxTokenPhases`:
 `decode`, `verify` and serving `logits` indexed by exact positive row count;
 prompt operations, known appends and full-sequence heads listed over contiguous
-row or position ranges). Exact-row tables can declare a fixed default for counts
-beyond their explicit entries; prompt chunks and tails can bind different ranges.
+row or position ranges). A table may state an explicit `default` operation for
+other positive row counts, as ordinary inspectable data. No Proxy fills missing
+entries. A missing entry without a declared default is an error. Each graph
+declares its chunk and tail tables, including an explicit shared table when both
+use the same operations; dispatch never supplies an undeclared phase alias.
 The scheduler indexes the rows it batched and dispatches prompt pieces to the GPU or Neural Engine as a
 resource it manages. Row-wise layers take M rows and do not know whether they
 are one sequence or M; only `attend` and the recurrence see the row layout.

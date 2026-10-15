@@ -2,13 +2,13 @@ import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
 import { WeightAudit } from "../../artifacts/weight-audit";
 import { MlxArray } from "@mlx-bun/mlx/array";
-import { Dtype } from "@mlx-bun/mlx/ffi";
+import { Dtype, deviceArchitecture } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { Cache } from "../../contracts/mlx/cache";
 import type { MlxCacheLayer, MlxSequenceRange, MlxRowTable, MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPromptRange, MlxTokenPhases } from "../../contracts/mlx/graph";
 import type { GraphCapabilities } from "../../contracts/portable/graph";
 import { logitSoftcap } from "../../kernels/logits";
-import { tiledTrellisPrefillEligible, splitKTrellisPrefillEligible } from "../../kernels/trellis/index";
+import { qualifiedRepresentations, tiledTrellisPrefillEligible, splitKTrellisPrefillEligible } from "../../kernels/trellis/index";
 import { disposing } from "../../layers/helpers";
 import { LoraState } from "../../layers/lora";
 import { QuantizedLinear } from "../../layers/quantized-linear";
@@ -23,10 +23,6 @@ import { cacheRead, type AttentionReadStrategy } from "../qwen/blocks";
 import { genericArgsFor, universalCacheWindows, universalMaskRecipe, type UniversalArgs } from "./archs";
 import { UniversalLayer, softcapRead, buildRope, stockProjection, packedProjection, expandedProjection, projectionFacts, normType } from "./blocks";
 export { UniversalAttention, UniversalLayer, UniversalMLP, type SwigluFn } from "./blocks";
-
-// Fixed artifact representation facts for this file's projection forms.
-const TRELLIS_FORMS = { gateUpCodebook: false, mixedExactBits: false,
-  scatter: {bits:false,genericBits:false,floatCodebook:false}, widePrefill: false };
 
 export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
   readonly config: ModelConfig;
@@ -55,7 +51,8 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
   // bound at construction; later edits to `args` cannot make them disagree.
   readonly #cacheWindows: readonly (number | null)[];
 
-  constructor(weights: Weights, config: ModelConfig, args?: UniversalArgs, maxPhaseRows = DEFAULT_PHASE_ROWS) {
+  constructor(weights: Weights, config: ModelConfig, args?: UniversalArgs, maxPhaseRows = DEFAULT_PHASE_ROWS, device = deviceArchitecture()) {
+    const representations = qualifiedRepresentations(device);
     const a = args ?? genericArgsFor(config);
     if (!a)
       throw new Error(`UniversalDenseModel: no descriptor for model_type ${config.modelType}`);
@@ -88,7 +85,7 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
     );
     this.layers = Array.from(
       { length: a.numHiddenLayers },
-      (_, i) => new UniversalLayer(weights, config, `model.layers.${i}`, a, this.ropes[i]!, audit, reads(i), TRELLIS_FORMS),
+      (_, i) => new UniversalLayer(weights, config, `model.layers.${i}`, a, this.ropes[i]!, audit, reads(i), representations),
     );
     this.encodedKvAttention = this.layers.every(layer => layer.attn.softcap === null);
     this.finalNorm = a.norm === "layernorm"
@@ -96,7 +93,7 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
       : loadRmsNorm(weights, "model.norm", a.normEps, a.norm === "rmsnorm_plus_one", audit);
     this.lmHead = a.tieWordEmbeddings
       ? null
-      : loadLinear(weights, "lm_head", config, audit, TRELLIS_FORMS);
+      : loadLinear(weights, "lm_head", config, audit, representations);
 
     // Load-time weight audit: unconsumed tensors (outside the arch's
     // sanitize drops) are a LOAD ERROR, never a silently-wrong model.
@@ -110,14 +107,14 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
     const five=(base:AnyLinear):RowProjection=> {
       if (!(base instanceof TrellisLinear)) return stockProjection(base);
       const dtype=facts.types.get(base)!;
-      return tiledTrellisPrefillEligible(base.geometry,5,dtype,false) ? new TrellisTiledPrompt(base)
+      return tiledTrellisPrefillEligible(base.geometry,5,dtype,representations.widePrefill) ? new TrellisTiledPrompt(base)
         : splitKTrellisPrefillEligible(base.geometry,5,dtype) ? new TrellisSplitKPrompt(base) : expandedProjection(base);
     };
     const nine=(base:AnyLinear):RowProjection=>base instanceof TrellisLinear
-      ? tiledTrellisPrefillEligible(base.geometry,9,facts.types.get(base)!,false) ? new TrellisTiledPrompt(base) : expandedProjection(base)
+      ? tiledTrellisPrefillEligible(base.geometry,9,facts.types.get(base)!,representations.widePrefill) ? new TrellisTiledPrompt(base) : expandedProjection(base)
       : stockProjection(base);
     const sixteen=(base:AnyLinear):RowProjection=>base instanceof TrellisLinear
-      ? tiledTrellisPrefillEligible(base.geometry,16,facts.types.get(base)!,false) ? new TrellisTiledPrompt(base) : expandedProjection(base)
+      ? tiledTrellisPrefillEligible(base.geometry,16,facts.types.get(base)!,representations.widePrefill) ? new TrellisTiledPrompt(base) : expandedProjection(base)
       : stockProjection(base);
     const expanded=(base:AnyLinear):RowProjection=>base instanceof TrellisLinear ? expandedProjection(base) : stockProjection(base);
     const bind=(from:number,to:number,project:(base:AnyLinear)=>RowProjection)=> {
@@ -139,16 +136,22 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
       ? hidden=>this.logitsFromHidden!(hidden) : view.head;
     this.prompt=this.#views.map(view=>({from:view.from,to:view.to,operation:(ids,cache)=>this.forwardLayers(this.#embed(ids),cache,"window",view.layers)}));
     this.multiSequencePrompt=this.prompt;
+    this.promptChunk=this.prompt;
+    this.multiSequencePromptChunk=this.multiSequencePrompt;
     this.appendKnown=this.#views.map(view=>({from:view.from,to:view.to,operation:(ids,cache)=>this.forwardLayers(this.#embed(ids),cache,"window",view.layers)}));
-    this.decode=rowTableFrom(rows=>{
+    const expandedView=this.#views.at(-1)!;
+    const decodeExpanded:MlxCapturingForward=(ids,cache)=>this.forwardLayers(this.#embed(ids),cache,"decode",expandedView.layers);
+    const verifyExpanded:MlxCapturingForward=(ids,cache)=>this.forwardLayers(this.#embed(ids),cache,"window",expandedView.layers);
+    // Admission caps do not remove the component's distinct 1–32 row forms.
+    this.decode=Object.freeze({...rowTableFrom<MlxCapturingForward>(rows=>{
       const view=this.#views.find(view=>rows>=view.from && rows<=view.to)!;
       return (ids,cache)=>this.forwardLayers(this.#embed(ids),cache,"decode",view.layers);
-    },maxPhaseRows);
-    this.verify=rowTableFrom(rows=>{
+    },Math.max(32,maxPhaseRows)),default:decodeExpanded});
+    this.verify=Object.freeze({...rowTableFrom<MlxCapturingForward>(rows=>{
       const view=this.#views.find(view=>rows>=view.from && rows<=view.to)!;
       return (ids,cache)=>this.forwardLayers(this.#embed(ids),cache,"window",view.layers);
-    },maxPhaseRows);
-    this.logits=rowTableFrom(rows=>head(this.#views.find(view=>rows>=view.from && rows<=view.to)!),maxPhaseRows);
+    },Math.max(32,maxPhaseRows)),default:verifyExpanded});
+    this.logits=Object.freeze({...rowTableFrom(rows=>head(this.#views.find(view=>rows>=view.from && rows<=view.to)!),Math.max(32,maxPhaseRows)),default:head(expandedView)});
     this.sequence=this.#views.map(view=>({from:view.from,to:view.to,operation:(ids,cache)=>this.forwardLayers(this.#embed(ids),cache,"window",view.layers)}));
     this.sequenceLogits=this.#views.map(view=>({from:view.from,to:view.to,operation:head(view)}));
 
@@ -192,6 +195,8 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
   /** One whole chunk of a prompt; rows are sequences times the chunk size. The GPU is this graph's one unit. */
   readonly prompt: readonly MlxPromptRange[];
   readonly multiSequencePrompt: readonly MlxPromptRange[];
+  readonly promptChunk: readonly MlxPromptRange[];
+  readonly multiSequencePromptChunk: readonly MlxPromptRange[];
 
   /** Known tokens: this graph declares no committed spans, so they read as a window. */
   readonly appendKnown: import("../../contracts/mlx/graph").MlxKnownOperations;

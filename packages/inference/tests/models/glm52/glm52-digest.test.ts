@@ -1,3 +1,4 @@
+import { rowOperationFor } from "../../../src/runtime/row-operations";
 import { knownOperationFor } from "../../../src/generation/phase-dispatch";
 import { bindGraphCaches } from "../../../src/models/cache-composition";
 import { GLM52_F32_CACHES } from "../../../src/models/glm52/model";
@@ -175,8 +176,8 @@ async function phase(graph: Glm52Model, which: Phase, ids: MlxArray, cache: Cach
   switch (which) {
     case "chunk": return await graph.multiSequencePrompt.at(-1)!.operation(ids, cache, null);
     case "tail": return await new MlxPhaseDispatch(graph).prompt("tail", 1, width)(ids, cache, null);
-    case "decode": return await graph.decode[width]!(ids, cache, null);
-    case "verify": return await graph.verify[width]!(ids, cache, null);
+    case "decode": return await rowOperationFor(graph.decode,width)(ids, cache, null);
+    case "verify": return await rowOperationFor(graph.verify,width)(ids, cache, null);
     case "known": return await knownOperationFor(graph.appendKnown, width)(ids, cache);
   }
 }

@@ -286,7 +286,9 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
     const multiSequencePrompt: MlxCapturingForward = (ids, cache) =>
     this.forwardLayers(this.embed.encode(ids), cache, "window");
     this.prompt = [{ from: 1, to: Infinity, operation: multiSequencePrompt }];
+    this.promptChunk = this.prompt;
     this.multiSequencePrompt = this.prompt;
+    this.multiSequencePromptChunk = this.multiSequencePrompt;
     this.appendKnown = [{from:1,to:Infinity,operation:(ids, cache) =>
     this.forwardLayers(this.embed.encode(ids), cache, "window")}];
     this.logits = rowTable<MlxHeadForward>(hidden => this.logitsFromHidden(hidden), maxPhaseRows);
@@ -337,6 +339,8 @@ export class MiniCPM5Model implements MlxDeclaredGraph, MlxTokenPhases {
 
   /** One whole chunk of a prompt; rows are sequences times the chunk size. The GPU is this graph's one unit. */
   readonly prompt: readonly MlxPromptRange[];
+  readonly promptChunk: typeof this.prompt;
+  readonly multiSequencePromptChunk: typeof this.multiSequencePrompt;
   readonly multiSequencePrompt: readonly MlxPromptRange[];
 
   /** A prompt's positions that are not a whole chunk: the window read at every width. */

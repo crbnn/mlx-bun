@@ -1,3 +1,4 @@
+import { rowOperationFor } from "../../runtime/row-operations";
 // Gemma-4 "-assistant" drafter — port of optiq's
 // runtime/spec/drafters/gemma_assistant.py (itself a port of Ollama's
 // x/models/gemma4/assistant.go, MIT).
@@ -204,7 +205,7 @@ export class GemmaAssistantDrafter implements AssistantDrafterModel {
    * Donors are chronological; position is the target's last position. */
   forward(lastTokenEmb: MlxArray, targetHidden: MlxArray,
     sharedKv: { sliding: [MlxArray, MlxArray]; full: [MlxArray, MlxArray] }, position: number): DrafterStep {
-    const result = this.forwardRows[1]!(lastTokenEmb, targetHidden, plainAssistantDonors(sharedKv, position), position);
+    const result = rowOperationFor(this.forwardRows, 1)(lastTokenEmb, targetHidden, plainAssistantDonors(sharedKv, position), position);
     try { return { token: ops.itemUint32(result.tokens), nextHidden: result.nextHidden }; }
     catch (error) { result.nextHidden.dispose(); throw error; }
     finally { result.tokens.dispose(); }

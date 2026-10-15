@@ -269,7 +269,9 @@ export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
     const windowSorted = (ids: MlxArray, cache: Cache[]) => this.forwardLayers(this.embed.encode(ids), cache, "window", sorted);
     this.prompt = [{ from: 1, to: sortFrom - 1, operation: windowUnsorted }, { from: sortFrom, to: Infinity, operation: windowSorted }]
       .filter(range => range.from <= range.to);
+    this.promptChunk = this.prompt;
     this.multiSequencePrompt = this.prompt;
+    this.multiSequencePromptChunk = this.multiSequencePrompt;
     this.decode = rowTableFrom(rows => rows < sortFrom ? decodeUnsorted : decodeSorted, maxPhaseRows);
     const windows = rowTableFrom(rows => rows < sortFrom ? windowUnsorted : windowSorted, maxPhaseRows);
     this.verify = windows;
@@ -317,6 +319,8 @@ export class Qwen3MoeModel implements MlxDeclaredGraph, MlxTokenPhases {
 
   /** One whole chunk of a prompt; rows are sequences times the chunk size. The GPU is this graph's one unit. */
   readonly prompt: readonly MlxPromptRange[];
+  readonly promptChunk: typeof this.prompt;
+  readonly multiSequencePromptChunk: typeof this.multiSequencePrompt;
   readonly multiSequencePrompt: readonly MlxPromptRange[];
 
   /** A prompt's positions that are not a whole chunk: the window read at every width. */

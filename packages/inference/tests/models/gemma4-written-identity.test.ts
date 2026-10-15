@@ -1,3 +1,4 @@
+import { rowOperationFor } from "../../src/runtime/row-operations";
 import { phaseRowLimit } from "../../src/models/graph";
 // The written Gemma graphs against the generic family over deterministic
 // synthetic weights: exact hidden/logits/cache bytes through prompt, decode,
@@ -12,13 +13,13 @@ import type { Weights } from "../../src/artifacts/weights";
 import type { BatchableCache, Cache } from "../../src/contracts/mlx/cache";
 import type { MlxTokenPhases } from "../../src/contracts/mlx/graph";
 import type { KvStorageScheme } from "../../src/contracts/portable/composition";
-import type { ServedComposition } from "../../src/models/implementation";
 import { Gemma4Model } from "../../src/models/gemma4/model";
 import { phaseHidden } from "./phase-forward";
 import { testGraph, testComposition } from "./test-composition";
 import * as current12b from "../../src/models/gemma4/gemma4-12b";
 import * as current26b from "../../src/models/gemma4/gemma4-26b";
 import * as currentE4b from "../../src/models/gemma4/gemma4-e4b";
+import { GEMMA_GRAPHS } from "../../src/models/gemma4/graphs";
 
 const HIDDEN = 256, INTER = 512, EXPERT_INTER = 128, VOCAB = 256, HEADS = 4, KV_HEADS = 2;
 const HEAD_DIM = 256, GLOBAL_HEAD_DIM = 512, WINDOW = 16, PER_LAYER = 64, EXPERTS = 16, TOP_K = 8;
@@ -158,7 +159,7 @@ const record = (label: string, diff: number, tensors: number) => {
 };
 afterAll(() => {
   for (const [label, { worst, tensors }] of results)
-    console.log(`gemma4-generated-identity ${label}: maxDiff ${worst} over ${tensors} tensors`);
+    console.log(`gemma4-written-identity ${label}: maxDiff ${worst} over ${tensors} tensors`);
 });
 
 /** Largest absolute difference after requiring equal shape, dtype and bytes. */
@@ -201,16 +202,11 @@ function stateDiff(label: string, actual: readonly Cache[], expected: readonly C
 // ── The graphs ──────────────────────────────────────────────────────────────
 
 type Graph = MlxTokenPhases & { makeCache(): Cache[]; logitsFromHidden(hidden: MlxArray): MlxArray };
-interface Generated {
-  readonly COMPOSITION: ServedComposition;
-  readonly GeneratedGemma4: { new (weights: Weights, config: ModelConfig): Graph & { readonly cacheLayers: readonly MlxCacheLayer[] }; readonly prototype: object };
-
-}
-const COMPOSITIONS: readonly { stem: string; repo: string; module: Generated }[] = [
-  { stem: "gemma4-e4b", repo: "gemma-4-e4b-it-OptiQ-4bit", module: currentE4b as unknown as Generated },
-  { stem: "gemma4-12b", repo: "gemma-4-12B-it-OptiQ-4bit", module: current12b as unknown as Generated },
-  { stem: "gemma4-26b", repo: "gemma-4-26B-A4B-it-OptiQ-4bit", module: current26b as unknown as Generated },
-];
+const GRAPHS = [
+  { stem: "gemma4-e4b", repo: "gemma-4-e4b-it-OptiQ-4bit", Graph: currentE4b.Gemma4E4b },
+  { stem: "gemma4-12b", repo: "gemma-4-12B-it-OptiQ-4bit", Graph: current12b.Gemma4TwelveB },
+  { stem: "gemma4-26b", repo: "gemma-4-26B-A4B-it-OptiQ-4bit", Graph: current26b.Gemma4Moe },
+] as const;
 
 const prompt = (n: number, salt: number) => Array.from({ length: n }, (_, i) => (i * 37 + salt * 11 + 5) % VOCAB);
 const ids = (rows: number[][]) => ops.fromInt32(rows.flat(), [rows.length, rows[0]!.length]);
@@ -237,20 +233,20 @@ function both(label: string, model: Graph, generic: Graph, mine: Cache[], theirs
   stateDiff(label, mine, theirs);
 }
 
-test("the generated graphs extend nothing", () => {
-  for (const c of COMPOSITIONS) expect(Object.getPrototypeOf(c.module.GeneratedGemma4.prototype)).toBe(Object.prototype);
+test("the written graphs extend nothing", () => {
+  for (const c of GRAPHS) expect(Object.getPrototypeOf(c.Graph.prototype)).toBe(Object.prototype);
 });
 
-for (const c of COMPOSITIONS) {
-  describe(`${c.stem}: the generated graph against the generic Gemma 4 graph, kv_config composition`, () => {
+for (const c of GRAPHS) {
+  describe(`${c.stem}: the written graph against the generic Gemma 4 graph, kv_config composition`, () => {
     let graphs: { model: Graph; generic: Graph } | null = null;
     const pair = async () => {
       if (graphs) return graphs;
       const { weights, config } = artifact(await fixtureConfig(c.repo), 1);
       const kv = artifactScheme(c.repo);
-      expect(c.module.COMPOSITION.kv![0]).toEqual({ kind: "affine-layers", layers: kv.layers });
+      expect(GEMMA_GRAPHS.find(entry => entry.id === c.stem)!.serves.kv![0]).toEqual({ kind: "affine-layers", layers: kv.layers });
       const composition = testComposition(kv);
-      return graphs = { model: bindGraphCaches(new c.module.GeneratedGemma4(weights, config), composition), generic: bindGraphCaches(new Gemma4Model(weights, config, phaseRowLimit(composition)), composition) };
+      return graphs = { model: bindGraphCaches(new c.Graph(weights, config), composition), generic: bindGraphCaches(new Gemma4Model(weights, config, phaseRowLimit(composition)), composition) };
 
     };
 
@@ -258,7 +254,7 @@ for (const c of COMPOSITIONS) {
       const { weights, config } = artifact(await fixtureConfig(c.repo), 7);
       const kv = artifactScheme(c.repo);
       for (const direct of [false, true]) {
-        const raw = new c.module.GeneratedGemma4(weights, config);
+        const raw = new c.Graph(weights, config);
         const composition = testComposition(kv, { pagedKv: { blockSize: 16, direct } });
         const model = testGraph(raw, composition);
         const standalone = model.makeCache();
@@ -348,13 +344,13 @@ for (const c of COMPOSITIONS) {
         using input = ids(rows);
         const count = input.size;
         try {
-          const actual = await model[phase][count]!(input, mine, null);
+          const actual = await rowOperationFor(model[phase], count)(input, mine, null);
           let expected: MlxArray | undefined;
           try {
-            expected = await generic[phase][count]!(input, theirs, null);
+            expected = await rowOperationFor(generic[phase], count)(input, theirs, null);
             maxDiff(actual, expected, `${c.stem} ${phase}${count} hidden`);
-            using left = model.logits[count]!(actual);
-            using right = generic.logits[count]!(expected);
+            using left = rowOperationFor(model.logits, count)(actual);
+            using right = rowOperationFor(generic.logits, count)(expected);
             maxDiff(left, right, `${c.stem} ${phase}${count} head`);
             stateDiff(`${c.stem} ${phase}${count}`, mine, theirs);
           } finally { actual.dispose(); expected?.dispose(); }

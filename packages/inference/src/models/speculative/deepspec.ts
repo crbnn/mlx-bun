@@ -29,7 +29,6 @@ import type {
   ContextKV, DeepspecContextAttention, DeepspecDraftRows, DeepspecDrafterModel, DrafterContextKV, DrafterContextProjection,
 } from "../../contracts/mlx/drafter";
 import type { MlxRowTable } from "../../contracts/mlx/graph";
-import { rowTableWithDefault } from "../row-table";
 import { isDeepspecArchitecture } from "./deepspec-artifact";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
@@ -415,11 +414,15 @@ export class DeepspecDrafter implements DeepspecDrafterModel {
   /** The context projection for every positive B·L row count (`matmulW`:
    *  MLX's quantized matmul, matmul for a BF16 checkpoint). */
   readonly projectContext: MlxRowTable<DrafterContextProjection> =
-    rowTableWithDefault({}, (targetHiddens: MlxArray) => this.#projectContext(targetHiddens));
+    Object.freeze({
+      default: (targetHiddens: MlxArray) => this.#projectContext(targetHiddens),
+    });
 
   /** Each layer's context K/V: the same operation for every positive B·L row count. */
   readonly projectContextKVRows: MlxRowTable<DrafterContextKV> =
-    rowTableWithDefault({}, (contextHidden: MlxArray, position: number | MlxArray) => this.#projectContextKVRows(contextHidden, position));
+    Object.freeze({
+      default: (contextHidden: MlxArray, position: number | MlxArray) => this.#projectContextKVRows(contextHidden, position),
+    });
 
   /**
    * Per-layer context K/V rows, projected + normed + ROPE'd, ready to cache
