@@ -249,6 +249,7 @@ for (const [family, checkpoint] of [
             const before = CompiledDecode.stepsExecuted, out: number[] = [];
             for await (const token of generate(graph, prompt, { maxTokens, temperature: 0, decodePolicy: { compiledDecode: graph === graphs[0], grammarJump: false } })) out.push(token.token);
             if (graph === graphs[0]) compiledSteps = CompiledDecode.stepsExecuted - before;
+            else expect(CompiledDecode.stepsExecuted - before, `${name}: generate's uncompiled control`).toBe(0);
             library.push(out);
           }
           expect(library[0]!.length, name).toBeGreaterThan(4);
@@ -259,18 +260,22 @@ for (const [family, checkpoint] of [
           let groupSteps = 0;
           for (const graph of graphs) {
             const binding = bindMlxGateway(graph);
-            const options = { temperature: 0, maxTokens, eosTokenIds: [] as number[], decodePolicy: { compiledDecode: graph === graphs[0], grammarJump: false } };
+            const options = { temperature: 0, maxTokens, eosTokenIds: [] as number[] };
             const plan = binding.plan(shape, options, { checkpoints: false });
-            expect(plan.compiledDecode, name).toBe(graph === graphs[0]);
+            // Both graphs declare the same compiled operation. The host applies
+            // the control policy after planning, just as generate receives its
+            // resolved decodePolicy; it does not change the graph's capability.
+            expect(plan.compiledDecode, name).toBe(true);
             const group = binding.createBatchGroup({ maxBatch: 1 });
             const before = CompiledDecode.stepsExecuted, out: number[] = [];
             try {
               await group.submit({
-                compiledDecode: plan.compiledDecode, promptIds: prompt, maxTokens, eosTokenIds: [],
+                compiledDecode: graph === graphs[0] && plan.compiledDecode, promptIds: prompt, maxTokens, eosTokenIds: [],
                 sample: (logits: MlxArray) => mlx.ops.argmaxAxis(logits, -1),
                 onToken(token: number) { out.push(token); } });
             } finally { await group.close(); }
             if (graph === graphs[0]) groupSteps = CompiledDecode.stepsExecuted - before;
+            else expect(CompiledDecode.stepsExecuted - before, `${name}: batch group's uncompiled control`).toBe(0);
             served.push(out);
           }
           expect(served[0], `${name}: batch group`).toEqual(served[1]);
