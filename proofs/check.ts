@@ -261,6 +261,14 @@ const proofFiles = [
   "kernels/sampling/LogSumExpRanges.lean",
   "kernels/sampling/GreedySampling.lean",
   "models/qwen/TokenSampledInitialRanges.lean",
+  "contracts/mlx/RelativeRounding.lean",
+  "contracts/mlx/RsqrtRelativeBounds.lean",
+  "contracts/mlx/NormalizedCastBounds.lean",
+  "contracts/mlx/SquaredSumRelativeBounds.lean",
+  "kernels/delta/RecurrenceStability.lean",
+  "kernels/delta/SiluRmsHeadsSumBounds.lean",
+  "kernels/delta/SiluRmsHeadsEnergy.lean",
+  "models/qwen/DeltaHeadEnergy.lean",
 ];
 
 const discoveredProofs = await Array.fromAsync(new Bun.Glob("**/*.lean").scan({
@@ -342,6 +350,7 @@ process.stdout.write(await runLake(["build",
   "Mathlib.Analysis.SpecialFunctions.Trigonometric.Bounds",
   "Mathlib.Data.List.FinRange",
   "Mathlib.Data.List.Nodup",
+  "Mathlib.Algebra.Order.BigOperators.Ring.Finset",
 ]));
 dependencyPath = (await runLake(["env", "printenv", "LEAN_PATH"])).trim();
 const sources = new Map<string, { source: string; expected: string }>();
@@ -426,6 +435,6 @@ try {
 } finally {
   await rm(dir, { recursive: true, force: true });
 }
-console.log(`Checked ${proofFiles.length} proof modules: Trellis and affine numerical bounds, MLX fast-qmv source-model equivalence, packed windows, conditional M1 loads, scratch stores, flushed binary32/bfloat16 arithmetic and range bounds, SwiGLU and sigmoid, RMS normalization, Delta convolution/recurrence/cache, Q/K normalization and partial RoPE, one-pass SDPA arithmetic and scratch transpose, plain KV append, quantized embedding, residual Delta/attention layer composition, initial cache state, and the conditional 64-layer token-to-logits source model with returned-cache bounds.`);
+console.log(`Checked ${proofFiles.length} proof modules: Trellis and affine numerical bounds, MLX fast-qmv source-model equivalence, packed windows, conditional M1 loads, scratch stores, flushed binary32/bfloat16 arithmetic and range bounds, SwiGLU and sigmoid, RMS normalization, Delta convolution/recurrence/cache and normalized-key stability, Q/K normalization and partial RoPE, one-pass SDPA arithmetic and scratch transpose, plain KV append, quantized embedding, residual Delta/attention layer composition, initial cache state, conditional first-token greedy selection with returned-cache bounds, and looped logsumexp/normalized argmax source models.`);
 console.log("Permitted axioms: propext, Classical.choice, Quot.sound. No native proof evaluation.");
 console.log("Scope: the first-token source model covers embedding, all 64 layers, final normalization, logits, 1024-thread looped logsumexp, normalized greedy selection and returned-cache error bounds, conditional on parameter and scalar/platform contracts. Selection maximizes the rounded normalized score with lowest-index ties; exact-real winner agreement requires an explicit numerical margin. Normalization literals have checked range certificates; their host attachment checker is outside Lean. Full checkpoint/loader binding, a useful final accuracy bound, subsequent-token stability, native memory/dispatch and hardware/compiler correspondence remain unproved.");
