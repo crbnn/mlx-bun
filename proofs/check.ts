@@ -12,6 +12,10 @@ let dependencyPath = "";
 // Reviewed manual translations, not a verified Metal/TypeScript frontend. Pins
 // prevent source drift; changing a hash requires reviewing the affected proofs.
 const sourcePins = {
+  "kernels/delta/silu-rms-heads.ts": "52c59772bf95e2cd8f7f813a69a7dfac0c352dadc3c2a1e0e550c054dd301145",
+  "kernels/residual-rms-norm.ts": "27353e109e7f91bc030fbd493785fcc4839eeccea2d585c22d610ba8f9e909d0",
+  "kernels/gated-rms-norm.ts": "e402118d33622ef62a017e964c257e23456d03f96b0fdc855b48704ff0fb954f",
+  "layers/delta-heads.ts": "3d44375dd8bf8be8ea6ebf9772a4c3f1321fa22f567e9e9c7e7da11301a87a6d",
   "kernels/delta/gated.ts": "3f0e11f777f57b6595d57d62ec3f8b8331cbfa7263183e1baa98892efe935aec",
   "models/qwen/blocks.ts": "2fa644511dbafc027cf4f191be69e932abda7d8c6a92ebe45f7d76332324645f",
   "layers/loading.ts": "8dba0d4a34db80b373fb99f36b8f72cfc4afc77f96241101b1c4352ac32ee550",
@@ -64,6 +68,7 @@ const proofFiles = [
   "kernels/trellis/SwiGLUStability.lean",
   "kernels/trellis/GateUpTailFlushToZero.lean",
   "kernels/trellis/GateUpSplitTail.lean",
+  "kernels/StableSigmoid.lean",
   "kernels/delta/Gates.lean",
   "kernels/delta/Softplus.lean",
   "kernels/delta/Decay.lean",
@@ -71,9 +76,13 @@ const proofFiles = [
   "kernels/delta/Layout.lean",
   "kernels/delta/Recurrence.lean",
   "kernels/delta/Inputs.lean",
+  "kernels/delta/SiluRmsHeads.lean",
+  "kernels/ResidualRmsNorm.lean",
+  "kernels/GatedRmsNorm.lean",
   "layers/TrellisCodebookGateUp.lean",
   "layers/TrellisCodebookDown.lean",
   "layers/Normalization.lean",
+  "layers/DeltaHeads.lean",
   "models/qwen/WrittenLayers.lean",
   "models/qwen/Blocks.lean",
 ];
@@ -218,6 +227,6 @@ try {
 } finally {
   await rm(dir, { recursive: true, force: true });
 }
-console.log(`Checked ${proofFiles.length} proof modules: decoding, packed windows, conditional M1 loads, initialization and scratch stores, flushed binary32/bfloat16 arithmetic, both SwiGLU tails including exponential overflow, single-row projection error propagation, RMS reduction and in-place ownership, weight preparation, packed bf16 boundaries, the normalized MLP residual block, and DeltaNet recurrence, tensor offsets, and cache-write bounds.`);
+console.log(`Checked ${proofFiles.length} proof modules: decoding, packed windows, conditional M1 loads, initialization and scratch stores, flushed binary32/bfloat16 arithmetic, SwiGLU and stable sigmoid including exponential overflow, single-row projection error propagation, RMS reduction and in-place ownership, weight preparation, packed bf16 boundaries, the normalized MLP residual block, DeltaNet softplus/decay and recurrence, tensor offsets and cache-write bounds, and fused head/residual/gated normalization.`);
 console.log("Permitted axioms: propext, Classical.choice, Quot.sound. No native proof evaluation.");
 console.log("Scope: these are conditional numerical bounds for reviewed source models. Hardware/compiler conformance, model-wide range bounds, native memory/dispatch, delta adapters, remaining kernels, and the complete inference graph remain unproved.");
