@@ -15,7 +15,7 @@ export interface GraphDescriptor {
  * - `pixels`: raw image pixels are the denoising method's own prefill input. */
 export type GraphMediaInput = "embeddings" | "embeddings+positions" | "pixels";
 
-/** Facts a graph declares once, when it is constructed. Composition binds the
+/** Portable facts about a bound graph. Composition binds the
  * operations these facts require and refuses what is genuinely missing;
  * scheduling reads only these declarations plus request and dynamic state
  * (batch membership, cache contents, cancellation), never a model's class or
@@ -33,7 +33,7 @@ export interface GraphCapabilities {
   readonly compiledDecode: boolean;
   /** Attention selects a sparse subset of positions (surfaced to clients). */
   readonly sparseAttention: boolean;
-  /** The graph exposes a pooled text-embedding path. */
+  /** Derived from the bound graph's pooled text-embedding operation. */
   readonly embeddings: boolean;
   /** Hidden-layer outputs can be tapped for drafts that read them. */
   readonly hiddenLayerTaps: boolean;
@@ -64,6 +64,14 @@ export interface GraphCapabilities {
     readonly grammarProposals: boolean;
   };
 }
+
+/** Facts supplied by a graph at construction. Pooled embedding support is the
+ * presence of its operation; only the bound portable description carries the
+ * derived boolean. `never` also rejects separately typed declaration objects
+ * that try to supply that flag. */
+export type GraphDeclaration = Omit<GraphCapabilities, "embeddings"> & {
+  readonly embeddings?: never;
+};
 
 /** A fused InferenceMethod can bypass this graph interface entirely. It need
  * only satisfy the method's output, cancellation, and ownership contracts. */

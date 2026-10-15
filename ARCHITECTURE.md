@@ -92,8 +92,13 @@ and lifetime establish that this is correct, with numerical and lifecycle eviden
 Sampling, caches, scheduling, and speculative methods compose through their
 contracts. Bind required operations and reject genuinely missing capabilities
 at the composition boundary rather than maintaining model/flag combination
-allowlists. For example, a missing draft head is a missing component. Dynamic
-request data, batch membership, cancellation, and state transitions still need
+allowlists. An operation's presence can itself declare a capability: pooled
+embeddings are declared by `embedPooled`, and the bound portable description
+derives its support flag from that operation. Graph construction uses
+`GraphDeclaration`; consumers that need the portable `GraphCapabilities` report
+use `graphCapabilitiesOf`. The types and seam ratchet prevent independent
+pooled-embedding flags from returning. A missing draft head is a missing
+component. Dynamic request data, batch membership, cancellation, and state transitions still need
 runtime handling. Graphs declare their capabilities when constructed; the gateway
 plans from those declarations and the app engine binds media through graph
 operations. Every graph implements `dispose()` and releases what it built;
@@ -367,7 +372,8 @@ the host's automatic choice (`pickDefault`), which the app supplies from the sel
   acceptance and the loader are exempt; profiling hooks and the two compile-context
   queries, `isCompiledTrace` and `isShapelessTracing`, which ask whether the graph is
   being recorded rather than run, by name), a
-  representation-specific cache read outside `state/`, and the removed whole-forward
+  representation-specific cache read outside `state/`, an independent pooled-embedding
+  flag passed to `declareGraph` or read from a graph's declaration, and the removed whole-forward
   entry points reached from `execution/` or `generation/`. Code that breaks them is
   listed per file in `seamRatchet`, whose counts may only fall; the table is empty,
   so any finding fails the gate with the paved road in its message.

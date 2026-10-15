@@ -22,20 +22,27 @@ Paged attention accepts numerical storage; adapter mounting accepts named LoRA
 targets; prompt preparation accepts encoder interfaces. Callers can supply their
 own implementations without subclassing a concrete model or cache.
 
-Each graph declares what it can do (`GraphCapabilities`, portable; a model exposes
-it as `graphCapabilities`): its method, media
-input, compiled decode, sparse attention, pooled embeddings, hidden-layer taps for
+Each graph declares its construction facts (`GraphDeclaration`, portable; a model
+exposes it as `graphCapabilities`): its method, media
+input, compiled decode, sparse attention, hidden-layer taps for
 drafts, a draft head its checkpoint carries (`nativeDraft`), whether long prompts prefill in workspace-bounded
 chunks, and what its verifier qualifies (adapters, logprobs, external tokens,
 grammar proposals). None names a cache format: the composition's caches serve
 every method, and the planner never reads how they store keys and values.
-`MlxDeclaredGraph` names the operations behind those promises (`embed`, `bindMediaInput`,
-`embedPooled`, `mediaEncoders`, `pixelInput`, `draftTarget`, `nativeDraftHead`, `trainable`,
+Pooled embedding support is the presence of `embedPooled` itself; graphs supply no
+separate `embeddings` flag. `graphCapabilitiesOf` derives that boolean in the
+portable `GraphCapabilities` description consumed by the gateway. `isEmbeddingModel`
+narrows the graph to its required pooling operation, and the existing
+`embedOne`/`embedMany` entry points consume it directly. The architecture ratchet
+rejects independent pooling flags and reads of the retired declaration field.
+`MlxDeclaredGraph` names the operations behind the other promises (`embed`, `bindMediaInput`,
+`mediaEncoders`, `pixelInput`, `draftTarget`, `nativeDraftHead`, `trainable`,
 `compiledDecodeStep` and `releaseCompiledDecode`, `expertResidency`) and the facts its
 composition declares (`verifyRoundCosts`, `knownSpans`, `mixed`), and
 `declaredGraph` in `models/capabilities` checks the pairing once when composition
-binds the graph: an undeclared graph, or a declaration without its operation, is
-refused. The gateway plans from the declarations, the request and dynamic state
+binds the graph: an undeclared graph, malformed pooling operation, or media
+declaration without its operation is refused. The gateway plans from the
+declarations, the request and dynamic state
 (batch membership, cache contents, cancellation), and
 `MlxGatewayBinding.capabilities` reports what it resolved. Supporting a new graph
 means declaring and implementing; `execution/` and the app engine need no edit.

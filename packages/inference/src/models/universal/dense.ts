@@ -6,7 +6,7 @@ import { Dtype, deviceArchitecture } from "@mlx-bun/mlx/ffi";
 import * as ops from "@mlx-bun/mlx/ops";
 import type { Cache } from "../../contracts/mlx/cache";
 import type { MlxCacheLayer, MlxSequenceRange, MlxRowTable, MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxPromptRange, MlxTokenPhases } from "../../contracts/mlx/graph";
-import type { GraphCapabilities } from "../../contracts/portable/graph";
+import type { GraphDeclaration } from "../../contracts/portable/graph";
 import { logitSoftcap } from "../../kernels/logits";
 import { qualifiedRepresentations, tiledTrellisPrefillEligible, splitKTrellisPrefillEligible } from "../../kernels/trellis/index";
 import { disposing } from "../../layers/helpers";
@@ -44,7 +44,7 @@ export class UniversalDenseModel implements MlxDeclaredGraph, MlxTokenPhases {
 
   /** A graph whose attention softcaps its scores verifies ordinary rounds only
    * (its layers read dense K/V through the softcapped read). */
-  get graphCapabilities(): GraphCapabilities {
+  get graphCapabilities(): GraphDeclaration {
     return declareGraph(this.encodedKvAttention === false ? { speculation: ORDINARY_VERIFICATION } : {});
   }
   // Cache layout and each layer's read come from the same descriptor facts,

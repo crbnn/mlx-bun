@@ -1,5 +1,5 @@
 import type { ModelConfig } from "../../artifacts/config";
-import type { GraphCapabilities } from "../../contracts/portable/graph";
+import type { GraphDeclaration } from "../../contracts/portable/graph";
 import { declaredGraph } from "../../models/capabilities";
 import type { PrefillPolicy } from "../../contracts/portable/prefill";
 import { sdpaFallbackBytes } from "../../state/kv-scheme";
@@ -8,7 +8,7 @@ import type { RuntimeConfig } from "../../runtime/config";
 /** The graph facts prefill sizing reads: its geometry and its declaration. */
 export interface PrefillSizedGraph {
   readonly config: ModelConfig;
-  readonly graphCapabilities: GraphCapabilities;
+  readonly graphCapabilities: GraphDeclaration;
 }
 
 /** Retain large chunks for short prompts, but where the graph declares a

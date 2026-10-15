@@ -30,7 +30,7 @@ import type { ModelConfig } from "../../artifacts/config";
 import type { Weights } from "../../artifacts/weights";
 import { Checkpoint } from "@mlx-bun/mlx/checkpoint";
 import { LoraState } from "../../layers/lora";
-import type { GraphCapabilities } from "../../contracts/portable/graph";
+import type { GraphDeclaration } from "../../contracts/portable/graph";
 import type { MlxCapturingForward, MlxRowTable, MlxCompiledDecodeStep, MlxDeclaredGraph, MlxHeadForward, MlxLayerCapture, MlxMixedForward, MlxPhaseForward, MlxKnownOperations, MlxPromptRange, MlxTokenPhases, MlxVerifyForward } from "../../contracts/mlx/graph";
 import { CompiledDecode } from "./compiled-decode";
 import type { TargetView } from "../../contracts/mlx/draft-target";
@@ -176,7 +176,7 @@ export class Gemma4Model implements MlxDeclaredGraph, MlxTokenPhases {
   /** Prepared image/audio embeddings, layer taps for drafts, and a compiled
    * decode step, except through experts: shapeless replay
    * retraces their growing windows. */
-  get graphCapabilities(): GraphCapabilities {
+  get graphCapabilities(): GraphDeclaration {
     return declareGraph({
       media: { input: "embeddings", video: false }, hiddenLayerTaps: true,
       compiledDecode: this.config?.modelType?.startsWith("gemma4") === true && !this.config.text.enableMoeBlock,

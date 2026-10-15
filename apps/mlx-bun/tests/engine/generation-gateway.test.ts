@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { GenerationGateway } from "../../src/engine/generation-gateway";
 import type { RequestShape, Vision } from "../../src/engine/completion";
-import { declareGraph } from "@mlx-bun/inference/models";
+import { declareGraph, graphCapabilitiesOf } from "@mlx-bun/inference/models";
 import { UnsupportedExecutionError } from "../../src/engine/completion";
 import { runtimeConfig } from "@mlx-bun/inference/runtime/config";
 import type { MlxGatewayBinding, MlxBatchGroup } from "@mlx-bun/inference/execution";
@@ -26,7 +26,8 @@ function fake(options: { submit?: MlxBatchGroup["submit"]; plan?: MlxGatewayBind
   const group: MlxBatchGroup = { activeRows: 0, pendingRows: 0, kick() {}, async close() { closed = true; },
     submit: options.submit ?? (async request => { await request.onToken(7); return result; }),
   };
-  const binding = { config: { modelType: "replacement", eosTokenIds: [2] } as MlxGatewayBinding["config"], runtime: runtimeConfig(), capabilities: declareGraph(),
+  const binding = { config: { modelType: "replacement", eosTokenIds: [2] } as MlxGatewayBinding["config"], runtime: runtimeConfig(),
+    capabilities: graphCapabilitiesOf({ graphCapabilities: declareGraph(), dispose() {} }),
     plan: options.plan ?? (() => execution), reusesPrefix: () => true,
     graph: { makeCache: () => [], config: { modelType: "replacement", eosTokenIds: [2] } as MlxGatewayBinding["config"] },
     continuationRequest(_execution, _options, _prompt, onToken) {

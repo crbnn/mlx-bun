@@ -26,7 +26,7 @@ import { QuantizedLinear, QuantizedLinearPlain, QuantizedLinearRows } from "../.
 import { RMSNorm } from "../../layers/normalization";
 import { type Cache } from "../../contracts/mlx/cache";
 import { qwen35WeightsView } from "./checkpoint";
-import type { GraphCapabilities } from "../../contracts/portable/graph";
+import type { GraphDeclaration } from "../../contracts/portable/graph";
 import type { MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxKnownSpans, MlxLayerCapture, MlxPromptRange, MlxTokenPhases, MlxVerifyForward, MlxRowTable } from "../../contracts/mlx/graph";
 import type { TargetView } from "../../contracts/mlx/draft-target";
 import type { MediaEncoders, MlxPromptInput, Vision } from "../../contracts/mlx/media";
@@ -82,7 +82,7 @@ export class Qwen35Model implements MlxDeclaredGraph, MlxTokenPhases {
   /** Prepared image and video embeddings with request-owned mRoPE positions,
    * layer taps for drafts. Its few full-attention layers materialize their
    * scores at long context, so prefill chunks shrink to bound that workspace. */
-  get graphCapabilities(): GraphCapabilities {
+  get graphCapabilities(): GraphDeclaration {
     return declareGraph({
       media: { input: "embeddings+positions", video: true }, hiddenLayerTaps: true,
       prefill: { boundedWorkspace: true },

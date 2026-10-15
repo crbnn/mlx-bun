@@ -20,7 +20,7 @@ import { ColibriGlm52ResidentWeights } from "../../artifacts/glm52/resident-weig
 import { ColibriGlm52Weights } from "../../artifacts/glm52/weights";
 import { type Cache, type LatentAttentionCache } from "../../contracts/mlx/cache";
 import { LoraState } from "../../layers/lora";
-import type { GraphCapabilities } from "../../contracts/portable/graph";
+import type { GraphDeclaration } from "../../contracts/portable/graph";
 import type { MlxRowTable, MlxCapturingForward, MlxDeclaredGraph, MlxHeadForward, MlxKnownOperations, MlxPromptRange, MlxTokenPhases } from "../../contracts/mlx/graph";
 import { declareGraph } from "../capabilities";
 import { type QuantizedLinear } from "../../layers/quantized-linear";
@@ -690,7 +690,7 @@ export class Glm52Model implements MlxDeclaredGraph, MlxTokenPhases {
   readonly loraState = new LoraState();
   /** Attends its own compressed MLA storage, which no KV scheme converts. Adapters
    * are not offered on streamed experts. */
-  get graphCapabilities(): GraphCapabilities {
+  get graphCapabilities(): GraphDeclaration {
     return declareGraph({
       sparseAttention: this.capabilities?.dsa === true,
       nativeDraft: this.capabilities?.mtpEnabled === true

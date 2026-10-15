@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { loadModelConfig } from "../../src/artifacts/config";
-import { declareGraph, declaredGraph } from "../../src/models/capabilities";
+import { declareGraph, declaredGraph, graphCapabilitiesOf } from "../../src/models/capabilities";
 import { BUILTIN_ARTIFACT_PROFILES, chatTemplateFallbackFor, embeddingDeclarationFor, generationDefaultsFor, GENERIC_GENERATION_DEFAULTS,
   mediaTokenDeclarationFor, resolveModelProfile, sentinelDeclarationFor, type ResolvedModelProfile } from "../../src/models/profile";
 import { loadModelChatTemplate } from "../../src/models/chat-template";
@@ -48,10 +48,10 @@ describe("pooled embeddings", () => {
     for (const type of ["llama", "qwen3_5", "qwen3_moe", "gemma4", "whisper", "glm_moe_dsa"]) expect(isEmbeddingModelType(type)).toBe(false);
   });
 
-  test("a graph that declares embeddings must provide the pooling operation", () => {
-    expect(() => declaredGraph({ graphCapabilities: declareGraph({ embeddings: true }) })).toThrow("provides no embedPooled");
-    expect(declaredGraph({ graphCapabilities: declareGraph({ embeddings: true }), embedPooled: () => { throw new Error("unused"); } })
-      .graphCapabilities.embeddings).toBe(true);
+  test("the pooling operation declares embedding support", () => {
+    expect(graphCapabilitiesOf(declaredGraph({ graphCapabilities: declareGraph() })).embeddings).toBe(false);
+    expect(graphCapabilitiesOf(declaredGraph({ graphCapabilities: declareGraph(), embedPooled: () => { throw new Error("unused"); } }))
+      .embeddings).toBe(true);
   });
 
   test("the terminator id comes from the tokenizer and must be one token", () => {

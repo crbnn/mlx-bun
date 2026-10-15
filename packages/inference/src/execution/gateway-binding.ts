@@ -4,7 +4,7 @@ import { createOrdinaryContinuationRequest } from "./continuation-request";
 import type { ExecutionContext } from "../contracts/portable/scheduling";
 import type { ModelConfig } from "../artifacts/config";
 import type { MlxTokenGraph } from "../models/graph";
-import { declaredGraph } from "../models/capabilities";
+import { declaredGraph, graphCapabilitiesOf } from "../models/capabilities";
 import { BF16_KV, COMPOSITION_DEFAULTS, type KvStorageScheme } from "../contracts/portable/composition";
 import { runtimeConfig, type RuntimeConfig } from "../runtime/config";
 import type { CacheServiceGraph } from "../state/cache-service";
@@ -82,7 +82,7 @@ export function bindMlxGateway(model: MlxTokenGraph,
   // The declarations are resolved once, when the graph is bound; planning reads
   // only these and the request.
   const graph = declaredGraph(model);
-  const caps = graph.graphCapabilities;
+  const caps = graphCapabilitiesOf(graph);
   const verification = caps.speculation;
   // Denoising rows interleave through their own grouped method. Token-level
   // methods (speculation, grammar proposals, fill) never bind to this graph.

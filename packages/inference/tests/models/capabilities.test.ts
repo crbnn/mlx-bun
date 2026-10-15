@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { declareGraph, declaredGraph, ORDINARY_VERIFICATION } from "../../src/models/capabilities";
+import { declareGraph, declaredGraph, graphCapabilitiesOf, ORDINARY_VERIFICATION } from "../../src/models/capabilities";
 import { testComposition } from "./test-composition";
 import { Gemma4Model } from "../../src/models/gemma4/model";
 import { UniversalDenseModel } from "../../src/models/universal/dense";
@@ -34,7 +34,9 @@ describe("every graph declares its capabilities", () => {
   test("ordinary autoregressive graphs declare the defaults: every method over every cache lego", () => {
     expect(graph(MiniCPM5Model.prototype).graphCapabilities).toEqual(plainCaps);
     expect(graph(Qwen3MoeModel.prototype).graphCapabilities).toEqual(plainCaps);
-    expect(graph(Qwen3Model.prototype).graphCapabilities).toEqual(declareGraph({ embeddings: true }));
+    expect(graph(Qwen3Model.prototype).graphCapabilities).toEqual(plainCaps);
+    expect(graphCapabilitiesOf(graph(Qwen3Model.prototype)).embeddings).toBe(true);
+    expect(graphCapabilitiesOf(graph(Qwen3MoeModel.prototype)).embeddings).toBe(false);
   });
 
   test("a universal graph reads its own attention: softcapped layers verify ordinary rounds only", () => {
