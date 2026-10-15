@@ -35,6 +35,7 @@ const sourcePins = {
   "layers/trellis-codebook-gate-up.ts": "28d27e84cb669c18a4532723e8dbc66786e386a4390454121640a3e14e5526f5",
   "layers/trellis-codebook-down.ts": "48752c429a3ab558131f95c6d361b15b6795c3bb6ee161f8afdca71609437898",
   "models/qwen/written-layers.ts": "ebf7710ffdf202d3e25ec7721930e5d992df31fb3d7fa5bde9709aa7a608c2c9",
+  "models/qwen/checkpoint.ts": "1ec846424a2d4e5a046bcb62b43a5e6b8e1f3d9c2b4b3f5f3d7180276362edd8",
 };
 // Exact upstream source for the reviewed MLX convolution, qmv and RoPE translations.
 // These pins do not establish correspondence with the bundled native binary.
@@ -71,6 +72,7 @@ const proofFiles = [
   "contracts/mlx/DyadicCover.lean",
   "contracts/mlx/Negation.lean",
   "contracts/mlx/BFloat16Arithmetic.lean",
+  "contracts/mlx/TensorWords.lean",
   "contracts/mlx/BFloat16Fma.lean",
   "contracts/mlx/BFloat16Bounds.lean",
   "contracts/mlx/BFloat16UnitInterval.lean",
@@ -233,6 +235,9 @@ const proofFiles = [
   "models/qwen/DecodeChainInitialRanges.lean",
   "models/qwen/Qwen38TrellisM1MaxInitialRanges.lean",
   "models/qwen/TokenInitialRanges.lean",
+  "models/qwen/CheckpointTransforms.lean",
+  "models/qwen/CheckpointRanges.lean",
+  "models/qwen/CheckpointNormalizationData.lean",
 ];
 
 const discoveredProofs = await Array.fromAsync(new Bun.Glob("**/*.lean").scan({
@@ -295,6 +300,8 @@ console.log("Building pinned numerical proof dependencies...");
 process.stdout.write(await runLake(["build",
   "FloatLib.Floats.Formats.BinaryInterchange.Analysis.StandardModel",
   "FloatLib.Floats.Formats.BinaryInterchange.Arithmetic.LeanModel.MulDiv",
+  "FloatLib.Floats.Formats.BinaryInterchange.Arithmetic.SqrtSemantics",
+  "FloatLib.Floats.Formats.BinaryInterchange.IntervalSemantics.Order",
   "FloatLib.Floats.Formats.IEEE754.Native.Model",
   "FloatLib.Floats.Formats.IEEE754.Native.AddSub",
   "FloatLib.Floats.Formats.IEEE754.Native.Integer.Constructors",
@@ -398,4 +405,4 @@ try {
 }
 console.log(`Checked ${proofFiles.length} proof modules: Trellis and affine numerical bounds, MLX fast-qmv source-model equivalence, packed windows, conditional M1 loads, scratch stores, flushed binary32/bfloat16 arithmetic and range bounds, SwiGLU and sigmoid, RMS normalization, Delta convolution/recurrence/cache, Q/K normalization and partial RoPE, one-pass SDPA arithmetic and scratch transpose, plain KV append, quantized embedding, residual Delta/attention layer composition, initial cache state, and the conditional 64-layer token-to-logits source model with returned-cache bounds.`);
 console.log("Permitted axioms: propext, Classical.choice, Quot.sound. No native proof evaluation.");
-console.log("Scope: these are conditional numerical bounds for reviewed source models. Hardware/compiler conformance, model-wide range bounds, native memory/dispatch, delta adapters, remaining kernels, and the complete inference graph remain unproved.");
+console.log("Scope: first-token source-model ranges and error composition cover embedding, all 64 layers, final normalization, logits and returned caches, conditional on parameter and scalar/platform contracts. Normalization literals have checked range certificates; their host attachment checker is outside Lean. Full checkpoint/loader binding, a useful final accuracy bound, subsequent-token stability, native memory/dispatch and hardware/compiler correspondence remain unproved.");
