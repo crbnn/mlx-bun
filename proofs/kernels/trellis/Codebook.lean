@@ -1,13 +1,13 @@
 import Std
 
 /-
-First arithmetic obligation for the Qwen3.8-27B Trellis M1 Max graph.
+Arithmetic and packed-state obligations for the Qwen3.8-27B Trellis M1 Max graph.
 Run: bun proofs/check.ts (Lean 4.35.0 must be on PATH).
 
 Paths under proofs/ mirror packages/inference/src/, with PascalCase Lean
 module filenames. This module corresponds to kernels/trellis/codebook.ts.
 
-The implementation below is a manually reviewed translation of trellis_y in
+The definitions below are manually reviewed translations of helpers in
 packages/inference/src/kernels/trellis/codebook.ts. check.ts pins that source;
 the pin prevents silent drift but does not prove the translation correct.
 
@@ -19,8 +19,11 @@ All proofs use ordinary proof terms checked by Lean's logical kernel. The
 axiom checks below permit only propext, Classical.choice, and Quot.sound;
 native computation assumptions, custom axioms, and proof holes are rejected.
 
-This proves the integer helper, not floating-point decoding, GPU memory access,
-a projection kernel, a layer, or the complete inference graph.
+This proves helper arithmetic, floating-point decoder contracts, and packed
+window extraction. It does not prove GPU execution, a complete projection
+kernel, a layer, or the inference graph. Float32 uses Lean 4.35's reducible
+binary32 model (round to nearest, ties to even); Metal compilation and hardware
+correspondence remain outside these proofs.
 -/
 namespace Inference.Kernels.Trellis.Codebook
 
@@ -198,9 +201,6 @@ theorem cyclic_correct (w : Nat → BitVec 32) (k t j : Nat)
     have hb : (255-t)*k%32+j-32 = ((255-t)*k+j)%32 := by omega
     rw [hw, hb]
 
-#print axioms correct
-#print axioms geometry
-#print axioms cyclic_correct
 end PackedState
 
 
@@ -218,7 +218,7 @@ theorem mask_bit (j : Nat) : (16383#32).getLsbD j = decide (j < 14) := by
   change Nat.testBit (2^14-1) j = decide (j < 14)
   exact Nat.testBit_two_pow_sub_one 14 j
 
-theorem correct (w : Nat → BitVec 32) (off j : Nat) (ho : off ≤ 60) (hj : j < 12) :
+theorem correct (w : Nat → BitVec 32) (off j : Nat) (ho : off ≤ 124) (hj : j < 12) :
     (byteOffset w off >>> 2).getLsbD j =
       (w ((off+j)/32)).getLsbD ((off+j)%32) := by
   unfold byteOffset
@@ -282,12 +282,162 @@ theorem lane_geometry (k i : Nat) (hk : k=2 ∨ k=3 ∨ k=4) (hi : i<16) :
 -- cannot establish a portable aligned float load. M1 load semantics are needed.
 theorem unaligned_witness : (byteOffset (fun _ => 1#32) 2).toNat % 4 = 1 := by decide
 
-#print axioms correct
-#print axioms byteOffset_bound
-#print axioms index_bound
-#print axioms load_indices
-#print axioms lane_geometry
-#print axioms unaligned_witness
 end CodebookWindow
+
+
+namespace FloatingPoint
+set_option maxRecDepth 10000
+set_option maxHeartbeats 0
+
+def divisor : Float32 := 147.800537109375
+
+def reference (y : Int) : Float32 := Float32.ofInt y / divisor
+
+def reciprocal : Float32 := 1 / divisor
+
+def unrefined (y : Int) : Float32 := Float32.ofInt y * reciprocal
+
+def refined (y : Int) : Float32 :=
+  let yf := Float32.ofInt y
+  let q := yf * reciprocal
+  let e := Float32.fma (-q) divisor yf
+  Float32.fma e reciprocal q
+
+def lifted (y : Int) : Float32 :=
+  Float32.ofBits (0x4b000000 ||| UInt32.ofInt (y + 510)) - 8389118
+
+theorem lifted_correct : ∀ i : Fin 1021,
+    (lifted (i.val - 510)).toBits = (Float32.ofInt (i.val - 510)).toBits := by decide +kernel
+
+theorem refined_correct : ∀ i : Fin 1021,
+    (refined (i.val - 510)).toBits = (reference (i.val - 510)).toBits := by decide +kernel
+
+-- Float.toFloat32 is opaque; explicitly round its binary64 logical value.
+def narrow (v : Float) : Float32 :=
+  let rounded := match v.toModel.unpack with
+    | .finite s m e _ => Float.Model.UnpackedFloat.round .binary32 s m e
+    | x => x
+  Float32.ofModel (Float32.Model.pack rounded)
+
+def host (y : Int) : Float32 := narrow (Float.ofInt y / (147.800537109375 : Float))
+
+theorem host_correct : ∀ i : Fin 1021,
+    (host (i.val - 510)).toBits = (reference (i.val - 510)).toBits := by decide +kernel
+
+-- Exact dyadic value in units of 2^-32. For this domain, exponents are >= -32.
+def scaled (v : Float32) : Int := match v.toModel.unpack with
+  | .finite s m e _ => s.apply (m * 2^(e + 32).toNat)
+  | _ => 0
+
+def representable (v : Float32) : Bool := match v.toModel.unpack with
+  | .finite _ _ e _ => decide (-32 ≤ e)
+  | .zero _ => true
+  | _ => false
+
+def errorNumerator (v : Float32) (y : Int) : Nat :=
+  (scaled v * 605391 - y * 4096 * 2^32).natAbs
+
+-- Since d = 605391/4096, these integer inequalities state relative error
+-- bounds of 2^-24 and 2^-23 against the exact rational y/d. At y=0 they
+-- assert zero absolute error. representable ensures scaled is the exact
+-- dyadic value multiplied by 2^32, not its fallback for non-finite inputs.
+theorem reference_accuracy : ∀ i : Fin 1021,
+    representable (reference (i.val - 510)) = true ∧
+    errorNumerator (reference (i.val - 510)) (i.val - 510) * 2^24 ≤
+      ((i.val - 510 : Int) * 4096 * 2^32).natAbs := by decide +kernel
+
+theorem unrefined_relative_accuracy : ∀ i : Fin 1021,
+    representable (unrefined (i.val - 510)) = true ∧
+    errorNumerator (unrefined (i.val - 510)) (i.val - 510) * 2^23 ≤
+      ((i.val - 510 : Int) * 4096 * 2^32).natAbs := by decide +kernel
+
+theorem unrefined_accuracy : ∀ i : Fin 1021,
+    ((unrefined (i.val - 510)).toBits.toNat : Int) - (reference (i.val - 510)).toBits.toNat ≤ 1 ∧
+    ((reference (i.val - 510)).toBits.toNat : Int) - (unrefined (i.val - 510)).toBits.toNat ≤ 1 ∧
+    (unrefined (i.val - 510)).isFinite = true := by decide +kernel
+
+-- The fast decoder's contract is accuracy, not equality to precise division.
+theorem unrefined_not_exact : (unrefined 9).toBits ≠ (reference 9).toBits := by decide +kernel
+
+private theorem eq_of_bits_eq (a b : Float32) (h : a.toBits = b.toBits) : a = b := by
+  cases a with
+  | ofModel a =>
+    cases b with
+    | ofModel b =>
+      cases a with
+      | mk ab av =>
+        cases b with
+        | mk bb bv =>
+          change ab = bb at h
+          cases h
+          rfl
+
+-- Compose the integer range theorem with the exhaustive binary32 proof.
+-- These statements cover every uint32 state, not just the 4096 LUT entries.
+def stateIndex (s : BitVec 32) : Fin 1021 :=
+  ⟨(implementation s + 510).toNat, by have h := range s; omega⟩
+
+theorem stateIndex_value (s : BitVec 32) : (stateIndex s).val - (510 : Int) = implementation s := by
+  have h := range s
+  simp only [stateIndex]
+  omega
+
+theorem refined_state_correct (s : BitVec 32) :
+    (refined (implementation s)).toBits = (host (specification s)).toBits := by
+  have hr := refined_correct (stateIndex s)
+  have hh := host_correct (stateIndex s)
+  rw [stateIndex_value] at hr hh
+  rw [← correct s]
+  exact hr.trans hh.symm
+
+theorem lifted_state_correct (s : BitVec 32) :
+    lifted (implementation s) = Float32.ofInt (specification s) := by
+  apply eq_of_bits_eq
+  have h := lifted_correct (stateIndex s)
+  rw [stateIndex_value, correct] at h
+  simpa only [correct] using h
+
+theorem unrefined_bits_state_correct (s : BitVec 32) :
+    (lifted (implementation s) * reciprocal).toBits =
+      (unrefined (specification s)).toBits := by
+  rw [lifted_state_correct]
+  rfl
+
+theorem unrefined_state_accuracy (s : BitVec 32) :
+    representable (unrefined (implementation s)) = true ∧
+    errorNumerator (unrefined (implementation s)) (specification s) * 2^23 ≤
+      (specification s * 4096 * 2^32).natAbs := by
+  have h := unrefined_relative_accuracy (stateIndex s)
+  rw [stateIndex_value] at h
+  simpa only [correct] using h
+
+def bfloat (v : Float32) : Float32 :=
+  let u := v.toBits
+  Float32.ofBits ((u + (0x7fff : UInt32) + ((u >>> (16 : UInt32)) &&& (1 : UInt32))) &&& (0xffff0000 : UInt32))
+
+def bfloatReference (v : Float32) : Float32 :=
+  let fmt : Float.Model.Format := { mantissaBitsWithoutImplicit := 7, exponentBits := 8 }
+  let rounded := match v.toModel.unpack with
+    | .finite s m e _ => Float.Model.UnpackedFloat.round fmt s m e
+    | x => x
+  -- Re-normalize the 8-significand-bit result for binary32 packing.
+  let widened := match rounded with
+    | .finite s m e _ => Float.Model.UnpackedFloat.round .binary32 s m e
+    | x => x
+  Float32.ofModel (Float32.Model.pack widened)
+
+theorem bfloat_correct : ∀ i : Fin 1021,
+    (bfloat (reference (i.val - 510))).toBits = (bfloatReference (reference (i.val - 510))).toBits := by decide +kernel
+
+theorem bfloat_state_correct (s : BitVec 32) :
+    (bfloat (refined (implementation s))).toBits =
+      (bfloatReference (host (specification s))).toBits := by
+  have hr := refined_correct (stateIndex s)
+  have hh := host_correct (stateIndex s)
+  have hb := bfloat_correct (stateIndex s)
+  rw [stateIndex_value] at hr hh hb
+  rw [eq_of_bits_eq _ _ hr, ← correct s, eq_of_bits_eq _ _ hh]
+  exact hb
+end FloatingPoint
 
 end Inference.Kernels.Trellis.Codebook
