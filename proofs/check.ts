@@ -58,12 +58,17 @@ const proofFiles = [
   "contracts/mlx/Numerics.lean",
   "contracts/mlx/FlushToZero.lean",
   "contracts/mlx/Arithmetic.lean",
+  "contracts/mlx/Float32Bounds.lean",
+  "contracts/mlx/NativeMultiplication.lean",
+  "contracts/mlx/NativeFma.lean",
+  "contracts/mlx/ArithmeticBounds.lean",
   "contracts/mlx/Division.lean",
   "contracts/mlx/BFloat16.lean",
   "contracts/mlx/Negation.lean",
   "contracts/mlx/BFloat16Arithmetic.lean",
   "contracts/mlx/BFloat16Fma.lean",
   "contracts/mlx/BFloat16Bounds.lean",
+  "contracts/mlx/BFloat16ConversionBounds.lean",
   "contracts/mlx/ElementwiseAdd.lean",
   "contracts/mlx/Reduction.lean",
   "contracts/mlx/FlushedReduction.lean",
@@ -112,6 +117,7 @@ const proofFiles = [
   "kernels/delta/Decay.lean",
   "kernels/delta/Gated.lean",
   "kernels/delta/Convolution.lean",
+  "kernels/delta/ConvolutionBounds.lean",
   "kernels/delta/Layout.lean",
   "kernels/delta/Recurrence.lean",
   "kernels/delta/Inputs.lean",
@@ -151,6 +157,8 @@ const proofFiles = [
   "models/qwen/DecodeChain.lean",
   "models/qwen/Qwen38TrellisM1Max.lean",
   "models/qwen/TokenInference.lean",
+  "models/qwen/EmbeddingRanges.lean",
+  "models/qwen/InitialState.lean",
 ];
 
 const discoveredProofs = await Array.fromAsync(new Bun.Glob("**/*.lean").scan({
@@ -312,6 +320,6 @@ try {
 } finally {
   await rm(dir, { recursive: true, force: true });
 }
-console.log(`Checked ${proofFiles.length} proof modules: Trellis and affine numerical bounds, MLX fast-qmv source-model equivalence, packed windows, conditional M1 loads, scratch stores, flushed binary32/bfloat16 arithmetic, SwiGLU and sigmoid, RMS normalization, Delta convolution/recurrence/cache, Q/K normalization and partial RoPE, one-pass SDPA arithmetic and scratch transpose, plain KV append, residual Delta/attention layer composition, and the 64-layer embedded-row-to-logits source model with returned-cache bounds.`);
+console.log(`Checked ${proofFiles.length} proof modules: Trellis and affine numerical bounds, MLX fast-qmv source-model equivalence, packed windows, conditional M1 loads, scratch stores, flushed binary32/bfloat16 arithmetic and range bounds, SwiGLU and sigmoid, RMS normalization, Delta convolution/recurrence/cache, Q/K normalization and partial RoPE, one-pass SDPA arithmetic and scratch transpose, plain KV append, quantized embedding, residual Delta/attention layer composition, initial cache state, and the conditional 64-layer token-to-logits source model with returned-cache bounds.`);
 console.log("Permitted axioms: propext, Classical.choice, Quot.sound. No native proof evaluation.");
 console.log("Scope: these are conditional numerical bounds for reviewed source models. Hardware/compiler conformance, model-wide range bounds, native memory/dispatch, delta adapters, remaining kernels, and the complete inference graph remain unproved.");
