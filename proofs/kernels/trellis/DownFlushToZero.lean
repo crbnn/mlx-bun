@@ -142,11 +142,11 @@ def projectionExpr : Reduction.Tree 32 → DotProduct.Expr
 theorem evaluate_projection (words : PackedMatrix) (k : Nat) (scale input : Nat → Float32)
     (col : Nat) (tree : Reduction.Tree 32) :
     FlushedDotProduct.evaluate (fun row => coefficient words k row col) scale input (projectionExpr tree) =
-      GateUpFlushToZero.evaluateTree (fun y => partialSum words k scale input y.val col) tree := by
+      FlushedReduction.evaluate (fun y => partialSum words k scale input y.val col) tree := by
   induction tree with
   | leaf y => exact evaluate_partial words k scale input y.val col
   | add a b ia ib =>
-    simp only [projectionExpr, FlushedDotProduct.evaluate, GateUpFlushToZero.evaluateTree, ia, ib]
+    simp only [projectionExpr, FlushedDotProduct.evaluate, FlushedReduction.evaluate, ia, ib]
 
 theorem ideal_split (term : Nat → ℝ) (split : Nat) :
     DotProduct.ideal term (splitExpr split) = ∑ r : Fin 136, term (split*136+r.val) := by

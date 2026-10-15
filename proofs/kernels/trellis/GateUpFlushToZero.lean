@@ -1,4 +1,5 @@
 import contracts.mlx.FlushedDotProduct
+import contracts.mlx.FlushedReduction
 import kernels.trellis.GateUpAccuracy
 import kernels.trellis.CodebookFlushToZero
 
@@ -128,23 +129,16 @@ def projectionExpr : Reduction.Tree 32 → DotProduct.Expr
   | .leaf lane => GateUpAccuracy.laneExpr lane.val
   | .add a b => .add (projectionExpr a) (projectionExpr b)
 
-def evaluateTree (input : Fin 32 → Float32) : Reduction.Tree 32 → Float32
-  | .leaf i => input i
-  | .add a b => FlushToZero.add (evaluateTree input a) (evaluateTree input b)
-
-structure SimdContract (reduce : DownExecution.SimdReduction) where
-  tree : Reduction.Tree 32
-  coverage : (Reduction.leaves tree).Perm (List.finRange 32)
-  execution : ∀ input, reduce input = evaluateTree input tree
+abbrev SimdContract := FlushedReduction.SimdContract
 
 theorem evaluate_projection (words : DownExecution.PackedMatrix) (k : Nat) (scale : Nat → Float32)
     (input : Nat → BitVec 16) (row : Nat) (tree : Reduction.Tree 32) :
     FlushedDotProduct.evaluate (fun col => DownExecution.coefficient words k row col) (fun _ => scale row)
       (fun col => widen (input col)) (projectionExpr tree) =
-      evaluateTree (fun lane => referenceLane words k scale input row lane.val) tree := by
+      FlushedReduction.evaluate (fun lane => referenceLane words k scale input row lane.val) tree := by
   induction tree with
   | leaf lane => exact evaluate_lane words k scale input row lane.val
-  | add a b ia ib => simp only [projectionExpr, FlushedDotProduct.evaluate, evaluateTree, ia, ib]
+  | add a b ia ib => simp only [projectionExpr, FlushedDotProduct.evaluate, FlushedReduction.evaluate, ia, ib]
 
 theorem projection_ideal (term : Nat → ℝ) (tree : Reduction.Tree 32) :
     DotProduct.ideal term (projectionExpr tree) =

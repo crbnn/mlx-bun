@@ -1,26 +1,20 @@
 import contracts.mlx.NormalizationSchedule
 import contracts.mlx.Memory
+import contracts.mlx.FlushedReduction
 import Mathlib.Data.List.Basic
 
 namespace Inference.Contracts.Mlx.NormalizationReduction
 open Numerics
 
-def evaluateTree (input : Fin n → Float32) : Reduction.Tree n → Float32
-  | .leaf i => input i
-  | .add a b => FlushToZero.add (evaluateTree input a) (evaluateTree input b)
-
-structure SimdContract (reduce : (Fin 32 → Float32) → Float32) where
-  tree : Reduction.Tree 32
-  coverage : (Reduction.leaves tree).Perm (List.finRange 32)
-  execution : ∀ input, reduce input = evaluateTree input tree
+abbrev SimdContract := FlushedReduction.SimdContract
 
 theorem evaluate_reduceTree (input : Fin n → Float32) (expr : Fin m → SquaredSum.Expr n)
     (tree : Reduction.Tree m) :
     SquaredSum.evaluate input (SquaredSum.reduceTree expr tree) =
-      evaluateTree (fun i => SquaredSum.evaluate input (expr i)) tree := by
+      FlushedReduction.evaluate (fun i => SquaredSum.evaluate input (expr i)) tree := by
   induction tree with
   | leaf i => rfl
-  | add a b ia ib => simp only [SquaredSum.reduceTree, SquaredSum.evaluate, evaluateTree, ia, ib]
+  | add a b ia ib => simp only [SquaredSum.reduceTree, SquaredSum.evaluate, FlushedReduction.evaluate, ia, ib]
 
 def truncateIndex (size : Nat) (i : Fin capacity) : Option (Fin size) :=
   if h : i.val < size then some ⟨i.val, h⟩ else none
