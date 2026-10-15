@@ -1,5 +1,6 @@
 import layers.TrellisCodebookGateUp
 import layers.TrellisCodebookDown
+import kernels.delta.Gates
 
 namespace Inference.Models.Qwen.WrittenLayers
 open Contracts.Mlx Contracts.Mlx.Numerics Kernels.Trellis
@@ -89,6 +90,31 @@ noncomputable def splitFiniteContract (p : TrellisCodebookGateUp.Platform)
       (GateUpSplitTail.sigmoidBudget expAbs expError (BFloat16.narrow (TrellisCodebookGateUp.raw p gate input row))))
   accuracy row := TrellisCodebookGateUp.split_finite_error p gate up input row.val expAbs expError exponential
     (hg row) (hu row) (hs row) (hp row)
+
+-- Compose either the finite exponential proof or its explicit overflow case.
+noncomputable def splitValidContract (p : TrellisCodebookGateUp.Platform)
+    (gate up : TrellisCodebookGateUp.Projection) (input : Nat → BitVec 16)
+    (expAbs : BFloat16Arithmetic.Value → BFloat16Arithmetic.Value) (expError : BFloat16Arithmetic.Value → ℝ)
+    (exponential : GateUpSplitTail.ExpAbsContract expAbs expError)
+    (hg : ∀ row : Fin 17408, TrellisCodebookGateUp.Finite p gate input row.val)
+    (hu : ∀ row : Fin 17408, TrellisCodebookGateUp.Finite p up input row.val)
+    (hs : ∀ row : Fin 17408, Kernels.Delta.Gates.BetaValid expAbs (BFloat16.narrow (TrellisCodebookGateUp.raw p gate input row.val)))
+    (hp : ∀ row : Fin 17408, GateUpSplitTail.ProductsFinite expAbs
+      (BFloat16.narrow (TrellisCodebookGateUp.raw p gate input row.val)) (BFloat16.narrow (TrellisCodebookGateUp.raw p up input row.val))) :
+    HiddenContract (.split expAbs) p gate up input where
+  error row := TrellisCodebookGateUp.layerBudget p gate up input row
+    (Model.toReal (BFloat16.narrow (TrellisCodebookGateUp.raw p up input row)))
+    (GateUpSplitTail.tailBudget expAbs (BFloat16.narrow (TrellisCodebookGateUp.raw p gate input row))
+      (BFloat16.narrow (TrellisCodebookGateUp.raw p up input row))
+      (Kernels.Delta.Gates.betaBudget expAbs expError (BFloat16.narrow (TrellisCodebookGateUp.raw p gate input row))))
+  accuracy row := by
+    have he := Kernels.Delta.Gates.beta_total_error expAbs expError exponential _ (hp row).hGate (hs row)
+      (Model.toReal (BFloat16.narrow (TrellisCodebookGateUp.raw p gate input row.val))) 0 (by simp)
+    simp only [zero_div, add_zero] at he
+    have ht := GateUpSplitTail.tail_error_of_sigmoid_error expAbs _ _ _ (hp row).hGate (hp row).hUp
+      (Kernels.Delta.Gates.beta_finite expAbs expError exponential _ (hs row)) (hp row).hSilu (hp row).hOutput he
+    exact TrellisCodebookGateUp.split_compose p gate up input row.val expAbs _ (hg row) (hu row)
+      (hp row).hGate (hp row).hUp (GateUpSplitTail.output_finite expAbs _ _ (hp row)) ht
 
 -- GateDownMLP.forward is gateUp.forward followed by down.forward. This theorem
 -- composes their numerical contracts for the base single-row Trellis path.

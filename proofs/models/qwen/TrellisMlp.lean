@@ -25,7 +25,7 @@ structure SplitFinite (p : TrellisCodebookGateUp.Platform)
   exponential : GateUpSplitTail.ExpAbsContract expAbs expError
   gateFinite : ∀ row : Fin 17408, TrellisCodebookGateUp.Finite p gate input row.val
   upFinite : ∀ row : Fin 17408, TrellisCodebookGateUp.Finite p up input row.val
-  sigmoid : ∀ row : Fin 17408, GateUpSplitTail.SigmoidFinite expAbs (BFloat16.narrow (TrellisCodebookGateUp.raw p gate input row.val))
+  sigmoid : ∀ row : Fin 17408, Kernels.Delta.Gates.BetaValid expAbs (BFloat16.narrow (TrellisCodebookGateUp.raw p gate input row.val))
   products : ∀ row : Fin 17408, GateUpSplitTail.ProductsFinite expAbs
     (BFloat16.narrow (TrellisCodebookGateUp.raw p gate input row.val)) (BFloat16.narrow (TrellisCodebookGateUp.raw p up input row.val))
 
@@ -40,7 +40,7 @@ noncomputable def tailContract (activation : Activation) (p : TrellisCodebookGat
     TailFinite activation p gate up input → HiddenContract activation p gate up input :=
   match activation with
   | .float expNeg => fun h => floatFiniteContract p gate up input expNeg h.expError h.exponential h.gateFinite h.upFinite h.gateCast h.upCast h.tail
-  | .split expAbs => fun h => splitFiniteContract p gate up input expAbs h.expError h.exponential h.gateFinite h.upFinite h.sigmoid h.products
+  | .split expAbs => fun h => splitValidContract p gate up input expAbs h.expError h.exponential h.gateFinite h.upFinite h.sigmoid h.products
 
 structure Finite (mlp : GateDown) (input : Nat → BitVec 16) where
   tail : TailFinite mlp.activation mlp.gatePlatform mlp.gate mlp.up input

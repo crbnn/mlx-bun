@@ -44,7 +44,7 @@ structure Result (norm : Blocks.Norm) (layer : Layer) (cache : Cache) (x : Nat �
 
 theorem ranges (norm : Blocks.Norm) (layer : Layer) (parameters : Parameters norm layer) (primitive : Primitives norm layer)
     (cache : Cache) (x : Nat → Fin 5120 → BF)
-    (hx : ∀ t i, Model.isFinite (x t i) = true ∧ |Model.toReal (x t i)| ≤ (2 : ℝ)^(50 : Nat))
+    (hx : ∀ t i, Model.isFinite (x t i) = true ∧ |Model.toReal (x t i)| ≤ (2 : ℝ)^(56 : Nat))
     (history : ∀ i c, Model.isFinite (cache.history i c) = true ∧ |Model.toReal (cache.history i c)| ≤ (2 : ℝ)^(34 : Nat))
     (state : ∀ h v i, (cache.recurrent h v i).isFinite = true ∧ |real (cache.recurrent h v i)| ≤ 1) :
     Result norm layer cache x := by
@@ -65,7 +65,7 @@ theorem ranges (norm : Blocks.Norm) (layer : Layer) (parameters : Parameters nor
 theorem accuracy (norm : Blocks.Norm) (layer : Layer) (parameters : Parameters norm layer) (primitive : Primitives norm layer)
     (cache : Cache) (targetCache errorCache : ReferenceCache) (cacheError : CacheError cache targetCache errorCache)
     (x : Nat → Fin 5120 → BF)
-    (hx : ∀ t i, Model.isFinite (x t i) = true ∧ |Model.toReal (x t i)| ≤ (2 : ℝ)^(50 : Nat))
+    (hx : ∀ t i, Model.isFinite (x t i) = true ∧ |Model.toReal (x t i)| ≤ (2 : ℝ)^(56 : Nat))
     (history : ∀ i c, Model.isFinite (cache.history i c) = true ∧ |Model.toReal (cache.history i c)| ≤ (2 : ℝ)^(34 : Nat))
     (state : ∀ h v i, (cache.recurrent h v i).isFinite = true ∧ |real (cache.recurrent h v i)| ≤ 1)
     (target error : Nat → Fin 5120 → ℝ) (he : ∀ t i, |Model.toReal (x t i)-target t i| ≤ error t i) :

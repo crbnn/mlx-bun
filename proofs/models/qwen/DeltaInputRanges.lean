@@ -29,7 +29,7 @@ theorem projections (norm : Blocks.Norm) (layer : Layer) (parameters : Parameter
     (normDivision : DivisionDirectedBounds.Contract norm.platform.divide) (root : RsqrtBounds.Envelope norm.platform.rsqrt)
     (hw : ∀ i, Model.isFinite (norm.weight i) = true ∧ |Model.toReal (norm.weight i)| ≤ 1)
     (x : Nat → Fin 5120 → BF)
-    (hx : ∀ t i, Model.isFinite (x t i) = true ∧ |Model.toReal (x t i)| ≤ (2 : ℝ)^(50 : Nat)) :
+    (hx : ∀ t i, Model.isFinite (x t i) = true ∧ |Model.toReal (x t i)| ≤ (2 : ℝ)^(56 : Nat)) :
     (∀ t, norm.Finite (x t)) ∧ ProjectionRanges layer (fun t => norm.forward (x t)) := by
   have hq t := NormalizedAffineProjection.ranges norm layer.qkv parameters.qkv normDivision root divisions.qkv hw (x t) (hx t)
   have hz t := NormalizedAffineProjection.ranges norm layer.z parameters.z normDivision root divisions.z hw (x t) (hx t)
@@ -112,7 +112,7 @@ theorem convolution_accuracy (norm : Blocks.Norm) (layer : Layer) (parameters : 
     (normDivision : DivisionDirectedBounds.Contract norm.platform.divide) (root : RsqrtBounds.Envelope norm.platform.rsqrt)
     (hw : ∀ i, Model.isFinite (norm.weight i) = true ∧ |Model.toReal (norm.weight i)| ≤ 1)
     (x : Nat → Fin 5120 → BF)
-    (hx : ∀ t i, Model.isFinite (x t i) = true ∧ |Model.toReal (x t i)| ≤ (2 : ℝ)^(50 : Nat))
+    (hx : ∀ t i, Model.isFinite (x t i) = true ∧ |Model.toReal (x t i)| ≤ (2 : ℝ)^(56 : Nat))
     (target error : Nat → Fin 5120 → ℝ) (he : ∀ t i, |Model.toReal (x t i) - target t i| ≤ error t i)
     (cache : Cache) (targetCache errorCache : ReferenceCache) (cacheError : CacheError cache targetCache errorCache)
     (history : ∀ i c, Model.isFinite (cache.history i c) = true ∧ |Model.toReal (cache.history i c)| ≤ (2 : ℝ)^(34 : Nat))

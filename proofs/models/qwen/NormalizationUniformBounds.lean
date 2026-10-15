@@ -50,4 +50,21 @@ theorem ranges (norm : Blocks.Norm)
   rw [← NormalizationRanges.width_constructor] at h
   simpa only [outputCap_real] using NormalizationRanges.transfer norm x outputCap h.1 h.2
 
+theorem ranges_wide (norm : Blocks.Norm)
+    (division : DivisionDirectedBounds.Contract norm.platform.divide) (root : RsqrtBounds.Envelope norm.platform.rsqrt)
+    (hw : ∀ i, Model.isFinite (norm.weight i) = true ∧ |Model.toReal (norm.weight i)| ≤ 1)
+    (x : Fin 5120 → BF) (hx : ∀ i, Model.isFinite (x i) = true ∧ |Model.toReal (x i)| ≤ (2 : ℝ)^(56 : Nat)) :
+    norm.Finite x ∧ ∀ i, |Model.toReal (norm.forward x i)| ≤ 512 := by
+  have h := NormalizationUniform.ranges_wide profile norm.platform.divide norm.platform.divError norm.platform.division
+    division norm.platform.rsqrt root (RmsNorm.expression norm.platform 5120) (RmsNorm.coverage norm.platform 5120)
+    (Blocks.widenInput x) norm.weight
+    (NormalizationRanges.widened x 56 (fun i => by simpa only [zpow_ofNat] using hx i))
+    (fun i => by simpa only [profile, BFloat16Arithmetic.real_one] using hw i)
+  change NormalizationExecution.Finite norm.platform.divide (Blocks.widenInput x) norm.weight
+    (RmsNorm.expression norm.platform 5120) (Float32.ofInt ((5120 : Nat) : Int)) Blocks.eps norm.platform.rsqrt ∧
+      (∀ i, |real (NormalizationExecution.output norm.platform.divide (Blocks.widenInput x) norm.weight
+        (RmsNorm.expression norm.platform 5120) (Float32.ofInt ((5120 : Nat) : Int)) Blocks.eps norm.platform.rsqrt i)| ≤ Model.toReal outputCap) at h
+  rw [← NormalizationRanges.width_constructor] at h
+  simpa only [outputCap_real] using NormalizationRanges.transfer norm x outputCap h.1 h.2
+
 end Inference.Models.Qwen.NormalizationUniformBounds

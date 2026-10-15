@@ -8,7 +8,7 @@ open NormalizationExecution
 structure Profile where
   inputExponent : Int
   inputLower : -74 ≤ inputExponent
-  inputUpper : inputExponent+inputExponent ≤ 100
+  inputUpper : inputExponent+inputExponent ≤ 112
   eps : Float32
   epsFinite : eps.isFinite = true
   epsNormal : FlushToZero.threshold < real eps
@@ -32,18 +32,18 @@ theorem Profile.reductionExpr (p : Profile) (divide : Float32 → Float32 → Fl
     (expr : SquaredSum.Expr n) (coverage : (SquaredSum.indices expr).Perm (List.finRange n))
     (input : Fin n → Float32)
     (hx : ∀ i, (input i).isFinite = true ∧ |real (input i)| ≤ (2 : ℝ)^p.inputExponent)
-    (positive : 0 < n) (size : n+1 < 16777216) :
+    (positive : 0 < n) (size : n+1 ≤ 16384) :
     ReductionFinite divide input expr (Float32.ofInt n) p.eps ∧
       real p.eps ≤ real (denominator divide input expr (Float32.ofInt n) p.eps) := by
   have hlo : -149 ≤ p.inputExponent+p.inputExponent := by have := p.inputLower; omega
-  have hs := SquaredSumDyadicBounds.covered_range input p.inputExponent hlo p.inputUpper hx expr
+  have hs := SquaredSumDyadicBounds.covered_range_wide input p.inputExponent hlo p.inputUpper hx expr
     coverage (by omega)
   have hw := IntegerBounds.natural n (by omega)
-  have cs := DyadicBounds.ceiling_range n (p.inputExponent+p.inputExponent) (by omega) hlo p.inputUpper
+  have cs := DyadicBounds.ceiling_range_wide n (p.inputExponent+p.inputExponent) (by omega) hlo p.inputUpper
   let denominatorExponent := max 0 (p.inputExponent+p.inputExponent)
   have edLo : -149 ≤ denominatorExponent := by dsimp [denominatorExponent]; omega
-  have edHi : denominatorExponent ≤ 100 := by dsimp [denominatorExponent]; have := p.inputUpper; omega
-  have cd := DyadicBounds.ceiling_range (n+1) denominatorExponent size edLo edHi
+  have edHi : denominatorExponent ≤ 112 := by dsimp [denominatorExponent]; have := p.inputUpper; omega
+  have cd := DyadicBounds.ceiling_range_wide (n+1) denominatorExponent size edLo edHi
   have hd : Division.DivisorDomain (Float32.ofInt n) := by
     rw [Division.DivisorDomain, hw.2]
     constructor
@@ -112,7 +112,7 @@ theorem Profile.rangesExpr (p : Profile) (divide : Float32 → Float32 → Float
     (input : Fin n → Float32) (weight : Fin n → BFloat16Arithmetic.Value)
     (hx : ∀ i, (input i).isFinite = true ∧ |real (input i)| ≤ (2 : ℝ)^p.inputExponent)
     (hw : ∀ i, Model.isFinite (weight i) = true ∧ |Model.toReal (weight i)| ≤ Model.toReal p.weightCap)
-    (positive : 0 < n) (size : n+1 < 16777216) :
+    (positive : 0 < n) (size : n+1 ≤ 16384) :
     Finite divide input weight expr (Float32.ofInt n) p.eps rsqrt ∧
       ∀ i, |real (output divide input weight expr (Float32.ofInt n) p.eps rsqrt i)| ≤
         Model.toReal p.outputCap := by
@@ -126,7 +126,7 @@ theorem Profile.reduction (p : Profile) (platform : RmsNorm.Platform)
     (division : DivisionBounds.Contract platform.divide)
     (input : Fin n → Float32)
     (hx : ∀ i, (input i).isFinite = true ∧ |real (input i)| ≤ (2 : ℝ)^p.inputExponent)
-    (positive : 0 < n) (size : n+1 < 16777216) :
+    (positive : 0 < n) (size : n+1 ≤ 16384) :
     ReductionFinite platform.divide input (RmsNorm.expression platform n) (Float32.ofInt n) p.eps ∧
       real p.eps ≤ real (denominator platform.divide input (RmsNorm.expression platform n) (Float32.ofInt n) p.eps) :=
   p.reductionExpr platform.divide platform.divError platform.division division
@@ -150,7 +150,7 @@ theorem Profile.ranges (p : Profile) (platform : RmsNorm.Platform)
     (input : Fin n → Float32) (weight : Fin n → BFloat16Arithmetic.Value)
     (hx : ∀ i, (input i).isFinite = true ∧ |real (input i)| ≤ (2 : ℝ)^p.inputExponent)
     (hw : ∀ i, Model.isFinite (weight i) = true ∧ |Model.toReal (weight i)| ≤ Model.toReal p.weightCap)
-    (positive : 0 < n) (size : n+1 < 16777216) :
+    (positive : 0 < n) (size : n+1 ≤ 16384) :
     Finite platform.divide input weight (RmsNorm.expression platform n) (Float32.ofInt n) p.eps platform.rsqrt ∧
       ∀ i, |real (output platform.divide input weight (RmsNorm.expression platform n) (Float32.ofInt n) p.eps platform.rsqrt i)| ≤
         Model.toReal p.outputCap :=

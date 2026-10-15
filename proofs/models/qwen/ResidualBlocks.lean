@@ -135,6 +135,20 @@ theorem Mlp.forward_error (b : Mlp) (x update : Fin 5120 → BF)
     (residual_error x update targetX targetUpdate errorX errorUpdate hx hu hf.addition)
     (b.branch_error x update targetX targetUpdate errorX errorUpdate hx hu hf) i
 
+-- Direct operand ranges can establish the final addition independently of
+-- the accumulated error budget. This is used by the model-wide range proof.
+theorem Mlp.forward_error_of_bounds (b : Mlp) (x update : Fin 5120 → BF)
+    (targetX targetUpdate errorX errorUpdate : Fin 5120 → ℝ)
+    (hx : ∀ i, |Model.toReal (x i) - targetX i| ≤ errorX i)
+    (hu : ∀ i, |Model.toReal (update i) - targetUpdate i| ≤ errorUpdate i)
+    (hf : b.Finite x update) (bounds : ElementwiseAdd.Bounds (residual x update) (b.branch x update)) (i : Fin 5120) :
+    |Model.toReal (b.forward x update i) - b.target targetX targetUpdate i| ≤ b.budget x update targetX targetUpdate errorX errorUpdate hf i :=
+  ElementwiseAdd.forward_error _ _ bounds
+    (residualTarget targetX targetUpdate) (b.branchTarget targetX targetUpdate) (residualBudget x update errorX errorUpdate)
+    (b.branchBudget x update targetX targetUpdate errorX errorUpdate hf)
+    (residual_error x update targetX targetUpdate errorX errorUpdate hx hu hf.addition)
+    (b.branch_error x update targetX targetUpdate errorX errorUpdate hx hu hf) i
+
 theorem Mlp.forward_finite (b : Mlp) (x update : Fin 5120 → BF)
     (targetX targetUpdate errorX errorUpdate : Fin 5120 → ℝ)
     (hx : ∀ i, |Model.toReal (x i) - targetX i| ≤ errorX i)

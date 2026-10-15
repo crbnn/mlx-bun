@@ -41,4 +41,29 @@ theorem ceiling_range (count : Nat) (exponent : Int) (hc : count < 16777216)
   · unfold ceiling
     rw [BFloat16.bridge, h.2, hd]
 
+-- Smaller reductions admit larger squared inputs without binary32 overflow.
+theorem ceiling_range_wide (count : Nat) (exponent : Int) (hc : count ≤ 16384)
+    (lo : -149 ≤ exponent) (hi : exponent ≤ 112) :
+    (ceiling count exponent).isFinite = true ∧ real (ceiling count exponent) = (count : ℝ) * (2 : ℝ)^exponent := by
+  let d : FloatLib.Numerics.Dyadic := ⟨false, count, exponent⟩
+  have hd : d.toReal = (count : ℝ) * (2 : ℝ)^exponent := by
+    simp [d, FloatLib.Numerics.Dyadic.toReal, FloatLib.Numerics.Dyadic.signedSignificand]
+  have he : (2 : ℝ)^exponent ≤ (2 : ℝ)^(112 : Int) := zpow_le_zpow_right₀ (by norm_num) hi
+  have hb : |d.toReal| ≤ Model.toReal (Model.posMaxFinite FloatFormat.binary32) := by
+    rw [hd, abs_of_nonneg (mul_nonneg (Nat.cast_nonneg _) (zpow_nonneg (by norm_num) _))]
+    apply le_trans ?_ (Float32Bounds.ceiling_max large large_finite)
+    rw [large_real]
+    calc
+      _ ≤ (16384 : ℝ) * (2 : ℝ)^(112 : Int) :=
+        mul_le_mul (by exact_mod_cast hc) he (zpow_nonneg (by norm_num) _) (by norm_num)
+      _ ≤ _ := by norm_num
+  have h := Model.roundDyadic_of_representable FloatFormat.binary32 (by decide) d count 0
+    (by simp [d]) (by change count < 16777216; omega) lo hb
+  constructor
+  · change (Model.toFloat32Model (Model.roundDyadic FloatFormat.binary32 d)).unpack.isFinite = true
+    rw [Model.unpack_toFloat32Model, Model.isFinite_toModel (by decide)]
+    exact h.1
+  · unfold ceiling
+    rw [BFloat16.bridge, h.2, hd]
+
 end Inference.Contracts.Mlx.DyadicBounds

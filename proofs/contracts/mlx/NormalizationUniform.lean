@@ -8,19 +8,19 @@ open Numerics NormalizationExecution
 open FloatLib FloatLib.Floats FloatLib.Floats.Formats.BinaryInterchange
 abbrev BF := BFloat16Arithmetic.Value
 
-private theorem float_cap (e : Int) (lo : -149 ≤ e) (hi : e ≤ 100) :
+private theorem float_cap (e : Int) (lo : -149 ≤ e) (hi : e ≤ 112) :
     (DyadicBounds.ceiling 1 e).isFinite = true ∧ real (DyadicBounds.ceiling 1 e) = (2 : ℝ)^e := by
-  simpa only [Nat.cast_one, one_mul] using DyadicBounds.ceiling_range 1 e (by decide) lo hi
+  simpa only [Nat.cast_one, one_mul] using DyadicBounds.ceiling_range_wide 1 e (by decide) lo hi
 private theorem bf_cap (e : Int) (lo : -133 ≤ e) (hi : e ≤ 119) :
     Model.isFinite (BFloat16DyadicBounds.ceiling 1 e) = true ∧ Model.toReal (BFloat16DyadicBounds.ceiling 1 e) = (2 : ℝ)^e := by
   simpa only [Nat.cast_one, one_mul] using BFloat16DyadicBounds.ceiling_range 1 e (by decide) lo hi
 
 -- The uniform bound depends on head width and weights, not on input scale.
--- The range [-10,50] below is a proof partition, not runtime dispatch.
+-- The range [-10,56] below is a proof partition, not runtime dispatch.
 structure Profile (n : Nat) where
   positive : 0 < n
   widthLog : Nat
-  widthLogBound : widthLog ≤ 20
+  widthLogBound : widthLog ≤ 13
   widthBound : n ≤ 2^widthLog
   normalizedExponent : Nat
   normalizedPositive : 1 ≤ normalizedExponent
@@ -37,8 +37,8 @@ structure Profile (n : Nat) where
   outputCapacity : Model.toReal weightCap * (2 : ℝ)^normalizedExponent ≤ Model.toReal outputCap
 
 private def Profile.dyadic (p : Profile n) (exponent inverse : Int)
-    (lo : -10 ≤ exponent) (hi : exponent ≤ 50)
-    (ilo : -149 ≤ inverse) (ihi : inverse ≤ 100)
+    (lo : -10 ≤ exponent) (hi : exponent ≤ 56)
+    (ilo : -149 ≤ inverse) (ihi : inverse ≤ 112)
     (capacity : exponent+inverse ≤ (p.normalizedExponent : Int)) : NormalizationDyadicBounds.Profile where
   inputExponent := exponent
   inputLower := by omega
@@ -68,7 +68,7 @@ private def Profile.dyadic (p : Profile n) (exponent inverse : Int)
     rw [(bf_cap p.normalizedExponent (by omega) (by have := p.normalizedBound; omega)).2, zpow_natCast]
     exact p.outputCapacity
 
-private theorem Profile.size (p : Profile n) : n+1 < 16777216 := by
+private theorem Profile.size (p : Profile n) : n+1 ≤ 16384 := by
   have h := p.widthBound.trans (Nat.pow_le_pow_right (by decide : 0 < 2) p.widthLogBound)
   norm_num at h
   omega
@@ -95,7 +95,7 @@ theorem bin_range (p : Profile n) (divide : Float32 → Float32 → Float32)
     (division : DivisionDirectedBounds.Contract divide) (rsqrt : Float32 → Float32) (root : RsqrtBounds.Envelope rsqrt)
     (expr : SquaredSum.Expr n) (coverage : (SquaredSum.indices expr).Perm (List.finRange n))
     (input : Fin n → Float32) (weight : Fin n → BF)
-    (e : Int) (lo : -10 < e) (hi : e ≤ 50)
+    (e : Int) (lo : -10 < e) (hi : e ≤ 56)
     (hx : ∀ i, (input i).isFinite = true ∧ |real (input i)| ≤ (2 : ℝ)^e)
     (hw : ∀ i, Model.isFinite (weight i) = true ∧ |Model.toReal (weight i)| ≤ Model.toReal p.weightCap)
     (i : Fin n) (lower : (2 : ℝ)^(e-1) < |real (input i)|) :
@@ -103,7 +103,7 @@ theorem bin_range (p : Profile n) (divide : Float32 → Float32 → Float32)
       ∀ j, |real (output divide input weight expr (Float32.ofInt n) p.eps rsqrt j)| ≤ Model.toReal p.outputCap := by
   let inverse : Int := (p.normalizedExponent : Int)-e
   have il : -149 ≤ inverse := by dsimp [inverse]; omega
-  have iu : inverse ≤ 100 := by dsimp [inverse]; have := p.normalizedBound; omega
+  have iu : inverse ≤ 112 := by dsimp [inverse]; have := p.normalizedBound; omega
   let profile := p.dyadic e inverse (by omega) hi il iu (by dsimp [inverse]; omega)
   let squareFloor := DyadicBounds.ceiling 1 (2*e-2)
   let meanFloor := DyadicBounds.ceiling 1 (2*e-2-(p.widthLog : Int))
@@ -146,6 +146,23 @@ theorem bin_range (p : Profile n) (divide : Float32 → Float32 → Float32)
   exact NormalizationFloorBounds.ranges_expr profile divide divError accuracy expr coverage division input weight hx hw
     p.positive p.size i squareFloor meanFloor hs.1 sn hm.1 mn square capacity rsqrt hr
 
+theorem ranges_wide (p : Profile n) (divide : Float32 → Float32 → Float32)
+    (divError : Float32 → Float32 → ℝ) (accuracy : Division.Contract divide divError)
+    (division : DivisionDirectedBounds.Contract divide) (rsqrt : Float32 → Float32) (root : RsqrtBounds.Envelope rsqrt)
+    (expr : SquaredSum.Expr n) (coverage : (SquaredSum.indices expr).Perm (List.finRange n))
+    (input : Fin n → Float32) (weight : Fin n → BF)
+    (hx : ∀ i, (input i).isFinite = true ∧ |real (input i)| ≤ (2 : ℝ)^(56 : Nat))
+    (hw : ∀ i, Model.isFinite (weight i) = true ∧ |Model.toReal (weight i)| ≤ Model.toReal p.weightCap) :
+    Finite divide input weight expr (Float32.ofInt n) p.eps rsqrt ∧
+      ∀ i, |real (output divide input weight expr (Float32.ofInt n) p.eps rsqrt i)| ≤ Model.toReal p.outputCap := by
+  rcases DyadicCover.interval (fun i => real (input i)) (-10) 66
+      (fun i => by simpa only [show (-10 : Int)+(66 : Nat) = 56 from by decide, zpow_ofNat] using (hx i).2) with
+    small | ⟨e, lo, hi, upper, i, lower⟩
+  · exact small_range p divide divError accuracy division.toContract rsqrt root expr coverage input weight
+      (fun i => ⟨(hx i).1, small i⟩) hw
+  · exact bin_range p divide divError accuracy division rsqrt root expr coverage input weight e lo (by norm_num at hi; exact hi)
+      (fun i => ⟨(hx i).1, upper i⟩) hw i lower
+
 theorem ranges (p : Profile n) (divide : Float32 → Float32 → Float32)
     (divError : Float32 → Float32 → ℝ) (accuracy : Division.Contract divide divError)
     (division : DivisionDirectedBounds.Contract divide) (rsqrt : Float32 → Float32) (root : RsqrtBounds.Envelope rsqrt)
@@ -154,13 +171,8 @@ theorem ranges (p : Profile n) (divide : Float32 → Float32 → Float32)
     (hx : ∀ i, (input i).isFinite = true ∧ |real (input i)| ≤ (2 : ℝ)^(50 : Nat))
     (hw : ∀ i, Model.isFinite (weight i) = true ∧ |Model.toReal (weight i)| ≤ Model.toReal p.weightCap) :
     Finite divide input weight expr (Float32.ofInt n) p.eps rsqrt ∧
-      ∀ i, |real (output divide input weight expr (Float32.ofInt n) p.eps rsqrt i)| ≤ Model.toReal p.outputCap := by
-  rcases DyadicCover.interval (fun i => real (input i)) (-10) 60
-      (fun i => by simpa only [show (-10 : Int)+(60 : Nat) = 50 from by decide, zpow_ofNat] using (hx i).2) with
-    small | ⟨e, lo, hi, upper, i, lower⟩
-  · exact small_range p divide divError accuracy division.toContract rsqrt root expr coverage input weight
-      (fun i => ⟨(hx i).1, small i⟩) hw
-  · exact bin_range p divide divError accuracy division rsqrt root expr coverage input weight e lo (by norm_num at hi; exact hi)
-      (fun i => ⟨(hx i).1, upper i⟩) hw i lower
+      ∀ i, |real (output divide input weight expr (Float32.ofInt n) p.eps rsqrt i)| ≤ Model.toReal p.outputCap :=
+  ranges_wide p divide divError accuracy division rsqrt root expr coverage input weight
+    (fun i => ⟨(hx i).1, (hx i).2.trans (by norm_num)⟩) hw
 
 end Inference.Contracts.Mlx.NormalizationUniform

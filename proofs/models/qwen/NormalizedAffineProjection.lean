@@ -53,11 +53,11 @@ theorem range3 (norm : Blocks.Norm) (projection : Projection3 10 rows)
     (root : RsqrtBounds.Envelope norm.platform.rsqrt)
     (projectDivision : DivisionDirectedBounds.Contract projection.platform.tile.divide)
     (hw : ∀ i, Model.isFinite (norm.weight i) = true ∧ |Model.toReal (norm.weight i)| ≤ 1)
-    (x : Fin 5120 → BF) (hx : ∀ i, Model.isFinite (x i) = true ∧ |Model.toReal (x i)| ≤ (2 : ℝ)^(50 : Nat)) :
+    (x : Fin 5120 → BF) (hx : ∀ i, Model.isFinite (x i) = true ∧ |Model.toReal (x i)| ≤ (2 : ℝ)^(56 : Nat)) :
     norm.Finite x ∧ projection.Finite (norm.forward x) ∧
       ∀ row, Model.isFinite (projection.forward (norm.forward x) row) = true ∧
         |Model.toReal (projection.forward (norm.forward x) row)| ≤ (2 : ℝ)^(23 : Nat) := by
-  have hn := NormalizationUniformBounds.ranges norm normDivision root hw x hx
+  have hn := NormalizationUniformBounds.ranges_wide norm normDivision root hw x hx
   have hp := Layers.AffineVerifyLinearShiftedBounds.range3 projection profile3 parameters projectDivision (norm.forward x)
     (fun i => ⟨norm.forward_finite x hn.1 i, by simpa only [profile3, show (2 : ℝ)^(9 : Int) = 512 from by norm_num] using hn.2 i⟩)
   exact ⟨hn.1, hp.1, fun row => ⟨projection.forward_finite _ hp.1 row,
@@ -69,11 +69,11 @@ theorem range4 (norm : Blocks.Norm) (projection : Projection4 10 rows)
     (root : RsqrtBounds.Envelope norm.platform.rsqrt)
     (projectDivision : DivisionDirectedBounds.Contract projection.platform.tile.divide)
     (hw : ∀ i, Model.isFinite (norm.weight i) = true ∧ |Model.toReal (norm.weight i)| ≤ 1)
-    (x : Fin 5120 → BF) (hx : ∀ i, Model.isFinite (x i) = true ∧ |Model.toReal (x i)| ≤ (2 : ℝ)^(50 : Nat)) :
+    (x : Fin 5120 → BF) (hx : ∀ i, Model.isFinite (x i) = true ∧ |Model.toReal (x i)| ≤ (2 : ℝ)^(56 : Nat)) :
     norm.Finite x ∧ projection.Finite (norm.forward x) ∧
       ∀ row, Model.isFinite (projection.forward (norm.forward x) row) = true ∧
         |Model.toReal (projection.forward (norm.forward x) row)| ≤ (2 : ℝ)^(23 : Nat) := by
-  have hn := NormalizationUniformBounds.ranges norm normDivision root hw x hx
+  have hn := NormalizationUniformBounds.ranges_wide norm normDivision root hw x hx
   have hp := Layers.AffineVerifyLinearShiftedBounds.range4 projection profile4 parameters projectDivision (norm.forward x)
     (fun i => ⟨norm.forward_finite x hn.1 i, by simpa only [profile4, show (2 : ℝ)^(9 : Int) = 512 from by norm_num] using hn.2 i⟩)
   exact ⟨hn.1, hp.1, fun row => ⟨projection.forward_finite _ hp.1 row,
@@ -85,7 +85,7 @@ theorem accuracy3 (norm : Blocks.Norm) (projection : Projection3 10 rows)
     (root : RsqrtBounds.Envelope norm.platform.rsqrt)
     (projectDivision : DivisionDirectedBounds.Contract projection.platform.tile.divide)
     (hw : ∀ i, Model.isFinite (norm.weight i) = true ∧ |Model.toReal (norm.weight i)| ≤ 1)
-    (x : Fin 5120 → BF) (hx : ∀ i, Model.isFinite (x i) = true ∧ |Model.toReal (x i)| ≤ (2 : ℝ)^(50 : Nat))
+    (x : Fin 5120 → BF) (hx : ∀ i, Model.isFinite (x i) = true ∧ |Model.toReal (x i)| ≤ (2 : ℝ)^(56 : Nat))
     (target error : Fin 5120 → ℝ) (he : ∀ i, |Model.toReal (x i) - target i| ≤ error i) (row : Fin rows) :
     Model.isFinite (projection.forward (norm.forward x) row) = true ∧
       |Model.toReal (projection.forward (norm.forward x) row)| ≤ (2 : ℝ)^(23 : Nat) ∧
@@ -101,7 +101,7 @@ theorem accuracy4 (norm : Blocks.Norm) (projection : Projection4 10 rows)
     (root : RsqrtBounds.Envelope norm.platform.rsqrt)
     (projectDivision : DivisionDirectedBounds.Contract projection.platform.tile.divide)
     (hw : ∀ i, Model.isFinite (norm.weight i) = true ∧ |Model.toReal (norm.weight i)| ≤ 1)
-    (x : Fin 5120 → BF) (hx : ∀ i, Model.isFinite (x i) = true ∧ |Model.toReal (x i)| ≤ (2 : ℝ)^(50 : Nat))
+    (x : Fin 5120 → BF) (hx : ∀ i, Model.isFinite (x i) = true ∧ |Model.toReal (x i)| ≤ (2 : ℝ)^(56 : Nat))
     (target error : Fin 5120 → ℝ) (he : ∀ i, |Model.toReal (x i) - target i| ≤ error i) (row : Fin rows) :
     Model.isFinite (projection.forward (norm.forward x) row) = true ∧
       |Model.toReal (projection.forward (norm.forward x) row)| ≤ (2 : ℝ)^(23 : Nat) ∧
@@ -124,7 +124,7 @@ theorem ranges (norm : Blocks.Norm) (projection : Projection 10 rows)
     (normDivision : DivisionDirectedBounds.Contract norm.platform.divide)
     (root : RsqrtBounds.Envelope norm.platform.rsqrt) (projectDivision : DivisionContract projection)
     (hw : ∀ i, Model.isFinite (norm.weight i) = true ∧ |Model.toReal (norm.weight i)| ≤ 1)
-    (x : Fin 5120 → BF) (hx : ∀ i, Model.isFinite (x i) = true ∧ |Model.toReal (x i)| ≤ (2 : ℝ)^(50 : Nat)) :
+    (x : Fin 5120 → BF) (hx : ∀ i, Model.isFinite (x i) = true ∧ |Model.toReal (x i)| ≤ (2 : ℝ)^(56 : Nat)) :
     norm.Finite x ∧ projection.Finite (norm.forward x) ∧
       ∀ row, Model.isFinite (projection.forward (norm.forward x) row) = true ∧
         |Model.toReal (projection.forward (norm.forward x) row)| ≤ (2 : ℝ)^(23 : Nat) := by
@@ -137,7 +137,7 @@ theorem accuracy (norm : Blocks.Norm) (projection : Projection 10 rows)
     (normDivision : DivisionDirectedBounds.Contract norm.platform.divide)
     (root : RsqrtBounds.Envelope norm.platform.rsqrt) (projectDivision : DivisionContract projection)
     (hw : ∀ i, Model.isFinite (norm.weight i) = true ∧ |Model.toReal (norm.weight i)| ≤ 1)
-    (x : Fin 5120 → BF) (hx : ∀ i, Model.isFinite (x i) = true ∧ |Model.toReal (x i)| ≤ (2 : ℝ)^(50 : Nat))
+    (x : Fin 5120 → BF) (hx : ∀ i, Model.isFinite (x i) = true ∧ |Model.toReal (x i)| ≤ (2 : ℝ)^(56 : Nat))
     (target error : Fin 5120 → ℝ) (he : ∀ i, |Model.toReal (x i) - target i| ≤ error i) (row : Fin rows) :
     Model.isFinite (projection.forward (norm.forward x) row) = true ∧
       |Model.toReal (projection.forward (norm.forward x) row)| ≤ (2 : ℝ)^(23 : Nat) ∧
