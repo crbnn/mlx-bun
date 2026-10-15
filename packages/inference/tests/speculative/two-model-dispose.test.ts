@@ -12,6 +12,7 @@ import { writeShardedSafetensors, type NamedTensor } from "../../src/artifacts/s
 import { TwoModelProvider } from "../../src/generation/speculative/sources/two-model";
 import { UniversalDenseModel } from "../../src/models/universal/dense";
 import { UniversalDenseWideModel } from "../../src/models/universal/dense-wide";
+import { UniversalDenseG13Model } from "../../src/models/universal/dense-g13";
 
 const HIDDEN = 64, HEADS = 2, KV_HEADS = 1, HEAD_DIM = 32, INTER = 64, VOCAB = 64;
 let dir: string;
@@ -59,8 +60,8 @@ afterAll(() => rmSync(dir, { recursive: true, force: true }));
 test("a two-model provider's dispose releases its graph's constants, then its weights", async () => {
   const provider = await TwoModelProvider.load(dir);
   const graph = provider.model;
-  expect(graph instanceof UniversalDenseModel || graph instanceof UniversalDenseWideModel).toBe(true);
-  const freqs = (graph as TestGraph<UniversalDenseModel | UniversalDenseWideModel>).sharedRope.freqs;
+  expect(graph instanceof UniversalDenseModel || graph instanceof UniversalDenseWideModel || graph instanceof UniversalDenseG13Model).toBe(true);
+  const freqs = (graph as TestGraph<UniversalDenseModel | UniversalDenseWideModel | UniversalDenseG13Model>).sharedRope.freqs;
   expect(freqs).not.toBeNull();
   // The provider's weights are private; the order is read off both disposals.
   const weights = (provider as unknown as { weights: { dispose(): void } }).weights;

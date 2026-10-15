@@ -142,7 +142,6 @@ export class GeneratedGemma4 implements MlxDeclaredGraph, MlxTokenPhases {
   readonly numDonors = CACHES;
   readonly perLayerWidth: number;
   readonly graphCapabilities = declareGraph({ media: { input: "embeddings", video: false }, hiddenLayerTaps: true, compiledDecode: true });
-  readonly cachePaging = true;
   makeCache!: () => Cache[];
   readonly cacheLayers: readonly MlxCacheLayer[];
   readonly layers: readonly GemmaInputLayer[];

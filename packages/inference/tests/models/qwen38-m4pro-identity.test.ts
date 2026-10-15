@@ -3,16 +3,15 @@ import type { TestGraph } from "./test-composition";
 import { phaseRowLimit } from "../../src/models/graph";
 import { MlxPhaseDispatch } from "../../src/generation/phase-dispatch";
 import { bindMlxAutoregressiveGraph } from "../../src/generation/bindings/autoregressive";
-// The generated M4 Pro graph (src/models/qwen/qwen38-27b-trellis-m4pro.ts, an entire graph built from the
-// composition) on small synthetic weights laid out by the generated quant table: 48 DeltaNet and 16 attention layers
+// The written M4 Pro graph on small synthetic weights laid out by the artifact
+// quant table: 48 DeltaNet and 16 attention layers
 // with the artifact's 3- and 4-bit affine projections, Trellis gate/up at the artifact's widths (mixed in its ten
 // layers) and its 3-bit block-interleaved and row-major downs, scaled down in width. What the composition builds:
 // makeCache composes the lego the KV scheme names and the graph declares what it built. Where the graph runs the
-// generic blocks (a whole prompt chunk, windows wider than eight rows, every operation under the adapters
-// composition) it is held to the generic Qwen 3.5 graph of its family over the same weights, hidden, logits and
-// every cache tensor, at maxDiff 0. Its row kernels have no generic counterpart: the generator's drift test
-// (qwen38-generated-sync), the real-artifact parity suite (tests/parity/qwen-trellis-parity.test.ts) and the app
-// digests are their gates. No model, no download.
+// generic blocks it is held to the generic Qwen 3.5 graph of its family over the
+// same weights, hidden, logits and every cache tensor, at maxDiff 0. Row kernels
+// retain their fixed bindings; real-artifact parity and app digests qualify their
+// served geometry. No model, no download.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { MlxArray } from "@mlx-bun/mlx/array";
 import { Dtype } from "@mlx-bun/mlx/ffi";
@@ -26,6 +25,8 @@ import { LAYERS } from "./qwen38-layout";
 import { AneProgram } from "../../src/kernels/ane/linear";
 import { bindGraphCaches, composeGraphCaches } from "../../src/models/cache-composition";
 import { Qwen35Model } from "../../src/models/qwen/qwen3_5";
+import { Qwen35WideModel } from "../../src/models/qwen/qwen3_5-wide";
+import { Qwen35WideKnownModel } from "../../src/models/qwen/qwen3_5-wide-known";
 import { unfusedAffineKernels } from "../../src/state/affine-attention";
 import { Bf16FirstKv4Head256Cache, Bf16FirstQuantizedKVCache, Bf16FirstTurboQuantKVCache } from "../../src/state/bf16-first-kv";
 import { KVCache } from "../../src/state/kv";
@@ -51,7 +52,7 @@ const tensor = (values: Float32Array, shape: number[], dtype = Dtype.bfloat16): 
 };
 
 /** The synthetic artifact: every layer laid out as the generated table lists it. */
-function artifact(): { weights: Weights; config: ModelConfig } {
+function artifact(mlp: "trellis" | "affine" = "trellis"): { weights: Weights; config: ModelConfig } {
   const tensors = new Map<string, MlxArray>();
   const quant: Record<string, unknown> = { bits: 4, group_size: 64, mode: "affine" };
   let seed = 1;
@@ -104,9 +105,15 @@ function artifact(): { weights: Weights; config: ModelConfig } {
       norm(`${p}.k_norm.weight`, HEAD_DIM);
     }
     const m = `${prefix}.mlp`;
-    trellis(`${m}.gate_proj`, INTER, HIDDEN, 1, spec.gate);
-    trellis(`${m}.up_proj`, INTER, HIDDEN, 1, spec.up);
-    trellis(`${m}.down_proj`, INTER, HIDDEN, 0, spec.down, spec.downLayout === "k3Interleaved");
+    if (mlp === "affine") {
+      affine(`${m}.gate_proj`, INTER, HIDDEN);
+      affine(`${m}.up_proj`, INTER, HIDDEN);
+      affine(`${m}.down_proj`, HIDDEN, INTER);
+    } else {
+      trellis(`${m}.gate_proj`, INTER, HIDDEN, 1, spec.gate);
+      trellis(`${m}.up_proj`, INTER, HIDDEN, 1, spec.up);
+      trellis(`${m}.down_proj`, INTER, HIDDEN, 0, spec.down, spec.downLayout === "k3Interleaved");
+    }
   });
   const weights = {
     tensorNames: [...tensors.keys()],
@@ -267,6 +274,77 @@ describe("composition", () => {
 });
 
 describe("the M4 Pro graph against the generic Qwen 3.5 graph where both run the generic blocks (bf16 KV)", () => {
+  test("short multi-sequence tails retain the submitted row operations while chunks retain stock operations", () => {
+    const current = graph(), dispatch = new MlxPhaseDispatch(current);
+    for (const [sequences, tokens] of [[2, 1], [3, 1], [2, 2], [2, 3], [4, 2]]) {
+      const rows = sequences! * tokens!;
+      expect(dispatch.prompt("tail", sequences!, tokens!)).toBe(current.verify[rows]!);
+      expect(dispatch.prompt("chunk", sequences!, tokens!)).not.toBe(current.verify[rows]!);
+      const tail = current.makeCache(), window = current.makeCache();
+      try {
+        using input = ids(Array.from({ length: sequences! }, (_, row) => prompt(tokens!, 81 + row)));
+        outputDiff(`cohort tail ${sequences}x${tokens}`, dispatch.prompt("tail", sequences!, tokens!)(input, tail, null) as MlxArray,
+          current.verify[rows]!(input, window, null), current.logits[rows]!, current.logits[rows]!);
+        stateDiff(`cohort tail ${sequences}x${tokens}`, tail, window);
+      } finally { disposeAll(tail, window); }
+    }
+  }, 180_000);
+  test("short multi-sequence chunks retain main's unfused generic arithmetic", () => {
+    const current = graph(), dispatch = new MlxPhaseDispatch(current), { weights, config } = source();
+    const legacy = testGraph(new Qwen35WideModel(weights, config, 8), composition());
+    try {
+      for (const tokens of [1, 2]) {
+        expect(dispatch.prompt("chunk", 1, 2 * tokens)).toBe(dispatch.prompt("chunk", 2, tokens));
+        const mine = current.makeCache(), theirs = legacy.makeCache();
+        try {
+          using input = ids([prompt(tokens, 82), prompt(tokens, 83)]);
+          let hidden = legacy.embed.encode(input);
+          try {
+            for (const [index, layer] of legacy.layers.entries()) {
+              // Main's chunk named the generic wider operation even at 2–4
+              // actual rows, disabling the fused narrow gate/up operation.
+              const next = layer.forward(hidden, theirs[index]!, "window", null, 9);
+              hidden.dispose(); hidden = next;
+            }
+            outputDiff(`cohort chunk 2x${tokens}`, dispatch.prompt("chunk", 2, tokens)(input, mine, null) as MlxArray,
+              legacy.finalNorm.forward(hidden), current.logitsFromHidden.bind(current), legacy.logitsFromHidden.bind(legacy));
+            stateDiff(`cohort chunk 2x${tokens}`, mine, theirs);
+          } finally { hidden.dispose(); }
+        } finally { disposeAll(mine, theirs); }
+      }
+    } finally { legacy.dispose(); }
+  }, 180_000);
+  test("generic committed graph retains main's committed projections and whole-span geometry", () => {
+    for (const [kind, { weights, config }] of [["trellis", source()], ["affine", artifact("affine")]] as const) {
+      const facts = composition();
+      const current = testGraph(new Qwen35WideKnownModel(weights, config, 64), facts);
+      const legacy = testGraph(new Qwen35WideModel(weights, config, 64), facts);
+      const committed = (input: MlxArray, cache: Cache[], rows: number): MlxArray => {
+        let hidden = legacy.embed.encode(input);
+        try {
+          for (const [index, layer] of legacy.layers.entries()) {
+            const next = layer.forward(hidden, cache[index]!, "committed", null, rows);
+            hidden.dispose(); hidden = next;
+          }
+          return legacy.finalNorm.forward(hidden);
+        } finally { hidden.dispose(); }
+      };
+      try {
+        for (const rows of [1, 3, 8, 40]) {
+          const mine = current.makeCache(), theirs = legacy.makeCache();
+          try {
+            using input = ids([prompt(rows, 83)]);
+            outputDiff(`generic ${kind} committed ${rows}`, new MlxPhaseDispatch(current).known(rows)(input, mine) as MlxArray,
+              committed(input, theirs, rows), current.logitsFromHidden.bind(current), legacy.logitsFromHidden.bind(legacy));
+            stateDiff(`generic ${kind} committed ${rows}`, mine, theirs);
+          } finally { disposeAll(mine, theirs); }
+        }
+        for (const [offset, chunk] of [[0, 4], [1022, 1], [1023, 1], [1024, 4], [8191, 1]])
+          expect(current.knownSpans.maxChunkSize([{ offset } as Cache])).toBe(chunk!);
+        expect(legacy.knownSpans).toBeUndefined();
+      } finally { current.dispose(); legacy.dispose(); }
+    }
+  }, 180_000);
   test("unbounded verify, explicit decode and positioned decode retain the expanded operations",()=>{
     const current=graph(),{weights,config}=source(),facts=composition();
     const generic=testGraph(new Qwen35Model(weights,config,513),facts);

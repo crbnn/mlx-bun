@@ -15,7 +15,7 @@ import type { KvStorageScheme } from "../../src/contracts/portable/composition";
 import type { ServedComposition } from "../../src/models/implementation";
 import { Gemma4Model } from "../../src/models/gemma4/model";
 import { phaseHidden } from "./phase-forward";
-import { testComposition } from "./test-composition";
+import { testGraph, testComposition } from "./test-composition";
 import * as current12b from "../../src/models/gemma4/gemma4-12b";
 import * as current26b from "../../src/models/gemma4/gemma4-26b";
 import * as currentE4b from "../../src/models/gemma4/gemma4-e4b";
@@ -254,6 +254,58 @@ for (const c of COMPOSITIONS) {
 
     };
 
+    test(`${c.stem}: the cache service provisions direct and gathered page pools for prompt plus output`, async () => {
+      const { weights, config } = artifact(await fixtureConfig(c.repo), 7);
+      const kv = artifactScheme(c.repo);
+      for (const direct of [false, true]) {
+        const raw = new c.module.GeneratedGemma4(weights, config);
+        const composition = testComposition(kv, { pagedKv: { blockSize: 16, direct } });
+        const model = testGraph(raw, composition);
+        const standalone = model.makeCache();
+        try { expect(standalone.some(cache => cache instanceof PagedKVCache)).toBe(false); }
+        finally { disposeAll(standalone); }
+        const service = new KvCacheService({ config, makeCache: model.makeCache, composition });
+        const request = { promptIds: prompt(37, 1), maxTokens: 29 };
+        const { caches } = service.acquire(request, "");
+        try {
+          for (const [index, cache] of caches.entries()) {
+            if (raw.cacheLayers[index]!.kind === "sliding") { expect(cache instanceof PagedKVCache).toBe(false); continue; }
+            expect(cache).toBeInstanceOf(PagedKVCache);
+            const paged = cache as PagedKVCache;
+            expect(paged.capacityTokens).toBe(66); expect(paged.blockSize).toBe(16); expect(paged.direct).toBe(direct);
+            expect(paged.quantization).toEqual({ bits: kv.layers[index]!.bits, groupSize: 64 });
+            expect(paged.pool).toBeNull();
+          }
+          const index = raw.cacheLayers.findIndex(layer => layer.kind === "full");
+          const paged = caches[index] as PagedKVCache;
+          const control = new PagedKVCache(66, 16, direct, paged.quantization);
+          try {
+            for (const rows of [37, 28]) {
+              using values = MlxArray.fromFloat32(noise(rows * 64, rows, 0.2), [1, 1, rows, 64]);
+              using k = values.astype(Dtype.bfloat16), v = ops.mulScalar(k, 0.5);
+              const actual = paged.appendAndGather(k, v), expected = control.appendAndGather(k, v);
+              try { maxDiff(actual[0], expected[0], "paged keys"); maxDiff(actual[1], expected[1], "paged values"); }
+              finally { for (const array of [...actual, ...expected]) array.dispose(); }
+              expect(paged.pool!.numBlocks).toBe(5);
+              expect(paged.offset).toBe(rows === 37 ? 37 : 65);
+            }
+            using token = MlxArray.fromFloat32(noise(64, 1, 0.2), [1, 1, 1, 64]);
+            using k = token.astype(Dtype.bfloat16), v = ops.mulScalar(k, 0.5);
+            const actualRead = paged.appendDecode(k, v), expectedRead = control.appendDecode(k, v);
+            try {
+              using actual = actualRead.attend(k, 0.125), expected = expectedRead.attend(k, 0.125);
+              maxDiff(actual, expected, direct ? "direct paged decode" : "gathered paged decode");
+            } finally { actualRead.dispose(); expectedRead.dispose(); }
+            expect(paged.offset).toBe(66); expect(paged.pool!.numBlocks).toBe(5);
+            expect(paged.blockTable).toHaveLength(5);
+          } finally { control.dispose(); }
+        } finally {
+          disposeAll(caches); service.release(request, false); await service.close();
+          (raw as unknown as { dispose(): void }).dispose();
+        }
+      }
+    }, 120_000);
+
     test(`${c.stem}: prefill 37, decodes, a window across the sliding boundary, verify 4, decodes`, async () => {
       const { model, generic } = await pair();
       const mine = model.makeCache(), theirs = generic.makeCache();
@@ -340,3 +392,6 @@ import { bindGraphCaches } from "../../src/models/cache-composition";
 import type { MlxCompiledDecodeStep } from "../../src/contracts/mlx/graph";
 
 import { knownOperationFor } from "../../src/generation/phase-dispatch";
+
+import { PagedKVCache } from "../../src/state/paged/cache";
+import { KvCacheService } from "../../src/state/cache-service";

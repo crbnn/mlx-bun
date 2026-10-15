@@ -1,5 +1,9 @@
 import { UniversalDenseWideModel } from "./universal/dense-wide";
 import { Qwen35WideModel } from "./qwen/qwen3_5-wide";
+import { UniversalDenseG13Model } from "./universal/dense-g13";
+import { Qwen35G13Model } from "./qwen/qwen3_5-g13";
+import { Qwen35WideKnownModel } from "./qwen/qwen3_5-wide-known";
+import { qwen35KnownSpansEligible } from "./qwen/known-span-eligibility";
 import type { ServedComposition } from "./implementation";
 // Model construction consumes one declared profile and one composition. Exact
 // artifact profiles outrank family profiles; the profile names the family's
@@ -62,8 +66,8 @@ import {
 } from "./profile";
 
 type WrittenGraph = (
-  | Gemma4Model | GeneratedGemma4Graph | MiniCPM5Model | Qwen35Model | Qwen35WideModel | Qwen38TrellisM4Pro | Qwen38TrellisM1Max | Qwen3Model | Qwen3MoeModel
-  | DiffusionGemmaModel | Glm52Model | UniversalDenseModel | UniversalDenseWideModel);
+  | Gemma4Model | GeneratedGemma4Graph | MiniCPM5Model | Qwen35Model | Qwen35WideModel | Qwen35G13Model | Qwen35WideKnownModel | Qwen38TrellisM4Pro | Qwen38TrellisM1Max | Qwen3Model | Qwen3MoeModel
+  | DiffusionGemmaModel | Glm52Model | UniversalDenseModel | UniversalDenseWideModel | UniversalDenseG13Model);
 
 export type RuntimeModel = WrittenGraph & { makeCache(): Cache[]; readonly composition?: Composition };
 
@@ -100,8 +104,12 @@ export const MLX_GRAPH_TABLES: Readonly<Record<ModelGraph, GraphTable<Weights, R
       fingerprint:"cfa205c8f5af046a",device:"applegpu_g13s",
     }, create: (weights, config) => new Qwen38TrellisM1Max(weights, config),
       anePrograms: () => qwen38TrellisM1MaxAnePrograms() }),
+    generic("qwen3.5-wide-known-m4", (weights, config, composition) => new Qwen35WideKnownModel(weights, config, phaseRowLimit(composition)),
+      { device: "applegpu_g16s", artifact: qwen35KnownSpansEligible }),
     generic("qwen3.5-wide-m3", (weights, config, composition) => new Qwen35WideModel(weights, config, phaseRowLimit(composition)), { device: "applegpu_g15s" }),
     generic("qwen3.5-wide-m4", (weights, config, composition) => new Qwen35WideModel(weights, config, phaseRowLimit(composition)), { device: "applegpu_g16s" }),
+    generic("qwen3.5-wide", (weights, config, composition) => new Qwen35WideModel(weights, config, phaseRowLimit(composition)), { minGpuFamily: 15 }),
+    generic("qwen3.5-g13", (weights, config, composition) => new Qwen35G13Model(weights, config, phaseRowLimit(composition)), { device: "applegpu_g13s" }),
     generic("qwen3.5", (weights, config, composition) => new Qwen35Model(weights, config, phaseRowLimit(composition))),
   ], qwen35GraphFingerprint),
   "qwen3-moe": new GraphTable([generic("qwen3-moe", (weights, config, composition) => new Qwen3MoeModel(weights, config, phaseRowLimit(composition)))]),
@@ -111,6 +119,8 @@ export const MLX_GRAPH_TABLES: Readonly<Record<ModelGraph, GraphTable<Weights, R
   "universal-dense": new GraphTable([
     generic("universal-dense-wide-m3", (weights, config, composition) => new UniversalDenseWideModel(weights, config, genericArgsFor(config)!, phaseRowLimit(composition)), { device: "applegpu_g15s" }),
     generic("universal-dense-wide-m4", (weights, config, composition) => new UniversalDenseWideModel(weights, config, genericArgsFor(config)!, phaseRowLimit(composition)), { device: "applegpu_g16s" }),
+    generic("universal-dense-wide", (weights, config, composition) => new UniversalDenseWideModel(weights, config, genericArgsFor(config)!, phaseRowLimit(composition)), { minGpuFamily: 15 }),
+    generic("universal-dense-g13", (weights, config, composition) => new UniversalDenseG13Model(weights, config, genericArgsFor(config)!, phaseRowLimit(composition)), { device: "applegpu_g13s" }),
     generic("universal-dense", (weights, config, composition) =>
     new UniversalDenseModel(weights, config, genericArgsFor(config)!, phaseRowLimit(composition)))]),
 });

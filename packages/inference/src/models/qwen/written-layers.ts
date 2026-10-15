@@ -5,7 +5,7 @@ import { QuantizedLinear } from "../../layers/quantized-linear";
 import { TrellisLinear } from "../../layers/trellis-linear";
 import type { TrellisRepresentations } from "../../kernels/trellis/index";
 import type { RowProjection } from "../../layers/trellis-prompt";
-import { TrellisUnfusedMLP,TrellisReducePrompt,TrellisExpandReducePrompt,TrellisExpandScatterPrompt } from "../../layers/trellis-prompt";
+import { TrellisUnfusedMLP,TrellisExpandReducePrompt,TrellisExpandScatterPrompt } from "../../layers/trellis-prompt";
 import { LoraOperation,LoraState } from "../../layers/lora";
 import { QwenGatedDeltaNet, Qwen3TextAttention, Qwen3MediaAttention, QwenDeltaLayer, QwenAttentionLayer } from "./blocks";
 import { AneAffineSplit, type AneMlpSplit, type AneGpuRows } from "../../layers/ane-prefill-split";
@@ -112,11 +112,11 @@ export class DeltaWeights {
     this.outProj = QuantizedLinear.load(weights, `${block}.out_proj`, config);
   }
   stage(weights: Weights, config: ModelConfig, Layer: typeof QwenDeltaLayer,
-    Mlp: GateDownClass, GateUp: GateUpClass, Down: TrellisProjectionClass,
+    Mlp: GateDownClass, GateUp: GateUpClass, Gate: TrellisProjectionClass, Down: TrellisProjectionClass,
     Qkv: AffineProjectionClass, Z: AffineProjectionClass, A: AffineProjectionClass,
     B: AffineProjectionClass, Out: AffineProjectionClass, qkScale: { q: MlxArray; k: MlxArray }): QwenDeltaLayer {
     const down=new Down(this.trellis.down),plain=new Mlp(new GateUp(this.trellis.gate,this.trellis.up),down);
-    const overlay=new TrellisUnfusedMLP(new TrellisReducePrompt(this.trellis.gate),new TrellisReducePrompt(this.trellis.up),down);
+    const overlay=new TrellisUnfusedMLP(new Gate(this.trellis.gate),new Gate(this.trellis.up),down);
     return new Layer(weights,config,this.prefix,this.bind(weights,config,Qkv,Z,A,B,Out,qkScale),this.trellis.operation(plain,overlay));
   }
   prompt(weights: Weights, config: ModelConfig, Layer: typeof QwenDeltaLayer,
@@ -210,10 +210,10 @@ export class AttentionWeights {
     this.oProj = QuantizedLinear.load(weights, `${block}.o_proj`, config);
   }
   stage(weights: Weights, config: ModelConfig, Layer: typeof QwenAttentionLayer,
-    Mlp: GateDownClass, GateUp: GateUpClass, Down: TrellisProjectionClass,
+    Mlp: GateDownClass, GateUp: GateUpClass, Gate: TrellisProjectionClass, Down: TrellisProjectionClass,
     Q: AffineProjectionClass, K: AffineProjectionClass, V: AffineProjectionClass, O: AffineProjectionClass): QwenAttentionLayer {
     const down=new Down(this.trellis.down),plain=new Mlp(new GateUp(this.trellis.gate,this.trellis.up),down);
-    const overlay=new TrellisUnfusedMLP(new TrellisReducePrompt(this.trellis.gate),new TrellisReducePrompt(this.trellis.up),down);
+    const overlay=new TrellisUnfusedMLP(new Gate(this.trellis.gate),new Gate(this.trellis.up),down);
     return new Layer(weights,config,this.prefix,this.text(weights,config,Q,K,V,O),this.trellis.operation(plain,overlay));
   }
   prompt(weights: Weights, config: ModelConfig, Layer: typeof QwenAttentionLayer,

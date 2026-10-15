@@ -110,6 +110,32 @@ describe("a graph table", () => {
     expect(() => table.explicit("missing")).toThrow("no graph named missing");
   });
 
+  test("GPU family and artifact facts guide defaults without restricting explicit choices", () => {
+    let inspected = 0;
+    const known = entry("known", { device: M4_PRO,
+      artifact: config => { inspected++; return config.modelDir === "known"; } });
+    const table = new GraphTable([
+      known,
+      entry("m4", { device: M4_PRO }),
+      entry("wide", { minGpuFamily: 15 }),
+      entry("g13", { device: M1_MAX }),
+      entry("generic", {}),
+    ]);
+    const config = { modelDir: "known" } as ModelConfig;
+    expect(table.select(config, composition()).id).toBe("known");
+    expect(table.select({ modelDir: "other" } as ModelConfig, composition()).id).toBe("m4");
+    for (const device of ["applegpu_g15x", "applegpu_g16x", "applegpu_g17s", "applegpu_g19s"])
+      expect(table.select(config, composition({ device })).id).toBe("wide");
+    expect(table.select(config, composition({ device: "applegpu_g14s" })).id).toBe("generic");
+    expect(table.select(config, composition({ device: M1_MAX })).id).toBe("g13");
+    expect(table.select(config, composition({ device: "unknown" })).id).toBe("generic");
+    inspected = 0;
+    expect(table.select(config, composition({ device: M1_MAX }), "known")).toBe(known);
+    expect(inspected).toBe(0);
+    expect(() => new GraphTable([entry("invalid", { minGpuFamily: 0 }), entry("generic", {})]))
+      .toThrow("positive integer GPU family");
+  });
+
   test("construction rejects tables whose selection would refuse or depend on order", () => {
     expect(() => new GraphTable([entry("a", { device: M4_PRO })])).toThrow("exactly one generic entry");
     expect(() => new GraphTable([entry("a", {}), entry("b", {})])).toThrow("exactly one generic entry");
@@ -196,15 +222,15 @@ describe("the Qwen 3.5 table", () => {
   test("the M1 recommendation still requires its device and artifact fingerprint", () => {
     expect(select(on("applegpu_g15s", qwen))).toBe("qwen3.5-wide-m3");
     expect(select(on("unlisted-gpu", qwen, { maxRows: 4096 }))).toBe("qwen3.5");
-    expect(select(on(M1_MAX, qwen, { maxRows: 4096 }), "another-artifact")).toBe("qwen3.5");
+    expect(select(on(M1_MAX, qwen, { maxRows: 4096 }), "another-artifact")).toBe("qwen3.5-g13");
   });
 
   test("another Qwen 3.5 artifact gets the generic graph on every device; the table fingerprints with the Trellis graph fingerprint", () => {
     const fingerprint = qwen35GraphFingerprint(qwen);
     expect(fingerprint).not.toBe(TRELLIS);
     for (const device of [M4_PRO, M1_MAX]) {
-      expect(table.select(qwen, on(device, qwen)).id).toBe(device === M4_PRO ? "qwen3.5-wide-m4" : "qwen3.5");
-      expect(select(on(device, qwen), fingerprint)).toBe(device === M4_PRO ? "qwen3.5-wide-m4" : "qwen3.5");
+      expect(table.select(qwen, on(device, qwen)).id).toBe(device === M4_PRO ? "qwen3.5-wide-m4" : "qwen3.5-g13");
+      expect(select(on(device, qwen), fingerprint)).toBe(device === M4_PRO ? "qwen3.5-wide-m4" : "qwen3.5-g13");
     }
   });
 
@@ -213,6 +239,8 @@ describe("the Qwen 3.5 table", () => {
     expect(table.select(config, on("unlisted-gpu", config)).id).toBe("qwen3.5");
     expect(table.select(config, on(M4_PRO, config), "qwen3.5").id).toBe("qwen3.5");
     expect(table.select(config, on(M1_MAX, config), "qwen3.5-wide-m4").id).toBe("qwen3.5-wide-m4");
+    for (const device of ["applegpu_g15x", "applegpu_g16x", "applegpu_g17s"])
+      expect(table.select(config, on(device, config)).id).toBe("qwen3.5-wide");
   });
 
   test("the published Trellis config selects by its own fingerprint (config only; skips when the snapshot is not downloaded)", async () => {
@@ -222,7 +250,7 @@ describe("the Qwen 3.5 table", () => {
     expect(qwen35GraphFingerprint(config)).toBe(TRELLIS);
     expect(table.select(config, on(M4_PRO, config)).id).toBe(QWEN38_TRELLIS_M4PRO_GRAPH);
     expect(table.select(config, on(M1_MAX, config)).id).toBe(QWEN38_TRELLIS_M1MAX_GRAPH);
-    expect(table.select(config, on(M4_PRO, config, { kv: { override: 8 } })).id).toBe("qwen3.5-wide-m4");
+    expect(table.select(config, on(M4_PRO, config, { kv: { override: 8 } })).id).toBe("qwen3.5-wide-known-m4");
   });
 });
 
