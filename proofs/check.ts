@@ -12,6 +12,7 @@ let dependencyPath = "";
 // Reviewed manual translations, not a verified Metal/TypeScript frontend. Pins
 // prevent source drift; changing a hash requires reviewing the affected proofs.
 const sourcePins = {
+  "layers/quantized-embedding.ts": "cdead9d17af0a47f7f178ee4bd6b2710364a485dd7001e4ca98c62dec991fe4c",
   "models/qwen/qwen38-27b-trellis-m1max.ts": "915f129881b5ce85f97b6bca5c98afe06dedc21be514a81137a75e058cac882b",
   "state/kv.ts": "526a42d976c7dd0a8e908dcf8b515b94d43269042dc3fc3023e1a5baf0d8a579",
   "state/attention-read.ts": "8081b76f6bd7676825511476c2275601c0c34cb5b68ef30637c7a1c8f9f1c50c",
@@ -61,6 +62,8 @@ const proofFiles = [
   "contracts/mlx/BFloat16.lean",
   "contracts/mlx/Negation.lean",
   "contracts/mlx/BFloat16Arithmetic.lean",
+  "contracts/mlx/BFloat16Fma.lean",
+  "contracts/mlx/BFloat16Bounds.lean",
   "contracts/mlx/ElementwiseAdd.lean",
   "contracts/mlx/Reduction.lean",
   "contracts/mlx/FlushedReduction.lean",
@@ -96,6 +99,8 @@ const proofFiles = [
   "kernels/StableSigmoid.lean",
   "kernels/quantization/AffinePacking.lean",
   "kernels/quantization/AffineLift.lean",
+  "kernels/quantization/AffineDequantize.lean",
+  "kernels/quantization/AffineDequantizeBounds.lean",
   "kernels/quantization/AffineInput.lean",
   "kernels/quantization/AffineDot.lean",
   "kernels/quantization/AffineTile.lean",
@@ -129,6 +134,7 @@ const proofFiles = [
   "layers/Normalization.lean",
   "layers/DeltaHeads.lean",
   "layers/AffineVerifyLinear.lean",
+  "layers/QuantizedEmbedding.lean",
   "state/Ssm.lean",
   "state/Kv.lean",
   "models/qwen/WrittenLayers.lean",
@@ -144,6 +150,7 @@ const proofFiles = [
   "models/qwen/DecodeStage.lean",
   "models/qwen/DecodeChain.lean",
   "models/qwen/Qwen38TrellisM1Max.lean",
+  "models/qwen/TokenInference.lean",
 ];
 
 const discoveredProofs = await Array.fromAsync(new Bun.Glob("**/*.lean").scan({
