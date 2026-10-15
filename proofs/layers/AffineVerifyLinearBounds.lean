@@ -9,29 +9,29 @@ open FloatLib FloatLib.Floats FloatLib.Floats.Formats.BinaryInterchange
 -- A static range certificate for an affine projection. All arithmetic and
 -- storage finiteness is derived from input/parameter magnitudes and capacities.
 -- The hardware boundary remains the scalar division and SIMD instruction.
-structure Profile (steps weight : Nat) where
+structure Profile (steps weight : Nat) (dotShift : Nat := 16) where
   inputExponent : Int
   scaleExponent : Int
   biasExponent : Int
   tileExponent : Int
   inputLower : -133 ≤ inputExponent
-  inputUpper : inputExponent+16 ≤ 100
+  inputUpper : inputExponent+dotShift ≤ 100
   tileLower : -149 ≤ tileExponent
   tileUpper : tileExponent ≤ 100
-  scaled : inputExponent+16+scaleExponent ≤ tileExponent
+  scaled : inputExponent+dotShift+scaleExponent ≤ tileExponent
   biased : inputExponent+biasExponent ≤ tileExponent
   size : 32 * (steps * weight) < 16777216
   outputCap : BF
   outputFinite : Model.isFinite outputCap = true
   capacity : ((32 * (steps * weight) : Nat) : ℝ) * (2 : ℝ)^tileExponent ≤ Model.toReal outputCap
 
-structure Parameters3 (p : Projection3 steps rows) (profile : Profile steps 36) : Prop where
+structure Parameters3 (p : Projection3 steps rows) (profile : Profile steps 36 dotShift) : Prop where
   scale : ∀ row group, Model.isFinite ((p.weights row).scale group) = true ∧
     |Model.toReal ((p.weights row).scale group)| ≤ (2 : ℝ)^profile.scaleExponent
   bias : ∀ row group, Model.isFinite ((p.weights row).bias group) = true ∧
     |Model.toReal ((p.weights row).bias group)| ≤ (2 : ℝ)^profile.biasExponent
 
-structure Parameters4 (p : Projection4 steps rows) (profile : Profile steps 32) : Prop where
+structure Parameters4 (p : Projection4 steps rows) (profile : Profile steps 32 dotShift) : Prop where
   scale : ∀ row group, Model.isFinite ((p.weights row).scale group) = true ∧
     |Model.toReal ((p.weights row).scale group)| ≤ (2 : ℝ)^profile.scaleExponent
   bias : ∀ row group, Model.isFinite ((p.weights row).bias group) = true ∧
