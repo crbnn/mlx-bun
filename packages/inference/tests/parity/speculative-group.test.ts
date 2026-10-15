@@ -119,6 +119,7 @@ export function attachmentMatches(kind: Kind, tokens: number, attachment: A): bo
 // ---- shared native setup ---------------------------------------------------------------
 async function load(inputs: Inputs) {
   const { loadModelConfig, Weights, createModel, openGlm52RuntimeModel, resolveComposition } = await import("@mlx-bun/inference");
+  const { disposeResources } = await import("@mlx-bun/inference/execution");
   const speculative = await import("@mlx-bun/inference/generation/speculative");
   const { kvSchemeOf } = await import("@mlx-bun/inference/state");
   const config = await loadModelConfig(inputs.target);
@@ -151,10 +152,12 @@ async function load(inputs: Inputs) {
   } else {
     const weights = await Weights.open(inputs.target);
     model = createModel(weights, config, composition) as A;
-    dispose = () => {
-      try { weights.dispose(); }
-      finally { for (const file of weights.shards.files.values()) file.mmap.unmap(); }
-    };
+    dispose = () => disposeResources([
+      { dispose: () => model.releaseCompiledDecode?.() },
+      model,
+      weights,
+      ...[...weights.shards.files.values()].map(file => ({ dispose: () => file.mmap.unmap() })),
+    ]);
   }
   if (inputs.window !== undefined) expect({ layerTypes: model.args?.layerTypes, slidingWindow: model.args?.slidingWindow })
     .toEqual({ layerTypes: config.text.layerTypes, slidingWindow: config.text.slidingWindow });
