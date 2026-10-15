@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 const root = new URL("../", import.meta.url);
 const sourcePath = new URL("packages/inference/src/kernels/trellis/codebook.ts", root);
-const proofPath = new URL("Trellis.lean", import.meta.url);
+const proofPath = new URL("kernels/trellis/Codebook.lean", import.meta.url);
 const lean = process.env.LEAN ?? "lean";
 const expected = `static inline int trellis_y(uint s) {
   const uint x = s * 34038481u + 76625530u;

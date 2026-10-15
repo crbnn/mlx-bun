@@ -4,6 +4,9 @@ import Std
 First arithmetic obligation for the Qwen3.8-27B Trellis M1 Max graph.
 Run: bun proofs/check.ts (Lean 4.35.0 must be on PATH).
 
+Paths under proofs/ mirror packages/inference/src/, with PascalCase Lean
+module filenames. This module corresponds to kernels/trellis/codebook.ts.
+
 The implementation below is a manually reviewed translation of trellis_y in
 packages/inference/src/kernels/trellis/codebook.ts. check.ts pins that source;
 the pin prevents silent drift but does not prove the translation correct.
@@ -19,7 +22,7 @@ native computation assumptions, custom axioms, and proof holes are rejected.
 This proves the integer helper, not floating-point decoding, GPU memory access,
 a projection kernel, a layer, or the complete inference graph.
 -/
-namespace Trellis
+namespace Inference.Kernels.Trellis.Codebook
 
 def mix (s : BitVec 32) : BitVec 32 := s * 34038481 + 76625530
 
@@ -120,10 +123,10 @@ theorem range (s : BitVec 32) : -510 ≤ implementation s ∧ implementation s �
   rw [ite_eq_left (by omega)]
   omega
 
-/-- info: 'Trellis.correct' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+/-- info: 'Inference.Kernels.Trellis.Codebook.correct' depends on axioms: [propext, Classical.choice, Quot.sound] -/
 #guard_msgs in
 #print axioms correct
-/-- info: 'Trellis.range' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+/-- info: 'Inference.Kernels.Trellis.Codebook.range' depends on axioms: [propext, Classical.choice, Quot.sound] -/
 #guard_msgs in
 #print axioms range
-end Trellis
+end Inference.Kernels.Trellis.Codebook
