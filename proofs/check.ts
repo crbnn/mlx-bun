@@ -21,9 +21,14 @@ const proofFiles = [
   "contracts/mlx/M1Max.lean",
   "contracts/mlx/Memory.lean",
   "contracts/mlx/Numerics.lean",
+  "contracts/mlx/FlushToZero.lean",
+  "contracts/mlx/BFloat16.lean",
   "contracts/mlx/Reduction.lean",
+  "contracts/mlx/DotProduct.lean",
+  "contracts/mlx/FlushedDotProduct.lean",
   "kernels/trellis/Codebook.lean",
   "kernels/trellis/CodebookLoad.lean",
+  "kernels/trellis/CodebookFlushToZero.lean",
   "kernels/trellis/CodebookAccuracy.lean",
   "kernels/trellis/CodebookInitialization.lean",
   "kernels/trellis/DownCodebook.lean",
@@ -31,7 +36,11 @@ const proofFiles = [
   "kernels/trellis/DownExecution.lean",
   "kernels/trellis/DownMemory.lean",
   "kernels/trellis/DownAccuracy.lean",
+  "kernels/trellis/DownReduction.lean",
   "kernels/trellis/GateUpExecution.lean",
+  "kernels/trellis/GateUpAccuracy.lean",
+  "kernels/trellis/GateUpFlushToZero.lean",
+  "kernels/trellis/GateUpTail.lean",
 ];
 
 function checkSource(name: keyof typeof sourcePins, source: string): void {
@@ -88,6 +97,8 @@ process.stdout.write(await runLake(["build",
   "FloatLib.Floats.Formats.BinaryInterchange.Analysis.StandardModel",
   "FloatLib.Floats.Formats.BinaryInterchange.Arithmetic.LeanModel.MulDiv",
   "FloatLib.Floats.Formats.IEEE754.Native.Model",
+  "FloatLib.Floats.Formats.BinaryInterchange.Conversion.Cast.Proof",
+  "Mathlib.Analysis.SpecialFunctions.Exp",
 ]));
 dependencyPath = (await runLake(["env", "printenv", "LEAN_PATH"])).trim();
 const sources = new Map<keyof typeof sourcePins, string>();
@@ -156,6 +167,6 @@ try {
 } finally {
   await rm(dir, { recursive: true, force: true });
 }
-console.log("Checked decoding, packed windows, binary32 rounding/error bounds, conditional M1 loads, initialization stores, gate/up accumulators, down scratch reduction, and down split error bounds including decoder error.");
+console.log("Checked decoding, packed windows, binary32/bfloat16 rounding bounds, conditional M1 loads, initialization stores, gate/up and down dot-product error bounds, and the TAIL=0 SwiGLU arithmetic bound.");
 console.log("Permitted axioms: propext, Classical.choice, Quot.sound. No native proof evaluation.");
-console.log("Scope: source-pinned manual translations. M1 loads require a hardware hypothesis; SIMD reduction/casts remain parameters. Finite intermediate values remain caller obligations. Whole-projection bounds, SwiGLU, machine-code correspondence, layers, and graph remain unproved.");
+console.log("Scope: gate/up also has a flush-to-zero model; down/SwiGLU bounds still use gradual underflow and do not yet describe the observed M1 Max flushing behavior. Hardware/compiler conformance, finite intermediates, TAIL=1 arithmetic, remaining kernels, layers, and graph remain unproved.");

@@ -49,6 +49,20 @@ theorem mul_real (x y : Float32) (hout : (x*y).isFinite=true) :
   exact Model.toReal_ofModel_mul_toModel_eq_roundAt (by decide) (model x) (model y)
     (by change Model.isFinite (model (x*y))=true; rw [finite_model]; exact hout)
 
+theorem div_real (x y : Float32) (hy : y.isFinite=true) (hout : (x/y).isFinite=true) :
+    real (x/y) = Model.roundAt FloatFormat.binary32 (real x / real y) := by
+  exact Model.toReal_ofModel_div_toModel_eq_roundAt (by decide) (model x) (model y)
+    (by rw [finite_model]; exact hy)
+    (by change Model.isFinite (model (x/y))=true; rw [finite_model]; exact hout)
+
+theorem real_one : real (1 : Float32) = 1 := by
+  rw [real_unpack]
+  change Model.unpackedToReal (.finite .positive 8388608 (-23) (by decide)) = 1
+  rw [Model.unpackedToReal_finite]
+  norm_num [Model.modelSignBit, FloatLib.Floats.Formats.Flocq.bpow]
+  change 8388608 * ((2 : ℝ)^23)⁻¹ = 1
+  norm_num
+
 
 theorem fma_real (x y z : Float32) (hx : x.isFinite=true) (hy : y.isFinite=true) (hz : z.isFinite=true)
     (hout : (Float32.fma x y z).isFinite=true) :
@@ -131,6 +145,11 @@ noncomputable abbrev epsilon (x : ℝ) := Model.epsilonAt FloatFormat.binary32 x
 theorem mul_error (x y : Float32) (hout : (x*y).isFinite=true) :
     |real (x*y) - real x*real y| ≤ epsilon (real x*real y) := by
   rw [mul_real x y hout]
+  exact Model.abs_roundAt_sub_le _ _
+
+theorem div_error (x y : Float32) (hy : y.isFinite=true) (hout : (x/y).isFinite=true) :
+    |real (x/y) - real x / real y| ≤ epsilon (real x / real y) := by
+  rw [div_real x y hy hout]
   exact Model.abs_roundAt_sub_le _ _
 
 theorem fma_error (x y z : Float32) (hx : x.isFinite=true) (hy : y.isFinite=true) (hz : z.isFinite=true)
