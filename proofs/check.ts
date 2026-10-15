@@ -36,6 +36,9 @@ const sourcePins = {
 // These pins do not establish correspondence with the bundled native binary.
 const mlxRevision = "1f8e74e3f12f31365464a6867c6579f0e9b29d85";
 const mlxSourcePins = {
+  "mlx/backend/metal/scaled_dot_product_attention.cpp": "215ebac6495706cf01a2635c4dcec29802e130165ed8704f212d789679d2e673",
+  "mlx/backend/metal/kernels/scaled_dot_product_attention.metal": "f6fefad1d91b01f05c12095e69f248e255f880d65b5ae9e9d8bc2714da56fb41",
+  "mlx/backend/metal/kernels/sdpa_vector.h": "de098d50a67a865e2e64fb1700fc4819307861f009a65642679777a9a9cec7cd",
   "mlx/backend/metal/rope.cpp": "9ec2d2f298381af6445b1e2281dd90521988861ed170a602944ec0f1fca17ecc",
   "mlx/backend/metal/kernels/rope.metal": "2b35221ebea033ff43100b85eaaddec5c0e34e3cfd52e7c692573764b2b7d0ab",
   "mlx/backend/metal/conv.cpp": "ffec76d32b453b232245978ee067fac70a0205981d9ff38311e19db422dc0758",
@@ -105,6 +108,11 @@ const proofFiles = [
   "kernels/delta/SiluRmsHeads.lean",
   "kernels/attention/Rope.lean",
   "kernels/attention/RopeAngles.lean",
+  "kernels/attention/OnlineSoftmax.lean",
+  "kernels/attention/SdpaUpdate.lean",
+  "kernels/attention/SdpaLoop.lean",
+  "kernels/attention/SdpaNormalize.lean",
+  "kernels/attention/SdpaScore.lean",
   "kernels/ResidualRmsNorm.lean",
   "kernels/GatedRmsNorm.lean",
   "layers/TrellisCodebookGateUp.lean",
