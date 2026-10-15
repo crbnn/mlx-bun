@@ -3,7 +3,7 @@ import contracts.mlx.ArithmeticBounds
 import contracts.mlx.ArithmeticFold
 
 namespace Inference.Contracts.Mlx.ArithmeticFoldBounds
-open Numerics Arithmetic ArithmeticFold
+open Numerics Arithmetic ArithmeticFold ArithmeticBounds
 
 theorem madd_range (input : Nat → Float32) (contracted : Bool) (a b acc : Expr)
     (ea eb : Int) (count : Nat) (lo : -149 ≤ ea + eb) (hi : ea + eb ≤ 100)
@@ -66,5 +66,59 @@ theorem from_zero (input : Nat → Float32) (contracted : Bool) (a b : α → Ex
     rw [real_unpack]; exact FloatLib.Floats.Formats.BinaryInterchange.Model.unpackedToReal_zero .positive
   simpa only [Nat.zero_add] using fold_range input contracted a b ea eb lo hi ha hb indices .zero 0
     (by simpa only [Nat.zero_add] using size) ⟨True.intro, by simp only [evaluate, hz, abs_zero, Nat.cast_zero, zero_mul, le_refl]⟩
+
+theorem fold (inputCap : Nat → Float32) (contracted : Bool) (a b : α → Expr)
+    (ca cb : Float32) (exponent : Int) (lo : -149 ≤ exponent) (hi : exponent ≤ 100)
+    (ha : ∀ i, Certificate inputCap (a i) ca) (hb : ∀ i, Certificate inputCap (b i) cb)
+    (product : real ca * real cb ≤ (2 : ℝ)^exponent)
+    (indices : List α) (acc : Expr) (count : Nat)
+    (initial : Certificate inputCap acc (DyadicBounds.ceiling count exponent))
+    (size : count + indices.length < 16777216) :
+    Certificate inputCap (indices.foldl (fun acc i => madd contracted (a i) (b i) acc) acc)
+      (DyadicBounds.ceiling (count + indices.length) exponent) := by
+  induction indices generalizing acc count with
+  | nil => simpa only [List.foldl_nil, List.length_nil, Nat.add_zero] using initial
+  | cons i rest ih =>
+    have hcount : count < 16777216 := by simp only [List.length_cons] at size; omega
+    have hnext : count+1 < 16777216 := by simp only [List.length_cons] at size; omega
+    have hc := DyadicBounds.ceiling_range count exponent hcount lo hi
+    have hn := DyadicBounds.ceiling_range (count+1) exponent hnext lo hi
+    have hp := DyadicBounds.ceiling_range 1 exponent (by decide) lo hi
+    have step : Certificate inputCap (madd contracted (a i) (b i) acc)
+        (DyadicBounds.ceiling (count+1) exponent) := by
+      cases contracted with
+      | false =>
+        exact .add initial (.mul (ha i) (hb i) (DyadicBounds.ceiling 1 exponent) hp.1
+          (by simpa only [hp.2, Nat.cast_one, one_mul] using product)) _ hn.1
+          (by rw [hc.2, hp.2, hn.2]; push_cast; ring_nf; exact le_refl _)
+      | true =>
+        exact .fma (ha i) (hb i) initial _ hn.1 (by
+          rw [hc.2, hn.2]
+          calc
+            _ ≤ (2 : ℝ)^exponent + (count : ℝ)*(2 : ℝ)^exponent := add_le_add_left product _
+            _ = _ := by push_cast; ring)
+    have h := ih (madd contracted (a i) (b i) acc) (count+1) step
+      (by simp only [List.length_cons] at size; omega)
+    simpa only [List.foldl_cons, List.length_cons, show count+1+rest.length = count+(rest.length+1) from by omega] using h
+
+theorem reduction (inputCap : Nat → Float32) (lanes : Fin n → Expr)
+    (perLane : Nat) (exponent : Int) (lo : -149 ≤ exponent) (hi : exponent ≤ 100)
+    (hl : ∀ i, Certificate inputCap (lanes i) (DyadicBounds.ceiling perLane exponent))
+    (tree : Reduction.Tree n) (size : (Reduction.leaves tree).length * perLane < 16777216) :
+    Certificate inputCap (reduceExpr lanes tree)
+      (DyadicBounds.ceiling ((Reduction.leaves tree).length * perLane) exponent) := by
+  induction tree with
+  | leaf i => simpa only [reduceExpr, Reduction.leaves, List.length_singleton, Nat.one_mul] using hl i
+  | add a b ia ib =>
+    have hs : ((Reduction.leaves a).length + (Reduction.leaves b).length)*perLane < 16777216 := by
+      simpa only [Reduction.leaves, List.length_append] using size
+    have sa : (Reduction.leaves a).length*perLane < 16777216 := by nlinarith
+    have sb : (Reduction.leaves b).length*perLane < 16777216 := by nlinarith
+    have ca := DyadicBounds.ceiling_range _ exponent sa lo hi
+    have cb := DyadicBounds.ceiling_range _ exponent sb lo hi
+    have c := DyadicBounds.ceiling_range _ exponent size lo hi
+    exact .add (ia sa) (ib sb) _ c.1 (by
+      rw [ca.2, cb.2, c.2]
+      simp only [Reduction.leaves, List.length_append, Nat.cast_add, add_mul, le_refl])
 
 end Inference.Contracts.Mlx.ArithmeticFoldBounds

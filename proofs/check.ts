@@ -213,6 +213,21 @@ const proofFiles = [
   "models/qwen/EmbeddingRanges.lean",
   "models/qwen/EmbeddingNormalization.lean",
   "models/qwen/InitialState.lean",
+  "contracts/mlx/Float32OverflowMargin.lean",
+  "contracts/mlx/FlushedIdentities.lean",
+  "kernels/attention/OutputGateRanges.lean",
+  "kernels/attention/RopeAnglesRanges.lean",
+  "kernels/attention/RopeRanges.lean",
+  "kernels/attention/SdpaExponentRanges.lean",
+  "kernels/attention/SdpaScoreRanges.lean",
+  "kernels/attention/SdpaInitialUpdateRanges.lean",
+  "kernels/attention/SdpaInitialLoopRanges.lean",
+  "kernels/attention/SdpaMergeRanges.lean",
+  "kernels/attention/SdpaInitialRanges.lean",
+  "models/qwen/AttentionInputRanges.lean",
+  "models/qwen/AttentionInitialHeadsRanges.lean",
+  "models/qwen/AttentionInitialRanges.lean",
+  "models/qwen/ResidualAttentionInitialRanges.lean",
 ];
 
 const discoveredProofs = await Array.fromAsync(new Bun.Glob("**/*.lean").scan({
