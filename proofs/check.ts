@@ -12,6 +12,7 @@ let dependencyPath = "";
 // Reviewed manual translations, not a verified Metal/TypeScript frontend. Pins
 // prevent source drift; changing a hash requires reviewing the affected proofs.
 const sourcePins = {
+  "models/qwen/qwen38-27b-trellis-m1max.ts": "915f129881b5ce85f97b6bca5c98afe06dedc21be514a81137a75e058cac882b",
   "state/kv.ts": "526a42d976c7dd0a8e908dcf8b515b94d43269042dc3fc3023e1a5baf0d8a579",
   "state/attention-read.ts": "8081b76f6bd7676825511476c2275601c0c34cb5b68ef30637c7a1c8f9f1c50c",
   "layers/affine-verify-linear.ts": "ee519b24ad34a0322dee6f35d9a0ed9e3c37a367b78a6b09bd4d0353c81a3870",
@@ -138,6 +139,11 @@ const proofFiles = [
   "models/qwen/ResidualBlocks.lean",
   "models/qwen/DeltaCache.lean",
   "models/qwen/ResidualDelta.lean",
+  "models/qwen/Attention.lean",
+  "models/qwen/ResidualAttention.lean",
+  "models/qwen/DecodeStage.lean",
+  "models/qwen/DecodeChain.lean",
+  "models/qwen/Qwen38TrellisM1Max.lean",
 ];
 
 const discoveredProofs = await Array.fromAsync(new Bun.Glob("**/*.lean").scan({
@@ -299,6 +305,6 @@ try {
 } finally {
   await rm(dir, { recursive: true, force: true });
 }
-console.log(`Checked ${proofFiles.length} proof modules: Trellis and affine row numerical bounds, MLX fast-qmv source-model equivalence, packed windows, conditional M1 loads, initialization and scratch stores, flushed binary32/bfloat16 arithmetic, SwiGLU and stable sigmoid including exponential overflow, projection error propagation, RMS reduction and in-place ownership, weight preparation, packed bf16 boundaries, the normalized MLP residual block, DeltaNet gates, convolution history and recurrent composition, tensor offsets and cache-write bounds, and fused head/residual/gated normalization.`);
+console.log(`Checked ${proofFiles.length} proof modules: Trellis and affine numerical bounds, MLX fast-qmv source-model equivalence, packed windows, conditional M1 loads, scratch stores, flushed binary32/bfloat16 arithmetic, SwiGLU and sigmoid, RMS normalization, Delta convolution/recurrence/cache, Q/K normalization and partial RoPE, one-pass SDPA arithmetic and scratch transpose, plain KV append, residual Delta/attention layer composition, and the 64-layer embedded-row-to-logits source model with returned-cache bounds.`);
 console.log("Permitted axioms: propext, Classical.choice, Quot.sound. No native proof evaluation.");
 console.log("Scope: these are conditional numerical bounds for reviewed source models. Hardware/compiler conformance, model-wide range bounds, native memory/dispatch, delta adapters, remaining kernels, and the complete inference graph remain unproved.");
