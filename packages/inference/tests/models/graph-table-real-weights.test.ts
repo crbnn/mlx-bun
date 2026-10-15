@@ -2,7 +2,7 @@
 // artifact gets the generic graph for the default composition (bf16 KV) and its
 // written graph for the kv_config composition (`--kv-quant config`); the
 // published Qwen3.8 Trellis artifact gets the M4 Pro graph on applegpu_g16s and
-// the generated M1 Max graph on applegpu_g13s for the default composition. The graphs are
+// the written M1 Max graph on applegpu_g13s for the default composition. The graphs are
 // constructed (weights open, nothing runs a forward). Opt in with
 //   MLX_BUN_TEST_GRAPH_TABLE_MODEL=/snapshot
 // naming one such artifact. Unset skips; a blank value, a missing config.json or

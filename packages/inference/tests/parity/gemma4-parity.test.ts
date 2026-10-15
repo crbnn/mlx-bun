@@ -10,7 +10,7 @@ import type { TestGraph } from "../models/test-composition";
 // At every step the whole vector must be finite and its argmax must be the
 // reference token, which is then fed. This is a 100-token trajectory plus four
 // vectors and a separate 12-step control, not 100-step full-vector parity. The
-// generated 12B graph serves only the kv_config composition, so for plain KV (the
+// written 12B graph serves only the kv_config composition, so for plain KV (the
 // default composition) the loader's table selects the generic graph for this
 // artifact, and both entry points build Gemma4Model.
 // The model and reference stay outside this repository; Python never runs.
