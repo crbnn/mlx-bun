@@ -129,4 +129,165 @@ theorem range (s : BitVec 32) : -510 ≤ implementation s ∧ implementation s �
 /-- info: 'Inference.Kernels.Trellis.Codebook.range' depends on axioms: [propext, Classical.choice, Quot.sound] -/
 #guard_msgs in
 #print axioms range
+
+namespace PackedState
+def implementation (lo hi : BitVec 32) (off : Nat) : BitVec 32 :=
+  (if off + 12 > 32 then (lo >>> off) ||| (hi <<< (32-off)) else lo >>> off) &&& 4095#32
+
+theorem mask_bit (j : Nat) : (4095#32).getLsbD j = decide (j < 12) := by
+  change Nat.testBit (2^12-1) j = decide (j < 12)
+  exact Nat.testBit_two_pow_sub_one 12 j
+
+theorem correct (lo hi : BitVec 32) (off j : Nat) (ho : off < 32) (hj : j < 12) :
+    (implementation lo hi off).getLsbD j =
+    (hi ++ lo).getLsbD (off+j) := by
+  unfold implementation
+  simp only [BitVec.getLsbD_and, mask_bit, hj, decide_true, Bool.and_true]
+  split
+  next h =>
+    simp only [BitVec.getLsbD_or, BitVec.getLsbD_ushiftRight, BitVec.getLsbD_shiftLeft,
+      BitVec.getLsbD_append]
+    by_cases hc : off+j < 32
+    · simp [hc, show j < 32-off by omega]
+    · have he : j-(32-off) = off+j-32 := by omega
+      simp [hc, he, show ¬j < 32-off by omega, show j < 32 by omega,
+        BitVec.getLsbD_of_ge lo (off+j) (by omega)]
+  next h =>
+    simp only [BitVec.getLsbD_ushiftRight, BitVec.getLsbD_append]
+    simp only [show off+j < 32 by omega, ite_true]
+
+theorem geometry (k t : Nat) (hk : k=2 ∨ k=3 ∨ k=4) (ht : t<256) :
+    (255-t)*k < 2^32 ∧ ((255-t)*k)/32 < 8*k ∧ ((255-t)*k)%32 < 32 ∧
+    (if ((255-t)*k)/32+1 = 8*k then 0 else ((255-t)*k)/32+1) < 8*k := by
+  rcases hk with hk | hk | hk <;> subst k <;> split <;> omega
+
+def read (w : Nat → BitVec 32) (k t : Nat) : BitVec 32 :=
+  let p := (255-t)*k
+  let wi := p/32
+  let next := if wi+1=8*k then 0 else wi+1
+  implementation (w wi) (w next) (p%32)
+
+theorem cyclic_correct (w : Nat → BitVec 32) (k t j : Nat)
+    (hk : k=2 ∨ k=3 ∨ k=4) (ht : t<256) (hj : j<12) :
+    (read w k t).getLsbD j =
+      (w ((((255-t)*k+j)%(256*k))/32)).getLsbD (((255-t)*k+j)%32) := by
+  unfold read
+  rw [correct _ _ _ _ (by omega) hj, BitVec.getLsbD_append]
+  split
+  next hc =>
+    have hn : (255-t)*k+j < 256*k := by
+      rcases hk with hk | hk | hk <;> subst k <;> omega
+    rw [Nat.mod_eq_of_lt hn]
+    have hw : (255-t)*k/32 = (((255-t)*k+j)%(256*k))/32 := by
+      rw [Nat.mod_eq_of_lt hn]
+      omega
+    have hb : (255-t)*k%32+j = ((255-t)*k+j)%32 := by omega
+    rw [Nat.mod_eq_of_lt hn] at hw
+    rw [hw, hb]
+  next hc =>
+    have hw : (if (255-t)*k/32+1=8*k then 0 else (255-t)*k/32+1) =
+        (((255-t)*k+j)%(256*k))/32 := by
+      split
+      next hlast =>
+        rcases hk with hk | hk | hk <;> subst k <;> omega
+      next hlast =>
+        have hn : (255-t)*k+j < 256*k := by
+          rcases hk with hk | hk | hk <;> subst k <;> omega
+        rw [Nat.mod_eq_of_lt hn]
+        omega
+    have hb : (255-t)*k%32+j-32 = ((255-t)*k+j)%32 := by omega
+    rw [hw, hb]
+
+#print axioms correct
+#print axioms geometry
+#print axioms cyclic_correct
+end PackedState
+
+
+namespace CodebookWindow
+def virtualWord (w : Nat → BitVec 32) (i : Nat) : BitVec 32 :=
+  if i = 0 then w 0 <<< 16 else (w (i-1) >>> 16) ||| (w i <<< 16)
+
+def byteOffset (w : Nat → BitVec 32) (off : Nat) : BitVec 32 :=
+  if 2 ≤ off ∧ (off - 2) % 32 + 14 ≤ 32 then
+    (w ((off-2)/32) >>> ((off-2)%32)) &&& 16383#32
+  else
+    (virtualWord w ((off+14)/32) >>> ((off+14)%32)) &&& 16383#32
+
+theorem mask_bit (j : Nat) : (16383#32).getLsbD j = decide (j < 14) := by
+  change Nat.testBit (2^14-1) j = decide (j < 14)
+  exact Nat.testBit_two_pow_sub_one 14 j
+
+theorem correct (w : Nat → BitVec 32) (off j : Nat) (ho : off ≤ 60) (hj : j < 12) :
+    (byteOffset w off >>> 2).getLsbD j =
+      (w ((off+j)/32)).getLsbD ((off+j)%32) := by
+  unfold byteOffset
+  split
+  next h =>
+    simp only [BitVec.getLsbD_ushiftRight, BitVec.getLsbD_and, mask_bit]
+    have hmask : 2 + j < 14 := by omega
+    simp only [hmask, decide_true, Bool.and_true]
+    have hw : (off - 2) / 32 = (off+j)/32 := by omega
+    have hb : (off - 2) % 32 + (2+j) = (off+j)%32 := by omega
+    simp only [hw, hb]
+  next h =>
+    simp only [BitVec.getLsbD_ushiftRight, BitVec.getLsbD_and, mask_bit]
+    have hmask : 2 + j < 14 := by omega
+    simp only [hmask, decide_true, Bool.and_true]
+    unfold virtualWord
+    split
+    next hz =>
+      simp only [BitVec.getLsbD_shiftLeft]
+      have hbit : 16 ≤ (off+14)%32 + (2+j) := by omega
+      have he : (off+14)%32+(2+j)-16 = (off+j)%32 := by omega
+      have hw : (off+j)/32 = 0 := by omega
+      have hu : (off+14)%32+(2+j) < 32 := by omega
+      simp [hbit, he, hw, hu]
+    next hn =>
+      simp only [BitVec.getLsbD_or, BitVec.getLsbD_ushiftRight, BitVec.getLsbD_shiftLeft]
+      by_cases hb : (off+14)%32+(2+j) < 16
+      · have hw : (off+14)/32-1 = (off+j)/32 := by omega
+        have he : 16+((off+14)%32+(2+j)) = (off+j)%32 := by omega
+        simp [hw, he, show ¬16 ≤ (off+14)%32+(2+j) by omega]
+      · have hw : (off+14)/32 = (off+j)/32 := by omega
+        have he : (off+14)%32+(2+j)-16 = (off+j)%32 := by omega
+        have hi : 32 ≤ 16+((off+14)%32+(2+j)) := by omega
+        have hu : (off+14)%32+(2+j) < 32 := by omega
+        simp [hw, he, hu, BitVec.getLsbD_of_ge _ _ hi, show 16 ≤ (off+14)%32+(2+j) by omega]
+
+theorem byteOffset_bound (w : Nat → BitVec 32) (off : Nat) :
+    (byteOffset w off).toNat < 16384 := by
+  have bound (v : BitVec 32) : (v &&& 16383#32).toNat ≤ 16383 := by
+    simpa using (Nat.and_le_right (n := v.toNat) (m := 16383))
+  unfold byteOffset
+  split <;> exact Nat.lt_of_le_of_lt (bound _) (by decide)
+
+theorem index_bound (w : Nat → BitVec 32) (off : Nat) :
+    (byteOffset w off >>> 2).toNat < 4096 := by
+  have h := byteOffset_bound w off
+  simp only [BitVec.toNat_ushiftRight, Nat.shiftRight_eq_div_pow]
+  omega
+
+theorem load_indices (off : Nat) (ho : off ≤ 60) :
+    (off-2)/32 < 3 ∧ (off+14)/32 < 3 ∧ (off+14)/32-1 < 3 ∧
+    (off-2)%32 < 32 ∧ (off+14)%32 < 32 := by omega
+
+theorem lane_geometry (k i : Nat) (hk : k=2 ∨ k=3 ∨ k=4) (hi : i<16) :
+    i*k ≤ 60 ∧ (i*k-2)/32 < (15*k+43)/32 ∧
+    (i*k+14)/32 < (15*k+43)/32 ∧
+    (i*k+14)/32-1 < (15*k+43)/32 := by
+  rcases hk with hk | hk | hk <;> subst k <;> omega
+
+-- This is a valid k=2, i=1 window and demonstrates why the arithmetic proof
+-- cannot establish a portable aligned float load. M1 load semantics are needed.
+theorem unaligned_witness : (byteOffset (fun _ => 1#32) 2).toNat % 4 = 1 := by decide
+
+#print axioms correct
+#print axioms byteOffset_bound
+#print axioms index_bound
+#print axioms load_indices
+#print axioms lane_geometry
+#print axioms unaligned_witness
+end CodebookWindow
+
 end Inference.Kernels.Trellis.Codebook
