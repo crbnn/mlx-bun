@@ -92,6 +92,19 @@ theorem flush_eq_or_zero (x : Float32) : flush x = x ∨ real (flush x) = 0 := b
     · exact Or.inl rfl
   · exact Or.inl rfl
 
+theorem flush_nonpositive (x : Float32) (hx : real x ≤ 0) : real (flush x) ≤ 0 := by
+  rcases flush_eq_or_zero x with h | h
+  · rwa [h]
+  · rw [h]
+
+theorem mul_nonpositive (x y : Float32) (hx : real x ≤ 0) (hy : 0 ≤ real y)
+    (ho : (flush x * flush y).isFinite = true) : real (mul x y) ≤ 0 := by
+  apply flush_nonpositive
+  rw [Numerics.mul_real _ _ ho]
+  have h := Model.roundAt_mono FloatFormat.binary32
+    (mul_nonpos_of_nonpos_of_nonneg (flush_nonpositive x hx) (flush_nonnegative y hy))
+  simpa only [Model.roundAt_zero] using h
+
 theorem flush_eq_of_one_le (x : Float32) (hx : 1 ≤ real x) : flush x = x := by
   rcases flush_eq_or_zero x with h | h
   · exact h

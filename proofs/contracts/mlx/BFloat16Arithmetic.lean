@@ -45,6 +45,31 @@ theorem flush_nonnegative (x : Value) (h : 0 ≤ Model.toReal x) : 0 ≤ Model.t
   · rw [Model.toReal_zero]
   · exact h
 
+theorem flush_nonpositive (x : Value) (h : Model.toReal x ≤ 0) : Model.toReal (flush x) ≤ 0 := by
+  unfold flush
+  split
+  · rw [Model.toReal_zero]
+  · exact h
+
+theorem add_nonnegative (x y : Value) (hx : Model.isFinite x = true) (hy : Model.isFinite y = true)
+    (hxn : 0 ≤ Model.toReal x) (hyn : 0 ≤ Model.toReal y)
+    (ho : Model.isFinite (Model.add (flush x) (flush y)) = true) :
+    0 ≤ Model.toReal (add x y) := by
+  apply flush_nonnegative
+  rw [Model.toReal_add_eq_roundAt _ _ (by decide) (finite_flush x hx) (finite_flush y hy) ho]
+  have h := Model.roundAt_mono FloatFormat.bfloat16 (add_nonneg (flush_nonnegative x hxn) (flush_nonnegative y hyn))
+  simpa only [Model.roundAt_zero] using h
+
+theorem sub_nonpositive (x y : Value) (hx : Model.isFinite x = true) (hy : Model.isFinite y = true)
+    (hxn : Model.toReal x ≤ 0) (hyn : 0 ≤ Model.toReal y)
+    (ho : Model.isFinite (Model.sub (flush x) (flush y)) = true) :
+    Model.toReal (sub x y) ≤ 0 := by
+  apply flush_nonpositive
+  rw [Model.toReal_sub_eq_roundAt _ _ (by decide) (finite_flush x hx) (finite_flush y hy) ho]
+  have h := Model.roundAt_mono FloatFormat.bfloat16
+    (sub_nonpos.mpr (le_trans (flush_nonpositive x hxn) (flush_nonnegative y hyn)))
+  simpa only [Model.roundAt_zero] using h
+
 theorem flush_eq_of_one_le (x : Value) (h : 1 ≤ Model.toReal x) : flush x = x := by
   unfold flush
   split
