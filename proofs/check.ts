@@ -30,6 +30,10 @@ const proofFiles = [
   "contracts/mlx/Reduction.lean",
   "contracts/mlx/DotProduct.lean",
   "contracts/mlx/FlushedDotProduct.lean",
+  "contracts/mlx/SquaredSum.lean",
+  "contracts/mlx/NormalizationSchedule.lean",
+  "contracts/mlx/Normalization.lean",
+  "contracts/mlx/NormalizationExecution.lean",
   "kernels/trellis/Codebook.lean",
   "kernels/trellis/CodebookLoad.lean",
   "kernels/trellis/CodebookFlushToZero.lean",
@@ -123,6 +127,7 @@ process.stdout.write(await runLake(["build",
   "Mathlib.Analysis.SpecialFunctions.ExpDeriv",
   "Mathlib.Analysis.Calculus.MeanValue",
   "Mathlib.Analysis.Calculus.Deriv.Inv",
+  "Mathlib.Analysis.Real.Sqrt",
 ]));
 dependencyPath = (await runLake(["env", "printenv", "LEAN_PATH"])).trim();
 const sources = new Map<keyof typeof sourcePins, string>();
@@ -191,6 +196,6 @@ try {
 } finally {
   await rm(dir, { recursive: true, force: true });
 }
-console.log("Checked decoding, packed windows, conditional M1 loads, initialization and scratch stores, flushed binary32/bfloat16 arithmetic, both SwiGLU tails including exponential overflow, and numerical error propagation through the single-row projections.");
+console.log(`Checked ${proofFiles.length} proof modules: decoding, packed windows, conditional M1 loads, initialization and scratch stores, flushed binary32/bfloat16 arithmetic, both SwiGLU tails including exponential overflow, single-row projection error propagation, and conditional RMS arithmetic bounds.`);
 console.log("Permitted axioms: propext, Classical.choice, Quot.sound. No native proof evaluation.");
 console.log("Scope: these are conditional numerical bounds for reviewed source models. Hardware/compiler conformance, model-wide range bounds, native memory/dispatch, delta adapters, remaining kernels, and the complete inference graph remain unproved.");

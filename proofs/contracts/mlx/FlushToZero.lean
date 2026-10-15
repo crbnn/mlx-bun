@@ -88,6 +88,66 @@ theorem flush_eq_of_one_le (x : Float32) (hx : 1 ≤ real x) : flush x = x := by
     have ht : threshold < 1 := by norm_num [threshold]
     linarith
 
+theorem flush_eq_of_threshold_lt (x : Float32) (hx : threshold < |real x|) : flush x = x := by
+  rcases flush_eq_or_zero x with h | h
+  · exact h
+  · have he := flush_error x
+    rw [h, zero_sub, abs_neg] at he
+    linarith
+
+theorem round_nonnegative (x : ℝ) (hx : 0 ≤ x) :
+    0 ≤ Model.roundAt FloatFormat.binary32 x := by
+  have h := Model.roundAt_mono FloatFormat.binary32 hx
+  simpa only [Model.roundAt_zero] using h
+
+theorem mul_nonnegative (x y : Float32)
+    (hp : 0 ≤ real (flush x) * real (flush y)) (ho : (flush x * flush y).isFinite=true) :
+    0 ≤ real (mul x y) := by
+  apply flush_nonnegative
+  rw [Numerics.mul_real _ _ ho]
+  exact round_nonnegative _ hp
+
+theorem add_nonnegative (x y : Float32) (hx : x.isFinite=true) (hy : y.isFinite=true)
+    (hnx : 0 ≤ real x) (hny : 0 ≤ real y) (ho : (flush x + flush y).isFinite=true) :
+    0 ≤ real (add x y) := by
+  apply flush_nonnegative
+  rw [Numerics.add_real _ _ (finite_flush x hx) (finite_flush y hy) ho]
+  exact round_nonnegative _ (add_nonneg (flush_nonnegative x hnx) (flush_nonnegative y hny))
+
+theorem fma_square_nonnegative (x acc : Float32) (hx : x.isFinite=true) (ha : acc.isFinite=true)
+    (hna : 0 ≤ real acc) (ho : (Float32.fma (flush x) (flush x) (flush acc)).isFinite=true) :
+    0 ≤ real (fma x x acc) := by
+  apply flush_nonnegative
+  rw [Numerics.fma_real _ _ _ (finite_flush x hx) (finite_flush x hx) (finite_flush acc ha) ho]
+  exact round_nonnegative _ (add_nonneg (mul_self_nonneg _) (flush_nonnegative acc hna))
+
+theorem div_nonnegative (x y : Float32) (hy : y.isFinite=true)
+    (hnx : 0 ≤ real x) (hny : 0 ≤ real y) (ho : (flush x / flush y).isFinite=true) :
+    0 ≤ real (div x y) := by
+  apply flush_nonnegative
+  rw [Numerics.div_real _ _ (finite_flush y hy) ho]
+  exact round_nonnegative _ (div_nonneg (flush_nonnegative x hnx) (flush_nonnegative y hny))
+
+-- Adding a nonnegative value cannot decrease a positive normal addend, even
+-- when input/output subnormals are flushed. Used to establish RMS positivity.
+theorem add_ge_normal_right (x y : Float32) (hx : x.isFinite=true) (hy : y.isFinite=true)
+    (hnx : 0 ≤ real x) (hny : threshold < real y) (ho : (flush x + flush y).isFinite=true) :
+    real y ≤ real (add x y) := by
+  have hyp : 0 < real y := lt_trans threshold_pos hny
+  have hfy := flush_eq_of_threshold_lt y (by rwa [abs_of_pos hyp])
+  have h := Model.roundAt_mono FloatFormat.binary32
+    (show real y ≤ real (flush x) + real y by have := flush_nonnegative x hnx; linarith)
+  have hround : Model.roundAt FloatFormat.binary32 (real y) = real y :=
+    Model.roundAt_toReal_eq (model y) (by rw [finite_model]; exact hy)
+  rw [hround] at h
+  have hr : real y ≤ real (flush x + flush y) := by
+    rw [Numerics.add_real _ _ (finite_flush x hx) (finite_flush y hy) ho, hfy]
+    exact h
+  have hfo := flush_eq_of_threshold_lt (flush x + flush y) (by
+    rw [abs_of_pos (lt_of_lt_of_le hyp hr)]
+    exact lt_of_lt_of_le hny hr)
+  simpa only [add, hfo] using hr
+
 theorem flush_one : flush (1 : Float32) = 1 := by
   apply flush_eq_of_one_le
   rw [real_one]
@@ -120,6 +180,26 @@ theorem reciprocal_error (x : Float32) (hx : x.isFinite=true) (hn : 1 ≤ real x
     _ = |(real (flush ((1 : Float32)/x))-real ((1 : Float32)/x)) +
         (real ((1 : Float32)/x)-1/real x)| := by congr 1; ring
     _ ≤ _ := (abs_add_le _ _).trans (add_le_add ef er)
+
+noncomputable def divBudget (x y : Float32) : ℝ :=
+  threshold + epsilon (real (flush x)/real y) + threshold/|real y|
+
+theorem div_normal_error (x y : Float32) (hy : y.isFinite=true) (hn : 1 ≤ real y)
+    (ho : (flush x/y).isFinite=true) :
+    |real (div x y)-real x/real y| ≤ divBudget x y := by
+  have er := Numerics.div_error (flush x) y hy ho
+  have ef := flush_error (flush x/y)
+  have ei : |real (flush x)/real y-real x/real y| ≤ threshold/|real y| := by
+    rw [← sub_div, abs_div]
+    exact div_le_div_of_nonneg_right (flush_error x) (abs_nonneg _)
+  unfold div divBudget
+  rw [flush_eq_of_one_le y hn]
+  calc
+    _ = |(real (flush (flush x/y))-real (flush x/y)) +
+        ((real (flush x/y)-real (flush x)/real y)+(real (flush x)/real y-real x/real y))| := by congr 1; ring
+    _ ≤ _ := by
+      have h := (abs_add_le _ _).trans (add_le_add ef ((abs_add_le _ _).trans (add_le_add er ei)))
+      linarith
 
 theorem product_input_error (x y : Float32) :
     |real (flush x)*real (flush y)-real x*real y| ≤ threshold*(|real x|+|real y|) := by
