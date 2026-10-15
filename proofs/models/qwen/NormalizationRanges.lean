@@ -6,7 +6,7 @@ open Contracts.Mlx Contracts.Mlx.Numerics
 open FloatLib FloatLib.Floats FloatLib.Floats.Formats.BinaryInterchange
 abbrev BF := BFloat16Arithmetic.Value
 
-private theorem width_constructor : Blocks.width = Float32.ofInt ((5120 : Nat) : Int) := by decide +kernel
+theorem width_constructor : Blocks.width = Float32.ofInt ((5120 : Nat) : Int) := by decide +kernel
 
 theorem widened (x : Fin 5120 → BF) (exponent : Int)
     (hx : ∀ i, Model.isFinite (x i) = true ∧ |Model.toReal (x i)| ≤ (2 : ℝ)^exponent) (i : Fin 5120) :
@@ -16,7 +16,7 @@ theorem widened (x : Fin 5120 → BF) (exponent : Int)
     rw [BFloat16.widen_real _ (hx i).1]
     exact (hx i).2⟩
 
-private theorem transfer (norm : Blocks.Norm) (x : Fin 5120 → BF) (cap : BF)
+theorem transfer (norm : Blocks.Norm) (x : Fin 5120 → BF) (cap : BF)
     (hf : norm.Finite x)
     (hb : ∀ i, |real (NormalizationExecution.output norm.platform.divide (Blocks.widenInput x) norm.weight
       (RmsNorm.expression norm.platform 5120) Blocks.width Blocks.eps norm.platform.rsqrt i)| ≤ Model.toReal cap) :

@@ -20,14 +20,14 @@ structure Divisions (layer : Layer) : Prop where
 
 structure ProjectionRanges (layer : Layer) (input : Nat → Fin 5120 → BF) : Prop where
   finite : ProjectionFinite layer input
-  qkv : ∀ t c, |Model.toReal (layer.qkv.forward (input t) c)| ≤ (2 : ℝ)^(34 : Nat)
-  z : ∀ t c, |Model.toReal (layer.z.forward (input t) c)| ≤ (2 : ℝ)^(34 : Nat)
-  a : ∀ t c, |Model.toReal (layer.a.forward (input t) c)| ≤ (2 : ℝ)^(34 : Nat)
-  b : ∀ t c, |Model.toReal (layer.b.forward (input t) c)| ≤ (2 : ℝ)^(34 : Nat)
+  qkv : ∀ t c, |Model.toReal (layer.qkv.forward (input t) c)| ≤ (2 : ℝ)^(23 : Nat)
+  z : ∀ t c, |Model.toReal (layer.z.forward (input t) c)| ≤ (2 : ℝ)^(23 : Nat)
+  a : ∀ t c, |Model.toReal (layer.a.forward (input t) c)| ≤ (2 : ℝ)^(23 : Nat)
+  b : ∀ t c, |Model.toReal (layer.b.forward (input t) c)| ≤ (2 : ℝ)^(23 : Nat)
 
 theorem projections (norm : Blocks.Norm) (layer : Layer) (parameters : Parameters layer) (divisions : Divisions layer)
     (normDivision : DivisionDirectedBounds.Contract norm.platform.divide) (root : RsqrtBounds.Envelope norm.platform.rsqrt)
-    (hw : ∀ i, Model.isFinite (norm.weight i) = true ∧ |Model.toReal (norm.weight i)| ≤ 32)
+    (hw : ∀ i, Model.isFinite (norm.weight i) = true ∧ |Model.toReal (norm.weight i)| ≤ 1)
     (x : Nat → Fin 5120 → BF)
     (hx : ∀ t i, Model.isFinite (x t i) = true ∧ |Model.toReal (x t i)| ≤ (2 : ℝ)^(50 : Nat)) :
     (∀ t, norm.Finite (x t)) ∧ ProjectionRanges layer (fun t => norm.forward (x t)) := by
@@ -88,7 +88,7 @@ theorem convolution (layer : Layer) (cache : Cache) (input : Nat → Fin 5120 �
     unfold State.Ssm.window Convolution.window Convolution.joined
     split
     · exact history _ c
-    · exact ⟨layer.qkv.forward_finite _ (projection.finite.qkv _) c, projection.qkv _ c⟩
+    · exact ⟨layer.qkv.forward_finite _ (projection.finite.qkv _) c, (projection.qkv _ c).trans (by norm_num)⟩
   have h (t : Nat) (c : Fin 10240) := convolutionProfile.ranges layer.recurrence.convolutionContracted
     (State.Ssm.window (convData layer cache input) t c) (layer.convolutionWeight c) (hw t c)
     (fun i => by simpa only [convolutionProfile, real_one] using weight c i)
@@ -106,11 +106,11 @@ theorem history_after (layer : Layer) (cache : Cache) (input : Nat → Fin 5120 
   unfold Convolution.joined
   split
   · exact history _ c
-  · exact ⟨layer.qkv.forward_finite _ (projection.finite.qkv _) c, projection.qkv _ c⟩
+  · exact ⟨layer.qkv.forward_finite _ (projection.finite.qkv _) c, (projection.qkv _ c).trans (by norm_num)⟩
 
 theorem convolution_accuracy (norm : Blocks.Norm) (layer : Layer) (parameters : Parameters layer) (divisions : Divisions layer)
     (normDivision : DivisionDirectedBounds.Contract norm.platform.divide) (root : RsqrtBounds.Envelope norm.platform.rsqrt)
-    (hw : ∀ i, Model.isFinite (norm.weight i) = true ∧ |Model.toReal (norm.weight i)| ≤ 32)
+    (hw : ∀ i, Model.isFinite (norm.weight i) = true ∧ |Model.toReal (norm.weight i)| ≤ 1)
     (x : Nat → Fin 5120 → BF)
     (hx : ∀ t i, Model.isFinite (x t i) = true ∧ |Model.toReal (x t i)| ≤ (2 : ℝ)^(50 : Nat))
     (target error : Nat → Fin 5120 → ℝ) (he : ∀ t i, |Model.toReal (x t i) - target t i| ≤ error t i)
