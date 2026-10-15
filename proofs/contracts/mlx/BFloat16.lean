@@ -17,6 +17,25 @@ def cast (x : Float32) : Float32 :=
 def widen (x : Model FloatFormat.bfloat16) : Float32 :=
   Float32.ofModel (Model.toFloat32Model (Model.cast FloatFormat.bfloat16 FloatFormat.binary32 x))
 
+-- The staged kernels widen a stored bf16 word by shifting its bits. Prove
+-- that representation change equals the numerical cast, including subnormals
+-- and signed zero, for every finite bf16 value.
+theorem widen_bits (x : Model FloatFormat.bfloat16) (hx : Model.isFinite x = true) :
+    widen x = Float32.ofBits ⟨x.bits.setWidth 32 <<< 16⟩ := by
+  unfold widen
+  rw [Model.cast_eq_widenExact_of_compatibleWidening x (by decide) (by decide) (by decide) (by decide) hx,
+    Model.widenExact_eq_widenExactImpl]
+  unfold Model.widenExactImpl
+  let bits : BitVec 16 := x.bits
+  have hb : (Model.widenBits (dst := FloatFormat.binary32) x (by decide) (by decide)).bits = (bits.setWidth 32 <<< 16 : BitVec 32) := by
+    change (BitVec.ofNatLT (bits.toNat <<< 16) _ : BitVec 32) = _
+    apply BitVec.eq_of_toNat_eq
+    simp only [BitVec.toNat_shiftLeft, BitVec.toNat_setWidth]
+    rw [Nat.mod_eq_of_lt (lt_trans bits.isLt (by decide))]
+    rw [Nat.mod_eq_of_lt (Nat.shiftLeft_lt (m := 16) bits.isLt)]
+    rfl
+  exact congrArg (fun b : BitVec 32 => Float32.ofBits ⟨b⟩) hb
+
 theorem bridge (x : Model FloatFormat.binary32) :
     real (Float32.ofModel (Model.toFloat32Model x)) = Model.toReal x := by
   rw [real_unpack]

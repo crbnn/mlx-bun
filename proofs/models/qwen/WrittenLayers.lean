@@ -28,6 +28,33 @@ structure HiddenContract (activation : Activation) (platform : TrellisCodebookGa
   accuracy : ∀ row : Fin 17408,
     |real (hidden activation platform gate up input row.val)-TrellisCodebookGateUp.layerTarget gate up input row.val| ≤ error row.val
 
+-- Lift a checked kernel contract to an independently specified input. This
+-- is needed when normalization has already introduced numerical error.
+theorem hidden_input_error (activation : Activation) (platform : TrellisCodebookGateUp.Platform)
+    (gate up : TrellisCodebookGateUp.Projection) (input : Nat → BitVec 16)
+    (localProof : HiddenContract activation platform gate up input) (ideal inputError : Fin 5120 → ℝ)
+    (hi : ∀ c, |real (GateUpExecution.widen (input c.val)) - ideal c| ≤ inputError c) (row : Fin 17408) :
+    |real (hidden activation platform gate up input row.val) - TrellisCodebookGateUp.idealLayerTarget gate up ideal row.val| ≤
+      localProof.error row.val + TrellisCodebookGateUp.layerInputBudget gate up input ideal inputError row.val := by
+  calc
+    _ = |(real (hidden activation platform gate up input row.val) - TrellisCodebookGateUp.layerTarget gate up input row.val) +
+      (TrellisCodebookGateUp.layerTarget gate up input row.val - TrellisCodebookGateUp.idealLayerTarget gate up ideal row.val)| := by congr 1; ring
+    _ ≤ _ := (abs_add_le _ _).trans (add_le_add (localProof.accuracy row)
+      (TrellisCodebookGateUp.layer_input_error gate up input ideal inputError hi row.val))
+
+-- The down projection propagates that upstream error through the actual
+-- decoded weights. No claim of input equality is used at this boundary.
+theorem gateDown_target_error (gate up : TrellisCodebookGateUp.Projection) (input : Nat → BitVec 16)
+    (ideal inputError : Fin 5120 → ℝ)
+    (hi : ∀ c, |real (GateUpExecution.widen (input c.val)) - ideal c| ≤ inputError c)
+    (words : DownExecution.PackedMatrix) (k : Nat) (scale : Nat → Float32) (col : Nat) :
+    |TrellisCodebookDown.target words k scale (TrellisCodebookGateUp.layerTarget gate up input) col -
+      TrellisCodebookDown.target words k scale (TrellisCodebookGateUp.idealLayerTarget gate up ideal) col| ≤
+      TrellisCodebookDown.propagatedBudget words k scale
+        (TrellisCodebookGateUp.layerInputBudget gate up input ideal inputError) col :=
+  TrellisCodebookDown.target_error words k scale _ _ _ col
+    (fun row => TrellisCodebookGateUp.layer_input_error gate up input ideal inputError hi row.val)
+
 noncomputable def floatFiniteContract (p : TrellisCodebookGateUp.Platform)
     (gate up : TrellisCodebookGateUp.Projection) (input : Nat → BitVec 16)
     (expNeg : Float32 → Float32) (expError : Float32 → ℝ) (exponential : GateUpTail.ExpNegContract expNeg expError)
@@ -87,5 +114,42 @@ theorem gateDown_error (activation : Activation) (p : TrellisCodebookGateUp.Plat
   exact TrellisCodebookDown.output_error load loads before base ha hn words k hk scale
     (hidden activation p gate up input) (TrellisCodebookGateUp.layerTarget gate up input) hmid.error col hc
     reduce hardware convert conversion hf hb hmid.accuracy
+
+-- The specialized graph fixes these choices once. This record describes the
+-- base single-row GateDownMLP execution and its statically selected tail.
+structure GateDown where
+  activation : Activation
+  gatePlatform : TrellisCodebookGateUp.Platform
+  gate : TrellisCodebookGateUp.Projection
+  up : TrellisCodebookGateUp.Projection
+  downPlatform : TrellisCodebookDown.Platform
+  down : TrellisCodebookDown.Projection
+
+def GateDown.intermediate (mlp : GateDown) (input : Nat → BitVec 16) : Nat → Float32 :=
+  hidden mlp.activation mlp.gatePlatform mlp.gate mlp.up input
+
+def GateDown.forward (mlp : GateDown) (input : Nat → BitVec 16) : Fin 5120 → BFloat16Arithmetic.Value :=
+  TrellisCodebookDown.value mlp.downPlatform mlp.down (mlp.intermediate input)
+
+noncomputable def GateDown.target (mlp : GateDown) (input : Fin 5120 → ℝ) (col : Fin 5120) : ℝ :=
+  TrellisCodebookDown.target mlp.down.words mlp.down.width mlp.down.scale
+    (TrellisCodebookGateUp.idealLayerTarget mlp.gate mlp.up input) col.val
+
+noncomputable def GateDown.errorBudget (mlp : GateDown) (input : Nat → BitVec 16) (ideal inputError : Fin 5120 → ℝ)
+    (localProof : HiddenContract mlp.activation mlp.gatePlatform mlp.gate mlp.up input) (col : Fin 5120) : ℝ :=
+  TrellisCodebookDown.errorBudget mlp.downPlatform mlp.down (mlp.intermediate input)
+    (fun row => localProof.error row + TrellisCodebookGateUp.layerInputBudget mlp.gate mlp.up input ideal inputError row) col
+
+theorem GateDown.forward_finite (mlp : GateDown) (input : Nat → BitVec 16)
+    (hf : TrellisCodebookDown.Finite mlp.downPlatform mlp.down (mlp.intermediate input)) (col : Fin 5120) :
+    Model.isFinite (mlp.forward input col) = true := hf.narrowing col
+
+theorem GateDown.forward_error (mlp : GateDown) (input : Nat → BitVec 16) (ideal inputError : Fin 5120 → ℝ)
+    (hi : ∀ c, |real (GateUpExecution.widen (input c.val)) - ideal c| ≤ inputError c)
+    (localProof : HiddenContract mlp.activation mlp.gatePlatform mlp.gate mlp.up input)
+    (hf : TrellisCodebookDown.Finite mlp.downPlatform mlp.down (mlp.intermediate input)) (col : Fin 5120) :
+    |Model.toReal (mlp.forward input col) - mlp.target ideal col| ≤ mlp.errorBudget input ideal inputError localProof col :=
+  TrellisCodebookDown.value_error mlp.downPlatform mlp.down (mlp.intermediate input) hf _ _
+    (hidden_input_error mlp.activation mlp.gatePlatform mlp.gate mlp.up input localProof ideal inputError hi) col
 
 end Inference.Models.Qwen.WrittenLayers

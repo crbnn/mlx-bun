@@ -31,6 +31,18 @@ theorem finite_flush (x : Float32) (hx : x.isFinite=true) : (flush x).isFinite=t
     · exact hx
   · exact hx
 
+theorem finite_flush_iff (x : Float32) : (flush x).isFinite = x.isFinite := by
+  unfold flush
+  split
+  · rename_i s m e hm hu
+    split
+    · have hx : x.isFinite = true := by
+        simp only [Float32.isFinite, Float32.Model.isFinite, hu, Float.Model.UnpackedFloat.isFinite]
+      rw [hx]
+      cases s <;> decide
+    · rfl
+  · rfl
+
 theorem flush_abs_le (x : Float32) : |real (flush x)| ≤ |real x| := by
   unfold flush
   split

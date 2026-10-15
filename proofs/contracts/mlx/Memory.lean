@@ -55,4 +55,51 @@ theorem written_value_permuted (stores reordered : List Store) (order : reordere
   · obtain ⟨s, hs, he⟩ := covered
     exact ⟨s, order.mem_iff.mpr hs, he⟩
 
+-- Logical cells are independent of byte width. In particular bf16 device
+-- elements are not treated as the four-byte words used by scratch loads.
+def putCell (memory : Nat → α) (index : Nat) (value : α) : Nat → α :=
+  fun i => if i = index then value else memory i
+
+def writeCells (values : Nat → α) : List Nat → (Nat → α) → (Nat → α)
+  | [], memory => memory
+  | i :: rest, memory => writeCells values rest (putCell memory i (values i))
+
+def mapCells (f : Nat → α → α) : List Nat → (Nat → α) → (Nat → α)
+  | [], memory => memory
+  | i :: rest, memory => mapCells f rest (putCell memory i (f i (memory i)))
+
+theorem writeCells_read (values : Nat → α) (indices : List Nat) (before : Nat → α) (i : Nat) :
+    writeCells values indices before i = if i ∈ indices then values i else before i := by
+  induction indices generalizing before with
+  | nil => simp [writeCells]
+  | cons j rest ih =>
+    by_cases ht : i ∈ rest
+    · simp [writeCells, ih, ht]
+    · by_cases hj : i = j
+      · subst j
+        simp [writeCells, ih, ht, putCell]
+      · simp [writeCells, ih, ht, hj, putCell]
+
+theorem mapCells_eq_writeCells (f : Nat → α → α) (indices : List Nat) (original before : Nat → α)
+    (hn : indices.Nodup) (ha : ∀ i ∈ indices, before i = original i) :
+    mapCells f indices before = writeCells (fun i => f i (original i)) indices before := by
+  induction indices generalizing before with
+  | nil => rfl
+  | cons i rest ih =>
+    have hnodup := List.nodup_cons.mp hn
+    have hhead := ha i (by simp)
+    simp only [mapCells, writeCells, hhead]
+    apply ih _ hnodup.2
+    intro j hj
+    have hne : j ≠ i := by intro h; subst j; exact hnodup.1 hj
+    simp only [putCell, hne, ite_false]
+    exact ha j (by simp [hj])
+
+-- No address is updated twice. Consequently an in-place elementwise pass
+-- reads each cell's original value, regardless of the order of its owners.
+theorem mapCells_read (f : Nat → α → α) (indices : List Nat) (before : Nat → α)
+    (hn : indices.Nodup) (i : Nat) :
+    mapCells f indices before i = if i ∈ indices then f i (before i) else before i := by
+  rw [mapCells_eq_writeCells f indices before before hn (fun _ _ => rfl), writeCells_read]
+
 end Inference.Contracts.Mlx.Memory

@@ -12,6 +12,9 @@ let dependencyPath = "";
 // Reviewed manual translations, not a verified Metal/TypeScript frontend. Pins
 // prevent source drift; changing a hash requires reviewing the affected proofs.
 const sourcePins = {
+  "models/qwen/blocks.ts": "0d41a9cecdd0649665c2c66b5dd77e365a8ba3a7640485aea6202358bdeaf1c8",
+  "layers/loading.ts": "8dba0d4a34db80b373fb99f36b8f72cfc4afc77f96241101b1c4352ac32ee550",
+  "layers/normalization.ts": "3da742f8b9321aea3e05699361bb82a425b9c548f1a63340e2ca96fc7b8108c8",
   "kernels/trellis/codebook.ts": "0ba8624952767d077cdecc531fd9f49a159545b95ae4fc4ddd213ed13fa1e276",
   "kernels/trellis/down-codebook.ts": "5649124f12f6828241d88bb86f9e9f6bf965af2b3b5a298ddd8a2973277eec55",
   "kernels/trellis/gate-up-codebook.ts": "c0aec9b9f951c5fd94270a52f4bf4da43e7fb7d0ecda6ccd65e20571e8931f45",
@@ -25,15 +28,19 @@ const proofFiles = [
   "contracts/mlx/Memory.lean",
   "contracts/mlx/Numerics.lean",
   "contracts/mlx/FlushToZero.lean",
+  "contracts/mlx/Division.lean",
   "contracts/mlx/BFloat16.lean",
   "contracts/mlx/BFloat16Arithmetic.lean",
+  "contracts/mlx/ElementwiseAdd.lean",
   "contracts/mlx/Reduction.lean",
   "contracts/mlx/DotProduct.lean",
   "contracts/mlx/FlushedDotProduct.lean",
   "contracts/mlx/SquaredSum.lean",
   "contracts/mlx/NormalizationSchedule.lean",
+  "contracts/mlx/NormalizationReduction.lean",
   "contracts/mlx/Normalization.lean",
   "contracts/mlx/NormalizationExecution.lean",
+  "contracts/mlx/RmsNorm.lean",
   "kernels/trellis/Codebook.lean",
   "kernels/trellis/CodebookLoad.lean",
   "kernels/trellis/CodebookFlushToZero.lean",
@@ -55,7 +62,9 @@ const proofFiles = [
   "kernels/trellis/GateUpSplitTail.lean",
   "layers/TrellisCodebookGateUp.lean",
   "layers/TrellisCodebookDown.lean",
+  "layers/Normalization.lean",
   "models/qwen/WrittenLayers.lean",
+  "models/qwen/Blocks.lean",
 ];
 
 const discoveredProofs = await Array.fromAsync(new Bun.Glob("**/*.lean").scan({
@@ -196,6 +205,6 @@ try {
 } finally {
   await rm(dir, { recursive: true, force: true });
 }
-console.log(`Checked ${proofFiles.length} proof modules: decoding, packed windows, conditional M1 loads, initialization and scratch stores, flushed binary32/bfloat16 arithmetic, both SwiGLU tails including exponential overflow, single-row projection error propagation, and conditional RMS arithmetic bounds.`);
+console.log(`Checked ${proofFiles.length} proof modules: decoding, packed windows, conditional M1 loads, initialization and scratch stores, flushed binary32/bfloat16 arithmetic, both SwiGLU tails including exponential overflow, single-row projection error propagation, RMS reduction and in-place ownership, weight preparation, packed bf16 boundaries, and the normalized MLP residual block with propagated error bounds.`);
 console.log("Permitted axioms: propext, Classical.choice, Quot.sound. No native proof evaluation.");
 console.log("Scope: these are conditional numerical bounds for reviewed source models. Hardware/compiler conformance, model-wide range bounds, native memory/dispatch, delta adapters, remaining kernels, and the complete inference graph remain unproved.");

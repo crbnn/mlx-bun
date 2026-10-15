@@ -56,6 +56,25 @@ def evaluate (input : Fin n → Float32) : Expr n → Float32
   | .fmaSquare i a => FlushToZero.fma (input i) (input i) (evaluate input a)
   | .add a b => FlushToZero.add (evaluate input a) (evaluate input b)
 
+def arithmeticStep (contracted : Bool) (input : Fin n → Float32) (acc : Float32) (i : Fin n) : Float32 :=
+  if contracted then FlushToZero.fma (input i) (input i) acc
+  else FlushToZero.add acc (FlushToZero.mul (input i) (input i))
+
+theorem evaluate_step (contracted : Bool) (input : Fin n → Float32) (acc : Expr n) (i : Fin n) :
+    evaluate input (step contracted acc i) = arithmeticStep contracted input (evaluate input acc) i := by
+  cases contracted <;> rfl
+
+theorem evaluate_accumulate (contracted : Bool) (input : Fin n → Float32)
+    (columns : List (Fin n)) (acc : Expr n) :
+    evaluate input (accumulate contracted columns acc) =
+      columns.foldl (arithmeticStep contracted input) (evaluate input acc) := by
+  induction columns generalizing acc with
+  | nil => rfl
+  | cons i rest ih =>
+    change evaluate input (accumulate contracted rest (step contracted acc i)) = _
+    rw [ih, evaluate_step]
+    rfl
+
 noncomputable def ideal (input : Fin n → ℝ) : Expr n → ℝ
   | .zero => 0
   | .square i => input i ^ 2

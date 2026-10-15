@@ -65,6 +65,18 @@ noncomputable def subBudget (x y : Value) : ℝ :=
 noncomputable def mulBudget (x y : Value) : ℝ :=
   threshold + epsilon (Model.toReal (flush x)*Model.toReal (flush y)) + threshold*(|Model.toReal x|+|Model.toReal y|)
 
+-- Derive absence of addition overflow from operand bounds. Callers can carry
+-- these bounds across layer contracts without inspecting execution results.
+theorem raw_add_finite (x y : Value) (hx : Model.isFinite x = true) (hy : Model.isFinite y = true)
+    (bound : |Model.toReal x| + |Model.toReal y| ≤ Model.toReal (Model.posMaxFinite FloatFormat.bfloat16)) :
+    Model.isFinite (Model.add (flush x) (flush y)) = true := by
+  apply Model.isFinite_add_of_abs_add_le_posMaxFinite _ _ (by decide) (finite_flush x hx) (finite_flush y hy)
+  exact (add_le_add (flush_abs_le x) (flush_abs_le y)).trans bound
+
+theorem add_finite (x y : Value) (hx : Model.isFinite x = true) (hy : Model.isFinite y = true)
+    (bound : |Model.toReal x| + |Model.toReal y| ≤ Model.toReal (Model.posMaxFinite FloatFormat.bfloat16)) :
+    Model.isFinite (add x y) = true := finite_flush _ (raw_add_finite x y hx hy bound)
+
 theorem add_error (x y : Value) (hx : Model.isFinite x=true) (hy : Model.isFinite y=true)
     (ho : Model.isFinite (Model.add (flush x) (flush y))=true) :
     |Model.toReal (add x y)-(Model.toReal x+Model.toReal y)| ≤ addBudget x y := by

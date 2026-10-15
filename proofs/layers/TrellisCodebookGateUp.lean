@@ -43,6 +43,33 @@ def raw (p : Platform) (w : Projection) (input : Nat → BitVec 16) (row : Nat) 
 noncomputable def target (w : Projection) (input : Nat → BitVec 16) (row : Nat) : ℝ :=
   ∑ c : Fin 5120, GateUpAccuracy.term w.words w.width w.scale input row c.val
 
+noncomputable def weight (w : Projection) (row col : Nat) : ℝ :=
+  GateUpAccuracy.targetCoefficient w.words w.width row col * real (w.scale row)
+
+noncomputable def projectReal (w : Projection) (input : Fin 5120 → ℝ) (row : Nat) : ℝ :=
+  ∑ c : Fin 5120, weight w row c.val * input c
+
+noncomputable def propagatedBudget (w : Projection) (inputError : Fin 5120 → ℝ) (row : Nat) : ℝ :=
+  ∑ c : Fin 5120, |weight w row c.val| * inputError c
+
+theorem target_eq (w : Projection) (input : Nat → BitVec 16) (row : Nat) :
+    target w input row = projectReal w (fun c => real (GateUpExecution.widen (input c.val))) row := rfl
+
+theorem propagated_error (w : Projection) (input : Nat → BitVec 16) (ideal inputError : Fin 5120 → ℝ)
+    (hi : ∀ c, |real (GateUpExecution.widen (input c.val)) - ideal c| ≤ inputError c) (row : Nat) :
+    |target w input row - projectReal w ideal row| ≤ propagatedBudget w inputError row := by
+  rw [target_eq]
+  unfold projectReal propagatedBudget
+  rw [← Finset.sum_sub_distrib]
+  calc
+    _ ≤ ∑ c : Fin 5120, |weight w row c.val * real (GateUpExecution.widen (input c.val)) - weight w row c.val * ideal c| :=
+      Finset.abs_sum_le_sum_abs _ _
+    _ ≤ _ := by
+      apply Finset.sum_le_sum
+      intro c _
+      rw [← mul_sub, abs_mul]
+      exact mul_le_mul_of_nonneg_left (hi c) (abs_nonneg _)
+
 def Finite (p : Platform) (w : Projection) (input : Nat → BitVec 16) (row : Nat) : Prop :=
   FlushedDotProduct.Finite (fun col => DownExecution.coefficient w.words w.width row col)
     (fun _ => w.scale row) (fun col => GateUpExecution.widen (input col))
@@ -106,6 +133,20 @@ theorem cast_error (p : Platform) (w : Projection) (input : Nat → BitVec 16) (
 
 noncomputable def layerTarget (gate up : Projection) (input : Nat → BitVec 16) (row : Nat) : ℝ :=
   GateUpTail.swiglu (target gate input row) (target up input row)
+
+noncomputable def idealLayerTarget (gate up : Projection) (input : Fin 5120 → ℝ) (row : Nat) : ℝ :=
+  GateUpTail.swiglu (projectReal gate input row) (projectReal up input row)
+
+noncomputable def layerInputBudget (gate up : Projection) (input : Nat → BitVec 16)
+    (ideal inputError : Fin 5120 → ℝ) (row : Nat) : ℝ :=
+  propagatedBudget gate inputError row * (1 + |projectReal gate ideal row| / 4) * |target up input row| +
+    |projectReal gate ideal row| * propagatedBudget up inputError row
+
+theorem layer_input_error (gate up : Projection) (input : Nat → BitVec 16) (ideal inputError : Fin 5120 → ℝ)
+    (hi : ∀ c, |real (GateUpExecution.widen (input c.val)) - ideal c| ≤ inputError c) (row : Nat) :
+    |layerTarget gate up input row - idealLayerTarget gate up ideal row| ≤ layerInputBudget gate up input ideal inputError row :=
+  SwiGLUStability.swiglu_perturbation _ _ _ _ _ _
+    (propagated_error gate input ideal inputError hi row) (propagated_error up input ideal inputError hi row)
 
 def splitOutput (p : Platform) (gate up : Projection) (input : Nat → BitVec 16) (row : Nat)
     (expAbs : BFloat16Arithmetic.Value → BFloat16Arithmetic.Value) : Float32 :=
