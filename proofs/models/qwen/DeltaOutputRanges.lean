@@ -44,17 +44,17 @@ def tailProfile : Kernels.GatedRmsNormRanges.TailProfile where
   productCapacity := by rw [normProfile, (fp 23 (by decide) (by decide)).2, (bf 7 (by decide) (by decide)).2, (fp 30 (by decide) (by decide)).2]; norm_num
   storeCapacity := by rw [(fp 30 (by decide) (by decide)).2, (bf 30 (by decide) (by decide)).2]
 
-theorem gated (layer : Layer) (cache : Cache) (input : Nat → Fin 5120 → BF) (time : Nat)
+theorem gated_wide (layer : Layer) (cache : Cache) (input : Nat → Fin 5120 → BF) (time : Nat)
     (parameters : DeltaHeadRanges.Parameters layer)
     (weight : ∀ i, Model.isFinite (layer.normWeight i) = true ∧ |Model.toReal (layer.normWeight i)| ≤ 2)
     (projection : DeltaInputRanges.ProjectionRanges layer input)
     (recurrence : RecurrentFinite layer cache input time)
-    (recurrentBound : ∀ h v, |Model.toReal (recurrentOutput layer cache input time h v)| ≤ (2 : ℝ)^(50 : Nat))
+    (recurrentBound : ∀ h v, |Model.toReal (recurrentOutput layer cache input time h v)| ≤ (2 : ℝ)^(56 : Nat))
     (division : DivisionDirectedBounds.Contract layer.gated.divide) (root : RsqrtBounds.Envelope layer.gated.rsqrt)
     (exponential : Kernels.StableSigmoidRanges.ExponentialRange layer.gated.expAbs) :
     GatedFinite layer cache input time ∧ ∀ i, Model.isFinite (merged layer cache input time i) = true ∧
       |Model.toReal (merged layer cache input time i)| ≤ (2 : ℝ)^(30 : Nat) := by
-  have h head := Kernels.GatedRmsNormRanges.ranges layer.gated normProfile tailProfile (le_refl _)
+  have h head := Kernels.GatedRmsNormRanges.ranges_wide layer.gated normProfile tailProfile (le_refl _)
     division root exponential (recurrentOutput layer cache input time head) (zHead layer input time head) layer.normWeight
     (fun i => ⟨recurrence.cast head i, recurrentBound head i⟩)
     (fun i => by norm_num only [normProfile, (bf 1 (by decide) (by decide)).2, zpow_ofNat]; exact weight i)
@@ -73,6 +73,19 @@ theorem gated (layer : Layer) (cache : Cache) (input : Nat → Fin 5120 → BF) 
   rw [parameters.width, parameters.eps]
   simpa only [normProfile, tailProfile, (bf 30 (by decide) (by decide)).2, zpow_ofNat] using
     ((h (headOf i)).2 (valueOf i)).2.2
+
+theorem gated (layer : Layer) (cache : Cache) (input : Nat → Fin 5120 → BF) (time : Nat)
+    (parameters : DeltaHeadRanges.Parameters layer)
+    (weight : ∀ i, Model.isFinite (layer.normWeight i) = true ∧ |Model.toReal (layer.normWeight i)| ≤ 2)
+    (projection : DeltaInputRanges.ProjectionRanges layer input)
+    (recurrence : RecurrentFinite layer cache input time)
+    (recurrentBound : ∀ h v, |Model.toReal (recurrentOutput layer cache input time h v)| ≤ (2 : ℝ)^(50 : Nat))
+    (division : DivisionDirectedBounds.Contract layer.gated.divide) (root : RsqrtBounds.Envelope layer.gated.rsqrt)
+    (exponential : Kernels.StableSigmoidRanges.ExponentialRange layer.gated.expAbs) :
+    GatedFinite layer cache input time ∧ ∀ i, Model.isFinite (merged layer cache input time i) = true ∧
+      |Model.toReal (merged layer cache input time i)| ≤ (2 : ℝ)^(30 : Nat) :=
+  gated_wide layer cache input time parameters weight projection recurrence
+    (fun h v => (recurrentBound h v).trans (by norm_num)) division root exponential
 
 def outputCap : BF := BFloat16DyadicBounds.ceiling 1 44
 theorem outputCap_real : Model.toReal outputCap = (2 : ℝ)^(44 : Nat) := by

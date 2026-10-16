@@ -269,6 +269,24 @@ const proofFiles = [
   "kernels/delta/SiluRmsHeadsSumBounds.lean",
   "kernels/delta/SiluRmsHeadsEnergy.lean",
   "models/qwen/DeltaHeadEnergy.lean",
+  "kernels/delta/RecurrenceNumericalStability.lean",
+  "kernels/delta/GatedRecurrentRanges.lean",
+  "models/qwen/DeltaRecurrentInputs.lean",
+  "kernels/delta/RecurrenceGrowth.lean",
+  "contracts/mlx/ContractiveMultiplication.lean",
+  "kernels/delta/DecayStateBounds.lean",
+  "contracts/mlx/FlushedReductionRelative.lean",
+  "contracts/mlx/ArithmeticMaddRelative.lean",
+  "kernels/delta/GatedDotRelative.lean",
+  "kernels/delta/GatedPredictionRelative.lean",
+  "contracts/mlx/SubtractionRelative.lean",
+  "kernels/delta/GatedDeltaRelative.lean",
+  "kernels/delta/GatedUpdateRelative.lean",
+  "kernels/delta/RecurrenceSupportedRanges.lean",
+  "kernels/delta/RecurrenceReadoutRanges.lean",
+  "kernels/delta/RecurrenceSupportedError.lean",
+  "models/qwen/DeltaSequenceRecurrenceRanges.lean",
+  "models/qwen/DeltaSequenceRanges.lean",
 ];
 
 const discoveredProofs = await Array.fromAsync(new Bun.Glob("**/*.lean").scan({
@@ -351,6 +369,7 @@ process.stdout.write(await runLake(["build",
   "Mathlib.Data.List.FinRange",
   "Mathlib.Data.List.Nodup",
   "Mathlib.Algebra.Order.BigOperators.Ring.Finset",
+  "Mathlib.Analysis.Complex.ExponentialBounds",
 ]));
 dependencyPath = (await runLake(["env", "printenv", "LEAN_PATH"])).trim();
 const sources = new Map<string, { source: string; expected: string }>();
@@ -435,6 +454,6 @@ try {
 } finally {
   await rm(dir, { recursive: true, force: true });
 }
-console.log(`Checked ${proofFiles.length} proof modules: Trellis and affine numerical bounds, MLX fast-qmv source-model equivalence, packed windows, conditional M1 loads, scratch stores, flushed binary32/bfloat16 arithmetic and range bounds, SwiGLU and sigmoid, RMS normalization, Delta convolution/recurrence/cache and normalized-key stability, Q/K normalization and partial RoPE, one-pass SDPA arithmetic and scratch transpose, plain KV append, quantized embedding, residual Delta/attention layer composition, initial cache state, conditional first-token greedy selection with returned-cache bounds, and looped logsumexp/normalized argmax source models.`);
+console.log(`Checked ${proofFiles.length} proof modules: Trellis and affine numerical bounds, MLX fast-qmv source-model equivalence, packed windows, conditional M1 loads, scratch stores, flushed binary32/bfloat16 arithmetic and range bounds, SwiGLU and sigmoid, RMS normalization, Delta convolution/recurrence/cache, normalized-key stability and 262144-step Delta layer bounds, Q/K normalization and partial RoPE, one-pass SDPA arithmetic and scratch transpose, plain KV append, quantized embedding, residual Delta/attention layer composition, initial cache state, conditional first-token greedy selection with returned-cache bounds, and looped logsumexp/normalized argmax source models.`);
 console.log("Permitted axioms: propext, Classical.choice, Quot.sound. No native proof evaluation.");
-console.log("Scope: the first-token source model covers embedding, all 64 layers, final normalization, logits, 1024-thread looped logsumexp, normalized greedy selection and returned-cache error bounds, conditional on parameter and scalar/platform contracts. Selection maximizes the rounded normalized score with lowest-index ties; exact-real winner agreement requires an explicit numerical margin. Normalization literals have checked range certificates; their host attachment checker is outside Lean. Full checkpoint/loader binding, a useful final accuracy bound, subsequent-token stability, native memory/dispatch and hardware/compiler correspondence remain unproved.");
+console.log("Scope: the first-token source model covers embedding, all 64 layers, final normalization, logits, 1024-thread looped logsumexp, normalized greedy selection and returned-cache error bounds, conditional on parameter and scalar/platform contracts. Selection maximizes the rounded normalized score with lowest-index ties; exact-real winner agreement requires an explicit numerical margin. The Delta layer has conditional range and error composition through 262144 positions from zero recurrent state, including a derived recurrent rounding bound and finite-state invariant. Normalization literals have checked range certificates; their host attachment checker is outside Lean. Full checkpoint/loader binding, a useful final accuracy bound, subsequent-token attention/graph composition, native memory/dispatch and hardware/compiler correspondence remain unproved.");
