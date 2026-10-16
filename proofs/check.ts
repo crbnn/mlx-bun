@@ -598,6 +598,28 @@ const proofFiles = [
   "models/qwen/DeltaNormalizedMemory.lean",
   "models/qwen/ResidualDeltaMemory.lean",
   "models/qwen/AttentionAffineMemory.lean",
+  "models/qwen/AttentionQueryMemory.lean",
+  "kernels/RmsHeadReads.lean",
+  "kernels/RmsHeadStores.lean",
+  "kernels/RmsHeadsMemory.lean",
+  "models/qwen/AttentionParameterMemory.lean",
+  "models/qwen/AttentionProjectionHandoff.lean",
+  "models/qwen/AttentionNormalizedMemory.lean",
+  "models/qwen/AttentionNormalizationMemory.lean",
+  "models/qwen/DeltaAffineConstruction.lean",
+  "models/qwen/DeltaNormalizedConstruction.lean",
+  "kernels/attention/RopeSharedMemory.lean",
+  "kernels/attention/RopeDynamicMemory.lean",
+  "kernels/attention/RopeCopyMemory.lean",
+  "models/qwen/AttentionAffineConstruction.lean",
+  "models/qwen/AttentionNormalizedConstruction.lean",
+  "models/qwen/DeltaMemoryStage.lean",
+  "models/qwen/DeltaPreparationConstruction.lean",
+  "models/qwen/DeltaTailConstruction.lean",
+  "models/qwen/AttentionBlockMemory.lean",
+  "kernels/attention/RopeRowsMemory.lean",
+  "kernels/attention/RopeRowsDynamicMemory.lean",
+  "kernels/attention/RopeRowsCopyMemory.lean",
 ];
 
 const discoveredProofs = await Array.fromAsync(new Bun.Glob("**/*.lean").scan({
@@ -772,6 +794,7 @@ try {
 }
 console.log(`Checked ${proofFiles.length} proof modules: Trellis and affine numerical bounds, MLX fast-qmv source-model equivalence, packed windows, conditional M1 loads, scratch stores, flushed binary32/bfloat16 arithmetic and range bounds, SwiGLU and sigmoid, RMS normalization, Delta convolution/recurrence/cache, normalized-key stability, Q/K normalization and partial RoPE, dispatched full-context one-/two-pass SDPA bounds, intermediate storage and scratch transpose, plain KV append, quantized embedding, residual layer composition, conditional 262144-step autoregressive inference, looped logsumexp/normalized argmax, checkpoint normalization/Delta/Trellis/convolution literals and affine byte construction, host head-scale construction and accuracy, certified affine dictionaries, deterministic RoPE inputs, a parameter constructor with a fixed-point proof, and one-/two-pass SDPA dispatch/layout models.`);
 console.log("Permitted axioms: propext, Classical.choice, Quot.sound. No native proof evaluation.");
+console.log("Constructed memory executions: Delta and attention normalization/projection chains are built from original parameter buffers and explicit allocation contracts. Delta preparation and recurrence/gated-normalization/output projection also have concrete constructors. Attention Q copying, shared-head RMS and batched partial RoPE preserve actual source reads through legal interleavings, including the full-array copy before rotation. The attention cache/SDPA/output/residual path derives output and updated cache from exact buffer links. Complete attention-prefix integration, all-layer shared-heap composition, allocation instantiation and native loader/compiler/hardware correspondence remain open.");
 console.log("Additional numerical bounds: counted RMS rounding sites retain at least 1023/1024 of exact input energy minus 2^-46. Directed division and reciprocal-root contracts imply a stored normalized-vector energy bound of 32*width. The 5120-wide Qwen normalization has absolute sum at most 32768; affine real targets are bounded by 30720 (3-bit) or 47104 (4-bit). Input-magnitude, grouped BF16 sum, multiply/add, row-reduction and final-store lemmas give a 2^18 bound for both three- and four-bit normalized affine source models, including crossed packed fields and fused or separate arithmetic. The sharper logit bound holds at every supported step of the conditional autoregressive inference entry. Other internal envelopes remain conservative; numerical error budgets remain explicit.");
 console.log("Threadgroup memory: a legal per-thread write scheduler plus completion at a modeled barrier derives the write permutation. A finite completing schedule is constructed. Trellis codebook and down scratch contents follow for arbitrary legal interleavings. Gate-up jointly stages its codebook and input arrays, proves disjointness preserves both, and connects raw-word reads to BF16 unpacking. Raw uint4 words remain bit vectors. Native barrier/visibility, allocation, typed loads/stores, and compiled execution correspondence remain platform obligations.");
 console.log("Scheduled Trellis refinement: completed storage traces feed the actual gate/up and down computations, their activation output, residual blocks, all 64 decode stages, token-to-logits computation, and autoregressive feedback. Constructed schedules witness that the logical execution contracts are inhabited. Exact equality preserves logits, emitted tokens, every returned cache, and the existing numerical budgets through the inference entry. Legal modeled Trellis schedule choices do not change the autoregressive result. Other kernels retain their existing translated semantics; this does not establish native execution correspondence.");
