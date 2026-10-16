@@ -1,48 +1,47 @@
 # mlx-bun
 
-Local AI on Apple Silicon. mlx-bun 1.0 is an MLX inference engine, an
-OpenAI/Anthropic/Responses-compatible server, a browser app, and TypeScript
-libraries you can embed in your own Bun applications. Validated configurations
-are bit-exact with their reference implementation (mlx-lm, or mlx-optiq for
-mixed-precision KV); inference needs no Python.
+mlx-bun runs AI models locally on Apple Silicon Macs using Apple's MLX.
+Chat in your browser, serve models through a local API, or build with TypeScript
+libraries for Bun. No Python is required for inference.
+
+**mlx-bun 1.0.0 is beta and actively developed.** APIs and behavior may change;
+breaking changes will be called out in release notes.
 
 Docs: **[mlx-bun.dev](https://mlx-bun.dev)**
 
-Requires an Apple Silicon Mac running macOS 14 or later. The standalone installation
-includes its runtime; npm and source usage require Bun 1.4.2 or later.
+## Why mlx-bun?
+
+- **Local inference:** run supported models on your Mac without a hosted-model API key.
+- **Familiar interfaces:** browser chat, terminal commands, and OpenAI/Anthropic-compatible APIs.
+- **Local decisions:** use Jev or OpenAI Decisions-compatible endpoints with any
+  supported local language model, sharing the same loaded weights as generation.
+- **TypeScript libraries:** embed inference in a Bun app, with access to the
+  components for generation, quantization, and training.
 
 ## Install
 
+Requires an **Apple Silicon Mac with macOS 14 or later**. The standalone installer
+includes its runtime and native libraries; you don't need to install Bun or Python.
+
 ```sh
-# Signed, notarized standalone bundle
 curl -fsSL https://mlx-bun.dev/install.sh | sh
-
-# Homebrew
-brew install joshuarossi/tap/mlx-bun
-
-# npm package, run with Bun
-bun install -g mlx-bun   # or run once: bunx mlx-bun
 ```
 
-Each provides the `mlx-bun` command. The installer and npm package also provide
-`mlx-bun.server`, `mlx-bun.generate`, `mlx-bun.convert`, `mlx-bun.fuse`,
-`mlx-bun.lora` and `mlx-bun.upload`, which accept mlx-lm's arguments. See
-[installation](https://mlx-bun.dev/getting-started/installation/) for options.
-The installer then runs `mlx-bun compile-ane`, which compiles the Neural Engine
-programs your Mac's models use into the system's cache, so no model load or
-prompt compiles them. The app repeats that check before every model load and
-compiles only what the cache lacks, which covers Homebrew and npm installs and
-programs the system has since removed.
+Keep `~/.local/bin` on your `PATH`. Homebrew and Bun installations are covered
+in the [installation options](https://mlx-bun.dev/getting-started/installation/).
 
 ## Quickstart
 
 ```sh
-mlx-bun get mlx-community/gemma-4-e4b-it-OptiQ-4bit   # download a model
-mlx-bun serve e4b                                     # server + web app on port 8080
+mlx-bun
 ```
 
-`mlx-bun` with no command serves a cached model, downloading a starter model on
-first run. Send a request from another terminal:
+This serves a cached model and opens browser chat at
+**http://localhost:8080**. If no supported model is cached, it downloads a starter
+from Hugging Face and may download a recommended model in the background.
+Downloads require internet access.
+
+Send a request from another terminal:
 
 ```sh
 curl http://localhost:8080/v1/chat/completions \
@@ -50,45 +49,41 @@ curl http://localhost:8080/v1/chat/completions \
   -d '{"messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 128}'
 ```
 
-Or generate once without a server:
+For local classification and scoring, use `/v1/decisions` (OpenAI) or
+`/v1/systemone` (Jev). See the [runnable examples](apps/mlx-bun/scripts/decision-example.ts),
+[SDK examples](apps/mlx-bun/scripts/decision-website-examples.mjs) (Node 22+), and
+[supported question types and limits](apps/mlx-bun/README.md#local-decisions).
 
-```sh
-mlx-bun generate e4b "Write a haiku about Apple Silicon."
-```
+The [quickstart](https://mlx-bun.dev/getting-started/quickstart/) covers choosing a
+model and generating from the terminal. `mlx-bun --help` lists commands;
+the [HTTP API reference](https://mlx-bun.dev/reference/server-api/) describes the endpoints.
 
-The server also answers `/v1/completions`, `/v1/messages`, `/v1/responses` and
-`/v1/embeddings` when the loaded model supports them. Decisions are available at
-`/v1/decisions` (OpenAI) and `/v1/systemone` (Jev), sharing the loaded model with
-generation. See the [runnable examples](apps/mlx-bun/scripts/decision-example.ts)
-and [SDK examples](apps/mlx-bun/scripts/decision-website-examples.mjs).
-`mlx-bun --help` and
-`mlx-bun <command> --help` list every command and option; the
-[CLI](https://mlx-bun.dev/reference/cli/), [HTTP API](https://mlx-bun.dev/reference/server-api/)
-and [configuration](https://mlx-bun.dev/reference/server-config/) references
-are generated from the source.
+## Our quant on Hugging Face
+
+We publish [Qwen3.8-27B-Trellis-3.2bpw](https://huggingface.co/mlx-bun/Qwen3.8-27B-Trellis-3.2bpw),
+a 27B Qwen model in mlx-bun's packed Trellis format. The full download is about **12.25 GB**;
+running it needs additional memory for inference. See the model card for
+requirements, evaluations, and usage. It is an optional larger model, separate
+from the first-run starter.
 
 ## Libraries
 
-The `@mlx-bun/` packages expose loading and generation alongside the lower-level
-kernels, layers, graphs, state, sampling, quantization and training they compose.
-Start with `bun add @mlx-bun/inference` and the
+Use **Bun 1.4.2 or later** on an Apple Silicon Mac. Start with
+`bun add @mlx-bun/inference` and the
 [library guide](https://mlx-bun.dev/guides/library/); the
-[library API](https://mlx-bun.dev/api/) covers every public export.
+[library API](https://mlx-bun.dev/api/) covers the public exports.
+Numerical guarantees apply to validated models and configurations; see
+[correctness and evidence](https://mlx-bun.dev/about/correctness/).
 
 ## Repository layout
 
-- `apps/` — applications you run.
-- `packages/` — libraries you import, published under `@mlx-bun/`.
+- [App](apps/mlx-bun/README.md): terminal commands, server, browser app, and feature modules.
+- Libraries: [MLX bindings](packages/mlx/README.md), [inference](packages/inference/README.md),
+  [quantization](packages/quantize/README.md), [training](packages/training/README.md),
+  and [model hub](packages/hub/README.md).
+- [Website](apps/website/README.md): user guides and generated references.
 
-[`@mlx-bun/mlx`](packages/mlx/README.md) owns the native MLX bindings.
-[`@mlx-bun/inference`](packages/inference/README.md) owns inference graphs, kernels, layers, input processing, state, and memory fit estimates.
-[`@mlx-bun/quantize`](packages/quantize/README.md) owns checkpoint quantization: calibration, sensitivity, mixed-precision allocation, rotation, and Trellis packing.
-[`@mlx-bun/training`](packages/training/README.md) owns LoRA and preference training, optimizers, losses, and adapter production.
-[`@mlx-bun/hub`](packages/hub/README.md) owns the local model registry and Hugging Face downloads and uploads.
-`@mlx-bun/app-core` holds the core-service interfaces and module manifest contract, `@mlx-bun/app-host` the host-side module loader, `@mlx-bun/app-services` the core-service implementations hosts share, and [`@mlx-bun/web-shell`](packages/web-shell/README.md) the web shell that mounts module panels, for the [modular app](ARCHITECTURE.md#modular-application).
-The app's features are modules in `packages/module-*`, each with its README: [chat](packages/module-chat/README.md), [models](packages/module-models/README.md), [transcription](packages/module-transcription/README.md), [memory](packages/module-memory/README.md), [quantize](packages/module-quantize/README.md), [train](packages/module-train/README.md), [datasets](packages/module-datasets/README.md), [metrics](packages/module-metrics/README.md) and [benchmarks](packages/module-benchmarks/README.md).
-[`mlx-bun`](apps/mlx-bun/README.md) owns the terminal app, server, and web surfaces; `apps/transcribe` hosts the transcription module alone.
-The [public website](apps/website/README.md) owns user guides and build-only reference pages.
+The [architecture](ARCHITECTURE.md) explains package ownership and module boundaries.
 
 ## Contributing
 

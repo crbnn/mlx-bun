@@ -59,7 +59,7 @@ export const REVIEWED: Reviewed = {
   // unrecorded toolchain whose runtime glue is a release-era match for Emscripten 3.1.56 (inferred
   // from two runtime-glue fingerprints: WebAssembly-check absence and Module["ready"] presence):
   // the inference notice's XGrammar section (LICENSE, NOTICE, picojson's header and 3.1.56's
-  // Emscripten, musl, libc++ and libc++abi texts).
+  // Emscripten, musl, libc++ and libc++abi texts, plus compiler-rt conservatively).
   "@mlc-ai/web-xgrammar": { version: "0.1.27", sha256: {
     "lib/index.js": "803713906fb3e53483ab03f33244a64d8ed818820be9abe520e615754bfd3e24",
   } },
@@ -73,15 +73,15 @@ export const REVIEWED: Reviewed = {
   } },
 };
 
-/** Reviewed sha256 of each committed notice section copied from upstream, per
+/** Reviewed sha256 of each committed notice section and its stated sources, per
  * notice file: the text from its `## ` heading line up to the next `## ` heading. */
 export const CURATED: Record<string, Record<string, string>> = {
   "apps/mlx-bun/THIRD_PARTY_NOTICES.md": {
     "## Pi": "9756bd6ea6b0f1528e2acd38b80268b093bc854fcd3e6d6aeb29f93c861ee2ff",
-    "## Jiti 2.7.0 prebundle": "d92fcfa53e540b598d6842a20c90c29a92c142d9162226aacc5f0ff01312ec91",
+    "## Jiti 2.7.0 prebundle": "4e5aa1f7ef4fd6a01604f9ba484dc20120c6d39e07c79f840f29c5649d7e208a",
     "## json-bigint 1.0.0 copied code": "eb03ce6552d2906b0662a905f1cfd63b902b5b05d8b0f7c2545b01c2c87a1d36",
   },
-  "packages/inference/THIRD_PARTY_NOTICES.md": { "## XGrammar": "226e81596b8d905f71eaa95f54c380085efb7ecd640a4a6044f3da039e79d71d" },
+  "packages/inference/THIRD_PARTY_NOTICES.md": { "## XGrammar": "6b1f7c8a603b7ac266dbaff737eff232e0634639bb0118e2e2666535ab327edf" },
 };
 
 /** The `## ` section of `notice` that starts with the line `heading`. */
