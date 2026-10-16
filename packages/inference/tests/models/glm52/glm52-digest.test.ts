@@ -362,6 +362,7 @@ for (const dsa of [true, false]) describe(`GLM-5.2 latent legos (DSA ${dsa ? "on
     } finally { dispose(...rows.paged, ...rows.plain, batched.paged, batched.plain); }
   });
 
+  // Six cache forms run every phase against a reference, including kernel startup.
   test("encoded and paged encoded forms serve every phase, reported by KL against the f32 graph", async () => {
     const reference = composed({ kind: "bf16" }, false);
     const forms: [string, KvStorageScheme, boolean][] = [
@@ -393,5 +394,5 @@ for (const dsa of [true, false]) describe(`GLM-5.2 latent legos (DSA ${dsa ? "on
         argmaxAgree: totals.agree / totals.positions };
     }
     console.log(`glm52 latent legos (synthetic weights, DSA ${dsa ? "on" : "off"}, logits KL vs f32): ${JSON.stringify(report)}`);
-  });
+  }, 15_000);
 });

@@ -245,17 +245,6 @@ on main and the refactor is only useful when investigating a behavior difference
   notarization, including loading the signed native libraries from a relocated
   signed bundle. The native-blocked version check and mocked commands do not
   establish this acceptance.
-- [ ] Reproduce the remaining notices of code embedded in prebundled dependencies.
-  `babel-plugin-parameter-decorator@1.0.16` in Jiti's prebundle has no license text
-  upstream: only its manifest's `"license": "MIT"` and `"author": "Warner"`, its npm
-  `gitHead` is not in its repository, and no commit there adds a license file, so a
-  full text must come from its author. The toolchain that built XGrammar's WASM is
-  unknown (no producers section; a local build): the inference notice reproduces
-  Emscripten 3.1.56's texts because the runtime glue is a release-era match for 3.1.56,
-  inferred from two fingerprints (WebAssembly-check absence and `Module["ready"]`
-  presence), not exact provenance. Whether the stripped WASM links LLVM compiler-rt is
-  also unknown; if it does, its notice needs that Emscripten's
-  `system/lib/compiler-rt/LICENSE.TXT`.
 
 ## Completion
 
