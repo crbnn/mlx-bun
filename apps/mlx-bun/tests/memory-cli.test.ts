@@ -53,6 +53,7 @@ test("status is the default subcommand and reports the vault or its absence", as
   expect(missing.out).toContain("set one up:  mlx-bun memory init");
 });
 
+// Eight sequential CLI startups need room for hosted-runner startup variance.
 test("list, search, toc, section, links, and read work from the terminal", async () => {
   const paths = home();
   const list = await cli(paths, "list");
@@ -79,8 +80,9 @@ test("list, search, toc, section, links, and read work from the terminal", async
   const read = await cli(paths, "read", "Beta");
   expect(read.code).toBe(0);
   expect(read.out).toBe("# Beta\n\nBeta links to [[Alpha]].\n\n");
-});
+}, 15_000);
 
+// This case also starts eight CLI processes before completing its assertions.
 test("a missing article, a missing query, and an unknown subcommand fail with main's guidance", async () => {
   const paths = home();
   const missing = await cli(paths, "read", "Nope");
@@ -106,7 +108,7 @@ test("a missing article, a missing query, and an unknown subcommand fail with ma
   expect(helped.out).toContain("  init, setup        Create the wiki + walk through setup (idempotent);");
   expect(helped.out).toContain("  unschedule         Remove the nightly launchd job");
   expect(helped.out).toContain("--at <value>");
-});
+}, 15_000);
 
 test("synthesize --dry-run plans every stage without a server; a bad --port is a usage error", async () => {
   const paths = home();

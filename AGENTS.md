@@ -36,6 +36,8 @@ to repeat it. Use the existing workflow instead of inventing a new one:
 4. Run `./scripts/release-binary.sh <version>` using the Mac's existing signing
    identity and notarization profile. It defaults to `AC_PROFILE`, with
    `NOTARY_PROFILE` as the supported override. Use configured npm authentication.
+   In a separate worktree, compare `npm config get userconfig` with the original
+   checkout; reuse its configured path through `NPM_CONFIG_USERCONFIG` if needed.
    Do not export, copy, dump, or search for private keys or credential contents.
    If a script fails, report its exact failing stage and relevant error; do not
    infer that credentials need recreating from an unrelated or transient failure.
