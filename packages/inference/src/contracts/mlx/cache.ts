@@ -158,9 +158,12 @@ export interface GatedDeltaHeads {
   readonly v: MlxArray;
 }
 
-/** Pure decode operation bound by a layer. All inputs are borrowed; every
- * result is owned by the cache. `k` and `v` retain this position's exact inputs
- * for speculative rollback. State layouts match GatedDeltaCache. */
+/** Pure decode operation bound by a layer. `qkv` is [B, 1, convDim], `a` and
+ * `b` are [B, 1, Hv], `conv` is [B, K-1, convDim] and `recurrent` is null or
+ * [B, Hv, Dv, Dk] float32. All inputs are borrowed; every result is owned by
+ * the cache. `out` and `v` are [B, 1, Hv, Dv], `k` is [B, 1, Hk, Dk], and
+ * both returned states retain their input layouts. `k` and `v` retain this
+ * position's exact inputs for speculative rollback. */
 export type GatedDeltaDecode = (qkv: MlxArray, a: MlxArray, b: MlxArray,
   conv: MlxArray, recurrent: MlxArray | null) => {
     out: MlxArray; conv: MlxArray; recurrent: MlxArray; k: MlxArray; v: MlxArray;
@@ -185,8 +188,8 @@ export interface GatedDeltaParameters {
    * into q, k and v heads, and their norms and scaling. Pure. `convolved`
    * [B, S, convDim] is the raw convolution output (before activation) and is
    * borrowed. The cache owns and disposes the returned heads. The cache calls
-   * this once per recurrence call; a speculative round keeps the window's k and
-   * v for the rows a rollback retains. */
+   * this once per ordinary read; a bound `decode` supplies its own heads.
+   * A speculative round keeps k and v for the rows a rollback retains. */
   heads(convolved: MlxArray): GatedDeltaHeads;
 }
 

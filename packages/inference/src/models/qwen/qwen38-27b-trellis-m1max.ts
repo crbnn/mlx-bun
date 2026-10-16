@@ -29,7 +29,7 @@ import { GraphForwardScope, BoundedGraphForwardScope, SubmittedGraphForwardScope
 import { disposeResources } from "../../runtime/resources";
 import { declareGraph } from "../capabilities";
 import { type ReadPhase } from "../graph";
-import { QwenDeltaLayer as Delta, QwenAttentionLayer as Attention, QwenResidualDeltaLayer as ResidualDelta, QwenResidualAttentionLayer as ResidualAttention, QwenFusedDecodeDeltaNet as FusedDelta } from "./blocks";
+import { QwenDeltaLayer as Delta, QwenAttentionLayer as Attention, QwenResidualDeltaLayer as ResidualDelta, QwenResidualAttentionLayer as ResidualAttention, QwenFusedHeadsDeltaNet as FusedDelta } from "./blocks";
 import { bindQwenMediaInput, qwenDraftTarget, qwenDraftVocabularyMemo, qwenMediaEncoders, qwenResidualBasis } from "./media-input";
 import { DeltaWeights, AttentionWeights, GateDownMLP, AneWeightShares, AneBoundMlp, canonicalQwenWeights, type QwenProjectionTarget } from "./written-layers";
 import { PackedMixedScope } from "../../input/packed-mixed";
