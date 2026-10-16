@@ -137,6 +137,27 @@ model loading, first-use compilation, warm latency, memory, artifact/native/sour
 hashes and machine conditions separately. Performance qualification requires a
 clear machine preflight; a screening result cannot establish that gate.
 
+On 2026-10-16, the numerical implementation in `f809f840` passed the pinned
+checks on an Apple M1 Max (32 GB), Bun 1.4.2 and MLX 0.32.2: all three clips
+matched full text, token IDs and word times; encoder relative L2 error was
+0.0162–0.0195. Six fresh alternating process pairs (three warmup passes and
+nine timed repetitions per clip, `--screen --warmup 3 --repetitions 9`) gave
+completed warm transcription timings below. Audio decoding was outside timers.
+
+| Clip | Fermion default | mlx-bun | Paired ratio, 95% interval |
+|---|---:|---:|---:|
+| `1089-134686-0000.flac` | 75.66 ms | 68.61 ms | 0.918 [0.891, 0.947] |
+| `1089-134686-0002.flac` | 55.82 ms | 50.26 ms | 0.882 [0.823, 0.947] |
+| `1089-134686-0011.flac` | 80.44 ms | 75.21 ms | 0.935 [0.900, 0.971] |
+
+Model loading was 1.60 s versus 7.19 s. Resident MLX allocation was
+1.26 GB versus 1.30 GB; peak allocation was 1.87 GB versus 1.52 GB. These are
+diagnostic measurements: both preflights failed because of 3.5 GB of existing
+swap and competing CPU work. All three paired timing intervals favored mlx-bun,
+but the quiet-machine performance gate remains open. The benchmark records the
+fixed source snapshot, native hashes and all input hashes; `sourceUnchanged` was
+`true`. This is three-clip acceptance, not a full WER evaluation.
+
 ## Numerical and execution policy
 
 The inherited fidelity policy is L1 by default: bit-exact numerics against the
