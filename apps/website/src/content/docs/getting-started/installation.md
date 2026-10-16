@@ -7,7 +7,7 @@ mlx-bun requires an **Apple Silicon Mac running macOS 14 or later**. The
 standalone installer is the simplest way to start; it includes the runtime and
 native libraries, so you don't need to install Bun or Python separately.
 
-## Standalone bundle (recommended)
+## Standalone bundle
 
 ```sh
 curl -fsSL https://mlx-bun.dev/install.sh | sh
