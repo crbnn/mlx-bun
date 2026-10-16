@@ -51,22 +51,22 @@ theorem ranges (norm : Blocks.Norm) (layer : Layer) (parameters : Parameters nor
     · exact ⟨heads.finite.value h i, heads.value h i⟩
   have attention : SdpaSequenceRanges.Primitives layer.attention :=
     ⟨primitive.attention.maximum, primitive.attention.exponential, primitive.attentionDivision⟩
-  have read h := SdpaSequenceRanges.ranges layer.attention attention (steps+1) (by omega) bound
+  have read h := SdpaDispatched.ranges layer.attention attention layer.mergeContracted layer.architectureSuffix (steps+1) (by omega) bound
     ((layer.heads (norm.forward x) angle).query h)
     ((layer.cacheAfter (norm.forward x) angle cache).keys (SdpaScore.kvHead h))
     ((layer.cacheAfter (norm.forward x) angle cache).values (SdpaScore.kvHead h))
     (fun i => ⟨heads.finite.query h i, heads.query h i⟩) (keys (SdpaScore.kvHead h)) (values (SdpaScore.kvHead h))
   have gated h i := OutputGateRanges.ranges layer.gate primitive.gate (layer.read (norm.forward x) angle cache h i)
-    ((layer.heads (norm.forward x) angle).gate h i) SdpaSequenceRanges.outputCap
-    (SdpaVector.forward_finite _ _ _ _ (read h).1 i) (heads.finite.gate h i) SdpaSequenceRanges.outputCap_range.1
-    (by rw [SdpaSequenceRanges.outputCap_range.2]; exact (read h).2 i)
+    ((layer.heads (norm.forward x) angle).gate h i) SdpaTwoPassRanges.outputCap
+    (SdpaDispatched.forward_finite _ _ _ _ _ _ (read h).1 i) (heads.finite.gate h i) SdpaTwoPassRanges.outputCap_range.1
+    (by rw [SdpaTwoPassRanges.outputCap_range.2]; exact (read h).2 i)
   have output := DeltaOutputRanges.project layer.output parameters.output primitive.output (layer.merged (norm.forward x) angle cache)
     (fun i => ⟨(gated (headIndex i) (coordinate i)).2.2.1, by
       have h := (gated (headIndex i) (coordinate i)).2.2.2
-      rw [SdpaSequenceRanges.outputCap_range.2] at h
+      rw [SdpaTwoPassRanges.outputCap_range.2] at h
       exact h.trans (by norm_num)⟩)
   exact ⟨proj.1, ⟨proj.2.finite, heads.preparation,
-    fun h => ⟨(read h).1.scoresFinite, (read h).1.loops, (read h).1.merge, (read h).1.normalization⟩,
+    fun h => (read h).1,
     fun h i => (gated h i).1, fun h i => (gated h i).2.1, output.1⟩, output.2, keys, values⟩
 
 end Inference.Models.Qwen.AttentionSequenceRanges

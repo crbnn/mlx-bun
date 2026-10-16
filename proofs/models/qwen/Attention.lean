@@ -1,6 +1,6 @@
 import models.qwen.AttentionHeads
 import state.Kv
-import kernels.attention.SdpaVector
+import kernels.attention.SdpaDispatched
 import kernels.attention.OutputGate
 
 namespace Inference.Models.Qwen.Attention
@@ -10,22 +10,9 @@ open Kernels.Attention
 abbrev BF := BFloat16Arithmetic.Value
 abbrev Cache := State.Kv.Cache
 
--- Software arithmetic ranges for a read. Finiteness of its input tensors is
--- proved from the projection/preparation and cache theorems, not assumed here.
-structure ReadRange (p : SdpaVector.Platform) (query : Fin 256 → BF)
-    (keys values : Fin n → Fin 256 → BF) : Prop where
-  scores : ∀ t, Arithmetic.Finite (SdpaScore.bind query (keys t))
-    (SdpaScore.expression p.scoreContracted p.merge.reduction.tree)
-  loops : ∀ i g, SdpaLoop.Finite p.merge.scalar p.maximum (SdpaVector.scores p query keys)
-    (SdpaVector.valuesAt values i) (SdpaLayout.keys n g) (SdpaLoop.initial SdpaVector.initialShift)
-  merge : ∀ i, SdpaMerge.Finite p.merge (SdpaVector.partials p query keys values i) (SdpaVector.commonShift p query keys values)
-  normalization : ∀ i, SdpaNormalize.Finite p.normalization (SdpaVector.merged p query keys values i)
-
-theorem ReadRange.finite (p : SdpaVector.Platform) (query : Fin 256 → BF) (keys values : Fin n → Fin 256 → BF)
-    (hr : ReadRange p query keys values)
-    (hq : ∀ i, Model.isFinite (query i) = true) (hk : ∀ t i, Model.isFinite (keys t i) = true)
-    (hv : ∀ t i, Model.isFinite (values t i) = true) : SdpaVector.Finite p query keys values :=
-  ⟨hq, hk, hv, hr.scores, hr.loops, hr.merge, hr.normalization⟩
+-- Each route carries its proved arithmetic obligations, including input
+-- finiteness derived by the layer range theorem.
+abbrev ReadRange := @SdpaDispatched.Finite
 
 structure Layer where
   projections : AttentionHeads.Projections
@@ -33,6 +20,8 @@ structure Layer where
   attention : SdpaVector.Platform
   gate : OutputGate.Platform
   output : Layers.AffineVerifyLinear.Projection 12 5120
+  architectureSuffix : Char
+  mergeContracted : Bool
 
 def Layer.heads (l : Layer) (x : Fin 5120 → BF) (angle : RopeAngles.Inputs) : AttentionHeads.Heads BF :=
   l.preparation.forward (l.projections.forward x) angle
@@ -53,7 +42,7 @@ noncomputable def Layer.cacheBudgets (l : Layer) (x : Fin 5120 → BF) (target e
     (l.headBudgets x target error angle angleTarget angleError).value
 
 def Layer.read (l : Layer) (x : Fin 5120 → BF) (angle : RopeAngles.Inputs) (cache : Cache BF n) (h : Fin 24) : Fin 256 → BF :=
-  SdpaVector.forward l.attention ((l.heads x angle).query h)
+  SdpaDispatched.forward l.attention l.mergeContracted l.architectureSuffix ((l.heads x angle).query h)
     ((l.cacheAfter x angle cache).keys (SdpaScore.kvHead h)) ((l.cacheAfter x angle cache).values (SdpaScore.kvHead h))
 noncomputable def Layer.targetRead (l : Layer) (x : Fin 5120 → ℝ) (angle : RopeAngles.Target) (cache : Cache ℝ n) (h : Fin 24) : Fin 256 → ℝ :=
   SdpaVector.target ((l.targetHeads x angle).query h)
@@ -61,7 +50,7 @@ noncomputable def Layer.targetRead (l : Layer) (x : Fin 5120 → ℝ) (angle : R
 noncomputable def Layer.readBudgets (l : Layer) (x : Fin 5120 → BF) (target error : Fin 5120 → ℝ)
     (angle : RopeAngles.Inputs) (angleTarget angleError : RopeAngles.Target)
     (cache : Cache BF n) (cacheTarget cacheError : Cache ℝ n) (h : Fin 24) : Fin 256 → ℝ :=
-  SdpaVector.budget l.attention ((l.heads x angle).query h)
+  SdpaDispatched.budget l.attention l.mergeContracted l.architectureSuffix ((l.heads x angle).query h)
     ((l.cacheAfter x angle cache).keys (SdpaScore.kvHead h)) ((l.cacheAfter x angle cache).values (SdpaScore.kvHead h))
     ((l.targetHeads target angleTarget).query h) ((l.headBudgets x target error angle angleTarget angleError).query h)
     ((l.targetCacheAfter target angleTarget cacheTarget).keys (SdpaScore.kvHead h))
@@ -112,7 +101,7 @@ noncomputable def Layer.budget (l : Layer) (x : Fin 5120 → BF) (target error :
 structure Layer.Finite (l : Layer) (x : Fin 5120 → BF) (angle : RopeAngles.Inputs) (cache : Cache BF n) : Prop where
   projections : l.projections.Finite x
   preparation : l.preparation.Finite (l.projections.forward x) angle
-  readRange : ∀ h, ReadRange l.attention ((l.heads x angle).query h)
+  readRange : ∀ h, ReadRange l.attention l.mergeContracted l.architectureSuffix ((l.heads x angle).query h)
     ((l.cacheAfter x angle cache).keys (SdpaScore.kvHead h)) ((l.cacheAfter x angle cache).values (SdpaScore.kvHead h))
   gateValid : ∀ h i, OutputGate.Valid l.gate ((l.heads x angle).gate h i)
   gateProduct : ∀ h i, OutputGate.ProductFinite l.gate (l.read x angle cache h i) ((l.heads x angle).gate h i)
@@ -146,12 +135,10 @@ theorem Layer.cache_finite (l : Layer) (x : Fin 5120 → BF) (angle : RopeAngles
   exact State.Kv.append_finite cache _ _ hc hh.key hh.value
 
 theorem Layer.read_finite_contract (l : Layer) (x : Fin 5120 → BF) (angle : RopeAngles.Inputs) (cache : Cache BF n)
-    (hc : State.Kv.Finite cache) (hf : l.Finite x angle cache) (h : Fin 24) :
-    SdpaVector.Finite l.attention ((l.heads x angle).query h)
+    (_hc : State.Kv.Finite cache) (hf : l.Finite x angle cache) (h : Fin 24) :
+    SdpaDispatched.Finite l.attention l.mergeContracted l.architectureSuffix ((l.heads x angle).query h)
       ((l.cacheAfter x angle cache).keys (SdpaScore.kvHead h)) ((l.cacheAfter x angle cache).values (SdpaScore.kvHead h)) := by
-  have hh := l.heads_finite x angle cache hf
-  have hk := l.cache_finite x angle cache hc hf
-  exact (hf.readRange h).finite _ _ _ _ (hh.query h) (hk.keys (SdpaScore.kvHead h)) (hk.values (SdpaScore.kvHead h))
+  exact hf.readRange h
 
 theorem Layer.read_error (l : Layer) (x : Fin 5120 → BF) (target error : Fin 5120 → ℝ)
     (angle : RopeAngles.Inputs) (angleTarget angleError : RopeAngles.Target)
@@ -163,14 +150,14 @@ theorem Layer.read_error (l : Layer) (x : Fin 5120 → BF) (target error : Fin 5
       l.readBudgets x target error angle angleTarget angleError cache cacheTarget cacheError h i := by
   have hh := l.heads_error x target error angle angleTarget angleError cache hi hf ha hb
   have hk := l.cache_error x target error angle angleTarget angleError cache cacheTarget cacheError hi hc hf ha hb
-  exact SdpaVector.forward_error l.attention _ _ _ _ _ _ _ _ _
+  exact SdpaDispatched.forward_error l.attention l.mergeContracted l.architectureSuffix _ _ _ _ _ _ _ _ _
     ⟨hh.query h, hk.keys (SdpaScore.kvHead h), hk.values (SdpaScore.kvHead h)⟩
     (l.read_finite_contract x angle cache hcf hf h) (Nat.succ_pos n) i
 
 theorem Layer.read_finite (l : Layer) (x : Fin 5120 → BF) (angle : RopeAngles.Inputs) (cache : Cache BF n)
     (hc : State.Kv.Finite cache) (hf : l.Finite x angle cache) (h : Fin 24) (i : Fin 256) :
     Model.isFinite (l.read x angle cache h i) = true :=
-  SdpaVector.forward_finite l.attention _ _ _ (l.read_finite_contract x angle cache hc hf h) i
+  SdpaDispatched.forward_finite l.attention l.mergeContracted l.architectureSuffix _ _ _ (l.read_finite_contract x angle cache hc hf h) i
 
 theorem Layer.gated_error (l : Layer) (x : Fin 5120 → BF) (target error : Fin 5120 → ℝ)
     (angle : RopeAngles.Inputs) (angleTarget angleError : RopeAngles.Target)
@@ -187,7 +174,8 @@ theorem Layer.gated_error (l : Layer) (x : Fin 5120 → BF) (target error : Fin 
 
 -- Complete Qwen3Attention decode arithmetic, including the appended cache,
 -- grouped-query routing, output sigmoid/multiply and affine output projection.
--- The one-pass, one-token, plain-cache route is explicit in this source model.
+-- The one-token, plain-cache route selects the proved one-/two-pass reader
+-- using the pinned native dispatch predicates and default block counts.
 theorem Layer.forward_error (l : Layer) (x : Fin 5120 → BF) (target error : Fin 5120 → ℝ)
     (angle : RopeAngles.Inputs) (angleTarget angleError : RopeAngles.Target)
     (cache : Cache BF n) (cacheTarget cacheError : Cache ℝ n)
