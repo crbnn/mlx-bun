@@ -287,6 +287,17 @@ const proofFiles = [
   "kernels/delta/RecurrenceSupportedError.lean",
   "models/qwen/DeltaSequenceRecurrenceRanges.lean",
   "models/qwen/DeltaSequenceRanges.lean",
+  "models/qwen/AttentionSequenceHeadsRanges.lean",
+  "contracts/mlx/TwoProductsRelative.lean",
+  "kernels/attention/SdpaOrderedExponentRanges.lean",
+  "kernels/attention/SdpaUpdateRelative.lean",
+  "kernels/attention/SdpaUpdateBounds.lean",
+  "kernels/attention/SdpaLoopBounds.lean",
+  "kernels/attention/SdpaSequenceLoopRanges.lean",
+  "contracts/mlx/WeightedReductionRelative.lean",
+  "kernels/attention/SdpaMergeRelative.lean",
+  "kernels/attention/SdpaSequenceRanges.lean",
+  "models/qwen/AttentionSequenceRanges.lean",
 ];
 
 const discoveredProofs = await Array.fromAsync(new Bun.Glob("**/*.lean").scan({
@@ -454,6 +465,6 @@ try {
 } finally {
   await rm(dir, { recursive: true, force: true });
 }
-console.log(`Checked ${proofFiles.length} proof modules: Trellis and affine numerical bounds, MLX fast-qmv source-model equivalence, packed windows, conditional M1 loads, scratch stores, flushed binary32/bfloat16 arithmetic and range bounds, SwiGLU and sigmoid, RMS normalization, Delta convolution/recurrence/cache, normalized-key stability and 262144-step Delta layer bounds, Q/K normalization and partial RoPE, one-pass SDPA arithmetic and scratch transpose, plain KV append, quantized embedding, residual Delta/attention layer composition, initial cache state, conditional first-token greedy selection with returned-cache bounds, and looped logsumexp/normalized argmax source models.`);
+console.log(`Checked ${proofFiles.length} proof modules: Trellis and affine numerical bounds, MLX fast-qmv source-model equivalence, packed windows, conditional M1 loads, scratch stores, flushed binary32/bfloat16 arithmetic and range bounds, SwiGLU and sigmoid, RMS normalization, Delta convolution/recurrence/cache, normalized-key stability and 262144-step Delta layer bounds, Q/K normalization and partial RoPE, full-context one-pass SDPA bounds and scratch transpose, plain KV append, quantized embedding, residual Delta/attention layer composition, initial cache state, conditional first-token greedy selection with returned-cache bounds, and looped logsumexp/normalized argmax source models.`);
 console.log("Permitted axioms: propext, Classical.choice, Quot.sound. No native proof evaluation.");
-console.log("Scope: the first-token source model covers embedding, all 64 layers, final normalization, logits, 1024-thread looped logsumexp, normalized greedy selection and returned-cache error bounds, conditional on parameter and scalar/platform contracts. Selection maximizes the rounded normalized score with lowest-index ties; exact-real winner agreement requires an explicit numerical margin. The Delta layer has conditional range and error composition through 262144 positions from zero recurrent state, including a derived recurrent rounding bound and finite-state invariant. Normalization literals have checked range certificates; their host attachment checker is outside Lean. Full checkpoint/loader binding, a useful final accuracy bound, subsequent-token attention/graph composition, native memory/dispatch and hardware/compiler correspondence remain unproved.");
+console.log("Scope: the first-token source model covers embedding, all 64 layers, final normalization, logits, 1024-thread looped logsumexp, normalized greedy selection and returned-cache error bounds, conditional on parameter and scalar/platform contracts. Selection maximizes the rounded normalized score with lowest-index ties; exact-real winner agreement requires an explicit numerical margin. The Delta layer has conditional range and error composition through 262144 positions from zero recurrent state, including a derived recurrent rounding bound and finite-state invariant. The one-pass attention source model has conditional range bounds for 1–262144 keys, including nonzero-position RoPE, online-softmax numerator/denominator stability, group merge, division, gating, projection and KV append. This does not establish native dispatch to the modeled one-pass kernel. Normalization literals have checked range certificates; their host attachment checker is outside Lean. Full checkpoint/loader binding, a useful final accuracy bound, subsequent-token graph composition, native memory/dispatch and hardware/compiler correspondence remain unproved.");
