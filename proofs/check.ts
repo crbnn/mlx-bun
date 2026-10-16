@@ -1,13 +1,31 @@
-/** CPU-only: LEAN=/path/to/lean bun proofs/check.ts [--self-test].
+/** CPU-only: LEAN=/path/to/lean bun proofs/check.ts [--self-test] [--jobs 1..64].
  * Lake resolves the pinned FloatLib/mathlib proof dependencies in proofs/.
  * No MLX import. */
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
+import { buildProofs } from "./build.ts";
 import { checkScalarCopySourceBinding } from "./kernels/copy/ScalarCopySourceBinding.ts";
+import { checkGeneralCopy2DHostBinding } from "./kernels/copy/GeneralCopy2DHostBinding.ts";
+import { checkM1MaxSingleTokenEntry } from "./models/qwen/M1MaxSingleTokenEntryBinding.ts";
+import { checkCodebookIntegerSourceBinding } from "./kernels/trellis/CodebookIntegerSourceBinding.ts";
+import { checkCodebookBitsSourceBinding } from "./kernels/trellis/CodebookBitsSourceBinding.ts";
+import { checkCodebookTableSourceBinding } from "./kernels/trellis/CodebookTableSourceBinding.ts";
+import { checkCodebookWindowSourceBinding } from "./kernels/trellis/CodebookWindowSourceBinding.ts";
+import { checkBFloatAddSourceBinding } from "./kernels/binary/BFloatAddSourceBinding.ts";
+import { checkBinaryVvSourceBinding } from "./kernels/binary/BinaryVvSourceBinding.ts";
 import { checkGeneralCopy2DSourceBinding } from "./kernels/copy/GeneralCopy2DSourceBinding.ts";
 import { checkVectorCopySourceBinding } from "./kernels/copy/VectorCopySourceBinding.ts";
 import { checkScalarFullHostSourceBinding } from "./kernels/copy/ScalarFullHostSourceBinding.ts";
+
+import checkBufferLeaseSourceBinding from "./contracts/mlx/BufferLeaseSourceBinding.ts";
+import checkNormalizedArgmaxLeaseSourceBinding from "./models/qwen/NormalizedArgmaxLeaseSourceBinding.ts";
+import { checkResidualRmsCellSourceBinding } from "./kernels/normalization/ResidualRmsCellSourceBinding.ts";
+import { checkPackedArraySourceBinding } from "./kernels/trellis/PackedArraySourceBinding.ts";
+import { checkGateInputSourceBinding } from "./kernels/trellis/GateInputSourceBinding.ts";
+
+import { checkResidualRmsTailSourceBinding } from "./kernels/normalization/ResidualRmsTailSourceBinding.ts";
+import { checkGateAccumulateSourceBinding } from "./kernels/trellis/GateAccumulateSourceBinding.ts";
 
 const root = new URL("../", import.meta.url);
 const lean = process.env.LEAN ?? "lean";
@@ -16,6 +34,19 @@ let dependencyPath = "";
 // Reviewed manual translations, not a verified Metal/TypeScript frontend. Pins
 // prevent source drift; changing a hash requires reviewing the affected proofs.
 const sourcePins = {
+  "models/factory.ts": "8c9fa7ad26c51197673d20522a5ec1946ffadeb5fcd77df151737bc2b47c9023",
+  "models/implementation.ts": "fab08e8ed6431920c41ad28a726607ef1d2cd60a3aae7793e9c79040ffaef499",
+  "models/composition.ts": "b455b4498b44a2be4edc0d0c9aa4392574a203a66ce37a8c6b85119dd613dff9",
+  "models/cache-composition.ts": "b51b0056cce40215b2a5811058b59ea08855670518253b5e3c8078ee5029bbd8",
+  "models/capabilities.ts": "1c8e7c349233af2e865d5516421fc42c2557c87ba84fd11e0b8675d651162be7",
+  "state/kv-scheme.ts": "631a92f5a487cac486202a92dbac4fd1aa045242489747b0b9d90e5609c2e416",
+  "state/bf16-first-kv.ts": "91eb3dbe8857e5b2348402008f91b625e6135dea9b41c0a48e24d2d9bd018eaf",
+  "state/request-policy.ts": "95d6cffc7cd3eedb5db76e69c8defab9c50f3f67c787211ed1098dc8819b9ba4",
+  "generation/bindings/autoregressive.ts": "4d39973a00dea72a42659dd839805dc36169bc605c53426e4b3e6f2225a716c1",
+  "generation/autoregressive.ts": "d2a0b3980e26da231528aa04b1ceb1a904ef738e24bc4c4636cf206383c7a89c",
+  "generation/phase-dispatch.ts": "b17182d02c7d3fedb9335263b164907c99bb1898c176324b30076425432708de",
+  "generation/prefill.ts": "e7da71898c2ad711cf9250ece089220fcd9ba23071b5f9d690198b9488f9a2c3",
+  "contracts/portable/prefill.ts": "5709777b08e8915cf0f3fbcb3bf8226bf24b3fbe7a646eda4c040d2bb92ede3b",
   "layers/quantized-embedding.ts": "cdead9d17af0a47f7f178ee4bd6b2710364a485dd7001e4ca98c62dec991fe4c",
   "models/qwen/qwen38-27b-trellis-m1max.ts": "915f129881b5ce85f97b6bca5c98afe06dedc21be514a81137a75e058cac882b",
   "state/kv.ts": "526a42d976c7dd0a8e908dcf8b515b94d43269042dc3fc3023e1a5baf0d8a579",
@@ -50,6 +81,12 @@ const hostSourcePins = {
   "packages/mlx/src/ops.ts": "0672d9fa77e95490cad3201eb7a9eae073aa41a7c1aa0afaf3e1a640e32dc2cd",
 };
 const mlxSourcePins = {
+  "mlx/backend/metal/kernels.h": "f45059a96ffa4cf38c6cb85754a818075563b455ca008d0ae624737546f7b972",
+  "mlx/backend/metal/jit_kernels.cpp": "8201a166cc426cd7b1f6983e5e6f282d3ca7a1992cc4c3a80fa42cf8dd237c46",
+  "mlx/backend/metal/nojit_kernels.cpp": "94b31481ce88c7edd7c993008e4f708dcff2f8a0936c0b237c750a93a3cbe610",
+  "mlx/backend/common/compiled.cpp": "a5a4e711add8b57b153be9c096089e312c747691dcb9ec61d4db1bf29186e2cc",
+  "mlx/backend/metal/utils.cpp": "180b558f6e317df418aec0bf56e866aaf75e450f87cedb40c45f7882b8645b13",
+  "mlx/backend/metal/kernels/binary_ops.h": "2dd13c2496f5d6f0856e4ca99db2ceb5c6d7dc0c344b9ba8e41ef3b7d7ed8a97",
   "mlx/backend/gpu/copy.h": "ec5de8e2acaaa509aa4b1e42a6c6e478a189d8aae44a02f04b7d757ce8a2bc51",
   "mlx/allocator.h": "7ef6044508b4e71520c8aa20474356c435c5aa06734bb1d09ee598b6bc3065f0",
   "mlx/backend/metal/allocator.cpp": "b317edbeda67afbafe63a4abe685c810b1fb0fd7d94f5f5ee17a7773bf97c65f",
@@ -757,6 +794,86 @@ const proofFiles = [
   "models/qwen/TokenReuseSequenceMemory.lean",
   "models/qwen/TokenSequenceWorkspaceFootprint.lean",
   "state/KvInitialAllocation.lean",
+  "contracts/mlx/CopyDispatchCommutation.lean",
+  "contracts/mlx/NativeNormalizationDivision.lean",
+  "contracts/mlx/NativeDivisionDomain.lean",
+  "contracts/mlx/RsqrtEpsilonBounds.lean",
+  "kernels/binary/BFloatAddSource.lean",
+  "kernels/binary/BinaryVvSyntax.lean",
+  "kernels/binary/BinaryVvBody.lean",
+  "kernels/binary/BinaryVvInterleaving.lean",
+  "kernels/binary/BinaryVvSourceRefinement.lean",
+  "kernels/copy/GeneralCopy2DHostDispatch.lean",
+  "kernels/trellis/CodebookIntegerSyntax.lean",
+  "kernels/trellis/CodebookBitsSyntax.lean",
+  "kernels/trellis/CodebookIntegerSemantics.lean",
+  "kernels/trellis/CodebookBitsSemantics.lean",
+  "kernels/trellis/CodebookTableSyntax.lean",
+  "kernels/trellis/CodebookTableSource.lean",
+  "kernels/trellis/CodebookWindowSyntax.lean",
+  "kernels/trellis/CodebookWindowSemantics.lean",
+  "kernels/trellis/CodebookWindowSource.lean",
+  "models/qwen/AttentionInitialWorkspaceConstruction.lean",
+  "models/qwen/DecodeInitialMemoryStage.lean",
+  "models/qwen/AttentionInitialStageConstruction.lean",
+  "models/qwen/DecodeInitialMemoryChain.lean",
+  "models/qwen/DecodeInitialConstruction.lean",
+  "models/qwen/TokenDirectInitialConstruction.lean",
+  "models/qwen/DecodeInitialChainGeometry.lean",
+  "models/qwen/DecodeInitialGeometry.lean",
+  "models/qwen/TokenDirectInitialReady.lean",
+  "models/qwen/InitialDirectRequestConstruction.lean",
+  "models/qwen/TokenConstructedSequenceLogical.lean",
+  "models/qwen/CheckpointDirectSequenceMemory.lean",
+  "models/qwen/DecodeInitialWorkspaceFootprint.lean",
+  "models/qwen/GraphDivisionPrimitives.lean",
+  "models/qwen/M1MaxSingleTokenEntry.lean",
+  "models/qwen/M1MaxInitialKvDescriptor.lean",
+  "models/qwen/NormalizationEpsilonBounds.lean",
+  "models/qwen/ResidualMlpParsedAdd.lean",
+  "state/KvInitialDispatchScheduling.lean",
+  "contracts/mlx/BufferLeaseMemory.lean",
+  "kernels/NormalizationEpsilonRanges.lean",
+  "kernels/binary/BinaryVvAliasing.lean",
+  "kernels/normalization/ResidualRmsCellSyntax.lean",
+  "kernels/trellis/PackedArraySyntax.lean",
+  "models/qwen/AttentionHeadEpsilonRanges.lean",
+  "models/qwen/CheckpointDirectInference.lean",
+  "models/qwen/DeltaHeadEpsilonRanges.lean",
+  "models/qwen/DeltaOutputEpsilonRanges.lean",
+  "models/qwen/NormalizedArgmaxLeaseMemory.lean",
+  "kernels/normalization/ResidualRmsCellSemantics.lean",
+  "kernels/trellis/GateInputSyntax.lean",
+  "kernels/trellis/PackedArraySemantics.lean",
+  "models/qwen/DeltaHeadEnergyEpsilonRanges.lean",
+  "models/qwen/ReachedStageRanges.lean",
+  "kernels/normalization/ResidualRmsCellMemory.lean",
+  "kernels/normalization/ResidualRmsCellSource.lean",
+  "kernels/normalization/ResidualRmsFirstPassMemory.lean",
+  "kernels/trellis/GateInputSemantics.lean",
+  "kernels/trellis/PackedArrayPrograms.lean",
+  "models/qwen/ReachedSequenceRanges.lean",
+  "models/qwen/ReachedTokenContext.lean",
+  "models/qwen/ResidualMlpParsedFirstPass.lean",
+  "kernels/trellis/GateInputContext.lean",
+  "kernels/trellis/GateInputSource.lean",
+  "kernels/trellis/PackedArrayGate.lean",
+  "kernels/trellis/PackedArrayDown.lean",
+  "kernels/trellis/PackedArrayMaterialization.lean",
+  "kernels/trellis/PackedArrayDownMaterialization.lean",
+  "kernels/trellis/PackedArrayConsumer.lean",
+  "kernels/trellis/PackedArrayWeights.lean",
+  "kernels/trellis/PackedArraySource.lean",
+  "kernels/normalization/ResidualRmsReductionMemory.lean",
+  "kernels/normalization/ResidualRmsTailSyntax.lean",
+  "kernels/normalization/ResidualRmsTailSource.lean",
+  "kernels/trellis/GateAccumulateSource.lean",
+  "models/qwen/NormalizedArgmaxLeaseReuse.lean",
+  "models/qwen/ReachedTokenStepMemory.lean",
+  "models/qwen/ReachedTokenConstructedMemory.lean",
+  "models/qwen/ReachedTokenSequenceMemory.lean",
+  "models/qwen/ReachedTokenInitialMemory.lean",
+  "models/qwen/ReachedCheckpointMemory.lean",
 ];
 
 const discoveredProofs = await Array.fromAsync(new Bun.Glob("**/*.lean").scan({
@@ -873,10 +990,27 @@ for (const [name, expected] of Object.entries(mlxSourcePins)) {
 // Bind the checked parser literal to the exact pinned native body.
 // Host extraction remains trusted; Lean checks parsing and execution proofs.
 await checkScalarCopySourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkGeneralCopy2DHostBinding({ selfTest: process.argv.includes("--self-test") });
+await checkM1MaxSingleTokenEntry({ selfTest: process.argv.includes("--self-test") });
+await checkCodebookIntegerSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkCodebookBitsSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkCodebookTableSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkCodebookWindowSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkBFloatAddSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkBinaryVvSourceBinding({ selfTest: process.argv.includes("--self-test") });
 await checkGeneralCopy2DSourceBinding({ selfTest: process.argv.includes("--self-test") });
 await checkVectorCopySourceBinding({ selfTest: process.argv.includes("--self-test") });
 // Includes the Vector host wrapper guard. These C++ translations remain manual.
 await checkScalarFullHostSourceBinding({ selfTest: process.argv.includes("--self-test") });
+
+await checkBufferLeaseSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkNormalizedArgmaxLeaseSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkResidualRmsCellSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkPackedArraySourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkGateInputSourceBinding({ selfTest: process.argv.includes("--self-test") });
+
+await checkResidualRmsTailSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkGateAccumulateSourceBinding({ selfTest: process.argv.includes("--self-test") });
 
 const dir = await mkdtemp(join(tmpdir(), "mlx-bun-proof-"));
 async function checkProof(name: string, text: string, build = false) {
@@ -887,14 +1021,18 @@ async function checkProof(name: string, text: string, build = false) {
 }
 
 try {
-  for (const file of proofFiles) {
+  const jobsIndex = process.argv.indexOf("--jobs");
+  const jobs = jobsIndex < 0 ? 1 : Number(process.argv[jobsIndex + 1]);
+  const proofSources = new Map(await Promise.all(proofFiles.map(async file =>
+    [file, await Bun.file(new URL(file, import.meta.url)).text()] as const)));
+  await buildProofs(proofSources, jobs, async (file, source) => {
     console.log(`Checking ${file}...`);
-    const result = await checkProof(file, await Bun.file(new URL(file, import.meta.url)).text(), true);
+    const result = await checkProof(file, source, true);
     process.stdout.write(result.output);
     if (result.code !== 0 || result.output.includes("sorryAx") || !result.output.includes("Axiom audit passed:")) {
       throw new Error(`Lean did not establish ${file} without forbidden assumptions.`);
     }
-  }
+  });
 
   if (process.argv.includes("--self-test")) {
     for (const [name, { source, expected }] of sources) {
@@ -942,6 +1080,6 @@ console.log("Permitted axioms: propext, Classical.choice, Quot.sound. No native 
 console.log("Mathematical scope: conditional one-token M1 Max Qwen inference covers quantized embedding, 48 Delta and 16 attention layers, final normalization, all 248320 logits, logsumexp, greedy selection and cache feedback through 262144 steps. Parameter and primitive contracts derive intermediate finiteness and ranges, including a 2^18 logit bound. Error budgets compare with a real-valued reference consuming the same emitted tokens; independent exact-real token agreement requires winner margins. A useful final accuracy guarantee remains open. Prefill, batching and adapters are outside this result.");
 console.log("Memory refinement: concrete shared-heap kernel/layer constructors connect embedding, all decode stages, final projection, sampling and subsequent tokens. Final token and every updated cache are read from one resulting heap. Finite reachable traces require raw allocation plans only for actual predecessor states; they do not require an allocator for every possible heap. Head RMS supports fresh and donated Q/K buffers; RoPE preserves actual dynamic bases. Both dispatched SDPA routes, mixed Delta state/output writes, Trellis scratch/output phases and sampling local/global memories retain their read and frame proofs.");
 console.log("Parameter continuity: strong Delta and attention constructors consume the original parameter bundle, and the graph cursor selects each stage from one carried global bundle. Initialized finite token traces preserve that same embedding/graph bundle from the loaded initial heap through token stores, cache initialization, every layer and subsequent sampling. Checkpoint dictionary certificates supply the complete numerical Parameters contract to these memory-level results; ordered encodings, exact model bindings and primitive contracts remain explicit.");
-console.log("Constructible layouts: startup, initialized first token and every subsequent token through 262144 are constructed from the original checkpoint bundle, fresh address-space bounds and primitive/dispatch contracts, with no supplied graph/token plan or per-step execution oracle. Growth versus reuse follows the actual position and capacity. Parsed BF16/N1 history and FP32/N2 recurrent initializer executions start from created scalar-zero bytes and produce the exact initial heap consumed by the constructed sequence. The original parameter bytes remain unchanged. Persistent cache extent is at most 17333813248 bytes; the conservative retained bump-address budget for 262143 later steps is 127015766109984 bytes. This address-space construction does not establish physical-memory fit, scratch reuse or native allocator ownership.");
+console.log("Constructible layouts: parsed cache initialization, the direct BF16 first-token KV branch, and every subsequent token through 262144 are constructed from the original checkpoint bundle, fresh address-space bounds and primitive/dispatch contracts, with no supplied graph/token plan or per-step execution oracle. Initial KV allocation derives zero slabs, optional preservation copies, row updates and the active head stride. The exact first-token heap feeds the constructed continuation. A checkpoint adapter now accepts only the reached normal-input rsqrt envelopes and derives division bounds internally, preserving original functions and proving token selection with the lowest-index tie rule. Parameter bytes remain unchanged; readback has the reference cache ranges, propagated error bounds and finiteness. The conservative retained bump-address budget for 262143 later steps is 127015766109984 bytes. This address-space construction does not establish physical-memory fit, scratch reuse or native allocator ownership.");
 console.log("Checkpoint coverage: checked literals cover 129 main and 32 head normalization vectors, 144 Delta tensors, 192 Trellis scale tensors and 48 convolution tensors. Affine dictionaries cover distinct scale/bias alphabets from 612 tensors; ordered indices remain explicit inputs. Lean byte constructors establish exact parameter attachment and a fixed-point property. Native parsing/loading and specified host RoPE/head-scale results remain boundary contracts.");
-console.log("Native paths proved: 0. Most kernel models remain manually translated. Selected copy_s BF16/N1, FP32/N2 and BF16/N4, copy_v BF16/N4, and copy_gg_nd2 plus elem_to_loc_2 have checked parser/body and current-heap load/store refinements, including completed interleavings and constructive execution witnesses. Trusted host checks bind exact body bytes to pinned source. Manual host selection derives shape-specific scalar/vector dispatch and two-dimensional KV geometry. The direct first-KV path models zero slabs, explicit donation/copy preservation and row updates without empty concatenation; it connects to attention inputs/results, but is not yet substituted into the complete constructed token graph. Compiler lowering, native object/buffer extraction, command scheduling/visibility, checkpoint loading, allocator lifetimes and hardware arithmetic remain explicit boundaries. No GPU execution is part of this checker.");
+console.log("Native paths proved: 0. Selected scalar/vector/general copy kernels have checked parser/body and current-heap load/store refinements, including completed interleavings. Trellis integer codebook, reciprocal-based bit construction, cooperative table initialization and packed-window lookup have parsed-source refinements; parsed caller loops now derive packed word arrays and gate input chunks from original bytes. The parsed gate/up FMA branch preserves input and accumulation order; weight multiplication, outer loops and output source refinements remain incomplete. The BF16 Add helper and selected full binary_vv body have parsed-source and separate-load/store interleaving refinements; the residual MLP suffix uses their exact final heap. Physical builtin arithmetic remains a declared machine contract. Manual host translations select the default serial, unpaged, one-token BF16 M1 Max route and dispatch geometry. Trusted byte/hash guards bind these translations to source. Logical IEEE/FTZ division proves the mathematical division envelopes; actual instruction selection remains a boundary. Compiler lowering, native object/buffer extraction, command scheduling/visibility, checkpoint loading, allocator lifetimes and hardware arithmetic remain explicit boundaries. No GPU execution is part of this checker.");
