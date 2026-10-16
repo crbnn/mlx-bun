@@ -1,6 +1,7 @@
 import kernels.trellis.GateUpOutput
 import kernels.trellis.GateUpBytes
 import kernels.trellis.DownInputCongruence
+import kernels.trellis.DownOutput
 import models.qwen.TrellisMlpScheduled
 import models.qwen.MlpExecution
 
@@ -37,20 +38,24 @@ theorem activation_widen (mlp : GateDown) (input : Nat → BitVec 16)
   exact stored.trans (congrFun (TrellisMlpScheduled.intermediate_eq mlp input group.memory group.inputBase group.ready) row)
 
 -- Gate/up dispatch -> BF16 activation buffer -> down read/computation and
--- scratch phases -> global partial buffer -> fold. All intermediate inputs
+-- scratch phases -> global partial buffer -> fold -> BF16 output buffer.
+-- All intermediate inputs
 -- below are the values read from the preceding completed storage trace.
 structure Execution (mlp : GateDown) (input : Nat → BitVec 16) where
   gate : Nat → GateUpBytes.Trace mlp.gatePlatform.base input
   middle : GateUpOutput.Trace (activation mlp input gate)
   down : DownDevice.Trace mlp.downPlatform.load (fun ty => FloatMemory.encode (mlp.downPlatform.before ty))
     mlp.downPlatform.base mlp.down.words mlp.down.width mlp.down.scale middle.read
+  output : DownOutput.Trace (DownOutput.foldValues down mlp.downPlatform.reduce)
 
 def Execution.canonical (mlp : GateDown) (input : Nat → BitVec 16) : Execution mlp input :=
   let gate := fun _ : Nat => GateUpBytes.Trace.canonical mlp.gatePlatform.base input (fun _ => 0)
     (16*(mlp.gatePlatform.base/16+1025)) (by omega) (Or.inl (by omega))
   let middle := GateUpOutput.Trace.canonical (activation mlp input gate) (fun _ => 0) 0 (by decide) (by decide)
-  ⟨gate, middle, DownDevice.Trace.canonical mlp.downPlatform.load (fun ty => FloatMemory.encode (mlp.downPlatform.before ty))
-    mlp.downPlatform.base mlp.down.words mlp.down.width mlp.down.scale middle.read (fun _ => 0) 0 (by decide) (by decide)⟩
+  let down := DownDevice.Trace.canonical mlp.downPlatform.load (fun ty => FloatMemory.encode (mlp.downPlatform.before ty))
+    mlp.downPlatform.base mlp.down.words mlp.down.width mlp.down.scale middle.read (fun _ => 0) 0 (by decide) (by decide)
+  ⟨gate, middle, down, DownOutput.Trace.canonical (DownOutput.foldValues down mlp.downPlatform.reduce)
+    (fun _ => 0) 0 (by decide) (by decide)⟩
 
 theorem Execution.input_eq (execution : Execution mlp input) (row : Nat) (bound : row<17408) :
     execution.middle.read row=mlp.intermediate input row := by
@@ -59,11 +64,13 @@ theorem Execution.input_eq (execution : Execution mlp input) (row : Nat) (bound 
 
 def forward (mlp : GateDown) (input : Nat → BitVec 16) (execution : Execution mlp input) (column : Fin 5120) :
     BFloat16Arithmetic.Value :=
-  BFloat16.narrow (DownDevice.output execution.down mlp.downPlatform.reduce id column.val)
+  execution.output.read column.val
 
 theorem forward_eq (mlp : GateDown) (input : Nat → BitVec 16) (execution : Execution mlp input) (column : Fin 5120) :
     forward mlp input execution column=mlp.forward input column := by
   unfold forward
+  rw [execution.output.read_correct column.val column.isLt]
+  unfold DownOutput.foldValues
   rw [DownInputCongruence.output_eq execution.down mlp.downPlatform.loads mlp.downPlatform.aligned mlp.downPlatform.bounded
     mlp.down.validWidth (mlp.intermediate input) (fun row bound => execution.input_eq row bound)
       mlp.downPlatform.reduce id column.val column.isLt]
