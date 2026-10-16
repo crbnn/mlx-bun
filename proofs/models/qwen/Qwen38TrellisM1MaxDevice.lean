@@ -1,6 +1,7 @@
 import models.qwen.AutoregressiveImplementation
 import models.qwen.TrellisMlpDevice
 import models.qwen.AttentionDevice
+import models.qwen.DeltaDevice
 import models.qwen.Qwen38TrellisM1MaxMagnitude
 
 namespace Inference.Models.Qwen.Qwen38TrellisM1MaxDevice
@@ -9,7 +10,7 @@ open FloatLib FloatLib.Floats FloatLib.Floats.Formats.BinaryInterchange
 set_option maxRecDepth 10000
 
 def implementation : DecodeImplementation.Implementation :=
-  ⟨TrellisMlpDevice.implementation, AttentionDevice.implementation⟩
+  ⟨TrellisMlpDevice.implementation, AttentionDevice.implementation, DeltaDevice.implementation⟩
 
 abbrev Schedules (p : Pipeline) :=
   AutoregressiveImplementation.Schedules implementation p RopeInputConstruction.angles
@@ -17,9 +18,10 @@ abbrev Schedules (p : Pipeline) :=
 noncomputable def Schedules.canonical (p : Pipeline) : Schedules p :=
   AutoregressiveImplementation.Schedules.canonical implementation p RopeInputConstruction.angles
 
--- Fixed proved MLP and attention implementations feed each dependent stage.
+-- Fixed proved MLP, attention and Delta implementations feed each dependent stage.
 -- Their traces include final byte readback, both attention storage routes,
--- KV append and returned-cache readback, and the two-launch down reduction.
+-- KV append and returned-cache readback, Delta recurrence inputs and stores,
+-- and the two-launch down reduction.
 -- Other kernels retain their source translations; allocation/dispatch and
 -- compiled-binary correspondence remain separate obligations.
 noncomputable def run (p : Pipeline) (encoded : CheckpointDictionaryBinding.Encoding)
