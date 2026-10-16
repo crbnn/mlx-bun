@@ -24,22 +24,24 @@ export interface DeltaInput {
 // The complete head fits one group, allowing its output RMSNorm in the same
 // dispatch. Unlike Strata this does not transpose the stored recurrent state.
 const SOURCE = String.raw`
-  const int h = threadgroup_position_in_grid.x, batch = threadgroup_position_in_grid.y;
+  const int group = threadgroup_position_in_grid.x, batch = threadgroup_position_in_grid.y;
+  const int h = group / PARTS, part = group % PARTS;
   const int hk = h / (HV / HK), lane = thread_index_in_simdgroup;
   const int sg = simdgroup_index_in_threadgroup, tid = thread_index_in_threadgroup;
   threadgroup T qs[128], ks[128], vs[128], ys[128];
-  float st[8][4];
-  for (int r = 0; r < 8; ++r)
+  const int column = part * (128 / PARTS) + sg * COLS;
+  float st[COLS][4];
+  for (int r = 0; r < COLS; ++r)
     for (int i = 0; i < 4; ++i)
-      st[r][i] = state[((batch * HV + h) * 128 + sg * 8 + r) * 128 + lane * 4 + i];
+      st[r][i] = state[((batch * HV + h) * 128 + column + r) * 128 + lane * 4 + i];
   for (int t = 0; t < SEQ; ++t) {
-    if (tid < 192) {
-      const bool isq = tid < 32, isk = tid >= 32 && tid < 64;
-      const int count = tid < 64 ? 4 : 1;
+    for (int task = tid; task < 192; task += THREADS) {
+      const bool isq = task < 32, isk = task >= 32 && task < 64;
+      const int count = task < 64 ? 4 : 1;
       float sum = 0.0f;
       T vals[4];
       for (int i = 0; i < count; ++i) {
-        const int d = tid < 64 ? lane * 4 + i : tid - 64;
+        const int d = task < 64 ? lane * 4 + i : task - 64;
         const int ch = isq ? hk * 128 + d : isk ? (HK + hk) * 128 + d : 2 * HK * 128 + h * 128 + d;
         float cv = 0.0f;
         for (int k = 0; k < 4; ++k) {
@@ -53,9 +55,9 @@ const SOURCE = String.raw`
         const T activated = T(rounded * sigmoid);
         vals[i] = activated;
         sum += float(activated) * float(activated);
-        if (tid >= 64) vs[d] = activated;
+        if (task >= 64) vs[d] = activated;
       }
-      if (tid < 64) {
+      if (task < 64) {
         sum = metal::simd_sum(sum);
         const float inv = metal::precise::rsqrt(sum / 128.0f + 1e-6f);
         for (int i = 0; i < 4; ++i) {
@@ -68,8 +70,8 @@ const SOURCE = String.raw`
     }
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     const int th = (batch * SEQ + t) * HV + h;
-    for (int r = 0; r < 8; ++r) {
-      const int dv = sg * 8 + r;
+    for (int r = 0; r < COLS; ++r) {
+      const int dv = column + r;
       float kv = 0.0f;
       for (int i = 0; i < 4; ++i) {
         st[r][i] = st[r][i] * g[th];
@@ -85,10 +87,13 @@ const SOURCE = String.raw`
           first[((batch * HV + h) * 128 + dv) * 128 + lane * 4 + i] = st[r][i];
       }
       out = metal::simd_sum(out);
-      if (lane == 0) ys[dv] = T(out);
+      if (lane == 0) {
+        if (FUSE_TAIL) ys[dv] = T(out);
+        else y[th * 128 + dv] = T(out);
+      }
     }
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    if (tid < 32) {
+    if (FUSE_TAIL && tid < 32) {
       float sum = 0.0f;
       for (int i = 0; i < 4; ++i) {
         const float v = float(ys[tid * 4 + i]);
@@ -107,12 +112,12 @@ const SOURCE = String.raw`
     }
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
   }
-  for (int r = 0; r < 8; ++r)
+  for (int r = 0; r < COLS; ++r)
     for (int i = 0; i < 4; ++i)
-      next[((batch * HV + h) * 128 + sg * 8 + r) * 128 + lane * 4 + i] = st[r][i];
+      next[((batch * HV + h) * 128 + column + r) * 128 + lane * 4 + i] = st[r][i];
   // Value heads own their value history; the first value head of a GQA group
   // owns its shared Q/K history. No in-place history writes.
-  for (int ch0 = tid; ch0 < 384; ch0 += 512) {
+  for (int ch0 = tid; part == 0 && ch0 < 384; ch0 += THREADS) {
     const int ch = ch0 < 128 ? hk * 128 + ch0 : ch0 < 256 ? (HK + hk) * 128 + ch0 - 128
       : 2 * HK * 128 + h * 128 + ch0 - 256;
     if (ch0 < 256 && h % (HV / HK) != 0) continue;
@@ -126,6 +131,20 @@ const SOURCE = String.raw`
 
 let fused: MetalKernel | undefined;
 export function fusedDelta(x: DeltaInput, saveFirst = false): MlxArray[] {
+  return applyDelta(x, saveFirst, 1, 8, true);
+}
+
+/** Leave the output norm/gate parallel over tokens, and split each head's
+ * state across more threadgroups. Repeats the small convolution/head work
+ * per partition, trading that work for more independent recurrence groups. */
+export function splitDelta(x: DeltaInput, parts: 2 | 4 | 8 | 16, saveFirst = false): MlxArray[] {
+  const result = applyDelta(x, saveFirst, parts, 4, false);
+  using raw = result[0]!;
+  result[0] = gatedRmsNorm(raw, x.z, x.norm, 1e-6);
+  return result;
+}
+
+function applyDelta(x: DeltaInput, saveFirst: boolean, parts: number, columns: number, fuseTail: boolean): MlxArray[] {
   const [B, S, C] = x.qkv.shape;
   if (C !== (2 * x.hk + x.hv) * 128 || x.hv % x.hk || x.conv.shape[1] !== 4 || x.state.shape[2] !== 128 || x.state.shape[3] !== 128)
     throw new Error("fused screen requires 128-wide heads, four-tap convolution and integral GQA");
@@ -133,11 +152,13 @@ export function fusedDelta(x: DeltaInput, saveFirst = false): MlxArray[] {
   using beta = ops.sigmoid(x.b);
   fused ??= new MetalKernel({ name: "strata_screen_delta", inputNames: ["qkv", "history", "conv", "g", "beta", "state", "z", "norm", "qscale", "kscale"],
     outputNames: ["y", "next", "histout", "first"], source: SOURCE });
+  const threads = 128 / parts / columns * 32;
   const result = fused.apply([x.qkv, x.history, x.conv, g, beta, x.state, x.z, x.norm, x.qScale, x.kScale], {
     outputs: [{ shape: [B!, S!, x.hv, 128], dtype: x.qkv.dtype }, { shape: x.state.shape, dtype: Dtype.float32 },
       { shape: x.history.shape, dtype: x.qkv.dtype }, { shape: saveFirst ? x.state.shape : [1], dtype: Dtype.float32 }],
-    grid: [512 * x.hv, B!, 1], threadGroup: [512, 1, 1], templateDtypes: { T: x.qkv.dtype },
-    templateInts: { HK: x.hk, HV: x.hv, C: C!, SEQ: S!, SAVE_FIRST: Number(saveFirst) },
+    grid: [threads * parts * x.hv, B!, 1], threadGroup: [threads, 1, 1], templateDtypes: { T: x.qkv.dtype },
+    templateInts: { HK: x.hk, HV: x.hv, C: C!, SEQ: S!, SAVE_FIRST: Number(saveFirst),
+      PARTS: parts, COLS: columns, THREADS: threads, FUSE_TAIL: Number(fuseTail) },
   });
   if (!saveFirst) result.pop()!.dispose();
   return result;
@@ -149,13 +170,13 @@ export class CompiledDeltaPair {
   readonly baseline: CompiledFunction;
   readonly candidate: CompiledFunction;
   readonly inputs: MlxArray[];
-  constructor(x: DeltaInput) {
+  constructor(x: DeltaInput, candidate: (x: DeltaInput) => MlxArray[] = fusedDelta) {
     const keys = ["qkv", "history", "conv", "a", "b", "aLog", "dt", "state", "z", "norm", "qScale", "kScale"] as const;
     this.inputs = keys.map(k => x[k]);
     const rebuild = (inputs: MlxArray[]) => Object.fromEntries(keys.map((k, i) => [k, inputs[i]!])) as unknown as DeltaInput;
     const bind = (inputs: MlxArray[]): DeltaInput => ({ ...rebuild(inputs), hk: x.hk, hv: x.hv });
     this.baseline = new CompiledFunction(inputs => referenceDelta(bind(inputs)), false);
-    this.candidate = new CompiledFunction(inputs => fusedDelta(bind(inputs)), false);
+    this.candidate = new CompiledFunction(inputs => candidate(bind(inputs)), false);
   }
   dispose() { this.baseline.dispose(); this.candidate.dispose(); }
   [Symbol.dispose]() { this.dispose(); }

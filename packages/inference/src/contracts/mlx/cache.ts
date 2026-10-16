@@ -158,6 +158,14 @@ export interface GatedDeltaHeads {
   readonly v: MlxArray;
 }
 
+/** Pure decode operation bound by a layer. All inputs are borrowed; every
+ * result is owned by the cache. `k` and `v` retain this position's exact inputs
+ * for speculative rollback. State layouts match GatedDeltaCache. */
+export type GatedDeltaDecode = (qkv: MlxArray, a: MlxArray, b: MlxArray,
+  conv: MlxArray, recurrent: MlxArray | null) => {
+    out: MlxArray; conv: MlxArray; recurrent: MlxArray; k: MlxArray; v: MlxArray;
+  };
+
 /** What a gated DeltaNet block lends its recurrent cache for one call: the
  * layer's recurrence weights and the block's glue between the convolution and
  * the recurrence. The block keeps its projections, norms and activations. The
@@ -170,6 +178,9 @@ export interface GatedDeltaParameters {
   readonly aLog: MlxArray;
   /** Per-value-head timestep bias [Hv]. */
   readonly dtBias: MlxArray;
+  /** An explicitly bound fused decode read. Omission preserves the ordinary
+   * convolution/heads/recurrence. Window reads always use `heads`. */
+  readonly decode?: GatedDeltaDecode;
   /** The block's glue: the activation of the convolution output, the split
    * into q, k and v heads, and their norms and scaling. Pure. `convolved`
    * [B, S, convDim] is the raw convolution output (before activation) and is

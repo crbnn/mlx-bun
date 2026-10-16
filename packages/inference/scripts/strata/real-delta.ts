@@ -8,7 +8,9 @@ import { Weights } from "../../src/artifacts/weights";
 import { QuantizedEmbedding } from "../../src/layers/quantized-embedding";
 import { GatedDeltaNet } from "../../src/models/qwen/blocks";
 import { qwen35WeightsView } from "../../src/models/qwen/checkpoint";
-import { CompiledDeltaPair, fusedDelta, referenceDelta, type DeltaInput } from "./delta";
+import { convDeltaDecode } from "../../src/kernels/delta/conv-step";
+import { gatedRmsNorm } from "../../src/kernels/gated-rms-norm";
+import { CompiledDeltaPair, fusedDelta, splitDelta, referenceDelta, type DeltaInput } from "./delta";
 
 interface Measurement {
   difference(a: MlxArray, b: MlxArray): unknown;
@@ -16,7 +18,7 @@ interface Measurement {
 }
 /** First recurrent layer, real checkpoint projections and a continued state.
  * This qualifies this block's samples only, not whole-model logits or serving. */
-export async function realDelta(model: string, measure: Measurement): Promise<unknown[]> {
+export async function realDelta(model: string, measure: Measurement, split = false): Promise<unknown[]> {
   model = realpathSync(model);
   const config = await loadModelConfig(model), weights = await Weights.open(model);
   try {
@@ -55,26 +57,36 @@ export async function realDelta(model: string, measure: Measurement): Promise<un
       const x: DeltaInput = { ...p, ...common, state: seed[1]!, history: seed[2]! };
       try {
         ops.evalAll([...Object.values(p), ...seed]);
-        using compiled = new CompiledDeltaPair(x);
-        const a = referenceDelta(x), b = fusedDelta(x, true);
-        try {
-          const slice = (v: MlxArray) => v.slice(v.shape.map(() => 0), v.shape.map((n, i) => i === 1 ? 1 : n));
-          const first = { qkv: slice(p.qkv), a: slice(p.a), b: slice(p.b), z: slice(p.z) };
+        const variants = split ? ([2, 4, 8, 16] as const).map(parts => ({ name: `split-${parts}`,
+          run: (x: DeltaInput, saveFirst = false) => splitDelta(x, parts, saveFirst) })) : [{ name: "full", run: fusedDelta }];
+        if (split && S === 1) variants.push({ name: "decode-binding", run: (x: DeltaInput, saveFirst = false) => {
+          const result = convDeltaDecode(x.qkv, x.a, x.b, x.history, x.state, x.conv, x.aLog, x.dt, x.qScale, x.kScale, x.hk, x.hv);
+          using raw = result.out; result.k.dispose(); result.v.dispose();
+          return [gatedRmsNorm(raw, x.z, x.norm, 1e-6), result.recurrent, result.conv,
+            ...(saveFirst ? [ops.copyOf(result.recurrent)] : [])];
+        } });
+        for (const variant of variants) {
+          using compiled = new CompiledDeltaPair(x, variant.run);
+          const a = referenceDelta(x), b = variant.run(x, true);
           try {
-            const refFirst = referenceDelta({ ...x, ...first });
+            const slice = (v: MlxArray) => v.slice(v.shape.map(() => 0), v.shape.map((n, i) => i === 1 ? 1 : n));
+            const first = { qkv: slice(p.qkv), a: slice(p.a), b: slice(p.b), z: slice(p.z) };
             try {
-              const ca = compiled.baseline.apply(compiled.inputs), cb = compiled.candidate.apply(compiled.inputs);
-              let compiledDiff;
-              try { compiledDiff = ca.map((v, i) => measure.difference(cb[i]!, v)); }
-              finally { for (const v of [...ca, ...cb]) v.dispose(); }
-              const cell = { experiment: "real-layer-fused-delta", B, S, metadata,
-                diff: a.map((v, i) => measure.difference(b[i]!, v)), firstState: measure.difference(b[3]!, refFirst[1]!),
-                timing: measure.paired(() => referenceDelta(x), () => fusedDelta(x), 8), compiledDiff,
-                compiledTiming: measure.paired(() => compiled.baseline.apply(compiled.inputs), () => compiled.candidate.apply(compiled.inputs), 32) };
-              console.log(JSON.stringify(cell)); cells.push(cell);
-            } finally { for (const v of refFirst) v.dispose(); }
-          } finally { for (const v of Object.values(first)) v.dispose(); }
-        } finally { for (const v of [...a, ...b]) v.dispose(); }
+              const refFirst = referenceDelta({ ...x, ...first });
+              try {
+                const ca = compiled.baseline.apply(compiled.inputs), cb = compiled.candidate.apply(compiled.inputs);
+                let compiledDiff;
+                try { compiledDiff = ca.map((v, i) => measure.difference(cb[i]!, v)); }
+                finally { for (const v of [...ca, ...cb]) v.dispose(); }
+                const cell = { experiment: "real-layer-fused-delta", variant: variant.name, B, S, metadata,
+                  diff: a.map((v, i) => measure.difference(b[i]!, v)), firstState: measure.difference(b[3]!, refFirst[1]!),
+                  timing: measure.paired(() => referenceDelta(x), () => variant.run(x), 8), compiledDiff,
+                  compiledTiming: measure.paired(() => compiled.baseline.apply(compiled.inputs), () => compiled.candidate.apply(compiled.inputs), 32) };
+                console.log(JSON.stringify(cell)); cells.push(cell);
+              } finally { for (const v of refFirst) v.dispose(); }
+            } finally { for (const v of Object.values(first)) v.dispose(); }
+          } finally { for (const v of [...a, ...b]) v.dispose(); }
+        }
       } finally { for (const v of [...Object.values(before), ...Object.values(p), ...seed]) v.dispose(); }
     }
     return cells;

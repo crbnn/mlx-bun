@@ -16,6 +16,8 @@ Strata (https://github.com/Niko1221/Strata), revision
 `296b59d2f73c8f04a805df29c2fa97655adace78`. The chunked recurrence and expert
 planner read source from a caller-supplied Strata checkout; the fusion, prefix
 snapshot and matrix-operand experiments adapt those ideas to mlx-bun.
+`src/kernels/delta/conv-step.ts` uses the same fusion idea for single-position
+decode, retaining mlx-lm's recurrence arithmetic and state layout.
 
 MIT License
 

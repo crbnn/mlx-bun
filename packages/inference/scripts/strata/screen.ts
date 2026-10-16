@@ -23,6 +23,7 @@ if (values.help) {
   gpu.sh bun --no-env-file packages/inference/scripts/strata/screen.ts --strata /path/to/Strata --out /external/report.json
   --only fused,prefix,chunked,mpp,moe  Select experiments (all by default).
   --only real --model /cached/model  Compare the first real recurrent layer, after a 16-token prefix.
+  --only real-split --model /model  Sweep narrower fusion partitions with a separate output norm.
   --quick                           Reduce synthetic cases, not correctness thresholds.
 Timings complete fresh output graphs; real-layer results also include native compiled replay.
 Chunked state assumes an alternate cache layout prepared once outside timing. Expert-plan timings compare
@@ -37,7 +38,7 @@ if (values.out) {
   if (!path.startsWith("../")) throw new Error("report must be outside the source tree");
 }
 const selected = new Set(values.only!.split(","));
-for (const name of selected) if (!["fused", "prefix", "chunked", "mpp", "moe", "real"].includes(name)) throw new Error(`unknown experiment ${name}`);
+for (const name of selected) if (!["fused", "prefix", "chunked", "mpp", "moe", "real", "real-split"].includes(name)) throw new Error(`unknown experiment ${name}`);
 const hash = (x: Uint8Array | string) => createHash("sha256").update(x).digest("hex");
 export const median = (v: number[]) => [...v].sort((a, b) => a - b)[Math.floor(v.length / 2)]!;
 export function tensor(shape: number[], dtype: Dtype, seed: number, scale = 1, shift = 0): MlxArray {
@@ -225,9 +226,9 @@ if (selected.has("moe")) {
     } finally { release(result); }
   }
 }
-if (selected.has("real")) {
+for (const name of ["real", "real-split"]) if (selected.has(name)) {
   if (!values.model) throw new Error("real requires --model /path/to/cached/checkpoint");
-  cells.push(...await realDelta(values.model, { difference, paired }));
+  cells.push(...await realDelta(values.model, { difference, paired }, name === "real-split"));
 }
 const report = { schema: 1, kind: "kernel-screen", date: new Date().toISOString(), host: hostname(), architecture: deviceArchitecture(),
   acceptance: { fusedAndPrefix: "exact output and states", chunked: "finite, output relative RMS <=2e-4, state <=1e-4",
