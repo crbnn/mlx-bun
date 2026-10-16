@@ -1,5 +1,6 @@
 import models.qwen.ResidualMlpParsedAdd
 import kernels.normalization.ResidualRmsTailSource
+import kernels.normalization.ResidualRmsLoopMemory
 
 namespace Inference.Models.Qwen.ResidualMlpParsedFirstPass
 open Contracts.Mlx Kernels.Normalization
@@ -76,8 +77,8 @@ theorem parameters_values : (parametersAfter input weights shared parameters all
   (parametersAfter input weights shared parameters allocation).readMlp_eq
 
 -- These two source boundaries now join the same constructed layer execution.
--- The intervening normalization tail, Trellis arithmetic/reductions, native
--- scheduling and compiler correspondence still have their separate obligations.
+-- Trellis arithmetic/reductions, native scheduling and compiler correspondence
+-- still have their separate obligations.
 theorem source_boundaries :
     (firstPass input weights shared parameters allocation).memory=
       (execution input weights shared parameters allocation).residual.addition.trace.memory ∧
@@ -102,5 +103,41 @@ theorem parsed_tail_inverse (groups : block.norm.platform.groups=32)
     before inverseBefore base inverseBase
   exact ⟨after,source,phase,inverse.trans
     ((execution input weights shared parameters allocation).normalization.factor_eq before base).symm⟩
+
+
+-- The parsed tail's inverse feeds parsed output cells on the parsed loop
+-- programs. Their stores produce the complete existing normalized heap.
+theorem parsed_output_stores (groups : block.norm.platform.groups=32)
+    (before inverseBefore : M1Max.WordMemory) (base inverseBase : Nat) :
+    ∃ after, ResidualRmsTailSource.executeSource ResidualRmsTailSyntax.sourceBody block.norm.platform
+      Blocks.width Blocks.eps (firstPass input weights shared parameters allocation)
+      before inverseBefore base inverseBase=some after ∧ after.phase=7 ∧
+      ResidualRmsOutputMemory.Runs
+        (execution input weights shared parameters allocation).residual.normalizationInput.lhs.base
+        (execution input weights shared parameters allocation).residual.normalizationInput.rhs.base
+        (2*(execution input weights shared parameters allocation).normalization.normalized.base)
+        after.inverse inverseBase
+        ResidualRmsLoopMemory.programs.flatten
+        (firstPass input weights shared parameters allocation).memory
+        (execution input weights shared parameters allocation).normalization.normalized.trace.memory := by
+  obtain ⟨after,source,phase,factor⟩ := parsed_tail_inverse input weights shared parameters allocation groups
+    before inverseBefore base inverseBase
+  have stores := ResidualRmsLoopMemory.output_stores
+    (execution input weights shared parameters allocation).residual.normalizationInput
+    (execution input weights shared parameters allocation).normalization.normalized after.inverse inverseBase factor
+  change ResidualRmsOutputMemory.Runs _ _ _ _ _ _
+    (execution input weights shared parameters allocation).residual.addition.trace.memory _ at stores
+  rw [←parsed_heap input weights shared parameters allocation] at stores
+  exact ⟨after,source,phase,stores⟩
+
+
+-- Both nested source loops determine every first-pass thread's cells in the
+-- exact accumulation order used by the existing first-pass memory proof.
+theorem parsed_loop_execution :
+    ResidualRmsLoopMemory.FirstPass block.norm.platform.contracted input.lhs.base input.rhs.base
+      (2*allocation.norm.residualBase) (List.finRange 1024) (ResidualRmsFirstPassMemory.initial input)
+      (firstPass input weights shared parameters allocation) := by
+  unfold firstPass ResidualRmsFirstPassMemory.complete
+  exact ResidualRmsLoopMemory.firstPass _ _ _ _ _ _
 
 end Inference.Models.Qwen.ResidualMlpParsedFirstPass
