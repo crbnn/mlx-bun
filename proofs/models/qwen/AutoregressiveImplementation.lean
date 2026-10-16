@@ -6,11 +6,11 @@ open TokenInference TokenAutoregressive Kernels.Attention Kernels.Sampling
 open FloatLib FloatLib.Floats FloatLib.Floats.Formats.BinaryInterchange
 set_option maxRecDepth 10000
 
-abbrev Schedules (impl : MlpExecution.Implementation) (p : Pipeline) (angles : Angles) :=
+abbrev Schedules (impl : DecodeImplementation.Implementation) (p : Pipeline) (angles : Angles) :=
   ∀ (time : Nat) (cache : p.graph.Cache time) (token : Fin 248320),
     DecodeImplementation.PipelineTrace impl p cache token (angles.value time)
 
-def Schedules.canonical (impl : MlpExecution.Implementation) (p : Pipeline) (angles : Angles) : Schedules impl p angles :=
+def Schedules.canonical (impl : DecodeImplementation.Implementation) (p : Pipeline) (angles : Angles) : Schedules impl p angles :=
   fun _ cache token => DecodeImplementation.ChainTrace.canonical impl p.graph.stages cache (p.embedding.forward token) _
 
 private theorem state_eq (a b : State p time) (token : a.token=b.token) (cache : a.cache=b.cache)
@@ -23,7 +23,7 @@ private theorem state_eq (a b : State p time) (token : a.token=b.token) (cache :
   cases error
   rfl
 
-noncomputable def advance (impl : MlpExecution.Implementation) (p : Pipeline) (parameters : TokenSequenceRanges.Parameters p)
+noncomputable def advance (impl : DecodeImplementation.Implementation) (p : Pipeline) (parameters : TokenSequenceRanges.Parameters p)
     (primitive : Qwen38TrellisM1MaxSequenceRanges.Primitives p.graph)
     (sampling : LogSumExpRanges.Platform) (samplingPrimitive : LogSumExpRanges.Primitives sampling)
     (before : State p time) (angle : RopeAngles.Inputs) (ha : RopeAnglesRanges.InputsBound angle)
@@ -49,7 +49,7 @@ noncomputable def advance (impl : MlpExecution.Implementation) (p : Pipeline) (p
     cacheError := by rw [cacheEq]; exact reference.cacheError
   }
 
-theorem advance_eq (impl : MlpExecution.Implementation) (p : Pipeline) (parameters : TokenSequenceRanges.Parameters p)
+theorem advance_eq (impl : DecodeImplementation.Implementation) (p : Pipeline) (parameters : TokenSequenceRanges.Parameters p)
     (primitive : Qwen38TrellisM1MaxSequenceRanges.Primitives p.graph)
     (sampling : LogSumExpRanges.Platform) (samplingPrimitive : LogSumExpRanges.Primitives sampling)
     (before : State p time) (angle : RopeAngles.Inputs) (ha : RopeAnglesRanges.InputsBound angle)
@@ -67,7 +67,7 @@ theorem advance_eq (impl : MlpExecution.Implementation) (p : Pipeline) (paramete
   · rfl
   · rfl
 
-noncomputable def run (impl : MlpExecution.Implementation) (p : Pipeline) (parameters : TokenSequenceRanges.Parameters p)
+noncomputable def run (impl : DecodeImplementation.Implementation) (p : Pipeline) (parameters : TokenSequenceRanges.Parameters p)
     (primitive : Qwen38TrellisM1MaxSequenceRanges.Primitives p.graph)
     (sampling : LogSumExpRanges.Platform) (samplingPrimitive : LogSumExpRanges.Primitives sampling)
     (token : Fin 248320) (angles : Angles) (schedules : Schedules impl p angles) :
@@ -79,7 +79,7 @@ noncomputable def run (impl : MlpExecution.Implementation) (p : Pipeline) (param
       supported (angles.target t) (angles.error t) (angles.accuracy t (by omega)) (angles.base t (by omega))
         (schedules t before.cache before.token)
 
-theorem run_eq (impl : MlpExecution.Implementation) (p : Pipeline) (parameters : TokenSequenceRanges.Parameters p)
+theorem run_eq (impl : DecodeImplementation.Implementation) (p : Pipeline) (parameters : TokenSequenceRanges.Parameters p)
     (primitive : Qwen38TrellisM1MaxSequenceRanges.Primitives p.graph)
     (sampling : LogSumExpRanges.Platform) (samplingPrimitive : LogSumExpRanges.Primitives sampling)
     (token : Fin 248320) (angles : Angles) (schedules : Schedules impl p angles) (steps : Nat) (supported : steps ≤ 262144) :
@@ -89,7 +89,7 @@ theorem run_eq (impl : MlpExecution.Implementation) (p : Pipeline) (parameters :
   | zero => rfl
   | succ t ih => simp only [run, advance_eq, ih, TokenAutoregressive.run]
 
-theorem run_correct (impl : MlpExecution.Implementation) (p : Pipeline) (parameters : TokenSequenceRanges.Parameters p)
+theorem run_correct (impl : DecodeImplementation.Implementation) (p : Pipeline) (parameters : TokenSequenceRanges.Parameters p)
     (primitive : Qwen38TrellisM1MaxSequenceRanges.Primitives p.graph)
     (sampling : LogSumExpRanges.Platform) (samplingPrimitive : LogSumExpRanges.Primitives sampling)
     (token : Fin 248320) (angles : Angles) (schedules : Schedules impl p angles) (time : Nat) (supported : time+1 ≤ 262144) :
