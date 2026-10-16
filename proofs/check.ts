@@ -46,6 +46,9 @@ const hostSourcePins = {
   "packages/mlx/src/ops.ts": "0672d9fa77e95490cad3201eb7a9eae073aa41a7c1aa0afaf3e1a640e32dc2cd",
 };
 const mlxSourcePins = {
+  "mlx/backend/metal/normalization.cpp": "01bc537389638efe43a9bedeeb2008484864772022ac56e106a3f9911bcaa1aa",
+  "mlx/backend/metal/kernels/rms_norm.metal": "b2e04e377fdad1d645581f9beeaf9cbb06d1ad32926161e06cbc15240caf12bf",
+  "mlx/backend/metal/kernels/defines.h": "a2930dbd644c69c4b66a511a094034217f3c03f48e29a1613f601532150f9163",
   "mlx/backend/metal/copy.cpp": "35570b10905afb07f59ea16bf7abf840d290435fedbf716ca83cc7c51691e5d8",
   "mlx/backend/metal/kernels/copy.h": "a9fad1b262ffc25f4ccda4e09d0c76821cd580f12871acd2a0daa98151e1587c",
   "mlx/backend/metal/kernels/utils.h": "5e1568e9edde9d05dbf86f68fa0d6c6240f2c32b973c7c6a76166b9c0d91543d",
@@ -432,7 +435,6 @@ const proofFiles = [
   "state/KvConcat.lean",
   "state/KvDevice.lean",
   "models/qwen/AttentionExecution.lean",
-  "models/qwen/AttentionDevice.lean",
   "contracts/mlx/ArrayStorage.lean",
   "contracts/mlx/ArrayViews.lean",
   "contracts/mlx/HalfArrayWrites.lean",
@@ -459,6 +461,19 @@ const proofFiles = [
   "kernels/delta/GateDevice.lean",
   "models/qwen/DeltaConvolution.lean",
   "models/qwen/DeltaDevice.lean",
+  "contracts/mlx/RmsScratch.lean",
+  "contracts/mlx/RowStorage.lean",
+  "kernels/RmsNormDevice.lean",
+  "kernels/ResidualRmsNormDevice.lean",
+  "models/qwen/AttentionAffine.lean",
+  "models/qwen/AttentionNormalization.lean",
+  "kernels/attention/RopeDevice.lean",
+  "kernels/attention/SdpaLoads.lean",
+  "kernels/attention/OutputGateDevice.lean",
+  "models/qwen/AttentionHeadsDevice.lean",
+  "state/KvSources.lean",
+  "models/qwen/AttentionReadStorage.lean",
+  "models/qwen/AttentionDevice.lean",
   "models/qwen/DecodeImplementation.lean",
   "models/qwen/AutoregressiveImplementation.lean",
   "models/qwen/Qwen38TrellisM1MaxDevice.lean",
@@ -649,4 +664,5 @@ console.log("KV copy refinement: same-dtype 16-bit scalar/vector and strided cop
 console.log("Delta and persistent storage: mixed BF16/FP32 input loads and recurrent-state byte loads feed the selected single-token Delta recurrence. Ordered output and state stores have disjoint destinations and exact completed readback. The resulting layer output and cache refine the source model through all graph stages. The storage-carrying autoregressive loop passes the same resulting KV and recurrent-state buffers into the next step, preserving the conditional numerical and token-selection results. Native execution correspondence remains open.");
 console.log("Delta convolution and normalization storage: concurrent one-dimensional concat copies construct the four-row BF16 input, and the dynamic tail copy preserves the next three history rows. Shape collapse and signed indexing match the selected copy layouts. The four-tap convolution reads joined input and weight bytes, then stores its BF16 output. Head processing consumes that same allocation and writes Q/K/V buffers, which feed recurrence directly. Gated normalization consumes recurrence output bytes and writes its completed result. The graph and autoregressive loop carry both Delta history and recurrent-state buffers as well as KV storage. Native allocation, primitive execution, visibility and compiler correspondence remain open.");
 console.log("Affine and Delta handoffs: packed three-/four-bit loads and BF16 parameter loads reconstruct checkpoint projection weights. Completed fast-qmv stores preserve the projection result and numerical budget. Delta QKV, z, a and b projections consume a shared input buffer; their output allocations feed convolution, gated normalization and gate expressions. Completed FP32 decay/BF16 beta stores feed recurrence, and normalization output bytes feed the final affine projection. These source-model refinements propagate through the autoregressive loop. Generated MLX gate code, native allocation, dispatch, visibility and source-to-binary correspondence remain external obligations.");
+console.log("Attention buffer composition: affine Q/K/V output bytes feed the strided query copy, RMS scratch initialization/partial sums/inverse readback, and partial-RoPE copy plus disjoint pair stores. The stored key/value sources feed KV append; SDPA reads the actual query and appended cache byte images. Its output feeds the BF16 sigmoid/product stages and final affine projection. The graph and autoregressive loop preserve the previous numerical result. Row-local byte views have a proved disjoint representation; native allocation and dispatch still require correspondence. The residual-plus-normalization byte primitive is also checked, while stage-to-stage activation-buffer wiring, embedding/final-output/sampling byte execution and compiler/hardware correspondence remain open.");
 console.log("Scope: the conditional autoregressive source model covers embedding, all 64 layers, final normalization, logits, looped logsumexp, normalized greedy selection and returned-cache errors through 262144 steps. Each selected token and returned cache feeds the next call; range conditions are derived inductively. Error bounds compare against a mathematical reference consuming the same emitted tokens. Exact-real sequence agreement requires per-step numerical margins. The numerical composition selects the proved one-/two-pass reader using the pinned dispatch predicates and default block counts (MLX_SDPA_BLOCKS unset/zero). Both attention routes derive finiteness, output bounds and error against real softmax. The two-pass proof includes BF16 intermediate storage, strided first passes, maximum selection, ordered second-pass reductions and normalization. Logical buffer handoff, loop/address coverage and scratch transpose are proved; native synchronization and buffer attachment remain execution premises. Normalization, Delta gate/gated-normalization, all 192 Trellis scale tensors and all 48 convolution tensors have checked literal bounds, connected to the autoregressive parameter contract through exact attachment equalities. Packed scale dictionaries and FP16 widening are proved. Affine dictionaries extracted from 612 tensors have checked bounds; ordered affine indices remain explicit inputs, not literal payload certificates. Exact dictionary attachments discharge all parameter ranges. The pure model constructor supplies those attachments and is a fixed point on already attached models. The inference entry point constructs every RoPE position input, with exact position conversion and a proved 2^-20 log-base error from a specified host result. Head-scale construction is proved from a specified binary64 Math.pow result, whose host execution remains a premise. Exact byte constructors supply affine parameter contracts from checked payloads. Host attachment parsers remain outside Lean. Full checkpoint/loader binding, a useful final accuracy bound, native memory/dispatch execution and hardware/compiler correspondence remain unproved.");
