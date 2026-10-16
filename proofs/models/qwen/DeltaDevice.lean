@@ -21,13 +21,16 @@ structure Execution (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : 
   normalization : Kernels.GatedRmsNormDevice.Execution layer.gated layer.headParams.width layer.headParams.eps
     recurrence.output (DeltaNet.zHead layer (fun _ => input) 0) layer.normWeight
   normalizationInput : normalization.storage.input=GatedOutput.buffer recurrence
+  normalizationGate : normalization.storage.gate=convolution.projections.gateBuffer
+  projection : Layers.AffineDevice.Execution (groups := 1280) layer.out (GatedInputs.flatten normalization.output)
+  projectionInput : projection.inputStorage=normalization.readbackBuffer
 
 def Execution.storage (execution : Execution layer input cache) : Storage cache :=
   ⟨execution.convolution.convolution.convolution.old, execution.recurrence.storage⟩
 
-def Execution.fromStorage (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache)
-    (storage : Storage cache) : Execution layer input cache :=
-  let convolution := DeltaConvolution.Execution.fromStorage layer input cache storage.history
+def Execution.fromBuffers (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache)
+    (storage : Storage cache) (source : ArrayStorage.BFBuffer input) (weights : DeltaAffine.Weights layer) : Execution layer input cache :=
+  let convolution := DeltaConvolution.Execution.fromBuffers layer input cache storage.history source weights
   let recurrence : GatedDevice.Execution layer.recurrence.reduce layer.recurrence.flags cache.recurrent
       (DeltaConvolution.inputValues layer input cache convolution).inputs :=
     { values := DeltaConvolution.inputValues layer input cache convolution
@@ -35,8 +38,17 @@ def Execution.fromStorage (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (ca
       inputStorage := DeltaConvolution.inputStorage layer input cache convolution
       storage := storage.recurrent
       stores := GatedBytes.Trace.canonical _ _ }
-  ⟨convolution, recurrence, HEq.rfl, GatedOutput.normalization layer.gated layer.headParams.width layer.headParams.eps
-    recurrence (DeltaNet.zHead layer (fun _ => input) 0) layer.normWeight, rfl⟩
+  let normalizationStorage : Kernels.GatedRmsNormDevice.Storage recurrence.output (DeltaNet.zHead layer (fun _ => input) 0) layer.normWeight :=
+    ⟨GatedOutput.buffer recurrence, convolution.projections.gateBuffer, ArrayStorage.BFBuffer.canonical _ (by decide)⟩
+  let normalization := Kernels.GatedRmsNormDevice.Execution.fromStorage layer.gated layer.headParams.width layer.headParams.eps
+    recurrence.output (DeltaNet.zHead layer (fun _ => input) 0) layer.normWeight normalizationStorage
+  let projection := Layers.AffineDevice.Execution.fromStorage (groups := 1280) layer.out (GatedInputs.flatten normalization.output)
+    weights.out normalization.readbackBuffer (by decide)
+  ⟨convolution, recurrence, HEq.rfl, normalization, rfl, rfl, projection, Layers.AffineDevice.Execution.input_fromStorage _ _ _⟩
+
+def Execution.fromStorage (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache)
+    (storage : Storage cache) : Execution layer input cache :=
+  Execution.fromBuffers layer input cache storage (ArrayStorage.BFBuffer.canonical _ (by decide)) (DeltaAffine.Weights.canonical layer)
 
 def Execution.canonical (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache) : Execution layer input cache :=
   Execution.fromStorage layer input cache (Storage.canonical cache)
@@ -73,13 +85,22 @@ theorem merged_eq (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : De
   rfl
 
 def forward (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache)
-    (execution : Execution layer input cache) : Fin 5120 → BF := layer.out.forward (merged layer input cache execution)
+    (execution : Execution layer input cache) : Fin 5120 → BF := execution.projection.output
 
 theorem forward_eq (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache)
     (execution : Execution layer input cache) : forward layer input cache execution=layer.forward cache (fun _ => input) 0 := by
   unfold forward
+  rw [execution.projection.output_eq]
+  change layer.out.forward (merged layer input cache execution)=_
   rw [merged_eq]
   rfl
+
+def inputStorage (execution : Execution layer input cache) : ArrayStorage.BFBuffer input :=
+  execution.convolution.projections.source
+
+def outputStorage (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache)
+    (execution : Execution layer input cache) : ArrayStorage.BFBuffer (forward layer input cache execution) :=
+  execution.projection.outputBuffer
 
 -- Both cache fields now come from completed byte stores.
 def cacheAfter (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache)
@@ -98,6 +119,18 @@ def storageAfter (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : Del
 theorem normalization_input_bytes (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache)
     (execution : Execution layer input cache) : execution.normalization.storage.input.bytes=execution.recurrence.stores.outputMemory :=
   congrArg ArrayStorage.BFBuffer.bytes execution.normalizationInput
+
+theorem normalization_gate_bytes (execution : Execution layer input cache) :
+    execution.normalization.storage.gate.bytes=execution.convolution.projections.z.outputBuffer.bytes :=
+  congrArg ArrayStorage.BFBuffer.bytes execution.normalizationGate
+
+theorem projection_input_bytes (execution : Execution layer input cache) :
+    execution.projection.inputStorage.bytes=execution.normalization.stores.memory :=
+  congrArg ArrayStorage.BFBuffer.bytes execution.projectionInput
+
+theorem fromBuffers_input (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache)
+    (storage : Storage cache) (source : ArrayStorage.BFBuffer input) (weights : DeltaAffine.Weights layer) :
+    inputStorage (Execution.fromBuffers layer input cache storage source weights)=source := rfl
 
 def run (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache)
     (execution : Execution layer input cache) : (Fin 5120 → BF) × DeltaNet.Cache :=

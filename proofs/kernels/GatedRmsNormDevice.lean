@@ -62,6 +62,22 @@ theorem Execution.output_eq (execution : Execution p width eps x gate weights) :
   unfold Execution.output
   rw [ArrayStorage.BFBuffer.read_correct, flatten_index, produced_eq]
 
+def Execution.readbackBuffer (execution : Execution p width eps x gate weights) :
+    ArrayStorage.BFBuffer (flatten execution.output) where
+  bytes := execution.stores.memory
+  base := 0
+  aligned := by decide
+  bounded := by decide
+  attached := by
+    intro i
+    change HalfMemory.load execution.stores.memory (0+2*i.val)=
+      HalfMemory.load execution.stores.memory (0+2*(i.val/128*128+i.val%128))
+    congr 1
+    omega
+
+theorem Execution.readback_bytes (execution : Execution p width eps x gate weights) :
+    execution.readbackBuffer.bytes=execution.stores.memory := rfl
+
 theorem store_index (head : Fin 48) (lane : Fin 32) (i : Fin 4) :
     (CopyContiguous.index (blocks := 1536) ⟨head.val*32+lane.val, by have := head.isLt; have := lane.isLt; omega⟩ i).val=
       (index head ⟨lane.val*4+i.val, by have := lane.isLt; have := i.isLt; omega⟩).val := by
