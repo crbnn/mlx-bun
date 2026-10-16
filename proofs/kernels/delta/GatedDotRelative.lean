@@ -1,5 +1,5 @@
 import kernels.delta.GatedRanges
-import contracts.mlx.ArithmeticMaddRelative
+import contracts.mlx.WeightedFold
 import contracts.mlx.FlushedReductionRelative
 import contracts.mlx.ArithmeticDependencies
 import kernels.delta.RecurrenceStability
@@ -8,9 +8,8 @@ namespace Inference.Kernels.Delta.GatedDotRelative
 open Contracts.Mlx Contracts.Mlx.Numerics Arithmetic
 open scoped BigOperators
 
-def chain (contracted : Bool) (a b : Fin 128 → Expr) : List (Fin 128) → Expr
-  | [] => .zero
-  | i::rest => ArithmeticFold.madd contracted (a i) (b i) (chain contracted a b rest)
+abbrev chain (contracted : Bool) (a b : Fin 128 → Expr) : List (Fin 128) → Expr :=
+  WeightedFold.chain contracted a b
 
 noncomputable def term (input : Nat → Float32) (a b : Fin 128 → Expr) (i : Fin 128) : ℝ :=
   real (evaluate input (a i))*real (evaluate input (b i))
@@ -43,49 +42,8 @@ theorem chain_error (input : Nat → Float32) (contracted : Bool) (a b : Fin 128
     (hb : ∀ i, |real (evaluate input (b i))| ≤ 2)
     (indices : List (Fin 128)) (hf : Arithmetic.Finite input (chain contracted a b indices)) :
     |real (evaluate input (chain contracted a b indices))-(indices.map (term input a b)).sum| ≤
-      (factor indices.length-1)*mass input a b indices+tail indices.length := by
-  induction indices with
-  | nil =>
-    have hz : real (0 : Float32) = 0 := by
-      rw [real_unpack]
-      exact FloatLib.Floats.Formats.BinaryInterchange.Model.unpackedToReal_zero .positive
-    simp [chain, evaluate, hz, factor, tail, mass]
-  | cons i rest ih =>
-    have hacc : Arithmetic.Finite input (chain contracted a b rest) := by
-      cases contracted
-      · exact hf.1
-      · exact hf.2.2.1
-    have previous := ih hacc
-    have current := ArithmeticMaddRelative.error input contracted (a i) (b i) (chain contracted a b rest) hf (ha i) (hb i)
-    have accabs := NormalizedCastBounds.absolute_of_error _ _ _ previous
-    have bounded : |real (evaluate input (chain contracted a b rest))| ≤ factor rest.length*mass input a b rest+tail rest.length := by
-      linarith only [accabs, sum_bound input a b rest]
-    have inherited : |(real (evaluate input (a i))*real (evaluate input (b i))+
-        real (evaluate input (chain contracted a b rest)))-((i::rest).map (term input a b)).sum| ≤
-        (factor rest.length-1)*mass input a b rest+tail rest.length := by
-      simpa only [List.map_cons, List.sum_cons, term, add_sub_add_left_eq_sub] using previous
-    have total := (abs_sub_le (real (evaluate input (chain contracted a b (i::rest))))
-      (real (evaluate input (a i))*real (evaluate input (b i))+real (evaluate input (chain contracted a b rest)))
-      (((i::rest).map (term input a b)).sum)).trans (add_le_add current inherited)
-    have factorStep : factor (rest.length+1) = (1+3*(2 : ℝ)^(-24 : Int))*factor rest.length := by
-      unfold factor
-      rw [pow_succ]
-      ring
-    have tailStep : tail (rest.length+1) = 2*tail rest.length+(2 : ℝ)^(-60 : Int) := by
-      unfold tail
-      rw [pow_succ]
-      ring
-    have scaled := mul_le_mul_of_nonneg_left bounded
-      (by positivity : (0 : ℝ) ≤ 3*(2 : ℝ)^(-24 : Int))
-    have productNonnegative : 0 ≤ |real (evaluate input (a i))| * |real (evaluate input (b i))| :=
-      mul_nonneg (abs_nonneg _) (abs_nonneg _)
-    have factorNonnegative := factor_lower rest.length
-    have productSlack := mul_nonneg (sub_nonneg.mpr factorNonnegative) productNonnegative
-    have tailNonnegative := tail_nonnegative rest.length
-    change _ ≤ (factor (rest.length+1)-1)*(|term input a b i|+mass input a b rest)+tail (rest.length+1)
-    rw [factorStep, tailStep, term, abs_mul]
-    norm_num at total scaled ⊢
-    nlinarith only [total, scaled, productSlack, tailNonnegative]
+      (factor indices.length-1)*mass input a b indices+tail indices.length :=
+  WeightedFold.chain_error input contracted a b (fun i => add_le_add (ha i) (hb i)) indices hf
 
 def laneIndices (lane : Fin 32) : List (Fin 128) :=
   [Gated.laneIndex lane 3, Gated.laneIndex lane 2, Gated.laneIndex lane 1, Gated.laneIndex lane 0]

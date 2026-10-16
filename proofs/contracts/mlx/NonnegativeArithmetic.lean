@@ -1,5 +1,6 @@
 import contracts.mlx.SquaredSumDyadicBounds
 import contracts.mlx.FlushedIdentities
+import contracts.mlx.ArithmeticFold
 
 namespace Inference.Contracts.Mlx.NonnegativeArithmetic
 open Numerics Arithmetic
@@ -54,7 +55,9 @@ inductive LowerOne (input : Nat → Float32) : Expr → Prop where
   | addLeft {a b} : LowerOne input a → Nonnegative input b → LowerOne input (.add a b)
   | addRight {a b} : Nonnegative input a → LowerOne input b → LowerOne input (.add a b)
   | mulRightOne {a b} : LowerOne input a → real (evaluate input b) = 1 → LowerOne input (.mul a b)
+  | mulLeftOne {a b} : real (evaluate input a) = 1 → LowerOne input b → LowerOne input (.mul a b)
   | fmaProduct {a b c} : LowerOne input a → real (evaluate input b) = 1 → Nonnegative input c → LowerOne input (.fma a b c)
+  | fmaProductRight {a b c} : real (evaluate input a) = 1 → LowerOne input b → Nonnegative input c → LowerOne input (.fma a b c)
   | fmaAddend {a b c} : Nonnegative input a → Nonnegative input b → LowerOne input c → LowerOne input (.fma a b c)
 
 theorem lower_one (input : Nat → Float32) (expr : Expr)
@@ -77,6 +80,10 @@ theorem lower_one (input : Nat → Float32) (expr : Expr)
     apply flush_lower_one
     rw [mul_real _ _ hf.2.2, FlushedIdentities.flush_one _ hb, mul_one]
     exact rounded_lower_one _ (flush_lower_one _ (ih hf.1))
+  | mulLeftOne ha hb ih =>
+    apply flush_lower_one
+    rw [mul_real _ _ hf.2.2, FlushedIdentities.flush_one _ ha, one_mul]
+    exact rounded_lower_one _ (flush_lower_one _ (ih hf.2.1))
   | fmaProduct ha hb hc ih =>
     apply flush_lower_one
     rw [fma_real _ _ _ (FlushToZero.finite_flush _ (finite_evaluate _ _ hf.1))
@@ -84,6 +91,14 @@ theorem lower_one (input : Nat → Float32) (expr : Expr)
       (FlushToZero.finite_flush _ (finite_evaluate _ _ hf.2.2.1)) hf.2.2.2,
       FlushedIdentities.flush_one _ hb, mul_one]
     exact rounded_lower_one _ ((flush_lower_one _ (ih hf.1)).trans
+      (le_add_of_nonneg_right (FlushToZero.flush_nonnegative _ (nonnegative _ _ hc hf.2.2.1))))
+  | fmaProductRight ha hb hc ih =>
+    apply flush_lower_one
+    rw [fma_real _ _ _ (FlushToZero.finite_flush _ (finite_evaluate _ _ hf.1))
+      (FlushToZero.finite_flush _ (finite_evaluate _ _ hf.2.1))
+      (FlushToZero.finite_flush _ (finite_evaluate _ _ hf.2.2.1)) hf.2.2.2,
+      FlushedIdentities.flush_one _ ha, one_mul]
+    exact rounded_lower_one _ ((flush_lower_one _ (ih hf.2.1)).trans
       (le_add_of_nonneg_right (FlushToZero.flush_nonnegative _ (nonnegative _ _ hc hf.2.2.1))))
   | fmaAddend ha hb hc ih =>
     apply flush_lower_one
@@ -93,5 +108,27 @@ theorem lower_one (input : Nat → Float32) (expr : Expr)
     exact rounded_lower_one _ ((flush_lower_one _ (ih hf.2.2.1)).trans
       (le_add_of_nonneg_left (mul_nonneg (FlushToZero.flush_nonnegative _ (nonnegative _ _ ha hf.1))
         (FlushToZero.flush_nonnegative _ (nonnegative _ _ hb hf.2.1)))))
+
+theorem reduction_nonnegative (input : Nat → Float32) (lanes : Fin n → Expr)
+    (hi : ∀ i, Nonnegative input (lanes i)) (tree : Reduction.Tree n) :
+    Nonnegative input (ArithmeticFold.reduceExpr lanes tree) := by
+  induction tree with
+  | leaf i => exact hi i
+  | add a b ia ib => exact .add ia ib
+
+theorem reduction_lower_one (input : Nat → Float32) (lanes : Fin n → Expr)
+    (hi : ∀ i, Nonnegative input (lanes i)) (tree : Reduction.Tree n)
+    (witness : Fin n) (member : witness ∈ Reduction.leaves tree)
+    (hw : LowerOne input (lanes witness)) :
+    LowerOne input (ArithmeticFold.reduceExpr lanes tree) := by
+  induction tree with
+  | leaf i =>
+    have eq : witness = i := by simpa only [Reduction.leaves, List.mem_singleton] using member
+    subst i
+    exact hw
+  | add a b ia ib =>
+    rcases List.mem_append.mp member with ha | hb
+    · exact .addLeft (ia ha) (reduction_nonnegative input lanes hi b)
+    · exact .addRight (reduction_nonnegative input lanes hi a) (ib hb)
 
 end Inference.Contracts.Mlx.NonnegativeArithmetic

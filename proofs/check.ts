@@ -280,6 +280,7 @@ const proofFiles = [
   "kernels/delta/DecayStateBounds.lean",
   "contracts/mlx/FlushedReductionRelative.lean",
   "contracts/mlx/ArithmeticMaddRelative.lean",
+  "contracts/mlx/WeightedFold.lean",
   "kernels/delta/GatedDotRelative.lean",
   "kernels/delta/GatedPredictionRelative.lean",
   "contracts/mlx/SubtractionRelative.lean",
@@ -320,6 +321,13 @@ const proofFiles = [
   "models/qwen/CheckpointAffine.lean",
   "contracts/mlx/SdpaTwoPassDispatch.lean",
   "kernels/attention/SdpaTwoPassLayout.lean",
+  "kernels/attention/SdpaTwoPassFirstPass.lean",
+  "kernels/attention/SdpaTwoPassMaximum.lean",
+  "kernels/attention/SdpaTwoPassReduction.lean",
+  "kernels/attention/SdpaTwoPassMerge.lean",
+  "kernels/attention/SdpaTwoPassMergeRanges.lean",
+  "kernels/attention/SdpaTwoPassVector.lean",
+  "kernels/attention/SdpaTwoPassRanges.lean",
 ];
 
 const discoveredProofs = await Array.fromAsync(new Bun.Glob("**/*.lean").scan({
@@ -492,6 +500,6 @@ try {
 } finally {
   await rm(dir, { recursive: true, force: true });
 }
-console.log(`Checked ${proofFiles.length} proof modules: Trellis and affine numerical bounds, MLX fast-qmv source-model equivalence, packed windows, conditional M1 loads, scratch stores, flushed binary32/bfloat16 arithmetic and range bounds, SwiGLU and sigmoid, RMS normalization, Delta convolution/recurrence/cache, normalized-key stability, Q/K normalization and partial RoPE, full-context one-pass SDPA bounds and scratch transpose, plain KV append, quantized embedding, residual layer composition, conditional 262144-step autoregressive inference, looped logsumexp/normalized argmax, checkpoint normalization/Delta literals and affine byte construction, host head-scale construction, and one-/two-pass SDPA dispatch/layout models.`);
+console.log(`Checked ${proofFiles.length} proof modules: Trellis and affine numerical bounds, MLX fast-qmv source-model equivalence, packed windows, conditional M1 loads, scratch stores, flushed binary32/bfloat16 arithmetic and range bounds, SwiGLU and sigmoid, RMS normalization, Delta convolution/recurrence/cache, normalized-key stability, Q/K normalization and partial RoPE, full-context one-/two-pass SDPA numerical bounds and one-pass scratch transpose, plain KV append, quantized embedding, residual layer composition, conditional 262144-step autoregressive inference, looped logsumexp/normalized argmax, checkpoint normalization/Delta literals and affine byte construction, host head-scale construction, and one-/two-pass SDPA dispatch/layout models.`);
 console.log("Permitted axioms: propext, Classical.choice, Quot.sound. No native proof evaluation.");
-console.log("Scope: the conditional autoregressive source model covers embedding, all 64 layers, final normalization, logits, looped logsumexp, normalized greedy selection and returned-cache errors through 262144 steps. Each selected token and returned cache feeds the next call; range conditions are derived inductively. Error bounds compare against a mathematical reference consuming the same emitted tokens. Exact-real sequence agreement requires per-step numerical margins. This numerical composition uses one-pass attention throughout. Separate dispatch-source proofs select one-pass below 1024 keys and two-pass at longer lengths according to architecture. Two-pass layout/partition coverage is proved; its numerical execution is not yet composed. Normalization and Delta gate/gated-normalization literals have checked bounds. Head-scale construction is proved from a specified binary64 Math.pow result, whose host execution remains a premise. Exact byte constructors supply affine parameter contracts from checked payloads. Host attachment parsers remain outside Lean. Full checkpoint/loader binding, a useful final accuracy bound, native memory/dispatch execution and hardware/compiler correspondence remain unproved.");
+console.log("Scope: the conditional autoregressive source model covers embedding, all 64 layers, final normalization, logits, looped logsumexp, normalized greedy selection and returned-cache errors through 262144 steps. Each selected token and returned cache feeds the next call; range conditions are derived inductively. Error bounds compare against a mathematical reference consuming the same emitted tokens. Exact-real sequence agreement requires per-step numerical margins. This numerical composition uses one-pass attention throughout. Separate dispatch-source proofs select one-pass below 1024 keys and two-pass at longer lengths according to architecture. A separate two-pass attention-head theorem derives finiteness, output bounds and error against real softmax, including BF16 intermediate storage, strided first passes, maximum selection, ordered second-pass reductions and normalization. It is not yet connected to the autoregressive layer/graph composition or native buffer execution. Normalization and Delta gate/gated-normalization literals have checked bounds. Head-scale construction is proved from a specified binary64 Math.pow result, whose host execution remains a premise. Exact byte constructors supply affine parameter contracts from checked payloads. Host attachment parsers remain outside Lean. Full checkpoint/loader binding, a useful final accuracy bound, native memory/dispatch execution and hardware/compiler correspondence remain unproved.");
