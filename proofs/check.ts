@@ -41,6 +41,9 @@ const sourcePins = {
 // Exact upstream source for the reviewed MLX arithmetic and kernel translations.
 // These pins do not establish correspondence with the bundled native binary.
 const mlxRevision = "1f8e74e3f12f31365464a6867c6579f0e9b29d85";
+const hostSourcePins = {
+  "packages/mlx/src/ops.ts": "0672d9fa77e95490cad3201eb7a9eae073aa41a7c1aa0afaf3e1a640e32dc2cd",
+};
 const mlxSourcePins = {
   "mlx/backend/metal/kernels/unary_ops.h": "0a5492b65ae39ecb6d8b04e64ea5007e0a4ff60d8d9428559bfbfd03387ece2a",
   "mlx/backend/metal/kernels/bf16.h": "abd87446a310b77ac530ef52a324feae5cb285d03ec9613e3a88ebb71410fdcb",
@@ -309,6 +312,14 @@ const proofFiles = [
   "models/qwen/TokenSequenceRanges.lean",
   "models/qwen/TokenSampledSequenceRanges.lean",
   "models/qwen/TokenAutoregressive.lean",
+  "contracts/mlx/SdpaDispatch.lean",
+  "kernels/attention/SdpaAddresses.lean",
+  "models/qwen/HeadScaleConstruction.lean",
+  "models/qwen/CheckpointDeltaData.lean",
+  "models/qwen/CheckpointSequenceBinding.lean",
+  "models/qwen/CheckpointAffine.lean",
+  "contracts/mlx/SdpaTwoPassDispatch.lean",
+  "kernels/attention/SdpaTwoPassLayout.lean",
 ];
 
 const discoveredProofs = await Array.fromAsync(new Bun.Glob("**/*.lean").scan({
@@ -400,6 +411,11 @@ for (const [name, expected] of Object.entries(sourcePins)) {
   checkSource(name, source, expected);
   sources.set(name, { source, expected });
 }
+for (const [name, expected] of Object.entries(hostSourcePins)) {
+  const source = await Bun.file(new URL(name, root)).text();
+  checkSource(name, source, expected);
+  sources.set(name, { source, expected });
+}
 for (const [name, expected] of Object.entries(mlxSourcePins)) {
   const cached = new URL(`.lake/sources/mlx/${mlxRevision}/${name}`, import.meta.url);
   let source: string;
@@ -476,6 +492,6 @@ try {
 } finally {
   await rm(dir, { recursive: true, force: true });
 }
-console.log(`Checked ${proofFiles.length} proof modules: Trellis and affine numerical bounds, MLX fast-qmv source-model equivalence, packed windows, conditional M1 loads, scratch stores, flushed binary32/bfloat16 arithmetic and range bounds, SwiGLU and sigmoid, RMS normalization, Delta convolution/recurrence/cache, normalized-key stability and 262144-step Delta layer bounds, Q/K normalization and partial RoPE, full-context one-pass SDPA bounds and scratch transpose, plain KV append, quantized embedding, residual Delta/attention layer composition, initial cache state, conditional first-token greedy selection with returned-cache bounds, and looped logsumexp/normalized argmax source models.`);
+console.log(`Checked ${proofFiles.length} proof modules: Trellis and affine numerical bounds, MLX fast-qmv source-model equivalence, packed windows, conditional M1 loads, scratch stores, flushed binary32/bfloat16 arithmetic and range bounds, SwiGLU and sigmoid, RMS normalization, Delta convolution/recurrence/cache, normalized-key stability, Q/K normalization and partial RoPE, full-context one-pass SDPA bounds and scratch transpose, plain KV append, quantized embedding, residual layer composition, conditional 262144-step autoregressive inference, looped logsumexp/normalized argmax, checkpoint normalization/Delta literals and affine byte construction, host head-scale construction, and one-/two-pass SDPA dispatch/layout models.`);
 console.log("Permitted axioms: propext, Classical.choice, Quot.sound. No native proof evaluation.");
-console.log("Scope: the autoregressive source model covers embedding, all 64 layers, final normalization, logits, 1024-thread looped logsumexp, normalized greedy selection and returned-cache error bounds through 262144 steps, conditional on parameter and scalar/platform contracts. Each actual selected token and returned cache feeds the following call. Induction derives all intermediate range conditions, including the recurrent state and one-pass attention. Selection maximizes the rounded normalized score with lowest-index ties. Error bounds compare against a mathematical reference consuming the same emitted tokens; agreement with an independently generated exact-real token sequence requires per-step numerical margins. Attention bounds include nonzero-position RoPE, online-softmax numerator/denominator stability, group merge, division, gating, projection and KV append. This does not establish native dispatch to the modeled one-pass kernel. Normalization literals have checked range certificates; their host attachment checker is outside Lean. Full checkpoint/loader binding, a useful final accuracy bound, native memory/dispatch and hardware/compiler correspondence remain unproved.");
+console.log("Scope: the conditional autoregressive source model covers embedding, all 64 layers, final normalization, logits, looped logsumexp, normalized greedy selection and returned-cache errors through 262144 steps. Each selected token and returned cache feeds the next call; range conditions are derived inductively. Error bounds compare against a mathematical reference consuming the same emitted tokens. Exact-real sequence agreement requires per-step numerical margins. This numerical composition uses one-pass attention throughout. Separate dispatch-source proofs select one-pass below 1024 keys and two-pass at longer lengths according to architecture. Two-pass layout/partition coverage is proved; its numerical execution is not yet composed. Normalization and Delta gate/gated-normalization literals have checked bounds. Head-scale construction is proved from a specified binary64 Math.pow result, whose host execution remains a premise. Exact byte constructors supply affine parameter contracts from checked payloads. Host attachment parsers remain outside Lean. Full checkpoint/loader binding, a useful final accuracy bound, native memory/dispatch execution and hardware/compiler correspondence remain unproved.");
