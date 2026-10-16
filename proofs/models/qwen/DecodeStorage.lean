@@ -9,7 +9,7 @@ abbrev implementation := Qwen38TrellisM1MaxDevice.implementation
 -- KV and Delta recurrent-state bytes travel beside the logical graph cache.
 -- Each stage consumes its previous buffers and returns its actual stores.
 def StageStorage : (stage : Stage) → Cache stage n → Type
-  | .delta _, cache => Kernels.Delta.GatedDevice.Storage cache.recurrent
+  | .delta _, cache => DeltaDevice.Storage cache
   | .attention _, cache => State.KvAllocation.Storage cache
 
 def Storage : (stages : List Stage) → Caches stages n → Type
@@ -18,7 +18,7 @@ def Storage : (stages : List Stage) → Caches stages n → Type
 
 def Storage.canonical : (stages : List Stage) → (cache : Caches stages n) → Storage stages cache
   | [], _ => ⟨⟩
-  | .delta _::rest, cache => ⟨Kernels.Delta.GatedDevice.Storage.canonical cache.1.recurrent, Storage.canonical rest cache.2⟩
+  | .delta _::rest, cache => ⟨DeltaDevice.Storage.canonical cache.1, Storage.canonical rest cache.2⟩
   | .attention _::rest, cache => ⟨State.KvAllocation.Storage.canonical cache.1, Storage.canonical rest cache.2⟩
 
 private def reindex (a b : State.Kv.Cache BF n) (equal : a=b) (storage : State.KvAllocation.Storage a) :
@@ -65,13 +65,23 @@ def stageAfter : (stage : Stage) → (cache : Cache stage n) → (input : Row BF
         (AttentionDevice.storageAfter layer.mixer (layer.inputNorm.forward input) angle cache execution.1)
 
 theorem before_recurrent (layer : ResidualDelta.Layer) (cache : DeltaNet.Cache) (input : Row BF)
-    (angle : RopeAngles.Inputs) (storage : Kernels.Delta.GatedDevice.Storage cache.recurrent)
-    (trace : StageTrace (.delta layer) (n := n) cache input angle storage) : trace.execution.1.storage.bytes=storage.bytes :=
-  congrArg Kernels.Delta.GatedDevice.Storage.bytes trace.before
+    (angle : RopeAngles.Inputs) (storage : DeltaDevice.Storage cache)
+    (trace : StageTrace (.delta layer) (n := n) cache input angle storage) : trace.execution.1.storage.recurrent.bytes=storage.recurrent.bytes :=
+  congrArg (fun s : DeltaDevice.Storage cache => s.recurrent.bytes) trace.before
 
 theorem after_recurrent (layer : ResidualDelta.Layer) (cache : DeltaNet.Cache) (input : Row BF)
     (angle : RopeAngles.Inputs) (execution : DecodeImplementation.StageTrace implementation (.delta layer) (n := n) cache input angle) :
-    (stageAfter (.delta layer) cache input angle execution).bytes=execution.1.stores.stateMemory := rfl
+    (stageAfter (.delta layer) cache input angle execution).recurrent.bytes=execution.1.recurrence.stores.stateMemory := rfl
+
+theorem before_history (layer : ResidualDelta.Layer) (cache : DeltaNet.Cache) (input : Row BF)
+    (angle : RopeAngles.Inputs) (storage : DeltaDevice.Storage cache)
+    (trace : StageTrace (.delta layer) (n := n) cache input angle storage) : trace.execution.1.storage.history.bytes=storage.history.bytes :=
+  congrArg (fun s : DeltaDevice.Storage cache => s.history.bytes) trace.before
+
+theorem after_history (layer : ResidualDelta.Layer) (cache : DeltaNet.Cache) (input : Row BF)
+    (angle : RopeAngles.Inputs) (execution : DecodeImplementation.StageTrace implementation (.delta layer) (n := n) cache input angle) :
+    (stageAfter (.delta layer) cache input angle execution).history.bytes=
+      execution.1.convolution.convolution.convolution.tail.memory := rfl
 
 theorem before_keys (layer : ResidualAttention.Layer) (cache : State.Kv.Cache BF n) (input : Row BF)
     (angle : RopeAngles.Inputs) (storage : State.KvAllocation.Storage cache)

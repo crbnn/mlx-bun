@@ -1,60 +1,65 @@
-import models.qwen.DeltaExecution
-import kernels.delta.GatedDevice
+import models.qwen.DeltaConvolution
+import kernels.delta.GatedOutput
 
 namespace Inference.Models.Qwen.DeltaDevice
 open Contracts.Mlx Kernels.Delta
 abbrev BF := BFloat16Arithmetic.Value
+set_option maxRecDepth 10000
 
-abbrev Execution (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache) :=
-  GatedDevice.Execution layer.recurrence.reduce layer.recurrence.flags cache.recurrent
-    (fun head row => DeltaNet.inputs layer cache (fun _ => input) head row 0)
+structure Storage (cache : DeltaNet.Cache) where
+  history : State.ConvolutionStorage.Storage cache.history
+  recurrent : GatedDevice.Storage cache.recurrent
 
-@[irreducible] def inputValues (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache) : GatedInputs.Values :=
-  let heads := State.Ssm.heads layer.recurrence layer.headParams (DeltaNet.convData layer cache (fun _ => input)) 0
-  let gates := DeltaNet.gates layer (fun _ => input)
-  { key := heads.k 0
-    query := heads.q 0
-    value := heads.v 0
-    decay := fun h => Decay.value layer.recurrence.gates.decay (BFloat16.widen (gates.aLog h)) (gates.a 0 h) (gates.dtBias h)
-    beta := fun h => Kernels.Trellis.GateUpSplitTail.sigmoidValue layer.recurrence.gates.expAbs (gates.b 0 h) }
+def Storage.canonical (cache : DeltaNet.Cache) : Storage cache :=
+  ⟨State.ConvolutionStorage.Storage.canonical cache.history, GatedDevice.Storage.canonical cache.recurrent⟩
 
-theorem input_values_eq (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache) :
-    (inputValues layer input cache).inputs=(fun head row => DeltaNet.inputs layer cache (fun _ => input) head row 0) := by
-  unfold inputValues GatedInputs.Values.inputs DeltaNet.inputs State.Ssm.inputs Kernels.Delta.Inputs.actual State.Ssm.projected
-  rfl
+structure Execution (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache) where
+  convolution : DeltaConvolution.Execution layer input cache
+  recurrence : GatedDevice.Execution layer.recurrence.reduce layer.recurrence.flags cache.recurrent
+    (DeltaConvolution.inputValues layer input cache convolution).inputs
+  inputBuffers : HEq recurrence.inputStorage (DeltaConvolution.inputStorage layer input cache convolution)
+  normalization : Kernels.GatedRmsNormDevice.Execution layer.gated layer.headParams.width layer.headParams.eps
+    recurrence.output (DeltaNet.zHead layer (fun _ => input) 0) layer.normWeight
+  normalizationInput : normalization.storage.input=GatedOutput.buffer recurrence
+
+def Execution.storage (execution : Execution layer input cache) : Storage cache :=
+  ⟨execution.convolution.convolution.convolution.old, execution.recurrence.storage⟩
 
 def Execution.fromStorage (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache)
-    (storage : GatedDevice.Storage cache.recurrent) : Execution layer input cache where
-  values := inputValues layer input cache
-  binding := input_values_eq layer input cache
-  inputStorage := GatedInputs.Storage.canonical _
-  storage := storage
-  stores := GatedBytes.Trace.canonical _ _
+    (storage : Storage cache) : Execution layer input cache :=
+  let convolution := DeltaConvolution.Execution.fromStorage layer input cache storage.history
+  let recurrence : GatedDevice.Execution layer.recurrence.reduce layer.recurrence.flags cache.recurrent
+      (DeltaConvolution.inputValues layer input cache convolution).inputs :=
+    { values := DeltaConvolution.inputValues layer input cache convolution
+      binding := rfl
+      inputStorage := DeltaConvolution.inputStorage layer input cache convolution
+      storage := storage.recurrent
+      stores := GatedBytes.Trace.canonical _ _ }
+  ⟨convolution, recurrence, HEq.rfl, GatedOutput.normalization layer.gated layer.headParams.width layer.headParams.eps
+    recurrence (DeltaNet.zHead layer (fun _ => input) 0) layer.normWeight, rfl⟩
 
 def Execution.canonical (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache) : Execution layer input cache :=
-  Execution.fromStorage layer input cache (GatedDevice.Storage.canonical cache.recurrent)
+  Execution.fromStorage layer input cache (Storage.canonical cache)
 
 theorem output_eq (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache)
-    (execution : Execution layer input cache) : execution.output=DeltaNet.recurrentOutput layer cache (fun _ => input) 0 := by
-  rw [execution.output_eq]
+    (execution : Execution layer input cache) : execution.recurrence.output=DeltaNet.recurrentOutput layer cache (fun _ => input) 0 := by
+  rw [execution.recurrence.output_eq, DeltaConvolution.inputs_eq]
   unfold GatedDevice.producedOutput
   rfl
 
 theorem recurrent_eq (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache)
-    (execution : Execution layer input cache) : execution.state=(DeltaCache.after layer cache (fun _ => input) 1).recurrent := by
-  rw [execution.state_eq]
+    (execution : Execution layer input cache) : execution.recurrence.state=(DeltaCache.after layer cache (fun _ => input) 1).recurrent := by
+  rw [execution.recurrence.state_eq, DeltaConvolution.inputs_eq]
   unfold GatedDevice.producedState
   rfl
 
 def gated (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache)
-    (execution : Execution layer input cache) (head : Fin 48) : Fin 128 → BF :=
-  Kernels.GatedRmsNorm.value layer.gated (execution.output head) (DeltaNet.zHead layer (fun _ => input) 0 head)
-    layer.normWeight layer.headParams.width layer.headParams.eps
+    (execution : Execution layer input cache) : Fin 48 → Fin 128 → BF := execution.normalization.output
 
 theorem gated_eq (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache)
     (execution : Execution layer input cache) : gated layer input cache execution=DeltaNet.gatedOutput layer cache (fun _ => input) 0 := by
   unfold gated
-  rw [output_eq]
+  rw [execution.normalization.output_eq, output_eq]
   rfl
 
 def merged (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache)
@@ -76,19 +81,23 @@ theorem forward_eq (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : D
   rw [merged_eq]
   rfl
 
--- The convolution history retains its translated update. Recurrent state
--- and the row consumed by gated normalization use completed byte readback.
+-- Both cache fields now come from completed byte stores.
 def cacheAfter (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache)
     (execution : Execution layer input cache) : DeltaNet.Cache :=
-  {DeltaCache.after layer cache (fun _ => input) 1 with recurrent := execution.state}
+  ⟨execution.convolution.convolution.retained, execution.recurrence.state⟩
 
 theorem cache_eq (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache)
     (execution : Execution layer input cache) : cacheAfter layer input cache execution=DeltaCache.after layer cache (fun _ => input) 1 := by
   unfold cacheAfter
-  rw [recurrent_eq]
+  rw [DeltaConvolution.history_eq, recurrent_eq]
 
 def storageAfter (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache)
-    (execution : Execution layer input cache) : GatedDevice.Storage (cacheAfter layer input cache execution).recurrent := execution.after
+    (execution : Execution layer input cache) : Storage (cacheAfter layer input cache execution) :=
+  ⟨execution.convolution.convolution.after, execution.recurrence.after⟩
+
+theorem normalization_input_bytes (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache)
+    (execution : Execution layer input cache) : execution.normalization.storage.input.bytes=execution.recurrence.stores.outputMemory :=
+  congrArg ArrayStorage.BFBuffer.bytes execution.normalizationInput
 
 def run (layer : DeltaNet.Layer) (input : Fin 5120 → BF) (cache : DeltaNet.Cache)
     (execution : Execution layer input cache) : (Fin 5120 → BF) × DeltaNet.Cache :=

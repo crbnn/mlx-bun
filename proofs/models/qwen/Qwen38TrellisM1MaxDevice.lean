@@ -20,8 +20,9 @@ noncomputable def Schedules.canonical (p : Pipeline) : Schedules p :=
 
 -- Fixed proved MLP, attention and Delta implementations feed each dependent stage.
 -- Their traces include final byte readback, both attention storage routes,
--- KV append and returned-cache readback, Delta recurrence inputs and stores,
--- and the two-launch down reduction.
+-- KV append and returned-cache readback, convolution history and Q/K/V
+-- handoffs, Delta recurrence and gated normalization stores, and the
+-- two-launch down reduction.
 -- Other kernels retain their source translations; allocation/dispatch and
 -- compiled-binary correspondence remain separate obligations.
 noncomputable def run (p : Pipeline) (encoded : CheckpointDictionaryBinding.Encoding)
