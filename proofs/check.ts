@@ -651,6 +651,35 @@ const proofFiles = [
   "models/qwen/ResidualDeltaStorageConstruction.lean",
   "models/qwen/TokenAutoregressiveMemory.lean",
   "models/qwen/TokenAutoregressiveMemoryConstruction.lean",
+  "kernels/attention/SdpaWorkspace.lean",
+  "kernels/sampling/NormalizedArgmaxAllocation.lean",
+  "layers/QuantizedEmbeddingAllocation.lean",
+  "models/qwen/ResidualAttentionStorageConstruction.lean",
+  "models/qwen/AttentionEntryAllocation.lean",
+  "models/qwen/AttentionPrefixAllocation.lean",
+  "state/KvGrowthAllocation.lean",
+  "models/qwen/AttentionReadAllocation.lean",
+  "models/qwen/AttentionPrefixReadAllocation.lean",
+  "models/qwen/AttentionTailAllocation.lean",
+  "models/qwen/ResidualMlpAllocation.lean",
+  "models/qwen/AttentionTailWorkspaceConstruction.lean",
+  "models/qwen/TokenParameterMemory.lean",
+  "models/qwen/DecodeParameterConstruction.lean",
+  "models/qwen/TokenParameterConstruction.lean",
+  "models/qwen/TokenInitializationMemory.lean",
+  "models/qwen/TokenInitializedConstruction.lean",
+  "models/qwen/CheckpointTokenMemory.lean",
+  "models/qwen/TokenInitializationAllocation.lean",
+  "models/qwen/DecodeCacheGeometry.lean",
+  "models/qwen/DeltaEntryAllocation.lean",
+  "models/qwen/DeltaPreparationAllocation.lean",
+  "models/qwen/DeltaTailAllocation.lean",
+  "models/qwen/FinalProjectionAllocation.lean",
+  "models/qwen/ResidualAttentionWorkspaceConstruction.lean",
+  "models/qwen/ResidualDeltaWorkspaceConstruction.lean",
+  "models/qwen/ResidualDeltaAllocation.lean",
+  "models/qwen/ResidualDeltaHighWater.lean",
+  "models/qwen/TokenWorkspaceConstruction.lean",
 ];
 
 const discoveredProofs = await Array.fromAsync(new Bun.Glob("**/*.lean").scan({
@@ -827,6 +856,7 @@ console.log(`Checked ${proofFiles.length} proof modules.`);
 console.log("Permitted axioms: propext, Classical.choice, Quot.sound. No native proof evaluation.");
 console.log("Mathematical scope: conditional one-token M1 Max Qwen inference covers quantized embedding, 48 Delta and 16 attention layers, final normalization, all 248320 logits, logsumexp, greedy selection and cache feedback through 262144 steps. Parameter and primitive contracts derive intermediate finiteness and ranges, including a 2^18 logit bound. Error budgets compare with a real-valued reference consuming the same emitted tokens; independent exact-real token agreement requires winner margins. A useful final accuracy guarantee remains open. Prefill, batching and adapters are outside this result.");
 console.log("Memory refinement: concrete shared-heap kernel/layer constructors connect embedding, all decode stages, final projection, sampling and subsequent tokens. Final token and every updated cache are read from one resulting heap. Finite reachable traces require raw allocation plans only for actual predecessor states; they do not require an allocator for every possible heap. Head RMS supports fresh and donated Q/K buffers; RoPE preserves actual dynamic bases. Both dispatched SDPA routes, mixed Delta state/output writes, Trellis scratch/output phases and sampling local/global memories retain their read and frame proofs.");
-console.log("Parameter continuity: the strong Delta constructor derives later Z, normalization, output-projection and MLP views from original initial-heap buffers. Attention output projection is linked to its original prefix storage. Complete graph parameter bundles can be reframed through graph and sampler writes while preserving their original regions and attachments. Binding every stage and token to one fixed original bundle, and constructing a complete concrete allocator/ownership plan, remain integration obligations.");
+console.log("Parameter continuity: strong Delta and attention constructors consume the original parameter bundle, and the graph cursor selects each stage from one carried global bundle. Initialized finite token traces preserve that same embedding/graph bundle from the loaded initial heap through token stores, cache initialization, every layer and subsequent sampling. Checkpoint dictionary certificates supply the complete numerical Parameters contract to these memory-level results; ordered encodings, exact model bindings and primitive contracts remain explicit.");
+console.log("Constructible layouts: aligned workspaces derive operation-level geometry for embedding, normalization, Delta preparation/recurrence, attention prefix/SDPA/tail, residual MLP, final projection and sampling. One fresh 4139488-byte arena constructs a complete Delta block; attention uses one fixed arena of at most 13637632 bytes plus explicit KV growth or reuse geometry. Token/cache initialization packs 48 Delta caches into 153944068 bytes and proves pairwise cache separation. Delta frontier steps derive geometry from live-region endpoint bounds. A complete positive-length graph/token allocation plan and native resource ownership remain open.");
 console.log("Checkpoint coverage: checked literals cover 129 main and 32 head normalization vectors, 144 Delta tensors, 192 Trellis scale tensors and 48 convolution tensors. Affine dictionaries cover distinct scale/bias alphabets from 612 tensors; ordered indices remain explicit inputs. Lean byte constructors establish exact parameter attachment and a fixed-point property. Native parsing/loading and specified host RoPE/head-scale results remain boundary contracts.");
 console.log("Native paths proved: 0. These are manually translated models; pinned local/upstream sources detect drift but do not prove source/compiler/binary correspondence. Native allocation/lifetime, runtime ownership selection, dispatch/Metal visibility, hardware arithmetic and checkpoint attachment still require instantiation. Allocator/scheduler models prove ownership, page/reuse, bounded-view and fence bookkeeping properties without establishing their native implementation correspondence. No GPU execution is part of this checker.");
