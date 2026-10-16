@@ -88,6 +88,55 @@ writing their own graphs. Each request names its adapter file; its trained delta
 adds to the outputs of the projections it targets, under that request's scheduler
 context, independently of the file's projection kernel choices.
 
+## Phonon-2
+
+`openTranscriber(directory)` opens Whisper or [FermionResearch/Phonon-2](https://huggingface.co/FermionResearch/Phonon-2)
+through its registered speech graph. Supply mono 16 kHz `Float32Array` samples to
+`transcribe`, or use `start`/`feed`/`finish` for buffered sessions, then dispose
+the opened transcriber. The app's existing `transcribe`, `serve` and audio routes
+use this same entry point. See the [transcription module](../module-transcription/README.md)
+for CLI and HTTP options.
+
+The loader reads the published `phonon-2.bps.tar.zst` directly, checks the archive,
+manifest and container hashes, and makes native copies without extracting files
+onto disk. The dedicated graph composes 24 FastConformer blocks, the two-layer
+LSTM predictor and a token-duration joint head. Metal kernels expand the
+five-value palettes to FP16 once, generate relative positions, fuse LSTM gates,
+and commit greedy TDT state. MLX supplies matrix multiplication, convolution,
+relative attention and normalization. Encoder blocks and the decoder step are
+compiled; sixteen decoder steps share each host readback. This uses the GPU.
+The CoreML artifact and ANE execution are not part of this graph.
+
+Phonon-2 supports English greedy transcription, token-derived word timing and
+text/JSON/SRT/VTT output. Unsupported translation, non-English language requests,
+prompts/vocabulary hints, beam sizes other than one, nonzero temperature,
+`audio_ctx` and no-speech probability thresholds return an explicit error (HTTP
+400 for ordinary requests; an SSE stream reports an error event). Confidence
+and Whisper-specific decoder statistics are omitted. Sessions
+finalize complete utterance windows, with a quiet cut between 25 and 35 seconds
+for longer audio; they do not emit provisional partial words.
+
+The graph declares L3 numerical fidelity. Its real-weight test requires identical
+full text and token IDs, matching word times, and relative L2 error below 0.02
+for both normalized mels and the projected encoder, against pinned MLX 0.32.2,
+mlx-audio 0.4.6 and fermion-research 0.2.11. This is bounded numerical acceptance,
+not a bit-exact claim. [The reference producer](scripts/phonon2-reference.py)
+(`--help`) generates external captures from the official container and config;
+[the parity test](tests/parity/phonon2-parity.test.ts) takes
+`MLX_BUN_TEST_PHONON2_MODEL`, `MLX_BUN_TEST_PHONON2_REFERENCE`,
+`MLX_BUN_TEST_PHONON2_REFERENCE_SHA256` and `MLX_BUN_TEST_PHONON2_AUDIO` together.
+The pinned model revision is `7e153e4054c0a10db6d47d6fff5c062d4c77c154`;
+the three speech clips come from FermionResearch/Phonon-2-CoreML revision
+`1143812fd4236522232a8c33e3115f0577e3cd7d`. Kernel tests opt in with
+`MLX_BUN_TEST_NATIVE=1`. Coordinate all numerical runs through `gpu.sh`.
+
+[The paired speech benchmark](../../scripts/bench/phonon2.ts) (`--help`)
+compares fresh alternating sessions against Fermion's default `dense16+tdt16`
+MLX path, using the same audio and completed transcription calls. It records
+model loading, first-use compilation, warm latency, memory, artifact/native/source
+hashes and machine conditions separately. Performance qualification requires a
+clear machine preflight; a screening result cannot establish that gate.
+
 ## Numerical and execution policy
 
 The inherited fidelity policy is L1 by default: bit-exact numerics against the
@@ -963,7 +1012,7 @@ The direct graph imports currently include `models/gemma4`,
 `models/gemma4/graphs`, `models/minicpm5`, `models/qwen3`, `models/qwen3-moe`,
 `models/qwen3_5`, `models/qwen38-27b-trellis-m4pro`, `models/qwen38-27b-trellis-m1max`,
 and `models/universal`.
-`models/glm52`, `models/diffusion-gemma`, and `models/whisper` provide the other
+`models/glm52`, `models/diffusion-gemma`, `models/whisper`, and `models/phonon2` provide the other
 graph families.
 `@mlx-bun/inference/models` exposes the profile/implementation registry, the
 composition resolver and loading helpers: `createModel` loads the graph
@@ -1176,7 +1225,7 @@ fill session and proposal interfaces.
 - `input/audio`: WAV parsing, AudioToolbox decoding, transcoding, mel features,
   and the existing Whisper tokenizer. `loadWhisperTokenizer` reads local HF
   artifacts; it does not download them.
-- `transcription`: Whisper decoding, long-form and streaming transcription,
+- `transcription`: Whisper and TDT decoding, long-form and streaming transcription,
   word timing, and text/SRT/VTT formatting. Callers supply the Whisper graph,
   tokenizer, and audio samples. `transcription/format` exposes the
   text/SRT/VTT/verbose-JSON formatters alone, without loading native MLX, for
