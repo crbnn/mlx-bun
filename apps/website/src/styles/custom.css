@@ -1,22 +1,661 @@
-/* Shared product typography and accents; Starlight owns navigation/layout. */
+/* mlx-bun.dev. One typeface (Bricolage Grotesque, self-hosted), an indigo and
+   aluminum palette with one gold accent, and a datasheet layout for the landing
+   page (`lp-*`, rendered by src/content/docs/index.mdx and
+   src/components/Hero.astro). Starlight owns navigation and the docs layout.
+   These rules are unlayered, so they win over Starlight's layered defaults. */
+
+/* ---------- Tokens ---------- */
+
 :root {
-  --sl-font: 'SF Pro Text', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif;
-  --sl-font-mono: 'SF Mono', ui-monospace, Menlo, monospace;
+  --sl-font: 'Bricolage Grotesque Variable', -apple-system, BlinkMacSystemFont, sans-serif;
+  --sl-font-mono: ui-monospace, 'SF Mono', Menlo, monospace;
+  --sl-content-width: 48rem;
+  --sl-line-height: 1.6;
+  --sl-text-h1: 2.45rem;
+  --sl-text-h2: 1.95rem;
+  --sl-text-h3: 1.5rem;
+  --sl-text-h4: 1.2rem;
+  --lp-gold: #e6b04c;
+  --lp-gold-strong: #f2c66a;
+  --lp-amber: #8f5d00;
+  --lp-ink: #16152b;
+  --lp-ease: cubic-bezier(0.2, 0.7, 0.2, 1);
 }
+
 :root[data-theme='dark'] {
-  --sl-color-accent-low: #0a2540;
-  --sl-color-accent: #0a84ff;
-  --sl-color-accent-high: #64d2ff;
-  --sl-color-text-accent: #3a9bff;
-  --sl-color-bg: #000;
-  --sl-color-bg-nav: #000;
-  --sl-color-bg-sidebar: #000;
+  --sl-color-white: #edebf7;
+  --sl-color-gray-1: #dcd9ea;
+  --sl-color-gray-2: #bab7d0;
+  --sl-color-gray-3: #8e8bab;
+  --sl-color-gray-4: #55527a;
+  --sl-color-gray-5: #2a2847;
+  --sl-color-gray-6: #181730;
+  --sl-color-black: #100f1f;
+  --sl-color-accent-low: #3a2d0a;
+  --sl-color-accent: var(--lp-gold);
+  --sl-color-accent-high: #f6d58a;
+  --sl-color-text-accent: var(--lp-gold);
+  --sl-color-text-invert: #100f1f;
+  --sl-color-bg: #100f1f;
+  --sl-color-bg-nav: #100f1f;
+  --sl-color-bg-sidebar: #100f1f;
+  --sl-color-bg-inline-code: #1d1c36;
+  --sl-color-bg-accent: var(--lp-gold);
+  --sl-color-hairline: #221f3d;
+  --sl-color-hairline-light: #2a2847;
+  --sl-color-hairline-shade: #100f1f;
+  --lp-line: #2a2847;
+  --lp-surface: #181730;
+  --lp-die: #0b0a17;
+  --lp-die-block: #15142a;
+  --lp-die-block-lit: #1c1b36;
 }
+
 :root[data-theme='light'] {
-  --sl-color-accent: #0066cc;
-  --sl-color-text-accent: #0066cc;
-  --sl-color-accent-high: #003a75;
-  --sl-color-bg: #fbfbfd;
+  --sl-color-white: #16152b;
+  --sl-color-gray-1: #26254a;
+  --sl-color-gray-2: #403e62;
+  --sl-color-gray-3: #5c5a74;
+  --sl-color-gray-4: #9b99b0;
+  --sl-color-gray-5: #d6d6de;
+  --sl-color-gray-6: #e6e6ec;
+  --sl-color-gray-7: #f6f6f8;
+  --sl-color-black: #ffffff;
+  --sl-color-accent-low: #f6e7c4;
+  --sl-color-accent: var(--lp-amber);
+  --sl-color-accent-high: #5a3a00;
+  --sl-color-text-accent: var(--lp-amber);
+  --sl-color-text-invert: #ffffff;
+  --sl-color-bg: #f0f0f3;
+  --sl-color-bg-nav: #f0f0f3;
+  --sl-color-bg-sidebar: #f0f0f3;
+  --sl-color-bg-inline-code: #e3e3ea;
+  --sl-color-bg-accent: var(--lp-amber);
+  --sl-color-hairline: #dedee5;
+  --sl-color-hairline-light: #d2d2db;
+  --sl-color-hairline-shade: #dedee5;
+  --lp-line: #cfcfd9;
+  --lp-surface: #ffffff;
+  --lp-die: #0b0a17;
+  --lp-die-block: #15142a;
+  --lp-die-block-lit: #1c1b36;
 }
-body { -webkit-font-smoothing: antialiased; }
-.sl-markdown-content :is(h1, h2, h3) { letter-spacing: -0.025em; }
+
+/* ---------- Type ---------- */
+
+body {
+  font-optical-sizing: auto;
+  -webkit-font-smoothing: antialiased;
+}
+
+.sl-markdown-content :is(h1, h2, h3, h4) {
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  text-wrap: balance;
+}
+
+.sl-markdown-content p,
+.sl-markdown-content li {
+  text-wrap: pretty;
+}
+
+.site-title {
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.site-title img {
+  height: 1.4rem;
+}
+
+:focus-visible {
+  outline: 2px solid var(--sl-color-text-accent);
+  outline-offset: 2px;
+}
+
+/* ---------- Shared components ---------- */
+
+.sl-link-button {
+  border-radius: 0.5rem;
+  font-weight: 600;
+  padding: 0.7rem 1.1rem;
+  transition: background-color 0.15s, border-color 0.15s;
+}
+
+.sl-link-button.primary,
+.sl-link-button.primary:hover {
+  background: var(--lp-gold);
+  border-color: var(--lp-gold);
+  color: var(--lp-ink);
+}
+
+.sl-link-button.primary:hover {
+  background: var(--lp-gold-strong);
+  border-color: var(--lp-gold-strong);
+}
+
+.sl-link-button.secondary {
+  border-color: var(--lp-line);
+  background: transparent;
+  color: var(--sl-color-white);
+}
+
+.sl-link-button.secondary:hover {
+  border-color: var(--sl-color-gray-3);
+}
+
+@media (min-width: 50rem) {
+  .sl-link-button {
+    padding: 0.75rem 1.2rem;
+  }
+}
+
+starlight-tabs [role='tablist'] {
+  border-bottom: 1px solid var(--lp-line);
+}
+
+starlight-tabs [role='tab'] {
+  font-weight: 600;
+  font-size: var(--sl-text-sm);
+  color: var(--sl-color-gray-3);
+  border-bottom-width: 2px;
+}
+
+starlight-tabs [role='tab'][aria-selected='true'] {
+  color: var(--sl-color-white);
+  border-color: var(--sl-color-text-accent);
+}
+
+.sl-steps > li::before {
+  background: var(--sl-color-accent-low);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--lp-gold) 50%, transparent);
+  color: var(--sl-color-white);
+  font-weight: 600;
+}
+
+.sl-markdown-content code:not(:where(.expressive-code *)) {
+  border-radius: 0.3rem;
+  padding: 0.1em 0.35em;
+  font-size: 0.9em;
+}
+
+/* Tables keep Starlight's horizontal scrolling on narrow screens. */
+.sl-markdown-content table {
+  border: 1px solid var(--lp-line);
+  border-radius: 0.375rem;
+  overflow-x: auto;
+}
+
+.sl-markdown-content th {
+  background: var(--lp-surface);
+}
+
+.sidebar-content a {
+  border-radius: 0.3rem;
+}
+
+.sidebar-content a[aria-current='page'] {
+  font-weight: 600;
+}
+
+.sl-link-card {
+  border-color: var(--lp-line);
+  border-radius: 0.375rem;
+  box-shadow: none;
+}
+
+/* ---------- Landing page: hero ---------- */
+
+[data-has-hero] {
+  --sl-content-width: 70rem;
+}
+
+[data-has-hero] .content-panel {
+  padding-top: 0;
+}
+
+.lp-hero {
+  display: grid;
+  grid-template-columns: 100%;
+  gap: 2.5rem;
+  align-items: center;
+  padding-block: clamp(2.5rem, 6vw, 5rem) clamp(2rem, 5vw, 4rem);
+}
+
+@media (min-width: 60rem) {
+  .lp-hero {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 4rem;
+  }
+}
+
+.lp-hero h1 {
+  margin: 0;
+  font-size: clamp(2.6rem, 1.2rem + 4.8vw, 4.6rem);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1;
+  color: var(--sl-color-white);
+  text-wrap: balance;
+}
+
+.lp-hero-lede {
+  margin: 1.25rem 0 0;
+  max-width: 42ch;
+  font-size: clamp(1.05rem, 0.95rem + 0.4vw, 1.2rem);
+  line-height: 1.5;
+  color: var(--sl-color-gray-2);
+  text-wrap: pretty;
+}
+
+.lp-hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
+.lp-hero-note {
+  margin: 1.25rem 0 0;
+  max-width: 42ch;
+  font-size: 0.95rem;
+  color: var(--sl-color-gray-3);
+}
+
+/* The install command and its copy button. */
+.lp-install {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  max-width: 100%;
+  margin-top: 1.75rem;
+  padding: 0.45rem 0.45rem 0.45rem 0.9rem;
+  border: 1px solid var(--lp-line);
+  border-radius: 0.5rem;
+  background: var(--lp-surface);
+  font-family: var(--__sl-font-mono);
+  font-size: var(--sl-text-sm);
+  color: var(--sl-color-gray-1);
+}
+
+.lp-install code {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  white-space: nowrap;
+  padding: 0;
+  border: 0;
+  background: none;
+  font-size: inherit;
+  color: inherit;
+}
+
+@media (max-width: 40rem) {
+  .lp-install code {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+}
+
+.lp-install-prompt {
+  color: var(--sl-color-gray-3);
+  font-weight: 700;
+}
+
+.lp-copy {
+  display: inline-grid;
+  place-items: center;
+  width: 2.5rem;
+  height: 2.5rem;
+  flex-shrink: 0;
+  border: 1px solid var(--lp-line);
+  border-radius: 0.35rem;
+  background: transparent;
+  color: var(--sl-color-gray-2);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.lp-copy:hover {
+  color: var(--sl-color-white);
+  border-color: var(--sl-color-gray-3);
+}
+
+.lp-copy > * {
+  grid-area: 1 / 1;
+}
+
+.lp-copy .lp-copy-done,
+.lp-copy.is-copied .lp-copy-idle {
+  opacity: 0;
+}
+
+.lp-copy.is-copied .lp-copy-done {
+  opacity: 1;
+  color: var(--lp-gold);
+}
+
+.lp-copy.is-copied {
+  border-color: var(--lp-gold);
+}
+
+/* The die: a floorplan of the product's parts. It stays dark in both themes,
+   a chip on aluminum. Regions power on once, in order, when the page loads. */
+.lp-hero-visual {
+  min-width: 0;
+}
+
+.lp-die {
+  position: relative;
+  display: block;
+  aspect-ratio: 4 / 3;
+  padding: 0.5rem;
+  border: 1px solid #3a3860;
+  background: var(--lp-die);
+  color: #edebf7;
+}
+
+.lp-die::before {
+  content: '';
+  position: absolute;
+  top: 0.5rem;
+  left: 0.5rem;
+  width: 0.35rem;
+  height: 0.35rem;
+  background: var(--lp-gold);
+  z-index: 1;
+}
+
+.lp-die-grid {
+  display: grid;
+  height: 100%;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-rows: repeat(5, minmax(0, 1fr));
+  gap: 3px;
+}
+
+.lp-die-block {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 0.2rem;
+  min-width: 0;
+  padding: clamp(0.5rem, 0.3rem + 0.9vw, 1rem);
+  border: 1px solid #34325a;
+  background:
+    repeating-linear-gradient(0deg, rgba(237, 235, 247, 0.045) 0 1px, transparent 1px 7px),
+    repeating-linear-gradient(90deg, rgba(237, 235, 247, 0.045) 0 1px, transparent 1px 7px),
+    var(--lp-die-block);
+  color: inherit;
+  text-decoration: none;
+  opacity: 0;
+  animation: lp-power 0.45s var(--lp-ease) forwards;
+  animation-delay: calc(var(--i, 0) * 110ms + 120ms);
+  transition: border-color 0.15s, background-color 0.15s;
+}
+
+.lp-die-block:hover,
+.lp-die-block:focus-visible {
+  border-color: var(--lp-gold);
+  background-color: var(--lp-die-block-lit);
+}
+
+.lp-die-block strong {
+  font-size: clamp(0.8rem, 0.65rem + 0.6vw, 1.05rem);
+  font-weight: 600;
+  line-height: 1.15;
+  letter-spacing: -0.01em;
+  color: #fff;
+}
+
+.lp-die-block span {
+  font-size: clamp(0.66rem, 0.58rem + 0.3vw, 0.8rem);
+  line-height: 1.3;
+  color: rgba(237, 235, 247, 0.62);
+}
+
+.lp-die-engine { grid-column: 1 / 5; grid-row: 1 / 4; }
+.lp-die-server { grid-column: 5 / 7; grid-row: 1 / 3; }
+.lp-die-decisions { grid-column: 5 / 7; grid-row: 3 / 4; }
+.lp-die-app { grid-column: 1 / 3; grid-row: 4 / 6; }
+.lp-die-libraries { grid-column: 3 / 5; grid-row: 4 / 6; }
+.lp-die-models { grid-column: 5 / 7; grid-row: 4 / 6; }
+
+.lp-die-engine strong {
+  font-size: clamp(1rem, 0.8rem + 0.9vw, 1.4rem);
+}
+
+.lp-die-mark {
+  position: absolute;
+  right: 0.9rem;
+  bottom: 0.75rem;
+  font-size: 0.68rem;
+  letter-spacing: 0.04em;
+  color: rgba(237, 235, 247, 0.45);
+  pointer-events: none;
+}
+
+@keyframes lp-power {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lp-die-block {
+    opacity: 1;
+    animation: none;
+  }
+}
+
+/* ---------- Landing page: datasheet sections ---------- */
+
+.sl-markdown-content .lp-section {
+  display: grid;
+  grid-template-columns: 100%;
+  gap: 1.25rem 3rem;
+  margin-top: 0;
+  padding-block: clamp(2.5rem, 6vw, 4.5rem);
+  border-top: 1px solid var(--lp-line);
+}
+
+@media (min-width: 64rem) {
+  .sl-markdown-content .lp-section {
+    grid-template-columns: minmax(0, 17rem) minmax(0, 1fr);
+  }
+}
+
+.sl-markdown-content .lp-section > * {
+  margin-top: 0;
+  min-width: 0;
+}
+
+.sl-markdown-content .lp-section .sl-heading-wrapper {
+  margin: 0;
+}
+
+.sl-markdown-content .lp-section h2 {
+  margin: 0;
+  font-size: clamp(1.6rem, 1.2rem + 1.4vw, 2.1rem);
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+}
+
+.sl-markdown-content .lp-section-head > p {
+  margin-top: 0.75rem;
+  max-width: 34ch;
+  font-size: 1rem;
+  line-height: 1.5;
+  color: var(--sl-color-gray-2);
+}
+
+.sl-markdown-content .lp-section-body > * + * {
+  margin-top: 1.5rem;
+}
+
+.sl-markdown-content .lp-section-body > p,
+.sl-markdown-content .lp-section-body > ul:not(.not-content) > li {
+  max-width: 68ch;
+}
+
+.sl-markdown-content .lp-section-body > p + p {
+  margin-top: 1rem;
+}
+
+.sl-markdown-content .lp-section-body .sl-steps > li > p,
+.sl-markdown-content .lp-section-body starlight-tabs p {
+  max-width: 68ch;
+}
+
+/* Links in running text are underlined; the arrow suffix is gone. */
+.sl-markdown-content .lp-section a:not(.sl-link-button, [role='tab']),
+.lp-list a {
+  color: var(--sl-color-text-accent);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.18em;
+  text-decoration-color: color-mix(in srgb, var(--sl-color-text-accent) 55%, transparent);
+}
+
+.sl-markdown-content .lp-section a:not(.sl-link-button, [role='tab']):hover,
+.lp-list a:hover {
+  text-decoration-color: currentColor;
+}
+
+.sl-markdown-content .lp-section code:not(:where(.expressive-code *)),
+.lp-list code {
+  white-space: nowrap;
+}
+
+/* Rule-separated lists: a name column and a description column. */
+.lp-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.lp-list > li {
+  display: grid;
+  grid-template-columns: 100%;
+  gap: 0.25rem 2rem;
+  padding: 1rem 0;
+  border-top: 1px solid var(--lp-line);
+  scroll-margin-top: calc(var(--sl-nav-height) + 1rem);
+}
+
+.lp-list > li:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+@media (min-width: 48rem) {
+  .lp-list > li {
+    grid-template-columns: 11rem minmax(0, 1fr);
+  }
+}
+
+.lp-list h3 {
+  margin: 0;
+  font-size: 1.02rem;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--sl-color-white);
+}
+
+.lp-list p {
+  margin: 0;
+  max-width: 62ch;
+  font-size: 0.95rem;
+  line-height: 1.55;
+  color: var(--sl-color-gray-2);
+}
+
+.lp-list code {
+  font-family: var(--__sl-font-mono);
+  font-size: 0.88em;
+  padding: 0.1em 0.35em;
+  border-radius: 0.3rem;
+  background: var(--sl-color-bg-inline-code);
+  color: var(--sl-color-gray-1);
+}
+
+/* The models the engine serves, by graph. */
+.lp-models {
+  margin: 0;
+  display: grid;
+  grid-template-columns: 100%;
+  gap: 0.25rem 2rem;
+}
+
+@media (min-width: 48rem) {
+  .lp-models {
+    grid-template-columns: 11rem minmax(0, 1fr);
+  }
+}
+
+.lp-models dt {
+  padding-top: 1rem;
+  border-top: 1px solid var(--lp-line);
+  font-weight: 600;
+  color: var(--sl-color-white);
+}
+
+.lp-models dd {
+  margin: 0;
+  padding: 1rem 0;
+  border-top: 1px solid var(--lp-line);
+  max-width: 62ch;
+  font-size: 0.95rem;
+  line-height: 1.55;
+  color: var(--sl-color-gray-2);
+}
+
+@media (max-width: 47.99rem) {
+  .lp-models dd {
+    border-top: 0;
+    padding-top: 0;
+  }
+}
+
+.lp-models dt:first-child,
+.lp-models dt:first-child + dd {
+  border-top: 0;
+  padding-top: 0;
+}
+
+/* ---------- Footer ---------- */
+
+.lp-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem 2rem;
+  margin-top: 3rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--lp-line);
+  font-size: var(--sl-text-sm);
+  color: var(--sl-color-gray-3);
+}
+
+.lp-footer p {
+  margin: 0;
+}
+
+.lp-footer nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.25rem;
+}
+
+.lp-footer a {
+  color: var(--sl-color-gray-2);
+  text-decoration: none;
+}
+
+.lp-footer a:hover {
+  color: var(--sl-color-white);
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+}

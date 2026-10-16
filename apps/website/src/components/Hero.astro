@@ -1,0 +1,85 @@
+---
+// The landing page's hero: Starlight's hero frontmatter (title, tagline,
+// actions) beside a floorplan of mlx-bun's parts, drawn like the regions of a
+// die. Each region links to the section that explains it. Docs pages declare
+// no hero and never render this.
+import { Icon, LinkButton } from '@astrojs/starlight/components';
+import DefaultHero from '@astrojs/starlight/components/Hero.astro';
+
+const { entry } = Astro.locals.starlightRoute;
+const { data } = entry;
+const { title = data.title, tagline, actions = [] } = data.hero || {};
+// Only the landing page gets the floorplan; Starlight's 404 page also declares
+// a hero and keeps the default one.
+const isLanding = entry.id === 'index' || Astro.url.pathname === '/';
+
+const install = 'curl -fsSL https://mlx-bun.dev/install.sh | sh';
+
+/** The parts of mlx-bun as regions of the die, in the order they power on. */
+const regions = [
+  { id: 'engine', name: 'Inference engine', note: 'MLX, Metal and the Neural Engine', href: '#what-engine' },
+  { id: 'server', name: 'Local server', note: 'OpenAI and Anthropic APIs on localhost', href: '#what-server' },
+  { id: 'decisions', name: 'Decisions API', note: 'OpenAI and Jev formats', href: '#decisions' },
+  { id: 'app', name: 'Browser app', note: 'Chat, models, training, metrics', href: '#what-app' },
+  { id: 'libraries', name: 'Libraries', note: '@mlx-bun/* on npm, for Bun', href: '#what-libraries' },
+  { id: 'models', name: 'Models', note: 'Gemma 4, Qwen 3, GLM 5.2 and more', href: '#models' },
+];
+---
+
+{!isLanding && <DefaultHero />}
+{isLanding && <div class="lp-hero">
+  <div class="lp-hero-copy">
+    <h1 id="_top" data-page-title set:html={title} />
+    {tagline && <p class="lp-hero-lede" set:html={tagline} />}
+    <div class="lp-install" data-copy={install}>
+      <span class="lp-install-prompt" aria-hidden="true">$</span>
+      <code>{install}</code>
+      <button type="button" class="lp-copy" aria-label="Copy the install command">
+        <svg class="lp-copy-idle" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15V5a2 2 0 0 1 2-2h10" /></svg>
+        <Icon name="approve-check" class="lp-copy-done" size="1.1rem" />
+      </button>
+    </div>
+    {
+      actions.length > 0 && (
+        <div class="lp-hero-actions">
+          {actions.map(({ attrs: { class: className, ...attrs } = {}, icon, link: href, text, variant }) => (
+            <LinkButton {href} {variant} icon={icon?.name} class:list={[className]} {...attrs}>
+              {text}
+              {icon?.html && <Fragment set:html={icon.html} />}
+            </LinkButton>
+          ))}
+        </div>
+      )
+    }
+    <p class="lp-hero-note">Runs on Apple Silicon Macs with macOS 14 or later. MIT licensed.</p>
+  </div>
+  <div class="lp-hero-visual">
+    <nav class="lp-die" aria-label="The parts of mlx-bun">
+      <div class="lp-die-grid">
+        {regions.map((region, i) => (
+          <a class={`lp-die-block lp-die-${region.id}`} href={region.href} style={`--i:${i}`}>
+            <strong>{region.name}</strong>
+            <span>{region.note}</span>
+          </a>
+        ))}
+      </div>
+      <span class="lp-die-mark" aria-hidden="true">mlx-bun</span>
+    </nav>
+  </div>
+</div>}
+
+<script>
+  for (const box of document.querySelectorAll<HTMLElement>('.lp-install[data-copy]')) {
+    const button = box.querySelector<HTMLButtonElement>('button.lp-copy');
+    if (!button) continue;
+    button.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(box.dataset.copy ?? '');
+      } catch {
+        return;
+      }
+      button.classList.add('is-copied');
+      setTimeout(() => button.classList.remove('is-copied'), 1600);
+    });
+  }
+</script>
