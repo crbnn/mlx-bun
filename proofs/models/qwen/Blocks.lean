@@ -53,8 +53,8 @@ theorem eps_normal : FlushToZero.threshold < real eps := by
 -- QwenAttentionLayer.forwardMlp and QwenDeltaLayer.forwardMlp both use the
 -- loaded normalization weight directly, followed by GateDownMLP and a bf16
 -- residual add. Weight-file loading and the mixer half remain separate.
--- The fused residual-normalization and fused recurrent-head variants added to
--- the M1 Max graph have different execution schedules and are not covered here.
+-- This module describes standalone normalization. The fused residual
+-- schedule is modeled in ResidualBlocks; recurrent heads are modeled in Ssm.
 structure Norm where
   platform : RmsNorm.Platform
   weight : Fin 5120 → BFloat16Arithmetic.Value

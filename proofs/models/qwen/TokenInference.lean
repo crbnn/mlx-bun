@@ -11,7 +11,8 @@ structure Pipeline where
   graph : Qwen38TrellisM1Max.Graph
 
 -- Token-to-logits arithmetic and all returned cache slots for one decode
--- step. This models the plain BF16, one-pass attention, no-adapter route.
+-- step. This models the plain BF16 cache, dispatched one-/two-pass
+-- attention, no-adapter route.
 def Pipeline.run (p : Pipeline) (c : p.graph.Cache n) (token : Fin 248320) (a : RopeAngles.Inputs) :
     (Fin 248320 → BF) × p.graph.Cache (n+1) :=
   (p.graph.forward c (p.embedding.forward token) a,
