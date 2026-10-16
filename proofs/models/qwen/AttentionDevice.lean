@@ -1,6 +1,6 @@
 import models.qwen.AttentionExecution
 import kernels.attention.SdpaDispatchedDevice
-import state.KvAllocation
+import state.KvDevice
 
 namespace Inference.Models.Qwen.AttentionDevice
 open Contracts.Mlx Contracts.Mlx.Numerics Kernels.Attention
@@ -9,13 +9,15 @@ abbrev BF := BFloat16Arithmetic.Value
 
 structure Execution (layer : Attention.Layer) (input : Fin 5120 → BF) (angle : RopeAngles.Inputs)
     (cache : State.Kv.Cache BF n) where
-  updated : State.KvBytes.Execution cache (layer.heads input angle).key (layer.heads input angle).value
+  storage : State.KvAllocation.Storage cache
+  updated : State.KvDevice.Execution storage (layer.heads input angle).key (layer.heads input angle).value
   attention : SdpaDispatchedDevice.Execution layer.attention layer.mergeContracted layer.architectureSuffix
-    (layer.heads input angle).query (State.KvBytes.cacheAfter updated).keys (State.KvBytes.cacheAfter updated).values
+    (layer.heads input angle).query (State.KvBytes.cacheAfter updated.toKvBytes).keys (State.KvBytes.cacheAfter updated.toKvBytes).values
 
 def Execution.fromStorage (layer : Attention.Layer) (input : Fin 5120 → BF) (angle : RopeAngles.Inputs)
     (cache : State.Kv.Cache BF n) (storage : State.KvAllocation.Storage cache) : Execution layer input angle cache where
-  updated := storage.trace (layer.heads input angle).key (layer.heads input angle).value
+  storage := storage
+  updated := State.KvDevice.Execution.canonical storage (layer.heads input angle).key (layer.heads input angle).value
   attention := SdpaDispatchedDevice.Execution.canonical _ _ _ _ _ _
 
 def Execution.canonical (layer : Attention.Layer) (input : Fin 5120 → BF) (angle : RopeAngles.Inputs)
@@ -58,12 +60,13 @@ theorem forward_eq (layer : Attention.Layer) (input : Fin 5120 → BF) (angle : 
   rw [merged_eq]
   rfl
 
--- Attention consumes the appended cache bytes, and the returned cache reads
--- those same bytes. Allocation and native copy dispatch must implement the
--- KvBytes storage contract; the output uses the completed attention buffer.
+-- Attention consumes and returns the same appended bytes. KV traces include
+-- zero fill, concurrent growth copies, donation/vector-copy preservation and
+-- the strided slice update. Allocator, dispatch/visibility and compiler
+-- correspondence must still implement these translated execution models.
 def run (layer : Attention.Layer) (input : Fin 5120 → BF) (angle : RopeAngles.Inputs)
     (cache : State.Kv.Cache BF n) (execution : Execution layer input angle cache) : (Fin 5120 → BF) × State.Kv.Cache BF (n+1) :=
-  (forward layer input angle cache execution, State.KvBytes.cacheAfter execution.updated)
+  (forward layer input angle cache execution, State.KvBytes.cacheAfter execution.updated.toKvBytes)
 
 theorem run_eq (layer : Attention.Layer) (input : Fin 5120 → BF) (angle : RopeAngles.Inputs)
     (cache : State.Kv.Cache BF n) (execution : Execution layer input angle cache) :
@@ -71,6 +74,18 @@ theorem run_eq (layer : Attention.Layer) (input : Fin 5120 → BF) (angle : Rope
   unfold run
   rw [forward_eq, State.KvBytes.cacheAfter_eq]
   rfl
+
+def storageAfter (layer : Attention.Layer) (input : Fin 5120 → BF) (angle : RopeAngles.Inputs)
+    (cache : State.Kv.Cache BF n) (execution : Execution layer input angle cache) :
+    State.KvAllocation.Storage (layer.cacheAfter input angle cache) := execution.updated.after
+
+theorem storage_keys (layer : Attention.Layer) (input : Fin 5120 → BF) (angle : RopeAngles.Inputs)
+    (cache : State.Kv.Cache BF n) (execution : Execution layer input angle cache) :
+    (storageAfter layer input angle cache execution).keys=execution.updated.toKvBytes.keys.memory := rfl
+
+theorem storage_values (layer : Attention.Layer) (input : Fin 5120 → BF) (angle : RopeAngles.Inputs)
+    (cache : State.Kv.Cache BF n) (execution : Execution layer input angle cache) :
+    (storageAfter layer input angle cache execution).values=execution.updated.toKvBytes.values.memory := rfl
 
 def implementation : AttentionExecution.Implementation where
   Trace := Execution

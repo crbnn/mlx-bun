@@ -45,6 +45,19 @@ const hostSourcePins = {
   "packages/mlx/src/ops.ts": "0672d9fa77e95490cad3201eb7a9eae073aa41a7c1aa0afaf3e1a640e32dc2cd",
 };
 const mlxSourcePins = {
+  "mlx/backend/metal/copy.cpp": "35570b10905afb07f59ea16bf7abf840d290435fedbf716ca83cc7c51691e5d8",
+  "mlx/backend/metal/kernels/copy.h": "a9fad1b262ffc25f4ccda4e09d0c76821cd580f12871acd2a0daa98151e1587c",
+  "mlx/backend/metal/kernels/utils.h": "5e1568e9edde9d05dbf86f68fa0d6c6240f2c32b973c7c6a76166b9c0d91543d",
+  "mlx/backend/metal/kernels/copy.metal": "ed8a579eb6fe6a14c36560d2c8b548baf99e66fa77d300fb4ad7554883820eba",
+  "mlx/backend/common/utils.cpp": "f831b4e6576cb76519fddcbab2e424dc53e8f75811cce448f4a877ec1885331e",
+  "mlx/backend/common/copy.h": "2caa44885b43327747e53460f317e3107b9a0c012759a3c8f3d44095d1819ef0",
+  "mlx/backend/common/slicing.cpp": "ac82dd8972605a46dd4eab0c04303ed6758b273065bd9bde696d4591f914b1a2",
+  "mlx/backend/metal/slicing.cpp": "604d3bea4ce0e87eda3ca550200fc06eb78d949de49db42ef8bf12fb331e0b6c",
+  "mlx/backend/metal/indexing.cpp": "6592dec7e5490acbe47301b85fd1d2b9a5186952a29ecb23e7e2ff3442d0917e",
+  "mlx/backend/metal/utils.h": "2b57319453758b5f7c776de946375701f97f84deabca02a1ef024f0153599c70",
+  "mlx/backend/gpu/copy.cpp": "9e6304129e8a2425aae4d913e8b9eefb2dac4bf8afac5c460cfc9331c6c48031",
+  "mlx/backend/gpu/primitives.cpp": "5a796463969b675181111b42a7aeadce8243a9d793ec7a00a30051d325bffe86",
+  "mlx/backend/gpu/slicing.cpp": "6b010670e215a0016dd2707ab2101ddc256583243bc501a44b7be3ea4de513f4",
   "mlx/backend/metal/kernels/unary_ops.h": "0a5492b65ae39ecb6d8b04e64ea5007e0a4ff60d8d9428559bfbfd03387ece2a",
   "mlx/backend/metal/kernels/bf16.h": "abd87446a310b77ac530ef52a324feae5cb285d03ec9613e3a88ebb71410fdcb",
   "mlx/backend/metal/scaled_dot_product_attention.cpp": "215ebac6495706cf01a2635c4dcec29802e130165ed8704f212d789679d2e673",
@@ -410,6 +423,13 @@ const proofFiles = [
   "kernels/attention/SdpaDispatchedDevice.lean",
   "state/KvBytes.lean",
   "state/KvAllocation.lean",
+  "contracts/mlx/Copy2D.lean",
+  "contracts/mlx/CopyShape.lean",
+  "contracts/mlx/CopyContiguous.lean",
+  "contracts/mlx/CopyIndices.lean",
+  "state/KvCopy.lean",
+  "state/KvConcat.lean",
+  "state/KvDevice.lean",
   "models/qwen/AttentionExecution.lean",
   "models/qwen/AttentionDevice.lean",
   "models/qwen/DecodeImplementation.lean",
@@ -596,4 +616,5 @@ console.log("Byte storage and ownership: little-endian byte and word views are i
 console.log("Device buffer refinement: completed gate/up producers write the BF16 activation buffer, and down reads its stored values. The down producers write the full 32-by-5120 FP32 partial buffer, with disjoint destinations and proved aligned float4 reads for the fold launch. A fixed MLP implementation contract carries these dependent storage traces through all 64 stages and autoregressive feedback. The concrete entry preserves logits, selected tokens, caches and numerical bounds for arbitrary legal modeled schedules. Producer completion is a device-dispatch dependency, not a physical cross-threadgroup barrier. Native allocation, dispatch dependencies, typed accesses and binary correspondence remain obligations.");
 console.log("Final stores and attention storage: the Trellis inference implementation reads back the fold's final BF16 output buffer. Packed Trellis code loads and FP16 scales at their byte addresses agree with the finite checkpoint constructors, including gate/up wrap loads and the down 3-bit interleave. Two-pass attention projects one legal per-thread schedule onto three byte buffers, with unique writers and exact FP32/BF16 readback. One-pass summary arrays preserve raw FP32 partials; both routes complete scratch write/read barriers through all eight coordinate iterations and read their final BF16 output stores. A static attention contract carries these storage results and returned KV bytes through every attention stage and the autoregressive loop, preserving the existing logit bounds, error budgets and token-selection theorem. Native loader attachment, visibility and compiled execution are still external obligations.");
 console.log("KV byte storage: completed append writes preserve every old entry and exactly store the new key/value. For one-token appends from empty, capacity grows in 256-token chunks; growth occurs only at full aligned boundaries. Axis-2 concatenation repacks each head at its changed stride, preserves old words and zeros the extension. The prepared storage supplies append traces, and their resulting bytes satisfy the next-step attachment contract. Native allocator, concat/copy dispatch and memory visibility remain external obligations; trimming, restored caches and batched appends are outside this allocation result.");
+console.log("KV copy refinement: same-dtype 16-bit scalar/vector and strided copy source models refine their byte storage contracts. Zero-fill readback supplies the actual extension input to concurrent growth copies; their destinations are disjoint. Donation or completed vector-copy preservation supplies the append input. Dimension collapse selects the two-dimensional append/growth layouts; supported allocation geometry selects four-word contiguous copies without tails, and signed-32 copy indexing agrees with natural addresses without overflow. The resulting bytes feed attention, graph and autoregressive refinement and satisfy a next-step storage attachment. Native allocation, aliasing, dispatch/visibility and source-to-binary correspondence remain external obligations.");
 console.log("Scope: the conditional autoregressive source model covers embedding, all 64 layers, final normalization, logits, looped logsumexp, normalized greedy selection and returned-cache errors through 262144 steps. Each selected token and returned cache feeds the next call; range conditions are derived inductively. Error bounds compare against a mathematical reference consuming the same emitted tokens. Exact-real sequence agreement requires per-step numerical margins. The numerical composition selects the proved one-/two-pass reader using the pinned dispatch predicates and default block counts (MLX_SDPA_BLOCKS unset/zero). Both attention routes derive finiteness, output bounds and error against real softmax. The two-pass proof includes BF16 intermediate storage, strided first passes, maximum selection, ordered second-pass reductions and normalization. Logical buffer handoff, loop/address coverage and scratch transpose are proved; native synchronization and buffer attachment remain execution premises. Normalization, Delta gate/gated-normalization, all 192 Trellis scale tensors and all 48 convolution tensors have checked literal bounds, connected to the autoregressive parameter contract through exact attachment equalities. Packed scale dictionaries and FP16 widening are proved. Affine dictionaries extracted from 612 tensors have checked bounds; ordered affine indices remain explicit inputs, not literal payload certificates. Exact dictionary attachments discharge all parameter ranges. The pure model constructor supplies those attachments and is a fixed point on already attached models. The inference entry point constructs every RoPE position input, with exact position conversion and a proved 2^-20 log-base error from a specified host result. Head-scale construction is proved from a specified binary64 Math.pow result, whose host execution remains a premise. Exact byte constructors supply affine parameter contracts from checked payloads. Host attachment parsers remain outside Lean. Full checkpoint/loader binding, a useful final accuracy bound, native memory/dispatch execution and hardware/compiler correspondence remain unproved.");
