@@ -4,6 +4,7 @@
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
+import { checkScalarCopySourceBinding } from "./kernels/copy/ScalarCopySourceBinding.ts";
 
 const root = new URL("../", import.meta.url);
 const lean = process.env.LEAN ?? "lean";
@@ -680,6 +681,30 @@ const proofFiles = [
   "models/qwen/ResidualDeltaAllocation.lean",
   "models/qwen/ResidualDeltaHighWater.lean",
   "models/qwen/TokenWorkspaceConstruction.lean",
+  "kernels/copy/ScalarCopySemantics.lean",
+  "kernels/copy/ScalarCopySyntax.lean",
+  "kernels/copy/ScalarCopyBodySemantics.lean",
+  "kernels/copy/ScalarCopyInterleaving.lean",
+  "kernels/copy/ScalarCopySourceRefinement.lean",
+  "models/qwen/AttentionReadHighWater.lean",
+  "models/qwen/TokenBoundaryHighWater.lean",
+  "models/qwen/ResidualAttentionHighWater.lean",
+  "models/qwen/Qwen38TrellisM1MaxWorkspaceFootprint.lean",
+  "models/qwen/DecodeHighWaterConstruction.lean",
+  "models/qwen/TokenFirstPlanConstruction.lean",
+  "models/qwen/TokenInitializationHighWater.lean",
+  "models/qwen/TokenFirstInitializedConstruction.lean",
+  "models/qwen/CheckpointFirstTokenMemory.lean",
+  "models/qwen/ResidualAttentionExistingHighWater.lean",
+  "models/qwen/DecodeHighWaterGeometry.lean",
+  "models/qwen/DecodeExistingStepConstruction.lean",
+  "models/qwen/DecodeExistingHighWaterConstruction.lean",
+  "models/qwen/TokenFirstCacheGeometry.lean",
+  "models/qwen/TokenNextPlanConstruction.lean",
+  "models/qwen/CheckpointSecondTokenMemory.lean",
+  "models/qwen/InitialHistorySource.lean",
+  "models/qwen/InitialScalarConstruction.lean",
+  "models/qwen/Qwen38TrellisM1MaxCacheFootprint.lean",
 ];
 
 const discoveredProofs = await Array.fromAsync(new Bun.Glob("**/*.lean").scan({
@@ -793,6 +818,10 @@ for (const [name, expected] of Object.entries(mlxSourcePins)) {
   sources.set(`mlx@${mlxRevision}/${name}`, { source, expected });
 }
 
+// Bind the checked parser literal to the exact pinned native body.
+// Host extraction remains trusted; Lean checks parsing and execution proofs.
+await checkScalarCopySourceBinding({ selfTest: process.argv.includes("--self-test") });
+
 const dir = await mkdtemp(join(tmpdir(), "mlx-bun-proof-"));
 async function checkProof(name: string, text: string, build = false) {
   const path = join(dir, name);
@@ -857,6 +886,6 @@ console.log("Permitted axioms: propext, Classical.choice, Quot.sound. No native 
 console.log("Mathematical scope: conditional one-token M1 Max Qwen inference covers quantized embedding, 48 Delta and 16 attention layers, final normalization, all 248320 logits, logsumexp, greedy selection and cache feedback through 262144 steps. Parameter and primitive contracts derive intermediate finiteness and ranges, including a 2^18 logit bound. Error budgets compare with a real-valued reference consuming the same emitted tokens; independent exact-real token agreement requires winner margins. A useful final accuracy guarantee remains open. Prefill, batching and adapters are outside this result.");
 console.log("Memory refinement: concrete shared-heap kernel/layer constructors connect embedding, all decode stages, final projection, sampling and subsequent tokens. Final token and every updated cache are read from one resulting heap. Finite reachable traces require raw allocation plans only for actual predecessor states; they do not require an allocator for every possible heap. Head RMS supports fresh and donated Q/K buffers; RoPE preserves actual dynamic bases. Both dispatched SDPA routes, mixed Delta state/output writes, Trellis scratch/output phases and sampling local/global memories retain their read and frame proofs.");
 console.log("Parameter continuity: strong Delta and attention constructors consume the original parameter bundle, and the graph cursor selects each stage from one carried global bundle. Initialized finite token traces preserve that same embedding/graph bundle from the loaded initial heap through token stores, cache initialization, every layer and subsequent sampling. Checkpoint dictionary certificates supply the complete numerical Parameters contract to these memory-level results; ordered encodings, exact model bindings and primitive contracts remain explicit.");
-console.log("Constructible layouts: aligned workspaces derive operation-level geometry for embedding, normalization, Delta preparation/recurrence, attention prefix/SDPA/tail, residual MLP, final projection and sampling. One fresh 4139488-byte arena constructs a complete Delta block; attention uses one fixed arena of at most 13637632 bytes plus explicit KV growth or reuse geometry. Token/cache initialization packs 48 Delta caches into 153944068 bytes and proves pairwise cache separation. Delta frontier steps derive geometry from live-region endpoint bounds. A complete positive-length graph/token allocation plan and native resource ownership remain open.");
+console.log("Constructible layouts: the first-token constructor derives startup, embedding, all 64 layer plans, final projection and sampling from original parameter storage and fresh-workspace bounds, with no supplied complete graph/token plan. It constructs a positive initialized trace and binds certified finite logits bounded by 2^18 to the final token heap. Conservative first-token workspace is at most 604918000 bytes, excluding checkpoint storage, local memories and native overhead. Updated caches are pairwise disjoint and separate from original parameters. Existing-capacity graph construction reuses actual KV regions under derived region contracts. Address-space headroom does not establish bounded physical-memory execution or native ownership.");
 console.log("Checkpoint coverage: checked literals cover 129 main and 32 head normalization vectors, 144 Delta tensors, 192 Trellis scale tensors and 48 convolution tensors. Affine dictionaries cover distinct scale/bias alphabets from 612 tensors; ordered indices remain explicit inputs. Lean byte constructors establish exact parameter attachment and a fixed-point property. Native parsing/loading and specified host RoPE/head-scale results remain boundary contracts.");
-console.log("Native paths proved: 0. These are manually translated models; pinned local/upstream sources detect drift but do not prove source/compiler/binary correspondence. Native allocation/lifetime, runtime ownership selection, dispatch/Metal visibility, hardware arithmetic and checkpoint attachment still require instantiation. Allocator/scheduler models prove ownership, page/reuse, bounded-view and fence bookkeeping properties without establishing their native implementation correspondence. No GPU execution is part of this checker.");
+console.log("Native paths proved: 0. Most kernel models remain manually translated. The selected BF16/N1 copy_s body has kernel-checked parsing, dynamic shared-heap execution and completed load/store interleaving refinement, joined to the existing history initializer; a trusted host check binds exact body bytes to pinned MLX source. Compiler lowering, native buffers/dispatch/visibility and hardware arithmetic remain explicit boundaries. Native checkpoint loading and complete allocator/lifetime correspondence also remain open. No GPU execution is part of this checker.");
