@@ -70,6 +70,20 @@ import { checkMlxOutputGateHostSourceBinding } from "./kernels/attention/MlxOutp
 import { checkGatedStepSourceBinding } from "./kernels/delta/GatedStepSourceBinding.ts";
 import { checkGatedPointerSourceBinding } from "./kernels/delta/GatedPointerSourceBinding.ts";
 import { checkGatedOutputSourceBinding } from "./kernels/delta/GatedOutputSourceBinding.ts";
+import { checkMlxAttentionGateReshapeSourceBinding } from "./kernels/attention/MlxAttentionGateReshapeSourceBinding.ts";
+import { checkMlxAttentionQueryCopySourceBinding } from "./kernels/attention/MlxAttentionQueryCopySourceBinding.ts";
+import { checkAttentionGateCopyCallerSourceBinding } from "./models/qwen/AttentionGateCopyCallerSourceBinding.ts";
+import { checkGateHostSourceBinding } from "./kernels/trellis/GateHostSourceBinding.ts";
+import { checkGatedRms128SourceBinding } from "./kernels/normalization/GatedRms128SourceBinding.ts";
+import { checkGatedRms128HostSourceBinding } from "./kernels/normalization/GatedRms128HostSourceBinding.ts";
+import { checkSiluHeads128SourceBinding } from "./kernels/delta/SiluHeads128SourceBinding.ts";
+import { checkSiluHeads128HostSourceBinding } from "./kernels/delta/SiluHeads128HostSourceBinding.ts";
+import { checkDeltaFusedCallerSourceBinding } from "./models/qwen/DeltaFusedCallerSourceBinding.ts";
+import { checkMlxDepthwiseConvSourceBinding } from "./kernels/delta/MlxDepthwiseConvSourceBinding.ts";
+import { checkMlxDepthwiseConvModelBinding } from "./kernels/delta/MlxDepthwiseConvModelBinding.ts";
+import { checkMlxLogAddExpSourceBinding } from "./kernels/delta/MlxLogAddExpSourceBinding.ts";
+import { checkComputeGHostSourceBinding } from "./kernels/delta/ComputeGHostSourceBinding.ts";
+import { checkDeltaBetaSourceBinding } from "./kernels/delta/DeltaBetaSourceBinding.ts";
 import { checkAffineOuter3SourceBinding } from "./kernels/quantization/AffineOuter3SourceBinding.ts";
 import { checkDownPartialSourceBinding } from "./kernels/trellis/DownPartialSourceBinding.ts";
 import { checkDownScratchSourceBinding } from "./kernels/trellis/DownScratchSourceBinding.ts";
@@ -101,6 +115,7 @@ let dependencyPath = "";
 // Reviewed manual translations, not a verified Metal/TypeScript frontend. Pins
 // prevent source drift; changing a hash requires reviewing the affected proofs.
 const sourcePins = {
+  "layers/compiled-normalization.ts": "4a649678daf44c73e8528b519a57bace1a735178e29710711a5067c5e5e7d9cc",
   "models/factory.ts": "8c9fa7ad26c51197673d20522a5ec1946ffadeb5fcd77df151737bc2b47c9023",
   "models/implementation.ts": "fab08e8ed6431920c41ad28a726607ef1d2cd60a3aae7793e9c79040ffaef499",
   "models/composition.ts": "b455b4498b44a2be4edc0d0c9aa4392574a203a66ce37a8c6b85119dd613dff9",
@@ -148,6 +163,7 @@ const hostSourcePins = {
   "packages/mlx/src/ops.ts": "0672d9fa77e95490cad3201eb7a9eae073aa41a7c1aa0afaf3e1a640e32dc2cd",
 };
 const mlxSourcePins = {
+  "mlx/backend/common/common.cpp": "671d20a1a25524198e078c22af18a0f02b94f642786b6655f9c4e55ec8a6d8a4",
   "mlx/backend/metal/kernels.h": "f45059a96ffa4cf38c6cb85754a818075563b455ca008d0ae624737546f7b972",
   "mlx/backend/metal/jit_kernels.cpp": "8201a166cc426cd7b1f6983e5e6f282d3ca7a1992cc4c3a80fa42cf8dd237c46",
   "mlx/backend/metal/nojit_kernels.cpp": "94b31481ce88c7edd7c993008e4f708dcff2f8a0936c0b237c750a93a3cbe610",
@@ -1144,6 +1160,84 @@ const proofFiles = [
   "models/qwen/TrellisMlpParsedDown.lean",
   "models/qwen/TrellisMlpParsedGateProjection.lean",
   "models/qwen/DeltaParsedRecurrence.lean",
+  "kernels/attention/MlxAttentionGateCopyMemory.lean",
+  "kernels/attention/MlxAttentionGateCopySyntax.lean",
+  "kernels/attention/MlxAttentionGateReshapeHost.lean",
+  "kernels/attention/MlxAttentionQueryCopyHost.lean",
+  "kernels/delta/ComputeGHostMemory.lean",
+  "kernels/delta/ComputeGHostSource.lean",
+  "kernels/delta/ComputeGHostSyntax.lean",
+  "kernels/delta/DeltaBetaMemory.lean",
+  "kernels/delta/DeltaBetaSource.lean",
+  "kernels/delta/MlxDepthwiseConvHostSource.lean",
+  "kernels/delta/MlxDepthwiseConvMemory.lean",
+  "kernels/delta/MlxDepthwiseConvSource.lean",
+  "kernels/delta/MlxDepthwiseConvSyntax.lean",
+  "kernels/delta/MlxLogAddExpSource.lean",
+  "kernels/delta/MlxLogAddExpSyntax.lean",
+  "kernels/delta/SiluHeads128Activation.lean",
+  "kernels/delta/SiluHeads128Geometry.lean",
+  "kernels/delta/SiluHeads128HostSelection.lean",
+  "kernels/delta/SiluHeads128Memory.lean",
+  "kernels/delta/SiluHeads128Output.lean",
+  "kernels/delta/SiluHeads128Syntax.lean",
+  "kernels/delta/SiluHeads128Threads.lean",
+  "kernels/normalization/GatedRms128FirstSource.lean",
+  "kernels/normalization/GatedRms128HostSelection.lean",
+  "kernels/normalization/GatedRms128OutputSource.lean",
+  "kernels/normalization/GatedRms128Syntax.lean",
+  "kernels/normalization/GatedRms128TailSource.lean",
+  "kernels/trellis/DownInputTraceTransport.lean",
+  "kernels/trellis/GateHostSelectedShape.lean",
+  "kernels/trellis/GateHostSelection.lean",
+  "kernels/trellis/GateInputTraceTransport.lean",
+  "models/qwen/AttentionGateCopyFrames.lean",
+  "models/qwen/AttentionGateCopyFront.lean",
+  "models/qwen/AttentionGateCopyKeyConstruction.lean",
+  "models/qwen/AttentionGateCopyKvMemory.lean",
+  "models/qwen/AttentionGateCopyNormalizationMemory.lean",
+  "models/qwen/AttentionGateCopyParsedCacheAppend.lean",
+  "models/qwen/AttentionGateCopyParsedDispatch.lean",
+  "models/qwen/AttentionGateCopyParsedDonation.lean",
+  "models/qwen/AttentionGateCopyParsedFresh.lean",
+  "models/qwen/AttentionGateCopyParsedHeadNormalization.lean",
+  "models/qwen/AttentionGateCopyParsedPipeline.lean",
+  "models/qwen/AttentionGateCopyParsedQkv.lean",
+  "models/qwen/AttentionGateCopyParsedResult.lean",
+  "models/qwen/AttentionGateCopyParsedRope.lean",
+  "models/qwen/AttentionGateCopyParsedTwoPass.lean",
+  "models/qwen/AttentionGateCopyPreservation.lean",
+  "models/qwen/AttentionGateCopyQueryMemory.lean",
+  "models/qwen/AttentionGateCopyReadConstruction.lean",
+  "models/qwen/AttentionGateCopyRopeMemory.lean",
+  "models/qwen/AttentionGateCopyTrellisFrames.lean",
+  "models/qwen/AttentionGateCopyTrellisSuffix.lean",
+  "models/qwen/AttentionOutputParsedAffine4.lean",
+  "models/qwen/AttentionParsedGateReshape.lean",
+  "models/qwen/AttentionPlanParsedConstruction.lean",
+  "models/qwen/AttentionSuffixParsedConstruction.lean",
+  "models/qwen/DeltaConvolutionParsedSource.lean",
+  "models/qwen/DeltaParsedGatedNormalization.lean",
+  "models/qwen/DeltaParsedHeads.lean",
+  "models/qwen/DeltaParsedOutputProjection.lean",
+  "models/qwen/DeltaParsedProjections.lean",
+  "models/qwen/DeltaSuffixParsedConstruction.lean",
+  "models/qwen/Qwen38TrellisParsedExecution.lean",
+  "models/qwen/Qwen38TrellisParsedLayers.lean",
+  "models/qwen/Qwen38TrellisParsedLogitError.lean",
+  "models/qwen/ResidualMlpParsedConstruction.lean",
+  "models/qwen/ResidualMlpParsedTrellis.lean",
+  "models/qwen/TrellisMlpParsedGateStore.lean",
+  "models/qwen/TrellisMlpParsedGateTail.lean",
+  "models/qwen/TrellisMlpParsedMemory.lean",
+  "models/qwen/TrellisMlpParsedPipeline.lean",
+  "models/qwen/TrellisParsedHostBinding.lean",
+  "models/qwen/TrellisParsedNative.lean",
+  "models/qwen/TrellisParsedParameterAttachment.lean",
+  "models/qwen/TrellisParsedParameterChain.lean",
+  "models/qwen/TrellisParsedParameterStage.lean",
+  "models/qwen/TrellisParsedStageConstruction.lean",
+  "models/qwen/TrellisParsedStageSources.lean",
 ];
 
 const discoveredProofs = await Array.fromAsync(new Bun.Glob("**/*.lean").scan({
@@ -1325,6 +1419,20 @@ await checkMlxOutputGateHostSourceBinding({ selfTest: process.argv.includes("--s
 await checkGatedStepSourceBinding({ selfTest: process.argv.includes("--self-test") });
 await checkGatedPointerSourceBinding({ selfTest: process.argv.includes("--self-test") });
 await checkGatedOutputSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkMlxAttentionGateReshapeSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkMlxAttentionQueryCopySourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkAttentionGateCopyCallerSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkGateHostSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkGatedRms128SourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkGatedRms128HostSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkSiluHeads128SourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkSiluHeads128HostSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkDeltaFusedCallerSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkMlxDepthwiseConvSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkMlxDepthwiseConvModelBinding({ selfTest: process.argv.includes("--self-test") });
+await checkMlxLogAddExpSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkComputeGHostSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkDeltaBetaSourceBinding({ selfTest: process.argv.includes("--self-test") });
 await checkAffineOuter3SourceBinding({ selfTest: process.argv.includes("--self-test") });
 await checkDownPartialSourceBinding({ selfTest: process.argv.includes("--self-test") });
 await checkDownScratchSourceBinding({ selfTest: process.argv.includes("--self-test") });
@@ -1416,6 +1524,9 @@ console.log(`Checked ${proofFiles.length} proof modules.`);
 console.log("Permitted axioms: propext, Classical.choice, Quot.sound. No native proof evaluation.");
 console.log("Mathematical scope: conditional one-token M1 Max Qwen inference covers quantized embedding, 48 Delta and 16 attention layers, final normalization, all 248320 logits, logsumexp, greedy selection and cache feedback through 262144 steps. Parameter and primitive contracts derive intermediate finiteness and ranges, including a 2^18 logit bound. Error budgets compare with a real-valued reference consuming the same emitted tokens; independent exact-real token agreement requires winner margins. A useful final accuracy guarantee remains open. Prefill, batching and adapters are outside this result.");
 console.log("Parsed Delta recurrence: selected one-token pointers and four-cell register initialization feed source-ordered decay, prediction, correction and readout. Parsed time control, BF16 output and FP32 state stores execute on the original mixed schedule for every protected input prefix. The model join reaches the actual gated-normalization input and retained recurrent cache heap. Reviewed host selection pins the unmasked inference route, Tin, templates, dtypes and dispatch; native descriptors, compiler contraction and SIMD primitives remain explicit.");
+console.log("Parsed Delta preparation/tail: native depthwise convolution, fixed-width128 BF16 SiLU/Q/K/V heads and gated RMS normalization now derive source operations and output stores on the original traces. Q/K/V survive gate writes into recurrence; normalization reaches the actual three/four-bit output projection. QKV/Z custom projection certificates and native four-bit A/B certificates share the original ordered phase. The typed computeG host graph parses cast/exp/neg/BF16-add/logaddexp/mixed-multiply/exp and reaches the actual FP32 gate buffer under finite inputs; BF16 beta uses the parsed48-cell unary schedule. Guarded host token extraction, compiler graph preservation and native max/min equality policy remain explicit.");
+console.log("Copied attention source path: a separate constructed ReadPlan retains actual Q projection, strided gate reshape copy, K/V projections, query copy, head RMS reductions/output, RoPE, cache append, all three SDPA cases and gate/output projection on one sequence of current heaps. Parsed general copy bodies and separate load/store events reach the exact append heap consumed by SDPA. The original residual, normalization and Trellis parameters survive this copied prefix into its parsed Trellis suffix. General cache-growth source refinement and replacement of the older global attention-stage constructor remain separate; no new copied-prefix attachment to that older global chain is claimed.");
+console.log("Parsed Trellis composition: FTZ gate/up arithmetic, typed tails, BF16 stores, down partial/fold and residual output are joined on the same MLP heap. Original packed/scales checkpoint attachments and host shape/TAIL selection feed these source certificates. They compose over the existing parameter-backed64-stage constructor into actual hidden/logit heap reads and its conditional real-error theorem. That constructor retains its existing attention-prefix model; the newer copied-attention source construction is separate. Native compiler/ABI/descriptor attachment and device execution remain explicit.");
 console.log("Memory refinement: concrete shared-heap kernel/layer constructors connect embedding, all decode stages, final projection, sampling and subsequent tokens. Final token and every updated cache are read from one resulting heap. Finite reachable traces require raw allocation plans only for actual predecessor states; they do not require an allocator for every possible heap. Head RMS supports fresh and donated Q/K buffers; RoPE preserves actual dynamic bases. Both dispatched SDPA routes, mixed Delta state/output writes, Trellis scratch/output phases and sampling local/global memories retain their read and frame proofs.");
 console.log("Parameter continuity: strong Delta and attention constructors consume the original parameter bundle, and the graph cursor selects each stage from one carried global bundle. Initialized finite token traces preserve that same embedding/graph bundle from the loaded initial heap through token stores, cache initialization, every layer and subsequent sampling. Checkpoint dictionary certificates supply the complete numerical Parameters contract to these memory-level results; ordered encodings, exact model bindings and primitive contracts remain explicit.");
 console.log("Constructible layouts: parsed cache initialization, the direct BF16 first-token KV branch, and every subsequent token through 262144 are constructed from the original checkpoint bundle, fresh address-space bounds and primitive/dispatch contracts, with no supplied graph/token plan or per-step execution oracle. Initial KV allocation derives zero slabs, optional preservation copies, row updates and the active head stride. The exact first-token heap feeds the constructed continuation. A checkpoint adapter now accepts only the reached normal-input rsqrt envelopes and derives division bounds internally, preserving original functions and proving token selection with the lowest-index tie rule. Parameter bytes remain unchanged; readback has the reference cache ranges, propagated error bounds and finiteness. The conservative retained bump-address budget for 262143 later steps is 127015766109984 bytes. This address-space construction does not establish physical-memory fit, scratch reuse or native allocator ownership.");
