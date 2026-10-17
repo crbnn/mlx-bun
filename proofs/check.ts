@@ -53,6 +53,18 @@ import { checkMlxRmsHeadSourceBinding } from "./kernels/normalization/MlxRmsHead
 import { checkArgmaxLaunchSourceBinding } from "./kernels/sampling/ArgmaxLaunchSourceBinding.ts";
 import { checkGatePointerSourceBinding } from "./kernels/trellis/GatePointerSourceBinding.ts";
 import { checkDownSetupSourceBinding } from "./kernels/trellis/DownSetupSourceBinding.ts";
+import { checkAffineInput4SourceBinding } from "./kernels/quantization/AffineInput4SourceBinding.ts";
+import { checkAffinePreload4SourceBinding } from "./kernels/quantization/AffinePreload4SourceBinding.ts";
+import { checkAffineOutputSourceBinding } from "./kernels/quantization/AffineOutputSourceBinding.ts";
+import { checkAffineRowHostSourceBinding } from "./kernels/quantization/AffineRowHostSourceBinding.ts";
+import { checkAffineOuter4SourceBinding } from "./kernels/quantization/AffineOuter4SourceBinding.ts";
+import { checkDownPointerSourceBinding } from "./kernels/trellis/DownPointerSourceBinding.ts";
+import { checkDownDispatchSourceBinding } from "./kernels/trellis/DownDispatchSourceBinding.ts";
+import { checkDownControlSourceBinding } from "./kernels/trellis/DownControlSourceBinding.ts";
+import { checkDownStepSourceBinding } from "./kernels/trellis/DownStepSourceBinding.ts";
+import { checkMlxRopeSingleSourceBinding } from "./kernels/attention/MlxRopeSingleSourceBinding.ts";
+import { checkMlxSdpaVectorSourceBinding } from "./kernels/attention/MlxSdpaVectorSourceBinding.ts";
+import { checkMlxSdpaScoreSourceBinding } from "./kernels/attention/MlxSdpaScoreSourceBinding.ts";
 
 const root = new URL("../", import.meta.url);
 const lean = process.env.LEAN ?? "lean";
@@ -961,6 +973,46 @@ const proofFiles = [
   "kernels/trellis/GatePointerSource.lean",
   "kernels/trellis/GatePointerPipeline.lean",
   "kernels/trellis/DownSetupSource.lean",
+  "kernels/quantization/AffineInput4Syntax.lean",
+  "kernels/quantization/AffineInput4Source.lean",
+  "kernels/quantization/AffineScratch4Source.lean",
+  "kernels/quantization/AffinePreload4Syntax.lean",
+  "kernels/quantization/AffinePreload4Source.lean",
+  "kernels/quantization/AffineDot4TileMemory.lean",
+  "kernels/quantization/AffineDot4PreparedMemory.lean",
+  "kernels/quantization/AffineDot4PreloadedMemory.lean",
+  "kernels/quantization/AffineDot4PreloadFrame.lean",
+  "kernels/quantization/AffineOutputSyntax.lean",
+  "kernels/quantization/AffineOutputSource.lean",
+  "kernels/quantization/AffineRowHostSelection.lean",
+  "kernels/quantization/AffineOuter4Syntax.lean",
+  "kernels/quantization/AffineOuter4Call.lean",
+  "kernels/quantization/AffineOuter4Source.lean",
+  "kernels/trellis/DownPointerSyntax.lean",
+  "kernels/trellis/DownPointerSemantics.lean",
+  "kernels/trellis/DownPointerSource.lean",
+  "kernels/trellis/DownPointerArrays.lean",
+  "kernels/trellis/DownDispatchSource.lean",
+  "kernels/trellis/DownDispatchPointer.lean",
+  "kernels/trellis/DownControlSyntax.lean",
+  "kernels/trellis/DownControlSource.lean",
+  "kernels/trellis/DownControlDispatch.lean",
+  "kernels/trellis/DownStepSyntax.lean",
+  "kernels/trellis/DownReadSource.lean",
+  "kernels/trellis/DownWindowSource.lean",
+  "kernels/trellis/DownStepSource.lean",
+  "kernels/attention/MlxRopeSingleSyntax.lean",
+  "kernels/attention/MlxRopeSingleAngles.lean",
+  "kernels/attention/MlxRopeSingleMemory.lean",
+  "kernels/attention/MlxRopeSingleDispatch.lean",
+  "kernels/attention/MlxSdpaVectorSyntax.lean",
+  "kernels/attention/MlxSdpaVectorLoop.lean",
+  "kernels/attention/MlxSdpaVectorMemory.lean",
+  "kernels/attention/MlxSdpaVectorDispatch.lean",
+  "kernels/attention/MlxSdpaScoreSource.lean",
+  "kernels/attention/MlxSdpaUpdateSource.lean",
+  "kernels/attention/MlxSdpaPartialSource.lean",
+  "models/qwen/AttentionParsedRope.lean",
 ];
 
 const discoveredProofs = await Array.fromAsync(new Bun.Glob("**/*.lean").scan({
@@ -1125,6 +1177,18 @@ await checkMlxRmsHeadSourceBinding({ selfTest: process.argv.includes("--self-tes
 await checkArgmaxLaunchSourceBinding({ selfTest: process.argv.includes("--self-test") });
 await checkGatePointerSourceBinding({ selfTest: process.argv.includes("--self-test") });
 await checkDownSetupSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkAffineInput4SourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkAffinePreload4SourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkAffineOutputSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkAffineRowHostSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkAffineOuter4SourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkDownPointerSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkDownDispatchSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkDownControlSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkDownStepSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkMlxRopeSingleSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkMlxSdpaVectorSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkMlxSdpaScoreSourceBinding({ selfTest: process.argv.includes("--self-test") });
 
 const dir = await mkdtemp(join(tmpdir(), "mlx-bun-proof-"));
 async function checkProof(name: string, text: string, build = false) {
@@ -1196,4 +1260,4 @@ console.log("Memory refinement: concrete shared-heap kernel/layer constructors c
 console.log("Parameter continuity: strong Delta and attention constructors consume the original parameter bundle, and the graph cursor selects each stage from one carried global bundle. Initialized finite token traces preserve that same embedding/graph bundle from the loaded initial heap through token stores, cache initialization, every layer and subsequent sampling. Checkpoint dictionary certificates supply the complete numerical Parameters contract to these memory-level results; ordered encodings, exact model bindings and primitive contracts remain explicit.");
 console.log("Constructible layouts: parsed cache initialization, the direct BF16 first-token KV branch, and every subsequent token through 262144 are constructed from the original checkpoint bundle, fresh address-space bounds and primitive/dispatch contracts, with no supplied graph/token plan or per-step execution oracle. Initial KV allocation derives zero slabs, optional preservation copies, row updates and the active head stride. The exact first-token heap feeds the constructed continuation. A checkpoint adapter now accepts only the reached normal-input rsqrt envelopes and derives division bounds internally, preserving original functions and proving token selection with the lowest-index tie rule. Parameter bytes remain unchanged; readback has the reference cache ranges, propagated error bounds and finiteness. The conservative retained bump-address budget for 262143 later steps is 127015766109984 bytes. This address-space construction does not establish physical-memory fit, scratch reuse or native allocator ownership.");
 console.log("Checkpoint coverage: checked literals cover 129 main and 32 head normalization vectors, 144 Delta tensors, 192 Trellis scale tensors and 48 convolution tensors. Affine dictionaries cover distinct scale/bias alphabets from 612 tensors; ordered indices remain explicit inputs. Lean byte constructors establish exact parameter attachment and a fixed-point property. Native parsing/loading and specified host RoPE/head-scale results remain boundary contracts.");
-console.log("Native paths proved: 0. Selected scalar/vector/general copy kernels have checked parser/body and current-heap load/store refinements, including completed interleavings. Trellis integer codebook, reciprocal-based bit construction, cooperative table initialization and packed-window lookup have parsed-source refinements; parsed caller loops now derive packed word arrays and gate input chunks from original bytes. The parsed gate/up inner loops read original packed/scale/input bytes and refine the original lane specification without reassociation; accumulator initialization, SIMD projection and typed tail expressions have source bridges. Parsed row distribution and the lane-zero writer generate exact BF16 output stores in the current destination heap, with unique dispatch and outside-buffer preservation; Parsed gate/up pointer setup derives all private arrays from the original byte heap and propagates through the same lane, projection, tail and completed output schedule. Selected down-projection template and lane setup also have a parsed bridge; its row pointers remain separate. Residual RMS parses both loop schedules, current-heap cells, reduction tail and output stores through the exact completed normalized heap. MLX RMS joins the selected no-copy host route and native thread limit with parsed full/tail loops, current-heap BF16 first-pass cells, original FMA folds, both SIMD reductions, three barriers, inverse production, pointer updates and output stores through the exact normalized heap, including donated input. The selected 256-wide Q/K head path now parses actual cached captures, nonzero row pointers, original first-pass sums, shared reduction/inverse phases and donated-buffer output writes. An interleaved ownership simulation and query-to-key chain reach the exact existing final heap. Native metadata/descriptor attachment and physical primitive/barrier conformance remain explicit. Argmax parses normalized scoring, bounded partial traversal, comparator/shuffle phases, local scratch stores/barriers and the final uint32 store. Unique candidate origins retain exact signed-zero bits through shuffle, and scratch execution uses actual heaps; Parsed global partial stores, finish traversal and reads, scratch merges and final token store now form a whole-sampler certificate through the same partial-output heap, concluding exact greedy-token readback without desired phase outputs as premises. The parsed affine MLXQ_F macro refines the existing exact masked-integer theorem. The four-bit qdot source now binds initialization, uint16 pointer reinterpretation, ordered accumulation body, all four loop visits and final scale/bias expression to the tile model. Finite binary32 addition commutativity bridges the final operand order with exact signed-zero preservation. Prepared scratch-cell attachment and compiler contraction remain explicit. The BF16 Add helper and selected full binary_vv body have parsed-source and separate-load/store interleaving refinements; the residual MLP suffix uses their exact final heap. Physical builtin arithmetic remains a declared machine contract. Manual host translations select the default serial, unpaged, one-token BF16 M1 Max route and dispatch geometry. Trusted byte/hash guards bind these translations to source. Logical IEEE/FTZ division proves the mathematical division envelopes; actual instruction selection remains a boundary. Compiler lowering, native object/buffer extraction, command scheduling/visibility, checkpoint loading, allocator lifetimes and hardware arithmetic remain explicit boundaries. No GPU execution is part of this checker.");
+console.log("Native paths proved: 0. Selected scalar/vector/general copy kernels have checked parser/body and current-heap load/store refinements, including completed interleavings. Trellis integer codebook, reciprocal-based bit construction, cooperative table initialization and packed-window lookup have parsed-source refinements; parsed caller loops now derive packed word arrays and gate input chunks from original bytes. The parsed gate/up inner loops read original packed/scale/input bytes and refine the original lane specification without reassociation; accumulator initialization, SIMD projection and typed tail expressions have source bridges. Parsed row distribution and the lane-zero writer generate exact BF16 output stores in the current destination heap, with unique dispatch and outside-buffer preservation; Parsed gate/up pointer setup derives all private arrays from the original byte heap and propagates through the same lane, projection, tail and completed output schedule. Selected down-projection template, lane setup, builtin dispatch, active/row controls and typed row pointers now derive original packed arrays and input/scale loads. Parsed window and multiply-then-FMA statements consume those bytes and the actual current codebook heap. Whole-loop accumulation and output phases remain separate. Residual RMS parses both loop schedules, current-heap cells, reduction tail and output stores through the exact completed normalized heap. MLX RMS joins the selected no-copy host route and native thread limit with parsed full/tail loops, current-heap BF16 first-pass cells, original FMA folds, both SIMD reductions, three barriers, inverse production, pointer updates and output stores through the exact normalized heap, including donated input. The selected 256-wide Q/K head path now parses actual cached captures, nonzero row pointers, original first-pass sums, shared reduction/inverse phases and donated-buffer output writes. An interleaved ownership simulation and query-to-key chain reach the exact existing final heap. Selected BF16 single-position partial RoPE now parses angles, loads, forward arithmetic and stores; copied/donated query24 then key4 execution reaches the same final heap and preserves untouched head tails. Selected one-pass SDPA derives source pointers, scaled captured-query loads, key loads from protected current heaps and exact strided key visits. Parsed ordered score folds, SIMD sum, max/exp updates and complete per-group partials consume current bytes without expected-score/partial premises. The unconditional short-cache dispatch range is below 1024; larger transitions depend on an explicit native architecture suffix. Cross-group reductions and output-register provenance remain separate. Native metadata/descriptor attachment and physical primitive/barrier conformance remain explicit. Argmax parses normalized scoring, bounded partial traversal, comparator/shuffle phases, local scratch stores/barriers and the final uint32 store. Unique candidate origins retain exact signed-zero bits through shuffle, and scratch execution uses actual heaps; Parsed global partial stores, finish traversal and reads, scratch merges and final token store now form a whole-sampler certificate through the same partial-output heap, concluding exact greedy-token readback without desired phase outputs as premises. The parsed affine MLXQ_F macro refines the existing exact masked-integer theorem. The four-bit qdot source now binds initialization, uint16 pointer reinterpretation, ordered accumulation body, all four loop visits and final scale/bias expression to the tile model. Finite binary32 addition commutativity bridges the final operand order with exact signed-zero preservation. Parsed input preparation and shared preload construct one completed scratch bank from the actual activation heap. Every subsequent protected output-store prefix uses that same scratch with original packed weights, scales and biases. Parsed outer K visits, pointer/scalar reads and ordered four-row updates derive the original lane registers. SIMD output reduction and BF16 stores reach the existing projection heap. A reviewed host translation derives complete 16-SIMD custom-row launches and excludes small 48-row projections. These joins cover the custom four-bit route; three-bit and upstream source bodies remain separate. Wrapper selection, native metadata and compiler contraction remain explicit. The BF16 Add helper and selected full binary_vv body have parsed-source and separate-load/store interleaving refinements; the residual MLP suffix uses their exact final heap. Physical builtin arithmetic remains a declared machine contract. Manual host translations select the default serial, unpaged, one-token BF16 M1 Max route and dispatch geometry. Trusted byte/hash guards bind these translations to source. Logical IEEE/FTZ division proves the mathematical division envelopes; actual instruction selection remains a boundary. Compiler lowering, native object/buffer extraction, command scheduling/visibility, checkpoint loading, allocator lifetimes and hardware arithmetic remain explicit boundaries. No GPU execution is part of this checker.");
