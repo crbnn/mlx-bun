@@ -17,6 +17,7 @@ import { checkBinaryVvSourceBinding } from "./kernels/binary/BinaryVvSourceBindi
 import { checkGeneralCopy2DSourceBinding } from "./kernels/copy/GeneralCopy2DSourceBinding.ts";
 import { checkVectorCopySourceBinding } from "./kernels/copy/VectorCopySourceBinding.ts";
 import { checkScalarFullHostSourceBinding } from "./kernels/copy/ScalarFullHostSourceBinding.ts";
+import { checkCpuScalarSourceBinding } from "./kernels/copy/CpuScalarSourceBinding.ts";
 
 import checkBufferLeaseSourceBinding from "./contracts/mlx/BufferLeaseSourceBinding.ts";
 import checkNormalizedArgmaxLeaseSourceBinding from "./models/qwen/NormalizedArgmaxLeaseSourceBinding.ts";
@@ -173,6 +174,9 @@ const hostSourcePins = {
   "packages/mlx/src/ops.ts": "0672d9fa77e95490cad3201eb7a9eae073aa41a7c1aa0afaf3e1a640e32dc2cd",
 };
 const mlxSourcePins = {
+  "mlx/dtype.h": "a9b6c8719deae53015cfcf0452b570b2620c8c24b409b93e80ffd8ecb4537748",
+  "mlx/types/half_types.h": "43fa5d204abea6db4211f620058bde2f6869563f2615de2d5d5b28d9f7494229",
+  "mlx/types/bf16.h": "a279b39030b406eda06a42069abd660ad24fced7b1cfe33378b236b2ce1e786f",
   "mlx/backend/metal/kernels/indexing/indexing.h": "e820b8ee2b5132a97122780c12433ebb5100d8078d31e211d0429400a11415bb",
   "mlx/backend/common/common.cpp": "671d20a1a25524198e078c22af18a0f02b94f642786b6655f9c4e55ec8a6d8a4",
   "mlx/backend/metal/kernels.h": "f45059a96ffa4cf38c6cb85754a818075563b455ca008d0ae624737546f7b972",
@@ -1419,6 +1423,85 @@ const proofFiles = [
   "models/qwen/Qwen38InitialCopiedCache.lean",
   "models/qwen/ReachedNativeCopiedTokenState.lean",
   "models/qwen/TokenEmbeddingParsedConstruction.lean",
+  "models/qwen/AttentionSuffixHighWater.lean",
+  "models/qwen/CapacityCopiedAttentionHighWater.lean",
+  "models/qwen/CapacityCopiedDeltaHighWater.lean",
+  "models/qwen/CapacityCopiedHighWaterConstruction.lean",
+  "models/qwen/CapacityCopiedTokenHighWater.lean",
+  "models/qwen/CapacityCopiedWorkspace.lean",
+  "models/qwen/CheckpointCopiedHighWaterRun.lean",
+  "models/qwen/CheckpointCopiedHighWaterSeed.lean",
+  "models/qwen/CheckpointCopiedHighWaterSource.lean",
+  "models/qwen/CheckpointCopiedHighWaterState.lean",
+  "models/qwen/CheckpointCopiedInitializedRun.lean",
+  "models/qwen/CheckpointCopiedInitializedSource.lean",
+  "models/qwen/CheckpointNativeCopiedAdvanceGeometry.lean",
+  "models/qwen/CopiedAttentionAllocatedFront.lean",
+  "models/qwen/CopiedAttentionAllocatedFrontFrame.lean",
+  "models/qwen/CopiedAttentionAllocatedInitialRead.lean",
+  "models/qwen/CopiedAttentionAllocatedPositiveFrame.lean",
+  "models/qwen/CopiedAttentionAllocatedPositiveInput.lean",
+  "models/qwen/CopiedAttentionAllocatedPositiveRead.lean",
+  "models/qwen/CopiedAttentionAllocatedPositiveRoute.lean",
+  "models/qwen/CopiedAttentionCapacityArenaFactory.lean",
+  "models/qwen/CopiedAttentionCapacityArenaHighWater.lean",
+  "models/qwen/CopiedAttentionFreshAppendAllocation.lean",
+  "models/qwen/CopiedAttentionFreshReadHighWater.lean",
+  "models/qwen/CopiedAttentionGrowthPreparation.lean",
+  "models/qwen/CopiedAttentionInitialArenaFactory.lean",
+  "models/qwen/CopiedAttentionInitialArenaHighWater.lean",
+  "models/qwen/CopiedAttentionPositiveReuseAllocation.lean",
+  "models/qwen/CopiedAttentionPreparedGeometry.lean",
+  "models/qwen/CopiedAttentionReadHighWater.lean",
+  "models/qwen/CopiedAttentionTailArena.lean",
+  "models/qwen/CopiedAttentionTailArenaBounds.lean",
+  "models/qwen/CopiedAttentionTailArenaBuilt.lean",
+  "models/qwen/CopiedAttentionTailBuiltLineage.lean",
+  "models/qwen/CopiedTokenBodyConstruction.lean",
+  "models/qwen/CopiedTokenCacheGeometry.lean",
+  "models/qwen/CopiedTokenFinishAllocation.lean",
+  "models/qwen/CopiedTokenFinishHighWater.lean",
+  "models/qwen/CopiedTokenFinishRequest.lean",
+  "models/qwen/CopiedTokenFinishSafety.lean",
+  "models/qwen/EmptyKvLineage.lean",
+  "models/qwen/FinalProjectionAllocatedNative.lean",
+  "models/qwen/FinalProjectionSamplerAllocation.lean",
+  "models/qwen/InitialCopiedAttentionHighWater.lean",
+  "models/qwen/InitialCopiedDeltaHighWater.lean",
+  "models/qwen/InitialCopiedEntryLineage.lean",
+  "models/qwen/InitialCopiedHighWaterConstruction.lean",
+  "models/qwen/InitialCopiedInitializationLineage.lean",
+  "models/qwen/InitialCopiedSequenceSeed.lean",
+  "models/qwen/InitialCopiedTokenHighWater.lean",
+  "models/qwen/InitialCopiedWorkspace.lean",
+  "models/qwen/NativeCopiedAdvanceGeometry.lean",
+  "models/qwen/NativeCopiedAllocationBudget.lean",
+  "models/qwen/NativeCopiedHighWater.lean",
+  "models/qwen/NativeCopiedPlanGeometry.lean",
+  "models/qwen/NativeCopiedHighWaterFinalNative.lean",
+  "kernels/copy/CpuScalarSourceSemantics.lean",
+  "kernels/copy/CpuScalarSourceSyntax.lean",
+  "models/qwen/CapacityCopiedScalarBoundary.lean",
+  "models/qwen/CapacityCopiedTokenScalarBoundary.lean",
+  "models/qwen/CheckpointCopiedAllocatedAttachment.lean",
+  "models/qwen/CheckpointCopiedHighWaterRunFrame.lean",
+  "models/qwen/CheckpointCopiedInitializedBoundary.lean",
+  "models/qwen/CheckpointCopiedProducedScalarAttachment.lean",
+  "models/qwen/CheckpointCopiedReachedCertificate.lean",
+  "models/qwen/CopiedAttentionAllocatedScalarSources.lean",
+  "models/qwen/CopiedAttentionScalarPrefix.lean",
+  "models/qwen/CopiedCapacityGrowthBounds.lean",
+  "models/qwen/CopiedCapacityGrowthChainBounds.lean",
+  "models/qwen/CopiedCapacityScalarSources.lean",
+  "models/qwen/CopiedCpuScalarInitialization.lean",
+  "models/qwen/CopiedScalarInitialization.lean",
+  "models/qwen/CopiedScalarRunSources.lean",
+  "models/qwen/CpuScalarParsedConstruction.lean",
+  "models/qwen/InitialCopiedScalarBoundary.lean",
+  "models/qwen/InitialCopiedTokenScalarBoundary.lean",
+  "models/qwen/NativeCopiedConstructedInputs.lean",
+  "models/qwen/NativeCopiedHighWaterFrame.lean",
+  "models/qwen/NativeCopiedHighWaterScalarBoundary.lean",
 ];
 
 const discoveredProofs = await Array.fromAsync(new Bun.Glob("**/*.lean").scan({
@@ -1547,6 +1630,7 @@ await checkGeneralCopy2DSourceBinding({ selfTest: process.argv.includes("--self-
 await checkVectorCopySourceBinding({ selfTest: process.argv.includes("--self-test") });
 // Includes the Vector host wrapper guard. These C++ translations remain manual.
 await checkScalarFullHostSourceBinding({ selfTest: process.argv.includes("--self-test") });
+await checkCpuScalarSourceBinding({ selfTest: process.argv.includes("--self-test") });
 
 await checkBufferLeaseSourceBinding({ selfTest: process.argv.includes("--self-test") });
 await checkNormalizedArgmaxLeaseSourceBinding({ selfTest: process.argv.includes("--self-test") });
@@ -1725,9 +1809,11 @@ console.log("Embedding dequantization source: selectedbf16/64/4 parsing derives 
 console.log("Log-sum-exp source: parsed bounded four-cell reads, ordered max/rescale/sums, both scratch phases and final BF16 store reach the existing sampler heap. The source-selected1024-thread pipeline bound, descriptor attachment, native exp/log/SIMD and contraction remain explicit.");
 console.log("Token source composition links actual embedding output bytes to the copied model input, final RMS/head projection and source-derived log-sum-exp/argmax/token store. The indexed constructor selects the initial or positive-capacity chain and uses one original parameter bundle for embedding, all 64 layers and final normalization/head. Native attachments, sampler primitives and cache-route eligibility remain explicit.");
 console.log("Initial copied model chain: the cache-zero 64-stage factory uses direct zero initialization and supported copied/donated first-token cache preservation without an empty concatenate. It constructs parsed attention prefixes and residual/Trellis suffixes from original parameters and retains caches through the final sampler heap. Positive-capacity construction has the same original-parameter and heap linkage.");
-console.log("Checkpoint-derived copied token source: literal checkpoint bounds, generated RoPE inputs and normal-input rsqrt/exact-division selection derive all 64 layer finite contracts and the final logit envelope. Native inputs bind their capacity predicate to the actual cache index. A reached-state sequence composes initial and positive source factories: each next embedding consumes the previous uint32 token and cache heap, with the same original parameter bytes retained. Token/cache reads equal the checkpoint-derived logical recurrence. Existence of reached allocation plans, spatial protection, native attachments and physical scheduling remain explicit; this source sequence does not yet construct a complete native allocator.");
+console.log("Checkpoint-derived copied token source: literal checkpoint bounds, generated RoPE inputs and normal-input rsqrt/exact-division selection derive all 64 layer finite contracts and the final logit envelope. Native inputs bind their capacity predicate to the actual cache index. A reached-state sequence composes initial and positive source factories: each next embedding consumes the previous uint32 token and cache heap, with the same original parameter bytes retained. Token/cache reads equal the checkpoint-derived logical recurrence. Constructive copied-source initialization and indexed first/later-token arenas now derive all reached layer/token allocation plans and spatial protection from the original storage, dispatch choices and one cumulative address-space bound. Cache reuse/growth is selected automatically. The actual uint32 producer, next embedding and retained caches share the constructed heap. Native attachments, physical allocation success, compiler lowering and command scheduling remain explicit.");
 console.log("Memory refinement: concrete shared-heap kernel/layer constructors connect embedding, all decode stages, final projection, sampling and subsequent tokens. Final token and every updated cache are read from one resulting heap. Finite reachable traces require raw allocation plans only for actual predecessor states; they do not require an allocator for every possible heap. Head RMS supports fresh and donated Q/K buffers; RoPE preserves actual dynamic bases. Both dispatched SDPA routes, mixed Delta state/output writes, Trellis scratch/output phases and sampling local/global memories retain their read and frame proofs.");
 console.log("Parameter continuity: strong Delta and attention constructors consume the original parameter bundle, and the graph cursor selects each stage from one carried global bundle. Initialized finite token traces preserve that same embedding/graph bundle from the loaded initial heap through token stores, cache initialization, every layer and subsequent sampling. Checkpoint dictionary certificates supply the complete numerical Parameters contract to these memory-level results; ordered encodings, exact model bindings and primitive contracts remain explicit.");
+console.log("Constructible copied-source sequence: the actual guarded copied Q/K/V and gate route, original O weights, residual/Trellis suffix, final head and sampler are constructed without supplied initializer, layer or per-token plans. One monotone frontier derives fresh regions and preserves prior token/cache/parameter spans. The first state is produced by actual token/cache initialization. The exact indexed footprint is summed over all reached calls; a conservative 2^57-byte cumulative reservation budget covers 262144 calls, plus 153944080 initialization bytes. This is abstract 64-bit address headroom, not physical RAM fit, peak residency, native allocation success or lifetime recycling. Source certificates still require reached native metadata/descriptor and primitive attachments.");
+console.log("Produced scalar sources: selected parsed CPU zero construction and BF16/FP32 stores produce the exact scalar prefix heap used by parsed cache initialization. Current-heap scalar views survive every reached copied-source call. Initial and growth attention stages derive scalar-source witnesses and destination bounds from their constructed arenas; gate links and fresh final-normalization ownership are derived as well. Remaining attachments do not supply expected zero buffers or completed layer/token plans. Native C++ frontend and primitive/ABI conformance, per-call array identity and sharing, descriptor attachment and CPU/GPU coherence remain explicit boundaries; no native constant-sharing or physical-memory claim is established.");
 console.log("Constructible layouts for the older generic modeled route: parsed cache initialization, the direct BF16 first-token KV branch, and every subsequent token through 262144 are constructed from the original checkpoint bundle, fresh address-space bounds and primitive/dispatch contracts, with no supplied graph/token plan or per-step execution oracle. Initial KV allocation derives zero slabs, optional preservation copies, row updates and the active head stride. The exact first-token heap feeds the constructed continuation. A checkpoint adapter now accepts only the reached normal-input rsqrt envelopes and derives division bounds internally, preserving original functions and proving token selection with the lowest-index tie rule. Parameter bytes remain unchanged; readback has the reference cache ranges, propagated error bounds and finiteness. The conservative retained bump-address budget for 262143 later steps is 127015766109984 bytes. This address-space construction does not establish physical-memory fit, scratch reuse or native allocator ownership.");
 console.log("Checkpoint coverage: checked literals cover 129 main and 32 head normalization vectors, 144 Delta tensors, 192 Trellis scale tensors and 48 convolution tensors. Affine dictionaries cover distinct scale/bias alphabets from 612 tensors; ordered indices remain explicit inputs. Lean byte constructors establish exact parameter attachment and a fixed-point property. Native parsing/loading and specified host RoPE/head-scale results remain boundary contracts.");
 console.log("Native paths proved: 0. Selected scalar/vector/general copy kernels have checked parser/body and current-heap load/store refinements, including completed interleavings. Trellis integer codebook, reciprocal-based bit construction, cooperative table initialization and packed-window lookup have parsed-source refinements; parsed caller loops now derive packed word arrays and gate input chunks from original bytes. The parsed gate/up inner loops read original packed/scale/input bytes and refine the original lane specification without reassociation; accumulator initialization, SIMD projection and typed tail expressions have source bridges. Parsed row distribution and the lane-zero writer generate exact BF16 output stores in the current destination heap, with unique dispatch and outside-buffer preservation; Parsed gate/up pointer setup derives all private arrays from the original byte heap and propagates through the same lane, projection, tail and completed output schedule. Selected down-projection template, lane setup, builtin dispatch, active/row controls and typed row pointers now derive original packed arrays and input/scale loads. Parsed window and multiply-then-FMA statements consume those bytes and the actual current codebook heap. Parsed pair/tail/u/i loop headers now derive the entire down lane sequence from zero initialization, covering all 136 rows with separate standard/flushing variants. Parsed scratch alias, indices and all 256 thread programs now reuse the completed read-phase trace and derive current scratch bits/bytes, including represented NaN payloads. The partial producer parses its c-loop, group declarations, guard, positive-zero initializer, ordered four-way rounded add and 64-bit store address with no wrap. The parsed partial stores and final float4 fold now reuse the same native traces and current partial heap, reaching exact BF16 output bits/bytes. Reviewed host selection derives actual templates, intermediate shape/dtype and both dispatch geometries; parsed builtins derive producer split/block/lane indices. The model join uses the same preceding middle heap and carries the existing numerical bound to its actual output buffer. Standard and flush-to-zero gate/up weight/FMA interpretations are now explicitly separate and preserve source order. Residual RMS parses both loop schedules, current-heap cells, reduction tail and output stores through the exact completed normalized heap. MLX RMS joins the selected no-copy host route and native thread limit with parsed full/tail loops, current-heap BF16 first-pass cells, original FMA folds, both SIMD reductions, three barriers, inverse production, pointer updates and output stores through the exact normalized heap, including donated input. The selected 256-wide Q/K head path now parses actual cached captures, nonzero row pointers, original first-pass sums, shared reduction/inverse phases and donated-buffer output writes. An interleaved ownership simulation and query-to-key chain reach the exact existing final heap. Selected BF16 single-position partial RoPE now parses angles, loads, forward arithmetic and stores; copied/donated query24 then key4 execution reaches the same final heap and preserves untouched head tails. Selected one-pass SDPA derives source pointers, scaled captured-query loads, key loads from protected current heaps and exact strided key visits. Parsed ordered score folds, SIMD sum, max/exp updates and complete per-group partials consume current bytes without expected-score/partial premises. The unconditional short-cache dispatch range is below 1024; larger transitions depend on an explicit native architecture suffix. For donated one-pass SDPA, parsed cross-group summary writes, max/exp/sum merge, all eight scratch-transpose phases, barriers, divisions and BF16 stores now reach the same output heap. Complete source partitions supply summary and transpose provenance without expected intermediate values. The model join identifies that heap with the gate input and carries the existing real softmax error bound. The ordinary two-pass first phase now parses block-strided visits, six pointer cells, ordered SIMD score/update and mixed FP32-summary/BF16-partial stores; source partitions derive the actual second-pass readState with its BF16 narrow/widen step. Fresh-output one-pass now proves protected current query/cache reads, parsed complete partitions, summary/transpose provenance and final output schedules; both one-pass ownership branches feed the same layer gate heap. Contiguous query descriptor geometry remains explicit. Two-pass source merging now derives chunk reads from the actual first temporary heap, ordered SIMD/max/exp/sum/numerator/transposes and final stores, proving all output prefixes preserve first-phase reads. It joins the actual model gate heap and error contract, including architecture-independent long-cache selection under default override. Parsed BF16 sigmoid/multiply cells and selected width-one unary/binary traversals now execute the actual gate schedules, preserving current-heap reads and reaching the affine projection input. Contiguous native descriptor selection remains explicit. Native metadata/descriptor attachment and physical primitive/barrier conformance remain explicit. Argmax parses normalized scoring, bounded partial traversal, comparator/shuffle phases, local scratch stores/barriers and the final uint32 store. Unique candidate origins retain exact signed-zero bits through shuffle, and scratch execution uses actual heaps; Parsed global partial stores, finish traversal and reads, scratch merges and final token store now form a whole-sampler certificate through the same partial-output heap, concluding exact greedy-token readback without desired phase outputs as premises. The parsed affine MLXQ_F macro refines the existing exact masked-integer theorem. The four-bit qdot source now binds initialization, uint16 pointer reinterpretation, ordered accumulation body, all four loop visits and final scale/bias expression to the tile model. Finite binary32 addition commutativity bridges the final operand order with exact signed-zero preservation. Parsed input preparation and shared preload construct one completed scratch bank from the actual activation heap. Every subsequent protected output-store prefix uses that same scratch with original packed weights, scales and biases. Parsed outer K visits, pointer/scalar reads and ordered four-row updates derive the original lane registers. SIMD output reduction and BF16 stores reach the existing projection heap. A reviewed host translation derives complete 16-SIMD custom-row launches and excludes small 48-row projections. The four-bit lifecycle constructs one initial preload before quantifying over every protected output prefix. Its layer and final-head joins identify the actual output bytes with the original projection and inherit the numerical bound. Three-bit parsed qdot now derives the two ordered packed-byte iterations and all ten body updates per iteration, including split fields and their separately rounded scale factors. Its BF16 input preparation and producer-owned preload are parsed, and the three-bit lifecycle constructs one preload outside all later prefixes, actual parsed qdot call witnesses, ordered K/row accumulation and final output stores. The common custom three/four-bit layer source certificate reaches its actual output buffer. The distinct upstream MLX four-bit route now binds reviewed host selection, parsed private input loads, uint16 masks/casts, qdot loops, native K/row traversal, pointer updates and BF16 stores to the same output heap for every protected prefix. Its native two-SIMD branch reaches Delta48 A/B consumer buffers and existing projection bounds without assuming native architecture suffix or expected registers. Compiler lowering, helper interpretation and actual descriptor attachment remain explicit. Wrapper selection, native metadata and compiler contraction remain explicit. The BF16 Add helper and selected full binary_vv body have parsed-source and separate-load/store interleaving refinements; the residual MLP suffix uses their exact final heap. Physical builtin arithmetic remains a declared machine contract. Manual host translations select the default serial, unpaged, one-token BF16 M1 Max route and dispatch geometry. Trusted byte/hash guards bind these translations to source. Logical IEEE/FTZ division proves the mathematical division envelopes; actual instruction selection remains a boundary. Compiler lowering, native object/buffer extraction, command scheduling/visibility, checkpoint loading, allocator lifetimes and hardware arithmetic remain explicit boundaries. No GPU execution is part of this checker.");
