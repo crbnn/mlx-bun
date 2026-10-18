@@ -25,11 +25,12 @@ export function logitsFromHiddenPadM(
   return lg;
 }
 
-/** Per-row summed response log likelihood, extracted unchanged from DPO.
+/** Per-row summed response log likelihood for DPO and decision scoring.
  * logits [B,L-1,V] predict ids[:,1:]; mask is indexed in the original [B,L]
  * token coordinates. Prompt and padding masks are zero, answer masks one.
  * Borrows every input and returns an owned differentiable f32 tensor [B].
- * Subtraction precedes the f32 cast, retaining the existing DPO operation order.
+ * Normalize in f32: casting after logsumexp/subtraction cannot recover precision
+ * lost when logits are bf16 or f16.
  */
 export function sequenceLogProbabilities(logits: MlxArray, ids: number[][], mask: number[][]): MlxArray {
   const B = ids.length;
@@ -46,7 +47,8 @@ export function sequenceLogProbabilities(logits: MlxArray, ids: number[][], mask
       targetsHost[flat] = ids[b]![t + 1]!;
       maskHost[flat] = mask[b]![t + 1]!; // resp_mask[:, 1:]
     }
-  const logits2d = ops.reshape(logits, [N, V]);
+  const logitsF = logits.dtype === Dtype.float32 ? logits : logits.astype(Dtype.float32);
+  const logits2d = ops.reshape(logitsF, [N, V]);
   const targets = MlxArray.fromInt32(targetsHost, [N, 1]);
   const m = MlxArray.fromFloat32(maskHost, [N]);
 
@@ -54,12 +56,11 @@ export function sequenceLogProbabilities(logits: MlxArray, ids: number[][], mask
   const gathered = ops.takeAlongAxis(logits2d, targets, -1); // [N,1]
   const picked = ops.reshape(gathered, [N]); // [N]
   const logp = ops.sub(picked, lse); // log_softmax at the label
-  const logpF = logp.dtype === Dtype.float32 ? logp : logp.astype(Dtype.float32);
-  const masked = ops.mul(logpF, m); // [N]
+  const masked = ops.mul(logp, m); // [N]
   const masked2d = ops.reshape(masked, [B, T]); // [B, T]
   const perRow = ops.sumAxis(masked2d, 1, false); // [B]
 
   for (const a of [logits2d, targets, m, lse, gathered, picked, logp, masked, masked2d]) a.dispose();
-  if (logpF !== logp) logpF.dispose();
+  if (logitsF !== logits) logitsF.dispose();
   return perRow;
 }

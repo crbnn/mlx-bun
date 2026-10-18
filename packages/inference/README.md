@@ -1456,7 +1456,8 @@ their positions. Every candidate owns fresh caches, released before it settles.
 
 `sequenceLogProbabilities` and `logitsFromHiddenPadM` are the existing DPO
 response-mask reduction and DPO/ORPO head geometry, now owned here and consumed by
-training. The extraction preserves operation order and differentiability. API
+training. Response log likelihoods normalize logits in float32 before reduction,
+including bf16/f16 inputs, and preserve differentiability. API
 schemas, answer text encoding, confidence, and wire responses belong to the app.
 
 `scoring` exposes `forwardSequence` / `forwardSequenceHidden` for full-sequence
