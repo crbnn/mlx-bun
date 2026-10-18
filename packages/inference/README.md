@@ -1459,6 +1459,10 @@ response-mask reduction and DPO/ORPO head geometry, now owned here and consumed 
 training. Response log likelihoods normalize logits in float32 before reduction,
 including bf16/f16 inputs, and preserve differentiability. API
 schemas, answer text encoding, confidence, and wire responses belong to the app.
+`sequenceLogProbabilitiesFromHidden` applies the same scorer after gathering
+only response-predicting hidden rows. DPO uses it for both policy and reference:
+the transformer still sees the full sequence, while head logits are bounded by
+the longest response in the batch. Sparse and weighted masks retain their meaning.
 
 `scoring` exposes `forwardSequence` / `forwardSequenceHidden` for full-sequence
 logits and hidden states, including the existing padded-batch masks. The original

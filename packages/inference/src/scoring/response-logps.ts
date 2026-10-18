@@ -64,3 +64,38 @@ export function sequenceLogProbabilities(logits: MlxArray, ids: number[][], mask
   if (logitsF !== logits) logitsF.dispose();
   return perRow;
 }
+
+/** Same summed response score, applying the head only where mask[:,1:] is
+ * nonzero. Hidden states still come from the complete causal forward: gathering
+ * here preserves gradients through the prompt. Rows are padded to the longest
+ * response in the batch, not to the prompt length. Borrows hidden and model. */
+export function sequenceLogProbabilitiesFromHidden(
+  model: object,
+  hidden: MlxArray, // [B, L-1, hidden]
+  ids: number[][],
+  mask: number[][],
+): MlxArray {
+  const [B, T, H] = hidden.shape as [number, number, number];
+  const positions = mask.map(row => row.slice(1).flatMap((weight, t) => weight !== 0 ? [t] : []));
+  const M = Math.max(...positions.map(row => row.length));
+  if (M === 0) return ops.zeros([B], Dtype.float32);
+  const indices = new Int32Array(B * M);
+  const compactIds: number[][] = [], compactMask: number[][] = [];
+  for (let b = 0; b < B; b++) {
+    const tokens = [0], weights = [0];
+    for (let m = 0; m < M; m++) {
+      const t = positions[b]![m];
+      indices[b * M + m] = b * T + (t ?? 0);
+      tokens.push(t === undefined ? 0 : ids[b]![t + 1]!);
+      weights.push(t === undefined ? 0 : mask[b]![t + 1]!);
+    }
+    compactIds.push(tokens);
+    compactMask.push(weights);
+  }
+  using flat = ops.reshape(hidden, [B * T, H]);
+  using index = MlxArray.fromInt32(indices, [B * M]);
+  using selected = ops.takeAxis(flat, index, 0);
+  using span = ops.reshape(selected, [B, M, H]);
+  using logits = logitsFromHiddenPadM(model, span);
+  return sequenceLogProbabilities(logits, compactIds, compactMask);
+}
